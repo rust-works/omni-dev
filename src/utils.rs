@@ -40,11 +40,11 @@ pub fn validate_input(input: &str) -> Result<(), UtilError> {
     if input.is_empty() {
         return Err(UtilError::InvalidInput("Input cannot be empty".to_string()));
     }
-    
+
     if input.len() > 1000 {
         return Err(UtilError::InvalidInput("Input too long".to_string()));
     }
-    
+
     Ok(())
 }
 
