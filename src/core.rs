@@ -33,7 +33,7 @@ impl App {
         if self.config.verbose {
             println!("Running omni-dev in verbose mode");
         }
-        
+
         println!("omni-dev is ready!");
         Ok(())
     }

@@ -4,8 +4,8 @@
 
 This project implements a CLI tool that provides the functionality of the existing `.claude/commands/twiddle-msg` bash script but with a Rust-based CLI interface. The tool will support two main subcommands:
 
-- `omni-dev git view [commit-range]` - Analyze git commits and output comprehensive repository information in YAML format
-- `omni-dev git amend <yaml-file>` - Amend commit messages based on a YAML configuration file
+- `omni-dev git commit message view [commit-range]` - Analyze git commits and output comprehensive repository information in YAML format
+- `omni-dev git commit message amend <yaml-file>` - Amend commit messages based on a YAML configuration file
 
 ## Project Architecture
 
@@ -36,7 +36,7 @@ This project implements a CLI tool that provides the functionality of the existi
 
 ### Key Features to Implement
 
-#### 1. Git Repository Analysis (`view` command)
+#### 1. Git Repository Analysis (`git commit message view` command)
 - **Working Directory Status**: Check for uncommitted changes, untracked files
 - **Remote Analysis**: Detect all remotes, identify main branches (main/master), get URLs
 - **Commit Analysis**: For each commit in range:
@@ -47,7 +47,7 @@ This project implements a CLI tool that provides the functionality of the existi
   - Check if commit exists in remote main branches
   - Provide detailed file change statistics
 
-#### 2. Commit Amendment (`amend` command)
+#### 2. Commit Amendment (`git commit message amend` command)
 - **YAML Processing**: Parse amendment files with commit hash → message mapping
 - **Safety Checks**: 
   - Validate working directory is clean
@@ -82,15 +82,15 @@ chrono = { version = "0.4", features = ["serde"] }
 
 #### CLI Interface Structure
 ```
-omni-dev git <subcommand> [options] [args...]
+omni-dev git commit message <subcommand> [options] [args...]
 
 Subcommands:
   view [commit-range]    Output commit analysis in YAML format
   amend <yaml-file>      Amend commits with messages from YAML file
 
 Examples:
-  omni-dev git view HEAD~3..HEAD
-  omni-dev git amend amendments.yml
+  omni-dev git commit message view HEAD~3..HEAD
+  omni-dev git commit message amend amendments.yml
 ```
 
 #### YAML Amendment File Format

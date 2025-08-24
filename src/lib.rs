@@ -22,9 +22,13 @@
 #![warn(clippy::all)]
 #![deny(unsafe_code)]
 
+pub mod cli;
 pub mod core;
+pub mod data;
+pub mod git;
 pub mod utils;
 
+pub use crate::cli::Cli;
 pub use crate::core::*;
 
 /// The current version of omni-dev
