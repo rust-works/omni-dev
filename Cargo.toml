@@ -1,0 +1,27 @@
+[package]
+name = "omni-dev"
+version = "0.1.0"
+edition = "2021"
+authors = ["John Ky <newhoggy@gmail.com>"]
+license = "BSD-3-Clause"
+description = "A comprehensive development toolkit"
+repository = "https://github.com/rust-works/omni-dev"
+homepage = "https://github.com/rust-works/omni-dev"
+documentation = "https://docs.rs/omni-dev"
+readme = "README.md"
+keywords = ["development", "tools", "productivity"]
+categories = ["development-tools"]
+rust-version = "1.70.0"
+
+[dependencies]
+
+[dev-dependencies]
+
+[lib]
+name = "omni_dev"
+path = "src/lib.rs"
+
+[[bin]]
+name = "omni-dev"
+path = "src/main.rs"
+required-features = []
