@@ -97,33 +97,35 @@ impl MessageCommand {
 impl ViewCommand {
     /// Execute view command
     pub fn execute(self) -> Result<()> {
+        use crate::data::{FieldExplanation, FileStatusInfo, RepositoryView, WorkingDirectoryInfo};
         use crate::git::{GitRepository, RemoteInfo};
-        use crate::data::{RepositoryView, FieldExplanation, WorkingDirectoryInfo, FileStatusInfo};
-        
+
         let commit_range = self.commit_range.as_deref().unwrap_or("HEAD");
-        
+
         // Open git repository
         let repo = GitRepository::open()
             .context("Failed to open git repository. Make sure you're in a git repository.")?;
-        
+
         // Get working directory status
         let wd_status = repo.get_working_directory_status()?;
         let working_directory = WorkingDirectoryInfo {
             clean: wd_status.clean,
-            untracked_changes: wd_status.untracked_changes.into_iter()
+            untracked_changes: wd_status
+                .untracked_changes
+                .into_iter()
                 .map(|fs| FileStatusInfo {
                     status: fs.status,
                     file: fs.file,
                 })
                 .collect(),
         };
-        
+
         // Get remote information
         let remotes = RemoteInfo::get_all_remotes(repo.repository())?;
-        
+
         // Parse commit range and get commits
         let commits = repo.get_commits_in_range(commit_range)?;
-        
+
         // Build repository view
         let repo_view = RepositoryView {
             explanation: FieldExplanation::default(),
@@ -131,11 +133,11 @@ impl ViewCommand {
             remotes,
             commits,
         };
-        
+
         // Output as YAML
         let yaml_output = crate::data::to_yaml(&repo_view)?;
         println!("{}", yaml_output);
-        
+
         Ok(())
     }
 }
