@@ -83,7 +83,7 @@ impl CommitInfo {
         // TODO: Implement main branch detection
         let in_main_branches = Vec::new();
 
-        // Implement commit analysis
+        // TODO: Implement commit analysis
         let analysis = CommitAnalysis::analyze_commit(repo, commit)?;
 
         Ok(Self {
@@ -102,19 +102,20 @@ impl CommitAnalysis {
     pub fn analyze_commit(repo: &Repository, commit: &Commit) -> Result<Self> {
         // Get file changes
         let file_changes = Self::analyze_file_changes(repo, commit)?;
-        
+
         // Detect conventional commit type based on files and message
         let detected_type = Self::detect_commit_type(commit, &file_changes);
-        
+
         // Detect scope based on file paths
         let detected_scope = Self::detect_scope(&file_changes);
-        
+
         // Generate proposed conventional commit message
-        let proposed_message = Self::generate_proposed_message(commit, &detected_type, &detected_scope, &file_changes);
-        
+        let proposed_message =
+            Self::generate_proposed_message(commit, &detected_type, &detected_scope, &file_changes);
+
         // Get diff summary
         let diff_summary = Self::get_diff_summary(repo, commit)?;
-        
+
         Ok(Self {
             detected_type,
             detected_scope,
@@ -123,24 +124,29 @@ impl CommitAnalysis {
             diff_summary,
         })
     }
-    
+
     /// Analyze file changes in the commit
     fn analyze_file_changes(repo: &Repository, commit: &Commit) -> Result<FileChanges> {
         let mut file_list = Vec::new();
         let mut files_added = 0;
         let mut files_deleted = 0;
-        
+
         // Get the tree for this commit
         let commit_tree = commit.tree().context("Failed to get commit tree")?;
-        
+
         // Get parent tree if available
         let parent_tree = if commit.parent_count() > 0 {
-            Some(commit.parent(0).context("Failed to get parent commit")?
-                .tree().context("Failed to get parent tree")?)
+            Some(
+                commit
+                    .parent(0)
+                    .context("Failed to get parent commit")?
+                    .tree()
+                    .context("Failed to get parent tree")?,
+            )
         } else {
             None
         };
-        
+
         // Create diff between parent and commit
         let diff = if let Some(parent_tree) = parent_tree {
             repo.diff_tree_to_tree(Some(&parent_tree), Some(&commit_tree), None)
@@ -150,7 +156,7 @@ impl CommitAnalysis {
             repo.diff_tree_to_tree(None, Some(&commit_tree), None)
                 .context("Failed to create diff for initial commit")?
         };
-        
+
         // Process each diff delta
         diff.foreach(
             &mut |delta, _progress| {
@@ -167,9 +173,9 @@ impl CommitAnalysis {
                     git2::Delta::Renamed => "R",
                     git2::Delta::Copied => "C",
                     git2::Delta::Typechange => "T",
-                    _ => "?"
+                    _ => "?",
                 };
-                
+
                 if let Some(path) = delta.new_file().path() {
                     if let Some(path_str) = path.to_str() {
                         file_list.push(FileChange {
@@ -178,16 +184,17 @@ impl CommitAnalysis {
                         });
                     }
                 }
-                
+
                 true
             },
             None,
             None,
             None,
-        ).context("Failed to process diff")?;
-        
+        )
+        .context("Failed to process diff")?;
+
         let total_files = file_list.len();
-        
+
         Ok(FileChanges {
             total_files,
             files_added,
@@ -195,33 +202,48 @@ impl CommitAnalysis {
             file_list,
         })
     }
-    
+
     /// Detect conventional commit type based on files and existing message
     fn detect_commit_type(commit: &Commit, file_changes: &FileChanges) -> String {
         let message = commit.message().unwrap_or("");
-        
+
         // Check if message already has conventional commit format
         if let Some(existing_type) = Self::extract_conventional_type(message) {
             return existing_type;
         }
-        
+
         // Analyze file patterns
-        let files: Vec<&str> = file_changes.file_list.iter()
+        let files: Vec<&str> = file_changes
+            .file_list
+            .iter()
             .map(|f| f.file.as_str())
             .collect();
-        
+
         // Check for specific patterns
-        if files.iter().any(|f| f.contains("test") || f.contains("spec")) {
+        if files
+            .iter()
+            .any(|f| f.contains("test") || f.contains("spec"))
+        {
             "test".to_string()
-        } else if files.iter().any(|f| f.ends_with(".md") || f.contains("README") || f.contains("docs/")) {
+        } else if files
+            .iter()
+            .any(|f| f.ends_with(".md") || f.contains("README") || f.contains("docs/"))
+        {
             "docs".to_string()
-        } else if files.iter().any(|f| f.contains("Cargo.toml") || f.contains("package.json") || f.contains("config")) {
+        } else if files
+            .iter()
+            .any(|f| f.contains("Cargo.toml") || f.contains("package.json") || f.contains("config"))
+        {
             if file_changes.files_added > 0 {
                 "feat".to_string()
             } else {
                 "chore".to_string()
             }
-        } else if file_changes.files_added > 0 && files.iter().any(|f| f.ends_with(".rs") || f.ends_with(".js") || f.ends_with(".py")) {
+        } else if file_changes.files_added > 0
+            && files
+                .iter()
+                .any(|f| f.ends_with(".rs") || f.ends_with(".js") || f.ends_with(".py"))
+        {
             "feat".to_string()
         } else if message.to_lowercase().contains("fix") || message.to_lowercase().contains("bug") {
             "fix".to_string()
@@ -231,7 +253,7 @@ impl CommitAnalysis {
             "chore".to_string()
         }
     }
-    
+
     /// Extract conventional commit type from existing message
     fn extract_conventional_type(message: &str) -> Option<String> {
         let first_line = message.lines().next().unwrap_or("");
@@ -248,18 +270,32 @@ impl CommitAnalysis {
         }
         None
     }
-    
+
     /// Check if a string is a valid conventional commit type
     fn is_valid_conventional_type(s: &str) -> bool {
-        matches!(s, "feat" | "fix" | "docs" | "style" | "refactor" | "test" | "chore" | "build" | "ci" | "perf")
+        matches!(
+            s,
+            "feat"
+                | "fix"
+                | "docs"
+                | "style"
+                | "refactor"
+                | "test"
+                | "chore"
+                | "build"
+                | "ci"
+                | "perf"
+        )
     }
-    
+
     /// Detect scope based on file paths
     fn detect_scope(file_changes: &FileChanges) -> String {
-        let files: Vec<&str> = file_changes.file_list.iter()
+        let files: Vec<&str> = file_changes
+            .file_list
+            .iter()
             .map(|f| f.file.as_str())
             .collect();
-        
+
         // Analyze common path patterns
         if files.iter().any(|f| f.starts_with("src/cli/")) {
             "cli".to_string()
@@ -271,29 +307,38 @@ impl CommitAnalysis {
             "test".to_string()
         } else if files.iter().any(|f| f.starts_with("docs/")) {
             "docs".to_string()
-        } else if files.iter().any(|f| f.contains("Cargo.toml") || f.contains("deny.toml")) {
+        } else if files
+            .iter()
+            .any(|f| f.contains("Cargo.toml") || f.contains("deny.toml"))
+        {
             "deps".to_string()
         } else {
             "".to_string()
         }
     }
-    
+
     /// Generate a proposed conventional commit message
-    fn generate_proposed_message(commit: &Commit, commit_type: &str, scope: &str, file_changes: &FileChanges) -> String {
+    fn generate_proposed_message(
+        commit: &Commit,
+        commit_type: &str,
+        scope: &str,
+        file_changes: &FileChanges,
+    ) -> String {
         let current_message = commit.message().unwrap_or("").lines().next().unwrap_or("");
-        
+
         // If already properly formatted, return as-is
         if Self::extract_conventional_type(current_message).is_some() {
             return current_message.to_string();
         }
-        
+
         // Generate description based on changes
-        let description = if !current_message.is_empty() && !current_message.eq_ignore_ascii_case("stuff") {
-            current_message.to_string()
-        } else {
-            Self::generate_description(commit_type, file_changes)
-        };
-        
+        let description =
+            if !current_message.is_empty() && !current_message.eq_ignore_ascii_case("stuff") {
+                current_message.to_string()
+            } else {
+                Self::generate_description(commit_type, file_changes)
+            };
+
         // Format with scope if available
         if scope.is_empty() {
             format!("{}: {}", commit_type, description)
@@ -301,7 +346,7 @@ impl CommitAnalysis {
             format!("{}({}): {}", commit_type, scope, description)
         }
     }
-    
+
     /// Generate description based on commit type and changes
     fn generate_description(commit_type: &str, file_changes: &FileChanges) -> String {
         match commit_type {
@@ -317,21 +362,26 @@ impl CommitAnalysis {
             "test" => "add tests".to_string(),
             "refactor" => "improve code structure".to_string(),
             "chore" => "update project files".to_string(),
-            _ => "update project".to_string()
+            _ => "update project".to_string(),
         }
     }
-    
+
     /// Get diff summary statistics
     fn get_diff_summary(repo: &Repository, commit: &Commit) -> Result<String> {
         let commit_tree = commit.tree().context("Failed to get commit tree")?;
-        
+
         let parent_tree = if commit.parent_count() > 0 {
-            Some(commit.parent(0).context("Failed to get parent commit")?
-                .tree().context("Failed to get parent tree")?)
+            Some(
+                commit
+                    .parent(0)
+                    .context("Failed to get parent commit")?
+                    .tree()
+                    .context("Failed to get parent tree")?,
+            )
         } else {
             None
         };
-        
+
         let diff = if let Some(parent_tree) = parent_tree {
             repo.diff_tree_to_tree(Some(&parent_tree), Some(&commit_tree), None)
                 .context("Failed to create diff")?
@@ -339,23 +389,28 @@ impl CommitAnalysis {
             repo.diff_tree_to_tree(None, Some(&commit_tree), None)
                 .context("Failed to create diff for initial commit")?
         };
-        
+
         let stats = diff.stats().context("Failed to get diff stats")?;
-        
+
         let mut summary = String::new();
         for i in 0..stats.files_changed() {
-            if let Some(path) = diff.get_delta(i).and_then(|d| d.new_file().path()).and_then(|p| p.to_str()) {
+            if let Some(path) = diff
+                .get_delta(i)
+                .and_then(|d| d.new_file().path())
+                .and_then(|p| p.to_str())
+            {
                 let insertions = stats.insertions();
                 let deletions = stats.deletions();
-                summary.push_str(&format!(" {} | {} +{} -{}\n", 
-                    path, 
+                summary.push_str(&format!(
+                    " {} | {} +{} -{}\n",
+                    path,
                     insertions + deletions,
                     insertions,
                     deletions
                 ));
             }
         }
-        
+
         Ok(summary)
     }
 }

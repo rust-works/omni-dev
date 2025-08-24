@@ -1,8 +1,8 @@
 //! Git repository operations
 
+use crate::git::CommitInfo;
 use anyhow::{Context, Result};
 use git2::{Repository, Status};
-use crate::git::CommitInfo;
 
 /// Git repository wrapper
 pub struct GitRepository {
@@ -86,20 +86,22 @@ impl GitRepository {
     pub fn workdir(&self) -> Option<&std::path::Path> {
         self.repo.workdir()
     }
-    
+
     /// Get access to the underlying git2::Repository
     pub fn repository(&self) -> &Repository {
         &self.repo
     }
-    
+
     /// Parse commit range and get commits
     pub fn get_commits_in_range(&self, range: &str) -> Result<Vec<CommitInfo>> {
         let mut commits = Vec::new();
-        
+
         if range == "HEAD" {
             // Single HEAD commit
             let head = self.repo.head().context("Failed to get HEAD")?;
-            let commit = head.peel_to_commit().context("Failed to peel HEAD to commit")?;
+            let commit = head
+                .peel_to_commit()
+                .context("Failed to peel HEAD to commit")?;
             commits.push(CommitInfo::from_git_commit(&self.repo, &commit)?);
         } else if range.contains("..") {
             // Range format like HEAD~3..HEAD
@@ -107,50 +109,65 @@ impl GitRepository {
             if parts.len() != 2 {
                 anyhow::bail!("Invalid range format: {}", range);
             }
-            
+
             let start_spec = parts[0];
             let end_spec = parts[1];
-            
+
             // Parse start and end commits
-            let start_obj = self.repo.revparse_single(start_spec)
+            let start_obj = self
+                .repo
+                .revparse_single(start_spec)
                 .with_context(|| format!("Failed to parse start commit: {}", start_spec))?;
-            let end_obj = self.repo.revparse_single(end_spec)
+            let end_obj = self
+                .repo
+                .revparse_single(end_spec)
                 .with_context(|| format!("Failed to parse end commit: {}", end_spec))?;
-            
-            let start_commit = start_obj.peel_to_commit()
+
+            let start_commit = start_obj
+                .peel_to_commit()
                 .context("Failed to peel start object to commit")?;
-            let end_commit = end_obj.peel_to_commit()
+            let end_commit = end_obj
+                .peel_to_commit()
                 .context("Failed to peel end object to commit")?;
-            
+
             // Walk from end_commit back to start_commit (exclusive)
             let mut walker = self.repo.revwalk().context("Failed to create revwalk")?;
-            walker.push(end_commit.id()).context("Failed to push end commit")?;
-            walker.hide(start_commit.id()).context("Failed to hide start commit")?;
-            
+            walker
+                .push(end_commit.id())
+                .context("Failed to push end commit")?;
+            walker
+                .hide(start_commit.id())
+                .context("Failed to hide start commit")?;
+
             for oid in walker {
                 let oid = oid.context("Failed to get commit OID from walker")?;
-                let commit = self.repo.find_commit(oid)
+                let commit = self
+                    .repo
+                    .find_commit(oid)
                     .context("Failed to find commit")?;
-                
+
                 // Skip merge commits
                 if commit.parent_count() > 1 {
                     continue;
                 }
-                
+
                 commits.push(CommitInfo::from_git_commit(&self.repo, &commit)?);
             }
-            
+
             // Reverse to get chronological order (oldest first)
             commits.reverse();
         } else {
             // Single commit by hash or reference
-            let obj = self.repo.revparse_single(range)
+            let obj = self
+                .repo
+                .revparse_single(range)
                 .with_context(|| format!("Failed to parse commit: {}", range))?;
-            let commit = obj.peel_to_commit()
+            let commit = obj
+                .peel_to_commit()
                 .context("Failed to peel object to commit")?;
             commits.push(CommitInfo::from_git_commit(&self.repo, &commit)?);
         }
-        
+
         Ok(commits)
     }
 }

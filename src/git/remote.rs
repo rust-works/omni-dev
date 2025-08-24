@@ -1,7 +1,7 @@
 //! Git remote operations
 
 use anyhow::{Context, Result};
-use git2::{Repository, BranchType};
+use git2::{BranchType, Repository};
 use serde::{Deserialize, Serialize};
 
 /// Remote repository information
@@ -46,34 +46,38 @@ impl RemoteInfo {
         if let Ok(head_ref) = repo.find_reference(&head_ref_name) {
             if let Some(target) = head_ref.symbolic_target() {
                 // Extract branch name from refs/remotes/origin/main
-                if let Some(branch_name) = target.strip_prefix(&format!("refs/remotes/{}/", remote_name)) {
+                if let Some(branch_name) =
+                    target.strip_prefix(&format!("refs/remotes/{}/", remote_name))
+                {
                     return Ok(branch_name.to_string());
                 }
             }
         }
-        
+
         // Fallback to checking common branch names
         let common_branches = ["main", "master", "develop"];
-        
+
         for branch_name in &common_branches {
             let reference_name = format!("refs/remotes/{}/{}", remote_name, branch_name);
             if repo.find_reference(&reference_name).is_ok() {
                 return Ok(branch_name.to_string());
             }
         }
-        
+
         // If no common branch found, try to find any branch
         let branch_iter = repo.branches(Some(BranchType::Remote))?;
         for branch_result in branch_iter {
             let (branch, _) = branch_result?;
             if let Some(name) = branch.name()? {
                 if name.starts_with(&format!("{}/", remote_name)) {
-                    let branch_name = name.strip_prefix(&format!("{}/", remote_name)).unwrap_or(name);
+                    let branch_name = name
+                        .strip_prefix(&format!("{}/", remote_name))
+                        .unwrap_or(name);
                     return Ok(branch_name.to_string());
                 }
             }
         }
-        
+
         // If still no branch found, return "unknown"
         Ok("unknown".to_string())
     }
