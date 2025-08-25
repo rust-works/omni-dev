@@ -10,6 +10,7 @@ A powerful Git commit message analysis and amendment toolkit written in Rust.
 ## Features
 
 - 🔍 **Commit Analysis**: Comprehensive analysis of git commits with YAML output
+- 🌳 **Branch Analysis**: Analyze commits in current branch compared to base branch
 - ✏️ **Smart Amendment**: Amend single or multiple commit messages safely
 - 🎯 **Conventional Commits**: Automatic detection and suggestions for conventional commit format
 - 🛡️ **Safety First**: Working directory validation and error recovery
@@ -37,8 +38,11 @@ cargo build --release
 ### Command Line Interface
 
 ```bash
-# View and analyze commits
+# View and analyze commits in a range
 omni-dev git commit message view HEAD~3..HEAD
+
+# Analyze branch commits compared to base branch
+omni-dev git branch info main
 
 # Amend commit messages from a YAML file
 omni-dev git commit message amend amendments.yaml
@@ -49,7 +53,9 @@ omni-dev --help
 
 ### Viewing Commits
 
-Analyze commits in a range and get comprehensive information:
+#### Commit Range Analysis
+
+Analyze commits in a specific range:
 
 ```bash
 # Analyze recent commits
@@ -59,12 +65,28 @@ omni-dev git commit message view HEAD~5..HEAD
 omni-dev git commit message view origin/main..HEAD
 ```
 
-This outputs detailed YAML with:
+#### Branch Analysis
+
+Analyze all commits in the current branch compared to a base branch:
+
+```bash
+# Compare current branch to main (default)
+omni-dev git branch info
+
+# Compare current branch to specific base branch
+omni-dev git branch info develop
+
+# Compare current branch to main explicitly
+omni-dev git branch info main
+```
+
+Both commands output detailed YAML with:
 - Commit metadata (hash, author, date)
 - File changes and diff statistics
 - Conventional commit type detection
 - Proposed commit message improvements
 - Remote branch tracking information
+- Branch context (for `branch info` command)
 
 ### Amending Commits
 
