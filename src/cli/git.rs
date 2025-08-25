@@ -315,7 +315,7 @@ impl InfoCommand {
                 "--head",
                 branch_name,
                 "--json",
-                "number,title,state,url",
+                "number,title,state,url,body",
                 "--limit",
                 "50",
             ])
@@ -336,17 +336,19 @@ impl InfoCommand {
         let mut prs = Vec::new();
         if let Some(prs_array) = prs_json.as_array() {
             for pr_json in prs_array {
-                if let (Some(number), Some(title), Some(state), Some(url)) = (
+                if let (Some(number), Some(title), Some(state), Some(url), Some(body)) = (
                     pr_json.get("number").and_then(|n| n.as_u64()),
                     pr_json.get("title").and_then(|t| t.as_str()),
                     pr_json.get("state").and_then(|s| s.as_str()),
                     pr_json.get("url").and_then(|u| u.as_str()),
+                    pr_json.get("body").and_then(|b| b.as_str()),
                 ) {
                     prs.push(crate::data::PullRequest {
                         number,
                         title: title.to_string(),
                         state: state.to_string(),
                         url: url.to_string(),
+                        body: body.to_string(),
                     });
                 }
             }
