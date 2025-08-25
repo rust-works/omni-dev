@@ -266,7 +266,6 @@ impl InfoCommand {
             commits,
             branch_info: Some(BranchInfo {
                 branch: current_branch,
-                base_branch,
             }),
         };
 

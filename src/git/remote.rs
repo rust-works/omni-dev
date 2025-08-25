@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 pub struct RemoteInfo {
     /// Name of the remote (e.g., "origin", "upstream")
     pub name: String,
-    /// URL of the remote repository
-    pub url: String,
+    /// URI of the remote repository
+    pub uri: String,
     /// Detected main branch name for this remote
     pub main_branch: String,
 }
@@ -23,12 +23,12 @@ impl RemoteInfo {
 
         for name in remote_names.iter().flatten() {
             if let Ok(remote) = repo.find_remote(name) {
-                let url = remote.url().unwrap_or("").to_string();
+                let uri = remote.url().unwrap_or("").to_string();
                 let main_branch = Self::detect_main_branch(repo, name)?;
 
                 remotes.push(RemoteInfo {
                     name: name.to_string(),
-                    url,
+                    uri,
                     main_branch,
                 });
             }
@@ -48,6 +48,17 @@ impl RemoteInfo {
                     target.strip_prefix(&format!("refs/remotes/{}/", remote_name))
                 {
                     return Ok(branch_name.to_string());
+                }
+            }
+        }
+
+        // Try using GitHub CLI for GitHub repositories
+        if let Ok(remote) = repo.find_remote(remote_name) {
+            if let Some(uri) = remote.url() {
+                if uri.contains("github.com") {
+                    if let Ok(main_branch) = Self::get_github_default_branch(uri) {
+                        return Ok(main_branch);
+                    }
                 }
             }
         }
@@ -97,5 +108,63 @@ impl RemoteInfo {
 
         // If still no branch found, return "unknown"
         Ok("unknown".to_string())
+    }
+
+    /// Get the default branch from GitHub using gh CLI
+    fn get_github_default_branch(uri: &str) -> Result<String> {
+        use std::process::Command;
+
+        // Extract repository name from URI
+        let repo_name = Self::extract_github_repo_name(uri)?;
+
+        // Use gh CLI to get default branch
+        let output = Command::new("gh")
+            .args(&[
+                "repo",
+                "view",
+                &repo_name,
+                "--json",
+                "defaultBranchRef",
+                "--jq",
+                ".defaultBranchRef.name",
+            ])
+            .output();
+
+        match output {
+            Ok(output) if output.status.success() => {
+                let branch_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !branch_name.is_empty() && branch_name != "null" {
+                    Ok(branch_name)
+                } else {
+                    anyhow::bail!("GitHub CLI returned empty or null branch name")
+                }
+            }
+            _ => anyhow::bail!("Failed to get default branch from GitHub CLI"),
+        }
+    }
+
+    /// Extract GitHub repository name from URI
+    fn extract_github_repo_name(uri: &str) -> Result<String> {
+        // Handle both SSH and HTTPS GitHub URIs
+        let repo_name = if uri.starts_with("git@github.com:") {
+            // SSH format: git@github.com:owner/repo.git
+            uri.strip_prefix("git@github.com:")
+                .and_then(|s| s.strip_suffix(".git"))
+                .unwrap_or(uri.strip_prefix("git@github.com:").unwrap_or(uri))
+        } else if uri.contains("github.com") {
+            // HTTPS format: https://github.com/owner/repo.git
+            uri.split("github.com/")
+                .nth(1)
+                .and_then(|s| s.strip_suffix(".git"))
+                .unwrap_or(uri.split("github.com/").nth(1).unwrap_or(uri))
+        } else {
+            anyhow::bail!("Not a GitHub URI: {}", uri);
+        };
+
+        if repo_name.split('/').count() != 2 {
+            anyhow::bail!("Invalid GitHub repository format: {}", repo_name);
+        }
+
+        Ok(repo_name.to_string())
     }
 }
