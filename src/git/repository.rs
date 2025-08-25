@@ -54,6 +54,12 @@ impl GitRepository {
         for entry in statuses.iter() {
             if let Some(path) = entry.path() {
                 let status_flags = entry.status();
+
+                // Skip ignored files - they should not affect clean status
+                if status_flags.contains(Status::IGNORED) {
+                    continue;
+                }
+
                 let status_str = format_status_flags(status_flags);
 
                 untracked_changes.push(FileStatus {
