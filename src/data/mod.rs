@@ -66,8 +66,6 @@ pub struct FileStatusInfo {
 pub struct BranchInfo {
     /// Current branch name
     pub branch: String,
-    /// Base branch used for comparison
-    pub base_branch: String,
 }
 
 impl Default for FieldExplanation {
@@ -147,10 +145,6 @@ impl Default for FieldExplanation {
                 FieldDocumentation {
                     name: "branch_info.branch".to_string(),
                     text: "Current branch name (only present in branch commands)".to_string(),
-                },
-                FieldDocumentation {
-                    name: "branch_info.base_branch".to_string(),
-                    text: "Base branch used for comparison (only present in branch commands)".to_string(),
                 },
             ],
         }
