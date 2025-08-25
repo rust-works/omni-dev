@@ -1,4 +1,4 @@
-allowed-tools: [Bash(mkdir *), Read, Write, Edit, ".claude/commands/twiddle-msg *"]
+allowed-tools: [Bash(mkdir *), Read, Write, Edit, "omni-dev *"]
 argument-hint: [range]
 description: Twiddle git commit messages
 model: claude-sonnet-4
@@ -7,7 +7,7 @@ model: claude-sonnet-4
 Run this command:
 
 ```bash
-.claude/commands/twiddle-msg view $ARGUMENTS
+omni-dev git commit message view $ARGUMENTS
 ```
 
 # Step 2
@@ -36,5 +36,5 @@ amendments:                    # required, non-empty array
 Run this command:
 
 ```bash
-.claude/commands/twiddle-msg amend .ai/scratch/amendments-<random-hash>.yaml
+omni-dev git commit message amend .ai/scratch/amendments-<random-hash>.yaml
 ```
