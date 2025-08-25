@@ -309,7 +309,7 @@ impl InfoCommand {
 
         // Use gh CLI to get PRs for the branch
         let output = Command::new("gh")
-            .args(&[
+            .args([
                 "pr",
                 "list",
                 "--head",
