@@ -23,6 +23,9 @@ pub struct RepositoryView {
     /// Branch information (only present when using branch commands)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch_info: Option<BranchInfo>,
+    /// Pull request template content (only present in branch commands when template exists)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr_template: Option<String>,
 }
 
 /// Field explanation for the YAML output
@@ -145,6 +148,10 @@ impl Default for FieldExplanation {
                 FieldDocumentation {
                     name: "branch_info.branch".to_string(),
                     text: "Current branch name (only present in branch commands)".to_string(),
+                },
+                FieldDocumentation {
+                    name: "pr_template".to_string(),
+                    text: "Pull request template content from .github/pull_request_template.md (only present in branch commands when file exists)".to_string(),
                 },
             ],
         }
