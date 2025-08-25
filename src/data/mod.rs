@@ -85,6 +85,8 @@ pub struct PullRequest {
     pub state: String,
     /// PR URL
     pub url: String,
+    /// PR description/body content
+    pub body: String,
 }
 
 impl Default for FieldExplanation {
@@ -188,6 +190,10 @@ impl Default for FieldExplanation {
                 FieldDocumentation {
                     name: "branch_prs[].url".to_string(),
                     text: "Pull request URL".to_string(),
+                },
+                FieldDocumentation {
+                    name: "branch_prs[].body".to_string(),
+                    text: "Pull request description/body content".to_string(),
                 },
             ],
         }
