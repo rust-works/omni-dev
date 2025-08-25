@@ -160,6 +160,7 @@ impl ViewCommand {
             commits,
             branch_info: None,
             pr_template: None,
+            branch_prs: None,
         };
 
         // Output as YAML
@@ -262,6 +263,9 @@ impl InfoCommand {
         // Check for PR template
         let pr_template = Self::read_pr_template().ok();
 
+        // Get PRs for current branch
+        let branch_prs = Self::get_branch_prs(&current_branch).ok();
+
         // Build repository view with branch info
         let repo_view = RepositoryView {
             explanation: FieldExplanation::default(),
@@ -272,6 +276,7 @@ impl InfoCommand {
                 branch: current_branch,
             }),
             pr_template,
+            branch_prs,
         };
 
         // Output as YAML
@@ -293,5 +298,51 @@ impl InfoCommand {
         } else {
             anyhow::bail!("PR template file does not exist")
         }
+    }
+
+    /// Get pull requests for the current branch using gh CLI
+    fn get_branch_prs(branch_name: &str) -> Result<Vec<crate::data::PullRequest>> {
+        use std::process::Command;
+        use serde_json::Value;
+
+        // Use gh CLI to get PRs for the branch
+        let output = Command::new("gh")
+            .args(&[
+                "pr", "list", 
+                "--head", branch_name,
+                "--json", "number,title,state,url",
+                "--limit", "50"
+            ])
+            .output()
+            .context("Failed to execute gh command")?;
+
+        if !output.status.success() {
+            anyhow::bail!("gh command failed: {}", String::from_utf8_lossy(&output.stderr));
+        }
+
+        let json_str = String::from_utf8_lossy(&output.stdout);
+        let prs_json: Value = serde_json::from_str(&json_str)
+            .context("Failed to parse PR JSON from gh")?;
+
+        let mut prs = Vec::new();
+        if let Some(prs_array) = prs_json.as_array() {
+            for pr_json in prs_array {
+                if let (Some(number), Some(title), Some(state), Some(url)) = (
+                    pr_json.get("number").and_then(|n| n.as_u64()),
+                    pr_json.get("title").and_then(|t| t.as_str()),
+                    pr_json.get("state").and_then(|s| s.as_str()),
+                    pr_json.get("url").and_then(|u| u.as_str()),
+                ) {
+                    prs.push(crate::data::PullRequest {
+                        number,
+                        title: title.to_string(),
+                        state: state.to_string(),
+                        url: url.to_string(),
+                    });
+                }
+            }
+        }
+
+        Ok(prs)
     }
 }
