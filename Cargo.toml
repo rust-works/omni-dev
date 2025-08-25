@@ -22,8 +22,10 @@ serde_json = "1.0"
 termcolor = "1.1"
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
+tempfile = "3.0"
 
 [dev-dependencies]
+tempfile = "3.0"
 
 [lib]
 name = "omni_dev"

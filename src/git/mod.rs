@@ -3,10 +3,12 @@
 use anyhow::{Context, Result};
 use git2::Repository;
 
+pub mod amendment;
 pub mod commit;
 pub mod remote;
 pub mod repository;
 
+pub use amendment::AmendmentHandler;
 pub use commit::{CommitAnalysis, CommitInfo};
 pub use remote::RemoteInfo;
 pub use repository::GitRepository;

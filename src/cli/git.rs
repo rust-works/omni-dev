@@ -145,10 +145,17 @@ impl ViewCommand {
 impl AmendCommand {
     /// Execute amend command
     pub fn execute(self) -> Result<()> {
-        println!("Executing amend command with file: {}", self.yaml_file);
+        use crate::git::AmendmentHandler;
 
-        // TODO: Implement commit amendment
-        // This will be implemented in Phase 4
+        println!("🔄 Starting commit amendment process...");
+        println!("📄 Loading amendments from: {}", self.yaml_file);
+
+        // Create amendment handler and apply amendments
+        let handler = AmendmentHandler::new().context("Failed to initialize amendment handler")?;
+
+        handler
+            .apply_amendments(&self.yaml_file)
+            .context("Failed to apply amendments")?;
 
         Ok(())
     }
