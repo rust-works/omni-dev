@@ -58,9 +58,9 @@ pub struct FileStatusInfo {
     pub file: String,
 }
 
-impl FieldExplanation {
+impl Default for FieldExplanation {
     /// Create default field explanation
-    pub fn default() -> Self {
+    fn default() -> Self {
         Self {
             text: "Field documentation for the YAML output format. Each entry describes the purpose and content of fields returned by the view command.".to_string(),
             fields: vec![

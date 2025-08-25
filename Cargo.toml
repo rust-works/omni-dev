@@ -4,13 +4,13 @@ version = "0.1.0"
 edition = "2021"
 authors = ["John Ky <newhoggy@gmail.com>"]
 license = "BSD-3-Clause"
-description = "A comprehensive development toolkit"
+description = "A powerful Git commit message analysis and amendment toolkit"
 repository = "https://github.com/rust-works/omni-dev"
 homepage = "https://github.com/rust-works/omni-dev"
 documentation = "https://docs.rs/omni-dev"
 readme = "README.md"
-keywords = ["development", "tools", "productivity"]
-categories = ["development-tools"]
+keywords = ["git", "commit", "conventional-commits", "development", "cli"]
+categories = ["development-tools", "command-line-utilities"]
 rust-version = "1.70.0"
 
 [dependencies]

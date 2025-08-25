@@ -5,14 +5,16 @@
 [![Build Status](https://github.com/rust-works/omni-dev/workflows/CI/badge.svg)](https://github.com/rust-works/omni-dev/actions)
 [![License: BSD-3-Clause](https://img.shields.io/badge/License-BSD%203--Clause-blue.svg)](LICENSE)
 
-A comprehensive development toolkit written in Rust.
+A powerful Git commit message analysis and amendment toolkit written in Rust.
 
 ## Features
 
-- 🚀 Fast and efficient development tools
-- 🔧 Extensible architecture
-- 📦 Easy to install and use
-- 🛡️ Memory safe and reliable
+- 🔍 **Commit Analysis**: Comprehensive analysis of git commits with YAML output
+- ✏️ **Smart Amendment**: Amend single or multiple commit messages safely
+- 🎯 **Conventional Commits**: Automatic detection and suggestions for conventional commit format
+- 🛡️ **Safety First**: Working directory validation and error recovery
+- 📊 **Rich Information**: File changes, diff summaries, and remote branch tracking
+- ⚡ **Fast & Reliable**: Built with Rust for memory safety and performance
 
 ## Installation
 
@@ -35,33 +37,62 @@ cargo build --release
 ### Command Line Interface
 
 ```bash
-# Run omni-dev
+# View and analyze commits
+omni-dev git commit message view HEAD~3..HEAD
+
+# Amend commit messages from a YAML file
+omni-dev git commit message amend amendments.yaml
+
+# Get help
 omni-dev --help
 ```
 
-### As a Library
+### Viewing Commits
 
-Add this to your `Cargo.toml`:
+Analyze commits in a range and get comprehensive information:
 
-```toml
-[dependencies]
-omni-dev = "0.1.0"
+```bash
+# Analyze recent commits
+omni-dev git commit message view HEAD~5..HEAD
+
+# Analyze commits since main branch
+omni-dev git commit message view origin/main..HEAD
 ```
 
-Then use it in your Rust code:
+This outputs detailed YAML with:
+- Commit metadata (hash, author, date)
+- File changes and diff statistics
+- Conventional commit type detection
+- Proposed commit message improvements
+- Remote branch tracking information
 
-```rust
-use omni_dev::*;
+### Amending Commits
 
-fn main() {
-    // Your code here
-    println!("Hello from omni-dev!");
-}
+Create a YAML file with your desired commit message changes:
+
+```yaml
+amendments:
+  - commit: "abc123def456..."
+    message: |
+      feat: add user authentication system
+      
+      Implement OAuth 2.0 authentication with JWT tokens:
+      - Add login and logout endpoints  
+      - Implement token validation middleware
+      - Add user session management
 ```
 
-## Examples
+Then apply the amendments:
 
-Check out the [examples](examples/) directory for more usage examples.
+```bash
+omni-dev git commit message amend amendments.yaml
+```
+
+The tool safely handles:
+- Single HEAD commit amendments
+- Multi-commit amendments via interactive rebase
+- Working directory safety checks
+- Automatic error recovery
 
 ## Contributing
 
@@ -103,8 +134,8 @@ We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.
 ## Documentation
 
 - [API Documentation](https://docs.rs/omni-dev)
-- [User Guide](docs/guide.md)
-- [Examples](examples/)
+- [Project Plan](docs/plan/project.md)
+- [Field Documentation](docs/plan/project.md) - Complete specification of YAML output fields
 
 ## Changelog
 
