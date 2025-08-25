@@ -264,7 +264,9 @@ impl InfoCommand {
         let pr_template = Self::read_pr_template().ok();
 
         // Get PRs for current branch
-        let branch_prs = Self::get_branch_prs(&current_branch).ok();
+        let branch_prs = Self::get_branch_prs(&current_branch)
+            .ok()
+            .filter(|prs| !prs.is_empty());
 
         // Build repository view with branch info
         let repo_view = RepositoryView {
@@ -302,27 +304,34 @@ impl InfoCommand {
 
     /// Get pull requests for the current branch using gh CLI
     fn get_branch_prs(branch_name: &str) -> Result<Vec<crate::data::PullRequest>> {
-        use std::process::Command;
         use serde_json::Value;
+        use std::process::Command;
 
         // Use gh CLI to get PRs for the branch
         let output = Command::new("gh")
             .args(&[
-                "pr", "list", 
-                "--head", branch_name,
-                "--json", "number,title,state,url",
-                "--limit", "50"
+                "pr",
+                "list",
+                "--head",
+                branch_name,
+                "--json",
+                "number,title,state,url",
+                "--limit",
+                "50",
             ])
             .output()
             .context("Failed to execute gh command")?;
 
         if !output.status.success() {
-            anyhow::bail!("gh command failed: {}", String::from_utf8_lossy(&output.stderr));
+            anyhow::bail!(
+                "gh command failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
 
         let json_str = String::from_utf8_lossy(&output.stdout);
-        let prs_json: Value = serde_json::from_str(&json_str)
-            .context("Failed to parse PR JSON from gh")?;
+        let prs_json: Value =
+            serde_json::from_str(&json_str).context("Failed to parse PR JSON from gh")?;
 
         let mut prs = Vec::new();
         if let Some(prs_array) = prs_json.as_array() {
