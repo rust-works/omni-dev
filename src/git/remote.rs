@@ -119,7 +119,7 @@ impl RemoteInfo {
 
         // Use gh CLI to get default branch
         let output = Command::new("gh")
-            .args(&[
+            .args([
                 "repo",
                 "view",
                 &repo_name,
