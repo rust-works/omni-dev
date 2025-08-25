@@ -159,6 +159,7 @@ impl ViewCommand {
             remotes,
             commits,
             branch_info: None,
+            pr_template: None,
         };
 
         // Output as YAML
@@ -258,6 +259,9 @@ impl InfoCommand {
         // Parse commit range and get commits
         let commits = repo.get_commits_in_range(&commit_range)?;
 
+        // Check for PR template
+        let pr_template = Self::read_pr_template().ok();
+
         // Build repository view with branch info
         let repo_view = RepositoryView {
             explanation: FieldExplanation::default(),
@@ -267,6 +271,7 @@ impl InfoCommand {
             branch_info: Some(BranchInfo {
                 branch: current_branch,
             }),
+            pr_template,
         };
 
         // Output as YAML
@@ -274,5 +279,19 @@ impl InfoCommand {
         println!("{}", yaml_output);
 
         Ok(())
+    }
+
+    /// Read PR template file if it exists
+    fn read_pr_template() -> Result<String> {
+        use std::fs;
+        use std::path::Path;
+
+        let template_path = Path::new(".github/pull_request_template.md");
+        if template_path.exists() {
+            fs::read_to_string(template_path)
+                .context("Failed to read .github/pull_request_template.md")
+        } else {
+            anyhow::bail!("PR template file does not exist")
+        }
     }
 }
