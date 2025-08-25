@@ -26,6 +26,9 @@ pub struct RepositoryView {
     /// Pull request template content (only present in branch commands when template exists)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_template: Option<String>,
+    /// Pull requests created from the current branch (only present in branch commands)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_prs: Option<Vec<PullRequest>>,
 }
 
 /// Field explanation for the YAML output
@@ -69,6 +72,19 @@ pub struct FileStatusInfo {
 pub struct BranchInfo {
     /// Current branch name
     pub branch: String,
+}
+
+/// Pull request information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullRequest {
+    /// PR number
+    pub number: u64,
+    /// PR title
+    pub title: String,
+    /// PR state (open, closed, merged)
+    pub state: String,
+    /// PR URL
+    pub url: String,
 }
 
 impl Default for FieldExplanation {
@@ -152,6 +168,26 @@ impl Default for FieldExplanation {
                 FieldDocumentation {
                     name: "pr_template".to_string(),
                     text: "Pull request template content from .github/pull_request_template.md (only present in branch commands when file exists)".to_string(),
+                },
+                FieldDocumentation {
+                    name: "branch_prs".to_string(),
+                    text: "Pull requests created from the current branch (only present in branch commands)".to_string(),
+                },
+                FieldDocumentation {
+                    name: "branch_prs[].number".to_string(),
+                    text: "Pull request number".to_string(),
+                },
+                FieldDocumentation {
+                    name: "branch_prs[].title".to_string(),
+                    text: "Pull request title".to_string(),
+                },
+                FieldDocumentation {
+                    name: "branch_prs[].state".to_string(),
+                    text: "Pull request state (open, closed, merged)".to_string(),
+                },
+                FieldDocumentation {
+                    name: "branch_prs[].url".to_string(),
+                    text: "Pull request URL".to_string(),
                 },
             ],
         }
