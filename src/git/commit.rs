@@ -35,6 +35,8 @@ pub struct CommitAnalysis {
     pub file_changes: FileChanges,
     /// Git diff --stat output showing lines changed per file
     pub diff_summary: String,
+    /// Full diff content showing line-by-line changes
+    pub diff_content: String,
 }
 
 /// File changes statistics
@@ -116,12 +118,16 @@ impl CommitAnalysis {
         // Get diff summary
         let diff_summary = Self::get_diff_summary(repo, commit)?;
 
+        // Get full diff content
+        let diff_content = Self::get_diff_content(repo, commit)?;
+
         Ok(Self {
             detected_type,
             detected_scope,
             proposed_message,
             file_changes,
             diff_summary,
+            diff_content,
         })
     }
 
@@ -412,5 +418,55 @@ impl CommitAnalysis {
         }
 
         Ok(summary)
+    }
+
+    /// Get full diff content for the commit
+    fn get_diff_content(repo: &Repository, commit: &Commit) -> Result<String> {
+        let commit_tree = commit.tree().context("Failed to get commit tree")?;
+
+        let parent_tree = if commit.parent_count() > 0 {
+            Some(
+                commit
+                    .parent(0)
+                    .context("Failed to get parent commit")?
+                    .tree()
+                    .context("Failed to get parent tree")?,
+            )
+        } else {
+            None
+        };
+
+        let diff = if let Some(parent_tree) = parent_tree {
+            repo.diff_tree_to_tree(Some(&parent_tree), Some(&commit_tree), None)
+                .context("Failed to create diff")?
+        } else {
+            repo.diff_tree_to_tree(None, Some(&commit_tree), None)
+                .context("Failed to create diff for initial commit")?
+        };
+
+        let mut diff_content = String::new();
+
+        diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
+            let content = std::str::from_utf8(line.content()).unwrap_or("<binary>");
+            let prefix = match line.origin() {
+                '+' => "+",
+                '-' => "-",
+                ' ' => " ",
+                '@' => "@",
+                'H' => "", // Header
+                'F' => "", // File header
+                _ => "",
+            };
+            diff_content.push_str(&format!("{}{}", prefix, content));
+            true
+        })
+        .context("Failed to format diff")?;
+
+        // Ensure the diff content ends with a newline to encourage literal block style
+        if !diff_content.ends_with('\n') {
+            diff_content.push('\n');
+        }
+
+        Ok(diff_content)
     }
 }
