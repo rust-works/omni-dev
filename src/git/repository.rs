@@ -92,6 +92,47 @@ impl GitRepository {
         &self.repo
     }
 
+    /// Get current branch name
+    pub fn get_current_branch(&self) -> Result<String> {
+        let head = self.repo.head().context("Failed to get HEAD reference")?;
+
+        if let Some(name) = head.shorthand() {
+            if name != "HEAD" {
+                return Ok(name.to_string());
+            }
+        }
+
+        anyhow::bail!("Repository is in detached HEAD state")
+    }
+
+    /// Check if a branch exists
+    pub fn branch_exists(&self, branch_name: &str) -> Result<bool> {
+        // Check if it exists as a local branch
+        if self
+            .repo
+            .find_branch(branch_name, git2::BranchType::Local)
+            .is_ok()
+        {
+            return Ok(true);
+        }
+
+        // Check if it exists as a remote branch
+        if self
+            .repo
+            .find_branch(branch_name, git2::BranchType::Remote)
+            .is_ok()
+        {
+            return Ok(true);
+        }
+
+        // Check if we can resolve it as a reference
+        if self.repo.revparse_single(branch_name).is_ok() {
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
     /// Parse commit range and get commits
     pub fn get_commits_in_range(&self, range: &str) -> Result<Vec<CommitInfo>> {
         let mut commits = Vec::new();

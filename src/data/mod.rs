@@ -20,6 +20,9 @@ pub struct RepositoryView {
     pub remotes: Vec<RemoteInfo>,
     /// List of analyzed commits with metadata and analysis
     pub commits: Vec<CommitInfo>,
+    /// Branch information (only present when using branch commands)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_info: Option<BranchInfo>,
 }
 
 /// Field explanation for the YAML output
@@ -56,6 +59,15 @@ pub struct FileStatusInfo {
     pub status: String,
     /// Path to the file relative to repository root
     pub file: String,
+}
+
+/// Branch information for branch-specific commands
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BranchInfo {
+    /// Current branch name
+    pub branch: String,
+    /// Base branch used for comparison
+    pub base_branch: String,
 }
 
 impl Default for FieldExplanation {
@@ -131,6 +143,14 @@ impl Default for FieldExplanation {
                 FieldDocumentation {
                     name: "commits[].analysis.diff_content".to_string(),
                     text: "Full diff content showing line-by-line changes with added, removed, and context lines".to_string(),
+                },
+                FieldDocumentation {
+                    name: "branch_info.branch".to_string(),
+                    text: "Current branch name (only present in branch commands)".to_string(),
+                },
+                FieldDocumentation {
+                    name: "branch_info.base_branch".to_string(),
+                    text: "Base branch used for comparison (only present in branch commands)".to_string(),
                 },
             ],
         }
