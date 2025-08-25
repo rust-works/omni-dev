@@ -128,6 +128,10 @@ impl Default for FieldExplanation {
                     name: "commits[].analysis.diff_summary".to_string(),
                     text: "Git diff --stat output showing lines changed per file".to_string(),
                 },
+                FieldDocumentation {
+                    name: "commits[].analysis.diff_content".to_string(),
+                    text: "Full diff content showing line-by-line changes with added, removed, and context lines".to_string(),
+                },
             ],
         }
     }
