@@ -52,13 +52,32 @@ impl RemoteInfo {
             }
         }
 
-        // Fallback to checking common branch names
+        // Fallback to checking common branch names, preferring origin remote
         let common_branches = ["main", "master", "develop"];
 
-        for branch_name in &common_branches {
-            let reference_name = format!("refs/remotes/{}/{}", remote_name, branch_name);
-            if repo.find_reference(&reference_name).is_ok() {
-                return Ok(branch_name.to_string());
+        // First, check if this is the origin remote or if origin remote branches exist
+        if remote_name == "origin" {
+            for branch_name in &common_branches {
+                let reference_name = format!("refs/remotes/origin/{}", branch_name);
+                if repo.find_reference(&reference_name).is_ok() {
+                    return Ok(branch_name.to_string());
+                }
+            }
+        } else {
+            // For non-origin remotes, first check if origin has these branches
+            for branch_name in &common_branches {
+                let origin_reference = format!("refs/remotes/origin/{}", branch_name);
+                if repo.find_reference(&origin_reference).is_ok() {
+                    return Ok(branch_name.to_string());
+                }
+            }
+
+            // Then check the actual remote
+            for branch_name in &common_branches {
+                let reference_name = format!("refs/remotes/{}/{}", remote_name, branch_name);
+                if repo.find_reference(&reference_name).is_ok() {
+                    return Ok(branch_name.to_string());
+                }
             }
         }
 
