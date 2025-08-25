@@ -7,7 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2025-08-26
+
 ### Added
+- **Git Branch Analysis**: New `omni-dev git branch info` command for comprehensive branch analysis
+  - Branch-aware commit analysis with automatic range calculation
+  - Current branch detection and validation
+  - Base branch comparison (defaults to main/master)
+  - Enhanced YAML output including branch context
+- **GitHub Integration**: GitHub CLI integration for enhanced functionality
+  - Accurate main branch detection using GitHub API
+  - Pull request information retrieval and display
+  - PR template support with conditional YAML output
+  - GitHub repository URI parsing and validation
 - **Git Commit Analysis**: Comprehensive commit analysis with YAML output
   - Commit metadata extraction (hash, author, date)
   - File change analysis and diff statistics
@@ -27,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CLI Interface**: Full-featured command-line interface
   - `omni-dev git commit message view [range]` - Analyze and view commits
   - `omni-dev git commit message amend <yaml-file>` - Amend commit messages
+  - `omni-dev git branch info [base-branch]` - Analyze branch commits
   - Rich help system and error reporting
 - **Testing Infrastructure**: Comprehensive test suite
   - Integration tests with temporary git repositories
@@ -38,10 +51,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Complete rewrite of core functionality to focus on git commit operations
 - Updated CLI interface to provide git-specific commands
 - Enhanced error handling with detailed context and recovery options
+- Remote information now uses `uri` field instead of `url` for consistency
 
 ### Fixed
-- Working directory safety checks now properly ignore build artifacts and ignored files
+- Working directory safety checks now properly ignore git-ignored files
 - Multi-commit amendment reliability improved with individual rebase strategy
+- Clippy linting warnings resolved (needless_borrows_for_generic_args)
 - Compilation warnings eliminated through dead code cleanup
 
 ## [0.1.0] - 2024-08-24
@@ -57,5 +72,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation and community files (README, CONTRIBUTING, CODE_OF_CONDUCT)
 - BSD 3-Clause license
 
-[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/rust-works/omni-dev/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rust-works/omni-dev/releases/tag/v0.1.0
