@@ -13,9 +13,7 @@
 //! ```rust
 //! use omni_dev::*;
 //!
-//! fn main() {
-//!     println!("Hello from omni-dev!");
-//! }
+//! println!("Hello from omni-dev!");
 //! ```
 
 #![warn(missing_docs)]

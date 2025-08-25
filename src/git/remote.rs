@@ -21,18 +21,16 @@ impl RemoteInfo {
         let mut remotes = Vec::new();
         let remote_names = repo.remotes().context("Failed to get remote names")?;
 
-        for remote_name in remote_names.iter() {
-            if let Some(name) = remote_name {
-                if let Ok(remote) = repo.find_remote(name) {
-                    let url = remote.url().unwrap_or("").to_string();
-                    let main_branch = Self::detect_main_branch(repo, name)?;
+        for name in remote_names.iter().flatten() {
+            if let Ok(remote) = repo.find_remote(name) {
+                let url = remote.url().unwrap_or("").to_string();
+                let main_branch = Self::detect_main_branch(repo, name)?;
 
-                    remotes.push(RemoteInfo {
-                        name: name.to_string(),
-                        url,
-                        main_branch,
-                    });
-                }
+                remotes.push(RemoteInfo {
+                    name: name.to_string(),
+                    url,
+                    main_branch,
+                });
             }
         }
 

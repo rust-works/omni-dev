@@ -8,20 +8,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Initial project setup
-- Basic CLI interface
-- Core library structure
-- Utility functions and error handling
+- **Git Commit Analysis**: Comprehensive commit analysis with YAML output
+  - Commit metadata extraction (hash, author, date)
+  - File change analysis and diff statistics
+  - Conventional commit type detection
+  - Remote branch tracking and main branch detection
+  - Working directory status reporting
+- **Commit Message Amendment**: Safe and reliable commit message modification
+  - HEAD commit amendment using `git commit --amend`
+  - Multi-commit amendment via individual interactive rebases
+  - Shell-script-inspired strategy for reliable rebase operations
+  - YAML-based amendment file format with validation
+- **Safety Features**: Comprehensive safety checks and error handling
+  - Working directory cleanliness validation (ignoring build artifacts)
+  - Commit existence and accessibility validation
+  - Automatic rebase abort and error recovery
+  - Prevention of amendments to potentially problematic commits
+- **CLI Interface**: Full-featured command-line interface
+  - `omni-dev git commit message view [range]` - Analyze and view commits
+  - `omni-dev git commit message amend <yaml-file>` - Amend commit messages
+  - Rich help system and error reporting
+- **Testing Infrastructure**: Comprehensive test suite
+  - Integration tests with temporary git repositories
+  - Amendment functionality validation
+  - YAML parsing and validation tests
+  - Error handling and edge case testing
 
 ### Changed
-
-### Deprecated
-
-### Removed
+- Complete rewrite of core functionality to focus on git commit operations
+- Updated CLI interface to provide git-specific commands
+- Enhanced error handling with detailed context and recovery options
 
 ### Fixed
-
-### Security
+- Working directory safety checks now properly ignore build artifacts and ignored files
+- Multi-commit amendment reliability improved with individual rebase strategy
+- Compilation warnings eliminated through dead code cleanup
 
 ## [0.1.0] - 2024-08-24
 

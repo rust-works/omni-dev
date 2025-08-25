@@ -138,7 +138,7 @@ impl AmendmentHandler {
 
         // Use the simpler approach: git commit --amend
         let output = Command::new("git")
-            .args(&["commit", "--amend", "--message", new_message])
+            .args(["commit", "--amend", "--message", new_message])
             .output()
             .context("Failed to execute git commit --amend")?;
 
@@ -152,8 +152,8 @@ impl AmendmentHandler {
 
         println!(
             "✅ Amended HEAD commit {} -> {}",
-            head_commit.id().to_string()[..8].to_string(),
-            new_head.id().to_string()[..8].to_string()
+            &head_commit.id().to_string()[..8],
+            &new_head.id().to_string()[..8]
         );
 
         Ok(())
@@ -190,7 +190,6 @@ impl AmendmentHandler {
         Ok(())
     }
 
-
     /// Amend a single commit using individual interactive rebase (shell script strategy)
     fn amend_single_commit_via_rebase(&self, commit_hash: &str, new_message: &str) -> Result<()> {
         // Get the parent of the target commit to use as rebase base
@@ -203,7 +202,7 @@ impl AmendmentHandler {
         // Generate rebase sequence: edit the target commit, pick the rest
         let mut sequence_content = String::new();
         let commit_list_output = Command::new("git")
-            .args(&["rev-list", "--reverse", &format!("{}..HEAD", base_commit)])
+            .args(["rev-list", "--reverse", &format!("{}..HEAD", base_commit)])
             .output()
             .context("Failed to get commit list for rebase")?;
 
@@ -220,7 +219,7 @@ impl AmendmentHandler {
 
             // Get short commit message for the sequence file
             let subject_output = Command::new("git")
-                .args(&["log", "--format=%s", "-n", "1", commit])
+                .args(["log", "--format=%s", "-n", "1", commit])
                 .output()
                 .context("Failed to get commit subject")?;
 
@@ -247,7 +246,7 @@ impl AmendmentHandler {
 
         // Execute rebase with custom sequence editor
         let rebase_result = Command::new("git")
-            .args(&["rebase", "-i", &base_commit])
+            .args(["rebase", "-i", &base_commit])
             .env(
                 "GIT_SEQUENCE_EDITOR",
                 format!("cp {}", sequence_file.display()),
@@ -260,7 +259,7 @@ impl AmendmentHandler {
             let error_msg = String::from_utf8_lossy(&rebase_result.stderr);
 
             // Try to abort the rebase if it failed
-            let _ = Command::new("git").args(&["rebase", "--abort"]).output();
+            let _ = Command::new("git").args(["rebase", "--abort"]).output();
 
             anyhow::bail!("Interactive rebase failed: {}", error_msg);
         }
@@ -270,7 +269,7 @@ impl AmendmentHandler {
         if repo_state == git2::RepositoryState::RebaseInteractive {
             // We should be stopped at the target commit - amend it
             let current_commit_output = Command::new("git")
-                .args(&["rev-parse", "HEAD"])
+                .args(["rev-parse", "HEAD"])
                 .output()
                 .context("Failed to get current commit during rebase")?;
 
@@ -283,13 +282,13 @@ impl AmendmentHandler {
             {
                 // Amend with new message
                 let amend_result = Command::new("git")
-                    .args(&["commit", "--amend", "-m", new_message])
+                    .args(["commit", "--amend", "-m", new_message])
                     .output()
                     .context("Failed to amend commit during rebase")?;
 
                 if !amend_result.status.success() {
                     let error_msg = String::from_utf8_lossy(&amend_result.stderr);
-                    let _ = Command::new("git").args(&["rebase", "--abort"]).output();
+                    let _ = Command::new("git").args(["rebase", "--abort"]).output();
                     anyhow::bail!("Failed to amend commit: {}", error_msg);
                 }
 
@@ -297,19 +296,19 @@ impl AmendmentHandler {
 
                 // Continue the rebase
                 let continue_result = Command::new("git")
-                    .args(&["rebase", "--continue"])
+                    .args(["rebase", "--continue"])
                     .output()
                     .context("Failed to continue rebase")?;
 
                 if !continue_result.status.success() {
                     let error_msg = String::from_utf8_lossy(&continue_result.stderr);
-                    let _ = Command::new("git").args(&["rebase", "--abort"]).output();
+                    let _ = Command::new("git").args(["rebase", "--abort"]).output();
                     anyhow::bail!("Failed to continue rebase: {}", error_msg);
                 }
 
                 println!("✅ Rebase completed successfully");
             } else {
-                let _ = Command::new("git").args(&["rebase", "--abort"]).output();
+                let _ = Command::new("git").args(["rebase", "--abort"]).output();
                 anyhow::bail!(
                     "Unexpected commit during rebase. Expected {}, got {}",
                     &commit_hash[..8],
@@ -325,7 +324,6 @@ impl AmendmentHandler {
 
         Ok(())
     }
-
 
     /// Check if working directory is clean (uses the repository instance)
     fn check_working_directory_clean(&self) -> Result<()> {
