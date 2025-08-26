@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2025-08-26
+
+### Added
+- **Field Presence Tracking**: Enhanced YAML output with explicit field presence indicators
+  - Added `present: bool` field to `FieldDocumentation` struct for AI assistant guidance
+  - Implemented `update_field_presence()` method on `RepositoryView` to dynamically track available fields
+  - Added comprehensive AI assistant guidance in field explanation text
+  - Included git command mappings for better field documentation
+- **Enhanced Command Structure**: Reorganized Claude command files with improved analysis instructions
+  - Added commit-twiddle commands for debug, release, and standard modes
+  - Added pr-create commands with enhanced PR workflow decision guidance
+  - Standardized command structure across all variants with detailed field checking instructions
+
+### Changed
+- **Data Structure Improvements**: Reordered RepositoryView fields to place commits last for better readability
+  - Summary fields (explanation, working_directory, remotes, branch_info, pr_template, branch_prs) now appear before detailed commit analysis
+  - Improved YAML output organization and user experience
+
+### Fixed
+- **Code Quality**: Resolved clippy warnings for better code quality
+  - Replaced deprecated `map_or(false, |prs| !prs.is_empty())` patterns with `is_some_and(|prs| !prs.is_empty())`
+  - Maintained proper borrowing semantics with `.as_ref()` calls
+
 ## [0.2.0] - 2025-08-26
 
 ### Added
@@ -72,6 +95,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation and community files (README, CONTRIBUTING, CODE_OF_CONDUCT)
 - BSD 3-Clause license
 
-[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/rust-works/omni-dev/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rust-works/omni-dev/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rust-works/omni-dev/releases/tag/v0.1.0
