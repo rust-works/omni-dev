@@ -12,6 +12,9 @@ pub use yaml::*;
 /// Complete repository view output structure
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RepositoryView {
+    /// Version information for the omni-dev tool
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub versions: Option<VersionInfo>,
     /// Explanation of field meanings and structure
     pub explanation: FieldExplanation,
     /// Working directory status information
@@ -72,6 +75,13 @@ pub struct FileStatusInfo {
     pub file: String,
 }
 
+/// Version information for tools and environment
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VersionInfo {
+    /// Version of the omni-dev tool
+    pub omni_dev: String,
+}
+
 /// Branch information for branch-specific commands
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BranchInfo {
@@ -116,6 +126,7 @@ impl RepositoryView {
                 "commits[].analysis.file_changes.file_list" => !self.commits.is_empty(),
                 "commits[].analysis.diff_summary" => !self.commits.is_empty(),
                 "commits[].analysis.diff_content" => !self.commits.is_empty(),
+                "versions.omni_dev" => self.versions.is_some(),
                 "branch_info.branch" => self.branch_info.is_some(),
                 "pr_template" => self.pr_template.is_some(),
                 "branch_prs" => self.branch_prs.is_some(),
@@ -248,6 +259,12 @@ impl Default for FieldExplanation {
                     name: "commits[].analysis.diff_content".to_string(),
                     text: "Full diff content showing line-by-line changes with added, removed, and context lines".to_string(),
                     command: Some("git show <commit>".to_string()),
+                    present: false,
+                },
+                FieldDocumentation {
+                    name: "versions.omni_dev".to_string(),
+                    text: "Version of the omni-dev tool".to_string(),
+                    command: Some("omni-dev --version".to_string()),
                     present: false,
                 },
                 FieldDocumentation {
