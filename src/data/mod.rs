@@ -18,8 +18,6 @@ pub struct RepositoryView {
     pub working_directory: WorkingDirectoryInfo,
     /// List of remote repositories and their main branches
     pub remotes: Vec<RemoteInfo>,
-    /// List of analyzed commits with metadata and analysis
-    pub commits: Vec<CommitInfo>,
     /// Branch information (only present when using branch commands)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch_info: Option<BranchInfo>,
@@ -29,6 +27,8 @@ pub struct RepositoryView {
     /// Pull requests created from the current branch (only present in branch commands)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch_prs: Option<Vec<PullRequest>>,
+    /// List of analyzed commits with metadata and analysis
+    pub commits: Vec<CommitInfo>,
 }
 
 /// Field explanation for the YAML output
@@ -47,6 +47,11 @@ pub struct FieldDocumentation {
     pub name: String,
     /// Descriptive text explaining what the field contains
     pub text: String,
+    /// Git command that corresponds to this field (if applicable)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Whether this field is present in the current output
+    pub present: bool,
 }
 
 /// Working directory information
@@ -89,111 +94,209 @@ pub struct PullRequest {
     pub body: String,
 }
 
+impl RepositoryView {
+    /// Update the present field for all field documentation entries based on actual data
+    pub fn update_field_presence(&mut self) {
+        for field in &mut self.explanation.fields {
+            field.present = match field.name.as_str() {
+                "working_directory.clean" => true,             // Always present
+                "working_directory.untracked_changes" => true, // Always present
+                "remotes" => true,                             // Always present
+                "commits[].hash" => !self.commits.is_empty(),
+                "commits[].author" => !self.commits.is_empty(),
+                "commits[].date" => !self.commits.is_empty(),
+                "commits[].original_message" => !self.commits.is_empty(),
+                "commits[].in_main_branches" => !self.commits.is_empty(),
+                "commits[].analysis.detected_type" => !self.commits.is_empty(),
+                "commits[].analysis.detected_scope" => !self.commits.is_empty(),
+                "commits[].analysis.proposed_message" => !self.commits.is_empty(),
+                "commits[].analysis.file_changes.total_files" => !self.commits.is_empty(),
+                "commits[].analysis.file_changes.files_added" => !self.commits.is_empty(),
+                "commits[].analysis.file_changes.files_deleted" => !self.commits.is_empty(),
+                "commits[].analysis.file_changes.file_list" => !self.commits.is_empty(),
+                "commits[].analysis.diff_summary" => !self.commits.is_empty(),
+                "commits[].analysis.diff_content" => !self.commits.is_empty(),
+                "branch_info.branch" => self.branch_info.is_some(),
+                "pr_template" => self.pr_template.is_some(),
+                "branch_prs" => self.branch_prs.is_some(),
+                "branch_prs[].number" => {
+                    self.branch_prs.as_ref().is_some_and(|prs| !prs.is_empty())
+                }
+                "branch_prs[].title" => self.branch_prs.as_ref().is_some_and(|prs| !prs.is_empty()),
+                "branch_prs[].state" => self.branch_prs.as_ref().is_some_and(|prs| !prs.is_empty()),
+                "branch_prs[].url" => self.branch_prs.as_ref().is_some_and(|prs| !prs.is_empty()),
+                "branch_prs[].body" => self.branch_prs.as_ref().is_some_and(|prs| !prs.is_empty()),
+                _ => false, // Unknown fields are not present
+            }
+        }
+    }
+}
+
 impl Default for FieldExplanation {
     /// Create default field explanation
     fn default() -> Self {
         Self {
-            text: "Field documentation for the YAML output format. Each entry describes the purpose and content of fields returned by the view command.".to_string(),
+            text: [
+                "Field documentation for the YAML output format. Each entry describes the purpose and content of fields returned by the view command.",
+                "",
+                "Field structure:",
+                "- name: Specifies the YAML field path",
+                "- text: Provides a description of what the field contains",
+                "- command: Shows the corresponding command used to obtain that data (if applicable)",
+                "- present: Indicates whether this field is present in the current output",
+                "",
+                "IMPORTANT FOR AI ASSISTANTS: If a field shows present=true, it is guaranteed to be somewhere in this document. AI assistants should search the entire document thoroughly for any field marked as present=true, as it is definitely included in the output."
+            ].join("\n"),
             fields: vec![
                 FieldDocumentation {
                     name: "working_directory.clean".to_string(),
                     text: "Boolean indicating if the working directory has no uncommitted changes".to_string(),
+                    command: Some("git status".to_string()),
+                    present: false, // Will be set dynamically when creating output
                 },
                 FieldDocumentation {
                     name: "working_directory.untracked_changes".to_string(),
                     text: "Array of files with uncommitted changes, showing git status and file path".to_string(),
+                    command: Some("git status --porcelain".to_string()),
+                    present: false,
                 },
                 FieldDocumentation {
                     name: "remotes".to_string(),
                     text: "Array of git remotes with their URLs and detected main branch names".to_string(),
+                    command: Some("git remote -v".to_string()),
+                    present: false,
                 },
                 FieldDocumentation {
                     name: "commits[].hash".to_string(),
                     text: "Full SHA-1 hash of the commit".to_string(),
+                    command: Some("git log --format=%H".to_string()),
+                    present: false,
                 },
                 FieldDocumentation {
                     name: "commits[].author".to_string(),
                     text: "Commit author name and email address".to_string(),
+                    command: Some("git log --format=%an <%ae>".to_string()),
+                    present: false,
                 },
                 FieldDocumentation {
                     name: "commits[].date".to_string(),
                     text: "Commit date in ISO format with timezone".to_string(),
+                    command: Some("git log --format=%aI".to_string()),
+                    present: false,
                 },
                 FieldDocumentation {
                     name: "commits[].original_message".to_string(),
                     text: "The original commit message as written by the author".to_string(),
+                    command: Some("git log --format=%B".to_string()),
+                    present: false,
                 },
                 FieldDocumentation {
                     name: "commits[].in_main_branches".to_string(),
                     text: "Array of remote main branches that contain this commit (empty if not pushed)".to_string(),
+                    command: Some("git branch -r --contains <commit>".to_string()),
+                    present: false,
                 },
                 FieldDocumentation {
                     name: "commits[].analysis.detected_type".to_string(),
                     text: "Automatically detected conventional commit type (feat, fix, docs, test, chore, etc.)".to_string(),
+                    command: None,
+                    present: false,
                 },
                 FieldDocumentation {
                     name: "commits[].analysis.detected_scope".to_string(),
                     text: "Automatically detected scope based on file paths (commands, config, tests, etc.)".to_string(),
+                    command: None,
+                    present: false,
                 },
                 FieldDocumentation {
                     name: "commits[].analysis.proposed_message".to_string(),
                     text: "AI-generated conventional commit message based on file changes".to_string(),
+                    command: None,
+                    present: false,
                 },
                 FieldDocumentation {
                     name: "commits[].analysis.file_changes.total_files".to_string(),
                     text: "Total number of files modified in this commit".to_string(),
+                    command: Some("git show --name-only <commit>".to_string()),
+                    present: false,
                 },
                 FieldDocumentation {
                     name: "commits[].analysis.file_changes.files_added".to_string(),
                     text: "Number of new files added in this commit".to_string(),
+                    command: Some("git show --name-status <commit> | grep '^A'".to_string()),
+                    present: false,
                 },
                 FieldDocumentation {
                     name: "commits[].analysis.file_changes.files_deleted".to_string(),
                     text: "Number of files deleted in this commit".to_string(),
+                    command: Some("git show --name-status <commit> | grep '^D'".to_string()),
+                    present: false,
                 },
                 FieldDocumentation {
                     name: "commits[].analysis.file_changes.file_list".to_string(),
                     text: "Array of files changed with their git status (M=modified, A=added, D=deleted)".to_string(),
+                    command: Some("git show --name-status <commit>".to_string()),
+                    present: false,
                 },
                 FieldDocumentation {
                     name: "commits[].analysis.diff_summary".to_string(),
                     text: "Git diff --stat output showing lines changed per file".to_string(),
+                    command: Some("git show --stat <commit>".to_string()),
+                    present: false,
                 },
                 FieldDocumentation {
                     name: "commits[].analysis.diff_content".to_string(),
                     text: "Full diff content showing line-by-line changes with added, removed, and context lines".to_string(),
+                    command: Some("git show <commit>".to_string()),
+                    present: false,
                 },
                 FieldDocumentation {
                     name: "branch_info.branch".to_string(),
                     text: "Current branch name (only present in branch commands)".to_string(),
+                    command: Some("git branch --show-current".to_string()),
+                    present: false,
                 },
                 FieldDocumentation {
                     name: "pr_template".to_string(),
                     text: "Pull request template content from .github/pull_request_template.md (only present in branch commands when file exists)".to_string(),
+                    command: None,
+                    present: false,
                 },
                 FieldDocumentation {
                     name: "branch_prs".to_string(),
                     text: "Pull requests created from the current branch (only present in branch commands)".to_string(),
+                    command: None,
+                    present: false,
                 },
                 FieldDocumentation {
                     name: "branch_prs[].number".to_string(),
                     text: "Pull request number".to_string(),
+                    command: None,
+                    present: false,
                 },
                 FieldDocumentation {
                     name: "branch_prs[].title".to_string(),
                     text: "Pull request title".to_string(),
+                    command: None,
+                    present: false,
                 },
                 FieldDocumentation {
                     name: "branch_prs[].state".to_string(),
                     text: "Pull request state (open, closed, merged)".to_string(),
+                    command: None,
+                    present: false,
                 },
                 FieldDocumentation {
                     name: "branch_prs[].url".to_string(),
                     text: "Pull request URL".to_string(),
+                    command: None,
+                    present: false,
                 },
                 FieldDocumentation {
                     name: "branch_prs[].body".to_string(),
                     text: "Pull request description/body content".to_string(),
+                    command: None,
+                    present: false,
                 },
             ],
         }
