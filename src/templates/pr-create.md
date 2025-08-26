@@ -9,7 +9,7 @@ model: claude-sonnet-4
 Run this command:
 
 ```bash
-./target/release/omni-dev git branch info
+omni-dev git branch info
 ```
 
 ## Step 2
