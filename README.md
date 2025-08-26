@@ -158,6 +158,7 @@ We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.
 - [API Documentation](https://docs.rs/omni-dev)
 - [Project Plan](docs/plan/project.md)
 - [Field Documentation](docs/plan/project.md) - Complete specification of YAML output fields
+- [Release Process](docs/RELEASE.md) - Comprehensive guide for creating releases
 
 ## Changelog
 
