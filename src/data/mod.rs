@@ -18,8 +18,6 @@ pub struct RepositoryView {
     pub working_directory: WorkingDirectoryInfo,
     /// List of remote repositories and their main branches
     pub remotes: Vec<RemoteInfo>,
-    /// List of analyzed commits with metadata and analysis
-    pub commits: Vec<CommitInfo>,
     /// Branch information (only present when using branch commands)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch_info: Option<BranchInfo>,
@@ -29,6 +27,8 @@ pub struct RepositoryView {
     /// Pull requests created from the current branch (only present in branch commands)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch_prs: Option<Vec<PullRequest>>,
+    /// List of analyzed commits with metadata and analysis
+    pub commits: Vec<CommitInfo>,
 }
 
 /// Field explanation for the YAML output
@@ -119,26 +119,13 @@ impl RepositoryView {
                 "branch_info.branch" => self.branch_info.is_some(),
                 "pr_template" => self.pr_template.is_some(),
                 "branch_prs" => self.branch_prs.is_some(),
-                "branch_prs[].number" => self
-                    .branch_prs
-                    .as_ref()
-                    .map_or(false, |prs| !prs.is_empty()),
-                "branch_prs[].title" => self
-                    .branch_prs
-                    .as_ref()
-                    .map_or(false, |prs| !prs.is_empty()),
-                "branch_prs[].state" => self
-                    .branch_prs
-                    .as_ref()
-                    .map_or(false, |prs| !prs.is_empty()),
-                "branch_prs[].url" => self
-                    .branch_prs
-                    .as_ref()
-                    .map_or(false, |prs| !prs.is_empty()),
-                "branch_prs[].body" => self
-                    .branch_prs
-                    .as_ref()
-                    .map_or(false, |prs| !prs.is_empty()),
+                "branch_prs[].number" => {
+                    self.branch_prs.as_ref().is_some_and(|prs| !prs.is_empty())
+                }
+                "branch_prs[].title" => self.branch_prs.as_ref().is_some_and(|prs| !prs.is_empty()),
+                "branch_prs[].state" => self.branch_prs.as_ref().is_some_and(|prs| !prs.is_empty()),
+                "branch_prs[].url" => self.branch_prs.as_ref().is_some_and(|prs| !prs.is_empty()),
+                "branch_prs[].body" => self.branch_prs.as_ref().is_some_and(|prs| !prs.is_empty()),
                 _ => false, // Unknown fields are not present
             }
         }
