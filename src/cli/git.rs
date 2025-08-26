@@ -153,7 +153,7 @@ impl ViewCommand {
         let commits = repo.get_commits_in_range(commit_range)?;
 
         // Build repository view
-        let repo_view = RepositoryView {
+        let mut repo_view = RepositoryView {
             explanation: FieldExplanation::default(),
             working_directory,
             remotes,
@@ -162,6 +162,9 @@ impl ViewCommand {
             pr_template: None,
             branch_prs: None,
         };
+
+        // Update field presence based on actual data
+        repo_view.update_field_presence();
 
         // Output as YAML
         let yaml_output = crate::data::to_yaml(&repo_view)?;
@@ -269,7 +272,7 @@ impl InfoCommand {
             .filter(|prs| !prs.is_empty());
 
         // Build repository view with branch info
-        let repo_view = RepositoryView {
+        let mut repo_view = RepositoryView {
             explanation: FieldExplanation::default(),
             working_directory,
             remotes,
@@ -280,6 +283,9 @@ impl InfoCommand {
             pr_template,
             branch_prs,
         };
+
+        // Update field presence based on actual data
+        repo_view.update_field_presence();
 
         // Output as YAML
         let yaml_output = crate::data::to_yaml(&repo_view)?;
