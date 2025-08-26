@@ -123,7 +123,9 @@ impl MessageCommand {
 impl ViewCommand {
     /// Execute view command
     pub fn execute(self) -> Result<()> {
-        use crate::data::{FieldExplanation, FileStatusInfo, RepositoryView, WorkingDirectoryInfo};
+        use crate::data::{
+            FieldExplanation, FileStatusInfo, RepositoryView, VersionInfo, WorkingDirectoryInfo,
+        };
         use crate::git::{GitRepository, RemoteInfo};
 
         let commit_range = self.commit_range.as_deref().unwrap_or("HEAD");
@@ -152,15 +154,21 @@ impl ViewCommand {
         // Parse commit range and get commits
         let commits = repo.get_commits_in_range(commit_range)?;
 
+        // Create version information
+        let versions = Some(VersionInfo {
+            omni_dev: env!("CARGO_PKG_VERSION").to_string(),
+        });
+
         // Build repository view
         let mut repo_view = RepositoryView {
+            versions,
             explanation: FieldExplanation::default(),
             working_directory,
             remotes,
-            commits,
             branch_info: None,
             pr_template: None,
             branch_prs: None,
+            commits,
         };
 
         // Update field presence based on actual data
@@ -206,7 +214,8 @@ impl InfoCommand {
     /// Execute info command
     pub fn execute(self) -> Result<()> {
         use crate::data::{
-            BranchInfo, FieldExplanation, FileStatusInfo, RepositoryView, WorkingDirectoryInfo,
+            BranchInfo, FieldExplanation, FileStatusInfo, RepositoryView, VersionInfo,
+            WorkingDirectoryInfo,
         };
         use crate::git::{GitRepository, RemoteInfo};
 
@@ -271,17 +280,23 @@ impl InfoCommand {
             .ok()
             .filter(|prs| !prs.is_empty());
 
+        // Create version information
+        let versions = Some(VersionInfo {
+            omni_dev: env!("CARGO_PKG_VERSION").to_string(),
+        });
+
         // Build repository view with branch info
         let mut repo_view = RepositoryView {
+            versions,
             explanation: FieldExplanation::default(),
             working_directory,
             remotes,
-            commits,
             branch_info: Some(BranchInfo {
                 branch: current_branch,
             }),
             pr_template,
             branch_prs,
+            commits,
         };
 
         // Update field presence based on actual data
