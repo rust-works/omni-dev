@@ -13,6 +13,18 @@ Run this command:
 # Step 2
 Analyse the result.  The result of the previous command is self describing.
 
+In particular, try to find all the fields documented by `.explanation` in the result and print the fields that are relevant for PR creation.
+
+Things to look for include, but are not limited to:
+
+* Whether the working directory is clean
+* Whether there existing PRs
+* What branch PRs already exist this branch
+* What the name of the current checked out branch is
+* What the PR template file is if it exists
+
+A thorough search is sometimes needed to find the field.
+
 # Step 3
 If according to the results, a PR for this branch already exists, then stop.
 
