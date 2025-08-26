@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 pub mod git;
+pub mod help;
 
 /// omni-dev: A comprehensive development toolkit
 #[derive(Parser)]
@@ -21,6 +22,9 @@ pub struct Cli {
 pub enum Commands {
     /// Git-related operations
     Git(git::GitCommand),
+    /// Display comprehensive help for all commands
+    #[command(name = "help-all")]
+    HelpAll(help::HelpCommand),
 }
 
 impl Cli {
@@ -28,6 +32,7 @@ impl Cli {
     pub fn execute(self) -> Result<()> {
         match self.command {
             Commands::Git(git_cmd) => git_cmd.execute(),
+            Commands::HelpAll(help_cmd) => help_cmd.execute(),
         }
     }
 }
