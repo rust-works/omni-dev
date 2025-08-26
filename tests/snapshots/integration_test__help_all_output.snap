@@ -1,0 +1,141 @@
+---
+source: tests/integration_test.rs
+expression: help_output
+---
+omni-dev - A comprehensive development toolkit
+
+A comprehensive development toolkit
+
+Usage: omni-dev <COMMAND>
+
+Commands:
+  git       Git-related operations
+  help-all  Display comprehensive help for all commands
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+
+
+================================================================================
+
+omni-dev git - Git-related operations
+
+Git-related operations
+
+Usage: git <COMMAND>
+
+Commands:
+  commit  Commit-related operations
+  branch  Branch-related operations
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev git branch - Branch-related operations
+
+Branch-related operations
+
+Usage: branch <COMMAND>
+
+Commands:
+  info  Analyze branch commits and output repository information in YAML format
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev git branch info - Analyze branch commits and output repository information in YAML format
+
+Analyze branch commits and output repository information in YAML format
+
+Usage: info [BASE_BRANCH]
+
+Arguments:
+  [BASE_BRANCH]  Base branch to compare against (defaults to main/master)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev git commit - Commit-related operations
+
+Commit-related operations
+
+Usage: commit <COMMAND>
+
+Commands:
+  message  Commit message operations
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev git commit message - Commit message operations
+
+Commit message operations
+
+Usage: message <COMMAND>
+
+Commands:
+  view   Analyze commits and output repository information in YAML format
+  amend  Amend commit messages based on a YAML configuration file
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev git commit message amend - Amend commit messages based on a YAML configuration file
+
+Amend commit messages based on a YAML configuration file
+
+Usage: amend <YAML_FILE>
+
+Arguments:
+  <YAML_FILE>  YAML file containing commit amendments
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev git commit message view - Analyze commits and output repository information in YAML format
+
+Analyze commits and output repository information in YAML format
+
+Usage: view [COMMIT_RANGE]
+
+Arguments:
+  [COMMIT_RANGE]  Commit range to analyze (e.g., HEAD~3..HEAD, abc123..def456)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev help-all - Display comprehensive help for all commands
+
+Display comprehensive help for all commands
+
+Usage: help-all
+
+Options:
+  -h, --help  Print help
