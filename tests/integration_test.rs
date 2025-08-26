@@ -226,3 +226,18 @@ amendments:
 
     Ok(())
 }
+
+#[test]
+fn test_help_all_golden() -> Result<()> {
+    // Capture the help-all output using the help generator directly
+    use omni_dev::cli::help::HelpGenerator;
+
+    let generator = HelpGenerator::new();
+    let help_output = generator.generate_all_help()?;
+
+    // Use insta for snapshot testing - this creates a .snap file with the expected output
+    insta::assert_snapshot!("help_all_output", help_output);
+
+    println!("✅ Golden test for help-all command completed");
+    Ok(())
+}
