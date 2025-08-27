@@ -1,0 +1,191 @@
+---
+versions:
+  omni_dev: 0.3.0
+explanation:
+  text: |
+    Field documentation for the YAML output format. Each entry describes the purpose and content of fields returned by the view command.
+    
+    Field structure:
+    - name: Specifies the YAML field path
+    - text: Provides a description of what the field contains
+    - command: Shows the corresponding command used to obtain that data (if applicable)
+    - present: Indicates whether this field is present in the current output
+    
+    IMPORTANT FOR AI ASSISTANTS: If a field shows present=true, it is guaranteed to be somewhere in this document. AI assistants should search the entire document thoroughly for any field marked as present=true, as it is definitely included in the output.
+  fields:
+    - name: working_directory.clean
+      text: Boolean indicating if the working directory has no uncommitted changes
+      command: git status
+      present: true
+    - name: working_directory.untracked_changes
+      text: "Array of files with uncommitted changes, showing git status and file path"
+      command: git status --porcelain
+      present: true
+    - name: remotes
+      text: Array of git remotes with their URLs and detected main branch names
+      command: git remote -v
+      present: true
+    - name: "commits[].hash"
+      text: Full SHA-1 hash of the commit
+      command: git log --format=%H
+      present: false
+    - name: "commits[].author"
+      text: Commit author name and email address
+      command: git log --format=%an <%ae>
+      present: false
+    - name: "commits[].date"
+      text: Commit date in ISO format with timezone
+      command: git log --format=%aI
+      present: false
+    - name: "commits[].original_message"
+      text: The original commit message as written by the author
+      command: git log --format=%B
+      present: false
+    - name: "commits[].in_main_branches"
+      text: Array of remote main branches that contain this commit (empty if not pushed)
+      command: git branch -r --contains <commit>
+      present: false
+    - name: "commits[].analysis.detected_type"
+      text: "Automatically detected conventional commit type (feat, fix, docs, test, chore, etc.)"
+      present: false
+    - name: "commits[].analysis.detected_scope"
+      text: "Automatically detected scope based on file paths (commands, config, tests, etc.)"
+      present: false
+    - name: "commits[].analysis.proposed_message"
+      text: AI-generated conventional commit message based on file changes
+      present: false
+    - name: "commits[].analysis.file_changes.total_files"
+      text: Total number of files modified in this commit
+      command: git show --name-only <commit>
+      present: false
+    - name: "commits[].analysis.file_changes.files_added"
+      text: Number of new files added in this commit
+      command: "git show --name-status <commit> | grep '^A'"
+      present: false
+    - name: "commits[].analysis.file_changes.files_deleted"
+      text: Number of files deleted in this commit
+      command: "git show --name-status <commit> | grep '^D'"
+      present: false
+    - name: "commits[].analysis.file_changes.file_list"
+      text: "Array of files changed with their git status (M=modified, A=added, D=deleted)"
+      command: git show --name-status <commit>
+      present: false
+    - name: "commits[].analysis.diff_summary"
+      text: Git diff --stat output showing lines changed per file
+      command: git show --stat <commit>
+      present: false
+    - name: "commits[].analysis.diff_content"
+      text: "Full diff content showing line-by-line changes with added, removed, and context lines"
+      command: git show <commit>
+      present: false
+    - name: versions.omni_dev
+      text: Version of the omni-dev tool
+      command: omni-dev --version
+      present: true
+    - name: branch_info.branch
+      text: Current branch name (only present in branch commands)
+      command: git branch --show-current
+      present: true
+    - name: pr_template
+      text: Pull request template content from .github/pull_request_template.md (only present in branch commands when file exists)
+      present: true
+    - name: branch_prs
+      text: Pull requests created from the current branch (only present in branch commands)
+      present: false
+    - name: "branch_prs[].number"
+      text: Pull request number
+      present: false
+    - name: "branch_prs[].title"
+      text: Pull request title
+      present: false
+    - name: "branch_prs[].state"
+      text: "Pull request state (open, closed, merged)"
+      present: false
+    - name: "branch_prs[].url"
+      text: Pull request URL
+      present: false
+    - name: "branch_prs[].body"
+      text: Pull request description/body content
+      present: false
+working_directory:
+  clean: false
+  untracked_changes:
+    - status: " M"
+      file: src/cli/git.rs
+    - status: " M"
+      file: src/data/mod.rs
+    - status: " D"
+      file: src/utils.rs
+    - status: " ?"
+      file: src/utils/ai_scratch.rs
+    - status: " ?"
+      file: src/utils/general.rs
+    - status: " ?"
+      file: src/utils/mod.rs
+remotes:
+  - name: origin
+    uri: "git@github.com:rust-works/omni-dev.git"
+    main_branch: main
+branch_info:
+  branch: main
+pr_template: |
+  # Pull Request
+  
+  ## Description
+  <!-- Provide a brief description of what this PR does -->
+  
+  ## Type of Change
+  <!-- Mark the relevant option with an "x" -->
+  - [ ] Bug fix (non-breaking change which fixes an issue)
+  - [ ] New feature (non-breaking change which adds functionality)
+  - [ ] Breaking change (fix or feature that would cause existing functionality to not work as expected)
+  - [ ] Documentation update
+  - [ ] Refactoring (no functional changes)
+  - [ ] Performance improvement
+  - [ ] Test coverage improvement
+  
+  ## Related Issue
+  <!-- Link to the issue this PR addresses -->
+  Fixes #(issue_number)
+  <!-- or -->
+  Relates to #(issue_number)
+  
+  ## Changes Made
+  <!-- List the specific changes made in this PR -->
+  - 
+  - 
+  - 
+  
+  ## Testing
+  <!-- Describe the tests you ran and how to reproduce them -->
+  - [ ] All existing tests pass
+  - [ ] New tests added for new functionality
+  - [ ] Manual testing performed
+  
+  ### Test Commands
+  ```bash
+  cargo test
+  cargo clippy
+  cargo fmt --check
+  ```
+  
+  ## Screenshots
+  <!-- If applicable, add screenshots to help explain your changes -->
+  
+  ## Checklist
+  <!-- Mark completed items with an "x" -->
+  - [ ] My code follows the project's style guidelines
+  - [ ] I have performed a self-review of my own code
+  - [ ] I have commented my code, particularly in hard-to-understand areas
+  - [ ] I have made corresponding changes to the documentation
+  - [ ] My changes generate no new warnings
+  - [ ] I have added tests that prove my fix is effective or that my feature works
+  - [ ] New and existing unit tests pass locally with my changes
+  - [ ] Any dependent changes have been merged and published
+  
+  ## Breaking Changes
+  <!-- If this is a breaking change, describe what users need to do to migrate -->
+  
+  ## Additional Notes
+  <!-- Add any additional notes for reviewers -->
+commits: []
