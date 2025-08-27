@@ -56,14 +56,25 @@ mod tests {
     use std::env;
     use tempfile::TempDir;
 
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    /// Global lock to ensure environment variable tests don't interfere with each other
+    static ENV_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
     /// Helper to manage environment variables in tests to avoid interference
     struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
         vars: Vec<(String, Option<String>)>,
     }
 
     impl EnvGuard {
         fn new() -> Self {
-            Self { vars: Vec::new() }
+            let lock = ENV_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+            Self {
+                _lock: lock,
+                vars: Vec::new(),
+            }
         }
 
         fn set(&mut self, key: &str, value: &str) {
