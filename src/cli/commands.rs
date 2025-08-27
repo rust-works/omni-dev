@@ -8,6 +8,7 @@ use std::path::Path;
 // Embed the template files as strings
 const COMMIT_TWIDDLE_TEMPLATE: &str = include_str!("../templates/commit-twiddle.md");
 const PR_CREATE_TEMPLATE: &str = include_str!("../templates/pr-create.md");
+const PR_UPDATE_TEMPLATE: &str = include_str!("../templates/pr-update.md");
 
 /// Command template management
 #[derive(Parser)]
@@ -41,6 +42,9 @@ pub enum GenerateSubcommands {
     /// Generate pr-create command template
     #[command(name = "pr-create")]
     PrCreate,
+    /// Generate pr-update command template
+    #[command(name = "pr-update")]
+    PrUpdate,
     /// Generate all command templates
     All,
 }
@@ -66,12 +70,18 @@ impl GenerateCommand {
                 generate_pr_create()?;
                 println!("✅ Generated .claude/commands/pr-create.md");
             }
+            GenerateSubcommands::PrUpdate => {
+                generate_pr_update()?;
+                println!("✅ Generated .claude/commands/pr-update.md");
+            }
             GenerateSubcommands::All => {
                 generate_commit_twiddle()?;
                 generate_pr_create()?;
+                generate_pr_update()?;
                 println!("✅ Generated all command templates:");
                 println!("   - .claude/commands/commit-twiddle.md");
                 println!("   - .claude/commands/pr-create.md");
+                println!("   - .claude/commands/pr-update.md");
             }
         }
         Ok(())
@@ -94,6 +104,14 @@ fn generate_pr_create() -> Result<()> {
     ensure_claude_commands_dir()?;
     fs::write(".claude/commands/pr-create.md", PR_CREATE_TEMPLATE)
         .context("Failed to write .claude/commands/pr-create.md")?;
+    Ok(())
+}
+
+/// Generate pr-update command template
+fn generate_pr_update() -> Result<()> {
+    ensure_claude_commands_dir()?;
+    fs::write(".claude/commands/pr-update.md", PR_UPDATE_TEMPLATE)
+        .context("Failed to write .claude/commands/pr-update.md")?;
     Ok(())
 }
 
