@@ -21,6 +21,8 @@ pub struct RepositoryView {
     pub working_directory: WorkingDirectoryInfo,
     /// List of remote repositories and their main branches
     pub remotes: Vec<RemoteInfo>,
+    /// AI-related information
+    pub ai: AiInfo,
     /// Branch information (only present when using branch commands)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch_info: Option<BranchInfo>,
@@ -82,6 +84,13 @@ pub struct VersionInfo {
     pub omni_dev: String,
 }
 
+/// AI-related information
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AiInfo {
+    /// Path to AI scratch directory
+    pub scratch: String,
+}
+
 /// Branch information for branch-specific commands
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BranchInfo {
@@ -127,6 +136,7 @@ impl RepositoryView {
                 "commits[].analysis.diff_summary" => !self.commits.is_empty(),
                 "commits[].analysis.diff_content" => !self.commits.is_empty(),
                 "versions.omni_dev" => self.versions.is_some(),
+                "ai.scratch" => true,
                 "branch_info.branch" => self.branch_info.is_some(),
                 "pr_template" => self.pr_template.is_some(),
                 "branch_prs" => self.branch_prs.is_some(),
@@ -265,6 +275,12 @@ impl Default for FieldExplanation {
                     name: "versions.omni_dev".to_string(),
                     text: "Version of the omni-dev tool".to_string(),
                     command: Some("omni-dev --version".to_string()),
+                    present: false,
+                },
+                FieldDocumentation {
+                    name: "ai.scratch".to_string(),
+                    text: "Path to AI scratch directory (controlled by AI_SCRATCH environment variable)".to_string(),
+                    command: Some("echo $AI_SCRATCH".to_string()),
                     present: false,
                 },
                 FieldDocumentation {

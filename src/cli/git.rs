@@ -124,9 +124,11 @@ impl ViewCommand {
     /// Execute view command
     pub fn execute(self) -> Result<()> {
         use crate::data::{
-            FieldExplanation, FileStatusInfo, RepositoryView, VersionInfo, WorkingDirectoryInfo,
+            AiInfo, FieldExplanation, FileStatusInfo, RepositoryView, VersionInfo,
+            WorkingDirectoryInfo,
         };
         use crate::git::{GitRepository, RemoteInfo};
+        use crate::utils::ai_scratch;
 
         let commit_range = self.commit_range.as_deref().unwrap_or("HEAD");
 
@@ -159,12 +161,20 @@ impl ViewCommand {
             omni_dev: env!("CARGO_PKG_VERSION").to_string(),
         });
 
+        // Get AI scratch directory
+        let ai_scratch_path =
+            ai_scratch::get_ai_scratch_dir().context("Failed to determine AI scratch directory")?;
+        let ai_info = AiInfo {
+            scratch: ai_scratch_path.to_string_lossy().to_string(),
+        };
+
         // Build repository view
         let mut repo_view = RepositoryView {
             versions,
             explanation: FieldExplanation::default(),
             working_directory,
             remotes,
+            ai: ai_info,
             branch_info: None,
             pr_template: None,
             branch_prs: None,
@@ -214,10 +224,11 @@ impl InfoCommand {
     /// Execute info command
     pub fn execute(self) -> Result<()> {
         use crate::data::{
-            BranchInfo, FieldExplanation, FileStatusInfo, RepositoryView, VersionInfo,
+            AiInfo, BranchInfo, FieldExplanation, FileStatusInfo, RepositoryView, VersionInfo,
             WorkingDirectoryInfo,
         };
         use crate::git::{GitRepository, RemoteInfo};
+        use crate::utils::ai_scratch;
 
         // Open git repository
         let repo = GitRepository::open()
@@ -285,12 +296,20 @@ impl InfoCommand {
             omni_dev: env!("CARGO_PKG_VERSION").to_string(),
         });
 
+        // Get AI scratch directory
+        let ai_scratch_path =
+            ai_scratch::get_ai_scratch_dir().context("Failed to determine AI scratch directory")?;
+        let ai_info = AiInfo {
+            scratch: ai_scratch_path.to_string_lossy().to_string(),
+        };
+
         // Build repository view with branch info
         let mut repo_view = RepositoryView {
             versions,
             explanation: FieldExplanation::default(),
             working_directory,
             remotes,
+            ai: ai_info,
             branch_info: Some(BranchInfo {
                 branch: current_branch,
             }),
