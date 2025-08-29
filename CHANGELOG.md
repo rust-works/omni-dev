@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2025-08-29
+
+### Fixed
+- **Rebase Operations**: Fixed short commit hash ambiguity in interactive rebase operations
+  - Modified rebase sequence generation to use full commit hashes instead of 7-character truncated hashes
+  - Eliminates "short object ID is ambiguous" errors when multiple git objects share the same hash prefix
+  - Ensures reliable commit amendment operations regardless of repository size
+
 ## [0.4.0] - 2025-08-29
 
 ### Added
@@ -113,7 +121,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation and community files (README, CONTRIBUTING, CODE_OF_CONDUCT)
 - BSD 3-Clause license
 
-[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/rust-works/omni-dev/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/rust-works/omni-dev/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/rust-works/omni-dev/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rust-works/omni-dev/compare/v0.1.0...v0.2.0
