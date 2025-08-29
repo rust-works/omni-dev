@@ -9,7 +9,7 @@ model: claude-sonnet-4
 Run this command:
 
 ```bash
-./target/debug/omni-dev git commit message view $ARGUMENTS
+omni-dev git commit message view $ARGUMENTS
 ```
 
 ## Step 2
@@ -38,7 +38,7 @@ amendments:                    # required, non-empty array
 Run this command:
 
 ```bash
-./target/release/omni-dev git commit message amend .ai/scratch/amendments-<random-hash>.yaml
+omni-dev git commit message amend .ai/scratch/amendments-<random-hash>.yaml
 ```
 
 # Troubleshooting
