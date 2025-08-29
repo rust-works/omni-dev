@@ -229,10 +229,10 @@ impl AmendmentHandler {
 
             if commit.starts_with(&commit_hash[..commit.len().min(commit_hash.len())]) {
                 // This is our target commit - mark it for editing
-                sequence_content.push_str(&format!("edit {} {}\n", &commit[..7], subject));
+                sequence_content.push_str(&format!("edit {} {}\n", commit, subject));
             } else {
                 // Other commits - just pick them
-                sequence_content.push_str(&format!("pick {} {}\n", &commit[..7], subject));
+                sequence_content.push_str(&format!("pick {} {}\n", commit, subject));
             }
         }
 
