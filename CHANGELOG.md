@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2025-08-29
+
+### Added
+- **Command Template Management**: New command template system for enhanced CLI experience
+  - Added `pr-update` command template generation for pull request workflow automation
+  - Implemented comprehensive command template management system
+  - Enhanced Claude slash command integration with structured templates
+- **AI Scratch Directory Support**: Added AI scratch directory configuration support
+  - Integrated AI_SCRATCH environment variable support for enhanced AI assistant workflows
+  - Added scratch directory path handling in command templates
+- **Version Information Enhancement**: Added version information to command outputs
+  - Commands now include version context for better debugging and support
+  - Enhanced output format with version tracking
+- **Documentation Improvements**: Enhanced slash command documentation structure
+  - Improved Claude command file organization and documentation
+  - Added comprehensive AI assistant guide and release documentation
+  - Better structured troubleshooting information in slash commands
+
 ## [0.3.0] - 2025-08-26
 
 ### Added
@@ -95,7 +113,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation and community files (README, CONTRIBUTING, CODE_OF_CONDUCT)
 - BSD 3-Clause license
 
-[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/rust-works/omni-dev/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/rust-works/omni-dev/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rust-works/omni-dev/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rust-works/omni-dev/releases/tag/v0.1.0
