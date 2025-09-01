@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset};
 use git2::{Commit, Repository};
 use serde::{Deserialize, Serialize};
+use std::fs;
 
 /// Commit information structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,8 +36,8 @@ pub struct CommitAnalysis {
     pub file_changes: FileChanges,
     /// Git diff --stat output showing lines changed per file
     pub diff_summary: String,
-    /// Full diff content showing line-by-line changes
-    pub diff_content: String,
+    /// Path to diff file showing line-by-line changes
+    pub diff_file: String,
 }
 
 /// File changes statistics
@@ -118,8 +119,8 @@ impl CommitAnalysis {
         // Get diff summary
         let diff_summary = Self::get_diff_summary(repo, commit)?;
 
-        // Get full diff content
-        let diff_content = Self::get_diff_content(repo, commit)?;
+        // Write diff to file and get path
+        let diff_file = Self::write_diff_to_file(repo, commit)?;
 
         Ok(Self {
             detected_type,
@@ -127,7 +128,7 @@ impl CommitAnalysis {
             proposed_message,
             file_changes,
             diff_summary,
-            diff_content,
+            diff_file,
         })
     }
 
@@ -420,8 +421,21 @@ impl CommitAnalysis {
         Ok(summary)
     }
 
-    /// Get full diff content for the commit
-    fn get_diff_content(repo: &Repository, commit: &Commit) -> Result<String> {
+    /// Write full diff content to a file and return the path
+    fn write_diff_to_file(repo: &Repository, commit: &Commit) -> Result<String> {
+        // Get AI scratch directory
+        let ai_scratch_path = crate::utils::ai_scratch::get_ai_scratch_dir()
+            .context("Failed to determine AI scratch directory")?;
+
+        // Create diffs subdirectory
+        let diffs_dir = ai_scratch_path.join("diffs");
+        fs::create_dir_all(&diffs_dir).context("Failed to create diffs directory")?;
+
+        // Create filename with commit hash
+        let commit_hash = commit.id().to_string();
+        let diff_filename = format!("{}.diff", commit_hash);
+        let diff_path = diffs_dir.join(&diff_filename);
+
         let commit_tree = commit.tree().context("Failed to get commit tree")?;
 
         let parent_tree = if commit.parent_count() > 0 {
@@ -467,6 +481,10 @@ impl CommitAnalysis {
             diff_content.push('\n');
         }
 
-        Ok(diff_content)
+        // Write diff content to file
+        fs::write(&diff_path, diff_content).context("Failed to write diff file")?;
+
+        // Return the path as a string
+        Ok(diff_path.to_string_lossy().to_string())
     }
 }
