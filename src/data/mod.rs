@@ -134,7 +134,7 @@ impl RepositoryView {
                 "commits[].analysis.file_changes.files_deleted" => !self.commits.is_empty(),
                 "commits[].analysis.file_changes.file_list" => !self.commits.is_empty(),
                 "commits[].analysis.diff_summary" => !self.commits.is_empty(),
-                "commits[].analysis.diff_content" => !self.commits.is_empty(),
+                "commits[].analysis.diff_file" => !self.commits.is_empty(),
                 "versions.omni_dev" => self.versions.is_some(),
                 "ai.scratch" => true,
                 "branch_info.branch" => self.branch_info.is_some(),
@@ -266,8 +266,9 @@ impl Default for FieldExplanation {
                     present: false,
                 },
                 FieldDocumentation {
-                    name: "commits[].analysis.diff_content".to_string(),
-                    text: "Full diff content showing line-by-line changes with added, removed, and context lines".to_string(),
+                    name: "commits[].analysis.diff_file".to_string(),
+                    text: "Path to file containing full diff content showing line-by-line changes with added, removed, and context lines.\n\
+                           AI assistants should read this file to understand the specific changes made in the commit.".to_string(),
                     command: Some("git show <commit>".to_string()),
                     present: false,
                 },
