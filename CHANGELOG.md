@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2025-09-01
+
+### Changed
+- **Diff Output Format**: Modified YAML output to write diff content to external files instead of embedding in YAML
+  - Changed `diff_content` field to `diff_file` in `CommitAnalysis` struct for improved memory usage
+  - Diff content now written to temporary files in AI scratch directory
+  - Enables AI assistants to access detailed diff information through file reads
+  - Maintains backward compatibility with similar data structure
+  - Updated field documentation for AI assistant guidance
+
 ## [0.4.1] - 2025-08-29
 
 ### Fixed
@@ -121,7 +131,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation and community files (README, CONTRIBUTING, CODE_OF_CONDUCT)
 - BSD 3-Clause license
 
-[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/rust-works/omni-dev/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/rust-works/omni-dev/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/rust-works/omni-dev/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/rust-works/omni-dev/compare/v0.2.0...v0.3.0
