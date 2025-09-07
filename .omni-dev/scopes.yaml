@@ -1,0 +1,21 @@
+scopes:
+  - name: "claude"
+    description: "Claude AI client implementation and integration"
+    examples: ["claude: add contextual prompting", "claude: fix API error handling"]
+    file_patterns: ["src/claude/**", "src/data/context.rs"]
+  - name: "cli"
+    description: "Command-line interface and argument parsing"
+    examples: ["cli: add twiddle contextual options", "cli: improve help text"]
+    file_patterns: ["src/cli/**", "src/main.rs"]
+  - name: "git"
+    description: "Git operations and repository analysis"
+    examples: ["git: enhance commit parsing", "git: add branch analysis"]
+    file_patterns: ["src/git/**"]
+  - name: "data"
+    description: "Data structures and serialization"
+    examples: ["data: add context structures", "data: improve YAML output"]
+    file_patterns: ["src/data/**"]
+  - name: "docs"
+    description: "Documentation and planning"
+    examples: ["docs: update twiddle plan", "docs: add context intelligence spec"]
+    file_patterns: ["docs/**", "*.md", "README.md"]

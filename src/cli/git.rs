@@ -88,6 +88,30 @@ pub struct TwiddleCommand {
     /// Save generated amendments to file without applying
     #[arg(long, value_name = "FILE")]
     pub save_only: Option<String>,
+
+    /// Use additional project context for better suggestions (Phase 3)
+    #[arg(long, default_value = "true")]
+    pub use_context: bool,
+
+    /// Path to custom context directory (defaults to .omni-dev/)
+    #[arg(long)]
+    pub context_dir: Option<std::path::PathBuf>,
+
+    /// Specify work context (e.g., "feature: user authentication")
+    #[arg(long)]
+    pub work_context: Option<String>,
+
+    /// Override detected branch context
+    #[arg(long)]
+    pub branch_context: Option<String>,
+
+    /// Disable contextual analysis (use basic prompting only)
+    #[arg(long)]
+    pub no_context: bool,
+
+    /// Maximum number of commits to process in a single batch (default: 4)
+    #[arg(long, default_value = "4")]
+    pub batch_size: usize,
 }
 
 /// Branch operations
@@ -240,30 +264,74 @@ impl AmendCommand {
 }
 
 impl TwiddleCommand {
-    /// Execute twiddle command
+    /// Execute twiddle command with contextual intelligence
     pub async fn execute(self) -> Result<()> {
         use crate::claude::ClaudeClient;
 
-        println!("🪄 Starting AI-powered commit message improvement...");
+        // Determine if contextual analysis should be used
+        let use_contextual = self.use_context && !self.no_context;
 
-        // 1. Generate repository view (reuse ViewCommand logic)
-        let repo_view = self.generate_repository_view().await?;
+        if use_contextual {
+            println!(
+                "🪄 Starting AI-powered commit message improvement with contextual intelligence..."
+            );
+        } else {
+            println!("🪄 Starting AI-powered commit message improvement...");
+        }
 
-        // 2. Initialize Claude client
+        // 1. Generate repository view to get all commits
+        let full_repo_view = self.generate_repository_view().await?;
+
+        // 2. Check if batching is needed
+        if full_repo_view.commits.len() > self.batch_size {
+            println!(
+                "📦 Processing {} commits in batches of {} to ensure reliable analysis...",
+                full_repo_view.commits.len(),
+                self.batch_size
+            );
+            return self
+                .execute_with_batching(use_contextual, full_repo_view)
+                .await;
+        }
+
+        // 3. Collect contextual information (Phase 3)
+        let context = if use_contextual {
+            Some(self.collect_context(&full_repo_view).await?)
+        } else {
+            None
+        };
+
+        // 4. Show context summary if available
+        if let Some(ref ctx) = context {
+            self.show_context_summary(ctx)?;
+        }
+
+        // 5. Initialize Claude client
         let claude_client = ClaudeClient::new(self.model.clone())?;
 
-        // 3. Generate amendments via Claude API
-        println!("🤖 Analyzing commits with Claude AI...");
-        let amendments = claude_client.generate_amendments(&repo_view).await?;
+        // 6. Generate amendments via Claude API with context
+        if use_contextual && context.is_some() {
+            println!("🤖 Analyzing commits with enhanced contextual intelligence...");
+        } else {
+            println!("🤖 Analyzing commits with Claude AI...");
+        }
 
-        // 4. Handle different output modes
+        let amendments = if let Some(ctx) = context {
+            claude_client
+                .generate_contextual_amendments(&full_repo_view, &ctx)
+                .await?
+        } else {
+            claude_client.generate_amendments(&full_repo_view).await?
+        };
+
+        // 6. Handle different output modes
         if let Some(save_path) = self.save_only {
             amendments.save_to_file(save_path)?;
             println!("💾 Amendments saved to file");
             return Ok(());
         }
 
-        // 5. Show preview and get confirmation
+        // 7. Show preview and get confirmation
         if !amendments.amendments.is_empty() {
             self.show_amendment_preview(&amendments)?;
 
@@ -272,8 +340,110 @@ impl TwiddleCommand {
                 return Ok(());
             }
 
-            // 6. Apply amendments (reuse AmendCommand logic)
+            // 8. Apply amendments
             self.apply_amendments(amendments).await?;
+            println!("✅ Commit messages improved successfully!");
+        } else {
+            println!("✨ All commit messages are already well-formatted!");
+        }
+
+        Ok(())
+    }
+
+    /// Execute twiddle command with automatic batching for large commit ranges
+    async fn execute_with_batching(
+        &self,
+        use_contextual: bool,
+        full_repo_view: crate::data::RepositoryView,
+    ) -> Result<()> {
+        use crate::claude::ClaudeClient;
+        use crate::data::amendments::AmendmentFile;
+
+        // Initialize Claude client
+        let claude_client = ClaudeClient::new(self.model.clone())?;
+
+        // Split commits into batches
+        let commit_batches: Vec<_> = full_repo_view.commits.chunks(self.batch_size).collect();
+
+        let total_batches = commit_batches.len();
+        let mut all_amendments = AmendmentFile {
+            amendments: Vec::new(),
+        };
+
+        println!("📊 Processing {} batches...", total_batches);
+
+        for (batch_num, commit_batch) in commit_batches.into_iter().enumerate() {
+            println!(
+                "🔄 Processing batch {}/{} ({} commits)...",
+                batch_num + 1,
+                total_batches,
+                commit_batch.len()
+            );
+
+            // Create a repository view for just this batch
+            let batch_repo_view = crate::data::RepositoryView {
+                versions: full_repo_view.versions.clone(),
+                explanation: full_repo_view.explanation.clone(),
+                working_directory: full_repo_view.working_directory.clone(),
+                remotes: full_repo_view.remotes.clone(),
+                ai: full_repo_view.ai.clone(),
+                branch_info: full_repo_view.branch_info.clone(),
+                pr_template: full_repo_view.pr_template.clone(),
+                branch_prs: full_repo_view.branch_prs.clone(),
+                commits: commit_batch.to_vec(),
+            };
+
+            // Collect context for this batch if needed
+            let batch_context = if use_contextual {
+                Some(self.collect_context(&batch_repo_view).await?)
+            } else {
+                None
+            };
+
+            // Generate amendments for this batch
+            let batch_amendments = if let Some(ctx) = batch_context {
+                claude_client
+                    .generate_contextual_amendments(&batch_repo_view, &ctx)
+                    .await?
+            } else {
+                claude_client.generate_amendments(&batch_repo_view).await?
+            };
+
+            // Merge amendments from this batch
+            all_amendments
+                .amendments
+                .extend(batch_amendments.amendments);
+
+            if batch_num + 1 < total_batches {
+                println!("   ✅ Batch {}/{} completed", batch_num + 1, total_batches);
+                // Small delay between batches to be respectful to the API
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            }
+        }
+
+        println!(
+            "✅ All batches completed! Found {} commits to improve.",
+            all_amendments.amendments.len()
+        );
+
+        // Handle different output modes
+        if let Some(save_path) = &self.save_only {
+            all_amendments.save_to_file(save_path)?;
+            println!("💾 Amendments saved to file");
+            return Ok(());
+        }
+
+        // Show preview and get confirmation
+        if !all_amendments.amendments.is_empty() {
+            self.show_amendment_preview(&all_amendments)?;
+
+            if !self.auto_apply && !self.get_user_confirmation()? {
+                println!("❌ Amendment cancelled by user");
+                return Ok(());
+            }
+
+            // Apply all amendments
+            self.apply_amendments(all_amendments).await?;
             println!("✅ Commit messages improved successfully!");
         } else {
             println!("✨ All commit messages are already well-formatted!");
@@ -400,6 +570,107 @@ impl TwiddleCommand {
             .apply_amendments(&temp_file.to_string_lossy())
             .context("Failed to apply amendments")?;
 
+        Ok(())
+    }
+
+    /// Collect contextual information for enhanced commit message generation
+    async fn collect_context(
+        &self,
+        repo_view: &crate::data::RepositoryView,
+    ) -> Result<crate::data::context::CommitContext> {
+        use crate::claude::context::{BranchAnalyzer, ProjectDiscovery, WorkPatternAnalyzer};
+        use crate::data::context::CommitContext;
+        use crate::git::GitRepository;
+
+        let mut context = CommitContext::new();
+
+        // 1. Discover project context
+        let context_dir = self
+            .context_dir
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| std::path::PathBuf::from(".omni-dev"));
+
+        let discovery = ProjectDiscovery::new(context_dir);
+        context.project = discovery.discover().unwrap_or_default();
+
+        // 2. Analyze current branch
+        let repo = GitRepository::open()?;
+        let current_branch = repo
+            .get_current_branch()
+            .unwrap_or_else(|_| "HEAD".to_string());
+        context.branch = BranchAnalyzer::analyze(&current_branch).unwrap_or_default();
+
+        // 3. Analyze commit range patterns
+        if !repo_view.commits.is_empty() {
+            context.range = WorkPatternAnalyzer::analyze_commit_range(&repo_view.commits);
+        }
+
+        // 4. Apply user-provided context overrides
+        if let Some(ref work_ctx) = self.work_context {
+            context.user_provided = Some(work_ctx.clone());
+        }
+
+        if let Some(ref branch_ctx) = self.branch_context {
+            context.branch.description = branch_ctx.clone();
+        }
+
+        Ok(context)
+    }
+
+    /// Show context summary to user
+    fn show_context_summary(&self, context: &crate::data::context::CommitContext) -> Result<()> {
+        use crate::data::context::{VerbosityLevel, WorkPattern};
+
+        println!("🔍 Context Analysis:");
+
+        // Project context
+        if !context.project.valid_scopes.is_empty() {
+            let scope_names: Vec<&str> = context
+                .project
+                .valid_scopes
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect();
+            println!("   📁 Valid scopes: {}", scope_names.join(", "));
+        }
+
+        // Branch context
+        if context.branch.is_feature_branch {
+            println!(
+                "   🌿 Branch: {} ({})",
+                context.branch.description, context.branch.work_type
+            );
+            if let Some(ref ticket) = context.branch.ticket_id {
+                println!("   🎫 Ticket: {}", ticket);
+            }
+        }
+
+        // Work pattern
+        match context.range.work_pattern {
+            WorkPattern::Sequential => println!("   🔄 Pattern: Sequential development"),
+            WorkPattern::Refactoring => println!("   🧹 Pattern: Refactoring work"),
+            WorkPattern::BugHunt => println!("   🐛 Pattern: Bug investigation"),
+            WorkPattern::Documentation => println!("   📖 Pattern: Documentation updates"),
+            WorkPattern::Configuration => println!("   ⚙️  Pattern: Configuration changes"),
+            WorkPattern::Unknown => {}
+        }
+
+        // Verbosity level
+        match context.suggested_verbosity() {
+            VerbosityLevel::Comprehensive => {
+                println!("   📝 Detail level: Comprehensive (significant changes detected)")
+            }
+            VerbosityLevel::Detailed => println!("   📝 Detail level: Detailed"),
+            VerbosityLevel::Concise => println!("   📝 Detail level: Concise"),
+        }
+
+        // User context
+        if let Some(ref user_ctx) = context.user_provided {
+            println!("   👤 User context: {}", user_ctx);
+        }
+
+        println!();
         Ok(())
     }
 }
