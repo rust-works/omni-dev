@@ -50,6 +50,8 @@ pub enum MessageSubcommands {
     View(ViewCommand),
     /// Amend commit messages based on a YAML configuration file
     Amend(AmendCommand),
+    /// AI-powered commit message improvement using Claude
+    Twiddle(TwiddleCommand),
 }
 
 /// View command options
@@ -66,6 +68,26 @@ pub struct AmendCommand {
     /// YAML file containing commit amendments
     #[arg(value_name = "YAML_FILE")]
     pub yaml_file: String,
+}
+
+/// Twiddle command options
+#[derive(Parser)]
+pub struct TwiddleCommand {
+    /// Commit range to analyze and improve (e.g., HEAD~3..HEAD, abc123..def456)
+    #[arg(value_name = "COMMIT_RANGE")]
+    pub commit_range: Option<String>,
+
+    /// Claude API model to use (defaults to claude-3-5-sonnet-20241022)
+    #[arg(long, default_value = "claude-3-5-sonnet-20241022")]
+    pub model: String,
+
+    /// Skip confirmation prompt and apply amendments automatically
+    #[arg(long)]
+    pub auto_apply: bool,
+
+    /// Save generated amendments to file without applying
+    #[arg(long, value_name = "FILE")]
+    pub save_only: Option<String>,
 }
 
 /// Branch operations
@@ -116,6 +138,12 @@ impl MessageCommand {
         match self.command {
             MessageSubcommands::View(view_cmd) => view_cmd.execute(),
             MessageSubcommands::Amend(amend_cmd) => amend_cmd.execute(),
+            MessageSubcommands::Twiddle(twiddle_cmd) => {
+                // Use tokio runtime for async execution
+                let rt =
+                    tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
+                rt.block_on(twiddle_cmd.execute())
+            }
         }
     }
 }
@@ -205,6 +233,171 @@ impl AmendCommand {
 
         handler
             .apply_amendments(&self.yaml_file)
+            .context("Failed to apply amendments")?;
+
+        Ok(())
+    }
+}
+
+impl TwiddleCommand {
+    /// Execute twiddle command
+    pub async fn execute(self) -> Result<()> {
+        use crate::claude::ClaudeClient;
+
+        println!("🪄 Starting AI-powered commit message improvement...");
+
+        // 1. Generate repository view (reuse ViewCommand logic)
+        let repo_view = self.generate_repository_view().await?;
+
+        // 2. Initialize Claude client
+        let claude_client = ClaudeClient::new(self.model.clone())?;
+
+        // 3. Generate amendments via Claude API
+        println!("🤖 Analyzing commits with Claude AI...");
+        let amendments = claude_client.generate_amendments(&repo_view).await?;
+
+        // 4. Handle different output modes
+        if let Some(save_path) = self.save_only {
+            amendments.save_to_file(save_path)?;
+            println!("💾 Amendments saved to file");
+            return Ok(());
+        }
+
+        // 5. Show preview and get confirmation
+        if !amendments.amendments.is_empty() {
+            self.show_amendment_preview(&amendments)?;
+
+            if !self.auto_apply && !self.get_user_confirmation()? {
+                println!("❌ Amendment cancelled by user");
+                return Ok(());
+            }
+
+            // 6. Apply amendments (reuse AmendCommand logic)
+            self.apply_amendments(amendments).await?;
+            println!("✅ Commit messages improved successfully!");
+        } else {
+            println!("✨ All commit messages are already well-formatted!");
+        }
+
+        Ok(())
+    }
+
+    /// Generate repository view (reuse ViewCommand logic)
+    async fn generate_repository_view(&self) -> Result<crate::data::RepositoryView> {
+        use crate::data::{
+            AiInfo, FieldExplanation, FileStatusInfo, RepositoryView, VersionInfo,
+            WorkingDirectoryInfo,
+        };
+        use crate::git::{GitRepository, RemoteInfo};
+        use crate::utils::ai_scratch;
+
+        let commit_range = self.commit_range.as_deref().unwrap_or("HEAD~5..HEAD");
+
+        // Open git repository
+        let repo = GitRepository::open()
+            .context("Failed to open git repository. Make sure you're in a git repository.")?;
+
+        // Get working directory status
+        let wd_status = repo.get_working_directory_status()?;
+        let working_directory = WorkingDirectoryInfo {
+            clean: wd_status.clean,
+            untracked_changes: wd_status
+                .untracked_changes
+                .into_iter()
+                .map(|fs| FileStatusInfo {
+                    status: fs.status,
+                    file: fs.file,
+                })
+                .collect(),
+        };
+
+        // Get remote information
+        let remotes = RemoteInfo::get_all_remotes(repo.repository())?;
+
+        // Parse commit range and get commits
+        let commits = repo.get_commits_in_range(commit_range)?;
+
+        // Create version information
+        let versions = Some(VersionInfo {
+            omni_dev: env!("CARGO_PKG_VERSION").to_string(),
+        });
+
+        // Get AI scratch directory
+        let ai_scratch_path =
+            ai_scratch::get_ai_scratch_dir().context("Failed to determine AI scratch directory")?;
+        let ai_info = AiInfo {
+            scratch: ai_scratch_path.to_string_lossy().to_string(),
+        };
+
+        // Build repository view
+        let mut repo_view = RepositoryView {
+            versions,
+            explanation: FieldExplanation::default(),
+            working_directory,
+            remotes,
+            ai: ai_info,
+            branch_info: None,
+            pr_template: None,
+            branch_prs: None,
+            commits,
+        };
+
+        // Update field presence based on actual data
+        repo_view.update_field_presence();
+
+        Ok(repo_view)
+    }
+
+    /// Show amendment preview to user
+    fn show_amendment_preview(
+        &self,
+        amendments: &crate::data::amendments::AmendmentFile,
+    ) -> Result<()> {
+        println!(
+            "\n📝 Found {} commits that could be improved:",
+            amendments.amendments.len()
+        );
+        println!();
+
+        for amendment in &amendments.amendments {
+            let short_hash = &amendment.commit[..8];
+            println!("  {} → {}", short_hash, amendment.message);
+        }
+        println!();
+
+        Ok(())
+    }
+
+    /// Get user confirmation for applying amendments
+    fn get_user_confirmation(&self) -> Result<bool> {
+        use std::io::{self, Write};
+
+        print!("❓ Apply these amendments? [y/N] ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+
+        let input = input.trim().to_lowercase();
+        Ok(input == "y" || input == "yes")
+    }
+
+    /// Apply amendments using existing AmendmentHandler logic
+    async fn apply_amendments(
+        &self,
+        amendments: crate::data::amendments::AmendmentFile,
+    ) -> Result<()> {
+        use crate::git::AmendmentHandler;
+
+        // Create temporary file for amendments
+        let temp_dir = tempfile::tempdir()?;
+        let temp_file = temp_dir.path().join("twiddle_amendments.yaml");
+        amendments.save_to_file(&temp_file)?;
+
+        // Use AmendmentHandler to apply amendments
+        let handler = AmendmentHandler::new().context("Failed to initialize amendment handler")?;
+        handler
+            .apply_amendments(&temp_file.to_string_lossy())
             .context("Failed to apply amendments")?;
 
         Ok(())
