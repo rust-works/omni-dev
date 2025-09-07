@@ -38,10 +38,7 @@ impl AmendmentFile {
 
     /// Validate amendment file structure and content
     pub fn validate(&self) -> Result<()> {
-        if self.amendments.is_empty() {
-            anyhow::bail!("Amendment file must contain at least one amendment");
-        }
-
+        // Empty amendments are allowed - they indicate no changes are needed
         for (i, amendment) in self.amendments.iter().enumerate() {
             amendment
                 .validate()

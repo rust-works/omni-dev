@@ -211,10 +211,26 @@ Arguments:
   [COMMIT_RANGE]  Commit range to analyze and improve (e.g., HEAD~3..HEAD, abc123..def456)
 
 Options:
-      --model <MODEL>     Claude API model to use (defaults to claude-3-5-sonnet-20241022) [default: claude-3-5-sonnet-20241022]
-      --auto-apply        Skip confirmation prompt and apply amendments automatically
-      --save-only <FILE>  Save generated amendments to file without applying
-  -h, --help              Print help
+      --model <MODEL>
+          Claude API model to use (defaults to claude-3-5-sonnet-20241022) [default: claude-3-5-sonnet-20241022]
+      --auto-apply
+          Skip confirmation prompt and apply amendments automatically
+      --save-only <FILE>
+          Save generated amendments to file without applying
+      --use-context
+          Use additional project context for better suggestions (Phase 3)
+      --context-dir <CONTEXT_DIR>
+          Path to custom context directory (defaults to .omni-dev/)
+      --work-context <WORK_CONTEXT>
+          Specify work context (e.g., "feature: user authentication")
+      --branch-context <BRANCH_CONTEXT>
+          Override detected branch context
+      --no-context
+          Disable contextual analysis (use basic prompting only)
+      --batch-size <BATCH_SIZE>
+          Maximum number of commits to process in a single batch (default: 4) [default: 4]
+  -h, --help
+          Print help
 
 
 ================================================================================

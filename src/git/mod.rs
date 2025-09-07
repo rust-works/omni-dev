@@ -9,7 +9,7 @@ pub mod remote;
 pub mod repository;
 
 pub use amendment::AmendmentHandler;
-pub use commit::{CommitAnalysis, CommitInfo};
+pub use commit::{CommitAnalysis, CommitAnalysisForAI, CommitInfo, CommitInfoForAI};
 pub use remote::RemoteInfo;
 pub use repository::GitRepository;
 
