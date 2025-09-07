@@ -175,9 +175,10 @@ Commit message operations
 Usage: message <COMMAND>
 
 Commands:
-  view   Analyze commits and output repository information in YAML format
-  amend  Amend commit messages based on a YAML configuration file
-  help   Print this message or the help of the given subcommand(s)
+  view     Analyze commits and output repository information in YAML format
+  amend    Amend commit messages based on a YAML configuration file
+  twiddle  AI-powered commit message improvement using Claude
+  help     Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
@@ -196,6 +197,24 @@ Arguments:
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev git commit message twiddle - AI-powered commit message improvement using Claude
+
+AI-powered commit message improvement using Claude
+
+Usage: twiddle [OPTIONS] [COMMIT_RANGE]
+
+Arguments:
+  [COMMIT_RANGE]  Commit range to analyze and improve (e.g., HEAD~3..HEAD, abc123..def456)
+
+Options:
+      --model <MODEL>     Claude API model to use (defaults to claude-3-5-sonnet-20241022) [default: claude-3-5-sonnet-20241022]
+      --auto-apply        Skip confirmation prompt and apply amendments automatically
+      --save-only <FILE>  Save generated amendments to file without applying
+  -h, --help              Print help
 
 
 ================================================================================
