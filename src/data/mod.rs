@@ -1,16 +1,18 @@
 //! Data processing and serialization
 
-use crate::git::{CommitInfo, RemoteInfo};
+use crate::git::{CommitInfo, CommitInfoForAI, RemoteInfo};
 use serde::{Deserialize, Serialize};
 
 pub mod amendments;
+pub mod context;
 pub mod yaml;
 
 pub use amendments::*;
+pub use context::*;
 pub use yaml::*;
 
 /// Complete repository view output structure
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepositoryView {
     /// Version information for the omni-dev tool
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -36,8 +38,35 @@ pub struct RepositoryView {
     pub commits: Vec<CommitInfo>,
 }
 
+/// Enhanced repository view for AI processing with full diff content
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepositoryViewForAI {
+    /// Version information for the omni-dev tool
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub versions: Option<VersionInfo>,
+    /// Explanation of field meanings and structure
+    pub explanation: FieldExplanation,
+    /// Working directory status information
+    pub working_directory: WorkingDirectoryInfo,
+    /// List of remote repositories and their main branches
+    pub remotes: Vec<RemoteInfo>,
+    /// AI-related information
+    pub ai: AiInfo,
+    /// Branch information (only present when using branch commands)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_info: Option<BranchInfo>,
+    /// Pull request template content (only present in branch commands when template exists)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr_template: Option<String>,
+    /// Pull requests created from the current branch (only present in branch commands)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_prs: Option<Vec<PullRequest>>,
+    /// List of analyzed commits with enhanced metadata including full diff content
+    pub commits: Vec<CommitInfoForAI>,
+}
+
 /// Field explanation for the YAML output
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldExplanation {
     /// Descriptive text explaining the overall structure
     pub text: String,
@@ -46,7 +75,7 @@ pub struct FieldExplanation {
 }
 
 /// Individual field documentation
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldDocumentation {
     /// Name of the field being documented
     pub name: String,
@@ -60,7 +89,7 @@ pub struct FieldDocumentation {
 }
 
 /// Working directory information
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkingDirectoryInfo {
     /// Whether the working directory has no changes
     pub clean: bool,
@@ -69,7 +98,7 @@ pub struct WorkingDirectoryInfo {
 }
 
 /// File status information for working directory
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileStatusInfo {
     /// Git status flags (e.g., "AM", "??", "M ")
     pub status: String,
@@ -78,21 +107,21 @@ pub struct FileStatusInfo {
 }
 
 /// Version information for tools and environment
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VersionInfo {
     /// Version of the omni-dev tool
     pub omni_dev: String,
 }
 
 /// AI-related information
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiInfo {
     /// Path to AI scratch directory
     pub scratch: String,
 }
 
 /// Branch information for branch-specific commands
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BranchInfo {
     /// Current branch name
     pub branch: String,
@@ -334,5 +363,29 @@ impl Default for FieldExplanation {
                 },
             ],
         }
+    }
+}
+
+impl RepositoryViewForAI {
+    /// Convert from basic RepositoryView by loading diff content for all commits
+    pub fn from_repository_view(repo_view: RepositoryView) -> anyhow::Result<Self> {
+        // Convert all commits to AI-enhanced versions
+        let commits: Result<Vec<_>, _> = repo_view
+            .commits
+            .into_iter()
+            .map(CommitInfoForAI::from_commit_info)
+            .collect();
+
+        Ok(Self {
+            versions: repo_view.versions,
+            explanation: repo_view.explanation,
+            working_directory: repo_view.working_directory,
+            remotes: repo_view.remotes,
+            ai: repo_view.ai,
+            branch_info: repo_view.branch_info,
+            pr_template: repo_view.pr_template,
+            branch_prs: repo_view.branch_prs,
+            commits: commits?,
+        })
     }
 }
