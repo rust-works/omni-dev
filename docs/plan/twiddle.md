@@ -14,7 +14,14 @@
 - ✅ Preview functionality operational (`src/cli/git.rs:324-342`)
 - ✅ Comprehensive error messages via ClaudeError enum
 
-**Current Status**: Ready for production use with full Phase 1 & 2 functionality. Phase 3 (testing) and Phase 4 (edge cases) remain for future development.
+**Phase 3: Contextual Intelligence** - 🔄 **PLANNED**
+- 🔄 Project-level context discovery (.omni-dev/, .gitmessage, CONTRIBUTING.md)
+- 🔄 Branch-aware commit analysis and work pattern detection
+- 🔄 Multi-commit range context understanding
+- 🔄 File-based architectural context recognition
+- 🔄 Enhanced Claude prompting with project-specific guidelines
+
+**Current Status**: Ready for production use with full Phase 1 & 2 functionality. Phase 3 (contextual intelligence) and subsequent phases remain for future development.
 
 ### Key Accomplishments
 - ✅ Full `omni-dev git commit message twiddle` command implementation
@@ -33,6 +40,7 @@ The `omni-dev git commit message twiddle` command is a new feature that combines
 
 ## Command Flow
 
+### Basic Flow (Phase 1 & 2 - Implemented)
 ```
 omni-dev git commit message twiddle [COMMIT_RANGE]
     ↓
@@ -41,6 +49,25 @@ omni-dev git commit message twiddle [COMMIT_RANGE]
 2. Send YAML to Claude API → Amendment suggestions
     ↓
 3. Execute amend command logic → Apply amendments
+```
+
+### Enhanced Contextual Flow (Phase 3 - Planned)
+```
+omni-dev git commit message twiddle [COMMIT_RANGE] --use-context
+    ↓
+1. Project Context Discovery (.omni-dev/, .gitmessage, CONTRIBUTING.md)
+    ↓
+2. Branch Analysis (naming patterns, work type detection)
+    ↓
+3. Commit Range Analysis (work patterns, scope consistency)
+    ↓
+4. File-based Context (architectural layers, change impact)
+    ↓
+5. Enhanced Repository View (with contextual metadata)
+    ↓
+6. Context-aware Claude prompting → Intelligent suggestions
+    ↓
+7. Apply amendments with context validation
 ```
 
 ## Existing Commands Analysis
@@ -81,10 +108,14 @@ Add to `MessageSubcommands` in `src/cli/git.rs:47-53`:
 Twiddle(TwiddleCommand),
 ```
 
-### 2. TwiddleCommand Implementation
+### 2. Enhanced TwiddleCommand with Contextual Support
+
+#### Phase 3 Enhancement: Contextual Intelligence System
+
+The contextual system transforms twiddle from a basic formatter into an intelligent, project-aware commit improvement tool.
 
 ```rust
-/// Twiddle command options
+/// Twiddle command options (Phase 1 & 2 - Implemented)
 #[derive(Parser)]
 pub struct TwiddleCommand {
     /// Commit range to analyze and improve (e.g., HEAD~3..HEAD, abc123..def456)
@@ -102,6 +133,23 @@ pub struct TwiddleCommand {
     /// Save generated amendments to file without applying
     #[arg(long, value_name = "FILE")]
     pub save_only: Option<String>,
+    
+    // Phase 3 Contextual Enhancements - PLANNED
+    /// Use additional project context for better suggestions
+    #[arg(long, default_value = "true")]
+    pub use_context: bool,
+    
+    /// Path to custom context directory (defaults to .omni-dev/)
+    #[arg(long)]
+    pub context_dir: Option<PathBuf>,
+    
+    /// Specify work context (e.g., "feature: user authentication")
+    #[arg(long)]
+    pub work_context: Option<String>,
+    
+    /// Override detected branch context
+    #[arg(long)]
+    pub branch_context: Option<String>,
 }
 ```
 
@@ -188,7 +236,280 @@ Focus on commits that:
 Only include commits that actually need improvement. If all commits are already well-formatted, return an empty amendments array.
 ```
 
-### 5. Implementation Flow
+### 5. Contextual Intelligence System (Phase 3)
+
+#### 5.1. Multi-Layer Context Architecture
+
+The contextual system provides intelligent, project-aware commit message improvement through multiple layers of context discovery and analysis.
+
+```rust
+/// Core context structures for enhanced commit analysis
+pub struct CommitContext {
+    pub project: ProjectContext,
+    pub branch: BranchContext,
+    pub range: CommitRangeContext,
+    pub files: Vec<FileContext>,
+    pub user_provided: Option<String>,
+}
+
+/// Project-level context discovered from configuration files
+pub struct ProjectContext {
+    pub commit_guidelines: Option<String>,      // From .omni-dev/commit-guidelines.md
+    pub commit_template: Option<String>,        // From .gitmessage or .omni-dev/commit-template.txt
+    pub valid_scopes: Vec<ScopeDefinition>,     // From .omni-dev/scopes.yaml
+    pub feature_contexts: HashMap<String, FeatureContext>, // From .omni-dev/context/
+    pub project_conventions: ProjectConventions, // Parsed from CONTRIBUTING.md
+}
+
+/// Branch analysis and work pattern detection
+pub struct BranchContext {
+    pub work_type: WorkType,                    // feature, fix, docs, refactor, chore
+    pub scope: Option<String>,                  // Extracted from branch naming
+    pub ticket_id: Option<String>,              // JIRA-123, #456, etc.
+    pub description: String,                    // Parsed from branch name
+    pub is_feature_branch: bool,
+}
+
+/// Multi-commit analysis and work patterns
+pub struct CommitRangeContext {
+    pub related_commits: Vec<CommitHash>,
+    pub common_files: Vec<PathBuf>,
+    pub work_pattern: WorkPattern,              // sequential, refactoring, bug-hunt
+    pub scope_consistency: ScopeAnalysis,
+    pub architectural_impact: ArchitecturalImpact,
+}
+
+/// File-based context and architectural understanding
+pub struct FileContext {
+    pub file_purpose: FilePurpose,              // config, test, docs, core-logic
+    pub architectural_layer: Layer,             // ui, business, data, infrastructure  
+    pub change_impact: Impact,                  // breaking, additive, fix, style
+    pub project_significance: Significance,     // critical, important, routine
+}
+```
+
+#### 5.2. Project Context Discovery
+
+**Convention-Based Discovery Priority**:
+1. `.omni-dev/` directory (project-specific)
+2. Standard git files (`.gitmessage`)
+3. Documentation parsing (`CONTRIBUTING.md`, `README.md`)
+4. Ecosystem conventions (Rust, Node.js, Python, etc.)
+
+```rust
+impl ProjectContext {
+    pub fn discover(repo_path: &Path) -> Result<Self> {
+        let mut context = Self::default();
+        
+        // 1. Check .omni-dev/ directory
+        let omni_dev_dir = repo_path.join(".omni-dev");
+        if omni_dev_dir.exists() {
+            context.load_omni_dev_config(&omni_dev_dir)?;
+        }
+        
+        // 2. Standard git configuration
+        if let Ok(template) = fs::read_to_string(repo_path.join(".gitmessage")) {
+            context.commit_template = Some(template);
+        }
+        
+        // 3. Parse documentation
+        context.parse_contributing_guidelines(repo_path)?;
+        context.detect_ecosystem_conventions(repo_path)?;
+        
+        Ok(context)
+    }
+    
+    fn load_omni_dev_config(&mut self, dir: &Path) -> Result<()> {
+        // Load commit-guidelines.md
+        if let Ok(guidelines) = fs::read_to_string(dir.join("commit-guidelines.md")) {
+            self.commit_guidelines = Some(guidelines);
+        }
+        
+        // Load scopes.yaml
+        if let Ok(scopes_yaml) = fs::read_to_string(dir.join("scopes.yaml")) {
+            self.valid_scopes = serde_yaml::from_str(&scopes_yaml)?;
+        }
+        
+        // Load feature contexts
+        let contexts_dir = dir.join("context/feature-contexts");
+        if contexts_dir.exists() {
+            self.load_feature_contexts(&contexts_dir)?;
+        }
+        
+        Ok(())
+    }
+}
+```
+
+#### 5.3. Enhanced Claude Prompting
+
+**Context-Aware System Prompt Generation**:
+```rust
+pub fn generate_contextual_system_prompt(context: &CommitContext) -> String {
+    let mut prompt = SYSTEM_PROMPT.to_string();
+    
+    // Add project-specific guidelines
+    if let Some(guidelines) = &context.project.commit_guidelines {
+        prompt.push_str(&format!("\n\nProject-specific commit guidelines:\n{}", guidelines));
+    }
+    
+    // Add valid scopes
+    if !context.project.valid_scopes.is_empty() {
+        let scopes = context.project.valid_scopes.iter()
+            .map(|s| format!("- {}: {}", s.name, s.description))
+            .collect::<Vec<_>>()
+            .join("\n");
+        prompt.push_str(&format!("\n\nValid scopes for this project:\n{}", scopes));
+    }
+    
+    // Add branch context
+    if context.branch.is_feature_branch {
+        prompt.push_str(&format!(
+            "\n\nBranch context: This is a {} working on {}. Consider this context when improving commit messages.",
+            context.branch.work_type,
+            context.branch.description
+        ));
+    }
+    
+    // Add work pattern context
+    match context.range.work_pattern {
+        WorkPattern::Sequential => {
+            prompt.push_str("\n\nWork pattern: Sequential feature development. Ensure commit messages show logical progression.");
+        }
+        WorkPattern::Refactoring => {
+            prompt.push_str("\n\nWork pattern: Refactoring work. Focus on clarity about what's being restructured and why.");
+        }
+        WorkPattern::BugHunt => {
+            prompt.push_str("\n\nWork pattern: Bug investigation. Emphasize debugging steps and fixes clearly.");
+        }
+    }
+    
+    prompt
+}
+```
+
+#### 5.4. Configuration File Examples
+
+**.omni-dev/commit-guidelines.md**:
+```markdown
+# Project Commit Guidelines
+
+## Scopes
+- `auth`: Authentication and authorization systems  
+- `api`: Public API endpoints and contracts
+- `db`: Database operations and schema changes
+- `ui`: User interface components and styling
+- `config`: Configuration files and environment setup
+
+## Conventions  
+- Always reference issue numbers when available: `Fixes #123`
+- Use present tense imperatives: "Add feature" not "Added feature"
+- Keep subject line under 50 characters
+- Include breaking change notes in commit footer
+- Use co-authored trailers for pair programming
+
+## Examples
+Good: `feat(auth): add JWT token validation with expiry`
+Bad: `fixed login stuff`
+```
+
+**.omni-dev/scopes.yaml**:
+```yaml
+scopes:
+  - name: auth
+    description: Authentication and authorization systems
+    examples: ["login", "jwt", "oauth", "permissions"]
+    files: ["src/auth/", "middleware/auth.rs"]
+  
+  - name: api
+    description: Public API endpoints and contracts  
+    examples: ["routes", "handlers", "schemas", "validation"]
+    files: ["src/api/", "src/handlers/"]
+    
+  - name: db
+    description: Database operations and schema
+    examples: ["migrations", "queries", "models", "indexes"]  
+    files: ["migrations/", "src/models/", "src/db/"]
+```
+
+#### 5.5. Branch Analysis and Work Pattern Detection
+
+```rust
+impl BranchContext {
+    pub fn analyze(branch_name: &str) -> Result<Self> {
+        let mut context = Self::default();
+        
+        // Parse branch naming conventions
+        if let Some(captures) = BRANCH_PATTERN.captures(branch_name) {
+            context.work_type = captures.name("type")
+                .map(|m| WorkType::from_str(m.as_str()))
+                .transpose()?
+                .unwrap_or(WorkType::Unknown);
+                
+            context.scope = captures.name("scope")
+                .map(|m| m.as_str().to_string());
+                
+            context.description = captures.name("desc")
+                .map(|m| m.as_str().replace('-', ' '))
+                .unwrap_or_default();
+                
+            // Extract ticket references
+            context.ticket_id = extract_ticket_references(branch_name);
+        }
+        
+        context.is_feature_branch = matches!(
+            context.work_type, 
+            WorkType::Feature | WorkType::Fix | WorkType::Refactor
+        );
+        
+        Ok(context)
+    }
+}
+
+// Regex patterns for branch naming conventions
+static BRANCH_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^(?P<type>feature|feat|fix|docs|refactor|chore)/(?P<scope>[^/]*)/(?P<desc>.+)$|^(?P<type>feature|feat|fix|docs|refactor|chore)/(?P<desc>[^/]+)$").unwrap()
+});
+```
+
+#### 5.6. Enhanced User Experience
+
+**Context-Aware Command Output**:
+```bash
+$ omni-dev git commit message twiddle HEAD~3..HEAD --use-context
+
+🔍 Discovering project context...
+  ✓ Found commit guidelines in .omni-dev/commit-guidelines.md
+  ✓ Loaded 5 project scopes from .omni-dev/scopes.yaml  
+  ✓ Detected feature branch: feature/auth/user-login
+  ✓ Work pattern: Sequential feature development
+  ✓ Common scope detected: auth (authentication systems)
+  
+🧠 Branch context analysis:
+  Type: Feature development
+  Scope: auth  
+  Work: user login functionality
+  Pattern: 3 commits building toward complete feature
+  
+🤖 Analyzing commits with enhanced context...
+  Using project guidelines for auth scope
+  Applying sequential development pattern
+  Considering authentication domain expertise
+  
+📝 Found 2 commits that could be improved:
+
+  abc1234 → feat(auth): implement JWT token validation with expiry checks
+           (enhanced: added security considerations from project guidelines)
+           (before: "add jwt stuff")
+           
+  def5678 → feat(auth): add secure user login endpoint with rate limiting  
+           (enhanced: follows API endpoint patterns and security requirements)
+           (before: "login endpoint")
+
+❓ Apply these context-enhanced amendments? [y/N]
+```
+
+### 6. Implementation Flow
 
 #### TwiddleCommand::execute() Logic
 ```rust
@@ -302,17 +623,35 @@ ARGS:
     <COMMIT_RANGE>    Commit range to analyze (e.g., HEAD~3..HEAD) [default: HEAD~5..HEAD]
 
 OPTIONS:
+    Phase 1 & 2 (Implemented):
         --model <MODEL>           Claude model to use [default: claude-3-5-sonnet-20241022]
         --auto-apply             Skip confirmation and apply changes automatically
         --save-only <FILE>       Save amendments to file without applying
+    
+    Phase 3 (Contextual Intelligence - Planned):
+        --use-context            Use project context for enhanced suggestions [default: true]
+        --context-dir <DIR>      Path to custom context directory [default: .omni-dev]
+        --work-context <TEXT>    Specify work context (e.g., "feature: user auth")
+        --branch-context <TEXT>  Override detected branch context
+        --no-context             Disable contextual analysis (Phase 1 behavior)
+    
     -h, --help                   Print help information
 
 EXAMPLES:
-    # Improve last 3 commits
+    # Basic usage (Phase 1 & 2)
     omni-dev git commit message twiddle HEAD~3..HEAD
     
-    # Improve all commits since main branch
-    omni-dev git commit message twiddle main..HEAD
+    # With enhanced context (Phase 3)
+    omni-dev git commit message twiddle HEAD~3..HEAD --use-context
+    
+    # Custom work context
+    omni-dev git commit message twiddle --work-context "feature: user authentication system"
+    
+    # Use custom context directory
+    omni-dev git commit message twiddle --context-dir .config/commits
+    
+    # Disable context (fallback to basic mode)
+    omni-dev git commit message twiddle --no-context
     
     # Save amendments without applying
     omni-dev git commit message twiddle --save-only amendments.yaml
@@ -373,13 +712,22 @@ export OMNI_DEV_CLAUDE_MODEL="claude-3-5-sonnet-20241022"
 3. ✅ Comprehensive error messages (`src/claude/error.rs`)
 4. ✅ Help documentation and examples (CLI help text, templates)
 
-#### Phase 3: Polish & Testing 🔄 **TODO**
-1. 🔄 Comprehensive test suite (unit, integration, golden tests)
-2. 🔄 Performance optimizations  
-3. 🔄 Advanced configuration options
-4. 🔄 Documentation and examples
+#### Phase 3: Contextual Intelligence 🔄 **PLANNED**
+1. 🔄 Project-level context discovery system (`.omni-dev/`, `.gitmessage`, docs parsing)
+2. 🔄 Branch analysis and work pattern detection
+3. 🔄 Multi-commit range context understanding
+4. 🔄 File-based architectural context recognition  
+5. 🔄 Enhanced Claude prompting with project-specific guidelines
+6. 🔄 Context-aware CLI options (`--use-context`, `--work-context`)
+7. 🔄 Configuration file standards (commit-guidelines.md, scopes.yaml)
 
-#### Phase 4: Edge Case Handling 🔄 **TODO**
+#### Phase 4: Polish & Testing 🔄 **TODO**
+1. 🔄 Comprehensive test suite (unit, integration, golden tests)
+2. 🔄 Performance optimizations for context discovery
+3. 🔄 Advanced configuration options and templates
+4. 🔄 Documentation and usage examples
+
+#### Phase 5: Edge Case Handling 🔄 **TODO**
 1. 🔄 Large commit range optimization (chunking strategies)
 2. 🔄 API token limit management and context window monitoring
 3. 🔄 Partial failure recovery and retry mechanisms
@@ -388,8 +736,9 @@ export OMNI_DEV_CLAUDE_MODEL="claude-3-5-sonnet-20241022"
 6. 🔄 Concurrent processing safety and lock management
 7. 🔄 Git repository state validation and corruption recovery
 
-## File Structure Changes ✅ COMPLETED
+## File Structure Changes
 
+### Phase 1 & 2 - ✅ COMPLETED
 ```
 src/
 ├── cli/
@@ -408,8 +757,51 @@ src/
 └── .claude/commands/
     └── commit-twiddle.md      # ✅ Claude Code command definition
 
-docs/plan/twiddle.md          # ✅ This file (implementation complete)
+docs/plan/twiddle.md          # ✅ This file (updated with contextual plan)
 Cargo.toml                    # ✅ Added reqwest, tokio dependencies
 ```
 
-This plan provides a comprehensive roadmap for implementing the `twiddle` command that seamlessly integrates Claude AI capabilities with the existing omni-dev architecture while maintaining code quality, safety, and user experience standards.
+### Phase 3 Contextual Intelligence - 🔄 PLANNED  
+```
+src/
+├── claude/
+│   ├── context/               # 🔄 NEW - Contextual intelligence module
+│   │   ├── mod.rs            # 🔄 Context system exports
+│   │   ├── discovery.rs      # 🔄 Project context discovery
+│   │   ├── branch.rs         # 🔄 Branch analysis and patterns
+│   │   ├── files.rs          # 🔄 File-based context recognition
+│   │   └── patterns.rs       # 🔄 Work pattern detection
+│   └── prompts.rs            # 🔄 Enhanced with contextual prompting
+├── cli/
+│   └── git.rs                # 🔄 Extended TwiddleCommand with context options
+└── data/
+    ├── context.rs            # 🔄 NEW - Context data structures  
+    └── amendments.rs         # 🔄 Enhanced with context validation
+
+# Project Configuration Examples (User-created)
+.omni-dev/                    # 🔄 NEW - Project-specific context directory
+├── commit-guidelines.md      # 🔄 Project commit conventions
+├── commit-template.txt       # 🔄 Default commit message template
+├── scopes.yaml              # 🔄 Valid scopes and descriptions
+└── context/
+    └── feature-contexts/     # 🔄 Feature-specific context files
+
+.gitmessage                   # 🔄 Standard git commit template support
+```
+
+## Summary
+
+This plan provides a comprehensive roadmap for implementing the `twiddle` command that evolves from a basic Claude AI-powered commit formatter into an intelligent, context-aware commit improvement system.
+
+**Current State (Phases 1 & 2 - Completed)**: Production-ready twiddle command with Claude AI integration, user confirmation, and comprehensive error handling.
+
+**Future Vision (Phase 3 - Contextual Intelligence)**: Transform twiddle into a project-aware system that:
+- Understands project-specific commit conventions and guidelines  
+- Analyzes branch naming patterns and work types
+- Recognizes architectural contexts and file purposes
+- Provides context-enhanced Claude prompting for superior suggestions
+- Supports popular open source conventions out-of-the-box
+
+The contextual system respects existing project standards while providing intelligent enhancements, making omni-dev's twiddle command a powerful tool for maintaining consistent, high-quality commit messages across diverse development workflows.
+
+**Architecture Philosophy**: The design maintains backward compatibility while enabling progressive enhancement—users benefit from basic functionality immediately, with contextual intelligence available when configured. The system gracefully handles missing context, ensuring robust operation in any environment.

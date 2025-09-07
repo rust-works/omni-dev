@@ -40,6 +40,42 @@ pub struct CommitAnalysis {
     pub diff_file: String,
 }
 
+/// Enhanced commit analysis for AI processing with full diff content
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitAnalysisForAI {
+    /// Automatically detected conventional commit type (feat, fix, docs, test, chore, etc.)
+    pub detected_type: String,
+    /// Automatically detected scope based on file paths (cli, git, data, etc.)
+    pub detected_scope: String,
+    /// AI-generated conventional commit message based on file changes
+    pub proposed_message: String,
+    /// Detailed statistics about file changes in this commit
+    pub file_changes: FileChanges,
+    /// Git diff --stat output showing lines changed per file
+    pub diff_summary: String,
+    /// Path to diff file showing line-by-line changes
+    pub diff_file: String,
+    /// Full diff content for AI analysis
+    pub diff_content: String,
+}
+
+/// Commit information with enhanced analysis for AI processing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitInfoForAI {
+    /// Full SHA-1 hash of the commit
+    pub hash: String,
+    /// Commit author name and email address
+    pub author: String,
+    /// Commit date in ISO format with timezone
+    pub date: DateTime<FixedOffset>,
+    /// The original commit message as written by the author
+    pub original_message: String,
+    /// Array of remote main branches that contain this commit
+    pub in_main_branches: Vec<String>,
+    /// Enhanced automated analysis of the commit including diff content
+    pub analysis: CommitAnalysisForAI,
+}
+
 /// File changes statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileChanges {
@@ -486,5 +522,40 @@ impl CommitAnalysis {
 
         // Return the path as a string
         Ok(diff_path.to_string_lossy().to_string())
+    }
+}
+
+impl CommitInfoForAI {
+    /// Convert from basic CommitInfo by loading diff content
+    pub fn from_commit_info(commit_info: CommitInfo) -> Result<Self> {
+        let analysis = CommitAnalysisForAI::from_commit_analysis(commit_info.analysis)?;
+
+        Ok(Self {
+            hash: commit_info.hash,
+            author: commit_info.author,
+            date: commit_info.date,
+            original_message: commit_info.original_message,
+            in_main_branches: commit_info.in_main_branches,
+            analysis,
+        })
+    }
+}
+
+impl CommitAnalysisForAI {
+    /// Convert from basic CommitAnalysis by loading diff content from file
+    pub fn from_commit_analysis(analysis: CommitAnalysis) -> Result<Self> {
+        // Read the actual diff content from the file
+        let diff_content = fs::read_to_string(&analysis.diff_file)
+            .with_context(|| format!("Failed to read diff file: {}", analysis.diff_file))?;
+
+        Ok(Self {
+            detected_type: analysis.detected_type,
+            detected_scope: analysis.detected_scope,
+            proposed_message: analysis.proposed_message,
+            file_changes: analysis.file_changes,
+            diff_summary: analysis.diff_summary,
+            diff_file: analysis.diff_file,
+            diff_content,
+        })
     }
 }
