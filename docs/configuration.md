@@ -24,6 +24,19 @@ export CLAUDE_API_KEY="your-api-key-here"
 
 ## Configuration Files
 
+### Local Override Support
+
+**NEW**: All configuration files now support local overrides! If a file exists in `.omni-dev/local/`, it will take precedence over the shared project configuration in `.omni-dev/`.
+
+**Priority Order**:
+
+1. `.omni-dev/local/{filename}` - **Local override (highest priority)**
+2. `.omni-dev/{filename}` - Shared project configuration
+
+This allows developers to customize their personal workflow without affecting team settings.
+
+**Important**: Add `.omni-dev/local/` to your `.gitignore` to keep personal configurations private.
+
 ### 1. Scope Definitions (`.omni-dev/scopes.yaml`)
 
 **Purpose**: Define project-specific scopes and their meanings.
@@ -432,10 +445,94 @@ Recommended `.omni-dev/` structure:
 ├── scopes.yaml              # Required: Project scopes
 ├── commit-guidelines.md     # Required: Commit standards
 ├── commit-template.txt      # Optional: Commit template
+├── local/                   # Optional: Local overrides (add to .gitignore)
+│   ├── scopes.yaml          # Personal scope definitions
+│   ├── commit-guidelines.md # Personal commit guidelines
+│   ├── commit-template.txt  # Personal commit template
+│   └── context/             # Personal feature contexts
+│       └── feature-contexts/
 └── examples/               # Optional: Usage examples
     ├── good-commits.md
     └── before-after.md
 ```
+
+### Local Override Examples
+
+#### Personal Scope Additions
+
+**Team config** (`.omni-dev/scopes.yaml`):
+
+```yaml
+scopes:
+  - name: "api"
+    description: "Backend API changes"
+    file_patterns: ["src/api/**"]
+  - name: "ui"
+    description: "Frontend changes"
+    file_patterns: ["src/ui/**"]
+```
+
+**Your personal config** (`.omni-dev/local/scopes.yaml`):
+
+```yaml
+scopes:
+  - name: "api"
+    description: "Backend API changes"
+    file_patterns: ["src/api/**"]
+  - name: "ui"
+    description: "Frontend changes"
+    file_patterns: ["src/ui/**"]
+  # Personal addition
+  - name: "experimental"
+    description: "[LOCAL] My experimental features"
+    examples:
+      - "experimental: try new auth approach"
+    file_patterns: ["experiments/**", "sandbox/**"]
+```
+
+#### Personal Commit Template
+
+**Your personal template** (`.omni-dev/local/commit-template.txt`):
+
+```
+# [type](scope): [description]
+
+# What changed:
+# - 
+
+# Why it changed:
+# - 
+
+# Testing performed:
+# - 
+
+# Fixes #(issue_number)
+# Signed-off-by: Your Name <your@email.com>
+```
+
+### Setting Up Local Overrides
+
+1. **Create local directory**:
+
+   ```bash
+   mkdir -p .omni-dev/local
+   ```
+
+2. **Add to .gitignore**:
+
+   ```bash
+   echo ".omni-dev/local/" >> .gitignore
+   ```
+
+3. **Copy and customize**:
+
+   ```bash
+   # Start with team config
+   cp .omni-dev/scopes.yaml .omni-dev/local/scopes.yaml
+   
+   # Customize for your workflow
+   vim .omni-dev/local/scopes.yaml
+   ```
 
 ## Advanced Configuration
 

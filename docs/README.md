@@ -9,6 +9,7 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 - **[README](../README.md)** - Quick overview and installation
 - **[User Guide](user-guide.md)** - Comprehensive usage guide with examples
 - **[Configuration Guide](configuration.md)** - Set up contextual intelligence
+- **[Local Overrides](local-overrides.md)** - Personal configuration customization
 - **[Examples](examples.md)** - Real-world usage examples across different project types
 
 ### Reference & Support
@@ -70,6 +71,7 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 | **AI-Powered Twiddle** | [User Guide - Twiddle](user-guide.md#twiddle---ai-powered-improvement) | [Examples - Before/After](examples.md#beforeafter-showcases) |
 | **Contextual Intelligence** | [Configuration Guide](configuration.md#contextual-intelligence) | [User Guide - Context](user-guide.md#contextual-intelligence) |
 | **Project Configuration** | [Configuration Guide - Setup](configuration.md#setting-up-context) | [Examples - Configurations](examples.md#project-specific-examples) |
+| **Local Overrides** | [Local Overrides Guide](local-overrides.md) | [Configuration - Local Setup](configuration.md#local-override-examples) |
 | **Automatic Batching** | [User Guide - Batching](user-guide.md#automatic-batching) | [Troubleshooting - Performance](troubleshooting.md#performance-issues) |
 | **Workflow Integration** | [User Guide - Workflows](user-guide.md#workflows) | [Examples - Enterprise](examples.md#enterprise-monorepo) |
 
