@@ -274,6 +274,23 @@ We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.
   - Set: `export CLAUDE_API_KEY="your-key"`
 - **Git**: Any modern version
 
+## 🐛 Debugging
+
+For troubleshooting and detailed logging, use the `RUST_LOG` environment variable:
+
+```bash
+# Enable debug logging for omni-dev components
+RUST_LOG=omni_dev=debug omni-dev git commit message twiddle ...
+
+# Debug specific modules (e.g., context discovery)  
+RUST_LOG=omni_dev::claude::context::discovery=debug omni-dev git commit message twiddle ...
+
+# Show only errors and warnings
+RUST_LOG=warn omni-dev git commit message twiddle ...
+```
+
+See [Troubleshooting Guide](docs/troubleshooting.md) for detailed debugging information.
+
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md) for a list of changes in each version.

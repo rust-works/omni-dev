@@ -41,3 +41,6 @@ cobertura.xml
 lcov.info
 
 .ai
+
+# Local omni-dev configuration overrides (personal settings)
+.omni-dev/local/
