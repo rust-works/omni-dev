@@ -445,7 +445,9 @@ impl TwiddleCommand {
             all_amendments.save_to_file(&amendments_file)?;
 
             // Show file path and get user choice
-            if !self.auto_apply && !self.handle_amendments_file(&amendments_file, &all_amendments)? {
+            if !self.auto_apply
+                && !self.handle_amendments_file(&amendments_file, &all_amendments)?
+            {
                 println!("❌ Amendment cancelled by user");
                 return Ok(());
             }
@@ -540,7 +542,7 @@ impl TwiddleCommand {
         );
         println!("💾 Amendments saved to: {}", amendments_file.display());
         println!();
-        
+
         loop {
             print!("❓ [A]pply amendments, [S]how file, or [Q]uit? [A/s/q] ");
             io::stdout().flush()?;
@@ -556,7 +558,9 @@ impl TwiddleCommand {
                 }
                 "q" | "quit" => return Ok(false),
                 _ => {
-                    println!("Invalid choice. Please enter 'a' to apply, 's' to show, or 'q' to quit.");
+                    println!(
+                        "Invalid choice. Please enter 'a' to apply, 's' to show, or 'q' to quit."
+                    );
                 }
             }
         }
@@ -565,16 +569,16 @@ impl TwiddleCommand {
     /// Show the contents of the amendments file
     fn show_amendments_file(&self, amendments_file: &std::path::Path) -> Result<()> {
         use std::fs;
-        
+
         println!("\n📄 Amendments file contents:");
         println!("─────────────────────────────");
-        
-        let contents = fs::read_to_string(amendments_file)
-            .context("Failed to read amendments file")?;
-        
+
+        let contents =
+            fs::read_to_string(amendments_file).context("Failed to read amendments file")?;
+
         println!("{}", contents);
         println!("─────────────────────────────");
-        
+
         Ok(())
     }
 
