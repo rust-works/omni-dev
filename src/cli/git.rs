@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use tracing::debug;
 
 /// Git operations
 #[derive(Parser)]
@@ -621,8 +622,20 @@ impl TwiddleCommand {
             .cloned()
             .unwrap_or_else(|| std::path::PathBuf::from(".omni-dev"));
 
-        let discovery = ProjectDiscovery::new(context_dir);
-        context.project = discovery.discover().unwrap_or_default();
+        // ProjectDiscovery takes repo root and context directory
+        let repo_root = std::path::PathBuf::from(".");
+        let discovery = ProjectDiscovery::new(repo_root, context_dir.clone());
+        debug!(context_dir = ?context_dir, "Using context directory");
+        match discovery.discover() {
+            Ok(project_context) => {
+                debug!("Discovery successful");
+                context.project = project_context;
+            }
+            Err(e) => {
+                debug!(error = %e, "Discovery failed");
+                context.project = Default::default();
+            }
+        }
 
         // 2. Analyze current branch
         let repo = GitRepository::open()?;
