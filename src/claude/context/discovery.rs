@@ -7,26 +7,42 @@ use crate::data::context::{
 use anyhow::Result;
 use std::fs;
 use std::path::{Path, PathBuf};
+use tracing::debug;
 
 /// Project context discovery system
 pub struct ProjectDiscovery {
     repo_path: PathBuf,
+    context_dir: PathBuf,
 }
 
 impl ProjectDiscovery {
     /// Create a new project discovery instance
-    pub fn new(repo_path: PathBuf) -> Self {
-        Self { repo_path }
+    pub fn new(repo_path: PathBuf, context_dir: PathBuf) -> Self {
+        Self {
+            repo_path,
+            context_dir,
+        }
     }
 
     /// Discover all project context
     pub fn discover(&self) -> Result<ProjectContext> {
         let mut context = ProjectContext::default();
 
-        // 1. Check .omni-dev/ directory (highest priority)
-        let omni_dev_dir = self.repo_path.join(".omni-dev");
-        if omni_dev_dir.exists() {
-            self.load_omni_dev_config(&mut context, &omni_dev_dir)?;
+        // 1. Check custom context directory (highest priority)
+        let context_dir_path = if self.context_dir.is_absolute() {
+            self.context_dir.clone()
+        } else {
+            self.repo_path.join(&self.context_dir)
+        };
+        debug!(
+            context_dir = ?context_dir_path,
+            exists = context_dir_path.exists(),
+            "Looking for context directory"
+        );
+        if context_dir_path.exists() {
+            debug!("Loading omni-dev config");
+            self.load_omni_dev_config(&mut context, &context_dir_path)?;
+            debug!("Config loading completed");
         }
 
         // 2. Standard git configuration files
@@ -41,22 +57,31 @@ impl ProjectDiscovery {
         Ok(context)
     }
 
-    /// Load configuration from .omni-dev/ directory
+    /// Load configuration from .omni-dev/ directory with local override support
     fn load_omni_dev_config(&self, context: &mut ProjectContext, dir: &Path) -> Result<()> {
-        // Load commit guidelines
-        let guidelines_path = dir.join("commit-guidelines.md");
+        // Load commit guidelines (with local override)
+        let guidelines_path = self.resolve_config_file(dir, "commit-guidelines.md");
+        debug!(
+            path = ?guidelines_path,
+            exists = guidelines_path.exists(),
+            "Checking for commit guidelines"
+        );
         if guidelines_path.exists() {
-            context.commit_guidelines = Some(fs::read_to_string(guidelines_path)?);
+            let content = fs::read_to_string(&guidelines_path)?;
+            debug!(bytes = content.len(), "Loaded commit guidelines");
+            context.commit_guidelines = Some(content);
+        } else {
+            debug!("No commit guidelines file found");
         }
 
-        // Load commit template
-        let template_path = dir.join("commit-template.txt");
+        // Load commit template (with local override)
+        let template_path = self.resolve_config_file(dir, "commit-template.txt");
         if template_path.exists() {
             context.commit_template = Some(fs::read_to_string(template_path)?);
         }
 
-        // Load scopes configuration
-        let scopes_path = dir.join("scopes.yaml");
+        // Load scopes configuration (with local override)
+        let scopes_path = self.resolve_config_file(dir, "scopes.yaml");
         if scopes_path.exists() {
             let scopes_yaml = fs::read_to_string(scopes_path)?;
             if let Ok(scopes_config) = serde_yaml::from_str::<ScopesConfig>(&scopes_yaml) {
@@ -64,13 +89,35 @@ impl ProjectDiscovery {
             }
         }
 
-        // Load feature contexts
+        // Load feature contexts (check both local and standard directories)
+        let local_contexts_dir = dir.join("local").join("context").join("feature-contexts");
         let contexts_dir = dir.join("context").join("feature-contexts");
+
+        // Load standard feature contexts first
         if contexts_dir.exists() {
             self.load_feature_contexts(context, &contexts_dir)?;
         }
 
+        // Load local feature contexts (will override if same name)
+        if local_contexts_dir.exists() {
+            self.load_feature_contexts(context, &local_contexts_dir)?;
+        }
+
         Ok(())
+    }
+
+    /// Resolve configuration file path with local override support
+    ///
+    /// Priority:
+    /// 1. .omni-dev/local/{filename} (local override)
+    /// 2. .omni-dev/{filename} (shared project config)
+    fn resolve_config_file(&self, dir: &Path, filename: &str) -> PathBuf {
+        let local_path = dir.join("local").join(filename);
+        if local_path.exists() {
+            local_path
+        } else {
+            dir.join(filename)
+        }
     }
 
     /// Load git configuration files

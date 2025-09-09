@@ -577,14 +577,80 @@ omni-dev git commit message twiddle "HEAD~5..HEAD"
 
 ### Enable Debug Output
 
-For detailed troubleshooting information:
+omni-dev uses the standard Rust logging system via the `RUST_LOG` environment variable. This provides detailed diagnostic information for troubleshooting.
+
+#### Basic Usage
 
 ```bash
-# Set Rust log level for more details
-RUST_LOG=debug omni-dev git commit message twiddle 'HEAD~3..HEAD' --use-context
+# Enable debug output for all omni-dev components
+RUST_LOG=omni_dev=debug omni-dev git commit message twiddle 'HEAD~3..HEAD' --use-context
 
-# Or just errors:
-RUST_LOG=error omni-dev git commit message twiddle 'HEAD~3..HEAD'
+# Enable all debug logging (including dependencies)
+RUST_LOG=debug omni-dev git commit message twiddle 'HEAD~3..HEAD'
+
+# Only show errors and warnings
+RUST_LOG=warn omni-dev git commit message twiddle 'HEAD~3..HEAD'
+```
+
+#### Log Levels (in order of verbosity)
+
+- `error` - Only errors
+- `warn` - Warnings and errors (default)  
+- `info` - Informational messages + above
+- `debug` - Debug information + above
+- `trace` - Most verbose logging + above
+
+#### Module-Specific Logging
+
+Target specific components for focused debugging:
+
+```bash
+# Debug only context discovery
+RUST_LOG=omni_dev::claude::context::discovery=debug omni-dev git commit message twiddle ...
+
+# Debug only Claude API interactions
+RUST_LOG=omni_dev::claude::client=debug omni-dev git commit message twiddle ...
+
+# Debug only CLI processing
+RUST_LOG=omni_dev::cli=debug omni-dev git commit message twiddle ...
+
+# Multiple modules
+RUST_LOG=omni_dev::claude=debug,omni_dev::git=info omni-dev git commit message twiddle ...
+```
+
+#### Common Debugging Scenarios
+
+**Configuration Issues:**
+```bash
+# See what config files are loaded
+RUST_LOG=omni_dev::claude::context::discovery=debug omni-dev git commit message twiddle ...
+```
+
+**API Communication Problems:**
+```bash  
+# Debug Claude API calls
+RUST_LOG=omni_dev::claude::client=debug omni-dev git commit message twiddle ...
+```
+
+**YAML Parsing Errors:**
+```bash
+# See raw Claude responses and parsing details
+RUST_LOG=omni_dev::claude=debug omni-dev git commit message twiddle ...
+```
+
+#### Output Format
+
+Debug output includes:
+- **Timestamp** - When the event occurred
+- **Level** - Log level (DEBUG, INFO, etc.)
+- **Module** - Which component generated the log
+- **Message** - The log message with structured fields
+- **Context** - Additional structured data (file paths, sizes, etc.)
+
+Example output:
+```
+2025-09-09T14:42:46.673223Z DEBUG omni_dev::claude::context::discovery: Looking for context directory context_dir="./.omni-dev" exists=true
+2025-09-09T14:42:46.673282Z DEBUG omni_dev::claude::context::discovery: Loaded commit guidelines bytes=1449
 ```
 
 ### Collect System Information

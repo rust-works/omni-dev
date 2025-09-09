@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use tracing::debug;
 
 /// Git operations
 #[derive(Parser)]
@@ -331,11 +332,15 @@ impl TwiddleCommand {
             return Ok(());
         }
 
-        // 7. Show preview and get confirmation
+        // 7. Handle amendments
         if !amendments.amendments.is_empty() {
-            self.show_amendment_preview(&amendments)?;
+            // Create temporary file for amendments
+            let temp_dir = tempfile::tempdir()?;
+            let amendments_file = temp_dir.path().join("twiddle_amendments.yaml");
+            amendments.save_to_file(&amendments_file)?;
 
-            if !self.auto_apply && !self.get_user_confirmation()? {
+            // Show file path and get user choice
+            if !self.auto_apply && !self.handle_amendments_file(&amendments_file, &amendments)? {
                 println!("❌ Amendment cancelled by user");
                 return Ok(());
             }
@@ -433,11 +438,17 @@ impl TwiddleCommand {
             return Ok(());
         }
 
-        // Show preview and get confirmation
+        // Handle amendments
         if !all_amendments.amendments.is_empty() {
-            self.show_amendment_preview(&all_amendments)?;
+            // Create temporary file for amendments
+            let temp_dir = tempfile::tempdir()?;
+            let amendments_file = temp_dir.path().join("twiddle_amendments.yaml");
+            all_amendments.save_to_file(&amendments_file)?;
 
-            if !self.auto_apply && !self.get_user_confirmation()? {
+            // Show file path and get user choice
+            if !self.auto_apply
+                && !self.handle_amendments_file(&amendments_file, &all_amendments)?
+            {
                 println!("❌ Amendment cancelled by user");
                 return Ok(());
             }
@@ -518,38 +529,58 @@ impl TwiddleCommand {
         Ok(repo_view)
     }
 
-    /// Show amendment preview to user
-    fn show_amendment_preview(
+    /// Handle amendments file - show path and get user choice
+    fn handle_amendments_file(
         &self,
+        amendments_file: &std::path::Path,
         amendments: &crate::data::amendments::AmendmentFile,
-    ) -> Result<()> {
-        println!(
-            "\n📝 Found {} commits that could be improved:",
-            amendments.amendments.len()
-        );
-        println!();
-
-        for amendment in &amendments.amendments {
-            let short_hash = &amendment.commit[..8];
-            println!("  {} → {}", short_hash, amendment.message);
-        }
-        println!();
-
-        Ok(())
-    }
-
-    /// Get user confirmation for applying amendments
-    fn get_user_confirmation(&self) -> Result<bool> {
+    ) -> Result<bool> {
         use std::io::{self, Write};
 
-        print!("❓ Apply these amendments? [y/N] ");
-        io::stdout().flush()?;
+        println!(
+            "\n📝 Found {} commits that could be improved.",
+            amendments.amendments.len()
+        );
+        println!("💾 Amendments saved to: {}", amendments_file.display());
+        println!();
 
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
+        loop {
+            print!("❓ [A]pply amendments, [S]how file, or [Q]uit? [A/s/q] ");
+            io::stdout().flush()?;
 
-        let input = input.trim().to_lowercase();
-        Ok(input == "y" || input == "yes")
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+
+            match input.trim().to_lowercase().as_str() {
+                "a" | "apply" | "" => return Ok(true),
+                "s" | "show" => {
+                    self.show_amendments_file(amendments_file)?;
+                    println!();
+                }
+                "q" | "quit" => return Ok(false),
+                _ => {
+                    println!(
+                        "Invalid choice. Please enter 'a' to apply, 's' to show, or 'q' to quit."
+                    );
+                }
+            }
+        }
+    }
+
+    /// Show the contents of the amendments file
+    fn show_amendments_file(&self, amendments_file: &std::path::Path) -> Result<()> {
+        use std::fs;
+
+        println!("\n📄 Amendments file contents:");
+        println!("─────────────────────────────");
+
+        let contents =
+            fs::read_to_string(amendments_file).context("Failed to read amendments file")?;
+
+        println!("{}", contents);
+        println!("─────────────────────────────");
+
+        Ok(())
     }
 
     /// Apply amendments using existing AmendmentHandler logic
@@ -591,8 +622,20 @@ impl TwiddleCommand {
             .cloned()
             .unwrap_or_else(|| std::path::PathBuf::from(".omni-dev"));
 
-        let discovery = ProjectDiscovery::new(context_dir);
-        context.project = discovery.discover().unwrap_or_default();
+        // ProjectDiscovery takes repo root and context directory
+        let repo_root = std::path::PathBuf::from(".");
+        let discovery = ProjectDiscovery::new(repo_root, context_dir.clone());
+        debug!(context_dir = ?context_dir, "Using context directory");
+        match discovery.discover() {
+            Ok(project_context) => {
+                debug!("Discovery successful");
+                context.project = project_context;
+            }
+            Err(e) => {
+                debug!(error = %e, "Discovery failed");
+                context.project = Default::default();
+            }
+        }
 
         // 2. Analyze current branch
         let repo = GitRepository::open()?;
