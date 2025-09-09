@@ -48,12 +48,15 @@ impl AmendmentFile {
         Ok(())
     }
 
-    /// Save amendments to YAML file
+    /// Save amendments to YAML file with proper multiline formatting
     pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let yaml_content =
             serde_yaml::to_string(self).context("Failed to serialize amendments to YAML")?;
 
-        fs::write(&path, yaml_content).with_context(|| {
+        // Post-process YAML to use literal block scalars for multiline messages
+        let formatted_yaml = self.format_multiline_yaml(&yaml_content);
+
+        fs::write(&path, formatted_yaml).with_context(|| {
             format!(
                 "Failed to write amendment file: {}",
                 path.as_ref().display()
@@ -61,6 +64,57 @@ impl AmendmentFile {
         })?;
 
         Ok(())
+    }
+
+    /// Format YAML to use literal block scalars for multiline messages
+    fn format_multiline_yaml(&self, yaml: &str) -> String {
+        let mut result = String::new();
+        let lines: Vec<&str> = yaml.lines().collect();
+        let mut i = 0;
+
+        while i < lines.len() {
+            let line = lines[i];
+
+            // Check if this is a message field with a quoted multiline string
+            if line.trim_start().starts_with("message:") && line.contains('"') {
+                let indent = line.len() - line.trim_start().len();
+                let indent_str = " ".repeat(indent);
+
+                // Extract the quoted content
+                if let Some(start_quote) = line.find('"') {
+                    if let Some(end_quote) = line.rfind('"') {
+                        if start_quote != end_quote {
+                            let quoted_content = &line[start_quote + 1..end_quote];
+
+                            // Check if it contains newlines (multiline content)
+                            if quoted_content.contains("\\n") {
+                                // Convert to literal block scalar format
+                                result.push_str(&format!("{}message: |\n", indent_str));
+
+                                // Process the content, converting \n to actual newlines
+                                let unescaped = quoted_content.replace("\\n", "\n");
+                                for (line_idx, content_line) in unescaped.lines().enumerate() {
+                                    if line_idx == 0 && content_line.trim().is_empty() {
+                                        // Skip leading empty line
+                                        continue;
+                                    }
+                                    result.push_str(&format!("{}  {}\n", indent_str, content_line));
+                                }
+                                i += 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Default: just copy the line as-is
+            result.push_str(line);
+            result.push('\n');
+            i += 1;
+        }
+
+        result
     }
 }
 
