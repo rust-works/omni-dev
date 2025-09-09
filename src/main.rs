@@ -3,6 +3,15 @@ use omni_dev::Cli;
 use std::process;
 
 fn main() {
+    // Initialize tracing subscriber with RUST_LOG environment variable support
+    // Default to "warn" level if RUST_LOG is not set
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .init();
+
     let cli = Cli::parse();
 
     if let Err(e) = cli.execute() {

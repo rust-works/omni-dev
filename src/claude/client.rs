@@ -5,6 +5,7 @@ use crate::data::{amendments::AmendmentFile, RepositoryView, RepositoryViewForAI
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 /// Claude API request message
 #[derive(Serialize)]
@@ -143,6 +144,17 @@ impl ClaudeClient {
         let system_prompt = prompts::generate_contextual_system_prompt(context);
         let user_prompt = prompts::generate_contextual_user_prompt(&repo_yaml, context);
 
+        // Debug logging to troubleshoot custom commit type issue
+        match &context.project.commit_guidelines {
+            Some(guidelines) => {
+                debug!(length = guidelines.len(), "Project commit guidelines found");
+                debug!(guidelines = %guidelines, "Commit guidelines content");
+            }
+            None => {
+                debug!("No project commit guidelines found");
+            }
+        }
+
         // Build the request with contextual prompts
         let request = ClaudeRequest {
             model: self.model.clone(),
@@ -157,8 +169,6 @@ impl ClaudeClient {
                 content: user_prompt,
             }],
         };
-
-        // Contextual request debugging can be enabled if needed for troubleshooting
 
         // Send request to Claude API
         let response = self
@@ -225,14 +235,14 @@ impl ClaudeClient {
 
         // Try to parse YAML
         let amendment_file: AmendmentFile = serde_yaml::from_str(yaml_content).map_err(|e| {
-            eprintln!("DEBUG: YAML parsing failed. Raw content:");
-            eprintln!("=== RAW CLAUDE RESPONSE ===");
-            eprintln!("{}", content);
-            eprintln!("=== EXTRACTED YAML ===");
-            eprintln!("{}", yaml_content);
-            eprintln!("=== YAML ERROR ===");
-            eprintln!("{}", e);
-            eprintln!("=== END DEBUG ===");
+            debug!(
+                error = %e,
+                content_length = content.len(),
+                yaml_length = yaml_content.len(),
+                "YAML parsing failed"
+            );
+            debug!(content = %content, "Raw Claude response");
+            debug!(yaml = %yaml_content, "Extracted YAML content");
 
             // Try to provide more helpful error messages for common issues
             if yaml_content.lines().any(|line| line.contains('\t')) {

@@ -7,26 +7,42 @@ use crate::data::context::{
 use anyhow::Result;
 use std::fs;
 use std::path::{Path, PathBuf};
+use tracing::debug;
 
 /// Project context discovery system
 pub struct ProjectDiscovery {
     repo_path: PathBuf,
+    context_dir: PathBuf,
 }
 
 impl ProjectDiscovery {
     /// Create a new project discovery instance
-    pub fn new(repo_path: PathBuf) -> Self {
-        Self { repo_path }
+    pub fn new(repo_path: PathBuf, context_dir: PathBuf) -> Self {
+        Self {
+            repo_path,
+            context_dir,
+        }
     }
 
     /// Discover all project context
     pub fn discover(&self) -> Result<ProjectContext> {
         let mut context = ProjectContext::default();
 
-        // 1. Check .omni-dev/ directory (highest priority)
-        let omni_dev_dir = self.repo_path.join(".omni-dev");
-        if omni_dev_dir.exists() {
-            self.load_omni_dev_config(&mut context, &omni_dev_dir)?;
+        // 1. Check custom context directory (highest priority)
+        let context_dir_path = if self.context_dir.is_absolute() {
+            self.context_dir.clone()
+        } else {
+            self.repo_path.join(&self.context_dir)
+        };
+        debug!(
+            context_dir = ?context_dir_path,
+            exists = context_dir_path.exists(),
+            "Looking for context directory"
+        );
+        if context_dir_path.exists() {
+            debug!("Loading omni-dev config");
+            self.load_omni_dev_config(&mut context, &context_dir_path)?;
+            debug!("Config loading completed");
         }
 
         // 2. Standard git configuration files
@@ -45,8 +61,17 @@ impl ProjectDiscovery {
     fn load_omni_dev_config(&self, context: &mut ProjectContext, dir: &Path) -> Result<()> {
         // Load commit guidelines (with local override)
         let guidelines_path = self.resolve_config_file(dir, "commit-guidelines.md");
+        debug!(
+            path = ?guidelines_path,
+            exists = guidelines_path.exists(),
+            "Checking for commit guidelines"
+        );
         if guidelines_path.exists() {
-            context.commit_guidelines = Some(fs::read_to_string(guidelines_path)?);
+            let content = fs::read_to_string(&guidelines_path)?;
+            debug!(bytes = content.len(), "Loaded commit guidelines");
+            context.commit_guidelines = Some(content);
+        } else {
+            debug!("No commit guidelines file found");
         }
 
         // Load commit template (with local override)

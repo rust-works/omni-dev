@@ -821,7 +821,7 @@ If you're currently writing commit messages manually:
 
 1. Check YAML syntax: `cat .omni-dev/scopes.yaml | python -m yaml`
 2. Verify file patterns match your structure
-3. Test with verbose output: `omni-dev git commit message view HEAD --use-context`
+3. Test with debug output: `RUST_LOG=omni_dev=debug omni-dev git commit message view HEAD --use-context`
 
 **Guidelines Not Loading**:
 
@@ -836,8 +836,8 @@ If you're currently writing commit messages manually:
 echo "Key starts with: $(echo $CLAUDE_API_KEY | head -c 10)..."
 echo "Key length: $(echo $CLAUDE_API_KEY | wc -c)"
 
-# Test API access
-omni-dev git commit message view HEAD --use-context --verbose
+# Test API access with debug output
+RUST_LOG=omni_dev=debug omni-dev git commit message view HEAD --use-context
 ```
 
 ## Example Setups

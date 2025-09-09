@@ -125,10 +125,16 @@ pub fn generate_contextual_system_prompt(context: &CommitContext) -> String {
         }
     }
 
-    // Add project-specific guidelines
+    // Add project-specific guidelines with strong emphasis
     if let Some(guidelines) = &context.project.commit_guidelines {
-        prompt.push_str("\n\nProject-specific commit guidelines:");
+        prompt.push_str("\n\n=== PROJECT-SPECIFIC COMMIT GUIDELINES (MANDATORY) ===");
+        prompt.push_str("\nIMPORTANT: This project uses CUSTOM commit types that COMPLETELY REPLACE the standard types (feat, fix, docs, etc.).");
+        prompt.push_str("\nYou MUST use ONLY the project-specific types shown below. DO NOT use any standard conventional commit types.");
+        prompt.push_str("\n\nFor example, if the project guidelines show 'xfeat' and 'xdocs', you must use 'xfeat' and 'xdocs', NOT 'feat' and 'docs'.");
+        prompt.push_str("\n\nProject commit guidelines:");
         prompt.push_str(&format!("\n{}", guidelines));
+        prompt.push_str("\n\n⚠️  CRITICAL: The commit types listed in the project guidelines above are the ONLY valid types for this project.");
+        prompt.push_str("\n⚠️  Do NOT use standard types like 'feat', 'fix', 'docs' - use the project-specific versions instead.");
     }
 
     // Add valid scopes if available
