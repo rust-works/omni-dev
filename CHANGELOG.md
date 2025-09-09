@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2025-09-09
+
+### Added
+- **File-based Amendment Workflow**: Complete overhaul of the twiddle command user experience
+  - Save amendments to temporary YAML files instead of printing to stdout
+  - Interactive menu system with [A]pply/[S]how/[Q]uit options 
+  - File content preview functionality for reviewing changes before applying
+  - Better user feedback and more granular control over amendment process
+  - Preserved backward compatibility with `--auto-apply` and `--save-only` options
+
+- **Local Configuration Overrides**: Personal workflow customization system
+  - Support for `.omni-dev/local/` directory to override shared project settings
+  - Local override capability for all configuration files (scopes, guidelines, templates)
+  - Priority system: local overrides take precedence over shared project configuration
+  - Automatic `.gitignore` exclusion to keep personal settings private
+  - Comprehensive documentation for setup and usage patterns
+
+- **Structured Debug Logging**: Professional logging system using `RUST_LOG`
+  - Integration with `tracing` and `tracing-subscriber` for structured logging
+  - Module-specific debug control (e.g., `RUST_LOG=omni_dev::claude=debug`)
+  - Detailed diagnostic information for troubleshooting configuration and API issues
+  - Comprehensive documentation in troubleshooting guide
+  - Replaced custom verbose flag with industry-standard logging approach
+
+### Improved
+- **YAML Output Formatting**: Enhanced readability of amendment files
+  - Automatic conversion of multiline commit messages to YAML literal block scalars (`|`)
+  - Proper formatting instead of escaped newlines in quoted strings
+  - Better preserved indentation and structure in generated files
+  - Improved user experience when reviewing amendment content
+
+### Removed
+- **Verbose Flag**: Removed `--verbose`/`-v` CLI option in favor of `RUST_LOG` environment variable
+  - More flexible and powerful debugging control through standard Rust logging
+  - Better performance with zero overhead when logging is disabled
+  - Industry-standard approach familiar to Rust developers
+
+### Documentation
+- **Comprehensive RUST_LOG Documentation**: Added detailed logging guides
+  - Basic usage examples and log level explanations
+  - Module-specific targeting for focused debugging
+  - Common troubleshooting scenarios with specific commands
+  - Updated README.md with debugging section
+- **Local Override Documentation**: Complete guide for personal configuration management
+  - Setup instructions and best practices
+  - Real-world usage examples and patterns
+  - Integration with team workflows
+
 ## [0.5.0] - 2025-09-01
 
 ### Changed
