@@ -397,18 +397,27 @@ Commits are validated by:
 
 ## Environment Setup
 
-### Claude API Key
+### AI Provider Setup
 
-**Required**: omni-dev needs a Claude API key for AI features.
+**Required**: omni-dev needs access to Claude AI for amendment features.
 
-#### Get Your API Key
+#### Available Options
+
+1. **Anthropic API** (Direct): Use Claude API directly from Anthropic
+2. **Amazon Bedrock** (AWS): Use Claude through AWS Bedrock service
+
+> 📖 **For detailed Bedrock setup**, see [Bedrock Integration Guide](bedrock-integration.md)
+
+#### Anthropic API Setup
+
+##### Get Your API Key
 
 1. Visit [Anthropic Console](https://console.anthropic.com/)
 2. Sign up/login to your account
 3. Navigate to API Keys section
 4. Generate a new API key
 
-#### Configure the Key
+##### Configure the Key
 
 **Option 1: Environment Variable (Recommended)**
 

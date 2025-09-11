@@ -22,6 +22,7 @@
 
 pub mod claude;
 pub mod cli;
+pub mod config;
 pub mod core;
 pub mod data;
 pub mod git;

@@ -41,7 +41,8 @@ struct ClaudeResponse {
 pub struct ClaudeClient {
     client: Client,
     api_key: String,
-    model: String,
+    /// The Claude model being used
+    pub model: String,
 }
 
 impl ClaudeClient {
