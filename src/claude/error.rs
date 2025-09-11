@@ -30,6 +30,10 @@ pub enum ClaudeError {
     /// Network connectivity error
     #[error("Network error: {0}")]
     NetworkError(String),
+
+    /// Configuration error
+    #[error("Configuration error: {0}")]
+    ConfigurationError(String),
 }
 
 // Note: anyhow already has a blanket impl for thiserror::Error types

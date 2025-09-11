@@ -12,7 +12,7 @@ conventional commit formats with project-aware suggestions.
 ## ✨ Key Features
 
 - 🤖 **AI-Powered Intelligence**: Claude AI analyzes your code changes to
-  suggest meaningful commit messages
+  suggest meaningful commit messages (via Anthropic API or AWS Bedrock)
 - 🧠 **Contextual Awareness**: Understands your project structure,
   conventions, and work patterns
 - 🔍 **Comprehensive Analysis**: Deep analysis of commits, branches, and
@@ -31,8 +31,9 @@ conventional commit formats with project-aware suggestions.
 # Install from crates.io
 cargo install omni-dev
 
-# Set up Claude API key (required for AI features)
+# Set up AI access (required for AI features)
 export CLAUDE_API_KEY="your-api-key-here"
+# OR use Amazon Bedrock (see docs/bedrock-integration.md)
 ```
 
 ### 30-Second Demo
