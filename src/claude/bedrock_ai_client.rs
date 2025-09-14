@@ -9,6 +9,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
+use tracing::{debug, info};
 use url::Url;
 
 /// Bedrock API request message
@@ -23,6 +24,7 @@ struct Message {
 struct BedrockRequest {
     anthropic_version: String,
     max_tokens: i32,
+    system: Option<String>,
     messages: Vec<Message>,
 }
 
@@ -110,15 +112,26 @@ impl BedrockAiClient {
         }
 
         // Create the base URL with path to the model endpoint
-        let model_url = url.join("model/")
+        let model_url = url
+            .join("model/")
             .map_err(|e| ClaudeError::NetworkError(format!("Failed to build API URL: {}", e)))?;
 
         // Now properly URL-encode the model ID and add it to the path
-        let encoded_model = url::form_urlencoded::byte_serialize(self.model.as_bytes()).collect::<String>();
+        let encoded_model =
+            url::form_urlencoded::byte_serialize(self.model.as_bytes()).collect::<String>();
+        debug!(original_model = %self.model, encoded_model = %encoded_model, "URL-encoded model ID");
 
         // Join the encoded model and invoke endpoint
-        let full_url = model_url.join(&format!("{}/invoke", encoded_model))
-            .map_err(|e| ClaudeError::NetworkError(format!("Failed to build API URL with encoded model: {}", e)))?;
+        let full_url = model_url
+            .join(&format!("{}/invoke", encoded_model))
+            .map_err(|e| {
+                ClaudeError::NetworkError(format!(
+                    "Failed to build API URL with encoded model: {}",
+                    e
+                ))
+            })?;
+
+        debug!(base_url = %self.base_url, full_url = %full_url, "Constructed Bedrock API URL");
 
         Ok(full_url.to_string())
     }
@@ -132,16 +145,8 @@ impl AiClient for BedrockAiClient {
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
         // Use Box::pin to wrap the async block in a Pin<Box<...>>
         Box::pin(async move {
-            // For Bedrock API, we need to include system prompt as a system message
+            // For Bedrock API, the system prompt is a separate parameter
             let mut messages = vec![];
-
-            // Add system message if provided
-            if !system_prompt.is_empty() {
-                messages.push(Message {
-                    role: "system".to_string(),
-                    content: system_prompt.to_string(),
-                });
-            }
 
             // Add user message
             messages.push(Message {
@@ -153,11 +158,26 @@ impl AiClient for BedrockAiClient {
             let request = BedrockRequest {
                 anthropic_version: "bedrock-2023-05-31".to_string(),
                 max_tokens: self.get_max_tokens(),
+                // Add system prompt as a separate field if it exists
+                system: if !system_prompt.is_empty() {
+                    Some(system_prompt.to_string())
+                } else {
+                    None
+                },
                 messages,
             };
 
+            debug!(
+                system_prompt_len = system_prompt.len(),
+                "Using system prompt"
+            );
+
             // Get the API URL
             let api_url = self.get_api_url()?;
+
+            // Log the URL for debugging purposes
+            info!(url = %api_url, "Sending request to Bedrock API");
+            debug!(model = %self.model, "Using model for Bedrock request");
 
             // Send request to Bedrock API
             let response = self
