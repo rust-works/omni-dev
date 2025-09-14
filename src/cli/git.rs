@@ -78,9 +78,9 @@ pub struct TwiddleCommand {
     #[arg(value_name = "COMMIT_RANGE")]
     pub commit_range: Option<String>,
 
-    /// Claude API model to use (defaults to claude-3-5-sonnet-20241022)
-    #[arg(long, default_value = "claude-3-5-sonnet-20241022")]
-    pub model: String,
+    /// Claude API model to use (if not specified, uses settings or default)
+    #[arg(long)]
+    pub model: Option<String>,
 
     /// Skip confirmation prompt and apply amendments automatically
     #[arg(long)]
@@ -306,7 +306,7 @@ impl TwiddleCommand {
         }
 
         // 5. Initialize Claude client
-        let claude_client = crate::claude::create_default_claude_client(Some(self.model.clone()))?;
+        let claude_client = crate::claude::create_default_claude_client(self.model.clone())?;
 
         // 6. Generate amendments via Claude API with context
         if use_contextual && context.is_some() {
@@ -362,7 +362,7 @@ impl TwiddleCommand {
         use crate::data::amendments::AmendmentFile;
 
         // Initialize Claude client
-        let claude_client = crate::claude::create_default_claude_client(Some(self.model.clone()))?;
+        let claude_client = crate::claude::create_default_claude_client(self.model.clone())?;
 
         // Split commits into batches
         let commit_batches: Vec<_> = full_repo_view.commits.chunks(self.batch_size).collect();

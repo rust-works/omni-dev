@@ -212,7 +212,7 @@ Arguments:
 
 Options:
       --model <MODEL>
-          Claude API model to use (defaults to claude-3-5-sonnet-20241022) [default: claude-3-5-sonnet-20241022]
+          Claude API model to use (if not specified, uses settings or default)
       --auto-apply
           Skip confirmation prompt and apply amendments automatically
       --save-only <FILE>
