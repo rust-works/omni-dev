@@ -1,6 +1,9 @@
 //! Claude API client implementation
 
-use crate::claude::{ai_client::{AiClient, AiClientMetadata}, error::ClaudeError};
+use crate::claude::{
+    ai_client::{AiClient, AiClientMetadata},
+    error::ClaudeError,
+};
 use anyhow::Result;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -59,7 +62,6 @@ impl ClaudeAiClient {
         }
     }
 
-
     /// Create a model-specific token limit
     fn get_max_tokens(&self) -> i32 {
         if self.model.contains("sonnet") {
@@ -78,7 +80,7 @@ impl AiClient for ClaudeAiClient {
     fn send_request<'a>(
         &'a self,
         system_prompt: &'a str,
-        user_prompt: &'a str
+        user_prompt: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
         // Use Box::pin to wrap the async block in a Pin<Box<...>>
         Box::pin(async move {
@@ -108,9 +110,11 @@ impl AiClient for ClaudeAiClient {
             if !response.status().is_success() {
                 let status = response.status();
                 let error_text = response.text().await.unwrap_or_default();
-                return Err(
-                    ClaudeError::ApiRequestFailed(format!("HTTP {}: {}", status, error_text)).into(),
-                );
+                return Err(ClaudeError::ApiRequestFailed(format!(
+                    "HTTP {}: {}",
+                    status, error_text
+                ))
+                .into());
             }
 
             let claude_response: ClaudeResponse = response
@@ -125,7 +129,8 @@ impl AiClient for ClaudeAiClient {
                 .filter(|c| c.content_type == "text")
                 .map(|c| c.text.clone())
                 .ok_or_else(|| {
-                    ClaudeError::InvalidResponseFormat("No text content in response".to_string()).into()
+                    ClaudeError::InvalidResponseFormat("No text content in response".to_string())
+                        .into()
                 })
         })
     }
@@ -139,7 +144,7 @@ impl AiClient for ClaudeAiClient {
         } else if self.model.contains("haiku") {
             (150000, 4096)
         } else {
-            (100000, 4000)  // default for older models
+            (100000, 4000) // default for older models
         };
 
         AiClientMetadata {
