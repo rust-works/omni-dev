@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2025-09-14
+
+### Added
+- **AWS Bedrock AI Client**: Complete integration with AWS Bedrock for Claude AI model access
+  - Implemented `BedrockAiClient` with full AWS API support
+  - Added comprehensive logging and diagnostics for troubleshooting
+  - Support for AWS credentials and region configuration
+  - Integration with existing `AiClient` trait architecture
+- **AI Client Architecture**: Extensible AI provider system
+  - New `AiClient` trait for pluggable AI providers
+  - Provider selection and configuration management
+  - Support for multiple AI service backends
+- **Settings Management System**: Enhanced configuration handling
+  - New settings management utilities for AI provider configuration
+  - Environment-based configuration support
+  - Structured settings validation and loading
+
+### Improved
+- **Code Quality**: Resolved clippy warnings for better maintainability
+  - Fixed `vec_init_then_push` patterns with `vec![]` macro usage
+  - Improved code consistency and performance
+
 ## [0.6.0] - 2025-09-09
 
 ### Added
@@ -179,7 +201,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation and community files (README, CONTRIBUTING, CODE_OF_CONDUCT)
 - BSD 3-Clause license
 
-[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/rust-works/omni-dev/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/rust-works/omni-dev/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/rust-works/omni-dev/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/rust-works/omni-dev/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/rust-works/omni-dev/compare/v0.3.0...v0.4.0
