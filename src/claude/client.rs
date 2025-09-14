@@ -1,7 +1,7 @@
 //! Claude client for commit message improvement
 
-use crate::claude::claude_ai_client::ClaudeAiClient;
 use crate::claude::{ai_client::AiClient, error::ClaudeError, prompts};
+use crate::claude::{bedrock_ai_client::BedrockAiClient, claude_ai_client::ClaudeAiClient};
 use crate::data::{
     amendments::AmendmentFile, context::CommitContext, RepositoryView, RepositoryViewForAI,
 };
@@ -149,14 +149,42 @@ impl ClaudeClient {
 pub fn create_default_claude_client(model: Option<String>) -> Result<ClaudeClient> {
     use crate::utils::settings::{get_env_var, get_env_vars};
 
+    // Check if we should use Bedrock
+    let use_bedrock = get_env_var("CLAUDE_CODE_USE_BEDROCK")
+        .map(|val| val == "true")
+        .unwrap_or(false);
+
     // Try to get model from env var ANTHROPIC_MODEL or use default
     let model = model
         .or_else(|| get_env_var("ANTHROPIC_MODEL").ok())
         .unwrap_or_else(|| "claude-3-haiku-20240307".to_string());
 
-    // Try to get API key from environment variables with settings fallback
-    let api_key = get_env_vars(&["CLAUDE_API_KEY", "ANTHROPIC_API_KEY"])
-        .map_err(|_| ClaudeError::ApiKeyNotFound)?;
+    if use_bedrock {
+        // Check if we should skip Bedrock auth
+        let skip_bedrock_auth = get_env_var("CLAUDE_CODE_SKIP_BEDROCK_AUTH")
+            .map(|val| val == "true")
+            .unwrap_or(false);
+
+        if skip_bedrock_auth {
+            // Use Bedrock AI client
+            let auth_token =
+                get_env_var("ANTHROPIC_AUTH_TOKEN").map_err(|_| ClaudeError::ApiKeyNotFound)?;
+
+            let base_url = get_env_var("ANTHROPIC_BEDROCK_BASE_URL")
+                .map_err(|_| ClaudeError::ApiKeyNotFound)?;
+
+            let ai_client = BedrockAiClient::new(model, auth_token, base_url);
+            return Ok(ClaudeClient::new(Box::new(ai_client)));
+        }
+    }
+
+    // Default: use standard Claude AI client
+    let api_key = get_env_vars(&[
+        "CLAUDE_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+    ])
+    .map_err(|_| ClaudeError::ApiKeyNotFound)?;
 
     let ai_client = ClaudeAiClient::new(model, api_key);
     Ok(ClaudeClient::new(Box::new(ai_client)))
