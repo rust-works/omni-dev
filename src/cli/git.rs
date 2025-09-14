@@ -267,7 +267,6 @@ impl AmendCommand {
 impl TwiddleCommand {
     /// Execute twiddle command with contextual intelligence
     pub async fn execute(self) -> Result<()> {
-
         // Determine if contextual analysis should be used
         let use_contextual = self.use_context && !self.no_context;
 

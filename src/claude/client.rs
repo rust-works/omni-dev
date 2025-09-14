@@ -1,8 +1,10 @@
 //! Claude client for commit message improvement
 
-use crate::claude::{ai_client::AiClient, error::ClaudeError, prompts};
 use crate::claude::claude_ai_client::ClaudeAiClient;
-use crate::data::{amendments::AmendmentFile, context::CommitContext, RepositoryView, RepositoryViewForAI};
+use crate::claude::{ai_client::AiClient, error::ClaudeError, prompts};
+use crate::data::{
+    amendments::AmendmentFile, context::CommitContext, RepositoryView, RepositoryViewForAI,
+};
 use anyhow::{Context, Result};
 use tracing::debug;
 
@@ -43,7 +45,8 @@ impl ClaudeClient {
         let user_prompt = prompts::generate_user_prompt(&repo_yaml);
 
         // Send request using AI client
-        let content = self.ai_client
+        let content = self
+            .ai_client
             .send_request(prompts::SYSTEM_PROMPT, &user_prompt)
             .await?;
 
@@ -81,7 +84,8 @@ impl ClaudeClient {
         }
 
         // Send request using AI client
-        let content = self.ai_client
+        let content = self
+            .ai_client
             .send_request(&system_prompt, &user_prompt)
             .await?;
 
@@ -141,13 +145,17 @@ impl ClaudeClient {
     }
 }
 
-/// Create a default Claude client using environment variables
+/// Create a default Claude client using environment variables and settings
 pub fn create_default_claude_client(model: Option<String>) -> Result<ClaudeClient> {
-    let model = model.unwrap_or_else(|| "claude-3-haiku-20240307".to_string());
+    use crate::utils::settings::{get_env_var, get_env_vars};
 
-    // Try to get API key from environment variables
-    let api_key = std::env::var("CLAUDE_API_KEY")
-        .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
+    // Try to get model from env var ANTHROPIC_MODEL or use default
+    let model = model
+        .or_else(|| get_env_var("ANTHROPIC_MODEL").ok())
+        .unwrap_or_else(|| "claude-3-haiku-20240307".to_string());
+
+    // Try to get API key from environment variables with settings fallback
+    let api_key = get_env_vars(&["CLAUDE_API_KEY", "ANTHROPIC_API_KEY"])
         .map_err(|_| ClaudeError::ApiKeyNotFound)?;
 
     let ai_client = ClaudeAiClient::new(model, api_key);
