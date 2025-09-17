@@ -3,6 +3,7 @@
 use crate::claude::{
     ai_client::{AiClient, AiClientMetadata},
     error::ClaudeError,
+    model_config::get_model_registry,
 };
 use anyhow::Result;
 use reqwest::Client;
@@ -88,17 +89,10 @@ impl BedrockAiClient {
         }
     }
 
-    /// Create a model-specific token limit
+    /// Get max tokens from model registry
     fn get_max_tokens(&self) -> i32 {
-        if self.model.contains("sonnet") {
-            8192
-        } else if self.model.contains("opus") {
-            12288
-        } else if self.model.contains("haiku") {
-            4096
-        } else {
-            4000 // default
-        }
+        let registry = get_model_registry();
+        registry.get_max_output_tokens(&self.model) as i32
     }
 
     /// Build the full API URL
@@ -252,16 +246,9 @@ impl AiClient for BedrockAiClient {
     }
 
     fn get_metadata(&self) -> AiClientMetadata {
-        // Determine context length based on model
-        let (max_context_length, max_response_length) = if self.model.contains("sonnet") {
-            (180000, 8192)
-        } else if self.model.contains("opus") {
-            (200000, 12288)
-        } else if self.model.contains("haiku") {
-            (150000, 4096)
-        } else {
-            (100000, 4000) // default for older models
-        };
+        let registry = get_model_registry();
+        let max_context_length = registry.get_input_context(&self.model);
+        let max_response_length = registry.get_max_output_tokens(&self.model);
 
         AiClientMetadata {
             provider: "Anthropic Bedrock".to_string(),
@@ -293,36 +280,28 @@ mod tests {
 
     #[test]
     fn test_get_max_tokens() {
-        // Test sonnet model
+        // Test legacy Claude 3 Opus
         let client = BedrockAiClient::new(
-            "claude-3-sonnet".to_string(),
+            "claude-3-opus-20240229".to_string(),
             "test_token".to_string(),
             "https://example.com".to_string(),
         );
-        assert_eq!(client.get_max_tokens(), 8192);
+        assert_eq!(client.get_max_tokens(), 4096); // Correct legacy limit
 
-        // Test opus model
+        // Test Claude Sonnet 4
         let client = BedrockAiClient::new(
-            "claude-3-opus".to_string(),
+            "claude-sonnet-4-20250514".to_string(),
             "test_token".to_string(),
             "https://example.com".to_string(),
         );
-        assert_eq!(client.get_max_tokens(), 12288);
+        assert_eq!(client.get_max_tokens(), 64000); // New high limit
 
-        // Test haiku model
+        // Test unknown model falls back to provider defaults
         let client = BedrockAiClient::new(
-            "claude-3-haiku".to_string(),
+            "claude-unknown-model".to_string(),
             "test_token".to_string(),
             "https://example.com".to_string(),
         );
-        assert_eq!(client.get_max_tokens(), 4096);
-
-        // Test unknown model
-        let client = BedrockAiClient::new(
-            "unknown-model".to_string(),
-            "test_token".to_string(),
-            "https://example.com".to_string(),
-        );
-        assert_eq!(client.get_max_tokens(), 4000);
+        assert_eq!(client.get_max_tokens(), 4096); // Claude provider default
     }
 }

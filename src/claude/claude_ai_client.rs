@@ -3,6 +3,7 @@
 use crate::claude::{
     ai_client::{AiClient, AiClientMetadata},
     error::ClaudeError,
+    model_config::get_model_registry,
 };
 use anyhow::Result;
 use reqwest::Client;
@@ -63,17 +64,10 @@ impl ClaudeAiClient {
         }
     }
 
-    /// Create a model-specific token limit
+    /// Get max tokens from model registry
     fn get_max_tokens(&self) -> i32 {
-        if self.model.contains("sonnet") {
-            8192
-        } else if self.model.contains("opus") {
-            12288
-        } else if self.model.contains("haiku") {
-            4096
-        } else {
-            4000 // default
-        }
+        let registry = get_model_registry();
+        registry.get_max_output_tokens(&self.model) as i32
     }
 }
 
@@ -175,16 +169,9 @@ impl AiClient for ClaudeAiClient {
     }
 
     fn get_metadata(&self) -> AiClientMetadata {
-        // Determine context length based on model
-        let (max_context_length, max_response_length) = if self.model.contains("sonnet") {
-            (180000, 8192)
-        } else if self.model.contains("opus") {
-            (200000, 12288)
-        } else if self.model.contains("haiku") {
-            (150000, 4096)
-        } else {
-            (100000, 4000) // default for older models
-        };
+        let registry = get_model_registry();
+        let max_context_length = registry.get_input_context(&self.model);
+        let max_response_length = registry.get_max_output_tokens(&self.model);
 
         AiClientMetadata {
             provider: "Anthropic".to_string(),
