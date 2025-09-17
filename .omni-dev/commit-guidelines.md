@@ -13,7 +13,7 @@ This project follows conventional commit format with specific requirements:
 
 ## Types
 - `feat`: New features or enhancements
-- `fix`: Bug fixes 
+- `fix`: Bug fixes
 - `docs`: Documentation changes
 - `refactor`: Code refactoring without behavior changes
 - `chore`: Maintenance tasks, dependency updates
@@ -35,9 +35,9 @@ For significant changes, include:
 ```
 feat(claude): add contextual intelligence for commit message improvement
 
-Implements Phase 3 of the twiddle command enhancement with multi-layer 
-context discovery including project conventions, branch analysis, and 
-work pattern detection. This enables more comprehensive and detailed 
+Implements Phase 3 of the twiddle command enhancement with multi-layer
+context discovery including project conventions, branch analysis, and
+work pattern detection. This enables more comprehensive and detailed
 commit messages similar to the Claude Code template workflow.
 
 - Add project context discovery from .omni-dev/ configuration
