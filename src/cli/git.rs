@@ -308,6 +308,9 @@ impl TwiddleCommand {
         // 5. Initialize Claude client
         let claude_client = crate::claude::create_default_claude_client(self.model.clone())?;
 
+        // Show model information
+        self.show_model_info()?;
+
         // 6. Generate amendments via Claude API with context
         if use_contextual && context.is_some() {
             println!("🤖 Analyzing commits with enhanced contextual intelligence...");
@@ -363,6 +366,9 @@ impl TwiddleCommand {
 
         // Initialize Claude client
         let claude_client = crate::claude::create_default_claude_client(self.model.clone())?;
+
+        // Show model information
+        self.show_model_info()?;
 
         // Split commits into batches
         let commit_batches: Vec<_> = full_repo_view.commits.chunks(self.batch_size).collect();
@@ -772,6 +778,62 @@ impl TwiddleCommand {
         // User context
         if let Some(ref user_ctx) = context.user_provided {
             println!("   👤 User context: {}", user_ctx);
+        }
+
+        println!();
+        Ok(())
+    }
+
+    /// Show model information and parameters
+    fn show_model_info(&self) -> Result<()> {
+        use crate::claude::model_config::get_model_registry;
+
+        // Get the model name from command line or settings
+        let model_name = self
+            .model
+            .clone()
+            .or_else(|| crate::utils::settings::get_env_var("ANTHROPIC_MODEL").ok())
+            .unwrap_or_else(|| "claude-3-haiku-20240307".to_string());
+
+        println!("🤖 AI Model Configuration:");
+
+        // Get model specifications from registry
+        let registry = get_model_registry();
+        if let Some(spec) = registry.get_model_spec(&model_name) {
+            // Highlight the API identifier portion in yellow
+            if model_name != spec.api_identifier {
+                println!(
+                    "   📡 Model: {} → \x1b[33m{}\x1b[0m",
+                    model_name, spec.api_identifier
+                );
+            } else {
+                println!("   📡 Model: \x1b[33m{}\x1b[0m", model_name);
+            }
+
+            println!("   🏷️  Provider: {}", spec.provider);
+            println!("   📊 Generation: {}", spec.generation);
+            println!("   ⭐ Tier: {} ({})", spec.tier, {
+                if let Some(tier_info) = registry.get_tier_info(&spec.provider, &spec.tier) {
+                    &tier_info.description
+                } else {
+                    "No description available"
+                }
+            });
+            println!("   📤 Max output tokens: {}", spec.max_output_tokens);
+            println!("   📥 Input context: {}", spec.input_context);
+
+            if spec.legacy {
+                println!("   ⚠️  Legacy model (consider upgrading to newer version)");
+            }
+        } else {
+            // Fallback to basic info if model not found in registry
+            let max_tokens = registry.get_max_output_tokens(&model_name);
+            let input_context = registry.get_input_context(&model_name);
+
+            println!("   📡 Model: \x1b[33m{}\x1b[0m", model_name);
+            println!("   ⚠️  Model not found in registry, using defaults:");
+            println!("   📤 Max output tokens: {}", max_tokens);
+            println!("   📥 Input context: {}", input_context);
         }
 
         println!();
