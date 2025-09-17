@@ -2,24 +2,60 @@
 
 use crate::data::context::{CommitContext, VerbosityLevel, WorkPattern};
 
+/// Default commit guidelines when no project-specific guidelines are provided
+const DEFAULT_COMMIT_GUIDELINES: &str = r#"## Commit Message Format
+
+Follow conventional commit format:
+
+```
+<type>(<scope>): <description>
+
+[optional body]
+
+[optional footer(s)]
+```
+
+## Types
+- `feat`: New features or enhancements
+- `fix`: Bug fixes 
+- `docs`: Documentation changes
+- `style`: Code style changes (formatting, missing semicolons, etc)
+- `refactor`: Code refactoring without changing functionality
+- `test`: Adding or updating tests
+- `chore`: Maintenance tasks, dependency updates
+- `ci`: CI/CD pipeline changes
+- `perf`: Performance improvements
+- `build`: Changes to build system or external dependencies
+
+## Guidelines
+- Use lowercase for description
+- No period at the end of description
+- Use imperative mood ("add" not "added" or "adds")
+- Keep description under 50 characters when possible
+- Use body to explain what and why, not how
+- Reference issues in footer (e.g., "Fixes #123")
+"#;
+
 /// Basic system prompt for commit message improvement (Phase 1 & 2)
-pub const BASIC_SYSTEM_PROMPT: &str = r#"You are an expert software engineer helping improve git commit messages. You will receive a YAML representation of a git repository with commit information. Your task is to analyze the commits and suggest improvements to make them follow conventional commit format and best practices.
+pub const BASIC_SYSTEM_PROMPT: &str = r#"You are an expert software engineer helping improve git commit messages. You will receive a YAML representation of a git repository with commit information and specific commit message guidelines to follow.
+
+Your task is to analyze the commits and suggest improvements based on:
+1. The actual code changes shown in the diff files
+2. The commit message guidelines provided in the user prompt
 
 CRITICAL: Your primary focus must be on the ACTUAL CODE CHANGES shown in the diff files. Base your commit messages on what the code actually does, not on file paths, branch names, or assumed context.
 
-Rules:
+Analysis Rules:
 1. **MOST IMPORTANT**: Read and analyze the diff_file content to understand what code changes were actually made
    - Look at lines with + (added) and - (removed) to see exactly what changed
    - Identify new functions, modified logic, added features, bug fixes, etc.
    - Focus on WHAT the code does, not WHERE it lives
-2. Follow conventional commit format: type(scope): description
-3. Types: feat, fix, docs, style, refactor, test, chore, ci, build, perf
-4. Keep subject lines under 50 characters when possible
-5. Use imperative mood ("Add feature" not "Added feature")
-6. Provide clear, concise descriptions of what the commit actually does (based on code changes)
-7. Only suggest changes for commits that would benefit from improvement
-8. Preserve the commit's original intent while improving clarity
-9. Ignore generic file path patterns - focus on actual functionality changes
+2. Follow EXACTLY the commit message format and guidelines provided in the user prompt
+3. Use imperative mood ("Add feature" not "Added feature") unless guidelines specify otherwise
+4. Provide clear, concise descriptions of what the commit actually does (based on code changes)
+5. Only suggest changes for commits that would benefit from improvement
+6. Preserve the commit's original intent while improving clarity
+7. Ignore generic file path patterns - focus on actual functionality changes
 
 DIFF ANALYSIS EXAMPLES:
 - Adding debug prints/logging = "debug: add debug logging for X" or "fix: improve error diagnostics for Y"
@@ -41,9 +77,9 @@ NOT: "feat(client): enhance context handling" (which ignores actual changes)
 
 Analysis Priority:
 1. First: What does the code change actually do? (from diff content)
-2. Second: What type of change is it? (feat/fix/refactor/etc.)  
-3. Third: What scope does it affect? (based on actual functionality, not just file paths)
-4. Last: How can the message be improved for clarity?
+2. Second: How can the message be improved for clarity and accuracy?
+3. Third: Apply the exact format specification provided in the user prompt
+4. Last: Are there any important implications or impacts to highlight?
 
 Respond with a YAML amendment file in this exact format:
 ```yaml
@@ -125,16 +161,35 @@ pub fn generate_contextual_system_prompt(context: &CommitContext) -> String {
         }
     }
 
-    // Add project-specific guidelines with strong emphasis
+    // Add project-specific commit guidelines to system prompt for maximum authority
     if let Some(guidelines) = &context.project.commit_guidelines {
-        prompt.push_str("\n\n=== PROJECT-SPECIFIC COMMIT GUIDELINES (MANDATORY) ===");
-        prompt.push_str("\nIMPORTANT: This project uses CUSTOM commit types that COMPLETELY REPLACE the standard types (feat, fix, docs, etc.).");
-        prompt.push_str("\nYou MUST use ONLY the project-specific types shown below. DO NOT use any standard conventional commit types.");
-        prompt.push_str("\n\nFor example, if the project guidelines show 'xfeat' and 'xdocs', you must use 'xfeat' and 'xdocs', NOT 'feat' and 'docs'.");
-        prompt.push_str("\n\nProject commit guidelines:");
-        prompt.push_str(&format!("\n{}", guidelines));
-        prompt.push_str("\n\n⚠️  CRITICAL: The commit types listed in the project guidelines above are the ONLY valid types for this project.");
-        prompt.push_str("\n⚠️  Do NOT use standard types like 'feat', 'fix', 'docs' - use the project-specific versions instead.");
+        prompt.push_str("\n\n=== MANDATORY COMMIT MESSAGE TEMPLATE ===");
+        prompt.push_str("\nThis is a LITERAL TEMPLATE that you must reproduce EXACTLY.");
+        prompt.push_str("\nDo NOT treat this as guidance - it is a FORMAT SPECIFICATION.");
+        prompt.push_str("\nEvery character, marker, and structure element must be preserved:");
+        prompt.push_str(&format!("\n\n{}", guidelines));
+        prompt.push_str("\n\nCRITICAL TEMPLATE REPRODUCTION RULES:");
+        prompt.push_str(
+            "\n1. This is NOT a description of how to write commits - it IS the actual format",
+        );
+        prompt.push_str(
+            "\n2. Every element shown above must appear in your commit messages exactly as shown",
+        );
+        prompt.push_str(
+            "\n3. Any text, markers, or symbols in the template are LITERAL and must be included",
+        );
+        prompt.push_str("\n4. The structure, spacing, and all content must be reproduced verbatim");
+        prompt
+            .push_str("\n5. Replace only obvious placeholders like <type>, <scope>, <description>");
+        prompt.push_str(
+            "\n6. Everything else in the template is literal text that must appear in every commit",
+        );
+        prompt.push_str(
+            "\n\nWRONG: Treating the above as 'guidance' and writing conventional commits",
+        );
+        prompt.push_str(
+            "\nRIGHT: Using the above as a literal template and reproducing its exact structure",
+        );
     }
 
     // Add valid scopes if available
@@ -227,6 +282,25 @@ pub fn generate_contextual_user_prompt(repo_yaml: &str, context: &CommitContext)
         "Please analyze the following repository information and suggest commit message improvements:\n\n{}\n\n",
         repo_yaml
     );
+
+    // Commit guidelines are now handled in the system prompt for maximum authority
+    // Only show default guidelines if no project-specific ones exist
+    if context.project.commit_guidelines.is_none() {
+        prompt.push_str("=== COMMIT GUIDELINES ===\n");
+        prompt.push_str("Follow these commit guidelines:\n\n");
+        prompt.push_str(DEFAULT_COMMIT_GUIDELINES);
+        prompt.push_str("\n\n");
+    }
+
+    // Add commit template if available (but not if project guidelines exist to avoid conflicts)
+    if let Some(template) = &context.project.commit_template {
+        if context.project.commit_guidelines.is_none() {
+            prompt.push_str("=== PROJECT COMMIT TEMPLATE ===\n");
+            prompt.push_str("Use this template structure for commit messages:\n\n");
+            prompt.push_str(template);
+            prompt.push_str("\n\n");
+        }
+    }
 
     // Emphasize diff analysis even with contextual intelligence
     prompt.push_str("CRITICAL ANALYSIS STEPS (WITH CONTEXT):\n");
