@@ -87,6 +87,15 @@ The project generates structured YAML output with field presence tracking:
 - **AI Guidance**: Look for `present: true` fields in the explanation section
 - **Dynamic Tracking**: The `update_field_presence()` method tracks which fields are available
 
+### AI Model Configuration
+The project includes a comprehensive model registry system:
+
+- **Model Registry**: `src/claude/model_config.rs` manages AI model specifications
+- **Model Templates**: `src/templates/models.yaml` defines supported Claude models with token limits
+- **Fuzzy Matching**: Supports various identifier formats (Bedrock, AWS, regional)
+- **Configuration Commands**: Use `omni-dev config models show` to view available models
+- **Dynamic Limits**: Token limits are automatically applied based on model specifications
+
 ### Command Structure
 Claude commands are organized in `.claude/commands/`:
 - `commit-twiddle*` - Commit message modification commands
