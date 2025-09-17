@@ -37,6 +37,7 @@ omni-dev is a powerful Git commit message analysis and amendment toolkit written
 ## Development Workflow
 
 ### Code Quality Standards
+- **Build Script**: Run `./scripts/build.sh` for complete validation (recommended)
 - **Tests**: Run `cargo test` before commits
 - **Linting**: Use `cargo clippy -- -D warnings` for code quality
 - **Formatting**: Apply `cargo fmt` for consistent style
