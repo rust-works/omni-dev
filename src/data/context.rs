@@ -25,8 +25,6 @@ pub struct CommitContext {
 pub struct ProjectContext {
     /// Project-specific commit guidelines from .omni-dev/commit-guidelines.md
     pub commit_guidelines: Option<String>,
-    /// Default commit message template from .gitmessage or .omni-dev/commit-template.txt
-    pub commit_template: Option<String>,
     /// Valid scopes and their descriptions from .omni-dev/scopes.yaml
     pub valid_scopes: Vec<ScopeDefinition>,
     /// Feature-specific context from .omni-dev/context/
