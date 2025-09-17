@@ -104,6 +104,7 @@ omni-dev git commit message twiddle [RANGE] [OPTIONS]
 | `--save-only FILE` | Save suggestions to file instead of applying | `--save-only suggestions.yaml` |
 | `--context-dir PATH` | Custom context directory | `--context-dir ./config` |
 | `--no-context` | Disable contextual features | `--no-context` |
+| `--edit` | Edit amendments in external editor before applying | `--edit` |
 
 **Commit Range Examples:**
 
@@ -270,19 +271,6 @@ fix(api): resolve rate limiting edge case
 docs(readme): update installation instructions
 refactor(ui): extract common button component
 
-```
-
-#### 4. Optional: Custom Commit Template (`.omni-dev/commit-template.txt`)
-
-```text
-# [type](scope): [description]
-#
-# [body - explain what and why]
-#
-# [footer - breaking changes, issues]
-#
-# Types: feat, fix, docs, style, refactor, test, chore
-# Scopes: auth, api, ui, db, deploy
 ```
 
 ### Branch Context Detection

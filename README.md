@@ -149,8 +149,7 @@ scopes:
 
 omni-dev automatically detects:
 
-- **Project Conventions**: From `.omni-dev/`, `.gitmessage`,
-  `CONTRIBUTING.md`
+- **Project Conventions**: From `.omni-dev/`, `CONTRIBUTING.md`
 - **Work Patterns**: Feature development, bug fixes, documentation,
   refactoring
 - **Branch Context**: Extracts work type from branch names
@@ -180,6 +179,7 @@ omni-dev git commit message twiddle 'main..HEAD' --batch-size 2
 | `--context-dir PATH` | Custom context directory | `--context-dir ./config` |
 | `--auto-apply` | Apply without confirmation | `--auto-apply` |
 | `--save-only FILE` | Save to file without applying | `--save-only fixes.yaml` |
+| `--edit` | Edit amendments in external editor | `--edit` |
 
 ## 📖 Real-World Examples
 
@@ -246,22 +246,18 @@ We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.
    cargo build
    ```
 
-4. Run tests:
+4. Run the build script (includes tests, linting, and formatting):
 
    ```bash
-   cargo test
+   ./scripts/build.sh
    ```
 
-5. Run clippy for linting:
+   Or run individual steps:
 
    ```bash
-   cargo clippy
-   ```
-
-6. Format code:
-
-   ```bash
-   cargo fmt
+   cargo test         # Run tests
+   cargo clippy       # Run linting
+   cargo fmt          # Format code
    ```
 
 ## 📚 Documentation
