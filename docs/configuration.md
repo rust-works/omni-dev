@@ -353,48 +353,6 @@ Commits are validated by:
 ```
 ```
 
-### 3. Commit Template (`.omni-dev/commit-template.txt`) [Optional]
-
-**Purpose**: Provide a template for developers when writing commits.
-
-**Basic Template**:
-
-```
-# [type](scope): [description]
-#
-# [Optional body explaining what and why]
-#
-# [Optional footer with breaking changes/issues]
-#
-# Types: feat, fix, docs, style, refactor, test, chore
-# Scopes: auth, api, ui, db, deploy
-# 
-# Examples:
-# feat(auth): add OAuth2 Google integration
-# fix(ui): resolve mobile navigation issue
-# docs(readme): update installation guide
-```
-
-**Enterprise Template**:
-
-```
-# [TICKET-ID] type(scope): description
-#
-# What was changed:
-# - 
-#
-# Why it was changed:
-# - 
-#
-# Testing performed:
-# - 
-#
-# Breaking changes (if any):
-# BREAKING CHANGE: 
-#
-# Closes #
-```
-
 ## Environment Setup
 
 ### Claude API Key
@@ -444,11 +402,9 @@ Recommended `.omni-dev/` structure:
 .omni-dev/
 ├── scopes.yaml              # Required: Project scopes
 ├── commit-guidelines.md     # Required: Commit standards
-├── commit-template.txt      # Optional: Commit template
 ├── local/                   # Optional: Local overrides (add to .gitignore)
 │   ├── scopes.yaml          # Personal scope definitions
 │   ├── commit-guidelines.md # Personal commit guidelines
-│   ├── commit-template.txt  # Personal commit template
 │   └── context/             # Personal feature contexts
 │       └── feature-contexts/
 └── examples/               # Optional: Usage examples
@@ -488,26 +444,6 @@ scopes:
     examples:
       - "experimental: try new auth approach"
     file_patterns: ["experiments/**", "sandbox/**"]
-```
-
-#### Personal Commit Template
-
-**Your personal template** (`.omni-dev/local/commit-template.txt`):
-
-```
-# [type](scope): [description]
-
-# What changed:
-# - 
-
-# Why it changed:
-# - 
-
-# Testing performed:
-# - 
-
-# Fixes #(issue_number)
-# Signed-off-by: Your Name <your@email.com>
 ```
 
 ### Setting Up Local Overrides

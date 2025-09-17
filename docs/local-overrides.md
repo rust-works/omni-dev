@@ -14,7 +14,6 @@ All `.omni-dev` configuration files now support local overrides through the `.om
 ## Supported Override Files
 
 - `commit-guidelines.md` - Personal commit guidelines
-- `commit-template.txt` - Personal commit template  
 - `scopes.yaml` - Personal scope definitions
 - `context/feature-contexts/*.yaml` - Personal feature contexts
 
@@ -74,31 +73,6 @@ scopes:
     examples:
       - "research: investigate new algorithms"
     file_patterns: ["research/**", "prototypes/**"]
-```
-
-### Personal Commit Template
-
-Customize your commit message structure:
-
-**Your personal template** (`.omni-dev/local/commit-template.txt`):
-
-```
-# [type](scope): [description]
-
-# What changed:
-# - 
-
-# Why it changed:
-# - 
-
-# Testing performed:
-# - 
-
-# Breaking changes (if any):
-# 
-
-# Fixes #(issue_number)
-# Signed-off-by: Your Name <your@email.com>
 ```
 
 ### Personal Commit Guidelines
