@@ -53,7 +53,7 @@ omni-dev git commit message twiddle 'origin/main..HEAD' --use-context
 
 ### 🤖 AI-Powered Commit Improvement (`twiddle`)
 
-The star feature - intelligently improve your commit messages:
+The star feature - intelligently improve your commit messages with real-time model information display:
 
 ```bash
 # Improve commits with contextual intelligence
@@ -88,6 +88,16 @@ omni-dev help-all
 ```bash
 # Apply specific amendments from YAML file
 omni-dev git commit message amend amendments.yaml
+```
+
+### ⚙️ Configuration Commands
+
+```bash
+# Show supported AI models and their specifications
+omni-dev config models show
+
+# View model information with token limits and capabilities
+omni-dev config models show | grep -A5 "claude-sonnet-4"
 ```
 
 ## 🧠 Contextual Intelligence
@@ -272,6 +282,10 @@ We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.
   - Get your key from
     [Anthropic Console](https://console.anthropic.com/)
   - Set: `export CLAUDE_API_KEY="your-key"`
+- **AI Model Selection**: Optional configuration for specific Claude models
+  - View available models: `omni-dev config models show`
+  - Configure via `~/.omni-dev/settings.json` or `ANTHROPIC_MODEL` environment variable
+  - Supports standard identifiers and Bedrock-style formats
 - **Git**: Any modern version
 
 ## 🐛 Debugging

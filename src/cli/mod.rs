@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 pub mod commands;
+pub mod config;
 pub mod git;
 pub mod help;
 
@@ -25,6 +26,8 @@ pub enum Commands {
     Git(git::GitCommand),
     /// Command template management
     Commands(commands::CommandsCommand),
+    /// Configuration and model information
+    Config(config::ConfigCommand),
     /// Display comprehensive help for all commands
     #[command(name = "help-all")]
     HelpAll(help::HelpCommand),
@@ -36,6 +39,7 @@ impl Cli {
         match self.command {
             Commands::Git(git_cmd) => git_cmd.execute(),
             Commands::Commands(commands_cmd) => commands_cmd.execute(),
+            Commands::Config(config_cmd) => config_cmd.execute(),
             Commands::HelpAll(help_cmd) => help_cmd.execute(),
         }
     }
