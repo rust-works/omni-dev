@@ -850,8 +850,6 @@ impl TwiddleCommand {
         project_context: &crate::data::context::ProjectContext,
         context_dir: &std::path::Path,
     ) -> Result<()> {
-        use std::path::Path;
-
         println!("📋 Project guidance files status:");
 
         // Check commit guidelines
@@ -876,32 +874,6 @@ impl TwiddleCommand {
             "❌ None found".to_string()
         };
         println!("   📝 Commit guidelines: {}", guidelines_source);
-
-        // Check commit template
-        let template_found = project_context.commit_template.is_some();
-        let template_source = if template_found {
-            let local_path = context_dir.join("local").join("commit-template.txt");
-            let project_path = context_dir.join("commit-template.txt");
-            let gitmessage_path = Path::new(".gitmessage");
-            let home_path = dirs::home_dir()
-                .map(|h| h.join(".omni-dev").join("commit-template.txt"))
-                .unwrap_or_default();
-
-            if local_path.exists() {
-                format!("✅ Local override: {}", local_path.display())
-            } else if project_path.exists() {
-                format!("✅ Project: {}", project_path.display())
-            } else if gitmessage_path.exists() {
-                format!("✅ Git template: {}", gitmessage_path.display())
-            } else if home_path.exists() {
-                format!("✅ Global: {}", home_path.display())
-            } else {
-                "✅ (source unknown)".to_string()
-            }
-        } else {
-            "❌ None found".to_string()
-        };
-        println!("   📄 Commit template: {}", template_source);
 
         // Check scopes
         let scopes_count = project_context.valid_scopes.len();

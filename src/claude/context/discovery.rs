@@ -74,12 +74,6 @@ impl ProjectDiscovery {
             debug!("No commit guidelines file found");
         }
 
-        // Load commit template (with local override)
-        let template_path = self.resolve_config_file(dir, "commit-template.txt");
-        if template_path.exists() {
-            context.commit_template = Some(fs::read_to_string(template_path)?);
-        }
-
         // Load scopes configuration (with local override)
         let scopes_path = self.resolve_config_file(dir, "scopes.yaml");
         if scopes_path.exists() {
@@ -136,13 +130,8 @@ impl ProjectDiscovery {
     }
 
     /// Load git configuration files
-    fn load_git_config(&self, context: &mut ProjectContext) -> Result<()> {
-        // Check for .gitmessage template
-        let gitmessage_path = self.repo_path.join(".gitmessage");
-        if gitmessage_path.exists() && context.commit_template.is_none() {
-            context.commit_template = Some(fs::read_to_string(gitmessage_path)?);
-        }
-
+    fn load_git_config(&self, _context: &mut ProjectContext) -> Result<()> {
+        // Git configuration loading can be extended here if needed
         Ok(())
     }
 
