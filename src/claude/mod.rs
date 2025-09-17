@@ -6,6 +6,7 @@ pub mod claude_ai_client;
 pub mod client;
 pub mod context;
 pub mod error;
+pub mod model_config;
 pub mod prompts;
 
 pub use ai_client::{AiClient, AiClientMetadata};
