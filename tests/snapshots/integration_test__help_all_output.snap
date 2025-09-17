@@ -11,6 +11,7 @@ Usage: omni-dev <COMMAND>
 Commands:
   git       Git-related operations
   commands  Command template management
+  config    Configuration and model information
   help-all  Display comprehensive help for all commands
   help      Print this message or the help of the given subcommand(s)
 
@@ -97,6 +98,50 @@ omni-dev commands generate pr-update - Generate pr-update command template
 Generate pr-update command template
 
 Usage: pr-update
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev config - Configuration and model information
+
+Configuration and model information
+
+Usage: config <COMMAND>
+
+Commands:
+  models  AI model configuration and information
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev config models - AI model configuration and information
+
+AI model configuration and information
+
+Usage: models <COMMAND>
+
+Commands:
+  show  Show the embedded models.yaml configuration
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev config models show - Show the embedded models.yaml configuration
+
+Show the embedded models.yaml configuration
+
+Usage: show
 
 Options:
   -h, --help  Print help
