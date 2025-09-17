@@ -292,16 +292,6 @@ pub fn generate_contextual_user_prompt(repo_yaml: &str, context: &CommitContext)
         prompt.push_str("\n\n");
     }
 
-    // Add commit template if available (but not if project guidelines exist to avoid conflicts)
-    if let Some(template) = &context.project.commit_template {
-        if context.project.commit_guidelines.is_none() {
-            prompt.push_str("=== PROJECT COMMIT TEMPLATE ===\n");
-            prompt.push_str("Use this template structure for commit messages:\n\n");
-            prompt.push_str(template);
-            prompt.push_str("\n\n");
-        }
-    }
-
     // Emphasize diff analysis even with contextual intelligence
     prompt.push_str("CRITICAL ANALYSIS STEPS (WITH CONTEXT):\n");
     prompt.push_str(
