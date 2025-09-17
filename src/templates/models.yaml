@@ -1,0 +1,109 @@
+# AI Model Specifications
+# This file defines the capabilities and limits for all supported AI models
+# Used by omni-dev to configure API requests correctly
+
+models:
+  # Claude 4 Series (Current Generation)
+  - provider: "claude"
+    model: "Claude Opus 4.1"
+    api_identifier: "claude-opus-4-1-20250805"
+    max_output_tokens: 32000
+    input_context: 200000
+    generation: 4
+    tier: "flagship"
+    
+  - provider: "claude"
+    model: "Claude Opus 4"
+    api_identifier: "claude-opus-4-20250514"
+    max_output_tokens: 32000
+    input_context: 200000
+    generation: 4
+    tier: "flagship"
+    
+  - provider: "claude"
+    model: "Claude Sonnet 4"
+    api_identifier: "claude-sonnet-4-20250514"
+    max_output_tokens: 64000
+    input_context: 200000  # 1M available with beta header
+    generation: 4
+    tier: "balanced"
+    
+  # Claude 3.7 Series
+  - provider: "claude"
+    model: "Claude Sonnet 3.7"
+    api_identifier: "claude-3-7-sonnet-20250219"
+    max_output_tokens: 64000  # 128K with beta header
+    input_context: 200000
+    generation: 3.7
+    tier: "balanced"
+    
+  # Claude 3.5 Series
+  - provider: "claude"
+    model: "Claude Haiku 3.5"
+    api_identifier: "claude-3-5-haiku-20241022"
+    max_output_tokens: 8192
+    input_context: 200000
+    generation: 3.5
+    tier: "fast"
+    
+  - provider: "claude"
+    model: "Claude Sonnet 3.5"
+    api_identifier: "claude-3-5-sonnet-20241022"
+    max_output_tokens: 8192
+    input_context: 200000
+    generation: 3.5
+    tier: "balanced"
+    
+  # Claude 3 Series (Legacy)
+  - provider: "claude"
+    model: "Claude Opus 3"
+    api_identifier: "claude-3-opus-20240229"
+    max_output_tokens: 4096
+    input_context: 200000
+    generation: 3
+    tier: "flagship"
+    legacy: true
+    
+  - provider: "claude"
+    model: "Claude Sonnet 3"
+    api_identifier: "claude-3-sonnet-20240229"
+    max_output_tokens: 4096
+    input_context: 200000
+    generation: 3
+    tier: "balanced"
+    legacy: true
+    
+  - provider: "claude"
+    model: "Claude Haiku 3"
+    api_identifier: "claude-3-haiku-20240307"
+    max_output_tokens: 4096
+    input_context: 200000
+    generation: 3
+    tier: "fast"
+    legacy: true
+
+# Provider-specific configurations
+providers:
+  claude:
+    name: "Anthropic Claude"
+    api_base: "https://api.anthropic.com/v1"
+    default_model: "claude-3-haiku-20240307"
+    
+    # Model tier descriptions
+    tiers:
+      flagship:
+        description: "Most capable models for complex reasoning and analysis"
+        use_cases: ["complex analysis", "research", "advanced reasoning"]
+        
+      balanced:
+        description: "Good balance of capability and speed"
+        use_cases: ["general tasks", "coding", "writing"]
+        
+      fast:
+        description: "Optimized for speed and cost efficiency"
+        use_cases: ["simple tasks", "high-volume processing", "quick responses"]
+
+    # Default fallback limits for unknown Claude models
+    defaults:
+      max_output_tokens: 4096
+      input_context: 100000
