@@ -145,6 +145,19 @@ impl AiClient for BedrockAiClient {
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
         // Use Box::pin to wrap the async block in a Pin<Box<...>>
         Box::pin(async move {
+            debug!(
+                system_prompt_len = system_prompt.len(),
+                user_prompt_len = user_prompt.len(),
+                model = %self.model,
+                "Preparing Bedrock API request"
+            );
+
+            debug!(
+                system_prompt = %system_prompt,
+                user_prompt = %user_prompt,
+                "Bedrock API request content"
+            );
+
             // For Bedrock API, the system prompt is a separate parameter
             let messages = vec![Message {
                 role: "user".to_string(),
@@ -166,7 +179,8 @@ impl AiClient for BedrockAiClient {
 
             debug!(
                 system_prompt_len = system_prompt.len(),
-                "Using system prompt"
+                max_tokens = self.get_max_tokens(),
+                "Built Bedrock request payload"
             );
 
             // Get the API URL
@@ -202,8 +216,17 @@ impl AiClient for BedrockAiClient {
                 .await
                 .map_err(|e| ClaudeError::InvalidResponseFormat(e.to_string()))?;
 
+            debug!(
+                response_id = %bedrock_response.id,
+                response_type = %bedrock_response.response_type,
+                content_count = bedrock_response.content.len(),
+                stop_reason = ?bedrock_response.stop_reason,
+                usage = ?bedrock_response.usage,
+                "Received Bedrock API response"
+            );
+
             // Extract text content from response
-            bedrock_response
+            let result = bedrock_response
                 .content
                 .first()
                 .filter(|c| c.content_type == "text")
@@ -211,7 +234,20 @@ impl AiClient for BedrockAiClient {
                 .ok_or_else(|| {
                     ClaudeError::InvalidResponseFormat("No text content in response".to_string())
                         .into()
-                })
+                });
+
+            if let Ok(ref text) = result {
+                debug!(
+                    response_len = text.len(),
+                    "Successfully extracted text content from Bedrock API response"
+                );
+                debug!(
+                    response_content = %text,
+                    "Bedrock API response content"
+                );
+            }
+
+            result
         })
     }
 
