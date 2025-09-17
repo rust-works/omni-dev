@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **AI Model Configuration System**: New `config models show` command to view available AI models
+  - Complete model registry with token limits and specifications
+  - Support for both standard Claude and AWS Bedrock identifier formats
+  - Model information display in twiddle command output
+- **Interactive Amendment Editing**: `--edit` option for twiddle command
+  - Integration with `OMNI_DEV_EDITOR` and `EDITOR` environment variables
+  - Manual review and editing of AI-generated amendments before applying
+- **Build Automation Script**: New `scripts/build.sh` for standardized builds
+  - Combines cargo build, format checking, and clippy analysis
+  - Comprehensive error handling and progress indicators
+
+### Enhanced
+- **Contextual Intelligence System**: Significantly improved commit message generation
+  - Home directory fallback support for all `.omni-dev` configuration files
+  - Literal template reproduction ensures AI follows project formats exactly
+  - Enhanced diagnostic output showing guidance file status and sources
+- **AI Client Logging**: Improved debugging and observability
+  - Enhanced logging for API requests and responses
+  - Better error handling and diagnostics for troubleshooting
+
+### Removed
+- **Commit Template System**: Removed template functionality to simplify configuration
+  - Projects should use commit guidelines instead of templates
+  - Eliminates conflicts between templates and guidelines
+  - **BREAKING**: `.gitmessage` and commit template files are no longer loaded
+
 ## [0.7.0] - 2025-09-14
 
 ### Added
