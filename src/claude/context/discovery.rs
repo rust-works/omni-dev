@@ -106,18 +106,33 @@ impl ProjectDiscovery {
         Ok(())
     }
 
-    /// Resolve configuration file path with local override support
+    /// Resolve configuration file path with local override support and home fallback
     ///
     /// Priority:
     /// 1. .omni-dev/local/{filename} (local override)
     /// 2. .omni-dev/{filename} (shared project config)
+    /// 3. $HOME/.omni-dev/{filename} (global user config)
     fn resolve_config_file(&self, dir: &Path, filename: &str) -> PathBuf {
         let local_path = dir.join("local").join(filename);
         if local_path.exists() {
-            local_path
-        } else {
-            dir.join(filename)
+            return local_path;
         }
+
+        let project_path = dir.join(filename);
+        if project_path.exists() {
+            return project_path;
+        }
+
+        // Check home directory fallback
+        if let Ok(home_dir) = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("No home directory")) {
+            let home_path = home_dir.join(".omni-dev").join(filename);
+            if home_path.exists() {
+                return home_path;
+            }
+        }
+
+        // Return project path as default (even if it doesn't exist)
+        project_path
     }
 
     /// Load git configuration files
