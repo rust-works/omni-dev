@@ -81,6 +81,8 @@ Analysis Priority:
 3. Third: Apply the exact format specification provided in the user prompt
 4. Last: Are there any important implications or impacts to highlight?
 
+CRITICAL OUTPUT REQUIREMENT: You MUST include ALL commits in your response, regardless of whether they need changes or not. If a commit message is already perfect, include it unchanged. Never skip commits from the amendments array.
+
 Respond with a YAML amendment file in this exact format:
 ```yaml
 amendments:
@@ -261,17 +263,19 @@ CRITICAL ANALYSIS STEPS:
 3. **CHOOSE APPROPRIATE TYPE**: Select commit type (feat/fix/refactor/etc.) based on actual changes, not file locations
 4. **SELECT MEANINGFUL SCOPE**: Choose scope based on functionality affected, not just directory names
 
-Focus on commits that:
-- Don't follow conventional commit format
-- Have unclear or vague descriptions that don't reflect actual code changes
-- Use past tense instead of imperative mood
-- Are too verbose or too brief for the actual changes made
-- Could benefit from proper type/scope classification based on real functionality
-- Have generic messages that don't describe what the code actually does
+MANDATORY: Include ALL commits in the amendments array - both those that need improvement AND those that are already well-formatted.
+
+For each commit, analyze whether improvements are needed:
+- Check if it follows conventional commit format
+- Verify descriptions accurately reflect the actual code changes
+- Ensure imperative mood is used (not past tense)
+- Confirm verbosity matches the scope of changes made
+- Validate type/scope classification based on real functionality
+- Ensure messages describe what the code actually does (not generic descriptions)
 
 Remember: File paths and directory names are just hints. The diff content shows the real changes.
 
-Include ALL commits in the amendments array. Even if a commit message is already well-formatted, include it with its current message. This allows users to review and potentially modify all commits."#,
+CRITICAL: Even if a commit message is perfect and needs no changes, include it in the amendments array with its current message unchanged. This allows users to review all commits and make manual adjustments if desired. DO NOT skip any commits from the amendments array."#,
         repo_yaml
     )
 }
@@ -305,10 +309,11 @@ pub fn generate_contextual_user_prompt(repo_yaml: &str, context: &CommitContext)
     prompt.push('\n');
 
     // Add context-specific focus areas
-    prompt.push_str("Focus on commits that:\n");
-    prompt.push_str("- Don't follow conventional commit format\n");
-    prompt.push_str("- Have unclear or vague descriptions\n");
-    prompt.push_str("- Use past tense instead of imperative mood\n");
+    prompt.push_str("MANDATORY: Include ALL commits in the amendments array - both those needing improvement AND those already well-formatted.\n\n");
+    prompt.push_str("For each commit, analyze whether improvements are needed:\n");
+    prompt.push_str("- Check if it follows conventional commit format\n");
+    prompt.push_str("- Verify descriptions are clear and accurate\n");
+    prompt.push_str("- Ensure imperative mood is used (not past tense)\n");
 
     // Add significance-based criteria
     if context.is_significant_change() {
@@ -362,7 +367,7 @@ pub fn generate_contextual_user_prompt(repo_yaml: &str, context: &CommitContext)
         }
     }
 
-    prompt.push_str("\nInclude ALL commits in the amendments array. Even if a commit message is already well-formatted, include it with its current message. This allows users to review and potentially modify all commits.");
+    prompt.push_str("\nCRITICAL: Include ALL commits in the amendments array. Even if a commit message is perfect and needs no changes, include it with its current message unchanged. This allows users to review all commits and make manual adjustments if desired. DO NOT skip any commits from the amendments array.");
 
     prompt
 }
