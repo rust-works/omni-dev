@@ -173,11 +173,45 @@ Branch-related operations
 Usage: branch <COMMAND>
 
 Commands:
-  info  Analyze branch commits and output repository information in YAML format
+  info    Analyze branch commits and output repository information in YAML format
+  create  Create operations
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev git branch create - Create operations
+
+Create operations
+
+Usage: create <COMMAND>
+
+Commands:
+  pr    Create a pull request with AI-generated description
   help  Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev git branch create pr - Create a pull request with AI-generated description
+
+Create a pull request with AI-generated description
+
+Usage: pr [OPTIONS] [BASE_BRANCH]
+
+Arguments:
+  [BASE_BRANCH]  Base branch to compare against (defaults to main/master)
+
+Options:
+      --auto-apply        Skip confirmation prompt and create PR automatically
+      --save-only <FILE>  Save generated PR details to file without creating PR
+  -h, --help              Print help
 
 
 ================================================================================

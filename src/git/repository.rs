@@ -253,3 +253,66 @@ fn format_status_flags(flags: Status) -> String {
 
     status
 }
+
+impl GitRepository {
+    /// Push current branch to remote
+    pub fn push_branch(&self, branch_name: &str, remote_name: &str) -> Result<()> {
+        // Get remote
+        let mut remote = self
+            .repo
+            .find_remote(remote_name)
+            .context("Failed to find remote")?;
+
+        // Set up refspec for push
+        let refspec = format!("refs/heads/{}:refs/heads/{}", branch_name, branch_name);
+
+        // Push with authentication callbacks
+        let mut push_options = git2::PushOptions::new();
+        let mut callbacks = git2::RemoteCallbacks::new();
+
+        // Try to use credentials from git credential helper or SSH agent
+        callbacks.credentials(|_url, username_from_url, _allowed_types| {
+            git2::Cred::ssh_key_from_agent(username_from_url.unwrap_or("git"))
+        });
+
+        push_options.remote_callbacks(callbacks);
+
+        // Perform the push
+        remote
+            .push(&[&refspec], Some(&mut push_options))
+            .context("Failed to push branch to remote")?;
+
+        Ok(())
+    }
+
+    /// Check if branch exists on remote
+    pub fn branch_exists_on_remote(&self, branch_name: &str, remote_name: &str) -> Result<bool> {
+        let remote = self
+            .repo
+            .find_remote(remote_name)
+            .context("Failed to find remote")?;
+
+        // Connect to remote to get refs
+        let mut remote = remote;
+        let mut callbacks = git2::RemoteCallbacks::new();
+        callbacks.credentials(|_url, username_from_url, _allowed_types| {
+            git2::Cred::ssh_key_from_agent(username_from_url.unwrap_or("git"))
+        });
+
+        remote
+            .connect_auth(git2::Direction::Fetch, Some(callbacks), None)
+            .context("Failed to connect to remote")?;
+
+        // Check if the remote branch exists
+        let refs = remote.list()?;
+        let remote_branch_ref = format!("refs/heads/{}", branch_name);
+
+        for remote_head in refs {
+            if remote_head.name() == remote_branch_ref {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+}

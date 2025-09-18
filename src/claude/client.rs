@@ -143,6 +143,111 @@ impl ClaudeClient {
 
         Ok(amendment_file)
     }
+
+    /// Generate AI-powered PR content (title + description) from repository view and template
+    pub async fn generate_pr_content(
+        &self,
+        repo_view: &RepositoryView,
+        pr_template: &str,
+    ) -> Result<crate::cli::git::PrContent> {
+        // Convert to AI-enhanced view with diff content
+        let ai_repo_view = RepositoryViewForAI::from_repository_view(repo_view.clone())
+            .context("Failed to enhance repository view with diff content")?;
+
+        // Convert repository view to YAML
+        let repo_yaml = crate::data::to_yaml(&ai_repo_view)
+            .context("Failed to serialize repository view to YAML")?;
+
+        // Generate prompts for PR description
+        let user_prompt = prompts::generate_pr_description_prompt(&repo_yaml, pr_template);
+
+        // Send request using AI client
+        let content = self
+            .ai_client
+            .send_request(prompts::PR_GENERATION_SYSTEM_PROMPT, &user_prompt)
+            .await?;
+
+        // Extract YAML block from markdown if present (same logic as amendment parsing)
+        let yaml_content = if content.contains("```yaml") {
+            content
+                .split("```yaml")
+                .nth(1)
+                .and_then(|s| s.split("```").next())
+                .unwrap_or(&content)
+                .trim()
+        } else if content.contains("```") {
+            // Handle generic code blocks
+            content
+                .split("```")
+                .nth(1)
+                .and_then(|s| s.split("```").next())
+                .unwrap_or(&content)
+                .trim()
+        } else {
+            content.trim()
+        };
+
+        // Parse the YAML response
+        let pr_content: crate::cli::git::PrContent = serde_yaml::from_str(yaml_content).context(
+            "Failed to parse AI response as YAML. AI may have returned malformed output.",
+        )?;
+
+        Ok(pr_content)
+    }
+
+    /// Generate AI-powered PR content with project context (title + description)
+    pub async fn generate_pr_content_with_context(
+        &self,
+        repo_view: &RepositoryView,
+        pr_template: &str,
+        context: &crate::data::context::CommitContext,
+    ) -> Result<crate::cli::git::PrContent> {
+        // Convert to AI-enhanced view with diff content
+        let ai_repo_view = RepositoryViewForAI::from_repository_view(repo_view.clone())
+            .context("Failed to enhance repository view with diff content")?;
+
+        // Convert repository view to YAML
+        let repo_yaml = crate::data::to_yaml(&ai_repo_view)
+            .context("Failed to serialize repository view to YAML")?;
+
+        // Generate contextual prompts for PR description
+        let system_prompt = prompts::generate_pr_system_prompt_with_context(context);
+        let user_prompt =
+            prompts::generate_pr_description_prompt_with_context(&repo_yaml, pr_template, context);
+
+        // Send request using AI client
+        let content = self
+            .ai_client
+            .send_request(&system_prompt, &user_prompt)
+            .await?;
+
+        // Extract YAML block from markdown if present (same logic as amendment parsing)
+        let yaml_content = if content.contains("```yaml") {
+            content
+                .split("```yaml")
+                .nth(1)
+                .and_then(|s| s.split("```").next())
+                .unwrap_or(&content)
+                .trim()
+        } else if content.contains("```") {
+            // Handle generic code blocks
+            content
+                .split("```")
+                .nth(1)
+                .and_then(|s| s.split("```").next())
+                .unwrap_or(&content)
+                .trim()
+        } else {
+            content.trim()
+        };
+
+        // Parse the YAML response
+        let pr_content: crate::cli::git::PrContent = serde_yaml::from_str(yaml_content).context(
+            "Failed to parse AI response as YAML. AI may have returned malformed output.",
+        )?;
+
+        Ok(pr_content)
+    }
 }
 
 /// Create a default Claude client using environment variables and settings

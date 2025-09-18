@@ -12,12 +12,14 @@ conventional commit formats with project-aware suggestions.
 ## ✨ Key Features
 
 - 🤖 **AI-Powered Intelligence**: Claude AI analyzes your code changes to
-  suggest meaningful commit messages
+  suggest meaningful commit messages and PR descriptions
 - 🧠 **Contextual Awareness**: Understands your project structure,
   conventions, and work patterns
 - 🔍 **Comprehensive Analysis**: Deep analysis of commits, branches, and
   file changes
 - ✏️ **Smart Amendments**: Safely improve single or multiple commit messages
+- 🚀 **PR Creation**: Generate professional pull requests with AI-powered
+  descriptions
 - 📦 **Automatic Batching**: Handles large commit ranges intelligently
 - 🎯 **Conventional Commits**: Automatic detection and formatting
 - 🛡️ **Safety First**: Working directory validation and error recovery
@@ -37,7 +39,7 @@ export CLAUDE_API_KEY="your-api-key-here"
 
 ### 30-Second Demo
 
-Transform your commit messages with AI intelligence:
+Transform your commit messages and create professional PRs with AI intelligence:
 
 ```bash
 # Analyze and improve commit messages in your current branch
@@ -47,6 +49,10 @@ omni-dev git commit message twiddle 'origin/main..HEAD' --use-context
 # After:  "feat(auth): implement OAuth2 authentication system"
 #         "docs(api): add comprehensive endpoint documentation"
 #         "fix(ui): resolve mobile responsive layout issues"
+
+# Create a professional PR with AI-generated description
+omni-dev git branch create pr
+# 🎉 Generates comprehensive PR with detailed description, testing info, and more
 ```
 
 ## 📋 Core Commands
@@ -81,6 +87,24 @@ omni-dev git branch info main
 
 # Get comprehensive help
 omni-dev help-all
+```
+
+### 🚀 AI-Powered PR Creation
+
+Create professional pull requests with AI-generated descriptions:
+
+```bash
+# Generate and create PR with AI-powered description
+omni-dev git branch create pr
+
+# Create PR with specific base branch
+omni-dev git branch create pr main
+
+# Save PR details to file without creating
+omni-dev git branch create pr --save-only pr-description.yaml
+
+# Auto-create without confirmation
+omni-dev git branch create pr --auto-apply
 ```
 
 ### ✏️ Manual Amendment
@@ -217,8 +241,10 @@ git commit -m "add more features"
 # 3. Before merging, improve all commit messages
 omni-dev git commit message twiddle 'main..HEAD' --use-context
 
-# 4. Review and apply the suggestions
-# ✅ Creates professional, contextual commit messages automatically
+# 4. Create professional PR with AI-generated description
+omni-dev git branch create pr
+
+# ✅ Professional commit history + comprehensive PR description ready for review
 ```
 
 ## Contributing
