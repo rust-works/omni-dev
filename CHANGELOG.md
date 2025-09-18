@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2025-09-18
+
+### Added
+- **AI-Powered Pull Request Creation**: New `git create pr` command with intelligent PR generation
+  - Automatically generates PR titles and descriptions using AI analysis of commits and diffs
+  - Supports both interactive creation and save-only modes for review
+  - Integrates with GitHub CLI for seamless PR creation and updates
+  - Context-aware analysis using project-specific guidelines and branch information
+- **PR Guidelines System**: Project-specific PR description guidelines support
+  - New `.omni-dev/pr-guidelines.md` configuration file for PR generation guidance
+  - Separate from commit guidelines to allow different standards for PRs vs commits
+  - Local override support with priority: local > project > global
+  - Integration with AI prompts for project-consistent PR descriptions
+- **Enhanced PR Template**: Significantly improved `.github/pull_request_template.md`
+  - Added comprehensive sections for testing, performance, security, and deployment
+  - Better structure and guidance for thorough PR descriptions
+  - Includes examples and best practices for different types of changes
+- **YAML Output Format**: New structured output format for PR details
+  - `pr-details.yaml` replaces `pr_description.md` for better structured data
+  - Complete PR content serialization including title and description
+  - Better integration with automation and tooling workflows
+
+### Enhanced
+- **Context-Aware AI Generation**: PR creation now uses full project context
+  - Leverages branch analysis, work patterns, and architectural understanding
+  - Project-specific scope validation and suggestions for PR organization
+  - Enhanced prompts that incorporate both commit analysis and PR best practices
+- **Command-Specific Guidance Display**: Improved user interface clarity
+  - Twiddle command shows only commit guidelines (focused on commit messages)
+  - PR creation command shows only PR guidelines (focused on PR descriptions)
+  - Eliminates confusion about which guidelines are being used for each operation
+- **Comprehensive Documentation**: Updated user guides and README
+  - Added complete workflow documentation for PR creation feature
+  - Enhanced examples and usage patterns for both commit and PR workflows
+  - Better organization of feature documentation and command references
+
+### Fixed
+- **YAML Parsing Robustness**: Improved Claude API response processing
+  - Better handling of markdown-wrapped YAML responses from AI
+  - Consistent parsing logic across commit amendments and PR generation
+  - Enhanced error diagnostics for malformed AI responses
+
 ## [0.8.0] - 2025-09-17
 
 ### Added
