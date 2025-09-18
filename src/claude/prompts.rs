@@ -371,3 +371,168 @@ pub fn generate_contextual_user_prompt(repo_yaml: &str, context: &CommitContext)
 
     prompt
 }
+
+/// System prompt for PR description generation
+pub const PR_GENERATION_SYSTEM_PROMPT: &str = r#"You are an expert software engineer helping generate intelligent pull request descriptions. You will receive a YAML representation of a git repository with branch information, commits, and a PR template to fill out.
+
+Your task is to analyze the branch data and generate a comprehensive, well-structured PR description that:
+1. Accurately describes what the changes accomplish based on actual code diffs
+2. Fills in the provided PR template with relevant information
+3. Provides clear value proposition and context for reviewers
+
+Analysis Guidelines:
+1. **READ THE DIFF FILES**: Carefully examine the diff content to understand what code changes were actually made
+2. **UNDERSTAND THE PURPOSE**: Determine the overall goal and impact of the changes
+3. **CATEGORIZE CHANGES**: Identify if this is a new feature, bug fix, refactoring, etc.
+4. **ASSESS SCOPE**: Understand which parts of the codebase are affected
+5. **HIGHLIGHT VALUE**: Explain why this change is beneficial
+
+Template Filling Instructions:
+- Replace placeholder text with specific, accurate information
+- Check appropriate boxes based on the actual changes made
+- Provide detailed explanations in description sections
+- List specific changes made in bullet points
+- Include any breaking changes or migration notes if applicable
+- Add relevant testing information
+
+Output Format:
+Return a YAML response with exactly this structure:
+
+```yaml
+title: "Concise PR title (50-80 characters ideal)"
+description: |
+  Your filled-in PR template in markdown format here.
+  Include all sections and content as markdown.
+```
+
+The title should be:
+- Concise and descriptive (ideally 50-80 characters)
+- Follow conventional commit format when appropriate (e.g., "feat(scope): description")
+- Clearly convey the main purpose of the PR
+
+The description should be the complete filled-in PR template ready for GitHub."#;
+
+/// Generate PR description using AI analysis
+pub fn generate_pr_description_prompt(repo_yaml: &str, pr_template: &str) -> String {
+    format!(
+        r#"Please analyze the following repository information and generate a comprehensive pull request description by filling in the provided template:
+
+Repository Information:
+{}
+
+PR Template to Fill:
+{}
+
+INSTRUCTIONS:
+1. **ANALYZE THE COMMITS AND DIFFS**: Read through all commits and their diff files to understand exactly what changes were made
+2. **UNDERSTAND THE OVERALL PURPOSE**: Determine what this branch accomplishes as a whole
+3. **FILL THE TEMPLATE**: Replace placeholder text with specific, accurate information based on your analysis
+4. **CHECK APPROPRIATE BOXES**: Mark the correct type of change checkboxes based on actual changes
+5. **BE SPECIFIC**: Provide concrete details about what was added, changed, or fixed
+6. **EXPLAIN VALUE**: Describe why these changes are beneficial or necessary
+7. **LIST CHANGES**: Provide specific bullet points of what was modified
+8. **INCLUDE CONTEXT**: Add any relevant background or rationale for the changes
+
+Return a YAML response with this exact structure:
+
+```yaml
+title: "Your concise PR title here"
+description: |
+  Your filled-in PR template in markdown format here.
+```
+
+Ensure the title is concise (50-80 characters) and the description contains the complete filled-in template."#,
+        repo_yaml, pr_template
+    )
+}
+
+/// Generate PR system prompt with project context and guidelines
+pub fn generate_pr_system_prompt_with_context(
+    context: &crate::data::context::CommitContext,
+) -> String {
+    let mut prompt = PR_GENERATION_SYSTEM_PROMPT.to_string();
+
+    // Add project-specific PR guidelines if available
+    if let Some(pr_guidelines) = &context.project.pr_guidelines {
+        prompt.push_str("\n\n=== PROJECT PR GUIDELINES ===");
+        prompt.push_str("\nThis project has specific guidelines for pull request descriptions:");
+        prompt.push_str(&format!("\n\n{}", pr_guidelines));
+        prompt.push_str("\n\nIMPORTANT: Follow these project-specific guidelines when generating the PR description.");
+        prompt.push_str("\nUse these guidelines to inform the style, level of detail, and specific sections to emphasize.");
+    }
+
+    // Add scope information if available
+    if !context.project.valid_scopes.is_empty() {
+        let scope_names: Vec<&str> = context
+            .project
+            .valid_scopes
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        prompt.push_str(&format!(
+            "\n\nValid scopes for this project: {}",
+            scope_names.join(", ")
+        ));
+    }
+
+    prompt
+}
+
+/// Generate PR description prompt with project context
+pub fn generate_pr_description_prompt_with_context(
+    repo_yaml: &str,
+    pr_template: &str,
+    context: &crate::data::context::CommitContext,
+) -> String {
+    let mut prompt = format!(
+        r#"Please analyze the following repository information and generate a comprehensive pull request description following the project's specific guidelines:
+
+Repository Information:
+{}
+
+PR Template:
+{}
+
+"#,
+        repo_yaml, pr_template
+    );
+
+    // Add project context information
+    if context.project.pr_guidelines.is_some() {
+        prompt
+            .push_str("IMPORTANT: This project has specific PR guidelines that must be followed. ");
+        prompt.push_str("Review the guidelines in the system prompt and apply them to create an appropriate PR description.\n\n");
+    }
+
+    // Add branch context if available
+    if context.branch.is_feature_branch {
+        prompt.push_str(&format!(
+            "BRANCH CONTEXT: This is {} work on '{}'. Use this context to better describe the purpose and scope.\n\n",
+            context.branch.work_type, context.branch.description
+        ));
+    }
+
+    prompt.push_str(r#"INSTRUCTIONS:
+1. **ANALYZE THE COMMITS AND DIFFS**: Read through all commits and their diff files to understand exactly what changes were made
+2. **UNDERSTAND THE OVERALL PURPOSE**: Determine what this branch accomplishes as a whole
+3. **FOLLOW PROJECT GUIDELINES**: Apply any project-specific PR guidelines provided in the system prompt
+4. **GENERATE COMPREHENSIVE DESCRIPTION**: Create a clear, informative PR description that explains the changes
+5. **USE APPROPRIATE DETAIL LEVEL**: Match the level of detail to the significance of the changes
+6. **BE SPECIFIC**: Provide concrete details about what was added, changed, or fixed based on actual code changes
+7. **EXPLAIN VALUE**: Describe why these changes are beneficial or necessary
+8. **REPLACE PLACEHOLDERS**: Remove all placeholder text, comments, and generic content
+9. **INCLUDE ACTUAL CHANGES**: List specific bullet points of what was modified based on the diffs
+
+Return a YAML response with this exact structure:
+
+```yaml
+title: "Your concise PR title here"
+description: |
+  Your comprehensive PR description in markdown format here.
+  Follow project guidelines and replace all template placeholders with actual information.
+```
+
+The title should follow conventional commit format when appropriate and the description should be tailored to this project's standards."#);
+
+    prompt
+}

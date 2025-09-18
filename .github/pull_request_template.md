@@ -1,5 +1,3 @@
-# Pull Request
-
 ## Description
 <!-- Provide a brief description of what this PR does -->
 
@@ -21,9 +19,9 @@ Relates to #(issue_number)
 
 ## Changes Made
 <!-- List the specific changes made in this PR -->
-- 
-- 
-- 
+-
+-
+-
 
 ## Testing
 <!-- Describe the tests you ran and how to reproduce them -->

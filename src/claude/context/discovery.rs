@@ -74,6 +74,21 @@ impl ProjectDiscovery {
             debug!("No commit guidelines file found");
         }
 
+        // Load PR guidelines (with local override)
+        let pr_guidelines_path = self.resolve_config_file(dir, "pr-guidelines.md");
+        debug!(
+            path = ?pr_guidelines_path,
+            exists = pr_guidelines_path.exists(),
+            "Checking for PR guidelines"
+        );
+        if pr_guidelines_path.exists() {
+            let content = fs::read_to_string(&pr_guidelines_path)?;
+            debug!(bytes = content.len(), "Loaded PR guidelines");
+            context.pr_guidelines = Some(content);
+        } else {
+            debug!("No PR guidelines file found");
+        }
+
         // Load scopes configuration (with local override)
         let scopes_path = self.resolve_config_file(dir, "scopes.yaml");
         if scopes_path.exists() {

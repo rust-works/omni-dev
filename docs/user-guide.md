@@ -42,7 +42,7 @@ intelligence.
 
 ### First Use
 
-Transform your commit messages in 3 steps:
+Transform your commit messages and create professional PRs in 4 steps:
 
 ```bash
 # 1. Navigate to your git repository
@@ -53,13 +53,17 @@ omni-dev git commit message twiddle 'HEAD~5..HEAD' --use-context
 
 # 3. Review and apply the suggestions
 # The tool will show you before/after and ask for confirmation
+
+# 4. Create a professional PR with AI-generated description
+omni-dev git branch create pr
+# Analyzes your commits and generates comprehensive PR description
 ```
 
 ## Core Concepts
 
-### The Three-Command Workflow
+### The Four-Command Workflow
 
-omni-dev follows a simple analyze → improve → apply workflow:
+omni-dev follows a simple analyze → improve → apply → ship workflow:
 
 ```bash
 # 📊 ANALYZE: See detailed commit information
@@ -70,6 +74,9 @@ omni-dev git commit message twiddle 'HEAD~3..HEAD' --use-context
 
 # ✏️ APPLY: Apply specific amendments manually
 omni-dev git commit message amend amendments.yaml
+
+# 🚀 SHIP: Create professional PR with AI description
+omni-dev git branch create pr
 ```
 
 ### Key Benefits
@@ -164,6 +171,77 @@ amendments:
       - JWT token management
       - User session handling
       - Role-based access control
+```
+
+### `create pr` - AI-Powered Pull Request Creation
+
+Generate professional pull requests with AI-analyzed descriptions:
+
+```bash
+# Create PR with AI-generated description
+omni-dev git branch create pr
+
+# Create PR for specific base branch
+omni-dev git branch create pr main
+
+# Common options
+omni-dev git branch create pr [BASE_BRANCH] [OPTIONS]
+```
+
+**Key Options:**
+
+| Option | Description | Example |
+|--------|-------------|---------|
+| `--auto-apply` | Create/update PR without confirmation | `--auto-apply` |
+| `--save-only FILE` | Save PR details to YAML file instead of creating | `--save-only pr-details.yaml` |
+
+**What it does:**
+
+- Analyzes your branch commits and changes
+- Generates comprehensive PR title and description using AI
+- Fills in PR template sections automatically
+- Handles both new PR creation and existing PR updates
+- Creates YAML file with structured PR details for editing
+
+**Requirements:**
+
+- Clean working directory (no uncommitted changes)
+- GitHub CLI (`gh`) installed and authenticated
+- Branch pushed to remote (will push automatically if needed)
+- Claude API key configured
+
+**Example Output:**
+
+The command creates a `pr-details.yaml` file with structure like:
+
+```yaml
+title: "feat(auth): implement comprehensive OAuth2 authentication system"
+description: |
+  # Pull Request
+
+  ## Description
+  This PR implements a comprehensive OAuth2 authentication system that enables
+  users to sign in using Google and GitHub providers. The implementation includes
+  secure token management, session handling, and role-based access control.
+
+  ## Type of Change
+  - [x] New feature (non-breaking change which adds functionality)
+
+  ## Changes Made
+  - Added OAuth2 integration with Google and GitHub providers
+  - Implemented JWT token validation and refresh mechanisms
+  - Created user session management system
+  - Added role-based access control middleware
+  - Updated authentication documentation
+
+  ## Testing
+  - [x] All existing tests pass
+  - [x] New tests added for authentication flows
+  - [x] Manual testing performed with both providers
+
+  ## Additional Notes
+  This implementation follows OAuth2 best practices and includes comprehensive
+  error handling for edge cases.
 ```
 
 ## Contextual Intelligence
@@ -321,6 +399,55 @@ omni-dev git commit message twiddle 'main..HEAD' --use-context
 
 # 3. Review suggestions and apply
 # ✅ Professional commit history ready for review
+```
+
+### Complete Feature Development Workflow
+
+End-to-end workflow from feature development to PR creation:
+
+```bash
+# 1. Create and work on feature branch
+git checkout -b feature/user-authentication
+# ... make changes and commits ...
+
+# 2. Improve commit messages with AI
+omni-dev git commit message twiddle 'main..HEAD' --use-context
+
+# 3. Create professional PR with AI-generated description
+omni-dev git branch create pr
+
+# ✅ Complete: clean commits + comprehensive PR ready for team review
+```
+
+### PR Creation and Updates
+
+Handle PR creation and updates efficiently:
+
+```bash
+# Create new PR with AI-generated description
+omni-dev git branch create pr main
+
+# If PR already exists, update it with new description
+omni-dev git branch create pr --auto-apply
+
+# Save PR details for review before creating
+omni-dev git branch create pr --save-only review-pr.yaml
+# Review and edit the file...
+# Then create manually using GitHub CLI or web interface
+```
+
+### Collaborative PR Workflow
+
+Work with existing PRs and team feedback:
+
+```bash
+# Update existing PR after new commits
+git add . && git commit -m "address review feedback"
+omni-dev git branch create pr  # Updates existing PR
+
+# Generate PR description without creating (for draft PRs)
+omni-dev git branch create pr --save-only draft-pr.yaml
+# Use the content to update draft PR manually
 ```
 
 ### Large Codebase Migration
@@ -508,6 +635,29 @@ echo "- [ ] Run \`omni-dev git commit message twiddle 'main..HEAD' --use-context
 
 # Document in CONTRIBUTING.md
 echo "Before creating a PR, clean up commit messages with omni-dev" >> CONTRIBUTING.md
+
+# Add PR creation to workflow
+echo "Create PR with: \`omni-dev git branch create pr\`" >> CONTRIBUTING.md
+```
+
+### 8. PR Creation Best Practices
+
+Optimize your PR creation workflow:
+
+```bash
+# ✅ Good - Clean commits first, then create PR
+omni-dev git commit message twiddle 'main..HEAD' --use-context
+omni-dev git branch create pr
+
+# ✅ Good - Review PR details before creating
+omni-dev git branch create pr --save-only review.yaml
+# Edit file if needed, then use GitHub CLI or web interface
+
+# ⚠️ Caution - Ensure working directory is clean
+git status  # Check for uncommitted changes first
+
+# ✅ Good - Use base branch when not default
+omni-dev git branch create pr develop  # For non-main base branches
 ```
 
 ## Troubleshooting
