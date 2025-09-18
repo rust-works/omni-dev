@@ -271,7 +271,7 @@ Focus on commits that:
 
 Remember: File paths and directory names are just hints. The diff content shows the real changes.
 
-Only include commits that actually need improvement. If all commits are already well-formatted, return an empty amendments array."#,
+Include ALL commits in the amendments array. Even if a commit message is already well-formatted, include it with its current message. This allows users to review and potentially modify all commits."#,
         repo_yaml
     )
 }
@@ -362,7 +362,7 @@ pub fn generate_contextual_user_prompt(repo_yaml: &str, context: &CommitContext)
         }
     }
 
-    prompt.push_str("\nOnly include commits that actually need improvement. If all commits are already well-formatted, return an empty amendments array.");
+    prompt.push_str("\nInclude ALL commits in the amendments array. Even if a commit message is already well-formatted, include it with its current message. This allows users to review and potentially modify all commits.");
 
     prompt
 }

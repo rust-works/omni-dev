@@ -346,11 +346,11 @@ impl TwiddleCommand {
                 return Ok(());
             }
 
-            // 8. Apply amendments
-            self.apply_amendments(amendments).await?;
+            // 8. Apply amendments (re-read from file to capture any user edits)
+            self.apply_amendments_from_file(&amendments_file).await?;
             println!("✅ Commit messages improved successfully!");
         } else {
-            println!("✨ All commit messages are already well-formatted!");
+            println!("✨ No commits found to process!");
         }
 
         Ok(())
@@ -456,11 +456,11 @@ impl TwiddleCommand {
                 return Ok(());
             }
 
-            // Apply all amendments
-            self.apply_amendments(all_amendments).await?;
+            // Apply all amendments (re-read from file to capture any user edits)
+            self.apply_amendments_from_file(&amendments_file).await?;
             println!("✅ Commit messages improved successfully!");
         } else {
-            println!("✨ All commit messages are already well-formatted!");
+            println!("✨ No commits found to process!");
         }
 
         Ok(())
@@ -650,22 +650,14 @@ impl TwiddleCommand {
         Ok(())
     }
 
-    /// Apply amendments using existing AmendmentHandler logic
-    async fn apply_amendments(
-        &self,
-        amendments: crate::data::amendments::AmendmentFile,
-    ) -> Result<()> {
+    /// Apply amendments from a file path (re-reads from disk to capture user edits)
+    async fn apply_amendments_from_file(&self, amendments_file: &std::path::Path) -> Result<()> {
         use crate::git::AmendmentHandler;
 
-        // Create temporary file for amendments
-        let temp_dir = tempfile::tempdir()?;
-        let temp_file = temp_dir.path().join("twiddle_amendments.yaml");
-        amendments.save_to_file(&temp_file)?;
-
-        // Use AmendmentHandler to apply amendments
+        // Use AmendmentHandler to apply amendments directly from file
         let handler = AmendmentHandler::new().context("Failed to initialize amendment handler")?;
         handler
-            .apply_amendments(&temp_file.to_string_lossy())
+            .apply_amendments(&amendments_file.to_string_lossy())
             .context("Failed to apply amendments")?;
 
         Ok(())
