@@ -3,6 +3,10 @@
 use crate::git::CommitInfo;
 use anyhow::{Context, Result};
 use git2::{Repository, Status};
+use ssh2_config::{ParseRule, SshConfig};
+use std::io::BufReader;
+use std::path::PathBuf;
+use tracing::{debug, error, info};
 
 /// Git repository wrapper
 pub struct GitRepository {
@@ -254,65 +258,372 @@ fn format_status_flags(flags: Status) -> String {
     status
 }
 
+/// Extract hostname from a git URL (e.g., "git@github.com:user/repo.git" -> "github.com")
+fn extract_hostname_from_git_url(url: &str) -> Option<String> {
+    if let Some(ssh_url) = url.strip_prefix("git@") {
+        // SSH URL format: git@hostname:path
+        ssh_url.split(':').next().map(|s| s.to_string())
+    } else if let Some(https_url) = url.strip_prefix("https://") {
+        // HTTPS URL format: https://hostname/path
+        https_url.split('/').next().map(|s| s.to_string())
+    } else if let Some(http_url) = url.strip_prefix("http://") {
+        // HTTP URL format: http://hostname/path
+        http_url.split('/').next().map(|s| s.to_string())
+    } else {
+        None
+    }
+}
+
+/// Get SSH identity file for a given host from SSH config
+fn get_ssh_identity_for_host(hostname: &str) -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let ssh_config_path = PathBuf::from(&home).join(".ssh/config");
+
+    if !ssh_config_path.exists() {
+        debug!("SSH config file not found at: {:?}", ssh_config_path);
+        return None;
+    }
+
+    // Open and parse the SSH config file
+    let file = std::fs::File::open(&ssh_config_path).ok()?;
+    let mut reader = BufReader::new(file);
+
+    let config = SshConfig::default()
+        .parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS)
+        .ok()?;
+
+    // Query the config for the specific host
+    let params = config.query(hostname);
+
+    // Get the identity file from the config
+    if let Some(identity_files) = &params.identity_file {
+        if let Some(first_identity) = identity_files.first() {
+            // Expand ~ to home directory
+            let identity_str = first_identity.to_string_lossy();
+            let identity_path = identity_str.replace("~", &home);
+            let path = PathBuf::from(identity_path);
+
+            if path.exists() {
+                debug!("Found SSH key for host '{}': {:?}", hostname, path);
+                return Some(path);
+            } else {
+                debug!("SSH key specified in config but not found: {:?}", path);
+            }
+        }
+    }
+
+    None
+}
+
 impl GitRepository {
     /// Push current branch to remote
     pub fn push_branch(&self, branch_name: &str, remote_name: &str) -> Result<()> {
+        info!(
+            "Pushing branch '{}' to remote '{}'",
+            branch_name, remote_name
+        );
+
         // Get remote
+        debug!("Finding remote '{}'", remote_name);
         let mut remote = self
             .repo
             .find_remote(remote_name)
             .context("Failed to find remote")?;
 
+        let remote_url = remote.url().unwrap_or("<unknown>");
+        debug!("Remote URL: {}", remote_url);
+
         // Set up refspec for push
         let refspec = format!("refs/heads/{}:refs/heads/{}", branch_name, branch_name);
+        debug!("Using refspec: {}", refspec);
+
+        // Extract hostname from remote URL for SSH config lookup
+        let hostname =
+            extract_hostname_from_git_url(remote_url).unwrap_or("github.com".to_string());
+        debug!(
+            "Extracted hostname '{}' from URL '{}'",
+            hostname, remote_url
+        );
 
         // Push with authentication callbacks
         let mut push_options = git2::PushOptions::new();
         let mut callbacks = git2::RemoteCallbacks::new();
+        let mut auth_attempts = 0;
 
         // Try to use credentials from git credential helper or SSH agent
-        callbacks.credentials(|_url, username_from_url, _allowed_types| {
-            git2::Cred::ssh_key_from_agent(username_from_url.unwrap_or("git"))
+        callbacks.credentials(move |url, username_from_url, allowed_types| {
+            auth_attempts += 1;
+            debug!(
+                "Credential callback attempt {} - URL: {}, Username: {:?}, Allowed types: {:?}",
+                auth_attempts, url, username_from_url, allowed_types
+            );
+
+            // Bail out after 3 attempts to prevent infinite loops
+            if auth_attempts > 3 {
+                error!(
+                    "Too many authentication attempts ({}), giving up",
+                    auth_attempts
+                );
+                return Err(git2::Error::from_str(
+                    "Authentication failed after multiple attempts",
+                ));
+            }
+
+            let username = username_from_url.unwrap_or("git");
+
+            // Try different authentication methods
+            if allowed_types.contains(git2::CredentialType::SSH_KEY) {
+                // On first attempt, try SSH config first since we know the exact key to use
+                // This avoids the issue where SSH agent returns OK but has no valid keys
+
+                // Try to get SSH key from SSH config
+                if let Some(ssh_key_path) = get_ssh_identity_for_host(&hostname) {
+                    let pub_key_path = ssh_key_path.with_extension("pub");
+                    debug!("Trying SSH key from config: {:?}", ssh_key_path);
+
+                    match git2::Cred::ssh_key(username, Some(&pub_key_path), &ssh_key_path, None) {
+                        Ok(cred) => {
+                            debug!(
+                                "Successfully loaded SSH key from config: {:?}",
+                                ssh_key_path
+                            );
+                            return Ok(cred);
+                        }
+                        Err(e) => {
+                            debug!("Failed to load SSH key from config: {}", e);
+                        }
+                    }
+                }
+
+                // Only try SSH agent on first attempt
+                if auth_attempts == 1 {
+                    match git2::Cred::ssh_key_from_agent(username) {
+                        Ok(cred) => {
+                            debug!("SSH agent credentials obtained (attempt {})", auth_attempts);
+                            return Ok(cred);
+                        }
+                        Err(e) => {
+                            debug!("SSH agent failed: {}, trying default keys", e);
+                        }
+                    }
+                }
+
+                // Try default SSH key locations as fallback
+                let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
+                let ssh_keys = [
+                    format!("{}/.ssh/id_ed25519", home),
+                    format!("{}/.ssh/id_rsa", home),
+                ];
+
+                for key_path in &ssh_keys {
+                    let key_path = PathBuf::from(key_path);
+                    if key_path.exists() {
+                        let pub_key_path = key_path.with_extension("pub");
+                        debug!("Trying default SSH key: {:?}", key_path);
+
+                        match git2::Cred::ssh_key(username, Some(&pub_key_path), &key_path, None) {
+                            Ok(cred) => {
+                                debug!("Successfully loaded SSH key from {:?}", key_path);
+                                return Ok(cred);
+                            }
+                            Err(e) => debug!("Failed to load SSH key from {:?}: {}", key_path, e),
+                        }
+                    }
+                }
+            }
+
+            // If all else fails, try default
+            debug!("Falling back to default credentials");
+            git2::Cred::default()
         });
 
         push_options.remote_callbacks(callbacks);
 
         // Perform the push
-        remote
-            .push(&[&refspec], Some(&mut push_options))
-            .context("Failed to push branch to remote")?;
-
-        Ok(())
+        debug!("Attempting to push to remote...");
+        match remote.push(&[&refspec], Some(&mut push_options)) {
+            Ok(_) => {
+                info!(
+                    "Successfully pushed branch '{}' to remote '{}'",
+                    branch_name, remote_name
+                );
+                Ok(())
+            }
+            Err(e) => {
+                error!("Failed to push branch: {}", e);
+                let error_msg =
+                    if e.message().contains("authentication") || e.message().contains("SSH") {
+                        format!(
+                            "Failed to push branch to remote: {}. \n\nTroubleshooting steps:\n\
+                        1. Check if your SSH key is loaded: ssh-add -l\n\
+                        2. Test GitHub SSH connection: ssh -T git@github.com\n\
+                        3. Use GitHub CLI auth instead: gh auth setup-git",
+                            e
+                        )
+                    } else {
+                        format!("Failed to push branch to remote: {}", e)
+                    };
+                Err(anyhow::anyhow!(error_msg))
+            }
+        }
     }
 
     /// Check if branch exists on remote
     pub fn branch_exists_on_remote(&self, branch_name: &str, remote_name: &str) -> Result<bool> {
+        debug!(
+            "Checking if branch '{}' exists on remote '{}'",
+            branch_name, remote_name
+        );
+
         let remote = self
             .repo
             .find_remote(remote_name)
             .context("Failed to find remote")?;
 
+        let remote_url = remote.url().unwrap_or("<unknown>");
+        debug!("Remote URL: {}", remote_url);
+
+        // Extract hostname from remote URL for SSH config lookup
+        let hostname =
+            extract_hostname_from_git_url(remote_url).unwrap_or("github.com".to_string());
+        debug!(
+            "Extracted hostname '{}' from URL '{}'",
+            hostname, remote_url
+        );
+
         // Connect to remote to get refs
         let mut remote = remote;
         let mut callbacks = git2::RemoteCallbacks::new();
-        callbacks.credentials(|_url, username_from_url, _allowed_types| {
-            git2::Cred::ssh_key_from_agent(username_from_url.unwrap_or("git"))
+        let mut auth_attempts = 0;
+
+        callbacks.credentials(move |url, username_from_url, allowed_types| {
+            auth_attempts += 1;
+            debug!(
+                "Credential callback attempt {} - URL: {}, Username: {:?}, Allowed types: {:?}",
+                auth_attempts, url, username_from_url, allowed_types
+            );
+
+            // Bail out after 3 attempts to prevent infinite loops
+            if auth_attempts > 3 {
+                error!(
+                    "Too many authentication attempts ({}), giving up",
+                    auth_attempts
+                );
+                return Err(git2::Error::from_str(
+                    "Authentication failed after multiple attempts",
+                ));
+            }
+
+            let username = username_from_url.unwrap_or("git");
+
+            // Try different authentication methods
+            if allowed_types.contains(git2::CredentialType::SSH_KEY) {
+                // On first attempt, try SSH config first since we know the exact key to use
+                // This avoids the issue where SSH agent returns OK but has no valid keys
+
+                // Try to get SSH key from SSH config
+                if let Some(ssh_key_path) = get_ssh_identity_for_host(&hostname) {
+                    let pub_key_path = ssh_key_path.with_extension("pub");
+                    debug!("Trying SSH key from config: {:?}", ssh_key_path);
+
+                    match git2::Cred::ssh_key(username, Some(&pub_key_path), &ssh_key_path, None) {
+                        Ok(cred) => {
+                            debug!(
+                                "Successfully loaded SSH key from config: {:?}",
+                                ssh_key_path
+                            );
+                            return Ok(cred);
+                        }
+                        Err(e) => {
+                            debug!("Failed to load SSH key from config: {}", e);
+                        }
+                    }
+                }
+
+                // Only try SSH agent on first attempt
+                if auth_attempts == 1 {
+                    match git2::Cred::ssh_key_from_agent(username) {
+                        Ok(cred) => {
+                            debug!("SSH agent credentials obtained (attempt {})", auth_attempts);
+                            return Ok(cred);
+                        }
+                        Err(e) => {
+                            debug!("SSH agent failed: {}, trying default keys", e);
+                        }
+                    }
+                }
+
+                // Try default SSH key locations as fallback
+                let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
+                let ssh_keys = [
+                    format!("{}/.ssh/id_ed25519", home),
+                    format!("{}/.ssh/id_rsa", home),
+                ];
+
+                for key_path in &ssh_keys {
+                    let key_path = PathBuf::from(key_path);
+                    if key_path.exists() {
+                        let pub_key_path = key_path.with_extension("pub");
+                        debug!("Trying default SSH key: {:?}", key_path);
+
+                        match git2::Cred::ssh_key(username, Some(&pub_key_path), &key_path, None) {
+                            Ok(cred) => {
+                                debug!("Successfully loaded SSH key from {:?}", key_path);
+                                return Ok(cred);
+                            }
+                            Err(e) => debug!("Failed to load SSH key from {:?}: {}", key_path, e),
+                        }
+                    }
+                }
+            }
+
+            // If all else fails, try default
+            debug!("Falling back to default credentials");
+            git2::Cred::default()
         });
 
-        remote
-            .connect_auth(git2::Direction::Fetch, Some(callbacks), None)
-            .context("Failed to connect to remote")?;
+        debug!("Attempting to connect to remote...");
+        match remote.connect_auth(git2::Direction::Fetch, Some(callbacks), None) {
+            Ok(_) => debug!("Successfully connected to remote"),
+            Err(e) => {
+                error!("Failed to connect to remote: {}", e);
+                let error_msg =
+                    if e.message().contains("authentication") || e.message().contains("SSH") {
+                        format!(
+                            "Failed to connect to remote: {}. \n\nTroubleshooting steps:\n\
+                        1. Check if your SSH key is loaded: ssh-add -l\n\
+                        2. Test GitHub SSH connection: ssh -T git@github.com\n\
+                        3. Use GitHub CLI auth instead: gh auth setup-git",
+                            e
+                        )
+                    } else {
+                        format!("Failed to connect to remote: {}", e)
+                    };
+                return Err(anyhow::anyhow!(error_msg));
+            }
+        }
 
         // Check if the remote branch exists
+        debug!("Listing remote refs...");
         let refs = remote.list()?;
         let remote_branch_ref = format!("refs/heads/{}", branch_name);
+        debug!("Looking for remote branch ref: {}", remote_branch_ref);
 
         for remote_head in refs {
+            debug!("Found remote ref: {}", remote_head.name());
             if remote_head.name() == remote_branch_ref {
+                info!(
+                    "Branch '{}' exists on remote '{}'",
+                    branch_name, remote_name
+                );
                 return Ok(true);
             }
         }
 
+        info!(
+            "Branch '{}' does not exist on remote '{}'",
+            branch_name, remote_name
+        );
         Ok(false)
     }
 }
