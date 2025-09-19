@@ -1307,28 +1307,61 @@ impl CreatePrCommand {
             "Failed to get current branch. Make sure you're not in detached HEAD state.",
         )?;
 
-        // Determine base branch
+        // Get remote information to determine proper remote and main branch
+        let remotes = RemoteInfo::get_all_remotes(repo.repository())?;
+
+        // Find the primary remote (prefer origin, fallback to first available)
+        let primary_remote = remotes
+            .iter()
+            .find(|r| r.name == "origin")
+            .or_else(|| remotes.first())
+            .ok_or_else(|| anyhow::anyhow!("No remotes found in repository"))?;
+
+        // Determine base branch (with remote prefix)
         let base_branch = match self.base_branch.as_ref() {
             Some(branch) => {
-                // Validate that the specified base branch exists
-                if !repo.branch_exists(branch)? {
-                    anyhow::bail!("Base branch '{}' does not exist", branch);
+                // User specified base branch - need to determine if it's local or remote format
+                let remote_branch = if branch.contains('/') {
+                    // Already in remote format (e.g., "origin/main")
+                    branch.clone()
+                } else {
+                    // Local branch name - convert to remote format
+                    format!("{}/{}", primary_remote.name, branch)
+                };
+
+                // Validate that the remote branch exists
+                let remote_ref = format!("refs/remotes/{}", remote_branch);
+                if repo.repository().find_reference(&remote_ref).is_err() {
+                    anyhow::bail!("Remote branch '{}' does not exist", remote_branch);
                 }
-                branch.clone()
+                remote_branch
             }
             None => {
-                // Default to main or master
-                if repo.branch_exists("main")? {
-                    "main".to_string()
-                } else if repo.branch_exists("master")? {
-                    "master".to_string()
-                } else {
-                    anyhow::bail!("No default base branch found (main or master)");
+                // Auto-detect using the primary remote's main branch
+                let main_branch = &primary_remote.main_branch;
+                if main_branch == "unknown" {
+                    anyhow::bail!(
+                        "Could not determine main branch for remote '{}'",
+                        primary_remote.name
+                    );
                 }
+
+                let remote_main = format!("{}/{}", primary_remote.name, main_branch);
+
+                // Validate that the remote main branch exists
+                let remote_ref = format!("refs/remotes/{}", remote_main);
+                if repo.repository().find_reference(&remote_ref).is_err() {
+                    anyhow::bail!(
+                        "Remote main branch '{}' does not exist. Try running 'git fetch' first.",
+                        remote_main
+                    );
+                }
+
+                remote_main
             }
         };
 
-        // Calculate commit range: [base_branch]..HEAD
+        // Calculate commit range: [remote_base]..HEAD
         let commit_range = format!("{}..HEAD", base_branch);
 
         // Get working directory status
@@ -1464,22 +1497,36 @@ impl CreatePrCommand {
 
     /// Show commit range and count information
     fn show_commit_range_info(&self, repo_view: &crate::data::RepositoryView) -> Result<()> {
-        // Determine the base branch and commit range used
-        let base_branch = self.base_branch.as_deref().unwrap_or_else(|| {
-            // Logic from generate_repository_view to determine default base branch
-            use crate::git::GitRepository;
-            if let Ok(repo) = GitRepository::open() {
-                if repo.branch_exists("main").unwrap_or(false) {
-                    "main"
-                } else if repo.branch_exists("master").unwrap_or(false) {
-                    "master"
+        // Recreate the base branch determination logic from generate_repository_view
+        let base_branch = match self.base_branch.as_ref() {
+            Some(branch) => {
+                // User specified base branch
+                if branch.contains('/') {
+                    // Already in remote format
+                    branch.clone()
                 } else {
-                    "unknown"
+                    // Get the primary remote name from repo_view
+                    let primary_remote_name = repo_view
+                        .remotes
+                        .iter()
+                        .find(|r| r.name == "origin")
+                        .or_else(|| repo_view.remotes.first())
+                        .map(|r| r.name.as_str())
+                        .unwrap_or("origin");
+                    format!("{}/{}", primary_remote_name, branch)
                 }
-            } else {
-                "unknown"
             }
-        });
+            None => {
+                // Auto-detected base branch from remotes
+                repo_view
+                    .remotes
+                    .iter()
+                    .find(|r| r.name == "origin")
+                    .or_else(|| repo_view.remotes.first())
+                    .map(|r| format!("{}/{}", r.name, r.main_branch))
+                    .unwrap_or_else(|| "unknown".to_string())
+            }
+        };
 
         let commit_range = format!("{}..HEAD", base_branch);
         let commit_count = repo_view.commits.len();
