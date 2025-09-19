@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use tracing::debug;
+use tracing::{debug, error};
 
 /// Git operations
 #[derive(Parser)]
@@ -2049,17 +2049,31 @@ impl CreatePrCommand {
         println!("   🌿 Branch: {}", branch_name);
 
         // Check if branch is pushed to remote and push if needed
+        debug!("Opening git repository to check branch status");
         let git_repo =
             crate::git::GitRepository::open().context("Failed to open git repository")?;
 
+        debug!(
+            "Checking if branch '{}' exists on remote 'origin'",
+            branch_name
+        );
         if !git_repo.branch_exists_on_remote(branch_name, "origin")? {
             println!("📤 Pushing branch to remote...");
+            debug!(
+                "Branch '{}' not found on remote, attempting to push",
+                branch_name
+            );
             git_repo
                 .push_branch(branch_name, "origin")
                 .context("Failed to push branch to remote")?;
+        } else {
+            debug!("Branch '{}' already exists on remote 'origin'", branch_name);
         }
 
         // Create PR using gh CLI
+        debug!("Creating PR with gh CLI - title: '{}'", title);
+        debug!("PR description length: {} characters", description.len());
+
         let pr_result = Command::new("gh")
             .args(["pr", "create", "--title", title, "--body", description])
             .output()
@@ -2068,9 +2082,11 @@ impl CreatePrCommand {
         if pr_result.status.success() {
             let pr_url = String::from_utf8_lossy(&pr_result.stdout);
             let pr_url = pr_url.trim();
+            debug!("PR created successfully with URL: {}", pr_url);
             println!("🎉 Pull request created: {}", pr_url);
         } else {
             let error_msg = String::from_utf8_lossy(&pr_result.stderr);
+            error!("gh CLI failed to create PR: {}", error_msg);
             anyhow::bail!("Failed to create pull request: {}", error_msg);
         }
 
