@@ -447,6 +447,31 @@ impl GitRepository {
                     "Successfully pushed branch '{}' to remote '{}'",
                     branch_name, remote_name
                 );
+
+                // Set upstream branch after successful push
+                debug!("Setting upstream branch for '{}'", branch_name);
+                match self.repo.find_branch(branch_name, git2::BranchType::Local) {
+                    Ok(mut branch) => {
+                        let remote_ref = format!("{}/{}", remote_name, branch_name);
+                        match branch.set_upstream(Some(&remote_ref)) {
+                            Ok(_) => {
+                                info!(
+                                    "Successfully set upstream to '{}'/{}",
+                                    remote_name, branch_name
+                                );
+                            }
+                            Err(e) => {
+                                // Log but don't fail - the push succeeded
+                                error!("Failed to set upstream branch: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Log but don't fail - the push succeeded
+                        error!("Failed to find local branch to set upstream: {}", e);
+                    }
+                }
+
                 Ok(())
             }
             Err(e) => {
