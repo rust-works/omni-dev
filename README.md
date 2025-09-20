@@ -33,6 +33,12 @@ conventional commit formats with project-aware suggestions.
 # Install from crates.io
 cargo install omni-dev
 
+# Install with Nix
+nix profile install github:rust-works/omni-dev
+
+# Install with Nix flakes (development)
+nix run github:rust-works/omni-dev
+
 # Set up Claude API key (required for AI features)
 export CLAUDE_API_KEY="your-api-key-here"
 ```
