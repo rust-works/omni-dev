@@ -39,8 +39,26 @@ nix profile install github:rust-works/omni-dev
 # Install with Nix flakes (development)
 nix run github:rust-works/omni-dev
 
+# Enable binary cache for faster builds (optional)
+cachix use omni-dev
+
 # Set up Claude API key (required for AI features)
 export CLAUDE_API_KEY="your-api-key-here"
+```
+
+#### Nix Binary Cache (Optional)
+
+For faster Nix builds, you can use the binary cache:
+
+```bash
+# Install cachix if you don't have it
+nix profile install nixpkgs#cachix
+
+# Enable the omni-dev binary cache
+cachix use omni-dev
+
+# Now Nix installations will use pre-built binaries instead of compiling from source
+nix profile install github:rust-works/omni-dev
 ```
 
 ### 30-Second Demo

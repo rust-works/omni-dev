@@ -90,11 +90,10 @@ jobs:
         extra_nix_config: |
           experimental-features = nix-command flakes
     - uses: cachix/cachix-action@v12
-      continue-on-error: true
       with:
-        name: nix-community
+        name: omni-dev
         authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
-        skipPush: true
+        extraPullNames: nix-community
     - name: Check Nix flake
       run: nix flake check
     - name: Build with Nix
