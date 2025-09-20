@@ -61,6 +61,12 @@ cachix use omni-dev
 nix profile install github:rust-works/omni-dev
 ```
 
+### 🎬 See It In Action
+
+[![asciicast](https://asciinema.org/a/eJJf5Aj8N26JoCaUsAFVH8dqz.svg)](https://asciinema.org/a/eJJf5Aj8N26JoCaUsAFVH8dqz)
+
+*Watch omni-dev transform messy commits into professional ones with AI-powered analysis*
+
 ### 30-Second Demo
 
 Transform your commit messages and create professional PRs with AI intelligence:

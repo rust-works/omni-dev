@@ -43,3 +43,6 @@ lcov.info
 
 # Local omni-dev configuration overrides (personal settings)
 .omni-dev/local/
+
+# ASCII Cinema demo files (temporary)
+cinema/
