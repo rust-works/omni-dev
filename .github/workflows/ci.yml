@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [ main ]
+    tags: [ 'v*' ]
   pull_request:
     branches: [ main ]
 
@@ -94,6 +95,7 @@ jobs:
         name: omni-dev
         authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
         extraPullNames: nix-community
+        skipPush: ${{ !startsWith(github.ref, 'refs/tags/') }}
     - name: Check Nix flake
       run: nix flake check
     - name: Build with Nix
