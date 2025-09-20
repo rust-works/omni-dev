@@ -11,6 +11,7 @@ The release process follows semantic versioning and includes:
 4. Git tagging
 5. GitHub release creation
 6. crates.io publication
+7. Nix binary cache publication
 
 ## Prerequisites
 
@@ -122,9 +123,14 @@ Push the commits and tag to the remote repository:
 # Push commits
 git push origin main
 
-# Push tag
+# Push tag (this triggers CI to build and publish to Nix binary cache)
 git push origin vX.Y.Z
 ```
+
+**Note**: Pushing the tag automatically triggers CI to:
+- Run all quality checks
+- Build the Nix package
+- Publish to the `omni-dev` binary cache on Cachix
 
 ### 7. Create GitHub Release
 
@@ -164,6 +170,23 @@ This will:
 - Upload to crates.io registry
 - Make it available for `cargo install omni-dev`
 
+### 9. Verify Nix Binary Cache Publication
+
+Check that the Nix binary cache was successfully updated:
+
+1. **Monitor CI**: Check that the tag-triggered CI run completed successfully
+2. **Verify cache contents**:
+   ```bash
+   # Check if the release is available in the cache
+   nix search github:rust-works/omni-dev
+
+   # Test installation from cache
+   cachix use omni-dev
+   nix profile install github:rust-works/omni-dev
+   ```
+
+The binary cache publication happens automatically when you push the tag, making Nix installations much faster for users.
+
 ## Post-Release Tasks
 
 After completing the release:
@@ -172,6 +195,7 @@ After completing the release:
    - Check GitHub releases page
    - Verify crates.io listing
    - Test installation: `cargo install omni-dev`
+   - Verify Nix binary cache: `nix profile install github:rust-works/omni-dev`
 
 2. **Update Documentation**:
    - Update any version-specific documentation
