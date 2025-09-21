@@ -20,6 +20,11 @@ impl ClaudeClient {
         Self { ai_client }
     }
 
+    /// Get metadata about the AI client
+    pub fn get_ai_client_metadata(&self) -> crate::claude::ai::AiClientMetadata {
+        self.ai_client.get_metadata()
+    }
+
     /// Create new Claude client with API key from environment variables
     pub fn from_env(model: String) -> Result<Self> {
         // Try to get API key from environment variables
@@ -69,7 +74,16 @@ impl ClaudeClient {
             .context("Failed to serialize repository view to YAML")?;
 
         // Generate contextual prompts using intelligence
-        let system_prompt = prompts::generate_contextual_system_prompt(context);
+        let provider = self.ai_client.get_metadata().provider;
+        let provider_name = if provider.to_lowercase().contains("openai")
+            || provider.to_lowercase().contains("ollama")
+        {
+            "openai"
+        } else {
+            "claude"
+        };
+        let system_prompt =
+            prompts::generate_contextual_system_prompt_for_provider(context, provider_name);
         let user_prompt = prompts::generate_contextual_user_prompt(&repo_yaml, context);
 
         // Debug logging to troubleshoot custom commit type issue
@@ -176,8 +190,17 @@ impl ClaudeClient {
         let repo_yaml = crate::data::to_yaml(&ai_repo_view)
             .context("Failed to serialize repository view to YAML")?;
 
-        // Generate contextual prompts for PR description
-        let system_prompt = prompts::generate_pr_system_prompt_with_context(context);
+        // Generate contextual prompts for PR description with provider-specific handling
+        let provider = self.ai_client.get_metadata().provider;
+        let provider_name = if provider.to_lowercase().contains("openai")
+            || provider.to_lowercase().contains("ollama")
+        {
+            "openai"
+        } else {
+            "claude"
+        };
+        let system_prompt =
+            prompts::generate_pr_system_prompt_with_context_for_provider(context, provider_name);
         let user_prompt =
             prompts::generate_pr_description_prompt_with_context(&repo_yaml, pr_template, context);
 
@@ -246,15 +269,61 @@ impl ClaudeClient {
 
 /// Create a default Claude client using environment variables and settings
 pub fn create_default_claude_client(model: Option<String>) -> Result<ClaudeClient> {
+    use crate::claude::ai::openai::OpenAiAiClient;
     use crate::utils::settings::{get_env_var, get_env_vars};
+
+    // Check if we should use OpenAI-compatible API (OpenAI or Ollama)
+    let use_openai = get_env_var("USE_OPENAI")
+        .map(|val| val == "true")
+        .unwrap_or(false);
+
+    let use_ollama = get_env_var("USE_OLLAMA")
+        .map(|val| val == "true")
+        .unwrap_or(false);
 
     // Check if we should use Bedrock
     let use_bedrock = get_env_var("CLAUDE_CODE_USE_BEDROCK")
         .map(|val| val == "true")
         .unwrap_or(false);
 
-    // Try to get model from env var ANTHROPIC_MODEL or use default
-    let model = model
+    debug!(
+        use_openai = use_openai,
+        use_ollama = use_ollama,
+        use_bedrock = use_bedrock,
+        "Client selection flags"
+    );
+
+    // Handle Ollama configuration
+    if use_ollama {
+        let ollama_model = model
+            .or_else(|| get_env_var("OLLAMA_MODEL").ok())
+            .unwrap_or_else(|| "llama2".to_string());
+        let base_url = get_env_var("OLLAMA_BASE_URL").ok();
+        let ai_client = OpenAiAiClient::new_ollama(ollama_model, base_url);
+        return Ok(ClaudeClient::new(Box::new(ai_client)));
+    }
+
+    // Handle OpenAI configuration
+    if use_openai {
+        debug!("Creating OpenAI client");
+        let openai_model = model
+            .or_else(|| get_env_var("OPENAI_MODEL").ok())
+            .unwrap_or_else(|| "gpt-5".to_string());
+        debug!(openai_model = %openai_model, "Selected OpenAI model");
+
+        let api_key = get_env_vars(&["OPENAI_API_KEY", "OPENAI_AUTH_TOKEN"]).map_err(|e| {
+            debug!(error = ?e, "Failed to get OpenAI API key");
+            ClaudeError::ApiKeyNotFound
+        })?;
+        debug!("OpenAI API key found");
+
+        let ai_client = OpenAiAiClient::new_openai(openai_model, api_key);
+        debug!("OpenAI client created successfully");
+        return Ok(ClaudeClient::new(Box::new(ai_client)));
+    }
+
+    // For Claude clients, try to get model from env vars or use default
+    let claude_model = model
         .or_else(|| get_env_var("ANTHROPIC_MODEL").ok())
         .unwrap_or_else(|| "claude-3-haiku-20240307".to_string());
 
@@ -272,12 +341,13 @@ pub fn create_default_claude_client(model: Option<String>) -> Result<ClaudeClien
             let base_url = get_env_var("ANTHROPIC_BEDROCK_BASE_URL")
                 .map_err(|_| ClaudeError::ApiKeyNotFound)?;
 
-            let ai_client = BedrockAiClient::new(model, auth_token, base_url);
+            let ai_client = BedrockAiClient::new(claude_model, auth_token, base_url);
             return Ok(ClaudeClient::new(Box::new(ai_client)));
         }
     }
 
     // Default: use standard Claude AI client
+    debug!("Falling back to Claude client");
     let api_key = get_env_vars(&[
         "CLAUDE_API_KEY",
         "ANTHROPIC_API_KEY",
@@ -285,6 +355,7 @@ pub fn create_default_claude_client(model: Option<String>) -> Result<ClaudeClien
     ])
     .map_err(|_| ClaudeError::ApiKeyNotFound)?;
 
-    let ai_client = ClaudeAiClient::new(model, api_key);
+    let ai_client = ClaudeAiClient::new(claude_model, api_key);
+    debug!("Claude client created successfully");
     Ok(ClaudeClient::new(Box::new(ai_client)))
 }
