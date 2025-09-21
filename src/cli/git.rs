@@ -1185,14 +1185,14 @@ impl CreatePrCommand {
         debug!("About to serialize PR content to YAML");
         let temp_dir = tempfile::tempdir()?;
         let pr_file = temp_dir.path().join("pr-details.yaml");
-        
+
         debug!(
             pre_serialize_title = %pr_content.title,
             pre_serialize_description_length = pr_content.description.len(),
             pre_serialize_description_preview = %pr_content.description.lines().take(3).collect::<Vec<_>>().join("\\n"),
             "About to serialize PR content with to_yaml"
         );
-        
+
         let pr_yaml =
             crate::data::to_yaml(&pr_content).context("Failed to serialize PR content to YAML")?;
 
@@ -1775,7 +1775,7 @@ impl CreatePrCommand {
         repo_view: &crate::data::RepositoryView,
     ) -> Result<PrContent> {
         use tracing::debug;
-        
+
         // Get PR template (either from repo or default)
         let pr_template = match &repo_view.pr_template {
             Some(template) => template.clone(),
@@ -1814,7 +1814,7 @@ impl CreatePrCommand {
                     "AI successfully generated PR content"
                 );
                 Ok(pr_content)
-            },
+            }
             Err(e) => {
                 debug!(error = %e, "AI PR generation failed, falling back to basic description");
                 // Fallback to basic description with commit analysis (silently)

@@ -9,13 +9,13 @@ use yaml_rust_davvid::YamlEmitter;
 /// Serialize data structure to YAML string with proper multi-line formatting
 pub fn to_yaml<T: Serialize>(data: &T) -> Result<String> {
     use tracing::debug;
-    
+
     debug!("Starting YAML serialization with hybrid approach");
-    
+
     // First convert to serde_yaml::Value, then to yaml-rust format
     let serde_value = serde_yaml::to_value(data).context("Failed to serialize to serde value")?;
     debug!("Converted to serde_yaml::Value successfully");
-    
+
     let yaml_rust_value = convert_serde_to_yaml_rust(&serde_value)?;
     debug!("Converted to yaml-rust format successfully");
 
@@ -24,11 +24,11 @@ pub fn to_yaml<T: Serialize>(data: &T) -> Result<String> {
     let mut emitter = YamlEmitter::new(&mut output);
     emitter.multiline_strings(true);
     debug!("Created YamlEmitter with multiline_strings(true)");
-    
+
     emitter
         .dump(&yaml_rust_value)
         .context("Failed to emit YAML")?;
-    
+
     debug!(
         output_length = output.len(),
         output_preview = %output.lines().take(10).collect::<Vec<_>>().join("\\n"),
@@ -40,8 +40,8 @@ pub fn to_yaml<T: Serialize>(data: &T) -> Result<String> {
 
 /// Convert serde_yaml::Value to yaml_rust_davvid::Yaml
 fn convert_serde_to_yaml_rust(value: &serde_yaml::Value) -> Result<yaml_rust_davvid::Yaml> {
-    use yaml_rust_davvid::Yaml;
     use tracing::debug;
+    use yaml_rust_davvid::Yaml;
 
     match value {
         serde_yaml::Value::Null => Ok(Yaml::Null),
@@ -87,21 +87,25 @@ fn convert_serde_to_yaml_rust(value: &serde_yaml::Value) -> Result<yaml_rust_dav
 /// Deserialize YAML string to data structure
 pub fn from_yaml<T: for<'de> Deserialize<'de>>(yaml: &str) -> Result<T> {
     use tracing::debug;
-    
+
     debug!(
         yaml_length = yaml.len(),
         yaml_preview = %yaml.lines().take(10).collect::<Vec<_>>().join("\\n"),
         "Deserializing YAML using serde_yaml"
     );
-    
+
     let result = serde_yaml::from_str(yaml).context("Failed to deserialize YAML");
-    
+
     debug!(
         success = result.is_ok(),
-        error = result.as_ref().err().map(|e| e.to_string()).unwrap_or_default(),
+        error = result
+            .as_ref()
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default(),
         "YAML deserialization result"
     );
-    
+
     result
 }
 
@@ -248,37 +252,54 @@ description: |
   - [x] New tests are added if needed and existing tests are updated. See [Running tests](https://github.com/input-output-hk/cardano-node-wiki/wiki/Running-tests) for more details
   - [x] Self-reviewed the diff"#;
 
-        // This should parse correctly using our hybrid approach  
+        // This should parse correctly using our hybrid approach
         #[derive(serde::Deserialize)]
         struct PrContent {
             title: String,
             description: String,
         }
-        
+
         println!("Testing YAML parsing with AI response...");
         println!("Input length: {} chars", ai_response_yaml.len());
-        println!("First 200 chars: {}", &ai_response_yaml[..200.min(ai_response_yaml.len())]);
-        
+        println!(
+            "First 200 chars: {}",
+            &ai_response_yaml[..200.min(ai_response_yaml.len())]
+        );
+
         let pr_content: PrContent = from_yaml(ai_response_yaml).unwrap();
-        
+
         println!("Parsed title: {}", pr_content.title);
-        println!("Parsed description length: {}", pr_content.description.len());
+        println!(
+            "Parsed description length: {}",
+            pr_content.description.len()
+        );
         println!("Description first 3 lines:");
         for (i, line) in pr_content.description.lines().take(3).enumerate() {
             println!("  {}: {}", i + 1, line);
         }
-        
-        assert_eq!(pr_content.title, "deps(test): upgrade hedgehog-extras to 0.10.0.0");
+
+        assert_eq!(
+            pr_content.title,
+            "deps(test): upgrade hedgehog-extras to 0.10.0.0"
+        );
         assert!(pr_content.description.contains("# Changelog"));
         assert!(pr_content.description.contains("# How to trust this PR"));
         assert!(pr_content.description.contains("**Key areas to review:**"));
         assert!(pr_content.description.contains("# Checklist"));
-        
+
         // Verify the multiline content is preserved properly
         let lines: Vec<&str> = pr_content.description.lines().collect();
-        assert!(lines.len() > 20, "Should have many lines, got {}", lines.len());
-        
-        // Verify the description is much longer than 11 characters 
-        assert!(pr_content.description.len() > 100, "Description should be long, got {}", pr_content.description.len());
+        assert!(
+            lines.len() > 20,
+            "Should have many lines, got {}",
+            lines.len()
+        );
+
+        // Verify the description is much longer than 11 characters
+        assert!(
+            pr_content.description.len() > 100,
+            "Description should be long, got {}",
+            pr_content.description.len()
+        );
     }
 }
