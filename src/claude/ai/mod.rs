@@ -1,5 +1,8 @@
 //! AI client trait and metadata definitions
 
+pub mod bedrock;
+pub mod claude;
+
 use anyhow::Result;
 use std::future::Future;
 use std::pin::Pin;

@@ -1163,7 +1163,14 @@ impl CreatePrCommand {
         self.show_context_information(&repo_view).await?;
 
         // 4. Generate AI-powered PR content (title + description)
+        debug!("About to generate PR content from AI");
         let pr_content = self.generate_pr_content(&repo_view).await?;
+        debug!(
+            generated_title = %pr_content.title,
+            generated_description_length = pr_content.description.len(),
+            generated_description_preview = %pr_content.description.lines().take(3).collect::<Vec<_>>().join("\\n"),
+            "Generated PR content from AI"
+        );
 
         // 5. Handle different output modes
         if let Some(save_path) = self.save_only {
@@ -1175,13 +1182,23 @@ impl CreatePrCommand {
         }
 
         // 6. Create temporary file for PR details
+        debug!("About to serialize PR content to YAML");
         let temp_dir = tempfile::tempdir()?;
         let pr_file = temp_dir.path().join("pr-details.yaml");
+
+        debug!(
+            pre_serialize_title = %pr_content.title,
+            pre_serialize_description_length = pr_content.description.len(),
+            pre_serialize_description_preview = %pr_content.description.lines().take(3).collect::<Vec<_>>().join("\\n"),
+            "About to serialize PR content with to_yaml"
+        );
+
         let pr_yaml =
             crate::data::to_yaml(&pr_content).context("Failed to serialize PR content to YAML")?;
 
         debug!(
             file_path = %pr_file.display(),
+            yaml_content_length = pr_yaml.len(),
             yaml_content = %pr_yaml,
             original_title = %pr_content.title,
             original_description_length = pr_content.description.len(),
@@ -1757,33 +1774,61 @@ impl CreatePrCommand {
         &self,
         repo_view: &crate::data::RepositoryView,
     ) -> Result<PrContent> {
+        use tracing::debug;
+
         // Get PR template (either from repo or default)
         let pr_template = match &repo_view.pr_template {
             Some(template) => template.clone(),
             None => self.get_default_pr_template(),
         };
 
+        debug!(
+            pr_template_length = pr_template.len(),
+            pr_template_preview = %pr_template.lines().take(5).collect::<Vec<_>>().join("\\n"),
+            "Using PR template for generation"
+        );
+
         println!("🤖 Generating AI-powered PR description...");
 
         // Collect project context for PR guidelines
+        debug!("Collecting context for PR generation");
         let context = self.collect_context(repo_view).await?;
+        debug!("Context collection completed");
 
         // Initialize Claude client for PR generation
+        debug!("Creating Claude client");
         let claude_client = crate::claude::create_default_claude_client(None)?;
+        debug!("Claude client created successfully");
 
         // Generate AI-powered PR content with context
+        debug!("About to call Claude AI for PR content generation");
         match claude_client
             .generate_pr_content_with_context(repo_view, &pr_template, &context)
             .await
         {
-            Ok(pr_content) => Ok(pr_content),
-            Err(_e) => {
+            Ok(pr_content) => {
+                debug!(
+                    ai_generated_title = %pr_content.title,
+                    ai_generated_description_length = pr_content.description.len(),
+                    ai_generated_description_preview = %pr_content.description.lines().take(3).collect::<Vec<_>>().join("\\n"),
+                    "AI successfully generated PR content"
+                );
+                Ok(pr_content)
+            }
+            Err(e) => {
+                debug!(error = %e, "AI PR generation failed, falling back to basic description");
                 // Fallback to basic description with commit analysis (silently)
                 let mut description = pr_template;
                 self.enhance_description_with_commits(&mut description, repo_view)?;
 
                 // Generate fallback title from commits
                 let title = self.generate_title_from_commits(repo_view);
+
+                debug!(
+                    fallback_title = %title,
+                    fallback_description_length = description.len(),
+                    "Created fallback PR content"
+                );
 
                 Ok(PrContent { title, description })
             }

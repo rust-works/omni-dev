@@ -1,7 +1,7 @@
 //! Claude client for commit message improvement
 
-use crate::claude::{ai_client::AiClient, error::ClaudeError, prompts};
-use crate::claude::{bedrock_ai_client::BedrockAiClient, claude_ai_client::ClaudeAiClient};
+use crate::claude::{ai::bedrock::BedrockAiClient, ai::claude::ClaudeAiClient};
+use crate::claude::{ai::AiClient, error::ClaudeError, prompts};
 use crate::data::{
     amendments::AmendmentFile, context::CommitContext, RepositoryView, RepositoryViewForAI,
 };
@@ -95,28 +95,11 @@ impl ClaudeClient {
 
     /// Parse Claude's YAML response into AmendmentFile
     fn parse_amendment_response(&self, content: &str) -> Result<AmendmentFile> {
-        // Extract YAML block from markdown if present
-        let yaml_content = if content.contains("```yaml") {
-            content
-                .split("```yaml")
-                .nth(1)
-                .and_then(|s| s.split("```").next())
-                .unwrap_or(content)
-                .trim()
-        } else if content.contains("```") {
-            // Handle generic code blocks
-            content
-                .split("```")
-                .nth(1)
-                .and_then(|s| s.split("```").next())
-                .unwrap_or(content)
-                .trim()
-        } else {
-            content.trim()
-        };
+        // Extract YAML from potential markdown wrapper
+        let yaml_content = self.extract_yaml_from_response(content);
 
-        // Try to parse YAML
-        let amendment_file: AmendmentFile = serde_yaml::from_str(yaml_content).map_err(|e| {
+        // Try to parse YAML using our hybrid YAML parser
+        let amendment_file: AmendmentFile = crate::data::from_yaml(&yaml_content).map_err(|e| {
             debug!(
                 error = %e,
                 content_length = content.len(),
@@ -167,28 +150,11 @@ impl ClaudeClient {
             .send_request(prompts::PR_GENERATION_SYSTEM_PROMPT, &user_prompt)
             .await?;
 
-        // Extract YAML block from markdown if present (same logic as amendment parsing)
-        let yaml_content = if content.contains("```yaml") {
-            content
-                .split("```yaml")
-                .nth(1)
-                .and_then(|s| s.split("```").next())
-                .unwrap_or(&content)
-                .trim()
-        } else if content.contains("```") {
-            // Handle generic code blocks
-            content
-                .split("```")
-                .nth(1)
-                .and_then(|s| s.split("```").next())
-                .unwrap_or(&content)
-                .trim()
-        } else {
-            content.trim()
-        };
+        // The AI response should be treated as YAML directly
+        let yaml_content = content.trim();
 
-        // Parse the YAML response
-        let pr_content: crate::cli::git::PrContent = serde_yaml::from_str(yaml_content).context(
+        // Parse the YAML response using our hybrid YAML parser
+        let pr_content: crate::cli::git::PrContent = crate::data::from_yaml(yaml_content).context(
             "Failed to parse AI response as YAML. AI may have returned malformed output.",
         )?;
 
@@ -221,32 +187,60 @@ impl ClaudeClient {
             .send_request(&system_prompt, &user_prompt)
             .await?;
 
-        // Extract YAML block from markdown if present (same logic as amendment parsing)
-        let yaml_content = if content.contains("```yaml") {
-            content
-                .split("```yaml")
-                .nth(1)
-                .and_then(|s| s.split("```").next())
-                .unwrap_or(&content)
-                .trim()
-        } else if content.contains("```") {
-            // Handle generic code blocks
-            content
-                .split("```")
-                .nth(1)
-                .and_then(|s| s.split("```").next())
-                .unwrap_or(&content)
-                .trim()
-        } else {
-            content.trim()
-        };
+        // The AI response should be treated as YAML directly
+        let yaml_content = content.trim();
 
-        // Parse the YAML response
-        let pr_content: crate::cli::git::PrContent = serde_yaml::from_str(yaml_content).context(
+        debug!(
+            content_length = content.len(),
+            yaml_content_length = yaml_content.len(),
+            yaml_content = %yaml_content,
+            "Extracted YAML content from AI response"
+        );
+
+        // Parse the YAML response using our hybrid YAML parser
+        let pr_content: crate::cli::git::PrContent = crate::data::from_yaml(yaml_content).context(
             "Failed to parse AI response as YAML. AI may have returned malformed output.",
         )?;
 
+        debug!(
+            parsed_title = %pr_content.title,
+            parsed_description_length = pr_content.description.len(),
+            parsed_description_preview = %pr_content.description.lines().take(3).collect::<Vec<_>>().join("\\n"),
+            "Successfully parsed PR content from YAML"
+        );
+
         Ok(pr_content)
+    }
+
+    /// Extract YAML content from Claude response, handling markdown wrappers
+    fn extract_yaml_from_response(&self, content: &str) -> String {
+        let content = content.trim();
+
+        // If content already starts with "amendments:", it's pure YAML - return as-is
+        if content.starts_with("amendments:") {
+            return content.to_string();
+        }
+
+        // Try to extract from ```yaml blocks first
+        if let Some(yaml_start) = content.find("```yaml") {
+            if let Some(yaml_content) = content[yaml_start + 7..].split("```").next() {
+                return yaml_content.trim().to_string();
+            }
+        }
+
+        // Try to extract from generic ``` blocks
+        if let Some(code_start) = content.find("```") {
+            if let Some(code_content) = content[code_start + 3..].split("```").next() {
+                let potential_yaml = code_content.trim();
+                // Check if it looks like YAML (starts with expected structure)
+                if potential_yaml.starts_with("amendments:") {
+                    return potential_yaml.to_string();
+                }
+            }
+        }
+
+        // If no markdown blocks found or extraction failed, return trimmed content
+        content.to_string()
     }
 }
 
