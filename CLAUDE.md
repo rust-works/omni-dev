@@ -88,6 +88,32 @@ The project generates structured YAML output with field presence tracking:
 - **AI Guidance**: Look for `present: true` fields in the explanation section
 - **Dynamic Tracking**: The `update_field_presence()` method tracks which fields are available
 
+### AI Response Parsing - CRITICAL UNDERSTANDING
+**IMPORTANT**: When working with AI-generated responses in this project, understand the correct data structure:
+
+- **AI responses are VALID YAML** with `title` and `description` fields
+- **The `description` field VALUE contains markdown content**, including embedded code blocks
+- **Embedded ```yaml blocks are CONTENT, not structure** - they're part of the description string
+- **NEVER attempt to "unwrap" or extract content between markdown code fences**
+- **Use simple `content.trim()` parsing** - complex extraction logic breaks the YAML structure
+
+**Example of correct AI response structure**:
+```yaml
+title: "PR title here"
+description: |
+  # Section
+  
+  ```yaml
+  - some: nested content
+  ```
+  
+  This is all part of the description field value.
+```
+
+**Common Mistake**: Treating embedded ```yaml blocks as if they need extraction. They don't - they're just content within the description field.
+
+**Correct Approach**: Parse the entire response as YAML directly. The markdown formatting (including code blocks) is the intended content of the description field.
+
 ### AI Model Configuration
 The project includes a comprehensive model registry system:
 
