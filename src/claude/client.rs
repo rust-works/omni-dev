@@ -95,28 +95,11 @@ impl ClaudeClient {
 
     /// Parse Claude's YAML response into AmendmentFile
     fn parse_amendment_response(&self, content: &str) -> Result<AmendmentFile> {
-        // Extract YAML block from markdown if present
-        let yaml_content = if content.contains("```yaml") {
-            content
-                .split("```yaml")
-                .nth(1)
-                .and_then(|s| s.split("```").next())
-                .unwrap_or(content)
-                .trim()
-        } else if content.contains("```") {
-            // Handle generic code blocks
-            content
-                .split("```")
-                .nth(1)
-                .and_then(|s| s.split("```").next())
-                .unwrap_or(content)
-                .trim()
-        } else {
-            content.trim()
-        };
+        // Use simple trimming approach - fallback mechanism handles markdown wrappers better
+        let yaml_content = content.trim();
 
-        // Try to parse YAML
-        let amendment_file: AmendmentFile = serde_yaml::from_str(yaml_content).map_err(|e| {
+        // Try to parse YAML using our hybrid YAML parser
+        let amendment_file: AmendmentFile = crate::data::from_yaml(yaml_content).map_err(|e| {
             debug!(
                 error = %e,
                 content_length = content.len(),
@@ -167,28 +150,11 @@ impl ClaudeClient {
             .send_request(prompts::PR_GENERATION_SYSTEM_PROMPT, &user_prompt)
             .await?;
 
-        // Extract YAML block from markdown if present (same logic as amendment parsing)
-        let yaml_content = if content.contains("```yaml") {
-            content
-                .split("```yaml")
-                .nth(1)
-                .and_then(|s| s.split("```").next())
-                .unwrap_or(&content)
-                .trim()
-        } else if content.contains("```") {
-            // Handle generic code blocks
-            content
-                .split("```")
-                .nth(1)
-                .and_then(|s| s.split("```").next())
-                .unwrap_or(&content)
-                .trim()
-        } else {
-            content.trim()
-        };
+        // The AI response should be treated as YAML directly
+        let yaml_content = content.trim();
 
-        // Parse the YAML response
-        let pr_content: crate::cli::git::PrContent = serde_yaml::from_str(yaml_content).context(
+        // Parse the YAML response using our hybrid YAML parser
+        let pr_content: crate::cli::git::PrContent = crate::data::from_yaml(yaml_content).context(
             "Failed to parse AI response as YAML. AI may have returned malformed output.",
         )?;
 
@@ -221,30 +187,27 @@ impl ClaudeClient {
             .send_request(&system_prompt, &user_prompt)
             .await?;
 
-        // Extract YAML block from markdown if present (same logic as amendment parsing)
-        let yaml_content = if content.contains("```yaml") {
-            content
-                .split("```yaml")
-                .nth(1)
-                .and_then(|s| s.split("```").next())
-                .unwrap_or(&content)
-                .trim()
-        } else if content.contains("```") {
-            // Handle generic code blocks
-            content
-                .split("```")
-                .nth(1)
-                .and_then(|s| s.split("```").next())
-                .unwrap_or(&content)
-                .trim()
-        } else {
-            content.trim()
-        };
+        // The AI response should be treated as YAML directly
+        let yaml_content = content.trim();
 
-        // Parse the YAML response
-        let pr_content: crate::cli::git::PrContent = serde_yaml::from_str(yaml_content).context(
+        debug!(
+            content_length = content.len(),
+            yaml_content_length = yaml_content.len(),
+            yaml_content = %yaml_content,
+            "Extracted YAML content from AI response"
+        );
+
+        // Parse the YAML response using our hybrid YAML parser
+        let pr_content: crate::cli::git::PrContent = crate::data::from_yaml(yaml_content).context(
             "Failed to parse AI response as YAML. AI may have returned malformed output.",
         )?;
+
+        debug!(
+            parsed_title = %pr_content.title,
+            parsed_description_length = pr_content.description.len(),
+            parsed_description_preview = %pr_content.description.lines().take(3).collect::<Vec<_>>().join("\\n"),
+            "Successfully parsed PR content from YAML"
+        );
 
         Ok(pr_content)
     }
