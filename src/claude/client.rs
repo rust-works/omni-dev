@@ -1,7 +1,7 @@
 //! Claude client for commit message improvement
 
-use crate::claude::{ai_client::AiClient, error::ClaudeError, prompts};
-use crate::claude::{bedrock_ai_client::BedrockAiClient, claude_ai_client::ClaudeAiClient};
+use crate::claude::{ai::bedrock::BedrockAiClient, ai::claude::ClaudeAiClient};
+use crate::claude::{ai::AiClient, error::ClaudeError, prompts};
 use crate::data::{
     amendments::AmendmentFile, context::CommitContext, RepositoryView, RepositoryViewForAI,
 };

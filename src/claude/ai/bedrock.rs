@@ -1,10 +1,7 @@
 //! Bedrock API client implementation for Claude
 
-use crate::claude::{
-    ai_client::{AiClient, AiClientMetadata},
-    error::ClaudeError,
-    model_config::get_model_registry,
-};
+use super::{AiClient, AiClientMetadata};
+use crate::claude::{error::ClaudeError, model_config::get_model_registry};
 use anyhow::Result;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
