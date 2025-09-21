@@ -83,14 +83,24 @@ Analysis Priority:
 
 CRITICAL OUTPUT REQUIREMENT: You MUST include ALL commits in your response, regardless of whether they need changes or not. If a commit message is already perfect, include it unchanged. Never skip commits from the amendments array.
 
-Respond with a YAML amendment file in this exact format:
-```yaml
+CRITICAL RESPONSE FORMAT: You MUST respond with ONLY valid YAML content. Do not include any explanatory text, markdown wrappers, or code blocks. Your entire response must be parseable YAML starting immediately with "amendments:" and containing nothing else.
+
+Your response must follow this exact YAML structure:
+
 amendments:
   - commit: "full-40-character-sha1-hash"
     message: "improved commit message"
   - commit: "another-full-40-character-sha1-hash"  
     message: "another improved commit message"
-```
+
+DO NOT include:
+- Any explanatory text before the YAML
+- Markdown code blocks (```)
+- Commentary or analysis
+- Any text after the YAML
+- Any non-YAML content whatsoever
+
+Your response must start with "amendments:" and be valid YAML only.
 
 CRITICAL YAML FORMATTING REQUIREMENTS:
 1. For single-line messages: Use quoted strings ("message here")
@@ -395,15 +405,16 @@ Template Filling Instructions:
 - Include any breaking changes or migration notes if applicable
 - Add relevant testing information
 
-Output Format:
-Return a YAML response with exactly this structure:
+CRITICAL RESPONSE FORMAT: You MUST respond with ONLY valid YAML content. Do not include any explanatory text, markdown wrappers, or code blocks. Your entire response must be parseable YAML.
 
-```yaml
+Your response must follow this exact YAML structure:
+
 title: "Concise PR title (50-80 characters ideal)"
 description: |
   Your filled-in PR template in markdown format here.
   Include all sections and content as markdown.
-```
+
+DO NOT include any explanatory text, markdown code blocks, or commentary. Start immediately with "title:" and provide only YAML content.
 
 The title should be:
 - Concise and descriptive (ideally 50-80 characters)
@@ -433,15 +444,15 @@ INSTRUCTIONS:
 7. **LIST CHANGES**: Provide specific bullet points of what was modified
 8. **INCLUDE CONTEXT**: Add any relevant background or rationale for the changes
 
-Return a YAML response with this exact structure:
+CRITICAL RESPONSE FORMAT: Respond with ONLY valid YAML content. Do not include explanatory text, markdown wrappers, or code blocks.
 
-```yaml
+Your response must follow this exact YAML structure:
+
 title: "Your concise PR title here"
 description: |
   Your filled-in PR template in markdown format here.
-```
 
-Ensure the title is concise (50-80 characters) and the description contains the complete filled-in template."#,
+Start immediately with "title:" and provide only YAML content. Ensure the title is concise (50-80 characters) and the description contains the complete filled-in template."#,
         repo_yaml, pr_template
     )
 }
@@ -523,16 +534,16 @@ PR Template:
 8. **REPLACE PLACEHOLDERS**: Remove all placeholder text, comments, and generic content
 9. **INCLUDE ACTUAL CHANGES**: List specific bullet points of what was modified based on the diffs
 
-Return a YAML response with this exact structure:
+CRITICAL RESPONSE FORMAT: Respond with ONLY valid YAML content. Do not include explanatory text, markdown wrappers, or code blocks.
 
-```yaml
+Your response must follow this exact YAML structure:
+
 title: "Your concise PR title here"
 description: |
   Your comprehensive PR description in markdown format here.
   Follow project guidelines and replace all template placeholders with actual information.
-```
 
-The title should follow conventional commit format when appropriate and the description should be tailored to this project's standards."#);
+Start immediately with "title:" and provide only YAML content. The title should follow conventional commit format when appropriate and the description should be tailored to this project's standards."#);
 
     prompt
 }
