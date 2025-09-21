@@ -2,6 +2,7 @@
 
 pub mod bedrock;
 pub mod claude;
+pub mod openai;
 
 use anyhow::Result;
 use std::future::Future;

@@ -125,6 +125,14 @@ pub const SYSTEM_PROMPT: &str = BASIC_SYSTEM_PROMPT;
 
 /// Generate contextual system prompt based on project and commit context (Phase 3)
 pub fn generate_contextual_system_prompt(context: &CommitContext) -> String {
+    generate_contextual_system_prompt_for_provider(context, "claude")
+}
+
+/// Generate contextual system prompt with provider-specific handling
+pub fn generate_contextual_system_prompt_for_provider(
+    context: &CommitContext,
+    provider: &str,
+) -> String {
     let mut prompt = BASIC_SYSTEM_PROMPT.to_string();
 
     // CRITICAL: Emphasize diff analysis priority even with context
@@ -173,35 +181,64 @@ pub fn generate_contextual_system_prompt(context: &CommitContext) -> String {
         }
     }
 
-    // Add project-specific commit guidelines to system prompt for maximum authority
+    // Add project-specific commit guidelines with provider-specific handling
     if let Some(guidelines) = &context.project.commit_guidelines {
-        prompt.push_str("\n\n=== MANDATORY COMMIT MESSAGE TEMPLATE ===");
-        prompt.push_str("\nThis is a LITERAL TEMPLATE that you must reproduce EXACTLY.");
-        prompt.push_str("\nDo NOT treat this as guidance - it is a FORMAT SPECIFICATION.");
-        prompt.push_str("\nEvery character, marker, and structure element must be preserved:");
-        prompt.push_str(&format!("\n\n{}", guidelines));
-        prompt.push_str("\n\nCRITICAL TEMPLATE REPRODUCTION RULES:");
-        prompt.push_str(
-            "\n1. This is NOT a description of how to write commits - it IS the actual format",
-        );
-        prompt.push_str(
-            "\n2. Every element shown above must appear in your commit messages exactly as shown",
-        );
-        prompt.push_str(
-            "\n3. Any text, markers, or symbols in the template are LITERAL and must be included",
-        );
-        prompt.push_str("\n4. The structure, spacing, and all content must be reproduced verbatim");
-        prompt
-            .push_str("\n5. Replace only obvious placeholders like <type>, <scope>, <description>");
-        prompt.push_str(
-            "\n6. Everything else in the template is literal text that must appear in every commit",
-        );
-        prompt.push_str(
-            "\n\nWRONG: Treating the above as 'guidance' and writing conventional commits",
-        );
-        prompt.push_str(
-            "\nRIGHT: Using the above as a literal template and reproducing its exact structure",
-        );
+        if provider == "claude" {
+            // Claude models handle "literal template" instructions correctly
+            prompt.push_str("\n\n=== MANDATORY COMMIT MESSAGE TEMPLATE ===");
+            prompt.push_str("\nThis is a LITERAL TEMPLATE that you must reproduce EXACTLY.");
+            prompt.push_str("\nDo NOT treat this as guidance - it is a FORMAT SPECIFICATION.");
+            prompt.push_str("\nEvery character, marker, and structure element must be preserved:");
+            prompt.push_str(&format!("\n\n{}", guidelines));
+            prompt.push_str("\n\nCRITICAL TEMPLATE REPRODUCTION RULES:");
+            prompt.push_str(
+                "\n1. This is NOT a description of how to write commits - it IS the actual format",
+            );
+            prompt.push_str(
+                "\n2. Every element shown above must appear in your commit messages exactly as shown",
+            );
+            prompt.push_str(
+                "\n3. Any text, markers, or symbols in the template are LITERAL and must be included",
+            );
+            prompt.push_str(
+                "\n4. The structure, spacing, and all content must be reproduced verbatim",
+            );
+            prompt.push_str(
+                "\n5. Replace only obvious placeholders like <type>, <scope>, <description>",
+            );
+            prompt.push_str(
+                "\n6. Everything else in the template is literal text that must appear in every commit",
+            );
+            prompt.push_str(
+                "\n\nWRONG: Treating the above as 'guidance' and writing conventional commits",
+            );
+            prompt.push_str(
+                "\nRIGHT: Using the above as a literal template and reproducing its exact structure",
+            );
+        } else {
+            // OpenAI and other models need clearer guidance-based instructions
+            prompt.push_str("\n\n=== PROJECT COMMIT GUIDELINES ===");
+            prompt.push_str("\nThis project has specific commit guidelines that you MUST follow when improving commit messages.");
+            prompt.push_str("\nThese are GUIDELINES for how to write commits, not text to copy:");
+            prompt.push_str(&format!("\n\n{}", guidelines));
+            prompt.push_str("\n\nCRITICAL GUIDELINES USAGE:");
+            prompt.push_str(
+                "\n1. These are GUIDELINES that describe how to write commit messages for this project",
+            );
+            prompt.push_str(
+                "\n2. Follow the format, style, and conventions described in the guidelines",
+            );
+            prompt.push_str("\n3. Use the specified commit types, scopes, and formatting rules");
+            prompt.push_str("\n4. Write proper commit messages that follow these guidelines");
+            prompt.push_str("\n5. Do NOT copy the guidelines text itself into commit messages");
+            prompt.push_str(
+                "\n6. Create commit messages that would be approved according to these guidelines",
+            );
+            prompt.push_str("\n\nWRONG: Copying the guidelines document into the commit message");
+            prompt.push_str(
+                "\nRIGHT: Writing commit messages that follow the guidelines' format and rules",
+            );
+        }
     }
 
     // Add valid scopes if available
@@ -383,45 +420,30 @@ pub fn generate_contextual_user_prompt(repo_yaml: &str, context: &CommitContext)
 }
 
 /// System prompt for PR description generation
-pub const PR_GENERATION_SYSTEM_PROMPT: &str = r#"You are an expert software engineer helping generate intelligent pull request descriptions. You will receive a YAML representation of a git repository with branch information, commits, and a PR template to fill out.
+pub const PR_GENERATION_SYSTEM_PROMPT: &str = r#"You are a software engineer generating pull request descriptions. You will receive git repository data and a PR template.
 
-Your task is to analyze the branch data and generate a comprehensive, well-structured PR description that:
-1. Accurately describes what the changes accomplish based on actual code diffs
-2. Fills in the provided PR template with relevant information
-3. Provides clear value proposition and context for reviewers
+Your task:
+1. Analyze the code changes in the diff files
+2. Fill out the PR template with specific information about what was changed
+3. Replace template placeholders with actual details
 
-Analysis Guidelines:
-1. **READ THE DIFF FILES**: Carefully examine the diff content to understand what code changes were actually made
-2. **UNDERSTAND THE PURPOSE**: Determine the overall goal and impact of the changes
-3. **CATEGORIZE CHANGES**: Identify if this is a new feature, bug fix, refactoring, etc.
-4. **ASSESS SCOPE**: Understand which parts of the codebase are affected
-5. **HIGHLIGHT VALUE**: Explain why this change is beneficial
+Analysis steps:
+1. Read the diff files to understand what code was changed
+2. Determine if this is a new feature, bug fix, or other type of change
+3. Fill in the template with accurate information about the changes
 
-Template Filling Instructions:
-- Replace placeholder text with specific, accurate information
-- Check appropriate boxes based on the actual changes made
-- Provide detailed explanations in description sections
-- List specific changes made in bullet points
-- Include any breaking changes or migration notes if applicable
-- Add relevant testing information
+RESPONSE FORMAT: Respond with YAML only. No explanations or markdown blocks.
 
-CRITICAL RESPONSE FORMAT: You MUST respond with ONLY valid YAML content. Do not include any explanatory text, markdown wrappers, or code blocks. Your entire response must be parseable YAML.
-
-Your response must follow this exact YAML structure:
-
-title: "Concise PR title (50-80 characters ideal)"
+Structure:
+title: "Short descriptive title"
 description: |
-  Your filled-in PR template in markdown format here.
-  Include all sections and content as markdown.
+  Filled-in template content here
 
-DO NOT include any explanatory text, markdown code blocks, or commentary. Start immediately with "title:" and provide only YAML content.
-
-The title should be:
-- Concise and descriptive (ideally 50-80 characters)
-- Follow conventional commit format when appropriate (e.g., "feat(scope): description")
-- Clearly convey the main purpose of the PR
-
-The description should be the complete filled-in PR template ready for GitHub."#;
+Requirements:
+- Replace all template placeholders with real information
+- Check appropriate boxes based on actual changes
+- Remove template comments and instructions
+- Provide specific details about what was changed"#;
 
 /// Generate PR description using AI analysis
 pub fn generate_pr_description_prompt(repo_yaml: &str, pr_template: &str) -> String {
@@ -457,11 +479,40 @@ Start immediately with "title:" and provide only YAML content. Ensure the title 
     )
 }
 
-/// Generate PR system prompt with project context and guidelines
+/// Generate PR system prompt with project context and guidelines  
 pub fn generate_pr_system_prompt_with_context(
     context: &crate::data::context::CommitContext,
 ) -> String {
+    generate_pr_system_prompt_with_context_for_provider(context, "claude")
+}
+
+/// Generate PR system prompt with provider-specific handling
+pub fn generate_pr_system_prompt_with_context_for_provider(
+    context: &crate::data::context::CommitContext,
+    provider: &str,
+) -> String {
     let mut prompt = PR_GENERATION_SYSTEM_PROMPT.to_string();
+
+    // Add provider-specific template handling instructions
+    if provider == "claude" {
+        prompt.push_str("\n\n=== TEMPLATE HANDLING FOR CLAUDE ===");
+        prompt.push_str(
+            "\nThe PR template provided is a TEMPLATE TO FILL OUT, not literal text to copy.",
+        );
+        prompt.push_str(
+            "\nYou must REPLACE placeholder content with actual information about the changes.",
+        );
+    } else {
+        prompt.push_str("\n\n=== TEMPLATE FILLING INSTRUCTIONS ===");
+        prompt.push_str("\nThe provided PR template should be filled out with specific information about the changes.");
+        prompt.push_str("\nReplace placeholder content with actual details:");
+        prompt.push_str("\n- Fill in the Description section with what this PR actually does");
+        prompt.push_str("\n- Mark the correct Type of Change checkboxes");
+        prompt.push_str("\n- List the specific changes made in the Changes Made section");
+        prompt.push_str("\n- Remove placeholder text like '(issue_number)' and template comments");
+        prompt.push_str("\n- Replace empty bullet points with actual information");
+        prompt.push_str("\n\nExample: Instead of '**Core Changes:**\\n-\\n-', write '**Core Changes:**\\n- Added OpenAI API client\\n- Implemented provider-specific prompts'");
+    }
 
     // Add project-specific PR guidelines if available
     if let Some(pr_guidelines) = &context.project.pr_guidelines {
