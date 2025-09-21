@@ -29,7 +29,7 @@ impl AmendmentFile {
         })?;
 
         let amendment_file: AmendmentFile =
-            serde_yaml::from_str(&content).context("Failed to parse YAML amendment file")?;
+            crate::data::from_yaml(&content).context("Failed to parse YAML amendment file")?;
 
         amendment_file.validate()?;
 
