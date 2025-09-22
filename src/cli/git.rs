@@ -1164,11 +1164,47 @@ impl CreatePrCommand {
         // 2. Validate branch state (always needed)
         self.validate_branch_state(&repo_view)?;
 
-        // 3. Generate AI-powered PR content and get Claude client (title + description)
-        debug!("About to generate PR content from AI");
-        let (pr_content, _claude_client) = self.generate_pr_content_with_client(&repo_view).await?;
+        // 3. Show guidance files status early (before AI processing)
+        use crate::claude::context::ProjectDiscovery;
+        let repo_root = std::path::PathBuf::from(".");
+        let context_dir = std::path::PathBuf::from(".omni-dev");
+        let discovery = ProjectDiscovery::new(repo_root, context_dir);
+        let project_context = discovery.discover().unwrap_or_default();
+        self.show_guidance_files_status(&project_context)?;
 
-        // 4. Show detailed context information (like twiddle command)
+        // 4. Show AI model configuration before generation
+        let claude_client = crate::claude::create_default_claude_client(None)?;
+        self.show_model_info_from_client(&claude_client)?;
+
+        // 5. Show branch analysis and commit information
+        self.show_commit_range_info(&repo_view)?;
+
+        // 6. Show context analysis (quick collection for display only)
+        let context = {
+            use crate::claude::context::{BranchAnalyzer, WorkPatternAnalyzer};
+            use crate::data::context::CommitContext;
+            let mut context = CommitContext::new();
+            context.project = project_context;
+
+            // Quick analysis for display
+            if let Some(branch_info) = &repo_view.branch_info {
+                context.branch = BranchAnalyzer::analyze(&branch_info.branch).unwrap_or_default();
+            }
+
+            if !repo_view.commits.is_empty() {
+                context.range = WorkPatternAnalyzer::analyze_commit_range(&repo_view.commits);
+            }
+            context
+        };
+        self.show_context_summary(&context)?;
+
+        // 7. Generate AI-powered PR content (title + description)
+        debug!("About to generate PR content from AI");
+        let (pr_content, _claude_client) = self
+            .generate_pr_content_with_client_internal(&repo_view, claude_client)
+            .await?;
+
+        // 8. Show detailed context information (like twiddle command)
         self.show_context_information(&repo_view).await?;
         debug!(
             generated_title = %pr_content.title,
@@ -1502,19 +1538,11 @@ impl CreatePrCommand {
     /// Show detailed context information (similar to twiddle command)
     async fn show_context_information(
         &self,
-        repo_view: &crate::data::RepositoryView,
+        _repo_view: &crate::data::RepositoryView,
     ) -> Result<()> {
-        // Show commit range and count information
-        self.show_commit_range_info(repo_view)?;
-
-        // Collect contextual information for enhanced PR generation
-        let context = self.collect_context(repo_view).await?;
-
-        // Show guidance files status
-        self.show_guidance_files_status(&context.project)?;
-
-        // Show context summary
-        self.show_context_summary(&context)?;
+        // Note: commit range info and context summary are now shown earlier
+        // This method is kept for potential future detailed information
+        // that should be shown after AI generation
 
         Ok(())
     }
@@ -1732,10 +1760,11 @@ impl CreatePrCommand {
         Ok(())
     }
 
-    /// Generate PR content and return both content and Claude client for later use
-    async fn generate_pr_content_with_client(
+    /// Generate PR content with pre-created client (internal method that doesn't show model info)
+    async fn generate_pr_content_with_client_internal(
         &self,
         repo_view: &crate::data::RepositoryView,
+        claude_client: crate::claude::client::ClaudeClient,
     ) -> Result<(PrContent, crate::claude::client::ClaudeClient)> {
         use tracing::debug;
 
@@ -1757,14 +1786,6 @@ impl CreatePrCommand {
         debug!("Collecting context for PR generation");
         let context = self.collect_context(repo_view).await?;
         debug!("Context collection completed");
-
-        // Initialize Claude client for PR generation
-        debug!("Creating Claude client");
-        let claude_client = crate::claude::create_default_claude_client(None)?;
-        debug!("Claude client created successfully");
-
-        // Show model information early in the process
-        self.show_model_info_from_client(&claude_client)?;
 
         // Generate AI-powered PR content with context
         debug!("About to call Claude AI for PR content generation");
