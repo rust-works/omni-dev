@@ -82,6 +82,121 @@ models:
     tier: "fast"
     legacy: true
 
+  # OpenAI GPT-5 Series (Latest - August 2025)
+  - provider: "openai"
+    model: "GPT-5"
+    api_identifier: "gpt-5"
+    max_output_tokens: 128000
+    input_context: 272000
+    generation: 5
+    tier: "flagship"
+    
+  - provider: "openai"
+    model: "GPT-5 Mini"
+    api_identifier: "gpt-5-mini"
+    max_output_tokens: 128000
+    input_context: 272000
+    generation: 5
+    tier: "balanced"
+    
+  - provider: "openai"
+    model: "GPT-5 Nano"
+    api_identifier: "gpt-5-nano"
+    max_output_tokens: 128000
+    input_context: 272000
+    generation: 5
+    tier: "fast"
+    
+  - provider: "openai"
+    model: "GPT-5 Chat Latest"
+    api_identifier: "gpt-5-chat-latest"
+    max_output_tokens: 128000
+    input_context: 272000
+    generation: 5
+    tier: "flagship"
+    
+  # OpenAI o1 Series (Reasoning Models)
+  - provider: "openai"
+    model: "o1"
+    api_identifier: "o1"
+    max_output_tokens: 100000
+    input_context: 200000
+    generation: 5
+    tier: "flagship"
+    legacy: true
+    
+  - provider: "openai"
+    model: "o1-mini"
+    api_identifier: "o1-mini"
+    max_output_tokens: 65536
+    input_context: 128000
+    generation: 5
+    tier: "fast"
+    legacy: true
+    
+  - provider: "openai"
+    model: "o1-preview"
+    api_identifier: "o1-preview"
+    max_output_tokens: 32768
+    input_context: 128000
+    generation: 5
+    tier: "flagship"
+    legacy: true
+    
+  # OpenAI GPT-4o Series (Latest Multimodal)
+  - provider: "openai"
+    model: "GPT-4o"
+    api_identifier: "gpt-4o"
+    max_output_tokens: 16384
+    input_context: 128000
+    generation: 4
+    tier: "flagship"
+    
+  - provider: "openai"
+    model: "GPT-4o Mini"
+    api_identifier: "gpt-4o-mini"
+    max_output_tokens: 16384
+    input_context: 128000
+    generation: 4
+    tier: "fast"
+    
+  # OpenAI GPT-4 Turbo Series
+  - provider: "openai"
+    model: "GPT-4 Turbo"
+    api_identifier: "gpt-4-turbo"
+    max_output_tokens: 4096
+    input_context: 128000
+    generation: 4
+    tier: "balanced"
+    
+  - provider: "openai"
+    model: "GPT-4 Turbo Preview"
+    api_identifier: "gpt-4-turbo-preview"
+    max_output_tokens: 4096
+    input_context: 128000
+    generation: 4
+    tier: "balanced"
+    legacy: true
+    
+  # OpenAI GPT-4 (Original)
+  - provider: "openai"
+    model: "GPT-4"
+    api_identifier: "gpt-4"
+    max_output_tokens: 8192
+    input_context: 8192
+    generation: 4
+    tier: "balanced"
+    legacy: true
+    
+  # OpenAI GPT-3.5 Series
+  - provider: "openai"
+    model: "GPT-3.5 Turbo"
+    api_identifier: "gpt-3.5-turbo"
+    max_output_tokens: 4096
+    input_context: 16385
+    generation: 3.5
+    tier: "fast"
+
 # Provider-specific configurations
 providers:
   claude:
@@ -89,7 +204,7 @@ providers:
     api_base: "https://api.anthropic.com/v1"
     default_model: "claude-3-haiku-20240307"
     
-    # Model tier descriptions
+    # Model tier descriptions for Claude
     tiers:
       flagship:
         description: "Most capable models for complex reasoning and analysis"
@@ -102,8 +217,32 @@ providers:
       fast:
         description: "Optimized for speed and cost efficiency"
         use_cases: ["simple tasks", "high-volume processing", "quick responses"]
-
+    
     # Default fallback limits for unknown Claude models
     defaults:
       max_output_tokens: 4096
       input_context: 100000
+      
+  openai:
+    name: "OpenAI"
+    api_base: "https://api.openai.com/v1"
+    default_model: "gpt-5-mini"
+    
+    # Model tier descriptions for OpenAI
+    tiers:
+      flagship:
+        description: "Most capable models for complex reasoning and analysis"
+        use_cases: ["complex analysis", "research", "advanced reasoning"]
+        
+      balanced:
+        description: "Good balance of capability and speed"
+        use_cases: ["general tasks", "coding", "writing"]
+        
+      fast:
+        description: "Optimized for speed and cost efficiency"
+        use_cases: ["simple tasks", "high-volume processing", "quick responses"]
+    
+    # Default fallback limits for unknown OpenAI models
+    defaults:
+      max_output_tokens: 4096
+      input_context: 8192
