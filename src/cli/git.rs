@@ -263,6 +263,7 @@ impl ViewCommand {
             ai: ai_info,
             branch_info: None,
             pr_template: None,
+            pr_template_location: None,
             branch_prs: None,
             commits,
         };
@@ -430,6 +431,7 @@ impl TwiddleCommand {
                 ai: full_repo_view.ai.clone(),
                 branch_info: full_repo_view.branch_info.clone(),
                 pr_template: full_repo_view.pr_template.clone(),
+                pr_template_location: full_repo_view.pr_template_location.clone(),
                 branch_prs: full_repo_view.branch_prs.clone(),
                 commits: commit_batch.to_vec(),
             };
@@ -555,6 +557,7 @@ impl TwiddleCommand {
             ai: ai_info,
             branch_info: None,
             pr_template: None,
+            pr_template_location: None,
             branch_prs: None,
             commits,
         };
@@ -1004,7 +1007,11 @@ impl InfoCommand {
         let commits = repo.get_commits_in_range(&commit_range)?;
 
         // Check for PR template
-        let pr_template = Self::read_pr_template().ok();
+        let pr_template_result = Self::read_pr_template().ok();
+        let (pr_template, pr_template_location) = match pr_template_result {
+            Some((content, location)) => (Some(content), Some(location)),
+            None => (None, None),
+        };
 
         // Get PRs for current branch
         let branch_prs = Self::get_branch_prs(&current_branch)
@@ -1034,6 +1041,7 @@ impl InfoCommand {
                 branch: current_branch,
             }),
             pr_template,
+            pr_template_location,
             branch_prs,
             commits,
         };
@@ -1048,15 +1056,16 @@ impl InfoCommand {
         Ok(())
     }
 
-    /// Read PR template file if it exists
-    fn read_pr_template() -> Result<String> {
+    /// Read PR template file if it exists, returning both content and location
+    fn read_pr_template() -> Result<(String, String)> {
         use std::fs;
         use std::path::Path;
 
         let template_path = Path::new(".github/pull_request_template.md");
         if template_path.exists() {
-            fs::read_to_string(template_path)
-                .context("Failed to read .github/pull_request_template.md")
+            let content = fs::read_to_string(template_path)
+                .context("Failed to read .github/pull_request_template.md")?;
+            Ok((content, template_path.to_string_lossy().to_string()))
         } else {
             anyhow::bail!("PR template file does not exist")
         }
@@ -1398,7 +1407,11 @@ impl CreatePrCommand {
         let commits = repo.get_commits_in_range(&commit_range)?;
 
         // Check for PR template
-        let pr_template = InfoCommand::read_pr_template().ok();
+        let pr_template_result = InfoCommand::read_pr_template().ok();
+        let (pr_template, pr_template_location) = match pr_template_result {
+            Some((content, location)) => (Some(content), Some(location)),
+            None => (None, None),
+        };
 
         // Get PRs for current branch
         let branch_prs = InfoCommand::get_branch_prs(&current_branch)
@@ -1428,6 +1441,7 @@ impl CreatePrCommand {
                 branch: current_branch,
             }),
             pr_template,
+            pr_template_location,
             branch_prs,
             commits,
         };
@@ -1653,6 +1667,15 @@ impl CreatePrCommand {
             "❌ None found".to_string()
         };
         println!("   🎯 Valid scopes: {}", scopes_source);
+
+        // Check PR template
+        let pr_template_path = std::path::Path::new(".github/pull_request_template.md");
+        let pr_template_status = if pr_template_path.exists() {
+            format!("✅ Project: {}", pr_template_path.display())
+        } else {
+            "❌ None found".to_string()
+        };
+        println!("   📋 PR template: {}", pr_template_status);
 
         println!();
         Ok(())
