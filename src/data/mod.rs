@@ -31,6 +31,9 @@ pub struct RepositoryView {
     /// Pull request template content (only present in branch commands when template exists)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_template: Option<String>,
+    /// Location of the pull request template file (only present when pr_template exists)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr_template_location: Option<String>,
     /// Pull requests created from the current branch (only present in branch commands)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch_prs: Option<Vec<PullRequest>>,
@@ -58,6 +61,9 @@ pub struct RepositoryViewForAI {
     /// Pull request template content (only present in branch commands when template exists)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_template: Option<String>,
+    /// Location of the pull request template file (only present when pr_template exists)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr_template_location: Option<String>,
     /// Pull requests created from the current branch (only present in branch commands)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch_prs: Option<Vec<PullRequest>>,
@@ -168,6 +174,7 @@ impl RepositoryView {
                 "ai.scratch" => true,
                 "branch_info.branch" => self.branch_info.is_some(),
                 "pr_template" => self.pr_template.is_some(),
+                "pr_template_location" => self.pr_template_location.is_some(),
                 "branch_prs" => self.branch_prs.is_some(),
                 "branch_prs[].number" => {
                     self.branch_prs.as_ref().is_some_and(|prs| !prs.is_empty())
@@ -326,6 +333,12 @@ impl Default for FieldExplanation {
                     present: false,
                 },
                 FieldDocumentation {
+                    name: "pr_template_location".to_string(),
+                    text: "Location of the pull request template file (only present when pr_template exists)".to_string(),
+                    command: None,
+                    present: false,
+                },
+                FieldDocumentation {
                     name: "branch_prs".to_string(),
                     text: "Pull requests created from the current branch (only present in branch commands)".to_string(),
                     command: None,
@@ -384,6 +397,7 @@ impl RepositoryViewForAI {
             ai: repo_view.ai,
             branch_info: repo_view.branch_info,
             pr_template: repo_view.pr_template,
+            pr_template_location: repo_view.pr_template_location,
             branch_prs: repo_view.branch_prs,
             commits: commits?,
         })
