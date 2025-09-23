@@ -1,7 +1,7 @@
 allowed-tools: [Bash(mkdir *), Read, Write, Edit, "omni-dev *"]
 argument-hint: [range]
 description: Twiddle git commit messages
-model: claude-sonnet-4
+model: claude-opus-4.1
 
 # Steps
 

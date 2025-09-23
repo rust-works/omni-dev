@@ -151,7 +151,7 @@ omni-dev git commit message amend amendments.yaml
 omni-dev config models show
 
 # View model information with token limits and capabilities
-omni-dev config models show | grep -A5 "claude-sonnet-4"
+omni-dev config models show | grep -A5 "claude-opus-4.1"
 ```
 
 ## 🧠 Contextual Intelligence

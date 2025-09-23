@@ -325,7 +325,7 @@ pub fn create_default_claude_client(model: Option<String>) -> Result<ClaudeClien
     // For Claude clients, try to get model from env vars or use default
     let claude_model = model
         .or_else(|| get_env_var("ANTHROPIC_MODEL").ok())
-        .unwrap_or_else(|| "claude-3-haiku-20240307".to_string());
+        .unwrap_or_else(|| "claude-opus-4-1-20250805".to_string());
 
     if use_bedrock {
         // Check if we should skip Bedrock auth
