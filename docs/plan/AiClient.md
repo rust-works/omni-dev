@@ -221,7 +221,7 @@ impl ClaudeClient {
 ```rust
 /// Create a default Claude client using environment variables
 pub fn create_default_claude_client(model: Option<String>) -> Result<ClaudeClient> {
-    let model = model.unwrap_or_else(|| "claude-3-haiku-20240307".to_string());
+    let model = model.unwrap_or_else(|| "claude-opus-4-1-20250805".to_string());
     let ai_client = ClaudeAiClient::new(model, None)?;
     Ok(ClaudeClient::new(Box::new(ai_client)))
 }
