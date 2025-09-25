@@ -504,7 +504,7 @@ impl TwiddleCommand {
     /// Generate repository view (reuse ViewCommand logic)
     async fn generate_repository_view(&self) -> Result<crate::data::RepositoryView> {
         use crate::data::{
-            AiInfo, FieldExplanation, FileStatusInfo, RepositoryView, VersionInfo,
+            AiInfo, BranchInfo, FieldExplanation, FileStatusInfo, RepositoryView, VersionInfo,
             WorkingDirectoryInfo,
         };
         use crate::git::{GitRepository, RemoteInfo};
@@ -515,6 +515,11 @@ impl TwiddleCommand {
         // Open git repository
         let repo = GitRepository::open()
             .context("Failed to open git repository. Make sure you're in a git repository.")?;
+
+        // Get current branch name
+        let current_branch = repo
+            .get_current_branch()
+            .unwrap_or_else(|_| "HEAD".to_string());
 
         // Get working directory status
         let wd_status = repo.get_working_directory_status()?;
@@ -548,14 +553,16 @@ impl TwiddleCommand {
             scratch: ai_scratch_path.to_string_lossy().to_string(),
         };
 
-        // Build repository view
+        // Build repository view with branch info
         let mut repo_view = RepositoryView {
             versions,
             explanation: FieldExplanation::default(),
             working_directory,
             remotes,
             ai: ai_info,
-            branch_info: None,
+            branch_info: Some(BranchInfo {
+                branch: current_branch,
+            }),
             pr_template: None,
             pr_template_location: None,
             branch_prs: None,
@@ -706,7 +713,6 @@ impl TwiddleCommand {
     ) -> Result<crate::data::context::CommitContext> {
         use crate::claude::context::{BranchAnalyzer, ProjectDiscovery, WorkPatternAnalyzer};
         use crate::data::context::CommitContext;
-        use crate::git::GitRepository;
 
         let mut context = CommitContext::new();
 
@@ -736,12 +742,18 @@ impl TwiddleCommand {
             }
         }
 
-        // 2. Analyze current branch
-        let repo = GitRepository::open()?;
-        let current_branch = repo
-            .get_current_branch()
-            .unwrap_or_else(|_| "HEAD".to_string());
-        context.branch = BranchAnalyzer::analyze(&current_branch).unwrap_or_default();
+        // 2. Analyze current branch from repository view
+        if let Some(branch_info) = &repo_view.branch_info {
+            context.branch = BranchAnalyzer::analyze(&branch_info.branch).unwrap_or_default();
+        } else {
+            // Fallback to getting current branch directly if not in repo view
+            use crate::git::GitRepository;
+            let repo = GitRepository::open()?;
+            let current_branch = repo
+                .get_current_branch()
+                .unwrap_or_else(|_| "HEAD".to_string());
+            context.branch = BranchAnalyzer::analyze(&current_branch).unwrap_or_default();
+        }
 
         // 3. Analyze commit range patterns
         if !repo_view.commits.is_empty() {
