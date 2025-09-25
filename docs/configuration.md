@@ -39,10 +39,30 @@ This allows developers to customize their personal workflow without affecting te
 
 ### 1. Scope Definitions (`.omni-dev/scopes.yaml`)
 
-**Purpose**: Define project-specific scopes and their meanings.
+**Purpose**: Define project-specific scopes and their meanings for use in conventional commit messages.
 
-**Format**:
+#### What are Scopes?
 
+Scopes are used in conventional commit messages to indicate which part of the codebase a change affects. They appear in the format: `type(scope): description`
+
+For example:
+- `feat(auth): add OAuth2 login`
+- `fix(api): resolve rate limiting bug`
+- `docs(readme): update installation steps`
+
+#### Creating Your First Scope
+
+**Step 1: Create the configuration directory**
+```bash
+mkdir -p .omni-dev
+```
+
+**Step 2: Create the scopes.yaml file**
+```bash
+touch .omni-dev/scopes.yaml
+```
+
+**Step 3: Define your scopes**
 ```yaml
 scopes:
   - name: "scope-name"
@@ -54,6 +74,40 @@ scopes:
       - "path/pattern/**"
       - "*.extension"
 ```
+
+#### Scope Definition Fields
+
+- **name** (required): The identifier used in commit messages
+- **description** (required): Clear explanation of what this scope covers
+- **examples** (required): 2-3 example commit messages using this scope
+- **file_patterns** (required): Glob patterns to match files belonging to this scope
+
+#### How Scopes Are Used
+
+1. **During commit analysis**: omni-dev examines changed files and suggests appropriate scopes based on file_patterns
+2. **In commit messages**: Scopes appear as `type(scope): description`
+3. **For organization**: Scopes help categorize changes and make commit history more searchable
+
+#### Scope Selection Logic
+
+When multiple scopes match changed files:
+- omni-dev prioritizes scopes with more specific file patterns
+- If patterns have equal specificity, all matching scopes are suggested
+- You can override automatic detection by specifying the scope manually
+
+#### Handling Overlapping Patterns
+
+If file patterns overlap between scopes:
+```yaml
+scopes:
+  - name: "api"
+    file_patterns: ["src/api/**"]
+
+  - name: "auth"
+    file_patterns: ["src/api/auth/**"]  # More specific
+```
+
+In this case, changes to `src/api/auth/login.js` would suggest the `auth` scope due to its more specific pattern.
 
 #### Example Configurations
 
@@ -640,6 +694,74 @@ git commit -m "feat(config): add omni-dev contextual intelligence setup"
 
 # Document major changes
 echo "## v2.0.0 - Updated scopes and guidelines" >> .omni-dev/CHANGELOG.md
+```
+
+## Real-World Usage Examples
+
+### How Scopes Appear in Commits
+
+Here's how scopes are used in actual commit messages:
+
+**Basic Usage**:
+```bash
+# Format: type(scope): description
+git commit -m "feat(auth): add two-factor authentication"
+git commit -m "fix(api): resolve timeout on large payloads"
+git commit -m "docs(readme): update API examples"
+```
+
+**With omni-dev**:
+```bash
+# omni-dev analyzes your changes and suggests the appropriate scope
+$ omni-dev git commit message twiddle HEAD --use-context
+
+# Output might suggest:
+# Based on changes to src/auth/login.js and src/auth/2fa.js:
+# Suggested scope: auth
+# Suggested message: feat(auth): implement two-factor authentication flow
+```
+
+### Scope Usage in Different Scenarios
+
+**1. Single File Change**:
+```bash
+# Changed: src/api/users.js
+# omni-dev suggests: fix(api): validate email format in user creation
+```
+
+**2. Multiple Files, Same Scope**:
+```bash
+# Changed: src/ui/Button.jsx, src/ui/Modal.jsx, src/ui/theme.css
+# omni-dev suggests: refactor(ui): update component styling to new design system
+```
+
+**3. Multiple Files, Different Scopes**:
+```bash
+# Changed: src/api/auth.js, docs/API.md
+# omni-dev suggests multiple options:
+# - feat(api): add OAuth provider with documentation
+# - feat(api,docs): implement OAuth and update API docs
+# You choose the most appropriate one
+```
+
+**4. No Matching Scope**:
+```bash
+# Changed: new-feature/experimental.js (no pattern matches)
+# omni-dev suggests: feat: add experimental feature
+# (No scope when patterns don't match)
+```
+
+### Working with Scope Overrides
+
+Sometimes you need to override the suggested scope:
+
+```bash
+# File changed: src/utils/logger.js
+# Pattern matches: "shared" scope
+# But this change is auth-specific
+
+# Override with your preferred scope:
+git commit -m "fix(auth): improve auth error logging detail"
 ```
 
 ## Team Setup
