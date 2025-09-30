@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2025-09-30
+
+### Added
+- **Branch Information in Twiddle**: Enhanced twiddle repository view with branch information
+  - Branch context now included in commit analysis and AI-powered amendments
+  - Better understanding of current branch status for more targeted suggestions
+  - Improved repository view completeness for AI assistants
+
+### Enhanced
+- **AI Model Configuration**: Updated default models to Claude Opus 4.1
+  - Latest AI model specifications for improved performance
+  - Enhanced model registry with updated token limits and capabilities
+  - Better AI response quality and accuracy
+- **PR Command User Experience**: Improved PR command UX by showing context early
+  - Faster feedback for users during PR creation process
+  - Better progress indicators and context display
+  - Enhanced user interface clarity
+- **PR Template Integration**: Enhanced PR template location exposure in repository views
+  - PR template location now visible in repository analysis
+  - Better integration between template system and PR creation workflow
+  - Improved AI understanding of project PR standards
+
+### Documentation
+- **Comprehensive Scope Documentation**: Added detailed scope documentation and usage examples
+  - Complete guide for scope usage patterns and best practices
+  - Real-world examples and configuration scenarios
+  - Enhanced developer documentation for project customization
+
 ## [0.9.0] - 2025-09-18
 
 ### Added
@@ -272,7 +300,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation and community files (README, CONTRIBUTING, CODE_OF_CONDUCT)
 - BSD 3-Clause license
 
-[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/rust-works/omni-dev/compare/v0.9.0...v0.10.0
+[0.9.0]: https://github.com/rust-works/omni-dev/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/rust-works/omni-dev/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/rust-works/omni-dev/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/rust-works/omni-dev/compare/v0.5.0...v0.6.0
