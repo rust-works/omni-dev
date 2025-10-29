@@ -2161,12 +2161,21 @@ impl CreatePrCommand {
             debug!("Branch '{}' already exists on remote 'origin'", branch_name);
         }
 
-        // Create PR using gh CLI
+        // Create PR using gh CLI with explicit head branch
         debug!("Creating PR with gh CLI - title: '{}'", title);
         debug!("PR description length: {} characters", description.len());
 
         let pr_result = Command::new("gh")
-            .args(["pr", "create", "--title", title, "--body", description])
+            .args([
+                "pr",
+                "create",
+                "--head",
+                branch_name,
+                "--title",
+                title,
+                "--body",
+                description,
+            ])
             .output()
             .context("Failed to create pull request")?;
 
