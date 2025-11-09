@@ -308,6 +308,8 @@ Options:
           Disable contextual analysis (use basic prompting only)
       --batch-size <BATCH_SIZE>
           Maximum number of commits to process in a single batch (default: 4) [default: 4]
+      --no-ai
+          Skip AI processing and only output repository YAML
   -h, --help
           Print help
 
