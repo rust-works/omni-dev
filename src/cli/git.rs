@@ -113,6 +113,10 @@ pub struct TwiddleCommand {
     /// Maximum number of commits to process in a single batch (default: 4)
     #[arg(long, default_value = "4")]
     pub batch_size: usize,
+
+    /// Skip AI processing and only output repository YAML
+    #[arg(long)]
+    pub no_ai: bool,
 }
 
 /// Branch operations
@@ -301,6 +305,11 @@ impl AmendCommand {
 impl TwiddleCommand {
     /// Execute twiddle command with contextual intelligence
     pub async fn execute(self) -> Result<()> {
+        // If --no-ai flag is set, skip AI processing and output YAML directly
+        if self.no_ai {
+            return self.execute_no_ai().await;
+        }
+
         // Determine if contextual analysis should be used
         let use_contextual = self.use_context && !self.no_context;
 
@@ -936,6 +945,59 @@ impl TwiddleCommand {
         println!("   🎯 Valid scopes: {}", scopes_source);
 
         println!();
+        Ok(())
+    }
+
+    /// Execute twiddle command without AI - create amendments with original messages
+    async fn execute_no_ai(&self) -> Result<()> {
+        use crate::data::amendments::{Amendment, AmendmentFile};
+
+        println!("📋 Generating amendments YAML without AI processing...");
+
+        // Generate repository view to get all commits
+        let repo_view = self.generate_repository_view().await?;
+
+        // Create amendments with original commit messages (no AI improvements)
+        let amendments: Vec<Amendment> = repo_view
+            .commits
+            .iter()
+            .map(|commit| Amendment {
+                commit: commit.hash.clone(),
+                message: commit.original_message.clone(),
+            })
+            .collect();
+
+        let amendment_file = AmendmentFile { amendments };
+
+        // Handle different output modes
+        if let Some(save_path) = &self.save_only {
+            amendment_file.save_to_file(save_path)?;
+            println!("💾 Amendments saved to file");
+            return Ok(());
+        }
+
+        // Handle amendments using the same flow as the AI-powered version
+        if !amendment_file.amendments.is_empty() {
+            // Create temporary file for amendments
+            let temp_dir = tempfile::tempdir()?;
+            let amendments_file = temp_dir.path().join("twiddle_amendments.yaml");
+            amendment_file.save_to_file(&amendments_file)?;
+
+            // Show file path and get user choice
+            if !self.auto_apply
+                && !self.handle_amendments_file(&amendments_file, &amendment_file)?
+            {
+                println!("❌ Amendment cancelled by user");
+                return Ok(());
+            }
+
+            // Apply amendments (re-read from file to capture any user edits)
+            self.apply_amendments_from_file(&amendments_file).await?;
+            println!("✅ Commit messages applied successfully!");
+        } else {
+            println!("✨ No commits found to process!");
+        }
+
         Ok(())
     }
 }
