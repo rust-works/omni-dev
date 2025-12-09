@@ -173,6 +173,14 @@ pub struct CreatePrCommand {
     /// Save generated PR details to file without creating PR
     #[arg(long, value_name = "FILE")]
     pub save_only: Option<String>,
+
+    /// Create PR as ready for review (overrides default)
+    #[arg(long, conflicts_with = "draft")]
+    pub ready: bool,
+
+    /// Create PR as draft (overrides default)
+    #[arg(long, conflicts_with = "ready")]
+    pub draft: bool,
 }
 
 impl GitCommand {
@@ -1228,6 +1236,35 @@ impl CreateCommand {
 }
 
 impl CreatePrCommand {
+    /// Determine if PR should be created as draft
+    ///
+    /// Priority order:
+    /// 1. --ready flag (not draft)
+    /// 2. --draft flag (draft)
+    /// 3. OMNI_DEV_DEFAULT_DRAFT_PR env/config setting
+    /// 4. Hard-coded default (draft)
+    fn should_create_as_draft(&self) -> bool {
+        use crate::utils::settings::get_env_var;
+
+        // Explicit flags take precedence
+        if self.ready {
+            return false;
+        }
+        if self.draft {
+            return true;
+        }
+
+        // Check configuration setting
+        get_env_var("OMNI_DEV_DEFAULT_DRAFT_PR")
+            .ok()
+            .and_then(|val| match val.to_lowercase().as_str() {
+                "true" | "1" | "yes" => Some(true),
+                "false" | "0" | "no" => Some(false),
+                _ => None,
+            })
+            .unwrap_or(true) // Default to draft if not configured
+    }
+
     /// Execute create PR command
     pub async fn execute(self) -> Result<()> {
         println!("🔄 Starting pull request creation process...");
@@ -1366,12 +1403,16 @@ impl CreatePrCommand {
             "Parsed PR content from YAML"
         );
 
+        // Determine draft status
+        let is_draft = self.should_create_as_draft();
+
         match pr_action {
             PrAction::CreateNew => {
                 self.create_github_pr(
                     &repo_view,
                     &final_pr_content.title,
                     &final_pr_content.description,
+                    is_draft,
                 )?;
                 println!("✅ Pull request created successfully!");
             }
@@ -2033,6 +2074,16 @@ impl CreatePrCommand {
 
         println!("\n📝 PR details generated.");
         println!("💾 Details saved to: {}", pr_file.display());
+
+        // Show draft status
+        let is_draft = self.should_create_as_draft();
+        let status_icon = if is_draft { "📋" } else { "✅" };
+        let status_text = if is_draft {
+            "draft"
+        } else {
+            "ready for review"
+        };
+        println!("{} PR will be created as: {}", status_icon, status_text);
         println!();
 
         // Check if there are existing PRs and show different options
@@ -2187,6 +2238,7 @@ impl CreatePrCommand {
         repo_view: &crate::data::RepositoryView,
         title: &str,
         description: &str,
+        is_draft: bool,
     ) -> Result<()> {
         use std::process::Command;
 
@@ -2197,7 +2249,12 @@ impl CreatePrCommand {
             .map(|bi| &bi.branch)
             .context("Branch info not available")?;
 
-        println!("🚀 Creating pull request...");
+        let pr_status = if is_draft {
+            "draft"
+        } else {
+            "ready for review"
+        };
+        println!("🚀 Creating pull request ({})...", pr_status);
         println!("   📋 Title: {}", title);
         println!("   🌿 Branch: {}", branch_name);
 
@@ -2226,18 +2283,25 @@ impl CreatePrCommand {
         // Create PR using gh CLI with explicit head branch
         debug!("Creating PR with gh CLI - title: '{}'", title);
         debug!("PR description length: {} characters", description.len());
+        debug!("PR draft status: {}", is_draft);
+
+        let mut args = vec![
+            "pr",
+            "create",
+            "--head",
+            branch_name,
+            "--title",
+            title,
+            "--body",
+            description,
+        ];
+
+        if is_draft {
+            args.push("--draft");
+        }
 
         let pr_result = Command::new("gh")
-            .args([
-                "pr",
-                "create",
-                "--head",
-                branch_name,
-                "--title",
-                title,
-                "--body",
-                description,
-            ])
+            .args(&args)
             .output()
             .context("Failed to create pull request")?;
 
