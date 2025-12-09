@@ -1,5 +1,6 @@
 ---
 source: tests/integration_test.rs
+assertion_line: 239
 expression: help_output
 ---
 omni-dev - A comprehensive development toolkit
@@ -211,6 +212,8 @@ Arguments:
 Options:
       --auto-apply        Skip confirmation prompt and create PR automatically
       --save-only <FILE>  Save generated PR details to file without creating PR
+      --ready             Create PR as ready for review (overrides default)
+      --draft             Create PR as draft (overrides default)
   -h, --help              Print help
 
 
