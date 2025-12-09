@@ -5,12 +5,13 @@ This document provides comprehensive guidelines for writing effective pull reque
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [PR Title Guidelines](#pr-title-guidelines)
-3. [Description Best Practices](#description-best-practices)
-4. [Template Section Guidelines](#template-section-guidelines)
-5. [Code Review Facilitation](#code-review-facilitation)
-6. [Common Patterns](#common-patterns)
-7. [Examples](#examples)
+2. [AI-Generated PR Descriptions](#ai-generated-pr-descriptions)
+3. [PR Title Guidelines](#pr-title-guidelines)
+4. [Description Best Practices](#description-best-practices)
+5. [Template Section Guidelines](#template-section-guidelines)
+6. [Code Review Facilitation](#code-review-facilitation)
+7. [Common Patterns](#common-patterns)
+8. [Examples](#examples)
 
 ## Overview
 
@@ -27,6 +28,64 @@ A well-written pull request serves multiple purposes:
 2. **Completeness**: Include all necessary information for review
 3. **Conciseness**: Be thorough but avoid unnecessary verbosity
 4. **Actionability**: Provide clear testing and validation steps
+
+## AI-Generated PR Descriptions
+
+**CRITICAL FOR AI ASSISTANTS**: When generating PR descriptions, you MUST:
+
+1. **ALWAYS REPLACE PLACEHOLDERS**: Never leave placeholder text like "TODO", "FIXME", "Add description here", "<!--comment-->", or generic instructions in brackets
+2. **FILL IN ACTUAL CONTENT**: Every section must contain specific, concrete information based on the actual code changes and diffs
+3. **BE SPECIFIC ABOUT CHANGES**: List the exact files modified, functions added, and features implemented
+4. **NO GENERIC TEXT**: Avoid generic statements like "various improvements" - specify what was improved and how
+5. **REMOVE TEMPLATE COMMENTS**: Delete all HTML comments and instructional text from the template
+6. **ANALYZE THE DIFFS**: Read through all commit diffs to understand what actually changed
+7. **PROVIDE REAL EXAMPLES**: If the template asks for test commands, provide the actual commands that should be run
+8. **COMPLETE ALL CHECKLISTS**: Mark checklist items as checked `[x]` only if they were actually completed based on the commits
+
+### What NOT to Do
+
+❌ **NEVER do this:**
+```markdown
+## Description
+<!-- Provide a clear, comprehensive overview of changes -->
+Add description here.
+
+## Changes Made
+**Core Changes:**
+-
+-
+
+**Documentation:**
+-
+```
+
+✅ **ALWAYS do this instead:**
+```markdown
+## Description
+This PR adds draft PR support with `--draft` and `--ready` CLI flags. The default behavior creates draft PRs, but users can override this via command-line flags or the `OMNI_DEV_DEFAULT_DRAFT_PR` configuration setting.
+
+## Changes Made
+**Core Changes:**
+- Added `--draft` and `--ready` flags to `CreatePrCommand` in `src/cli/git.rs`
+- Implemented `should_create_as_draft()` method with priority-based configuration resolution
+- Updated `create_github_pr()` to pass `--draft` flag to GitHub CLI when appropriate
+
+**Documentation:**
+- Updated help text to document new flags
+- Added configuration example to README
+```
+
+### AI Generation Checklist
+
+Before returning a PR description, verify:
+- [ ] All HTML comments and instructional text removed
+- [ ] All placeholder bullet points replaced with actual content
+- [ ] All "TODO" and "FIXME" markers removed
+- [ ] Specific file names and functions mentioned where relevant
+- [ ] Test commands are actual commands, not placeholders
+- [ ] Checklist items accurately reflect what was done
+- [ ] No sections left empty (either fill them or remove them)
+- [ ] Description explains WHAT changed and WHY based on actual commits
 
 ## PR Title Guidelines
 
