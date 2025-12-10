@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2025-12-10
+
+### Added
+- **Draft PR Support**: New draft PR functionality with configurable defaults
+  - Added `--draft` flag to PR creation command for creating draft pull requests
+  - Configurable default draft status via `.omni-dev/pr-config.yaml`
+  - Enhanced PR workflow with draft mode for work-in-progress changes
+- **No-AI Mode for Twiddle**: Direct YAML output without AI processing
+  - Added `--no-ai` flag to twiddle command for direct YAML generation
+  - Enables manual editing workflows without AI-powered amendment
+  - Better integration with custom automation pipelines
+
+### Documentation
+- **AI-Generated PR Guidelines**: Comprehensive documentation for PR description generation
+  - Detailed guidelines for AI-powered PR description creation
+  - Best practices and examples for effective PR generation
+  - Enhanced documentation for team collaboration
+
+### Fixed
+- **PR Creation Branch Handling**: Improved head branch parameter handling
+  - Fixed explicit head branch parameter in `gh pr create` command
+  - Better handling of upstream branch configuration
+  - More reliable PR creation workflow
+
 ## [0.10.0] - 2025-09-30
 
 ### Added
@@ -300,7 +324,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation and community files (README, CONTRIBUTING, CODE_OF_CONDUCT)
 - BSD 3-Clause license
 
-[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/rust-works/omni-dev/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/rust-works/omni-dev/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/rust-works/omni-dev/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/rust-works/omni-dev/compare/v0.7.0...v0.8.0
