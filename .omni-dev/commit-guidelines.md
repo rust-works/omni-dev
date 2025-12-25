@@ -1,8 +1,9 @@
 # omni-dev Commit Guidelines
 
-This project follows conventional commit format with specific requirements:
+This project follows conventional commit format with specific requirements.
 
 ## Commit Format
+
 ```
 <type>(<scope>): <description>
 
@@ -12,39 +13,93 @@ This project follows conventional commit format with specific requirements:
 ```
 
 ## Types
-- `feat`: New features or enhancements
-- `fix`: Bug fixes
-- `docs`: Documentation changes
-- `refactor`: Code refactoring without behavior changes
-- `chore`: Maintenance tasks, dependency updates
-- `test`: Test additions or modifications
-- `ci`: CI/CD pipeline changes
-- `build`: Build system changes
+
+Required. Must be one of:
+
+| Type       | Use for                                               |
+|------------|-------------------------------------------------------|
+| `feat`     | New features or enhancements to existing features     |
+| `fix`      | Bug fixes                                             |
+| `docs`     | Documentation changes only                            |
+| `refactor` | Code refactoring without behavior changes             |
+| `chore`    | Maintenance tasks, dependency updates, config changes |
+| `test`     | Test additions or modifications                       |
+| `ci`       | CI/CD pipeline changes                                |
+| `build`    | Build system or external dependency changes           |
+| `perf`     | Performance improvements                              |
+| `style`    | Code style changes (formatting, whitespace)           |
 
 ## Scopes
-Use scopes defined in `.omni-dev/scopes.yaml` to indicate the area of change.
+
+Required. Use scopes defined in `.omni-dev/scopes.yaml`:
+
+- `claude` - AI client implementation and integration
+- `cli` - Command-line interface and argument parsing
+- `git` - Git operations and repository analysis
+- `data` - Data structures and serialization
+- `docs` - Documentation and planning
+- `api` - External API integrations
+
+## Subject Line Rules
+
+- Use imperative mood: "add feature" not "added feature" or "adds feature"
+- Use lowercase for the description
+- No period at the end
+- Keep under 72 characters total
+- Be specific: avoid vague terms like "update", "fix stuff", "changes"
+
+## Accuracy Requirements
+
+The commit message must accurately reflect the actual code changes:
+
+- **Type must match changes**: Don't use `feat` for a bug fix, or `fix` for new functionality
+- **Scope must match files**: The scope should reflect which area of code was modified
+- **Description must be truthful**: Don't claim changes that weren't made
+- **Mention significant changes**: If you add error handling, logging, or change behavior, mention it
 
 ## Body Guidelines
-For significant changes, include:
-- What was changed and why
-- Impact on users or developers
-- Any breaking changes or migration notes
-- References to issues or tickets
+
+For significant changes (>50 lines or architectural changes), include a body:
+
+- Explain what was changed and why
+- Describe the approach taken
+- Note any breaking changes or migration requirements
+- Use bullet points for multiple related changes
+- Reference issues in footer: `Closes #123` or `Fixes #456`
+
+## Breaking Changes
+
+For breaking changes:
+- Add `!` after type/scope: `feat(api)!: change response format`
+- Include `BREAKING CHANGE:` footer with migration instructions
 
 ## Examples
+
+### Simple change
+```
+fix(cli): handle missing config file gracefully
+```
+
+### Feature with body
 ```
 feat(claude): add contextual intelligence for commit message improvement
 
 Implements Phase 3 of the twiddle command enhancement with multi-layer
 context discovery including project conventions, branch analysis, and
-work pattern detection. This enables more comprehensive and detailed
-commit messages similar to the Claude Code template workflow.
+work pattern detection.
 
 - Add project context discovery from .omni-dev/ configuration
 - Implement branch naming pattern analysis
 - Add work pattern detection across commit ranges
 - Enhance Claude prompting with contextual intelligence
-- Support verbosity levels based on change significance
 
 Closes #12
+```
+
+### Breaking change
+```
+feat(api)!: change amendment response format to YAML
+
+BREAKING CHANGE: The amendment API now returns YAML instead of JSON.
+Update clients to use a YAML parser for response handling.
 ```
