@@ -598,3 +598,170 @@ Start immediately with "title:" and provide only YAML content. The title should 
 
     prompt
 }
+
+/// Default commit guidelines for check command when no project-specific guidelines are provided
+const DEFAULT_CHECK_GUIDELINES: &str = r#"## Severity Levels
+
+| Severity | Sections                                |
+|----------|----------------------------------------|
+| error    | Commit Format, Types, Scopes, Accuracy |
+| warning  | Body Guidelines                        |
+| info     | Subject Line Style                     |
+
+## Commit Format
+- Use conventional commit format: `<type>(<scope>): <description>`
+
+## Types
+- Valid types: feat, fix, docs, style, refactor, test, chore, ci, perf, build
+
+## Scopes
+- Use meaningful scopes that describe the area of code affected
+
+## Subject Line
+- Keep under 72 characters total
+- Use imperative mood: "add feature" not "added feature"
+- Be specific: avoid vague terms like "update", "fix stuff", "changes"
+
+## Subject Line Style
+- Use lowercase for the description
+- No period at the end
+
+## Accuracy
+- Commit type must match actual changes
+- Scope must match files modified
+- Description must reflect what was actually done
+
+## Body Guidelines
+- For significant changes (>50 lines), include a body
+- Explain what was changed and why
+"#;
+
+/// System prompt for commit message check/validation
+pub const CHECK_SYSTEM_PROMPT: &str = r#"You are a commit message reviewer. Your task is to evaluate commit messages against project guidelines and report violations.
+
+You will receive:
+1. Project commit guidelines (with severity annotations in a "Severity Levels" section)
+2. Commit information including the message and diff
+
+## Severity Levels
+
+The guidelines contain a "Severity Levels" section with a table mapping sections to severities:
+
+```markdown
+## Severity Levels
+
+| Severity | Sections                       |
+|----------|--------------------------------|
+| error    | Format, Subject Line, Accuracy |
+| warning  | Content                        |
+| info     | Style                          |
+```
+
+Meaning:
+- `error` = Violations that block CI (exit code 1)
+- `warning` = Advisory issues (exit code 0, or 2 with --strict)
+- `info` = Suggestions only (never affect exit code)
+
+Sections not listed in the severity table default to `warning`.
+
+## Your Task
+
+For each commit:
+1. Check if the message follows each guideline section
+2. Compare the message against the actual diff to verify accuracy
+3. Report violations with the severity from that section's annotation
+4. Suggest a corrected message if there are issues
+
+## Accuracy Checks (Critical)
+
+These are the core value-add checks - compare what the message *claims* against what the diff *shows*:
+- Does the commit type match the actual changes? (e.g., don't use `feat` for a bug fix)
+- Does the scope match files modified?
+- Does the description accurately reflect what was done?
+- Are important changes mentioned? (e.g., rate limiting, breaking changes)
+
+## Response Format
+
+CRITICAL: Respond with ONLY valid YAML content. Do not include any explanatory text, markdown wrappers, or code blocks.
+
+Your response must follow this exact YAML structure:
+
+checks:
+  - commit: "abc123..."
+    passes: false
+    issues:
+      - severity: error
+        section: "Subject Line"
+        rule: "Keep under 72 characters"
+        explanation: "Subject is 85 characters"
+      - severity: warning
+        section: "Body Guidelines"
+        rule: "Body required for large changes"
+        explanation: "142 lines changed but no body provided"
+    suggestion:
+      message: |
+        feat(api): add user endpoint
+
+        Implement POST /api/users with validation.
+      explanation: |
+        - Shortened subject to under 72 chars
+        - Added body explaining the change
+
+For commits that pass all checks:
+  - commit: "def456..."
+    passes: true
+    issues: []
+
+IMPORTANT:
+- Include ALL commits in the response, whether they pass or fail
+- Use the exact severity from the guidelines' severity table
+- Set `passes: true` only if there are no error or warning level issues
+- Info-level issues do not affect the `passes` status"#;
+
+/// Generate check system prompt with project guidelines
+pub fn generate_check_system_prompt(guidelines: Option<&str>) -> String {
+    let mut prompt = CHECK_SYSTEM_PROMPT.to_string();
+
+    prompt.push_str("\n\n=== PROJECT COMMIT GUIDELINES ===\n");
+    prompt.push_str("Evaluate commits against these guidelines:\n\n");
+
+    if let Some(project_guidelines) = guidelines {
+        prompt.push_str(project_guidelines);
+    } else {
+        prompt.push_str(DEFAULT_CHECK_GUIDELINES);
+    }
+
+    prompt.push_str("\n\nCRITICAL: Use the Severity Levels table above to determine the severity of each violation. If a section is not listed, default to 'warning'.");
+
+    prompt
+}
+
+/// Generate user prompt for check command
+pub fn generate_check_user_prompt(repo_yaml: &str, include_suggestions: bool) -> String {
+    let mut prompt = format!(
+        r#"Please analyze the following commits and check their messages against the guidelines:
+
+{}
+
+ANALYSIS STEPS:
+1. For each commit, read the diff content to understand what was actually changed
+2. Compare the commit message against each guideline section
+3. Report any violations with appropriate severity level from the guidelines
+4. Check accuracy: does the message accurately describe the actual code changes?
+
+"#,
+        repo_yaml
+    );
+
+    if include_suggestions {
+        prompt.push_str("SUGGESTIONS: For commits with issues, provide a corrected message suggestion with explanation of improvements.\n\n");
+    } else {
+        prompt.push_str("SUGGESTIONS: Do NOT include suggestion fields - only report issues.\n\n");
+    }
+
+    prompt.push_str(r#"MANDATORY: Include ALL commits in the checks array, whether they pass or fail.
+
+CRITICAL RESPONSE FORMAT: Respond with ONLY valid YAML content starting with "checks:". Do not include any explanatory text, markdown wrappers, or code blocks."#);
+
+    prompt
+}

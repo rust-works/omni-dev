@@ -257,6 +257,7 @@ Commands:
   view     Analyze commits and output repository information in YAML format
   amend    Amend commit messages based on a YAML configuration file
   twiddle  AI-powered commit message improvement using Claude
+  check    Check commit messages against guidelines without modifying them
   help     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -276,6 +277,31 @@ Arguments:
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev git commit message check - Check commit messages against guidelines without modifying them
+
+Check commit messages against guidelines without modifying them
+
+Usage: check [OPTIONS] [COMMIT_RANGE]
+
+Arguments:
+  [COMMIT_RANGE]  Commit range to check (e.g., HEAD~3..HEAD, abc123..def456) Defaults to commits ahead of main branch
+
+Options:
+      --model <MODEL>              Claude API model to use (if not specified, uses settings or default)
+      --context-dir <CONTEXT_DIR>  Path to custom context directory (defaults to .omni-dev/)
+      --guidelines <GUIDELINES>    Explicit path to guidelines file
+      --format <FORMAT>            Output format: text (default), json, yaml [default: text]
+      --strict                     Exit with error code if any issues found (including warnings)
+      --quiet                      Only show errors/warnings, suppress info-level output
+      --verbose                    Show detailed analysis including passing commits
+      --show-passing               Include passing commits in output (hidden by default)
+      --batch-size <BATCH_SIZE>    Number of commits to process per AI request (default: 4) [default: 4]
+      --no-suggestions             Skip generating corrected message suggestions
+  -h, --help                       Print help
 
 
 ================================================================================

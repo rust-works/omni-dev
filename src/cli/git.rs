@@ -53,6 +53,8 @@ pub enum MessageSubcommands {
     Amend(AmendCommand),
     /// AI-powered commit message improvement using Claude
     Twiddle(TwiddleCommand),
+    /// Check commit messages against guidelines without modifying them
+    Check(CheckCommand),
 }
 
 /// View command options
@@ -121,6 +123,55 @@ pub struct TwiddleCommand {
     /// Ignore existing commit messages and generate fresh ones based solely on diffs
     #[arg(long)]
     pub fresh: bool,
+}
+
+/// Check command options - validates commit messages against guidelines
+#[derive(Parser)]
+pub struct CheckCommand {
+    /// Commit range to check (e.g., HEAD~3..HEAD, abc123..def456)
+    /// Defaults to commits ahead of main branch
+    #[arg(value_name = "COMMIT_RANGE")]
+    pub commit_range: Option<String>,
+
+    /// Claude API model to use (if not specified, uses settings or default)
+    #[arg(long)]
+    pub model: Option<String>,
+
+    /// Path to custom context directory (defaults to .omni-dev/)
+    #[arg(long)]
+    pub context_dir: Option<std::path::PathBuf>,
+
+    /// Explicit path to guidelines file
+    #[arg(long)]
+    pub guidelines: Option<std::path::PathBuf>,
+
+    /// Output format: text (default), json, yaml
+    #[arg(long, default_value = "text")]
+    pub format: String,
+
+    /// Exit with error code if any issues found (including warnings)
+    #[arg(long)]
+    pub strict: bool,
+
+    /// Only show errors/warnings, suppress info-level output
+    #[arg(long)]
+    pub quiet: bool,
+
+    /// Show detailed analysis including passing commits
+    #[arg(long)]
+    pub verbose: bool,
+
+    /// Include passing commits in output (hidden by default)
+    #[arg(long)]
+    pub show_passing: bool,
+
+    /// Number of commits to process per AI request (default: 4)
+    #[arg(long, default_value = "4")]
+    pub batch_size: usize,
+
+    /// Skip generating corrected message suggestions
+    #[arg(long)]
+    pub no_suggestions: bool,
 }
 
 /// Branch operations
@@ -217,6 +268,12 @@ impl MessageCommand {
                 let rt =
                     tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
                 rt.block_on(twiddle_cmd.execute())
+            }
+            MessageSubcommands::Check(check_cmd) => {
+                // Use tokio runtime for async execution
+                let rt =
+                    tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
+                rt.block_on(check_cmd.execute())
             }
         }
     }
@@ -2501,6 +2558,418 @@ impl CreatePrCommand {
             println!("   ⚠️  Model not found in registry, using client metadata:");
             println!("   📤 Max output tokens: {}", metadata.max_response_length);
             println!("   📥 Input context: {}", metadata.max_context_length);
+        }
+
+        println!();
+        Ok(())
+    }
+}
+
+impl CheckCommand {
+    /// Execute check command - validates commit messages against guidelines
+    pub async fn execute(self) -> Result<()> {
+        use crate::data::check::OutputFormat;
+
+        // Parse output format
+        let output_format: OutputFormat = self.format.parse().unwrap_or(OutputFormat::Text);
+
+        if !self.quiet && output_format == OutputFormat::Text {
+            println!("🔍 Checking commit messages against guidelines...");
+        }
+
+        // 1. Generate repository view to get all commits
+        let repo_view = self.generate_repository_view().await?;
+
+        // 2. Check for empty commit range (exit code 3)
+        if repo_view.commits.is_empty() {
+            eprintln!("error: no commits found in range");
+            std::process::exit(3);
+        }
+
+        if !self.quiet && output_format == OutputFormat::Text {
+            println!("📊 Found {} commits to check", repo_view.commits.len());
+        }
+
+        // 3. Load commit guidelines
+        let guidelines = self.load_guidelines().await?;
+
+        // 4. Initialize Claude client
+        let claude_client = crate::claude::create_default_claude_client(self.model.clone())?;
+
+        if self.verbose && output_format == OutputFormat::Text {
+            self.show_model_info(&claude_client)?;
+        }
+
+        // 5. Check if batching is needed
+        let report = if repo_view.commits.len() > self.batch_size {
+            if !self.quiet && output_format == OutputFormat::Text {
+                println!(
+                    "📦 Processing {} commits in batches of {}...",
+                    repo_view.commits.len(),
+                    self.batch_size
+                );
+            }
+            self.check_with_batching(&claude_client, &repo_view, guidelines.as_deref())
+                .await?
+        } else {
+            // 6. Single batch check
+            if !self.quiet && output_format == OutputFormat::Text {
+                println!("🤖 Analyzing commits with AI...");
+            }
+            claude_client
+                .check_commits(&repo_view, guidelines.as_deref(), !self.no_suggestions)
+                .await?
+        };
+
+        // 7. Output results
+        self.output_report(&report, output_format)?;
+
+        // 8. Determine exit code
+        let exit_code = report.exit_code(self.strict);
+        if exit_code != 0 {
+            std::process::exit(exit_code);
+        }
+
+        Ok(())
+    }
+
+    /// Generate repository view (reuse logic from TwiddleCommand)
+    async fn generate_repository_view(&self) -> Result<crate::data::RepositoryView> {
+        use crate::data::{
+            AiInfo, BranchInfo, FieldExplanation, FileStatusInfo, RepositoryView, VersionInfo,
+            WorkingDirectoryInfo,
+        };
+        use crate::git::{GitRepository, RemoteInfo};
+        use crate::utils::ai_scratch;
+
+        // Open git repository
+        let repo = GitRepository::open()
+            .context("Failed to open git repository. Make sure you're in a git repository.")?;
+
+        // Get current branch name
+        let current_branch = repo
+            .get_current_branch()
+            .unwrap_or_else(|_| "HEAD".to_string());
+
+        // Determine commit range
+        let commit_range = match &self.commit_range {
+            Some(range) => range.clone(),
+            None => {
+                // Default to commits ahead of main branch
+                let base = if repo.branch_exists("main")? {
+                    "main"
+                } else if repo.branch_exists("master")? {
+                    "master"
+                } else {
+                    "HEAD~5"
+                };
+                format!("{}..HEAD", base)
+            }
+        };
+
+        // Get working directory status
+        let wd_status = repo.get_working_directory_status()?;
+        let working_directory = WorkingDirectoryInfo {
+            clean: wd_status.clean,
+            untracked_changes: wd_status
+                .untracked_changes
+                .into_iter()
+                .map(|fs| FileStatusInfo {
+                    status: fs.status,
+                    file: fs.file,
+                })
+                .collect(),
+        };
+
+        // Get remote information
+        let remotes = RemoteInfo::get_all_remotes(repo.repository())?;
+
+        // Parse commit range and get commits
+        let commits = repo.get_commits_in_range(&commit_range)?;
+
+        // Create version information
+        let versions = Some(VersionInfo {
+            omni_dev: env!("CARGO_PKG_VERSION").to_string(),
+        });
+
+        // Get AI scratch directory
+        let ai_scratch_path =
+            ai_scratch::get_ai_scratch_dir().context("Failed to determine AI scratch directory")?;
+        let ai_info = AiInfo {
+            scratch: ai_scratch_path.to_string_lossy().to_string(),
+        };
+
+        // Build repository view with branch info
+        let mut repo_view = RepositoryView {
+            versions,
+            explanation: FieldExplanation::default(),
+            working_directory,
+            remotes,
+            ai: ai_info,
+            branch_info: Some(BranchInfo {
+                branch: current_branch,
+            }),
+            pr_template: None,
+            pr_template_location: None,
+            branch_prs: None,
+            commits,
+        };
+
+        // Update field presence based on actual data
+        repo_view.update_field_presence();
+
+        Ok(repo_view)
+    }
+
+    /// Load commit guidelines from file or context directory
+    async fn load_guidelines(&self) -> Result<Option<String>> {
+        use std::fs;
+
+        // If explicit guidelines path is provided, use it
+        if let Some(guidelines_path) = &self.guidelines {
+            let content = fs::read_to_string(guidelines_path).with_context(|| {
+                format!("Failed to read guidelines file: {:?}", guidelines_path)
+            })?;
+            return Ok(Some(content));
+        }
+
+        // Otherwise, use project discovery to find guidelines
+        let context_dir = self
+            .context_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from(".omni-dev"));
+
+        // Try local override first
+        let local_path = context_dir.join("local").join("commit-guidelines.md");
+        if local_path.exists() {
+            let content = fs::read_to_string(&local_path)
+                .with_context(|| format!("Failed to read guidelines: {:?}", local_path))?;
+            return Ok(Some(content));
+        }
+
+        // Try project-level guidelines
+        let project_path = context_dir.join("commit-guidelines.md");
+        if project_path.exists() {
+            let content = fs::read_to_string(&project_path)
+                .with_context(|| format!("Failed to read guidelines: {:?}", project_path))?;
+            return Ok(Some(content));
+        }
+
+        // Try global guidelines
+        if let Some(home) = dirs::home_dir() {
+            let home_path = home.join(".omni-dev").join("commit-guidelines.md");
+            if home_path.exists() {
+                let content = fs::read_to_string(&home_path)
+                    .with_context(|| format!("Failed to read guidelines: {:?}", home_path))?;
+                return Ok(Some(content));
+            }
+        }
+
+        // No custom guidelines found, will use defaults
+        Ok(None)
+    }
+
+    /// Check commits with batching for large commit ranges
+    async fn check_with_batching(
+        &self,
+        claude_client: &crate::claude::client::ClaudeClient,
+        full_repo_view: &crate::data::RepositoryView,
+        guidelines: Option<&str>,
+    ) -> Result<crate::data::check::CheckReport> {
+        use crate::data::check::{CheckReport, CommitCheckResult};
+
+        let commit_batches: Vec<_> = full_repo_view.commits.chunks(self.batch_size).collect();
+        let total_batches = commit_batches.len();
+        let mut all_results: Vec<CommitCheckResult> = Vec::new();
+
+        for (batch_num, commit_batch) in commit_batches.into_iter().enumerate() {
+            if !self.quiet {
+                println!(
+                    "🔄 Processing batch {}/{} ({} commits)...",
+                    batch_num + 1,
+                    total_batches,
+                    commit_batch.len()
+                );
+            }
+
+            // Create a repository view for just this batch
+            let batch_repo_view = crate::data::RepositoryView {
+                versions: full_repo_view.versions.clone(),
+                explanation: full_repo_view.explanation.clone(),
+                working_directory: full_repo_view.working_directory.clone(),
+                remotes: full_repo_view.remotes.clone(),
+                ai: full_repo_view.ai.clone(),
+                branch_info: full_repo_view.branch_info.clone(),
+                pr_template: full_repo_view.pr_template.clone(),
+                pr_template_location: full_repo_view.pr_template_location.clone(),
+                branch_prs: full_repo_view.branch_prs.clone(),
+                commits: commit_batch.to_vec(),
+            };
+
+            // Check this batch
+            let batch_report = claude_client
+                .check_commits(&batch_repo_view, guidelines, !self.no_suggestions)
+                .await?;
+
+            // Merge results
+            all_results.extend(batch_report.commits);
+
+            if batch_num + 1 < total_batches {
+                // Small delay between batches
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            }
+        }
+
+        Ok(CheckReport::new(all_results))
+    }
+
+    /// Output the check report in the specified format
+    fn output_report(
+        &self,
+        report: &crate::data::check::CheckReport,
+        format: crate::data::check::OutputFormat,
+    ) -> Result<()> {
+        use crate::data::check::OutputFormat;
+
+        match format {
+            OutputFormat::Text => self.output_text_report(report),
+            OutputFormat::Json => {
+                let json = serde_json::to_string_pretty(report)
+                    .context("Failed to serialize report to JSON")?;
+                println!("{}", json);
+                Ok(())
+            }
+            OutputFormat::Yaml => {
+                let yaml =
+                    crate::data::to_yaml(report).context("Failed to serialize report to YAML")?;
+                println!("{}", yaml);
+                Ok(())
+            }
+        }
+    }
+
+    /// Output text format report
+    fn output_text_report(&self, report: &crate::data::check::CheckReport) -> Result<()> {
+        use crate::data::check::IssueSeverity;
+
+        println!();
+
+        for result in &report.commits {
+            // Skip passing commits unless --show-passing is set
+            if result.passes && !self.show_passing {
+                continue;
+            }
+
+            // Skip info-only commits in quiet mode
+            if self.quiet {
+                let has_errors_or_warnings = result
+                    .issues
+                    .iter()
+                    .any(|i| matches!(i.severity, IssueSeverity::Error | IssueSeverity::Warning));
+                if !has_errors_or_warnings {
+                    continue;
+                }
+            }
+
+            // Determine icon
+            let icon = if result.passes {
+                "✅"
+            } else if result
+                .issues
+                .iter()
+                .any(|i| i.severity == IssueSeverity::Error)
+            {
+                "❌"
+            } else {
+                "⚠️ "
+            };
+
+            // Short hash
+            let short_hash = if result.hash.len() > 7 {
+                &result.hash[..7]
+            } else {
+                &result.hash
+            };
+
+            println!("{} {} - \"{}\"", icon, short_hash, result.message);
+
+            // Print issues
+            for issue in &result.issues {
+                // Skip info issues in quiet mode
+                if self.quiet && issue.severity == IssueSeverity::Info {
+                    continue;
+                }
+
+                let severity_str = match issue.severity {
+                    IssueSeverity::Error => "\x1b[31mERROR\x1b[0m  ",
+                    IssueSeverity::Warning => "\x1b[33mWARNING\x1b[0m",
+                    IssueSeverity::Info => "\x1b[36mINFO\x1b[0m   ",
+                };
+
+                println!(
+                    "   {} [{}] {}",
+                    severity_str, issue.section, issue.explanation
+                );
+            }
+
+            // Print suggestion if available and not in quiet mode
+            if !self.quiet {
+                if let Some(suggestion) = &result.suggestion {
+                    println!();
+                    println!("   Suggested message:");
+                    for line in suggestion.message.lines() {
+                        println!("      {}", line);
+                    }
+                    if self.verbose {
+                        println!();
+                        println!("   Why this is better:");
+                        for line in suggestion.explanation.lines() {
+                            println!("   {}", line);
+                        }
+                    }
+                }
+            }
+
+            println!();
+        }
+
+        // Print summary
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("Summary: {} commits checked", report.summary.total_commits);
+        println!(
+            "  {} errors, {} warnings",
+            report.summary.error_count, report.summary.warning_count
+        );
+        println!(
+            "  {} passed, {} with issues",
+            report.summary.passing_commits, report.summary.failing_commits
+        );
+
+        Ok(())
+    }
+
+    /// Show model information
+    fn show_model_info(&self, client: &crate::claude::client::ClaudeClient) -> Result<()> {
+        use crate::claude::model_config::get_model_registry;
+
+        println!("🤖 AI Model Configuration:");
+
+        let metadata = client.get_ai_client_metadata();
+        let registry = get_model_registry();
+
+        if let Some(spec) = registry.get_model_spec(&metadata.model) {
+            if metadata.model != spec.api_identifier {
+                println!(
+                    "   📡 Model: {} → \x1b[33m{}\x1b[0m",
+                    metadata.model, spec.api_identifier
+                );
+            } else {
+                println!("   📡 Model: \x1b[33m{}\x1b[0m", metadata.model);
+            }
+            println!("   🏷️  Provider: {}", spec.provider);
+        } else {
+            println!("   📡 Model: \x1b[33m{}\x1b[0m", metadata.model);
+            println!("   🏷️  Provider: {}", metadata.provider);
         }
 
         println!();
