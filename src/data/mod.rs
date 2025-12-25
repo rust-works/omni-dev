@@ -146,6 +146,9 @@ pub struct PullRequest {
     pub url: String,
     /// PR description/body content
     pub body: String,
+    /// Base branch the PR targets
+    #[serde(default)]
+    pub base: String,
 }
 
 impl RepositoryView {
