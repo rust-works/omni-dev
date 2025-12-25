@@ -264,6 +264,167 @@ impl ClaudeClient {
         Ok(pr_content)
     }
 
+    /// Check commit messages against guidelines and return a report
+    ///
+    /// Validates commit messages against project guidelines or defaults,
+    /// returning a structured report with issues and suggestions.
+    pub async fn check_commits(
+        &self,
+        repo_view: &RepositoryView,
+        guidelines: Option<&str>,
+        include_suggestions: bool,
+    ) -> Result<crate::data::check::CheckReport> {
+        self.check_commits_with_retry(repo_view, guidelines, include_suggestions, 2)
+            .await
+    }
+
+    /// Check commit messages with retry logic for parse failures
+    async fn check_commits_with_retry(
+        &self,
+        repo_view: &RepositoryView,
+        guidelines: Option<&str>,
+        include_suggestions: bool,
+        max_retries: u32,
+    ) -> Result<crate::data::check::CheckReport> {
+        // Convert to AI-enhanced view with diff content
+        let ai_repo_view = RepositoryViewForAI::from_repository_view(repo_view.clone())
+            .context("Failed to enhance repository view with diff content")?;
+
+        // Convert repository view to YAML
+        let repo_yaml = crate::data::to_yaml(&ai_repo_view)
+            .context("Failed to serialize repository view to YAML")?;
+
+        // Generate prompts
+        let system_prompt = prompts::generate_check_system_prompt(guidelines);
+        let user_prompt = prompts::generate_check_user_prompt(&repo_yaml, include_suggestions);
+
+        let mut last_error = None;
+
+        for attempt in 0..=max_retries {
+            // Send request using AI client
+            match self
+                .ai_client
+                .send_request(&system_prompt, &user_prompt)
+                .await
+            {
+                Ok(content) => match self.parse_check_response(&content, repo_view) {
+                    Ok(report) => return Ok(report),
+                    Err(e) => {
+                        if attempt < max_retries {
+                            eprintln!(
+                                "warning: failed to parse AI response (attempt {}), retrying...",
+                                attempt + 1
+                            );
+                            debug!(error = %e, attempt = attempt + 1, "Check response parse failed, retrying");
+                        }
+                        last_error = Some(e);
+                    }
+                },
+                Err(e) => {
+                    if attempt < max_retries {
+                        eprintln!(
+                            "warning: AI request failed (attempt {}), retrying...",
+                            attempt + 1
+                        );
+                        debug!(error = %e, attempt = attempt + 1, "AI request failed, retrying");
+                    }
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Check failed after retries")))
+    }
+
+    /// Parse the check response from AI
+    fn parse_check_response(
+        &self,
+        content: &str,
+        repo_view: &RepositoryView,
+    ) -> Result<crate::data::check::CheckReport> {
+        use crate::data::check::{
+            AiCheckResponse, CheckReport, CommitCheckResult as CheckResultType,
+        };
+
+        // Extract YAML from potential markdown wrapper
+        let yaml_content = self.extract_yaml_from_check_response(content);
+
+        // Parse YAML response
+        let ai_response: AiCheckResponse = crate::data::from_yaml(&yaml_content).map_err(|e| {
+            debug!(
+                error = %e,
+                content_length = content.len(),
+                yaml_length = yaml_content.len(),
+                "Check YAML parsing failed"
+            );
+            debug!(content = %content, "Raw AI response");
+            debug!(yaml = %yaml_content, "Extracted YAML content");
+            ClaudeError::AmendmentParsingFailed(format!("Check response parsing error: {}", e))
+        })?;
+
+        // Create a map of commit hashes to original messages for lookup
+        let commit_messages: std::collections::HashMap<&str, &str> = repo_view
+            .commits
+            .iter()
+            .map(|c| (c.hash.as_str(), c.original_message.as_str()))
+            .collect();
+
+        // Convert AI response to CheckReport
+        let results: Vec<CheckResultType> = ai_response
+            .checks
+            .into_iter()
+            .map(|check| {
+                let mut result: CheckResultType = check.into();
+                // Fill in the original message from repo_view
+                if let Some(msg) = commit_messages.get(result.hash.as_str()) {
+                    result.message = msg.lines().next().unwrap_or("").to_string();
+                } else {
+                    // Try to find by prefix
+                    for (hash, msg) in &commit_messages {
+                        if hash.starts_with(&result.hash) || result.hash.starts_with(*hash) {
+                            result.message = msg.lines().next().unwrap_or("").to_string();
+                            break;
+                        }
+                    }
+                }
+                result
+            })
+            .collect();
+
+        Ok(CheckReport::new(results))
+    }
+
+    /// Extract YAML content from check response, handling markdown wrappers
+    fn extract_yaml_from_check_response(&self, content: &str) -> String {
+        let content = content.trim();
+
+        // If content already starts with "checks:", it's pure YAML - return as-is
+        if content.starts_with("checks:") {
+            return content.to_string();
+        }
+
+        // Try to extract from ```yaml blocks first
+        if let Some(yaml_start) = content.find("```yaml") {
+            if let Some(yaml_content) = content[yaml_start + 7..].split("```").next() {
+                return yaml_content.trim().to_string();
+            }
+        }
+
+        // Try to extract from generic ``` blocks
+        if let Some(code_start) = content.find("```") {
+            if let Some(code_content) = content[code_start + 3..].split("```").next() {
+                let potential_yaml = code_content.trim();
+                // Check if it looks like YAML (starts with expected structure)
+                if potential_yaml.starts_with("checks:") {
+                    return potential_yaml.to_string();
+                }
+            }
+        }
+
+        // If no markdown blocks found or extraction failed, return trimmed content
+        content.to_string()
+    }
+
     /// Extract YAML content from Claude response, handling markdown wrappers
     fn extract_yaml_from_response(&self, content: &str) -> String {
         let content = content.trim();

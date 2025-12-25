@@ -4,10 +4,12 @@ use crate::git::{CommitInfo, CommitInfoForAI, RemoteInfo};
 use serde::{Deserialize, Serialize};
 
 pub mod amendments;
+pub mod check;
 pub mod context;
 pub mod yaml;
 
 pub use amendments::*;
+pub use check::*;
 pub use context::*;
 pub use yaml::*;
 
