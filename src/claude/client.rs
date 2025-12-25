@@ -38,9 +38,23 @@ impl ClaudeClient {
 
     /// Generate commit message amendments from repository view
     pub async fn generate_amendments(&self, repo_view: &RepositoryView) -> Result<AmendmentFile> {
+        self.generate_amendments_with_options(repo_view, false)
+            .await
+    }
+
+    /// Generate commit message amendments from repository view with options
+    ///
+    /// If `fresh` is true, ignores existing commit messages and generates new ones
+    /// based solely on the diff content.
+    pub async fn generate_amendments_with_options(
+        &self,
+        repo_view: &RepositoryView,
+        fresh: bool,
+    ) -> Result<AmendmentFile> {
         // Convert to AI-enhanced view with diff content
-        let ai_repo_view = RepositoryViewForAI::from_repository_view(repo_view.clone())
-            .context("Failed to enhance repository view with diff content")?;
+        let ai_repo_view =
+            RepositoryViewForAI::from_repository_view_with_options(repo_view.clone(), fresh)
+                .context("Failed to enhance repository view with diff content")?;
 
         // Convert repository view to YAML
         let repo_yaml = crate::data::to_yaml(&ai_repo_view)
@@ -65,9 +79,24 @@ impl ClaudeClient {
         repo_view: &RepositoryView,
         context: &CommitContext,
     ) -> Result<AmendmentFile> {
+        self.generate_contextual_amendments_with_options(repo_view, context, false)
+            .await
+    }
+
+    /// Generate contextual commit message amendments with options
+    ///
+    /// If `fresh` is true, ignores existing commit messages and generates new ones
+    /// based solely on the diff content.
+    pub async fn generate_contextual_amendments_with_options(
+        &self,
+        repo_view: &RepositoryView,
+        context: &CommitContext,
+        fresh: bool,
+    ) -> Result<AmendmentFile> {
         // Convert to AI-enhanced view with diff content
-        let ai_repo_view = RepositoryViewForAI::from_repository_view(repo_view.clone())
-            .context("Failed to enhance repository view with diff content")?;
+        let ai_repo_view =
+            RepositoryViewForAI::from_repository_view_with_options(repo_view.clone(), fresh)
+                .context("Failed to enhance repository view with diff content")?;
 
         // Convert repository view to YAML
         let repo_yaml = crate::data::to_yaml(&ai_repo_view)
