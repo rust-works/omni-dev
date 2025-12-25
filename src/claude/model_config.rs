@@ -285,9 +285,14 @@ mod tests {
         assert_eq!(opus_spec.unwrap().provider, "claude");
         assert!(registry.is_legacy_model("claude-3-opus-20240229"));
 
-        // Test newer model
+        // Test Claude 4.5 Sonnet (current generation)
+        let sonnet45_tokens = registry.get_max_output_tokens("claude-sonnet-4-5-20250929");
+        assert_eq!(sonnet45_tokens, 64000);
+
+        // Test legacy Claude 4 Sonnet
         let sonnet4_tokens = registry.get_max_output_tokens("claude-sonnet-4-20250514");
         assert_eq!(sonnet4_tokens, 64000);
+        assert!(registry.is_legacy_model("claude-sonnet-4-20250514"));
 
         // Test unknown model falls back to provider defaults
         let unknown_tokens = registry.get_max_output_tokens("claude-unknown-model");
@@ -342,7 +347,13 @@ mod tests {
         assert_eq!(spec.unwrap().api_identifier, "claude-3-opus-20240229");
         assert_eq!(spec.unwrap().max_output_tokens, 4096);
 
-        // Test exact match still works
+        // Test exact match still works for Claude 4.5 Sonnet
+        let exact_sonnet45 = "claude-sonnet-4-5-20250929";
+        let spec = registry.get_model_spec(exact_sonnet45);
+        assert!(spec.is_some());
+        assert_eq!(spec.unwrap().max_output_tokens, 64000);
+
+        // Test legacy Claude 4 Sonnet
         let exact_sonnet4 = "claude-sonnet-4-20250514";
         let spec = registry.get_model_spec(exact_sonnet4);
         assert!(spec.is_some());
