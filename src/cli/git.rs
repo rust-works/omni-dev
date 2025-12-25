@@ -1493,21 +1493,25 @@ impl CreatePrCommand {
         // Determine base branch (with remote prefix)
         let base_branch = match self.base_branch.as_ref() {
             Some(branch) => {
-                // User specified base branch - need to determine if it's local or remote format
-                let remote_branch = if branch.contains('/') {
-                    // Already in remote format (e.g., "origin/main")
+                // User specified base branch - try to resolve it
+                // First, check if it's already a valid remote ref (e.g., "origin/main")
+                let remote_ref = format!("refs/remotes/{}", branch);
+                if repo.repository().find_reference(&remote_ref).is_ok() {
                     branch.clone()
                 } else {
-                    // Local branch name - convert to remote format
-                    format!("{}/{}", primary_remote.name, branch)
-                };
-
-                // Validate that the remote branch exists
-                let remote_ref = format!("refs/remotes/{}", remote_branch);
-                if repo.repository().find_reference(&remote_ref).is_err() {
-                    anyhow::bail!("Remote branch '{}' does not exist", remote_branch);
+                    // Try prepending the primary remote name (e.g., "main" -> "origin/main")
+                    let with_remote = format!("{}/{}", primary_remote.name, branch);
+                    let remote_ref = format!("refs/remotes/{}", with_remote);
+                    if repo.repository().find_reference(&remote_ref).is_ok() {
+                        with_remote
+                    } else {
+                        anyhow::bail!(
+                            "Remote branch '{}' does not exist (also tried '{}')",
+                            branch,
+                            with_remote
+                        );
+                    }
                 }
-                remote_branch
             }
             None => {
                 // Auto-detect using the primary remote's main branch
