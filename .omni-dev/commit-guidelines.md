@@ -41,6 +41,7 @@ Required. Must be one of:
 
 Required. Use scopes defined in `.omni-dev/scopes.yaml`:
 
+- `ci` - CI/CD pipelines and GitHub Actions workflows
 - `claude` - AI client implementation and integration
 - `cli` - Command-line interface and argument parsing
 - `git` - Git operations and repository analysis
