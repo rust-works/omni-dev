@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Commit Message Validation Command**: New `check` command for validating commit messages against project guidelines
+  - AI-powered analysis with configurable severity levels (error, warning, info)
+  - Multiple output formats (text, JSON, YAML) for CI/CD integration
+  - Batch processing support for large commit ranges
+  - Smart exit codes for pipeline integration (0=pass, 1=errors, 2=warnings in strict mode)
+  - Optional suggestion generation for improved commit messages
+  - Color-coded severity indicators in text output
+- **Fresh Mode for Twiddle**: Generate commit messages from scratch ignoring existing messages
+  - New `--fresh` flag for twiddle command
+  - Forces AI to analyze only diff content for completely fresh suggestions
+  - Useful for poorly-written or misleading original messages
+- **Base Branch Support**: Explicit base branch selection for PR creation and updates
+  - New `--base` flag for `create pr` command
+  - Intelligent base branch resolution with fallback logic
+  - Interactive confirmation when changing base branch on updates
+  - Better visibility of target branches in PR operations
+- **Comprehensive Gemini Model Support**: Full Google Gemini model catalog
+  - Gemini 3.0 Pro and Flash (preview models)
+  - Gemini 2.5 series (Pro, Flash, Flash-Lite)
+  - Legacy support for Gemini 2.0 and 1.5 series
+  - Three-tier system (flagship, balanced, fast) for model selection
+
+### Changed
+- **AI Model Registry Update**: Updated to latest model releases (December 2025)
+  - Added Claude 4.5 series (Opus, Sonnet, Haiku) as current generation
+  - Updated default Claude model to claude-sonnet-4-5-20250929
+  - Added OpenAI GPT-5.2, o3/o4 reasoning models, and GPT-4.1 series
+  - Marked legacy models appropriately for deprecation visibility
+
+### Refactored
+- **Commit Guidelines Template**: Extracted default guidelines to shared template file
+  - Single source of truth in `src/templates/default-commit-guidelines.md`
+  - Consistent guidelines between twiddle and check commands
+  - Easier maintenance and editing as markdown
+
+### Documentation
+- **Enhanced Commit Guidelines**: Comprehensive guidelines with severity levels
+  - Detailed type and scope tables with clear use cases
+  - Subject line rules with imperative mood requirements
+  - Accuracy requirements section for truthful descriptions
+  - Severity level mapping for CI/CD integration
+- **Commit Message Check Plan**: Detailed implementation specification
+  - Design philosophy for guideline-driven validation
+  - Command structure and output format examples
+  - CI integration patterns and exit code behavior
+
 ## [0.11.0] - 2025-12-10
 
 ### Added
