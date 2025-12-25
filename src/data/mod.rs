@@ -385,11 +385,29 @@ impl Default for FieldExplanation {
 impl RepositoryViewForAI {
     /// Convert from basic RepositoryView by loading diff content for all commits
     pub fn from_repository_view(repo_view: RepositoryView) -> anyhow::Result<Self> {
+        Self::from_repository_view_with_options(repo_view, false)
+    }
+
+    /// Convert from basic RepositoryView with options
+    ///
+    /// If `fresh` is true, clears original commit messages to force AI to generate
+    /// new messages based solely on the diff content.
+    pub fn from_repository_view_with_options(
+        repo_view: RepositoryView,
+        fresh: bool,
+    ) -> anyhow::Result<Self> {
         // Convert all commits to AI-enhanced versions
-        let commits: Result<Vec<_>, _> = repo_view
+        let commits: anyhow::Result<Vec<_>> = repo_view
             .commits
             .into_iter()
-            .map(CommitInfoForAI::from_commit_info)
+            .map(|commit| {
+                let mut ai_commit = CommitInfoForAI::from_commit_info(commit)?;
+                if fresh {
+                    ai_commit.original_message =
+                        "(Original message hidden - generate fresh message from diff)".to_string();
+                }
+                Ok(ai_commit)
+            })
             .collect();
 
         Ok(Self {
