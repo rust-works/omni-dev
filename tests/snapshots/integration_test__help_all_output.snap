@@ -1,6 +1,5 @@
 ---
 source: tests/integration_test.rs
-assertion_line: 239
 expression: help_output
 ---
 omni-dev - A comprehensive development toolkit
@@ -204,12 +203,10 @@ omni-dev git branch create pr - Create a pull request with AI-generated descript
 
 Create a pull request with AI-generated description
 
-Usage: pr [OPTIONS] [BASE_BRANCH]
-
-Arguments:
-  [BASE_BRANCH]  Base branch to compare against (defaults to main/master)
+Usage: pr [OPTIONS]
 
 Options:
+      --base <BRANCH>     Base branch for the PR to be merged into (defaults to main/master)
       --auto-apply        Skip confirmation prompt and create PR automatically
       --save-only <FILE>  Save generated PR details to file without creating PR
       --ready             Create PR as ready for review (overrides default)
