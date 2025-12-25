@@ -2,6 +2,14 @@
 
 This project follows conventional commit format with specific requirements.
 
+## Severity Levels
+
+| Severity | Sections                                                               |
+|----------|------------------------------------------------------------------------|
+| error    | Commit Format, Types, Scopes, Subject Line, Accuracy, Breaking Changes |
+| warning  | Body Guidelines                                                        |
+| info     | Subject Line Style                                                     |
+
 ## Commit Format
 
 ```
@@ -40,15 +48,18 @@ Required. Use scopes defined in `.omni-dev/scopes.yaml`:
 - `docs` - Documentation and planning
 - `api` - External API integrations
 
-## Subject Line Rules
+## Subject Line
 
-- Use imperative mood: "add feature" not "added feature" or "adds feature"
-- Use lowercase for the description
-- No period at the end
 - Keep under 72 characters total
+- Use imperative mood: "add feature" not "added feature" or "adds feature"
 - Be specific: avoid vague terms like "update", "fix stuff", "changes"
 
-## Accuracy Requirements
+## Subject Line Style
+
+- Use lowercase for the description
+- No period at the end
+
+## Accuracy
 
 The commit message must accurately reflect the actual code changes:
 
