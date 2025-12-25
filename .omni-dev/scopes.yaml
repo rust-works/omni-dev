@@ -1,4 +1,8 @@
 scopes:
+  - name: "ci"
+    description: "CI/CD pipelines and GitHub Actions workflows"
+    examples: ["ci: add commit validation workflow", "ci: fix release pipeline"]
+    file_patterns: [".github/**"]
   - name: "claude"
     description: "Claude AI client implementation and integration"
     examples: ["claude: add contextual prompting", "claude: fix API error handling"]
