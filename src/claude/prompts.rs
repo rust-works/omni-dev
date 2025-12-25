@@ -2,39 +2,9 @@
 
 use crate::data::context::{CommitContext, VerbosityLevel, WorkPattern};
 
-/// Default commit guidelines when no project-specific guidelines are provided
-const DEFAULT_COMMIT_GUIDELINES: &str = r#"## Commit Message Format
-
-Follow conventional commit format:
-
-```
-<type>(<scope>): <description>
-
-[optional body]
-
-[optional footer(s)]
-```
-
-## Types
-- `feat`: New features or enhancements
-- `fix`: Bug fixes 
-- `docs`: Documentation changes
-- `style`: Code style changes (formatting, missing semicolons, etc)
-- `refactor`: Code refactoring without changing functionality
-- `test`: Adding or updating tests
-- `chore`: Maintenance tasks, dependency updates
-- `ci`: CI/CD pipeline changes
-- `perf`: Performance improvements
-- `build`: Changes to build system or external dependencies
-
-## Guidelines
-- Use lowercase for description
-- No period at the end of description
-- Use imperative mood ("add" not "added" or "adds")
-- Keep description under 50 characters when possible
-- Use body to explain what and why, not how
-- Reference issues in footer (e.g., "Fixes #123")
-"#;
+/// Default commit guidelines embedded from markdown file at compile time.
+/// Used by both twiddle and check commands when no project-specific guidelines are provided.
+const DEFAULT_COMMIT_GUIDELINES: &str = include_str!("../templates/default-commit-guidelines.md");
 
 /// Basic system prompt for commit message improvement (Phase 1 & 2)
 pub const BASIC_SYSTEM_PROMPT: &str = r#"You are an expert software engineer helping improve git commit messages. You will receive a YAML representation of a git repository with commit information and specific commit message guidelines to follow.
@@ -599,43 +569,6 @@ Start immediately with "title:" and provide only YAML content. The title should 
     prompt
 }
 
-/// Default commit guidelines for check command when no project-specific guidelines are provided
-const DEFAULT_CHECK_GUIDELINES: &str = r#"## Severity Levels
-
-| Severity | Sections                                |
-|----------|----------------------------------------|
-| error    | Commit Format, Types, Scopes, Accuracy |
-| warning  | Body Guidelines                        |
-| info     | Subject Line Style                     |
-
-## Commit Format
-- Use conventional commit format: `<type>(<scope>): <description>`
-
-## Types
-- Valid types: feat, fix, docs, style, refactor, test, chore, ci, perf, build
-
-## Scopes
-- Use meaningful scopes that describe the area of code affected
-
-## Subject Line
-- Keep under 72 characters total
-- Use imperative mood: "add feature" not "added feature"
-- Be specific: avoid vague terms like "update", "fix stuff", "changes"
-
-## Subject Line Style
-- Use lowercase for the description
-- No period at the end
-
-## Accuracy
-- Commit type must match actual changes
-- Scope must match files modified
-- Description must reflect what was actually done
-
-## Body Guidelines
-- For significant changes (>50 lines), include a body
-- Explain what was changed and why
-"#;
-
 /// System prompt for commit message check/validation
 pub const CHECK_SYSTEM_PROMPT: &str = r#"You are a commit message reviewer. Your task is to evaluate commit messages against project guidelines and report violations.
 
@@ -728,7 +661,7 @@ pub fn generate_check_system_prompt(guidelines: Option<&str>) -> String {
     if let Some(project_guidelines) = guidelines {
         prompt.push_str(project_guidelines);
     } else {
-        prompt.push_str(DEFAULT_CHECK_GUIDELINES);
+        prompt.push_str(DEFAULT_COMMIT_GUIDELINES);
     }
 
     prompt.push_str("\n\nCRITICAL: Use the Severity Levels table above to determine the severity of each violation. If a section is not listed, default to 'warning'.");
