@@ -162,9 +162,9 @@ pub enum CreateSubcommands {
 /// Create PR command options
 #[derive(Parser)]
 pub struct CreatePrCommand {
-    /// Base branch to compare against (defaults to main/master)
-    #[arg(value_name = "BASE_BRANCH")]
-    pub base_branch: Option<String>,
+    /// Base branch for the PR to be merged into (defaults to main/master)
+    #[arg(long, value_name = "BRANCH")]
+    pub base: Option<String>,
 
     /// Skip confirmation prompt and create PR automatically
     #[arg(long)]
@@ -1166,7 +1166,7 @@ impl InfoCommand {
                 "--head",
                 branch_name,
                 "--json",
-                "number,title,state,url,body",
+                "number,title,state,url,body,baseRefName",
                 "--limit",
                 "50",
             ])
@@ -1194,12 +1194,18 @@ impl InfoCommand {
                     pr_json.get("url").and_then(|u| u.as_str()),
                     pr_json.get("body").and_then(|b| b.as_str()),
                 ) {
+                    let base = pr_json
+                        .get("baseRefName")
+                        .and_then(|b| b.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     prs.push(crate::data::PullRequest {
                         number,
                         title: title.to_string(),
                         state: state.to_string(),
                         url: url.to_string(),
                         body: body.to_string(),
+                        base,
                     });
                 }
             }
@@ -1413,6 +1419,7 @@ impl CreatePrCommand {
                     &final_pr_content.title,
                     &final_pr_content.description,
                     is_draft,
+                    self.base.as_deref(),
                 )?;
                 println!("✅ Pull request created successfully!");
             }
@@ -1421,6 +1428,7 @@ impl CreatePrCommand {
                     &repo_view,
                     &final_pr_content.title,
                     &final_pr_content.description,
+                    self.base.as_deref(),
                 )?;
                 println!("✅ Pull request updated successfully!");
             }
@@ -1491,23 +1499,27 @@ impl CreatePrCommand {
             .ok_or_else(|| anyhow::anyhow!("No remotes found in repository"))?;
 
         // Determine base branch (with remote prefix)
-        let base_branch = match self.base_branch.as_ref() {
+        let base_branch = match self.base.as_ref() {
             Some(branch) => {
-                // User specified base branch - need to determine if it's local or remote format
-                let remote_branch = if branch.contains('/') {
-                    // Already in remote format (e.g., "origin/main")
+                // User specified base branch - try to resolve it
+                // First, check if it's already a valid remote ref (e.g., "origin/main")
+                let remote_ref = format!("refs/remotes/{}", branch);
+                if repo.repository().find_reference(&remote_ref).is_ok() {
                     branch.clone()
                 } else {
-                    // Local branch name - convert to remote format
-                    format!("{}/{}", primary_remote.name, branch)
-                };
-
-                // Validate that the remote branch exists
-                let remote_ref = format!("refs/remotes/{}", remote_branch);
-                if repo.repository().find_reference(&remote_ref).is_err() {
-                    anyhow::bail!("Remote branch '{}' does not exist", remote_branch);
+                    // Try prepending the primary remote name (e.g., "main" -> "origin/main")
+                    let with_remote = format!("{}/{}", primary_remote.name, branch);
+                    let remote_ref = format!("refs/remotes/{}", with_remote);
+                    if repo.repository().find_reference(&remote_ref).is_ok() {
+                        with_remote
+                    } else {
+                        anyhow::bail!(
+                            "Remote branch '{}' does not exist (also tried '{}')",
+                            branch,
+                            with_remote
+                        );
+                    }
                 }
-                remote_branch
             }
             None => {
                 // Auto-detect using the primary remote's main branch
@@ -1665,21 +1677,21 @@ impl CreatePrCommand {
     /// Show commit range and count information
     fn show_commit_range_info(&self, repo_view: &crate::data::RepositoryView) -> Result<()> {
         // Recreate the base branch determination logic from generate_repository_view
-        let base_branch = match self.base_branch.as_ref() {
+        let base_branch = match self.base.as_ref() {
             Some(branch) => {
                 // User specified base branch
-                if branch.contains('/') {
-                    // Already in remote format
+                // Get the primary remote name from repo_view
+                let primary_remote_name = repo_view
+                    .remotes
+                    .iter()
+                    .find(|r| r.name == "origin")
+                    .or_else(|| repo_view.remotes.first())
+                    .map(|r| r.name.as_str())
+                    .unwrap_or("origin");
+                // Check if already has remote prefix
+                if branch.starts_with(&format!("{}/", primary_remote_name)) {
                     branch.clone()
                 } else {
-                    // Get the primary remote name from repo_view
-                    let primary_remote_name = repo_view
-                        .remotes
-                        .iter()
-                        .find(|r| r.name == "origin")
-                        .or_else(|| repo_view.remotes.first())
-                        .map(|r| r.name.as_str())
-                        .unwrap_or("origin");
                     format!("{}/{}", primary_remote_name, branch)
                 }
             }
@@ -2239,6 +2251,7 @@ impl CreatePrCommand {
         title: &str,
         description: &str,
         is_draft: bool,
+        new_base: Option<&str>,
     ) -> Result<()> {
         use std::process::Command;
 
@@ -2257,6 +2270,9 @@ impl CreatePrCommand {
         println!("🚀 Creating pull request ({})...", pr_status);
         println!("   📋 Title: {}", title);
         println!("   🌿 Branch: {}", branch_name);
+        if let Some(base) = new_base {
+            println!("   🎯 Base: {}", base);
+        }
 
         // Check if branch is pushed to remote and push if needed
         debug!("Opening git repository to check branch status");
@@ -2284,6 +2300,9 @@ impl CreatePrCommand {
         debug!("Creating PR with gh CLI - title: '{}'", title);
         debug!("PR description length: {} characters", description.len());
         debug!("PR draft status: {}", is_draft);
+        if let Some(base) = new_base {
+            debug!("PR base branch: {}", base);
+        }
 
         let mut args = vec![
             "pr",
@@ -2295,6 +2314,11 @@ impl CreatePrCommand {
             "--body",
             description,
         ];
+
+        if let Some(base) = new_base {
+            args.push("--base");
+            args.push(base);
+        }
 
         if is_draft {
             args.push("--draft");
@@ -2325,38 +2349,71 @@ impl CreatePrCommand {
         repo_view: &crate::data::RepositoryView,
         title: &str,
         description: &str,
+        new_base: Option<&str>,
     ) -> Result<()> {
+        use std::io::{self, Write};
         use std::process::Command;
 
-        // Get the first existing PR number (assuming we're updating the most recent one)
-        let pr_number = repo_view
+        // Get the first existing PR (assuming we're updating the most recent one)
+        let existing_pr = repo_view
             .branch_prs
             .as_ref()
             .and_then(|prs| prs.first())
-            .map(|pr| pr.number)
             .context("No existing PR found to update")?;
+
+        let pr_number = existing_pr.number;
+        let current_base = &existing_pr.base;
 
         println!("🚀 Updating pull request #{}...", pr_number);
         println!("   📋 Title: {}", title);
+
+        // Check if base branch should be changed
+        let change_base = if let Some(base) = new_base {
+            if !current_base.is_empty() && current_base != base {
+                print!(
+                    "   🎯 Current base: {} → New base: {}. Change? [y/N]: ",
+                    current_base, base
+                );
+                io::stdout().flush()?;
+
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                let response = input.trim().to_lowercase();
+                response == "y" || response == "yes"
+            } else {
+                false
+            }
+        } else {
+            false
+        };
 
         debug!(
             pr_number = pr_number,
             title = %title,
             description_length = description.len(),
             description_preview = %description.lines().take(3).collect::<Vec<_>>().join("\\n"),
+            change_base = change_base,
             "Updating GitHub PR with title and description"
         );
 
         // Update PR using gh CLI
-        let gh_args = [
+        let pr_number_str = pr_number.to_string();
+        let mut gh_args = vec![
             "pr",
             "edit",
-            &pr_number.to_string(),
+            &pr_number_str,
             "--title",
             title,
             "--body",
             description,
         ];
+
+        if change_base {
+            if let Some(base) = new_base {
+                gh_args.push("--base");
+                gh_args.push(base);
+            }
+        }
 
         debug!(
             args = ?gh_args,
@@ -2364,16 +2421,17 @@ impl CreatePrCommand {
         );
 
         let pr_result = Command::new("gh")
-            .args(gh_args)
+            .args(&gh_args)
             .output()
             .context("Failed to update pull request")?;
 
         if pr_result.status.success() {
             // Get the PR URL using the existing PR data
-            if let Some(existing_pr) = repo_view.branch_prs.as_ref().and_then(|prs| prs.first()) {
-                println!("🎉 Pull request updated: {}", existing_pr.url);
-            } else {
-                println!("🎉 Pull request #{} updated successfully!", pr_number);
+            println!("🎉 Pull request updated: {}", existing_pr.url);
+            if change_base {
+                if let Some(base) = new_base {
+                    println!("   🎯 Base branch changed to: {}", base);
+                }
             }
         } else {
             let error_msg = String::from_utf8_lossy(&pr_result.stderr);
