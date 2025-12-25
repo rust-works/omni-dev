@@ -117,6 +117,10 @@ pub struct TwiddleCommand {
     /// Skip AI processing and only output repository YAML
     #[arg(long)]
     pub no_ai: bool,
+
+    /// Ignore existing commit messages and generate fresh ones based solely on diffs
+    #[arg(long)]
+    pub fresh: bool,
 }
 
 /// Branch operations
@@ -363,6 +367,9 @@ impl TwiddleCommand {
         self.show_model_info_from_client(&claude_client)?;
 
         // 6. Generate amendments via Claude API with context
+        if self.fresh {
+            println!("🔄 Fresh mode: ignoring existing commit messages...");
+        }
         if use_contextual && context.is_some() {
             println!("🤖 Analyzing commits with enhanced contextual intelligence...");
         } else {
@@ -371,10 +378,12 @@ impl TwiddleCommand {
 
         let amendments = if let Some(ctx) = context {
             claude_client
-                .generate_contextual_amendments(&full_repo_view, &ctx)
+                .generate_contextual_amendments_with_options(&full_repo_view, &ctx, self.fresh)
                 .await?
         } else {
-            claude_client.generate_amendments(&full_repo_view).await?
+            claude_client
+                .generate_amendments_with_options(&full_repo_view, self.fresh)
+                .await?
         };
 
         // 6. Handle different output modes
@@ -429,6 +438,9 @@ impl TwiddleCommand {
             amendments: Vec::new(),
         };
 
+        if self.fresh {
+            println!("🔄 Fresh mode: ignoring existing commit messages...");
+        }
         println!("📊 Processing {} batches...", total_batches);
 
         for (batch_num, commit_batch) in commit_batches.into_iter().enumerate() {
@@ -463,10 +475,12 @@ impl TwiddleCommand {
             // Generate amendments for this batch
             let batch_amendments = if let Some(ctx) = batch_context {
                 claude_client
-                    .generate_contextual_amendments(&batch_repo_view, &ctx)
+                    .generate_contextual_amendments_with_options(&batch_repo_view, &ctx, self.fresh)
                     .await?
             } else {
-                claude_client.generate_amendments(&batch_repo_view).await?
+                claude_client
+                    .generate_amendments_with_options(&batch_repo_view, self.fresh)
+                    .await?
             };
 
             // Merge amendments from this batch

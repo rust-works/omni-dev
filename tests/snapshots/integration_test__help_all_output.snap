@@ -310,6 +310,8 @@ Options:
           Maximum number of commits to process in a single batch (default: 4) [default: 4]
       --no-ai
           Skip AI processing and only output repository YAML
+      --fresh
+          Ignore existing commit messages and generate fresh ones based solely on diffs
   -h, --help
           Print help
 
