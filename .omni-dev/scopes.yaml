@@ -23,3 +23,11 @@ scopes:
     description: "Documentation and planning"
     examples: ["docs: update twiddle plan", "docs: add context intelligence spec"]
     file_patterns: ["docs/**", "*.md", "README.md"]
+  - name: "release"
+    description: "Release process, versioning, and publishing"
+    examples: ["release: bump version to 1.2.0", "release: update changelog"]
+    file_patterns: [".github/workflows/release.yml", "CHANGELOG.md", "Cargo.toml"]
+  - name: "scopes"
+    description: "Commit scope definitions and configuration"
+    examples: ["scopes: add release scope", "scopes: update file patterns"]
+    file_patterns: [".omni-dev/scopes.yaml"]
