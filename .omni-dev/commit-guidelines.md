@@ -48,6 +48,7 @@ Required. Use scopes defined in `.omni-dev/scopes.yaml`:
 - `data` - Data structures and serialization
 - `docs` - Documentation and planning
 - `api` - External API integrations
+- `workflows` - GitHub Actions workflow files
 
 ## Subject Line
 
