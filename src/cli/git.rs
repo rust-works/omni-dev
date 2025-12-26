@@ -2590,8 +2590,13 @@ impl CheckCommand {
             println!("📊 Found {} commits to check", repo_view.commits.len());
         }
 
-        // 3. Load commit guidelines
+        // 3. Load commit guidelines and scopes
         let guidelines = self.load_guidelines().await?;
+        let valid_scopes = self.load_scopes();
+
+        if !self.quiet && output_format == OutputFormat::Text {
+            self.show_guidance_files_status(&guidelines, &valid_scopes);
+        }
 
         // 4. Initialize Claude client
         let claude_client = crate::claude::create_default_claude_client(self.model.clone())?;
@@ -2609,15 +2614,25 @@ impl CheckCommand {
                     self.batch_size
                 );
             }
-            self.check_with_batching(&claude_client, &repo_view, guidelines.as_deref())
-                .await?
+            self.check_with_batching(
+                &claude_client,
+                &repo_view,
+                guidelines.as_deref(),
+                &valid_scopes,
+            )
+            .await?
         } else {
             // 6. Single batch check
             if !self.quiet && output_format == OutputFormat::Text {
                 println!("🤖 Analyzing commits with AI...");
             }
             claude_client
-                .check_commits(&repo_view, guidelines.as_deref(), !self.no_suggestions)
+                .check_commits_with_scopes(
+                    &repo_view,
+                    guidelines.as_deref(),
+                    &valid_scopes,
+                    !self.no_suggestions,
+                )
                 .await?
         };
 
@@ -2769,12 +2784,131 @@ impl CheckCommand {
         Ok(None)
     }
 
+    /// Load valid scopes from context directory
+    ///
+    /// This ensures the check command uses the same scopes as the twiddle command,
+    /// preventing false positives when validating commit messages.
+    fn load_scopes(&self) -> Vec<crate::data::context::ScopeDefinition> {
+        use crate::data::context::ScopeDefinition;
+        use std::fs;
+
+        // Local config struct matching the YAML format
+        #[derive(serde::Deserialize)]
+        struct ScopesConfig {
+            scopes: Vec<ScopeDefinition>,
+        }
+
+        let context_dir = self
+            .context_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from(".omni-dev"));
+
+        // Try local override first
+        let local_path = context_dir.join("local").join("scopes.yaml");
+        if local_path.exists() {
+            if let Ok(content) = fs::read_to_string(&local_path) {
+                if let Ok(config) = serde_yaml::from_str::<ScopesConfig>(&content) {
+                    return config.scopes;
+                }
+            }
+        }
+
+        // Try project-level scopes
+        let project_path = context_dir.join("scopes.yaml");
+        if project_path.exists() {
+            if let Ok(content) = fs::read_to_string(&project_path) {
+                if let Ok(config) = serde_yaml::from_str::<ScopesConfig>(&content) {
+                    return config.scopes;
+                }
+            }
+        }
+
+        // Try global scopes
+        if let Some(home) = dirs::home_dir() {
+            let home_path = home.join(".omni-dev").join("scopes.yaml");
+            if home_path.exists() {
+                if let Ok(content) = fs::read_to_string(&home_path) {
+                    if let Ok(config) = serde_yaml::from_str::<ScopesConfig>(&content) {
+                        return config.scopes;
+                    }
+                }
+            }
+        }
+
+        // No scopes found
+        Vec::new()
+    }
+
+    /// Show diagnostic information about loaded guidance files
+    fn show_guidance_files_status(
+        &self,
+        guidelines: &Option<String>,
+        valid_scopes: &[crate::data::context::ScopeDefinition],
+    ) {
+        let context_dir = self
+            .context_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from(".omni-dev"));
+
+        println!("📋 Project guidance files status:");
+
+        // Check commit guidelines
+        let guidelines_found = guidelines.is_some();
+        let guidelines_source = if guidelines_found {
+            let local_path = context_dir.join("local").join("commit-guidelines.md");
+            let project_path = context_dir.join("commit-guidelines.md");
+            let home_path = dirs::home_dir()
+                .map(|h| h.join(".omni-dev").join("commit-guidelines.md"))
+                .unwrap_or_default();
+
+            if local_path.exists() {
+                format!("✅ Local override: {}", local_path.display())
+            } else if project_path.exists() {
+                format!("✅ Project: {}", project_path.display())
+            } else if home_path.exists() {
+                format!("✅ Global: {}", home_path.display())
+            } else {
+                "✅ (source unknown)".to_string()
+            }
+        } else {
+            "⚪ Using defaults".to_string()
+        };
+        println!("   📝 Commit guidelines: {}", guidelines_source);
+
+        // Check scopes
+        let scopes_count = valid_scopes.len();
+        let scopes_source = if scopes_count > 0 {
+            let local_path = context_dir.join("local").join("scopes.yaml");
+            let project_path = context_dir.join("scopes.yaml");
+            let home_path = dirs::home_dir()
+                .map(|h| h.join(".omni-dev").join("scopes.yaml"))
+                .unwrap_or_default();
+
+            let source = if local_path.exists() {
+                format!("Local override: {}", local_path.display())
+            } else if project_path.exists() {
+                format!("Project: {}", project_path.display())
+            } else if home_path.exists() {
+                format!("Global: {}", home_path.display())
+            } else {
+                "(source unknown)".to_string()
+            };
+            format!("✅ {} ({} scopes)", source, scopes_count)
+        } else {
+            "⚪ None found (any scope accepted)".to_string()
+        };
+        println!("   🎯 Valid scopes: {}", scopes_source);
+
+        println!();
+    }
+
     /// Check commits with batching for large commit ranges
     async fn check_with_batching(
         &self,
         claude_client: &crate::claude::client::ClaudeClient,
         full_repo_view: &crate::data::RepositoryView,
         guidelines: Option<&str>,
+        valid_scopes: &[crate::data::context::ScopeDefinition],
     ) -> Result<crate::data::check::CheckReport> {
         use crate::data::check::{CheckReport, CommitCheckResult};
 
@@ -2806,9 +2940,14 @@ impl CheckCommand {
                 commits: commit_batch.to_vec(),
             };
 
-            // Check this batch
+            // Check this batch with scopes
             let batch_report = claude_client
-                .check_commits(&batch_repo_view, guidelines, !self.no_suggestions)
+                .check_commits_with_scopes(
+                    &batch_repo_view,
+                    guidelines,
+                    valid_scopes,
+                    !self.no_suggestions,
+                )
                 .await?;
 
             // Merge results
