@@ -123,6 +123,10 @@ pub struct TwiddleCommand {
     /// Ignore existing commit messages and generate fresh ones based solely on diffs
     #[arg(long)]
     pub fresh: bool,
+
+    /// Run commit message validation after applying amendments
+    #[arg(long)]
+    pub check: bool,
 }
 
 /// Check command options - validates commit messages against guidelines
@@ -466,6 +470,11 @@ impl TwiddleCommand {
             // 8. Apply amendments (re-read from file to capture any user edits)
             self.apply_amendments_from_file(&amendments_file).await?;
             println!("✅ Commit messages improved successfully!");
+
+            // 9. Run post-twiddle check if --check flag is set
+            if self.check {
+                self.run_post_twiddle_check().await?;
+            }
         } else {
             println!("✨ No commits found to process!");
         }
@@ -582,6 +591,11 @@ impl TwiddleCommand {
             // Apply all amendments (re-read from file to capture any user edits)
             self.apply_amendments_from_file(&amendments_file).await?;
             println!("✅ Commit messages improved successfully!");
+
+            // Run post-twiddle check if --check flag is set
+            if self.check {
+                self.run_post_twiddle_check().await?;
+            }
         } else {
             println!("✨ No commits found to process!");
         }
@@ -1073,9 +1087,343 @@ impl TwiddleCommand {
             // Apply amendments (re-read from file to capture any user edits)
             self.apply_amendments_from_file(&amendments_file).await?;
             println!("✅ Commit messages applied successfully!");
+
+            // Run post-twiddle check if --check flag is set
+            if self.check {
+                self.run_post_twiddle_check().await?;
+            }
         } else {
             println!("✨ No commits found to process!");
         }
+
+        Ok(())
+    }
+
+    /// Run commit message validation after twiddle amendments are applied
+    async fn run_post_twiddle_check(&self) -> Result<()> {
+        println!();
+        println!("🔍 Running commit message validation...");
+
+        // Generate fresh repository view to get updated commit messages
+        let repo_view = self.generate_repository_view().await?;
+
+        if repo_view.commits.is_empty() {
+            println!("⚠️  No commits to check");
+            return Ok(());
+        }
+
+        println!("📊 Checking {} commits", repo_view.commits.len());
+
+        // Load guidelines and scopes
+        let guidelines = self.load_check_guidelines()?;
+        let valid_scopes = self.load_check_scopes();
+
+        self.show_check_guidance_files_status(&guidelines, &valid_scopes);
+
+        // Initialize Claude client
+        let claude_client = crate::claude::create_default_claude_client(self.model.clone())?;
+
+        // Run check
+        let report = if repo_view.commits.len() > self.batch_size {
+            println!("📦 Checking commits in batches of {}...", self.batch_size);
+            self.check_commits_with_batching(
+                &claude_client,
+                &repo_view,
+                guidelines.as_deref(),
+                &valid_scopes,
+            )
+            .await?
+        } else {
+            println!("🤖 Analyzing commits with AI...");
+            claude_client
+                .check_commits_with_scopes(&repo_view, guidelines.as_deref(), &valid_scopes, true)
+                .await?
+        };
+
+        // Output text report
+        self.output_check_text_report(&report)?;
+
+        // Report issues but don't exit with error code (twiddle completed successfully)
+        if report.has_errors() {
+            println!("⚠️  Some commit messages still have issues after twiddling");
+        } else if report.has_warnings() {
+            println!("ℹ️  Some commit messages have minor warnings");
+        } else {
+            println!("✅ All commit messages pass validation");
+        }
+
+        Ok(())
+    }
+
+    /// Load commit guidelines for check (mirrors CheckCommand::load_guidelines)
+    fn load_check_guidelines(&self) -> Result<Option<String>> {
+        use std::fs;
+
+        let context_dir = self
+            .context_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from(".omni-dev"));
+
+        // Try local override first
+        let local_path = context_dir.join("local").join("commit-guidelines.md");
+        if local_path.exists() {
+            let content = fs::read_to_string(&local_path)
+                .with_context(|| format!("Failed to read guidelines: {:?}", local_path))?;
+            return Ok(Some(content));
+        }
+
+        // Try project-level guidelines
+        let project_path = context_dir.join("commit-guidelines.md");
+        if project_path.exists() {
+            let content = fs::read_to_string(&project_path)
+                .with_context(|| format!("Failed to read guidelines: {:?}", project_path))?;
+            return Ok(Some(content));
+        }
+
+        // Try global guidelines
+        if let Some(home) = dirs::home_dir() {
+            let home_path = home.join(".omni-dev").join("commit-guidelines.md");
+            if home_path.exists() {
+                let content = fs::read_to_string(&home_path)
+                    .with_context(|| format!("Failed to read guidelines: {:?}", home_path))?;
+                return Ok(Some(content));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Load valid scopes for check (mirrors CheckCommand::load_scopes)
+    fn load_check_scopes(&self) -> Vec<crate::data::context::ScopeDefinition> {
+        use crate::data::context::ScopeDefinition;
+        use std::fs;
+
+        #[derive(serde::Deserialize)]
+        struct ScopesConfig {
+            scopes: Vec<ScopeDefinition>,
+        }
+
+        let context_dir = self
+            .context_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from(".omni-dev"));
+
+        // Try local override first
+        let local_path = context_dir.join("local").join("scopes.yaml");
+        if local_path.exists() {
+            if let Ok(content) = fs::read_to_string(&local_path) {
+                if let Ok(config) = serde_yaml::from_str::<ScopesConfig>(&content) {
+                    return config.scopes;
+                }
+            }
+        }
+
+        // Try project-level scopes
+        let project_path = context_dir.join("scopes.yaml");
+        if project_path.exists() {
+            if let Ok(content) = fs::read_to_string(&project_path) {
+                if let Ok(config) = serde_yaml::from_str::<ScopesConfig>(&content) {
+                    return config.scopes;
+                }
+            }
+        }
+
+        // Try global scopes
+        if let Some(home) = dirs::home_dir() {
+            let home_path = home.join(".omni-dev").join("scopes.yaml");
+            if home_path.exists() {
+                if let Ok(content) = fs::read_to_string(&home_path) {
+                    if let Ok(config) = serde_yaml::from_str::<ScopesConfig>(&content) {
+                        return config.scopes;
+                    }
+                }
+            }
+        }
+
+        Vec::new()
+    }
+
+    /// Show guidance files status for check
+    fn show_check_guidance_files_status(
+        &self,
+        guidelines: &Option<String>,
+        valid_scopes: &[crate::data::context::ScopeDefinition],
+    ) {
+        let context_dir = self
+            .context_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from(".omni-dev"));
+
+        println!("📋 Project guidance files status:");
+
+        // Check commit guidelines
+        let guidelines_found = guidelines.is_some();
+        let guidelines_source = if guidelines_found {
+            let local_path = context_dir.join("local").join("commit-guidelines.md");
+            let project_path = context_dir.join("commit-guidelines.md");
+            let home_path = dirs::home_dir()
+                .map(|h| h.join(".omni-dev").join("commit-guidelines.md"))
+                .unwrap_or_default();
+
+            if local_path.exists() {
+                format!("✅ Local override: {}", local_path.display())
+            } else if project_path.exists() {
+                format!("✅ Project: {}", project_path.display())
+            } else if home_path.exists() {
+                format!("✅ Global: {}", home_path.display())
+            } else {
+                "✅ (source unknown)".to_string()
+            }
+        } else {
+            "⚪ Using defaults".to_string()
+        };
+        println!("   📝 Commit guidelines: {}", guidelines_source);
+
+        // Check scopes
+        let scopes_count = valid_scopes.len();
+        let scopes_source = if scopes_count > 0 {
+            let local_path = context_dir.join("local").join("scopes.yaml");
+            let project_path = context_dir.join("scopes.yaml");
+            let home_path = dirs::home_dir()
+                .map(|h| h.join(".omni-dev").join("scopes.yaml"))
+                .unwrap_or_default();
+
+            let source = if local_path.exists() {
+                format!("Local override: {}", local_path.display())
+            } else if project_path.exists() {
+                format!("Project: {}", project_path.display())
+            } else if home_path.exists() {
+                format!("Global: {}", home_path.display())
+            } else {
+                "(source unknown)".to_string()
+            };
+            format!("✅ {} ({} scopes)", source, scopes_count)
+        } else {
+            "⚪ None found (any scope accepted)".to_string()
+        };
+        println!("   🎯 Valid scopes: {}", scopes_source);
+
+        println!();
+    }
+
+    /// Check commits with batching (mirrors CheckCommand::check_with_batching)
+    async fn check_commits_with_batching(
+        &self,
+        claude_client: &crate::claude::client::ClaudeClient,
+        full_repo_view: &crate::data::RepositoryView,
+        guidelines: Option<&str>,
+        valid_scopes: &[crate::data::context::ScopeDefinition],
+    ) -> Result<crate::data::check::CheckReport> {
+        use crate::data::check::{CheckReport, CommitCheckResult};
+
+        let commit_batches: Vec<_> = full_repo_view.commits.chunks(self.batch_size).collect();
+        let total_batches = commit_batches.len();
+        let mut all_results: Vec<CommitCheckResult> = Vec::new();
+
+        for (batch_num, commit_batch) in commit_batches.into_iter().enumerate() {
+            println!(
+                "🔄 Checking batch {}/{} ({} commits)...",
+                batch_num + 1,
+                total_batches,
+                commit_batch.len()
+            );
+
+            let batch_repo_view = crate::data::RepositoryView {
+                versions: full_repo_view.versions.clone(),
+                explanation: full_repo_view.explanation.clone(),
+                working_directory: full_repo_view.working_directory.clone(),
+                remotes: full_repo_view.remotes.clone(),
+                ai: full_repo_view.ai.clone(),
+                branch_info: full_repo_view.branch_info.clone(),
+                pr_template: full_repo_view.pr_template.clone(),
+                pr_template_location: full_repo_view.pr_template_location.clone(),
+                branch_prs: full_repo_view.branch_prs.clone(),
+                commits: commit_batch.to_vec(),
+            };
+
+            let batch_report = claude_client
+                .check_commits_with_scopes(&batch_repo_view, guidelines, valid_scopes, true)
+                .await?;
+
+            all_results.extend(batch_report.commits);
+
+            if batch_num + 1 < total_batches {
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            }
+        }
+
+        Ok(CheckReport::new(all_results))
+    }
+
+    /// Output text format check report (mirrors CheckCommand::output_text_report)
+    fn output_check_text_report(&self, report: &crate::data::check::CheckReport) -> Result<()> {
+        use crate::data::check::IssueSeverity;
+
+        println!();
+
+        for result in &report.commits {
+            // Skip passing commits
+            if result.passes {
+                continue;
+            }
+
+            // Determine icon
+            let icon = if result
+                .issues
+                .iter()
+                .any(|i| i.severity == IssueSeverity::Error)
+            {
+                "❌"
+            } else {
+                "⚠️ "
+            };
+
+            // Short hash
+            let short_hash = if result.hash.len() > 7 {
+                &result.hash[..7]
+            } else {
+                &result.hash
+            };
+
+            println!("{} {} - \"{}\"", icon, short_hash, result.message);
+
+            // Print issues
+            for issue in &result.issues {
+                let severity_str = match issue.severity {
+                    IssueSeverity::Error => "\x1b[31mERROR\x1b[0m  ",
+                    IssueSeverity::Warning => "\x1b[33mWARNING\x1b[0m",
+                    IssueSeverity::Info => "\x1b[36mINFO\x1b[0m   ",
+                };
+
+                println!(
+                    "   {} [{}] {}",
+                    severity_str, issue.section, issue.explanation
+                );
+            }
+
+            // Print suggestion if available
+            if let Some(suggestion) = &result.suggestion {
+                println!();
+                println!("   Suggested message:");
+                for line in suggestion.message.lines() {
+                    println!("      {}", line);
+                }
+            }
+
+            println!();
+        }
+
+        // Print summary
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("Summary: {} commits checked", report.summary.total_commits);
+        println!(
+            "  {} errors, {} warnings",
+            report.summary.error_count, report.summary.warning_count
+        );
+        println!(
+            "  {} passed, {} with issues",
+            report.summary.passing_commits, report.summary.failing_commits
+        );
 
         Ok(())
     }
