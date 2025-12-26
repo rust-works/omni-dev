@@ -37,23 +37,42 @@ This skill performs the complete end-to-end release process for omni-dev, from v
    - MINOR: New features (new commands, flags, integrations)
    - PATCH: Bug fixes, docs, refactoring
 
-### Phase 2: Version & Changelog Updates
+### Phase 2: Documentation & Changelog Review
 
-6. **Update Cargo.toml**
-   - Change `version = "X.Y.Z"` to new version
+6. **Check if Docs Need Updates**
+   Review documentation for accuracy against new features:
+   - `docs/RELEASE.md` - Release process still accurate?
+   - `README.md` - Features and examples up to date?
+   - `CLAUDE.md` - AI guidance still relevant?
+   - `.claude/skills/` - Skills reflect current workflows?
+
+   Update any docs that are outdated before proceeding.
 
 7. **Update CHANGELOG.md**
    - Add new version section: `## [X.Y.Z] - YYYY-MM-DD`
-   - Move relevant entries from `[Unreleased]` or create new entries
+   - Document all changes since last release under appropriate categories:
+     - **Added**: New features
+     - **Changed**: Changes in existing functionality
+     - **Deprecated**: Soon-to-be removed features
+     - **Removed**: Now removed features
+     - **Fixed**: Bug fixes
+     - **Security**: Vulnerability fixes
+     - **Documentation**: Docs-only changes
+     - **CI/CD**: Build/workflow changes
    - Update version comparison links at bottom:
      ```markdown
      [Unreleased]: https://github.com/rust-works/omni-dev/compare/vX.Y.Z...HEAD
      [X.Y.Z]: https://github.com/rust-works/omni-dev/compare/vPREV...vX.Y.Z
      ```
 
-### Phase 3: Quality Checks
+### Phase 3: Version Update
 
-8. **Run Quality Checks**
+8. **Update Cargo.toml**
+   - Change `version = "X.Y.Z"` to new version
+
+### Phase 4: Quality Checks
+
+9. **Run Quality Checks**
    ```bash
    cargo build --release
    cargo test
@@ -61,25 +80,25 @@ This skill performs the complete end-to-end release process for omni-dev, from v
    ```
    Abort if any check fails.
 
-### Phase 4: Git Operations
+### Phase 5: Git Operations
 
-9. **Commit Changes**
-   ```bash
-   git add Cargo.toml Cargo.lock CHANGELOG.md
-   git commit -m "$(cat <<'EOF'
-   chore: prepare release vX.Y.Z
+10. **Commit Changes**
+    ```bash
+    git add Cargo.toml Cargo.lock CHANGELOG.md docs/
+    git commit -m "$(cat <<'EOF'
+    chore: prepare release vX.Y.Z
 
-   - Update version from PREV to X.Y.Z
-   - Update CHANGELOG.md with release notes
+    - Update version from PREV to X.Y.Z
+    - Update CHANGELOG.md with release notes
 
-   🤖 Generated with [Claude Code](https://claude.com/claude-code)
+    🤖 Generated with [Claude Code](https://claude.com/claude-code)
 
-   Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
-   EOF
-   )"
-   ```
+    Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
+    EOF
+    )"
+    ```
 
-10. **Create Annotated Tag**
+11. **Create Annotated Tag**
     ```bash
     git tag -a vX.Y.Z -m "Release version X.Y.Z
 
@@ -87,22 +106,22 @@ This skill performs the complete end-to-end release process for omni-dev, from v
     "
     ```
 
-11. **Push to Remote**
+12. **Push to Remote**
     ```bash
     git push origin main
     git push origin vX.Y.Z
     ```
 
-### Phase 5: Monitor CI Release
+### Phase 6: Monitor CI Release
 
-12. **Wait for Release Workflow**
+13. **Wait for Release Workflow**
     Poll the GitHub Actions release workflow until completion:
     ```bash
     # Get the run ID for the release workflow triggered by the tag
     gh run list --workflow=release.yml --branch=vX.Y.Z --limit=1 --json databaseId,status,conclusion
     ```
 
-13. **Poll Until Complete**
+14. **Poll Until Complete**
     Loop with 30-second intervals:
     ```bash
     gh run view <run_id> --json status,conclusion
@@ -111,24 +130,24 @@ This skill performs the complete end-to-end release process for omni-dev, from v
     - `status: "completed"` + `conclusion: "failure"` = Failed (show logs)
     - `status: "in_progress"` or `status: "queued"` = Keep polling
 
-14. **On Failure: Show Logs**
+15. **On Failure: Show Logs**
     ```bash
     gh run view <run_id> --log-failed
     ```
 
-### Phase 6: Verification
+### Phase 7: Verification
 
-15. **Verify GitHub Release**
+16. **Verify GitHub Release**
     ```bash
     gh release view vX.Y.Z
     ```
 
-16. **Verify crates.io Publication**
+17. **Verify crates.io Publication**
     ```bash
     cargo search omni-dev
     ```
 
-17. **Report Success**
+18. **Report Success**
     Display:
     - New version number
     - GitHub release URL
