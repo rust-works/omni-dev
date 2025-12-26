@@ -274,7 +274,22 @@ impl ClaudeClient {
         guidelines: Option<&str>,
         include_suggestions: bool,
     ) -> Result<crate::data::check::CheckReport> {
-        self.check_commits_with_retry(repo_view, guidelines, include_suggestions, 2)
+        self.check_commits_with_scopes(repo_view, guidelines, &[], include_suggestions)
+            .await
+    }
+
+    /// Check commit messages against guidelines with valid scopes and return a report
+    ///
+    /// Validates commit messages against project guidelines or defaults,
+    /// using the provided valid scopes for scope validation.
+    pub async fn check_commits_with_scopes(
+        &self,
+        repo_view: &RepositoryView,
+        guidelines: Option<&str>,
+        valid_scopes: &[crate::data::context::ScopeDefinition],
+        include_suggestions: bool,
+    ) -> Result<crate::data::check::CheckReport> {
+        self.check_commits_with_retry(repo_view, guidelines, valid_scopes, include_suggestions, 2)
             .await
     }
 
@@ -283,6 +298,7 @@ impl ClaudeClient {
         &self,
         repo_view: &RepositoryView,
         guidelines: Option<&str>,
+        valid_scopes: &[crate::data::context::ScopeDefinition],
         include_suggestions: bool,
         max_retries: u32,
     ) -> Result<crate::data::check::CheckReport> {
@@ -294,8 +310,9 @@ impl ClaudeClient {
         let repo_yaml = crate::data::to_yaml(&ai_repo_view)
             .context("Failed to serialize repository view to YAML")?;
 
-        // Generate prompts
-        let system_prompt = prompts::generate_check_system_prompt(guidelines);
+        // Generate prompts with scopes
+        let system_prompt =
+            prompts::generate_check_system_prompt_with_scopes(guidelines, valid_scopes);
         let user_prompt = prompts::generate_check_user_prompt(&repo_yaml, include_suggestions);
 
         let mut last_error = None;

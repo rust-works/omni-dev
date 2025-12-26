@@ -653,6 +653,14 @@ IMPORTANT:
 
 /// Generate check system prompt with project guidelines
 pub fn generate_check_system_prompt(guidelines: Option<&str>) -> String {
+    generate_check_system_prompt_with_scopes(guidelines, &[])
+}
+
+/// Generate check system prompt with project guidelines and valid scopes
+pub fn generate_check_system_prompt_with_scopes(
+    guidelines: Option<&str>,
+    valid_scopes: &[crate::data::context::ScopeDefinition],
+) -> String {
     let mut prompt = CHECK_SYSTEM_PROMPT.to_string();
 
     prompt.push_str("\n\n=== PROJECT COMMIT GUIDELINES ===\n");
@@ -662,6 +670,16 @@ pub fn generate_check_system_prompt(guidelines: Option<&str>) -> String {
         prompt.push_str(project_guidelines);
     } else {
         prompt.push_str(DEFAULT_COMMIT_GUIDELINES);
+    }
+
+    // Add valid scopes if available (ensures check uses same scopes as twiddle)
+    if !valid_scopes.is_empty() {
+        prompt.push_str("\n\n=== VALID SCOPES FOR THIS PROJECT ===\n");
+        prompt.push_str("The following scopes are valid for this project. When checking scope validity, only these scopes should be considered correct:\n\n");
+        for scope in valid_scopes {
+            prompt.push_str(&format!("- `{}`: {}\n", scope.name, scope.description));
+        }
+        prompt.push_str("\nIMPORTANT: Do NOT flag a commit as having an invalid scope if it uses one of the scopes listed above.");
     }
 
     prompt.push_str("\n\nCRITICAL: Use the Severity Levels table above to determine the severity of each violation. If a section is not listed, default to 'warning'.");
