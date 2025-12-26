@@ -31,3 +31,7 @@ scopes:
     description: "Commit scope definitions and configuration"
     examples: ["scopes: add release scope", "scopes: update file patterns"]
     file_patterns: [".omni-dev/scopes.yaml"]
+  - name: "workflows"
+    description: "GitHub Actions workflow files"
+    examples: ["workflows: add commit check on push", "workflows: fix release permissions"]
+    file_patterns: [".github/workflows/**"]
