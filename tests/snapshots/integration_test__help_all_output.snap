@@ -338,6 +338,8 @@ Options:
           Skip AI processing and only output repository YAML
       --fresh
           Ignore existing commit messages and generate fresh ones based solely on diffs
+      --check
+          Run commit message validation after applying amendments
   -h, --help
           Print help
 
