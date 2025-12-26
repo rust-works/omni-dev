@@ -52,8 +52,8 @@ jobs:
         - build: macos
           os: macos-latest
           rust: stable
-          target: x86_64-apple-darwin
-          archive-name: omni-dev-macos.tar.gz
+          target: aarch64-apple-darwin
+          archive-name: omni-dev-macos-arm64.tar.gz
         - build: win-msvc
           os: windows-latest
           rust: stable
