@@ -1,24 +1,28 @@
 # Release Process
 
-This document outlines the comprehensive release process for omni-dev, covering version updates, changelog maintenance, GitHub releases, and crates.io publication.
+This document outlines the release process for omni-dev, covering version updates, changelog maintenance, and triggering automated release workflows.
 
 ## Overview
 
-The release process follows semantic versioning and includes:
-1. Version updates
-2. Changelog maintenance
+The release process follows semantic versioning with **automated CI/CD**:
+
+### Manual Steps (You Do)
+1. Version update in `Cargo.toml`
+2. Changelog update in `CHANGELOG.md`
 3. Code quality checks
-4. Git tagging
-5. GitHub release creation
-6. crates.io publication
-7. Nix binary cache publication
+4. Commit and push changes
+5. Create and push git tag
+
+### Automated Steps (CI Does)
+6. GitHub release creation
+7. Cross-platform binary builds (Linux, macOS, Windows)
+8. crates.io publication
+9. Nix binary cache publication
 
 ## Prerequisites
 
 Before starting a release, ensure you have:
 - [ ] Commit access to the main branch
-- [ ] GitHub CLI (`gh`) installed and authenticated
-- [ ] Cargo configured with crates.io API token
 - [ ] All tests passing locally
 - [ ] Clean working directory
 
@@ -123,85 +127,70 @@ Push the commits and tag to the remote repository:
 # Push commits
 git push origin main
 
-# Push tag (this triggers CI to build and publish to Nix binary cache)
+# Push tag (this triggers all automated release steps)
 git push origin vX.Y.Z
 ```
 
-**Note**: Pushing the tag automatically triggers CI to:
-- Run all quality checks
-- Build the Nix package
-- Publish to the `omni-dev` binary cache on Cachix
+## Automated Release Pipeline
 
-### 7. Create GitHub Release
+Pushing a `v*` tag triggers the following automated workflows:
 
-Create a GitHub release using the GitHub CLI:
+### CI Workflow (`.github/workflows/ci.yml`)
+- Runs tests on stable, beta, and nightly Rust
+- Checks formatting with rustfmt
+- Runs clippy linting
+- Builds documentation
+- Generates code coverage
+- Builds and tests Nix package
+- Publishes to `omni-dev` Cachix binary cache
 
-```bash
-gh release create vX.Y.Z \
-  --title "Release vX.Y.Z" \
-  --notes-from-tag
-```
+### Release Workflow (`.github/workflows/release.yml`)
+- **Creates GitHub Release**: Automatically from the tag
+- **Builds Cross-Platform Binaries**:
+  - Linux (x86_64-unknown-linux-gnu)
+  - macOS (x86_64-apple-darwin)
+  - Windows (x86_64-pc-windows-msvc)
+- **Uploads Release Assets**: Attaches compiled binaries to the GitHub release
+- **Publishes to crates.io**: Automatically using `CARGO_REGISTRY_TOKEN` secret
 
-Alternatively, create a release with custom notes:
+### 7. Monitor and Verify
 
-```bash
-gh release create vX.Y.Z \
-  --title "Release vX.Y.Z" \
-  --notes "Release notes here..."
-```
+After pushing the tag, monitor the automated release:
 
-The release notes should include:
-- 🚀 **Features**: New functionality
-- 🔄 **Changes**: Modifications to existing features
-- 🐛 **Fixes**: Bug fixes and improvements
-- Link to full changelog
-
-### 8. Publish to crates.io
-
-Publish the package to crates.io:
-
-```bash
-cargo publish
-```
-
-This will:
-- Package the crate
-- Verify the build
-- Upload to crates.io registry
-- Make it available for `cargo install omni-dev`
-
-### 9. Verify Nix Binary Cache Publication
-
-Check that the Nix binary cache was successfully updated:
-
-1. **Monitor CI**: Check that the tag-triggered CI run completed successfully
-2. **Verify cache contents**:
+1. **Check GitHub Actions**: Watch the release workflow progress
    ```bash
-   # Check if the release is available in the cache
-   nix search github:rust-works/omni-dev
+   gh run list --workflow=release.yml
+   gh run watch
+   ```
 
-   # Test installation from cache
+2. **Verify GitHub Release**: Check the releases page
+   ```bash
+   gh release view vX.Y.Z
+   ```
+
+3. **Verify crates.io Publication**:
+   ```bash
+   cargo search omni-dev
+   # Or test installation
+   cargo install omni-dev
+   ```
+
+4. **Verify Nix Binary Cache**:
+   ```bash
+   nix search github:rust-works/omni-dev
    cachix use omni-dev
    nix profile install github:rust-works/omni-dev
    ```
 
-The binary cache publication happens automatically when you push the tag, making Nix installations much faster for users.
-
 ## Post-Release Tasks
 
-After completing the release:
+After the automated release completes:
 
-1. **Verify Publication**:
-   - Check GitHub releases page
-   - Verify crates.io listing
-   - Test installation: `cargo install omni-dev`
-   - Verify Nix binary cache: `nix profile install github:rust-works/omni-dev`
-
-2. **Update Documentation**:
+1. **Update Documentation** (if needed):
    - Update any version-specific documentation
    - Ensure README examples use current version
 
-3. **Announce Release**:
+2. **Announce Release** (optional):
    - Share release notes with team
    - Update project status if needed
 
@@ -247,13 +236,21 @@ If a release needs to be rolled back:
 3. **Git Tag**: Delete and recreate if needed
 4. **Version**: Create patch release with fixes
 
-## Automation Considerations
+## CI/CD Configuration
 
-For future automation, consider:
-- GitHub Actions for automated releases
-- Automated changelog generation
-- Version bump automation
-- Integration tests in CI/CD
+The automated release pipeline requires these GitHub secrets:
+
+| Secret                 | Purpose                                                     |
+|------------------------|-------------------------------------------------------------|
+| `GITHUB_TOKEN`         | Automatically provided by GitHub Actions for release creation |
+| `CARGO_REGISTRY_TOKEN` | crates.io API token for publishing                          |
+| `CACHIX_AUTH_TOKEN`    | Cachix authentication for Nix binary cache                  |
+
+### Workflow Files
+
+- `.github/workflows/ci.yml` - Quality checks and Nix builds
+- `.github/workflows/release.yml` - Release creation and publishing
+- `.github/workflows/commit-check.yml` - PR commit message validation
 
 ## Security Notes
 
