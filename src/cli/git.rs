@@ -2594,9 +2594,8 @@ impl CheckCommand {
         let guidelines = self.load_guidelines().await?;
         let valid_scopes = self.load_scopes();
 
-        if !self.quiet && output_format == OutputFormat::Text && !valid_scopes.is_empty() {
-            let scope_names: Vec<&str> = valid_scopes.iter().map(|s| s.name.as_str()).collect();
-            println!("📋 Valid scopes: {}", scope_names.join(", "));
+        if !self.quiet && output_format == OutputFormat::Text {
+            self.show_guidance_files_status(&guidelines, &valid_scopes);
         }
 
         // 4. Initialize Claude client
@@ -2838,6 +2837,69 @@ impl CheckCommand {
 
         // No scopes found
         Vec::new()
+    }
+
+    /// Show diagnostic information about loaded guidance files
+    fn show_guidance_files_status(
+        &self,
+        guidelines: &Option<String>,
+        valid_scopes: &[crate::data::context::ScopeDefinition],
+    ) {
+        let context_dir = self
+            .context_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from(".omni-dev"));
+
+        println!("📋 Project guidance files status:");
+
+        // Check commit guidelines
+        let guidelines_found = guidelines.is_some();
+        let guidelines_source = if guidelines_found {
+            let local_path = context_dir.join("local").join("commit-guidelines.md");
+            let project_path = context_dir.join("commit-guidelines.md");
+            let home_path = dirs::home_dir()
+                .map(|h| h.join(".omni-dev").join("commit-guidelines.md"))
+                .unwrap_or_default();
+
+            if local_path.exists() {
+                format!("✅ Local override: {}", local_path.display())
+            } else if project_path.exists() {
+                format!("✅ Project: {}", project_path.display())
+            } else if home_path.exists() {
+                format!("✅ Global: {}", home_path.display())
+            } else {
+                "✅ (source unknown)".to_string()
+            }
+        } else {
+            "⚪ Using defaults".to_string()
+        };
+        println!("   📝 Commit guidelines: {}", guidelines_source);
+
+        // Check scopes
+        let scopes_count = valid_scopes.len();
+        let scopes_source = if scopes_count > 0 {
+            let local_path = context_dir.join("local").join("scopes.yaml");
+            let project_path = context_dir.join("scopes.yaml");
+            let home_path = dirs::home_dir()
+                .map(|h| h.join(".omni-dev").join("scopes.yaml"))
+                .unwrap_or_default();
+
+            let source = if local_path.exists() {
+                format!("Local override: {}", local_path.display())
+            } else if project_path.exists() {
+                format!("Project: {}", project_path.display())
+            } else if home_path.exists() {
+                format!("Global: {}", home_path.display())
+            } else {
+                "(source unknown)".to_string()
+            };
+            format!("✅ {} ({} scopes)", source, scopes_count)
+        } else {
+            "⚪ None found (any scope accepted)".to_string()
+        };
+        println!("   🎯 Valid scopes: {}", scopes_source);
+
+        println!();
     }
 
     /// Check commits with batching for large commit ranges
