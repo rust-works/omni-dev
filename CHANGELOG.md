@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2025-12-27
+
+### Added
+- **Post-Twiddle Validation**: New `--check` flag for twiddle command
+  - Automatically validates commit messages after applying amendments
+  - Runs full AI-powered analysis against project guidelines
+  - Supports batched processing for large commit ranges
+  - Single-step workflow: improve and validate in one command
+- **Guidance File Diagnostics**: Enhanced diagnostic output for loaded configuration
+  - Shows status of commit guidelines, scopes, and other guidance files
+  - Clear visibility into which configuration files are being used
+  - Helps troubleshoot configuration issues
+- **Scope Validation in Check**: Enhanced commit message checking with scope awareness
+  - Validates commit scopes against project-defined scope list
+  - Reports invalid or missing scopes as warnings
+
+### Changed
+- **CI Workflow Enhancement**: Added commit message validation for pull requests
+  - New GitHub Actions workflow validates PR commit messages
+  - Automatic quality enforcement on all pull requests
+
+### Documentation
+- **Release Process Restructure**: Comprehensive overhaul of release documentation
+  - Reorganized for automated CI/CD workflow with clear manual vs automated steps
+  - Added documentation review phase before version updates
+  - Enhanced with CI monitoring commands and verification steps
+  - Improved release skill with complete automation guidance
+- **README Updates**: Added documentation for check command and new twiddle options
+  - New section for commit message validation command
+  - Updated options table with `--fresh` and `--check` flags
+
 ## [0.12.0] - 2025-12-25
 
 ### Added
@@ -373,7 +404,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation and community files (README, CONTRIBUTING, CODE_OF_CONDUCT)
 - BSD 3-Clause license
 
-[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/rust-works/omni-dev/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/rust-works/omni-dev/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/rust-works/omni-dev/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/rust-works/omni-dev/compare/v0.9.0...v0.10.0
