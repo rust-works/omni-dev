@@ -20,4 +20,3 @@ jobs:
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
           guidelines: .omni-dev/commit-guidelines.md
           verbose: true
-          version: "0.12.0"
