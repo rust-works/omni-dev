@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1] - 2025-01-07
+
+### Fixed
+- **Bedrock Client Selection Logic**: Fixed inverted conditional that prevented Bedrock from being used
+  - Setting `CLAUDE_CODE_USE_BEDROCK=true` now correctly uses Bedrock client
+  - Removed confusing `CLAUDE_CODE_SKIP_BEDROCK_AUTH` requirement
+  - Users only need `CLAUDE_CODE_USE_BEDROCK=true`, `ANTHROPIC_AUTH_TOKEN`, and `ANTHROPIC_BEDROCK_BASE_URL`
+- **CI Publish Ordering**: Publish to crates.io only after all platform builds succeed
+
+### Added
+- **Scope Definitions**: Added `release` and `workflows` scopes for better commit categorization
+  - `release`: Version bumps, changelog updates, release preparation
+  - `workflows`: GitHub Actions and CI/CD pipeline changes
+
+### Changed
+- **CI Commit Check**: Trigger commit validation on push to main branch
+- **CI Workflow**: Removed version pinning from commit-check workflow
+
 ## [0.13.0] - 2025-12-27
 
 ### Added
@@ -404,7 +422,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation and community files (README, CONTRIBUTING, CODE_OF_CONDUCT)
 - BSD 3-Clause license
 
-[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.13.1...HEAD
+[0.13.1]: https://github.com/rust-works/omni-dev/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/rust-works/omni-dev/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/rust-works/omni-dev/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/rust-works/omni-dev/compare/v0.10.0...v0.11.0
