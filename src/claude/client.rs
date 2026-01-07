@@ -535,22 +535,15 @@ pub fn create_default_claude_client(model: Option<String>) -> Result<ClaudeClien
         .unwrap_or_else(|| "claude-opus-4-1-20250805".to_string());
 
     if use_bedrock {
-        // Check if we should skip Bedrock auth
-        let skip_bedrock_auth = get_env_var("CLAUDE_CODE_SKIP_BEDROCK_AUTH")
-            .map(|val| val == "true")
-            .unwrap_or(false);
+        // Use Bedrock AI client
+        let auth_token =
+            get_env_var("ANTHROPIC_AUTH_TOKEN").map_err(|_| ClaudeError::ApiKeyNotFound)?;
 
-        if skip_bedrock_auth {
-            // Use Bedrock AI client
-            let auth_token =
-                get_env_var("ANTHROPIC_AUTH_TOKEN").map_err(|_| ClaudeError::ApiKeyNotFound)?;
+        let base_url =
+            get_env_var("ANTHROPIC_BEDROCK_BASE_URL").map_err(|_| ClaudeError::ApiKeyNotFound)?;
 
-            let base_url = get_env_var("ANTHROPIC_BEDROCK_BASE_URL")
-                .map_err(|_| ClaudeError::ApiKeyNotFound)?;
-
-            let ai_client = BedrockAiClient::new(claude_model, auth_token, base_url);
-            return Ok(ClaudeClient::new(Box::new(ai_client)));
-        }
+        let ai_client = BedrockAiClient::new(claude_model, auth_token, base_url);
+        return Ok(ClaudeClient::new(Box::new(ai_client)));
     }
 
     // Default: use standard Claude AI client
