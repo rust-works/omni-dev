@@ -225,6 +225,10 @@ pub struct CreatePrCommand {
     #[arg(long, value_name = "BRANCH")]
     pub base: Option<String>,
 
+    /// Claude API model to use (if not specified, uses settings or default)
+    #[arg(long)]
+    pub model: Option<String>,
+
     /// Skip confirmation prompt and create PR automatically
     #[arg(long)]
     pub auto_apply: bool,
@@ -1709,7 +1713,7 @@ impl CreatePrCommand {
         self.show_guidance_files_status(&project_context)?;
 
         // 4. Show AI model configuration before generation
-        let claude_client = crate::claude::create_default_claude_client(None)?;
+        let claude_client = crate::claude::create_default_claude_client(self.model.clone())?;
         self.show_model_info_from_client(&claude_client)?;
 
         // 5. Show branch analysis and commit information
