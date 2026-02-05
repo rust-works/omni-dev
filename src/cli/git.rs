@@ -394,6 +394,10 @@ impl TwiddleCommand {
             ai_info.provider, ai_info.model
         );
 
+        // Preflight check: ensure working directory is clean before expensive operations
+        crate::utils::preflight::check_working_directory_clean()?;
+        println!("✓ Working directory is clean");
+
         // Determine if contextual analysis should be used
         let use_contextual = self.use_context && !self.no_context;
 
