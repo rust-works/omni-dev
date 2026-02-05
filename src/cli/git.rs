@@ -387,6 +387,13 @@ impl TwiddleCommand {
             return self.execute_no_ai().await;
         }
 
+        // Preflight check: validate AI credentials before any processing
+        let ai_info = crate::utils::check_ai_command_prerequisites(self.model.as_deref())?;
+        println!(
+            "✓ {} credentials verified (model: {})",
+            ai_info.provider, ai_info.model
+        );
+
         // Determine if contextual analysis should be used
         let use_contextual = self.use_context && !self.no_context;
 
@@ -1696,6 +1703,15 @@ impl CreatePrCommand {
 
     /// Execute create PR command
     pub async fn execute(self) -> Result<()> {
+        // Preflight check: validate all prerequisites before any processing
+        // This catches missing credentials/tools early before wasting time
+        let ai_info = crate::utils::check_pr_command_prerequisites(self.model.as_deref())?;
+        println!(
+            "✓ {} credentials verified (model: {})",
+            ai_info.provider, ai_info.model
+        );
+        println!("✓ GitHub CLI verified");
+
         println!("🔄 Starting pull request creation process...");
 
         // 1. Generate repository view (reuse InfoCommand logic)
@@ -1809,10 +1825,7 @@ impl CreatePrCommand {
             return Ok(());
         }
 
-        // 8. Validate environment only when we're about to create the PR
-        self.validate_environment()?;
-
-        // 9. Create or update PR (re-read from file to capture any user edits)
+        // 8. Create or update PR (re-read from file to capture any user edits)
         let final_pr_yaml =
             std::fs::read_to_string(&pr_file).context("Failed to read PR details file")?;
 
@@ -1859,38 +1872,6 @@ impl CreatePrCommand {
         }
 
         Ok(())
-    }
-
-    /// Validate environment and dependencies
-    fn validate_environment(&self) -> Result<()> {
-        // Check if gh CLI is available
-        let gh_check = std::process::Command::new("gh")
-            .args(["--version"])
-            .output();
-
-        match gh_check {
-            Ok(output) if output.status.success() => {
-                // Test if gh can access the current repo (this validates both auth and repo access)
-                let repo_check = std::process::Command::new("gh")
-                    .args(["repo", "view", "--json", "name"])
-                    .output();
-
-                match repo_check {
-                    Ok(repo_output) if repo_output.status.success() => Ok(()),
-                    Ok(repo_output) => {
-                        // Get more specific error from stderr
-                        let error_details = String::from_utf8_lossy(&repo_output.stderr);
-                        if error_details.contains("authentication") || error_details.contains("login") {
-                            anyhow::bail!("GitHub CLI (gh) authentication failed. Please run 'gh auth login' or check your GITHUB_TOKEN environment variable.")
-                        } else {
-                            anyhow::bail!("GitHub CLI (gh) cannot access this repository. Error: {}", error_details.trim())
-                        }
-                    }
-                    Err(e) => anyhow::bail!("Failed to test GitHub CLI access: {}", e),
-                }
-            }
-            _ => anyhow::bail!("GitHub CLI (gh) is not installed or not available in PATH. Please install it from https://cli.github.com/"),
-        }
     }
 
     /// Generate repository view (reuse InfoCommand logic)
@@ -2924,6 +2905,15 @@ impl CheckCommand {
 
         // Parse output format
         let output_format: OutputFormat = self.format.parse().unwrap_or(OutputFormat::Text);
+
+        // Preflight check: validate AI credentials before any processing
+        let ai_info = crate::utils::check_ai_command_prerequisites(self.model.as_deref())?;
+        if !self.quiet && output_format == OutputFormat::Text {
+            println!(
+                "✓ {} credentials verified (model: {})",
+                ai_info.provider, ai_info.model
+            );
+        }
 
         if !self.quiet && output_format == OutputFormat::Text {
             println!("🔍 Checking commit messages against guidelines...");
