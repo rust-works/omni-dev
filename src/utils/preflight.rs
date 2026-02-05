@@ -210,6 +210,34 @@ pub fn check_git_repository() -> Result<()> {
     Ok(())
 }
 
+/// Validate working directory is clean (no uncommitted changes)
+///
+/// This checks for:
+/// - Staged changes
+/// - Unstaged modifications
+/// - Untracked files (excluding ignored files)
+///
+/// Use this before operations that require a clean working directory,
+/// like amending commits.
+pub fn check_working_directory_clean() -> Result<()> {
+    let repo = crate::git::GitRepository::open().context("Failed to open git repository")?;
+
+    let status = repo
+        .get_working_directory_status()
+        .context("Failed to get working directory status")?;
+
+    if !status.clean {
+        let mut message = String::from("Working directory has uncommitted changes:\n");
+        for change in &status.untracked_changes {
+            message.push_str(&format!("  {} {}\n", change.status, change.file));
+        }
+        message.push_str("\nPlease commit or stash your changes before proceeding.");
+        bail!(message);
+    }
+
+    Ok(())
+}
+
 /// Combined preflight check for AI commands
 ///
 /// Validates:
