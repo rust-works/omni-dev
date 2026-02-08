@@ -303,8 +303,13 @@ impl ClaudeClient {
         max_retries: u32,
     ) -> Result<crate::data::check::CheckReport> {
         // Convert to AI-enhanced view with diff content
-        let ai_repo_view = RepositoryViewForAI::from_repository_view(repo_view.clone())
+        let mut ai_repo_view = RepositoryViewForAI::from_repository_view(repo_view.clone())
             .context("Failed to enhance repository view with diff content")?;
+
+        // Run deterministic pre-validation checks before sending to AI
+        for commit in &mut ai_repo_view.commits {
+            commit.run_pre_validation_checks();
+        }
 
         // Convert repository view to YAML
         let repo_yaml = crate::data::to_yaml(&ai_repo_view)
