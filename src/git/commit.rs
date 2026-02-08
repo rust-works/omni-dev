@@ -7,6 +7,8 @@ use globset::Glob;
 use serde::{Deserialize, Serialize};
 use std::fs;
 
+use regex::Regex;
+
 use crate::data::context::ScopeDefinition;
 
 /// Commit information structure
@@ -77,6 +79,9 @@ pub struct CommitInfoForAI {
     pub in_main_branches: Vec<String>,
     /// Enhanced automated analysis of the commit including diff content
     pub analysis: CommitAnalysisForAI,
+    /// Deterministic checks already performed; the LLM should treat these as authoritative
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pre_validated_checks: Vec<String>,
 }
 
 /// File changes statistics
@@ -633,7 +638,26 @@ impl CommitInfoForAI {
             original_message: commit_info.original_message,
             in_main_branches: commit_info.in_main_branches,
             analysis,
+            pre_validated_checks: Vec::new(),
         })
+    }
+
+    /// Run deterministic pre-validation checks on the commit message.
+    /// Passing checks are recorded in pre_validated_checks so the LLM
+    /// can skip re-checking them. Failing checks are not recorded.
+    pub fn run_pre_validation_checks(&mut self) {
+        let re = Regex::new(r"^[a-z]+!\(([^)]+)\):|^[a-z]+\(([^)]+)\):").unwrap();
+        if let Some(caps) = re.captures(&self.original_message) {
+            let scope = caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str());
+            if let Some(scope) = scope {
+                if scope.contains(',') && !scope.contains(", ") {
+                    self.pre_validated_checks.push(format!(
+                        "Scope format verified: multi-scope '{}' correctly uses commas without spaces",
+                        scope
+                    ));
+                }
+            }
+        }
     }
 }
 
