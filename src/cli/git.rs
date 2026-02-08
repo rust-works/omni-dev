@@ -1132,65 +1132,147 @@ impl TwiddleCommand {
         Ok(())
     }
 
-    /// Run commit message validation after twiddle amendments are applied
+    /// Run commit message validation after twiddle amendments are applied.
+    /// If the check finds errors with suggestions, automatically applies the
+    /// suggestions and re-checks, up to 3 retries.
     async fn run_post_twiddle_check(&self) -> Result<()> {
-        println!();
-        println!("🔍 Running commit message validation...");
+        use crate::data::amendments::AmendmentFile;
 
-        // Generate fresh repository view to get updated commit messages
-        let mut repo_view = self.generate_repository_view().await?;
+        const MAX_CHECK_RETRIES: u32 = 3;
 
-        if repo_view.commits.is_empty() {
-            println!("⚠️  No commits to check");
-            return Ok(());
-        }
-
-        println!("📊 Checking {} commits", repo_view.commits.len());
-
-        // Load guidelines and scopes
+        // Load guidelines, scopes, and Claude client once (they don't change between retries)
         let guidelines = self.load_check_guidelines()?;
         let valid_scopes = self.load_check_scopes();
-
-        // Refine detected scopes using file_patterns from scope definitions
-        for commit in &mut repo_view.commits {
-            commit.analysis.refine_scope(&valid_scopes);
-        }
-
-        self.show_check_guidance_files_status(&guidelines, &valid_scopes);
-
-        // Initialize Claude client
         let claude_client = crate::claude::create_default_claude_client(self.model.clone())?;
 
-        // Run check
-        let report = if repo_view.commits.len() > self.batch_size {
-            println!("📦 Checking commits in batches of {}...", self.batch_size);
-            self.check_commits_with_batching(
-                &claude_client,
-                &repo_view,
-                guidelines.as_deref(),
-                &valid_scopes,
-            )
-            .await?
-        } else {
-            println!("🤖 Analyzing commits with AI...");
-            claude_client
-                .check_commits_with_scopes(&repo_view, guidelines.as_deref(), &valid_scopes, true)
+        for attempt in 0..=MAX_CHECK_RETRIES {
+            println!();
+            if attempt == 0 {
+                println!("🔍 Running commit message validation...");
+            } else {
+                println!(
+                    "🔍 Re-checking commit messages (retry {}/{})...",
+                    attempt, MAX_CHECK_RETRIES
+                );
+            }
+
+            // Generate fresh repository view to get updated commit messages
+            let mut repo_view = self.generate_repository_view().await?;
+
+            if repo_view.commits.is_empty() {
+                println!("⚠️  No commits to check");
+                return Ok(());
+            }
+
+            println!("📊 Checking {} commits", repo_view.commits.len());
+
+            // Refine detected scopes using file_patterns from scope definitions
+            for commit in &mut repo_view.commits {
+                commit.analysis.refine_scope(&valid_scopes);
+            }
+
+            if attempt == 0 {
+                self.show_check_guidance_files_status(&guidelines, &valid_scopes);
+            }
+
+            // Run check
+            let report = if repo_view.commits.len() > self.batch_size {
+                println!("📦 Checking commits in batches of {}...", self.batch_size);
+                self.check_commits_with_batching(
+                    &claude_client,
+                    &repo_view,
+                    guidelines.as_deref(),
+                    &valid_scopes,
+                )
                 .await?
-        };
+            } else {
+                println!("🤖 Analyzing commits with AI...");
+                claude_client
+                    .check_commits_with_scopes(
+                        &repo_view,
+                        guidelines.as_deref(),
+                        &valid_scopes,
+                        true,
+                    )
+                    .await?
+            };
 
-        // Output text report
-        self.output_check_text_report(&report)?;
+            // Output text report
+            self.output_check_text_report(&report)?;
 
-        // Report issues but don't exit with error code (twiddle completed successfully)
-        if report.has_errors() {
-            println!("⚠️  Some commit messages still have issues after twiddling");
-        } else if report.has_warnings() {
-            println!("ℹ️  Some commit messages have minor warnings");
-        } else {
-            println!("✅ All commit messages pass validation");
+            // If no errors, we're done
+            if !report.has_errors() {
+                if report.has_warnings() {
+                    println!("ℹ️  Some commit messages have minor warnings");
+                } else {
+                    println!("✅ All commit messages pass validation");
+                }
+                return Ok(());
+            }
+
+            // If we've exhausted retries, report and stop
+            if attempt == MAX_CHECK_RETRIES {
+                println!(
+                    "⚠️  Some commit messages still have issues after {} retries",
+                    MAX_CHECK_RETRIES
+                );
+                return Ok(());
+            }
+
+            // Build amendments from suggestions for failing commits
+            let amendments = self.build_amendments_from_suggestions(&report, &repo_view);
+
+            if amendments.is_empty() {
+                println!(
+                    "⚠️  Some commit messages have issues but no suggestions available to retry"
+                );
+                return Ok(());
+            }
+
+            // Apply the suggested amendments
+            println!(
+                "🔄 Applying {} suggested fix(es) and re-checking...",
+                amendments.len()
+            );
+            let amendment_file = AmendmentFile { amendments };
+            let temp_file = tempfile::NamedTempFile::new()
+                .context("Failed to create temp file for retry amendments")?;
+            amendment_file
+                .save_to_file(temp_file.path())
+                .context("Failed to save retry amendments")?;
+            self.apply_amendments_from_file(temp_file.path()).await?;
         }
 
         Ok(())
+    }
+
+    /// Build amendments from check report suggestions for failing commits.
+    /// Resolves short hashes from the AI response to full 40-char hashes
+    /// from the repository view.
+    fn build_amendments_from_suggestions(
+        &self,
+        report: &crate::data::check::CheckReport,
+        repo_view: &crate::data::RepositoryView,
+    ) -> Vec<crate::data::amendments::Amendment> {
+        use crate::data::amendments::Amendment;
+
+        report
+            .commits
+            .iter()
+            .filter(|r| !r.passes && r.suggestion.is_some())
+            .filter_map(|r| {
+                let suggestion = r.suggestion.as_ref().unwrap();
+                // Resolve short hash to full 40-char hash
+                let full_hash = repo_view.commits.iter().find_map(|c| {
+                    if c.hash.starts_with(&r.hash) || r.hash.starts_with(&c.hash) {
+                        Some(c.hash.clone())
+                    } else {
+                        None
+                    }
+                });
+                full_hash.map(|hash| Amendment::new(hash, suggestion.message.clone()))
+            })
+            .collect()
     }
 
     /// Load commit guidelines for check (mirrors CheckCommand::load_guidelines)
