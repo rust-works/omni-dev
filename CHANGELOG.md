@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-02-08
+
+### Added
+- **Scope Refinement via File Patterns**: Intelligent scope detection that matches changed file paths against configured scope patterns from `.omni-dev/scopes.yaml`
+  - Pattern matching using globset for project-specific scope rules
+  - Specificity-based matching prioritizes more specific patterns
+  - Support for negation patterns and multi-scope matching
+  - Fallback to original detection when no patterns match
+  - Applied across twiddle, check, and validation commands
+- **Preflight Validation System**: Comprehensive early failure detection for AI and GitHub commands
+  - AI provider detection and credential validation for Claude, Bedrock, OpenAI, and Ollama
+  - GitHub CLI availability and authentication checks
+  - Clear, actionable error messages with resolution guidance
+  - Integrated into twiddle, create-pr, and check commands
+- **Working Directory Validation**: Early cleanliness check before expensive twiddle operations
+  - Detects staged changes, unstaged modifications, and untracked files
+  - Provides detailed error messages showing specific uncommitted files
+  - Prevents wasted AI processing time on dirty working directories
+- **Model Parameter for create-pr**: Added `--model` flag to create-pr command for model selection
+
+### Changed
+- **Scope Definitions Loading**: Simplified and consolidated scope definitions loading logic in twiddle command
+  - Scope refinement now works consistently with or without contextual intelligence
+  - Same logic pattern applied to both full and batch processing modes
+
 ## [0.13.1] - 2025-01-07
 
 ### Fixed
@@ -422,7 +447,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation and community files (README, CONTRIBUTING, CODE_OF_CONDUCT)
 - BSD 3-Clause license
 
-[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.13.1...HEAD
+[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/rust-works/omni-dev/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/rust-works/omni-dev/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/rust-works/omni-dev/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/rust-works/omni-dev/compare/v0.11.0...v0.12.0
