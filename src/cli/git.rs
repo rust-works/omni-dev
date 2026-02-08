@@ -410,7 +410,7 @@ impl TwiddleCommand {
         }
 
         // 1. Generate repository view to get all commits
-        let full_repo_view = self.generate_repository_view().await?;
+        let mut full_repo_view = self.generate_repository_view().await?;
 
         // 2. Check if batching is needed
         if full_repo_view.commits.len() > self.batch_size {
@@ -430,6 +430,13 @@ impl TwiddleCommand {
         } else {
             None
         };
+
+        // Refine detected scopes using file_patterns from scope definitions
+        if let Some(ref ctx) = context {
+            for commit in &mut full_repo_view.commits {
+                commit.analysis.refine_scope(&ctx.project.valid_scopes);
+            }
+        }
 
         // 4. Show context summary if available
         if let Some(ref ctx) = context {
@@ -533,7 +540,7 @@ impl TwiddleCommand {
             );
 
             // Create a repository view for just this batch
-            let batch_repo_view = crate::data::RepositoryView {
+            let mut batch_repo_view = crate::data::RepositoryView {
                 versions: full_repo_view.versions.clone(),
                 explanation: full_repo_view.explanation.clone(),
                 working_directory: full_repo_view.working_directory.clone(),
@@ -552,6 +559,13 @@ impl TwiddleCommand {
             } else {
                 None
             };
+
+            // Refine detected scopes using file_patterns from scope definitions
+            if let Some(ref ctx) = batch_context {
+                for commit in &mut batch_repo_view.commits {
+                    commit.analysis.refine_scope(&ctx.project.valid_scopes);
+                }
+            }
 
             // Generate amendments for this batch
             let batch_amendments = if let Some(ctx) = batch_context {
@@ -1120,7 +1134,7 @@ impl TwiddleCommand {
         println!("🔍 Running commit message validation...");
 
         // Generate fresh repository view to get updated commit messages
-        let repo_view = self.generate_repository_view().await?;
+        let mut repo_view = self.generate_repository_view().await?;
 
         if repo_view.commits.is_empty() {
             println!("⚠️  No commits to check");
@@ -1132,6 +1146,11 @@ impl TwiddleCommand {
         // Load guidelines and scopes
         let guidelines = self.load_check_guidelines()?;
         let valid_scopes = self.load_check_scopes();
+
+        // Refine detected scopes using file_patterns from scope definitions
+        for commit in &mut repo_view.commits {
+            commit.analysis.refine_scope(&valid_scopes);
+        }
 
         self.show_check_guidance_files_status(&guidelines, &valid_scopes);
 
@@ -2924,7 +2943,7 @@ impl CheckCommand {
         }
 
         // 1. Generate repository view to get all commits
-        let repo_view = self.generate_repository_view().await?;
+        let mut repo_view = self.generate_repository_view().await?;
 
         // 2. Check for empty commit range (exit code 3)
         if repo_view.commits.is_empty() {
@@ -2939,6 +2958,11 @@ impl CheckCommand {
         // 3. Load commit guidelines and scopes
         let guidelines = self.load_guidelines().await?;
         let valid_scopes = self.load_scopes();
+
+        // Refine detected scopes using file_patterns from scope definitions
+        for commit in &mut repo_view.commits {
+            commit.analysis.refine_scope(&valid_scopes);
+        }
 
         if !self.quiet && output_format == OutputFormat::Text {
             self.show_guidance_files_status(&guidelines, &valid_scopes);

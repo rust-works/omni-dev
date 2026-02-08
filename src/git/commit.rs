@@ -3,8 +3,11 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset};
 use git2::{Commit, Repository};
+use globset::Glob;
 use serde::{Deserialize, Serialize};
 use std::fs;
+
+use crate::data::context::ScopeDefinition;
 
 /// Commit information structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,7 +334,7 @@ impl CommitAnalysis {
         )
     }
 
-    /// Detect scope based on file paths
+    /// Detect scope from file paths
     fn detect_scope(file_changes: &FileChanges) -> String {
         let files: Vec<&str> = file_changes
             .file_list
@@ -358,6 +361,99 @@ impl CommitAnalysis {
         } else {
             "".to_string()
         }
+    }
+
+    /// Re-detect scope using file_patterns from scope definitions.
+    ///
+    /// More specific patterns (more literal path components) win regardless of
+    /// definition order in scopes.yaml. Equally specific matches are joined
+    /// with ", ". If no scope definitions match, the existing detected_scope
+    /// is kept as a fallback.
+    pub fn refine_scope(&mut self, scope_defs: &[ScopeDefinition]) {
+        if scope_defs.is_empty() {
+            return;
+        }
+        let files: Vec<&str> = self
+            .file_changes
+            .file_list
+            .iter()
+            .map(|f| f.file.as_str())
+            .collect();
+        if files.is_empty() {
+            return;
+        }
+
+        let mut matches: Vec<(&str, usize)> = Vec::new();
+        for scope_def in scope_defs {
+            if let Some(specificity) = Self::scope_matches_files(&files, &scope_def.file_patterns) {
+                matches.push((&scope_def.name, specificity));
+            }
+        }
+
+        if matches.is_empty() {
+            return;
+        }
+
+        let max_specificity = matches.iter().map(|(_, s)| *s).max().unwrap();
+        let best: Vec<&str> = matches
+            .into_iter()
+            .filter(|(_, s)| *s == max_specificity)
+            .map(|(name, _)| name)
+            .collect();
+
+        self.detected_scope = best.join(", ");
+    }
+
+    /// Check if a scope's file_patterns match any of the given files.
+    ///
+    /// Returns `Some(max_specificity)` if at least one file matches the scope
+    /// (after applying negation patterns), or `None` if no file matches.
+    fn scope_matches_files(files: &[&str], patterns: &[String]) -> Option<usize> {
+        let mut positive = Vec::new();
+        let mut negative = Vec::new();
+        for pat in patterns {
+            if let Some(stripped) = pat.strip_prefix('!') {
+                negative.push(stripped);
+            } else {
+                positive.push(pat.as_str());
+            }
+        }
+
+        // Build negative matchers
+        let neg_matchers: Vec<_> = negative
+            .iter()
+            .filter_map(|p| Glob::new(p).ok().map(|g| g.compile_matcher()))
+            .collect();
+
+        let mut max_specificity: Option<usize> = None;
+        for pat in &positive {
+            let glob = match Glob::new(pat) {
+                Ok(g) => g,
+                Err(_) => continue,
+            };
+            let matcher = glob.compile_matcher();
+            for file in files {
+                if matcher.is_match(file) && !neg_matchers.iter().any(|neg| neg.is_match(file)) {
+                    let specificity = Self::count_specificity(pat);
+                    max_specificity =
+                        Some(max_specificity.map_or(specificity, |cur| cur.max(specificity)));
+                }
+            }
+        }
+        max_specificity
+    }
+
+    /// Count the number of literal (non-wildcard) path segments in a glob pattern.
+    ///
+    /// - `docs/adrs/**` → 2 (`docs`, `adrs`)
+    /// - `docs/**` → 1 (`docs`)
+    /// - `*.md` → 0
+    /// - `src/main/scala/**` → 3
+    fn count_specificity(pattern: &str) -> usize {
+        pattern
+            .split('/')
+            .filter(|segment| !segment.contains('*') && !segment.contains('?'))
+            .count()
     }
 
     /// Generate a proposed conventional commit message
