@@ -432,10 +432,12 @@ impl TwiddleCommand {
         };
 
         // Refine detected scopes using file_patterns from scope definitions
-        if let Some(ref ctx) = context {
-            for commit in &mut full_repo_view.commits {
-                commit.analysis.refine_scope(&ctx.project.valid_scopes);
-            }
+        let scope_defs = match &context {
+            Some(ctx) => ctx.project.valid_scopes.clone(),
+            None => self.load_check_scopes(),
+        };
+        for commit in &mut full_repo_view.commits {
+            commit.analysis.refine_scope(&scope_defs);
         }
 
         // 4. Show context summary if available
@@ -561,10 +563,12 @@ impl TwiddleCommand {
             };
 
             // Refine detected scopes using file_patterns from scope definitions
-            if let Some(ref ctx) = batch_context {
-                for commit in &mut batch_repo_view.commits {
-                    commit.analysis.refine_scope(&ctx.project.valid_scopes);
-                }
+            let batch_scope_defs = match &batch_context {
+                Some(ctx) => ctx.project.valid_scopes.clone(),
+                None => self.load_check_scopes(),
+            };
+            for commit in &mut batch_repo_view.commits {
+                commit.analysis.refine_scope(&batch_scope_defs);
             }
 
             // Generate amendments for this batch
