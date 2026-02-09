@@ -302,6 +302,7 @@ Options:
       --show-passing               Include passing commits in output (hidden by default)
       --batch-size <BATCH_SIZE>    Number of commits to process per AI request (default: 4) [default: 4]
       --no-suggestions             Skip generating corrected message suggestions
+      --twiddle                    Offer to apply suggested messages when issues are found
   -h, --help                       Print help
 
 
