@@ -8,6 +8,21 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+/// Beta header that unlocks enhanced model limits
+#[derive(Debug, Deserialize, Clone)]
+pub struct BetaHeader {
+    /// HTTP header name (e.g., "anthropic-beta")
+    pub key: String,
+    /// Header value (e.g., "context-1m-2025-08-07")
+    pub value: String,
+    /// Overridden max output tokens when this header is active
+    #[serde(default)]
+    pub max_output_tokens: Option<usize>,
+    /// Overridden input context when this header is active
+    #[serde(default)]
+    pub input_context: Option<usize>,
+}
+
 /// Model specification from YAML configuration
 #[derive(Debug, Deserialize, Clone)]
 pub struct ModelSpec {
@@ -28,6 +43,9 @@ pub struct ModelSpec {
     /// Whether this is a legacy model that may be deprecated
     #[serde(default)]
     pub legacy: bool,
+    /// Beta headers that unlock enhanced limits for this model
+    #[serde(default)]
+    pub beta_headers: Vec<BetaHeader>,
 }
 
 /// Model tier information
@@ -253,6 +271,39 @@ impl ModelRegistry {
     pub fn get_tier_info(&self, provider: &str, tier: &str) -> Option<&TierInfo> {
         self.config.providers.get(provider)?.tiers.get(tier)
     }
+
+    /// Get beta headers for a model
+    pub fn get_beta_headers(&self, api_identifier: &str) -> &[BetaHeader] {
+        self.get_model_spec(api_identifier)
+            .map(|spec| spec.beta_headers.as_slice())
+            .unwrap_or_default()
+    }
+
+    /// Get max output tokens for a model with a specific beta header active
+    pub fn get_max_output_tokens_with_beta(&self, api_identifier: &str, beta_value: &str) -> usize {
+        if let Some(spec) = self.get_model_spec(api_identifier) {
+            if let Some(bh) = spec.beta_headers.iter().find(|b| b.value == beta_value) {
+                if let Some(max) = bh.max_output_tokens {
+                    return max;
+                }
+            }
+            return spec.max_output_tokens;
+        }
+        self.get_max_output_tokens(api_identifier)
+    }
+
+    /// Get input context for a model with a specific beta header active
+    pub fn get_input_context_with_beta(&self, api_identifier: &str, beta_value: &str) -> usize {
+        if let Some(spec) = self.get_model_spec(api_identifier) {
+            if let Some(bh) = spec.beta_headers.iter().find(|b| b.value == beta_value) {
+                if let Some(ctx) = bh.input_context {
+                    return ctx;
+                }
+            }
+            return spec.input_context;
+        }
+        self.get_input_context(api_identifier)
+    }
 }
 
 /// Global model registry instance
@@ -384,5 +435,58 @@ mod tests {
             registry.extract_core_model_identifier("eu.anthropic.claude-sonnet-4-20250514-v2:1"),
             "claude-sonnet-4-20250514"
         );
+    }
+
+    #[test]
+    fn test_beta_header_lookups() {
+        let registry = ModelRegistry::load().unwrap();
+
+        // Opus 4.6 base limits
+        assert_eq!(registry.get_max_output_tokens("claude-opus-4-6"), 128000);
+        assert_eq!(registry.get_input_context("claude-opus-4-6"), 200000);
+
+        // Opus 4.6 with 1M context beta
+        assert_eq!(
+            registry.get_input_context_with_beta("claude-opus-4-6", "context-1m-2025-08-07"),
+            1000000
+        );
+        // max_output_tokens unchanged with context beta
+        assert_eq!(
+            registry.get_max_output_tokens_with_beta("claude-opus-4-6", "context-1m-2025-08-07"),
+            128000
+        );
+
+        // Sonnet 3.7 with output-128k beta
+        assert_eq!(
+            registry.get_max_output_tokens_with_beta(
+                "claude-3-7-sonnet-20250219",
+                "output-128k-2025-02-19"
+            ),
+            128000
+        );
+
+        // Sonnet 3.7 base max_output_tokens without beta
+        assert_eq!(
+            registry.get_max_output_tokens("claude-3-7-sonnet-20250219"),
+            64000
+        );
+
+        // Beta headers accessor
+        let headers = registry.get_beta_headers("claude-opus-4-6");
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].key, "anthropic-beta");
+        assert_eq!(headers[0].value, "context-1m-2025-08-07");
+
+        // Sonnet 3.7 has two beta headers
+        let headers = registry.get_beta_headers("claude-3-7-sonnet-20250219");
+        assert_eq!(headers.len(), 2);
+
+        // Model without beta headers returns empty slice
+        let headers = registry.get_beta_headers("claude-3-haiku-20240307");
+        assert!(headers.is_empty());
+
+        // Unknown model returns empty slice
+        let headers = registry.get_beta_headers("unknown-model");
+        assert!(headers.is_empty());
     }
 }
