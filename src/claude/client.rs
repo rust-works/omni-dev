@@ -25,6 +25,13 @@ impl ClaudeClient {
         self.ai_client.get_metadata()
     }
 
+    /// Send a raw prompt to the AI client and return the text response
+    pub async fn send_message(&self, system_prompt: &str, user_prompt: &str) -> Result<String> {
+        self.ai_client
+            .send_request(system_prompt, user_prompt)
+            .await
+    }
+
     /// Create new Claude client with API key from environment variables
     pub fn from_env(model: String) -> Result<Self> {
         // Try to get API key from environment variables
