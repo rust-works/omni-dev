@@ -71,11 +71,18 @@ pub struct BedrockAiClient {
     model: String,
     /// Base URL for the Bedrock API
     base_url: String,
+    /// Active beta header (key, value) if enabled
+    active_beta: Option<(String, String)>,
 }
 
 impl BedrockAiClient {
     /// Create a new Bedrock AI client
-    pub fn new(model: String, auth_token: String, base_url: String) -> Self {
+    pub fn new(
+        model: String,
+        auth_token: String,
+        base_url: String,
+        active_beta: Option<(String, String)>,
+    ) -> Self {
         let client = Client::new();
 
         Self {
@@ -83,13 +90,18 @@ impl BedrockAiClient {
             auth_token,
             model,
             base_url,
+            active_beta,
         }
     }
 
     /// Get max tokens from model registry
     fn get_max_tokens(&self) -> i32 {
         let registry = get_model_registry();
-        registry.get_max_output_tokens(&self.model) as i32
+        if let Some((_, ref value)) = self.active_beta {
+            registry.get_max_output_tokens_with_beta(&self.model, value) as i32
+        } else {
+            registry.get_max_output_tokens(&self.model) as i32
+        }
     }
 
     /// Build the full API URL
@@ -182,11 +194,18 @@ impl AiClient for BedrockAiClient {
             debug!(model = %self.model, "Using model for Bedrock request");
 
             // Send request to Bedrock API
-            let response = self
+            let mut builder = self
                 .client
                 .post(&api_url)
                 .header("Content-Type", "application/json")
-                .header("Authorization", format!("Bearer {}", self.auth_token))
+                .header("Authorization", format!("Bearer {}", self.auth_token));
+
+            if let Some((ref key, ref value)) = self.active_beta {
+                debug!(header_key = %key, header_value = %value, "Adding beta header to Bedrock API request");
+                builder = builder.header(key, value);
+            }
+
+            let response = builder
                 .json(&request)
                 .send()
                 .await
@@ -244,14 +263,23 @@ impl AiClient for BedrockAiClient {
 
     fn get_metadata(&self) -> AiClientMetadata {
         let registry = get_model_registry();
-        let max_context_length = registry.get_input_context(&self.model);
-        let max_response_length = registry.get_max_output_tokens(&self.model);
+        let (max_context_length, max_response_length) = match &self.active_beta {
+            Some((_, value)) => (
+                registry.get_input_context_with_beta(&self.model, value),
+                registry.get_max_output_tokens_with_beta(&self.model, value),
+            ),
+            None => (
+                registry.get_input_context(&self.model),
+                registry.get_max_output_tokens(&self.model),
+            ),
+        };
 
         AiClientMetadata {
             provider: "Anthropic Bedrock".to_string(),
             model: self.model.clone(),
             max_context_length,
             max_response_length,
+            active_beta: self.active_beta.clone(),
         }
     }
 }
@@ -266,6 +294,7 @@ mod tests {
             "us.anthropic.claude-3-7-sonnet-20250219-v1:0".to_string(),
             "test_token".to_string(),
             "https://bedrock-api.com/bedrock".to_string(),
+            None,
         );
 
         let url = client.get_api_url().unwrap();
@@ -282,6 +311,7 @@ mod tests {
             "claude-3-opus-20240229".to_string(),
             "test_token".to_string(),
             "https://example.com".to_string(),
+            None,
         );
         assert_eq!(client.get_max_tokens(), 4096); // Correct legacy limit
 
@@ -290,6 +320,7 @@ mod tests {
             "claude-sonnet-4-20250514".to_string(),
             "test_token".to_string(),
             "https://example.com".to_string(),
+            None,
         );
         assert_eq!(client.get_max_tokens(), 64000); // New high limit
 
@@ -298,6 +329,7 @@ mod tests {
             "claude-unknown-model".to_string(),
             "test_token".to_string(),
             "https://example.com".to_string(),
+            None,
         );
         assert_eq!(client.get_max_tokens(), 4096); // Claude provider default
     }
