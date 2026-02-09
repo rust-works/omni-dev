@@ -176,6 +176,10 @@ pub struct CheckCommand {
     /// Skip generating corrected message suggestions
     #[arg(long)]
     pub no_suggestions: bool,
+
+    /// Offer to apply suggested messages when issues are found
+    #[arg(long)]
+    pub twiddle: bool,
 }
 
 /// Branch operations
@@ -3095,7 +3099,16 @@ impl CheckCommand {
         // 7. Output results
         self.output_report(&report, output_format)?;
 
-        // 8. Determine exit code
+        // 8. If --twiddle and there are errors with suggestions, offer to apply them
+        if self.twiddle && report.has_errors() && output_format == OutputFormat::Text {
+            let amendments = self.build_amendments_from_suggestions(&report, &repo_view);
+            if !amendments.is_empty() && self.prompt_and_apply_suggestions(amendments).await? {
+                // Amendments applied — exit successfully
+                return Ok(());
+            }
+        }
+
+        // 9. Determine exit code
         let exit_code = report.exit_code(self.strict);
         if exit_code != 0 {
             std::process::exit(exit_code);
@@ -3569,5 +3582,80 @@ impl CheckCommand {
 
         println!();
         Ok(())
+    }
+
+    /// Build amendments from check report suggestions for failing commits.
+    fn build_amendments_from_suggestions(
+        &self,
+        report: &crate::data::check::CheckReport,
+        repo_view: &crate::data::RepositoryView,
+    ) -> Vec<crate::data::amendments::Amendment> {
+        use crate::data::amendments::Amendment;
+
+        report
+            .commits
+            .iter()
+            .filter(|r| !r.passes && r.suggestion.is_some())
+            .filter_map(|r| {
+                let suggestion = r.suggestion.as_ref().unwrap();
+                let full_hash = repo_view.commits.iter().find_map(|c| {
+                    if c.hash.starts_with(&r.hash) || r.hash.starts_with(&c.hash) {
+                        Some(c.hash.clone())
+                    } else {
+                        None
+                    }
+                });
+                full_hash.map(|hash| Amendment::new(hash, suggestion.message.clone()))
+            })
+            .collect()
+    }
+
+    /// Prompt user to apply suggested amendments and apply them if accepted.
+    /// Returns true if amendments were applied, false if user declined.
+    async fn prompt_and_apply_suggestions(
+        &self,
+        amendments: Vec<crate::data::amendments::Amendment>,
+    ) -> Result<bool> {
+        use crate::data::amendments::AmendmentFile;
+        use crate::git::AmendmentHandler;
+        use std::io::{self, Write};
+
+        println!();
+        println!(
+            "🔧 {} commit(s) have issues with suggested fixes available.",
+            amendments.len()
+        );
+
+        loop {
+            print!("❓ [A]pply suggested fixes, or [Q]uit? [A/q] ");
+            io::stdout().flush()?;
+
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+
+            match input.trim().to_lowercase().as_str() {
+                "a" | "apply" | "" => {
+                    let amendment_file = AmendmentFile { amendments };
+                    let temp_file = tempfile::NamedTempFile::new()
+                        .context("Failed to create temp file for amendments")?;
+                    amendment_file
+                        .save_to_file(temp_file.path())
+                        .context("Failed to save amendments")?;
+
+                    let handler = AmendmentHandler::new()
+                        .context("Failed to initialize amendment handler")?;
+                    handler
+                        .apply_amendments(&temp_file.path().to_string_lossy())
+                        .context("Failed to apply amendments")?;
+
+                    println!("✅ Suggested fixes applied successfully!");
+                    return Ok(true);
+                }
+                "q" | "quit" => return Ok(false),
+                _ => {
+                    println!("Invalid choice. Please enter 'a' to apply or 'q' to quit.");
+                }
+            }
+        }
     }
 }
