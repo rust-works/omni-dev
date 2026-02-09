@@ -77,6 +77,8 @@ pub struct OpenAiAiClient {
     max_tokens: Option<i32>,
     /// Temperature for response generation
     temperature: Option<f32>,
+    /// Active beta header (key, value) if enabled
+    active_beta: Option<(String, String)>,
 }
 
 impl OpenAiAiClient {
@@ -87,6 +89,7 @@ impl OpenAiAiClient {
         base_url: String,
         max_tokens: Option<i32>,
         temperature: Option<f32>,
+        active_beta: Option<(String, String)>,
     ) -> Self {
         let client = Client::new();
 
@@ -97,28 +100,39 @@ impl OpenAiAiClient {
             base_url,
             max_tokens,
             temperature,
+            active_beta,
         }
     }
 
     /// Create a new client for Ollama with sensible defaults
-    pub fn new_ollama(model: String, base_url: Option<String>) -> Self {
+    pub fn new_ollama(
+        model: String,
+        base_url: Option<String>,
+        active_beta: Option<(String, String)>,
+    ) -> Self {
         Self::new(
             model,
             None, // No API key needed for Ollama
             base_url.unwrap_or_else(|| "http://localhost:11434".to_string()),
             Some(4096), // Reasonable default
             Some(0.1),  // Low temperature for consistent output
+            active_beta,
         )
     }
 
     /// Create a new client for OpenAI with sensible defaults
-    pub fn new_openai(model: String, api_key: String) -> Self {
+    pub fn new_openai(
+        model: String,
+        api_key: String,
+        active_beta: Option<(String, String)>,
+    ) -> Self {
         Self::new(
             model,
             Some(api_key),
             "https://api.openai.com".to_string(),
             None,      // Use model registry for max tokens
             Some(0.1), // Low temperature for consistent output
+            active_beta,
         )
     }
 
@@ -129,7 +143,11 @@ impl OpenAiAiClient {
         }
 
         let registry = get_model_registry();
-        registry.get_max_output_tokens(&self.model) as i32
+        if let Some((_, ref value)) = self.active_beta {
+            registry.get_max_output_tokens_with_beta(&self.model, value) as i32
+        } else {
+            registry.get_max_output_tokens(&self.model) as i32
+        }
     }
 
     /// Build the full API URL
@@ -317,6 +335,7 @@ impl AiClient for OpenAiAiClient {
             model: self.model.clone(),
             max_context_length,
             max_response_length,
+            active_beta: self.active_beta.clone(),
         }
     }
 }
@@ -327,7 +346,7 @@ mod tests {
 
     #[test]
     fn test_new_ollama() {
-        let client = OpenAiAiClient::new_ollama("llama2".to_string(), None);
+        let client = OpenAiAiClient::new_ollama("llama2".to_string(), None, None);
         assert_eq!(client.model, "llama2");
         assert_eq!(client.base_url, "http://localhost:11434");
         assert!(client.api_key.is_none());
@@ -339,6 +358,7 @@ mod tests {
         let client = OpenAiAiClient::new_ollama(
             "codellama".to_string(),
             Some("http://192.168.1.100:11434".to_string()),
+            None,
         );
         assert_eq!(client.base_url, "http://192.168.1.100:11434");
         assert!(client.is_ollama());
@@ -346,7 +366,8 @@ mod tests {
 
     #[test]
     fn test_new_openai() {
-        let client = OpenAiAiClient::new_openai("gpt-4".to_string(), "sk-test123".to_string());
+        let client =
+            OpenAiAiClient::new_openai("gpt-4".to_string(), "sk-test123".to_string(), None);
         assert_eq!(client.model, "gpt-4");
         assert_eq!(client.base_url, "https://api.openai.com");
         assert_eq!(client.api_key, Some("sk-test123".to_string()));
@@ -355,7 +376,7 @@ mod tests {
 
     #[test]
     fn test_get_api_url() {
-        let client = OpenAiAiClient::new_ollama("llama2".to_string(), None);
+        let client = OpenAiAiClient::new_ollama("llama2".to_string(), None, None);
         let url = client.get_api_url().unwrap();
         assert_eq!(url, "http://localhost:11434/v1/chat/completions");
     }
@@ -366,6 +387,7 @@ mod tests {
             "test-model".to_string(),
             None,
             "http://localhost:11434/".to_string(),
+            None,
             None,
             None,
         );
@@ -382,6 +404,7 @@ mod tests {
             "http://localhost:11434".to_string(),
             None,
             None,
+            None,
         );
         assert!(ollama_client.is_ollama());
 
@@ -390,6 +413,7 @@ mod tests {
             "llama2".to_string(),
             Some("fake-key".to_string()),
             "http://127.0.0.1:11434".to_string(),
+            None,
             None,
             None,
         );
@@ -402,6 +426,7 @@ mod tests {
             "http://remote-server.com".to_string(),
             None,
             None,
+            None,
         );
         assert!(no_key_client.is_ollama());
 
@@ -410,6 +435,7 @@ mod tests {
             "gpt-4".to_string(),
             Some("sk-real-key".to_string()),
             "https://api.openai.com".to_string(),
+            None,
             None,
             None,
         );

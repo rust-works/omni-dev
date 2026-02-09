@@ -19,6 +19,8 @@ pub struct AiClientMetadata {
     pub max_context_length: usize,
     /// Maximum token response length supported
     pub max_response_length: usize,
+    /// Active beta header, if any: (key, value)
+    pub active_beta: Option<(String, String)>,
 }
 
 /// Trait for AI service clients
