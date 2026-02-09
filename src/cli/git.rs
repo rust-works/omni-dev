@@ -4,6 +4,14 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing::{debug, error};
 
+/// Parse a `--beta-header key:value` string into a `(key, value)` tuple.
+fn parse_beta_header(s: &str) -> Result<(String, String)> {
+    let (k, v) = s.split_once(':').ok_or_else(|| {
+        anyhow::anyhow!("Invalid --beta-header format '{}'. Expected key:value", s)
+    })?;
+    Ok((k.to_string(), v.to_string()))
+}
+
 /// Git operations
 #[derive(Parser)]
 pub struct GitCommand {
@@ -84,6 +92,11 @@ pub struct TwiddleCommand {
     #[arg(long)]
     pub model: Option<String>,
 
+    /// Beta header to send with API requests (format: key:value)
+    /// Only sent if the model supports it in the registry
+    #[arg(long, value_name = "KEY:VALUE")]
+    pub beta_header: Option<String>,
+
     /// Skip confirmation prompt and apply amendments automatically
     #[arg(long)]
     pub auto_apply: bool,
@@ -140,6 +153,11 @@ pub struct CheckCommand {
     /// Claude API model to use (if not specified, uses settings or default)
     #[arg(long)]
     pub model: Option<String>,
+
+    /// Beta header to send with API requests (format: key:value)
+    /// Only sent if the model supports it in the registry
+    #[arg(long, value_name = "KEY:VALUE")]
+    pub beta_header: Option<String>,
 
     /// Path to custom context directory (defaults to .omni-dev/)
     #[arg(long)]
@@ -450,7 +468,12 @@ impl TwiddleCommand {
         }
 
         // 5. Initialize Claude client
-        let claude_client = crate::claude::create_default_claude_client(self.model.clone())?;
+        let beta = self
+            .beta_header
+            .as_deref()
+            .map(parse_beta_header)
+            .transpose()?;
+        let claude_client = crate::claude::create_default_claude_client(self.model.clone(), beta)?;
 
         // Show model information
         self.show_model_info_from_client(&claude_client)?;
@@ -519,7 +542,12 @@ impl TwiddleCommand {
         use crate::data::amendments::AmendmentFile;
 
         // Initialize Claude client
-        let claude_client = crate::claude::create_default_claude_client(self.model.clone())?;
+        let beta = self
+            .beta_header
+            .as_deref()
+            .map(parse_beta_header)
+            .transpose()?;
+        let claude_client = crate::claude::create_default_claude_client(self.model.clone(), beta)?;
 
         // Show model information
         self.show_model_info_from_client(&claude_client)?;
@@ -1000,8 +1028,12 @@ impl TwiddleCommand {
                     "No description available"
                 }
             });
-            println!("   📤 Max output tokens: {}", spec.max_output_tokens);
-            println!("   📥 Input context: {}", spec.input_context);
+            println!("   📤 Max output tokens: {}", metadata.max_response_length);
+            println!("   📥 Input context: {}", metadata.max_context_length);
+
+            if let Some((ref key, ref value)) = metadata.active_beta {
+                println!("   🔬 Beta header: {}: {}", key, value);
+            }
 
             if spec.legacy {
                 println!("   ⚠️  Legacy model (consider upgrading to newer version)");
@@ -1147,7 +1179,12 @@ impl TwiddleCommand {
         // Load guidelines, scopes, and Claude client once (they don't change between retries)
         let guidelines = self.load_check_guidelines()?;
         let valid_scopes = self.load_check_scopes();
-        let claude_client = crate::claude::create_default_claude_client(self.model.clone())?;
+        let beta = self
+            .beta_header
+            .as_deref()
+            .map(parse_beta_header)
+            .transpose()?;
+        let claude_client = crate::claude::create_default_claude_client(self.model.clone(), beta)?;
 
         for attempt in 0..=MAX_CHECK_RETRIES {
             println!();
@@ -1842,7 +1879,7 @@ impl CreatePrCommand {
         self.show_guidance_files_status(&project_context)?;
 
         // 4. Show AI model configuration before generation
-        let claude_client = crate::claude::create_default_claude_client(self.model.clone())?;
+        let claude_client = crate::claude::create_default_claude_client(self.model.clone(), None)?;
         self.show_model_info_from_client(&claude_client)?;
 
         // 5. Show branch analysis and commit information
@@ -2991,8 +3028,12 @@ impl CreatePrCommand {
                     "No description available"
                 }
             });
-            println!("   📤 Max output tokens: {}", spec.max_output_tokens);
-            println!("   📥 Input context: {}", spec.input_context);
+            println!("   📤 Max output tokens: {}", metadata.max_response_length);
+            println!("   📥 Input context: {}", metadata.max_context_length);
+
+            if let Some((ref key, ref value)) = metadata.active_beta {
+                println!("   🔬 Beta header: {}: {}", key, value);
+            }
 
             if spec.legacy {
                 println!("   ⚠️  Legacy model (consider upgrading to newer version)");
@@ -3059,7 +3100,12 @@ impl CheckCommand {
         }
 
         // 4. Initialize Claude client
-        let claude_client = crate::claude::create_default_claude_client(self.model.clone())?;
+        let beta = self
+            .beta_header
+            .as_deref()
+            .map(parse_beta_header)
+            .transpose()?;
+        let claude_client = crate::claude::create_default_claude_client(self.model.clone(), beta)?;
 
         if self.verbose && output_format == OutputFormat::Text {
             self.show_model_info(&claude_client)?;

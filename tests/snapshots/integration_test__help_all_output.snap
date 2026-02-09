@@ -323,6 +323,7 @@ Arguments:
 
 Options:
       --model <MODEL>              Claude API model to use (if not specified, uses settings or default)
+      --beta-header <KEY:VALUE>    Beta header to send with API requests (format: key:value) Only sent if the model supports it in the registry
       --context-dir <CONTEXT_DIR>  Path to custom context directory (defaults to .omni-dev/)
       --guidelines <GUIDELINES>    Explicit path to guidelines file
       --format <FORMAT>            Output format: text (default), json, yaml [default: text]
@@ -350,6 +351,8 @@ Arguments:
 Options:
       --model <MODEL>
           Claude API model to use (if not specified, uses settings or default)
+      --beta-header <KEY:VALUE>
+          Beta header to send with API requests (format: key:value) Only sent if the model supports it in the registry
       --auto-apply
           Skip confirmation prompt and apply amendments automatically
       --save-only <FILE>
