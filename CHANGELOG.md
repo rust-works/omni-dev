@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-02-08
+
+### Added
+- **Beta Header Support**: New `--beta-header` flag for twiddle and check commands
+  - Enables enhanced model capabilities like 1M context window and 128K output tokens
+  - Format: `--beta-header key:value` (e.g., `--beta-header anthropic-beta:context-1m-2025-08-07`)
+  - Validates beta headers against the model registry with helpful error messages
+  - Beta-aware token limits automatically applied to API requests and display
+  - Debug logging for active beta headers sent with API requests
+- **Interactive Chat Command**: New `omni-dev chat` command for conversational AI interaction
+  - Interactive Claude AI chat session with streaming-style responses
+  - Configurable system prompts and model selection
+  - Multi-line input support and conversation history
+- **Interactive Twiddle Mode for Check**: New `--twiddle` flag on check command
+  - Automatically runs twiddle to fix failing commit messages after check identifies issues
+  - Streamlined workflow for validating and correcting commits in one step
+- **Intelligent Retry Mechanism**: Smart retry for twiddle commit validation
+  - Automatically retries failed commit message generation with refined prompts
+  - Configurable retry limits with exponential backoff
+  - Improved success rates for challenging commit messages
+- **Deterministic Scope Pre-Validation**: Rule-based validation before AI processing
+  - Catches common scope formatting issues (e.g., extra spaces) without API calls
+  - Reduces unnecessary AI requests for deterministic formatting rules
+
+### Changed
+- **Model Catalog Update**: Updated AI model registry to February 2026
+  - Added Claude Opus 4.6 as current flagship model
+  - Added beta header definitions for models supporting extended context and output
+  - Updated model specifications and tier classifications
+
+### CI/CD
+- **Enhanced Commit-Check Workflow**: Improved CI validation pipeline
+  - Added concurrency control to prevent redundant workflow runs
+  - Updated GitHub Actions to latest versions
+
+### Documentation
+- **Context Window Documentation**: Added documentation for context window limitations and fallback behavior
+
 ## [0.14.0] - 2026-02-08
 
 ### Added
@@ -447,7 +485,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation and community files (README, CONTRIBUTING, CODE_OF_CONDUCT)
 - BSD 3-Clause license
 
-[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/rust-works/omni-dev/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/rust-works/omni-dev/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/rust-works/omni-dev/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/rust-works/omni-dev/compare/v0.12.0...v0.13.0
