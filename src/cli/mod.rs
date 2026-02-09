@@ -3,6 +3,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+pub mod ai;
 pub mod commands;
 pub mod config;
 pub mod git;
@@ -22,6 +23,8 @@ pub struct Cli {
 /// Main command categories
 #[derive(Subcommand)]
 pub enum Commands {
+    /// AI operations
+    Ai(ai::AiCommand),
     /// Git-related operations
     Git(git::GitCommand),
     /// Command template management
@@ -37,6 +40,7 @@ impl Cli {
     /// Execute the CLI command
     pub fn execute(self) -> Result<()> {
         match self.command {
+            Commands::Ai(ai_cmd) => ai_cmd.execute(),
             Commands::Git(git_cmd) => git_cmd.execute(),
             Commands::Commands(commands_cmd) => commands_cmd.execute(),
             Commands::Config(config_cmd) => config_cmd.execute(),

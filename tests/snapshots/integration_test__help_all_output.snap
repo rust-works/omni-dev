@@ -9,6 +9,7 @@ A comprehensive development toolkit
 Usage: omni-dev <COMMAND>
 
 Commands:
+  ai        AI operations
   git       Git-related operations
   commands  Command template management
   config    Configuration and model information
@@ -18,6 +19,35 @@ Commands:
 Options:
   -h, --help     Print help
   -V, --version  Print version
+
+
+================================================================================
+
+omni-dev ai - AI operations
+
+AI operations
+
+Usage: ai <COMMAND>
+
+Commands:
+  chat  Interactive AI chat session
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev ai chat - Interactive AI chat session
+
+Interactive AI chat session
+
+Usage: chat [OPTIONS]
+
+Options:
+      --model <MODEL>  AI model to use (overrides environment configuration)
+  -h, --help           Print help
 
 
 ================================================================================
