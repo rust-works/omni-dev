@@ -47,24 +47,31 @@ pub struct ClaudeAiClient {
     api_key: String,
     /// Model identifier
     model: String,
+    /// Active beta header (key, value) if enabled
+    active_beta: Option<(String, String)>,
 }
 
 impl ClaudeAiClient {
     /// Create a new Claude AI client
-    pub fn new(model: String, api_key: String) -> Self {
+    pub fn new(model: String, api_key: String, active_beta: Option<(String, String)>) -> Self {
         let client = Client::new();
 
         Self {
             client,
             api_key,
             model,
+            active_beta,
         }
     }
 
     /// Get max tokens from model registry
     fn get_max_tokens(&self) -> i32 {
         let registry = get_model_registry();
-        registry.get_max_output_tokens(&self.model) as i32
+        if let Some((_, ref value)) = self.active_beta {
+            registry.get_max_output_tokens_with_beta(&self.model, value) as i32
+        } else {
+            registry.get_max_output_tokens(&self.model) as i32
+        }
     }
 }
 
@@ -108,12 +115,19 @@ impl AiClient for ClaudeAiClient {
             );
 
             // Send request to Claude API
-            let response = self
+            let mut builder = self
                 .client
                 .post("https://api.anthropic.com/v1/messages")
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", "2023-06-01")
-                .header("content-type", "application/json")
+                .header("content-type", "application/json");
+
+            if let Some((ref key, ref value)) = self.active_beta {
+                debug!(header_key = %key, header_value = %value, "Adding beta header to Claude API request");
+                builder = builder.header(key, value);
+            }
+
+            let response = builder
                 .json(&request)
                 .send()
                 .await
@@ -167,14 +181,23 @@ impl AiClient for ClaudeAiClient {
 
     fn get_metadata(&self) -> AiClientMetadata {
         let registry = get_model_registry();
-        let max_context_length = registry.get_input_context(&self.model);
-        let max_response_length = registry.get_max_output_tokens(&self.model);
+        let (max_context_length, max_response_length) = match &self.active_beta {
+            Some((_, value)) => (
+                registry.get_input_context_with_beta(&self.model, value),
+                registry.get_max_output_tokens_with_beta(&self.model, value),
+            ),
+            None => (
+                registry.get_input_context(&self.model),
+                registry.get_max_output_tokens(&self.model),
+            ),
+        };
 
         AiClientMetadata {
             provider: "Anthropic".to_string(),
             model: self.model.clone(),
             max_context_length,
             max_response_length,
+            active_beta: self.active_beta.clone(),
         }
     }
 }

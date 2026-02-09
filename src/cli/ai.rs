@@ -50,7 +50,7 @@ impl ChatCommand {
         );
         eprintln!("Enter to send, Shift+Enter for newline, Ctrl+D to exit.\n");
 
-        let client = crate::claude::create_default_claude_client(self.model.clone())?;
+        let client = crate::claude::create_default_claude_client(self.model.clone(), None)?;
 
         let rt = tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
         rt.block_on(chat_loop(&client))

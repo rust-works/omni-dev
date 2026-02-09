@@ -39,7 +39,7 @@ impl ClaudeClient {
             .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
             .map_err(|_| ClaudeError::ApiKeyNotFound)?;
 
-        let ai_client = ClaudeAiClient::new(model, api_key);
+        let ai_client = ClaudeAiClient::new(model, api_key, None);
         Ok(Self::new(Box::new(ai_client)))
     }
 
@@ -486,8 +486,40 @@ impl ClaudeClient {
     }
 }
 
+/// Validate a beta header against the model registry
+fn validate_beta_header(model: &str, beta_header: &Option<(String, String)>) -> Result<()> {
+    if let Some((ref key, ref value)) = beta_header {
+        let registry = crate::claude::model_config::get_model_registry();
+        let supported = registry.get_beta_headers(model);
+        if !supported
+            .iter()
+            .any(|bh| bh.key == *key && bh.value == *value)
+        {
+            let available: Vec<String> = supported
+                .iter()
+                .map(|bh| format!("{}:{}", bh.key, bh.value))
+                .collect();
+            if available.is_empty() {
+                anyhow::bail!("Model '{}' does not support any beta headers", model);
+            } else {
+                anyhow::bail!(
+                    "Beta header '{}:{}' is not supported for model '{}'. Supported: {}",
+                    key,
+                    value,
+                    model,
+                    available.join(", ")
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Create a default Claude client using environment variables and settings
-pub fn create_default_claude_client(model: Option<String>) -> Result<ClaudeClient> {
+pub fn create_default_claude_client(
+    model: Option<String>,
+    beta_header: Option<(String, String)>,
+) -> Result<ClaudeClient> {
     use crate::claude::ai::openai::OpenAiAiClient;
     use crate::utils::settings::{get_env_var, get_env_vars};
 
@@ -517,8 +549,9 @@ pub fn create_default_claude_client(model: Option<String>) -> Result<ClaudeClien
         let ollama_model = model
             .or_else(|| get_env_var("OLLAMA_MODEL").ok())
             .unwrap_or_else(|| "llama2".to_string());
+        validate_beta_header(&ollama_model, &beta_header)?;
         let base_url = get_env_var("OLLAMA_BASE_URL").ok();
-        let ai_client = OpenAiAiClient::new_ollama(ollama_model, base_url);
+        let ai_client = OpenAiAiClient::new_ollama(ollama_model, base_url, beta_header);
         return Ok(ClaudeClient::new(Box::new(ai_client)));
     }
 
@@ -529,6 +562,7 @@ pub fn create_default_claude_client(model: Option<String>) -> Result<ClaudeClien
             .or_else(|| get_env_var("OPENAI_MODEL").ok())
             .unwrap_or_else(|| "gpt-5".to_string());
         debug!(openai_model = %openai_model, "Selected OpenAI model");
+        validate_beta_header(&openai_model, &beta_header)?;
 
         let api_key = get_env_vars(&["OPENAI_API_KEY", "OPENAI_AUTH_TOKEN"]).map_err(|e| {
             debug!(error = ?e, "Failed to get OpenAI API key");
@@ -536,7 +570,7 @@ pub fn create_default_claude_client(model: Option<String>) -> Result<ClaudeClien
         })?;
         debug!("OpenAI API key found");
 
-        let ai_client = OpenAiAiClient::new_openai(openai_model, api_key);
+        let ai_client = OpenAiAiClient::new_openai(openai_model, api_key, beta_header);
         debug!("OpenAI client created successfully");
         return Ok(ClaudeClient::new(Box::new(ai_client)));
     }
@@ -545,6 +579,7 @@ pub fn create_default_claude_client(model: Option<String>) -> Result<ClaudeClien
     let claude_model = model
         .or_else(|| get_env_var("ANTHROPIC_MODEL").ok())
         .unwrap_or_else(|| "claude-opus-4-1-20250805".to_string());
+    validate_beta_header(&claude_model, &beta_header)?;
 
     if use_bedrock {
         // Use Bedrock AI client
@@ -554,7 +589,7 @@ pub fn create_default_claude_client(model: Option<String>) -> Result<ClaudeClien
         let base_url =
             get_env_var("ANTHROPIC_BEDROCK_BASE_URL").map_err(|_| ClaudeError::ApiKeyNotFound)?;
 
-        let ai_client = BedrockAiClient::new(claude_model, auth_token, base_url);
+        let ai_client = BedrockAiClient::new(claude_model, auth_token, base_url, beta_header);
         return Ok(ClaudeClient::new(Box::new(ai_client)));
     }
 
@@ -567,7 +602,7 @@ pub fn create_default_claude_client(model: Option<String>) -> Result<ClaudeClien
     ])
     .map_err(|_| ClaudeError::ApiKeyNotFound)?;
 
-    let ai_client = ClaudeAiClient::new(claude_model, api_key);
+    let ai_client = ClaudeAiClient::new(claude_model, api_key, beta_header);
     debug!("Claude client created successfully");
     Ok(ClaudeClient::new(Box::new(ai_client)))
 }
