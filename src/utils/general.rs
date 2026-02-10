@@ -1,13 +1,13 @@
-//! Utility functions and helpers
+//! Utility functions and helpers.
 
 use std::fmt;
 
-/// Error type for utility functions
+/// Error type for utility functions.
 #[derive(Debug)]
 pub enum UtilError {
-    /// Invalid input error
+    /// Invalid input error.
     InvalidInput(String),
-    /// I/O error wrapper
+    /// I/O error wrapper.
     Io(std::io::Error),
 }
 
@@ -35,7 +35,7 @@ impl From<std::io::Error> for UtilError {
     }
 }
 
-/// Utility function to validate input strings
+/// Validates input strings.
 pub fn validate_input(input: &str) -> Result<(), UtilError> {
     if input.is_empty() {
         return Err(UtilError::InvalidInput("Input cannot be empty".to_string()));
@@ -48,7 +48,7 @@ pub fn validate_input(input: &str) -> Result<(), UtilError> {
     Ok(())
 }
 
-/// Format bytes into human-readable format
+/// Formats bytes into human-readable format.
 pub fn format_bytes(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
     let mut size = bytes as f64;
@@ -71,28 +71,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_validate_input_valid() {
+    fn validate_input_valid() {
         assert!(validate_input("valid input").is_ok());
     }
 
     #[test]
-    fn test_validate_input_empty() {
+    fn validate_input_empty() {
         assert!(validate_input("").is_err());
     }
 
     #[test]
-    fn test_validate_input_too_long() {
+    fn validate_input_too_long() {
         let long_input = "a".repeat(1001);
         assert!(validate_input(&long_input).is_err());
     }
 
     #[test]
-    fn test_format_bytes() {
-        assert_eq!(format_bytes(0), "0 B");
-        assert_eq!(format_bytes(512), "512 B");
-        assert_eq!(format_bytes(1024), "1.0 KB");
-        assert_eq!(format_bytes(1536), "1.5 KB");
-        assert_eq!(format_bytes(1048576), "1.0 MB");
-        assert_eq!(format_bytes(1073741824), "1.0 GB");
+    fn format_bytes() {
+        assert_eq!(super::format_bytes(0), "0 B");
+        assert_eq!(super::format_bytes(512), "512 B");
+        assert_eq!(super::format_bytes(1024), "1.0 KB");
+        assert_eq!(super::format_bytes(1536), "1.5 KB");
+        assert_eq!(super::format_bytes(1048576), "1.0 MB");
+        assert_eq!(super::format_bytes(1073741824), "1.0 GB");
     }
 }

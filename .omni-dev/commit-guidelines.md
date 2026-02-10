@@ -4,11 +4,11 @@ This project follows conventional commit format with specific requirements.
 
 ## Severity Levels
 
-| Severity | Sections                                                               |
-|----------|------------------------------------------------------------------------|
+| Severity | Sections                                                                |
+|----------|-------------------------------------------------------------------------|
 | error    | Commit Format, Types, Scopes, Subject Line, Accuracy, Breaking Changes |
-| warning  | Body Guidelines                                                        |
-| info     | Subject Line Style                                                     |
+| warning  | Body Guidelines                                                         |
+| info     | Subject Line Style                                                      |
 
 ## Commit Format
 
@@ -18,6 +18,13 @@ This project follows conventional commit format with specific requirements.
 [optional body]
 
 [optional footer(s)]
+```
+
+Multiple scopes are allowed when a commit spans more than one area.
+Separate scopes with a comma and no space:
+
+```
+<type>(<scope1>,<scope2>): <description>
 ```
 
 ## Types
@@ -42,13 +49,18 @@ Required. Must be one of:
 Required. Use scopes defined in `.omni-dev/scopes.yaml`:
 
 - `ci` - CI/CD pipelines and GitHub Actions workflows
-- `claude` - AI client implementation and integration
+- `claude` - Claude AI client implementation and integration
 - `cli` - Command-line interface and argument parsing
 - `git` - Git operations and repository analysis
 - `data` - Data structures and serialization
 - `docs` - Documentation and planning
-- `api` - External API integrations
+- `release` - Release process, versioning, and publishing
+- `scopes` - Commit scope definitions and configuration
 - `workflows` - GitHub Actions workflow files
+
+For multi-scope commits, the scopes are correct when each listed scope
+matches at least one modified file. Do not flag scopes as incorrect
+when the commit legitimately spans multiple areas.
 
 ## Subject Line
 
@@ -70,6 +82,14 @@ The commit message must accurately reflect the actual code changes:
 - **Description must be truthful**: Don't claim changes that weren't made
 - **Mention significant changes**: If you add error handling, logging, or change behavior, mention it
 
+Only flag accuracy errors when the commit message is clearly and
+materially wrong. Do not flag minor terminology differences,
+language-specific semantic debates, or cases where the description
+is substantially correct even if slightly imprecise. Before reporting
+an issue, verify your reasoning is internally consistent — if your
+own explanation concludes the commit is actually correct, do not
+report it.
+
 ## Body Guidelines
 
 For significant changes (>50 lines or architectural changes), include a body:
@@ -83,36 +103,61 @@ For significant changes (>50 lines or architectural changes), include a body:
 ## Breaking Changes
 
 For breaking changes:
-- Add `!` after type/scope: `feat(api)!: change response format`
+- Add `!` after type/scope: `feat(cli)!: change output format`
 - Include `BREAKING CHANGE:` footer with migration instructions
 
 ## Examples
 
 ### Simple change
 ```
-fix(cli): handle missing config file gracefully
+fix(git): handle detached HEAD in branch analysis
 ```
 
 ### Feature with body
 ```
-feat(claude): add contextual intelligence for commit message improvement
+feat(claude): implement contextual prompting for commit analysis
 
-Implements Phase 3 of the twiddle command enhancement with multi-layer
-context discovery including project conventions, branch analysis, and
-work pattern detection.
+Adds context-aware system prompts that incorporate project scopes,
+branch analysis, and file-level architectural understanding to
+produce higher-quality commit message suggestions.
 
-- Add project context discovery from .omni-dev/ configuration
-- Implement branch naming pattern analysis
-- Add work pattern detection across commit ranges
-- Enhance Claude prompting with contextual intelligence
+- Add CommitContext with project, branch, and file context
+- Implement scope-aware prompt generation
+- Extract file purpose and architectural layer classification
 
-Closes #12
+Closes #85
+```
+
+### Documentation
+```
+docs(docs): add ADR for context intelligence design
+```
+
+```
+docs(docs): add architecture overview document
+```
+
+### Multiple scopes
+```
+feat(cli,claude): add twiddle contextual options
+```
+
+```
+feat(git,data): integrate branch analysis with commit context
+
+Wires branch detection into the commit analysis pipeline and
+exposes branch context through the data structures.
+
+- Add BranchContext with work type detection
+- Integrate branch parsing into GitRepository
+- Surface branch context in YAML output
 ```
 
 ### Breaking change
 ```
-feat(api)!: change amendment response format to YAML
+feat(cli)!: change commit check output format
 
-BREAKING CHANGE: The amendment API now returns YAML instead of JSON.
-Update clients to use a YAML parser for response handling.
+BREAKING CHANGE: The check command now returns structured YAML
+instead of plain text. Update scripts that parse the output
+to use the new format.
 ```

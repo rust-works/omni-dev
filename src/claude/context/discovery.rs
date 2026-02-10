@@ -1,22 +1,24 @@
-//! Project context discovery system
+//! Project context discovery system.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::Result;
+use tracing::debug;
 
 use crate::data::context::{
     Ecosystem, FeatureContext, ProjectContext, ProjectConventions, ScopeDefinition,
     ScopeRequirements,
 };
-use anyhow::Result;
-use std::fs;
-use std::path::{Path, PathBuf};
-use tracing::debug;
 
-/// Project context discovery system
+/// Project context discovery system.
 pub struct ProjectDiscovery {
     repo_path: PathBuf,
     context_dir: PathBuf,
 }
 
 impl ProjectDiscovery {
-    /// Create a new project discovery instance
+    /// Creates a new project discovery instance.
     pub fn new(repo_path: PathBuf, context_dir: PathBuf) -> Self {
         Self {
             repo_path,
@@ -24,7 +26,7 @@ impl ProjectDiscovery {
         }
     }
 
-    /// Discover all project context
+    /// Discovers all project context.
     pub fn discover(&self) -> Result<ProjectContext> {
         let mut context = ProjectContext::default();
 
@@ -57,7 +59,7 @@ impl ProjectDiscovery {
         Ok(context)
     }
 
-    /// Load configuration from .omni-dev/ directory with local override support
+    /// Loads configuration from .omni-dev/ directory with local override support.
     fn load_omni_dev_config(&self, context: &mut ProjectContext, dir: &Path) -> Result<()> {
         // Load commit guidelines (with local override)
         let guidelines_path = self.resolve_config_file(dir, "commit-guidelines.md");
@@ -115,7 +117,7 @@ impl ProjectDiscovery {
         Ok(())
     }
 
-    /// Resolve configuration file path with local override support and home fallback
+    /// Resolves configuration file path with local override support and home fallback.
     ///
     /// Priority:
     /// 1. .omni-dev/local/{filename} (local override)
@@ -144,13 +146,13 @@ impl ProjectDiscovery {
         project_path
     }
 
-    /// Load git configuration files
+    /// Loads git configuration files.
     fn load_git_config(&self, _context: &mut ProjectContext) -> Result<()> {
         // Git configuration loading can be extended here if needed
         Ok(())
     }
 
-    /// Parse project documentation for conventions
+    /// Parses project documentation for conventions.
     fn parse_documentation(&self, context: &mut ProjectContext) -> Result<()> {
         // Parse CONTRIBUTING.md
         let contributing_path = self.repo_path.join("CONTRIBUTING.md");
@@ -169,7 +171,7 @@ impl ProjectDiscovery {
         Ok(())
     }
 
-    /// Detect project ecosystem and apply conventions
+    /// Detects project ecosystem and applies conventions.
     fn detect_ecosystem(&self, context: &mut ProjectContext) -> Result<()> {
         context.ecosystem = if self.repo_path.join("Cargo.toml").exists() {
             self.apply_rust_conventions(context)?;
@@ -197,7 +199,7 @@ impl ProjectDiscovery {
         Ok(())
     }
 
-    /// Load feature contexts from directory
+    /// Loads feature contexts from a directory.
     fn load_feature_contexts(
         &self,
         context: &mut ProjectContext,
@@ -226,7 +228,7 @@ impl ProjectDiscovery {
         Ok(())
     }
 
-    /// Parse CONTRIBUTING.md for conventions
+    /// Parses CONTRIBUTING.md for conventions.
     fn parse_contributing_conventions(&self, content: &str) -> Result<ProjectConventions> {
         let mut conventions = ProjectConventions::default();
 
@@ -284,7 +286,7 @@ impl ProjectDiscovery {
         Ok(conventions)
     }
 
-    /// Parse README.md for additional conventions
+    /// Parses README.md for additional conventions.
     fn parse_readme_conventions(&self, context: &mut ProjectContext, content: &str) -> Result<()> {
         // Look for development or contribution sections
         let lines: Vec<&str> = content.lines().collect();
@@ -309,7 +311,7 @@ impl ProjectDiscovery {
         Ok(())
     }
 
-    /// Extract scope requirements from contributing documentation
+    /// Extracts scope requirements from contributing documentation.
     fn extract_scope_requirements(&self, lines: &[&str]) -> ScopeRequirements {
         let mut requirements = ScopeRequirements::default();
 
@@ -337,7 +339,7 @@ impl ProjectDiscovery {
         requirements
     }
 
-    /// Apply Rust ecosystem conventions
+    /// Applies Rust ecosystem conventions.
     fn apply_rust_conventions(&self, context: &mut ProjectContext) -> Result<()> {
         // Add common Rust scopes if not already defined
         let rust_scopes = vec![
@@ -388,7 +390,7 @@ impl ProjectDiscovery {
         Ok(())
     }
 
-    /// Apply Node.js ecosystem conventions
+    /// Applies Node.js ecosystem conventions.
     fn apply_node_conventions(&self, context: &mut ProjectContext) -> Result<()> {
         let node_scopes = vec![
             (
@@ -432,7 +434,7 @@ impl ProjectDiscovery {
         Ok(())
     }
 
-    /// Apply Python ecosystem conventions
+    /// Applies Python ecosystem conventions.
     fn apply_python_conventions(&self, context: &mut ProjectContext) -> Result<()> {
         let python_scopes = vec![
             (
@@ -471,7 +473,7 @@ impl ProjectDiscovery {
         Ok(())
     }
 
-    /// Apply Go ecosystem conventions
+    /// Applies Go ecosystem conventions.
     fn apply_go_conventions(&self, context: &mut ProjectContext) -> Result<()> {
         let go_scopes = vec![
             (
@@ -504,7 +506,7 @@ impl ProjectDiscovery {
         Ok(())
     }
 
-    /// Apply Java ecosystem conventions
+    /// Applies Java ecosystem conventions.
     fn apply_java_conventions(&self, context: &mut ProjectContext) -> Result<()> {
         let java_scopes = vec![
             (
@@ -540,13 +542,13 @@ impl ProjectDiscovery {
     }
 }
 
-/// Configuration structure for scopes.yaml
+/// Configuration structure for scopes.yaml.
 #[derive(serde::Deserialize)]
 struct ScopesConfig {
     scopes: Vec<ScopeDefinition>,
 }
 
-/// Extract commit types from a line
+/// Extracts commit types from a line.
 fn extract_commit_types(line: &str) -> Vec<String> {
     let mut types = Vec::new();
     let common_types = [
@@ -562,7 +564,7 @@ fn extract_commit_types(line: &str) -> Vec<String> {
     types
 }
 
-/// Extract scope from project structure description
+/// Extracts a scope from a project structure description.
 fn extract_scope_from_structure(line: &str) -> Option<String> {
     // Look for patterns like "src/auth/", "lib/config/", etc.
     if let Some(start) = line.find("src/") {
@@ -575,7 +577,7 @@ fn extract_scope_from_structure(line: &str) -> Option<String> {
     None
 }
 
-/// Extract scopes from examples in documentation
+/// Extracts scopes from examples in documentation.
 fn extract_scopes_from_examples(line: &str) -> Vec<String> {
     let mut scopes = Vec::new();
     let common_scopes = ["auth", "api", "ui", "db", "config", "core", "cli", "web"];

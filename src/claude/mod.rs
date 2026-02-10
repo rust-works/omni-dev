@@ -1,4 +1,4 @@
-//! Claude API integration for commit message improvement
+//! Claude API integration for commit message improvement.
 
 pub mod ai;
 pub mod client;
@@ -9,7 +9,7 @@ pub mod prompts;
 
 pub use ai::bedrock::BedrockAiClient;
 pub use ai::claude::ClaudeAiClient;
-pub use ai::{AiClient, AiClientMetadata};
+pub use ai::{AiClient, AiClientMetadata, PromptStyle};
 pub use client::{create_default_claude_client, ClaudeClient};
 pub use context::*;
 pub use error::ClaudeError;

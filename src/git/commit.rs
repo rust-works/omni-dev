@@ -1,113 +1,118 @@
-//! Git commit operations and analysis
+//! Git commit operations and analysis.
+
+use std::fs;
+use std::sync::LazyLock;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset};
 use git2::{Commit, Repository};
 use globset::Glob;
-use serde::{Deserialize, Serialize};
-use std::fs;
-
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 use crate::data::context::ScopeDefinition;
 
-/// Commit information structure
+/// Matches conventional commit scope patterns including breaking-change syntax.
+static SCOPE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-z]+!\(([^)]+)\):|^[a-z]+\(([^)]+)\):").unwrap());
+
+/// Commit information structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitInfo {
-    /// Full SHA-1 hash of the commit
+    /// Full SHA-1 hash of the commit.
     pub hash: String,
-    /// Commit author name and email address
+    /// Commit author name and email address.
     pub author: String,
-    /// Commit date in ISO format with timezone
+    /// Commit date in ISO format with timezone.
     pub date: DateTime<FixedOffset>,
-    /// The original commit message as written by the author
+    /// The original commit message as written by the author.
     pub original_message: String,
-    /// Array of remote main branches that contain this commit
+    /// Array of remote main branches that contain this commit.
     pub in_main_branches: Vec<String>,
-    /// Automated analysis of the commit including type detection and proposed message
+    /// Automated analysis of the commit including type detection and proposed message.
     pub analysis: CommitAnalysis,
 }
 
-/// Commit analysis information
+/// Commit analysis information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitAnalysis {
-    /// Automatically detected conventional commit type (feat, fix, docs, test, chore, etc.)
+    /// Automatically detected conventional commit type (feat, fix, docs, test, chore, etc.).
     pub detected_type: String,
-    /// Automatically detected scope based on file paths (cli, git, data, etc.)
+    /// Automatically detected scope based on file paths (cli, git, data, etc.).
     pub detected_scope: String,
-    /// AI-generated conventional commit message based on file changes
+    /// AI-generated conventional commit message based on file changes.
     pub proposed_message: String,
-    /// Detailed statistics about file changes in this commit
+    /// Detailed statistics about file changes in this commit.
     pub file_changes: FileChanges,
-    /// Git diff --stat output showing lines changed per file
+    /// Git diff --stat output showing lines changed per file.
     pub diff_summary: String,
-    /// Path to diff file showing line-by-line changes
+    /// Path to diff file showing line-by-line changes.
     pub diff_file: String,
 }
 
-/// Enhanced commit analysis for AI processing with full diff content
+/// Enhanced commit analysis for AI processing with full diff content.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitAnalysisForAI {
-    /// Automatically detected conventional commit type (feat, fix, docs, test, chore, etc.)
+    /// Automatically detected conventional commit type (feat, fix, docs, test, chore, etc.).
     pub detected_type: String,
-    /// Automatically detected scope based on file paths (cli, git, data, etc.)
+    /// Automatically detected scope based on file paths (cli, git, data, etc.).
     pub detected_scope: String,
-    /// AI-generated conventional commit message based on file changes
+    /// AI-generated conventional commit message based on file changes.
     pub proposed_message: String,
-    /// Detailed statistics about file changes in this commit
+    /// Detailed statistics about file changes in this commit.
     pub file_changes: FileChanges,
-    /// Git diff --stat output showing lines changed per file
+    /// Git diff --stat output showing lines changed per file.
     pub diff_summary: String,
-    /// Path to diff file showing line-by-line changes
+    /// Path to diff file showing line-by-line changes.
     pub diff_file: String,
-    /// Full diff content for AI analysis
+    /// Full diff content for AI analysis.
     pub diff_content: String,
 }
 
-/// Commit information with enhanced analysis for AI processing
+/// Commit information with enhanced analysis for AI processing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitInfoForAI {
-    /// Full SHA-1 hash of the commit
+    /// Full SHA-1 hash of the commit.
     pub hash: String,
-    /// Commit author name and email address
+    /// Commit author name and email address.
     pub author: String,
-    /// Commit date in ISO format with timezone
+    /// Commit date in ISO format with timezone.
     pub date: DateTime<FixedOffset>,
-    /// The original commit message as written by the author
+    /// The original commit message as written by the author.
     pub original_message: String,
-    /// Array of remote main branches that contain this commit
+    /// Array of remote main branches that contain this commit.
     pub in_main_branches: Vec<String>,
-    /// Enhanced automated analysis of the commit including diff content
+    /// Enhanced automated analysis of the commit including diff content.
     pub analysis: CommitAnalysisForAI,
-    /// Deterministic checks already performed; the LLM should treat these as authoritative
+    /// Deterministic checks already performed; the LLM should treat these as authoritative.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pre_validated_checks: Vec<String>,
 }
 
-/// File changes statistics
+/// File changes statistics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileChanges {
-    /// Total number of files modified in this commit
+    /// Total number of files modified in this commit.
     pub total_files: usize,
-    /// Number of new files added in this commit
+    /// Number of new files added in this commit.
     pub files_added: usize,
-    /// Number of files deleted in this commit
+    /// Number of files deleted in this commit.
     pub files_deleted: usize,
-    /// Array of files changed with their git status (M=modified, A=added, D=deleted)
+    /// Array of files changed with their git status (M=modified, A=added, D=deleted).
     pub file_list: Vec<FileChange>,
 }
 
-/// Individual file change
+/// Individual file change.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileChange {
-    /// Git status code (A=added, M=modified, D=deleted, R=renamed)
+    /// Git status code (A=added, M=modified, D=deleted, R=renamed).
     pub status: String,
-    /// Path to the file relative to repository root
+    /// Path to the file relative to repository root.
     pub file: String,
 }
 
 impl CommitInfo {
-    /// Create CommitInfo from git2::Commit
+    /// Creates a `CommitInfo` from a `git2::Commit`.
     pub fn from_git_commit(repo: &Repository, commit: &Commit) -> Result<Self> {
         let hash = commit.id().to_string();
 
@@ -145,7 +150,7 @@ impl CommitInfo {
 }
 
 impl CommitAnalysis {
-    /// Analyze a commit and generate analysis information
+    /// Analyzes a commit and generates analysis information.
     pub fn analyze_commit(repo: &Repository, commit: &Commit) -> Result<Self> {
         // Get file changes
         let file_changes = Self::analyze_file_changes(repo, commit)?;
@@ -176,7 +181,7 @@ impl CommitAnalysis {
         })
     }
 
-    /// Analyze file changes in the commit
+    /// Analyzes file changes in the commit.
     fn analyze_file_changes(repo: &Repository, commit: &Commit) -> Result<FileChanges> {
         let mut file_list = Vec::new();
         let mut files_added = 0;
@@ -254,7 +259,7 @@ impl CommitAnalysis {
         })
     }
 
-    /// Detect conventional commit type based on files and existing message
+    /// Detects conventional commit type based on files and existing message.
     fn detect_commit_type(commit: &Commit, file_changes: &FileChanges) -> String {
         let message = commit.message().unwrap_or("");
 
@@ -305,7 +310,7 @@ impl CommitAnalysis {
         }
     }
 
-    /// Extract conventional commit type from existing message
+    /// Extracts conventional commit type from an existing message.
     fn extract_conventional_type(message: &str) -> Option<String> {
         let first_line = message.lines().next().unwrap_or("");
         if let Some(colon_pos) = first_line.find(':') {
@@ -322,7 +327,7 @@ impl CommitAnalysis {
         None
     }
 
-    /// Check if a string is a valid conventional commit type
+    /// Checks if a string is a valid conventional commit type.
     fn is_valid_conventional_type(s: &str) -> bool {
         matches!(
             s,
@@ -339,7 +344,7 @@ impl CommitAnalysis {
         )
     }
 
-    /// Detect scope from file paths
+    /// Detects scope from file paths.
     fn detect_scope(file_changes: &FileChanges) -> String {
         let files: Vec<&str> = file_changes
             .file_list
@@ -368,7 +373,7 @@ impl CommitAnalysis {
         }
     }
 
-    /// Re-detect scope using file_patterns from scope definitions.
+    /// Re-detects scope using file_patterns from scope definitions.
     ///
     /// More specific patterns (more literal path components) win regardless of
     /// definition order in scopes.yaml. Equally specific matches are joined
@@ -399,7 +404,8 @@ impl CommitAnalysis {
             return;
         }
 
-        let max_specificity = matches.iter().map(|(_, s)| *s).max().unwrap();
+        // SAFETY: matches is non-empty (guarded by early return above)
+        let max_specificity = matches.iter().map(|(_, s)| *s).max().expect("non-empty");
         let best: Vec<&str> = matches
             .into_iter()
             .filter(|(_, s)| *s == max_specificity)
@@ -409,7 +415,7 @@ impl CommitAnalysis {
         self.detected_scope = best.join(", ");
     }
 
-    /// Check if a scope's file_patterns match any of the given files.
+    /// Checks if a scope's file_patterns match any of the given files.
     ///
     /// Returns `Some(max_specificity)` if at least one file matches the scope
     /// (after applying negation patterns), or `None` if no file matches.
@@ -448,7 +454,7 @@ impl CommitAnalysis {
         max_specificity
     }
 
-    /// Count the number of literal (non-wildcard) path segments in a glob pattern.
+    /// Counts the number of literal (non-wildcard) path segments in a glob pattern.
     ///
     /// - `docs/adrs/**` → 2 (`docs`, `adrs`)
     /// - `docs/**` → 1 (`docs`)
@@ -461,7 +467,7 @@ impl CommitAnalysis {
             .count()
     }
 
-    /// Generate a proposed conventional commit message
+    /// Generates a proposed conventional commit message.
     fn generate_proposed_message(
         commit: &Commit,
         commit_type: &str,
@@ -491,7 +497,7 @@ impl CommitAnalysis {
         }
     }
 
-    /// Generate description based on commit type and changes
+    /// Generates a description based on commit type and changes.
     fn generate_description(commit_type: &str, file_changes: &FileChanges) -> String {
         match commit_type {
             "feat" => {
@@ -510,7 +516,7 @@ impl CommitAnalysis {
         }
     }
 
-    /// Get diff summary statistics
+    /// Returns diff summary statistics.
     fn get_diff_summary(repo: &Repository, commit: &Commit) -> Result<String> {
         let commit_tree = commit.tree().context("Failed to get commit tree")?;
 
@@ -558,7 +564,7 @@ impl CommitAnalysis {
         Ok(summary)
     }
 
-    /// Write full diff content to a file and return the path
+    /// Writes full diff content to a file and returns the path.
     fn write_diff_to_file(repo: &Repository, commit: &Commit) -> Result<String> {
         // Get AI scratch directory
         let ai_scratch_path = crate::utils::ai_scratch::get_ai_scratch_dir()
@@ -627,7 +633,7 @@ impl CommitAnalysis {
 }
 
 impl CommitInfoForAI {
-    /// Convert from basic CommitInfo by loading diff content
+    /// Converts from a basic `CommitInfo` by loading diff content.
     pub fn from_commit_info(commit_info: CommitInfo) -> Result<Self> {
         let analysis = CommitAnalysisForAI::from_commit_analysis(commit_info.analysis)?;
 
@@ -642,12 +648,11 @@ impl CommitInfoForAI {
         })
     }
 
-    /// Run deterministic pre-validation checks on the commit message.
+    /// Runs deterministic pre-validation checks on the commit message.
     /// Passing checks are recorded in pre_validated_checks so the LLM
     /// can skip re-checking them. Failing checks are not recorded.
     pub fn run_pre_validation_checks(&mut self) {
-        let re = Regex::new(r"^[a-z]+!\(([^)]+)\):|^[a-z]+\(([^)]+)\):").unwrap();
-        if let Some(caps) = re.captures(&self.original_message) {
+        if let Some(caps) = SCOPE_RE.captures(&self.original_message) {
             let scope = caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str());
             if let Some(scope) = scope {
                 if scope.contains(',') && !scope.contains(", ") {
@@ -662,7 +667,7 @@ impl CommitInfoForAI {
 }
 
 impl CommitAnalysisForAI {
-    /// Convert from basic CommitAnalysis by loading diff content from file
+    /// Converts from a basic `CommitAnalysis` by loading diff content from file.
     pub fn from_commit_analysis(analysis: CommitAnalysis) -> Result<Self> {
         // Read the actual diff content from the file
         let diff_content = fs::read_to_string(&analysis.diff_file)

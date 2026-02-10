@@ -1,44 +1,44 @@
-//! Configuration-related CLI commands
+//! Configuration-related CLI commands.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-/// Configuration operations
+/// Configuration operations.
 #[derive(Parser)]
 pub struct ConfigCommand {
-    /// Configuration subcommand to execute
+    /// Configuration subcommand to execute.
     #[command(subcommand)]
     pub command: ConfigSubcommands,
 }
 
-/// Configuration subcommands
+/// Configuration subcommands.
 #[derive(Subcommand)]
 pub enum ConfigSubcommands {
-    /// AI model configuration and information
+    /// AI model configuration and information.
     Models(ModelsCommand),
 }
 
-/// Models operations
+/// Models operations.
 #[derive(Parser)]
 pub struct ModelsCommand {
-    /// Models subcommand to execute
+    /// Models subcommand to execute.
     #[command(subcommand)]
     pub command: ModelsSubcommands,
 }
 
-/// Models subcommands
+/// Models subcommands.
 #[derive(Subcommand)]
 pub enum ModelsSubcommands {
-    /// Show the embedded models.yaml configuration
+    /// Shows the embedded models.yaml configuration.
     Show(ShowCommand),
 }
 
-/// Show command options
+/// Show command options.
 #[derive(Parser)]
 pub struct ShowCommand {}
 
 impl ConfigCommand {
-    /// Execute config command
+    /// Executes the config command.
     pub fn execute(self) -> Result<()> {
         match self.command {
             ConfigSubcommands::Models(models_cmd) => models_cmd.execute(),
@@ -47,7 +47,7 @@ impl ConfigCommand {
 }
 
 impl ModelsCommand {
-    /// Execute models command
+    /// Executes the models command.
     pub fn execute(self) -> Result<()> {
         match self.command {
             ModelsSubcommands::Show(show_cmd) => show_cmd.execute(),
@@ -56,7 +56,7 @@ impl ModelsCommand {
 }
 
 impl ShowCommand {
-    /// Execute show command
+    /// Executes the show command.
     pub fn execute(self) -> Result<()> {
         // Print the embedded models.yaml file
         let yaml_content = include_str!("../templates/models.yaml");

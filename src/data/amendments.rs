@@ -1,28 +1,29 @@
-//! Amendment data structures and validation
+//! Amendment data structures and validation.
 
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
-/// Amendment file structure
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+/// Amendment file structure.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AmendmentFile {
-    /// List of commit amendments to apply
+    /// List of commit amendments to apply.
     pub amendments: Vec<Amendment>,
 }
 
-/// Individual commit amendment
+/// Individual commit amendment.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Amendment {
-    /// Full 40-character SHA-1 commit hash
+    /// Full 40-character SHA-1 commit hash.
     pub commit: String,
-    /// New commit message
+    /// New commit message.
     pub message: String,
 }
 
 impl AmendmentFile {
-    /// Load amendments from YAML file
+    /// Loads amendments from a YAML file.
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = fs::read_to_string(&path).with_context(|| {
             format!("Failed to read amendment file: {}", path.as_ref().display())
@@ -36,7 +37,7 @@ impl AmendmentFile {
         Ok(amendment_file)
     }
 
-    /// Validate amendment file structure and content
+    /// Validates amendment file structure and content.
     pub fn validate(&self) -> Result<()> {
         // Empty amendments are allowed - they indicate no changes are needed
         for (i, amendment) in self.amendments.iter().enumerate() {
@@ -48,7 +49,7 @@ impl AmendmentFile {
         Ok(())
     }
 
-    /// Save amendments to YAML file with proper multiline formatting
+    /// Saves amendments to a YAML file with proper multiline formatting.
     pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let yaml_content =
             serde_yaml::to_string(self).context("Failed to serialize amendments to YAML")?;
@@ -66,7 +67,7 @@ impl AmendmentFile {
         Ok(())
     }
 
-    /// Format YAML to use literal block scalars for multiline messages
+    /// Formats YAML to use literal block scalars for multiline messages.
     fn format_multiline_yaml(&self, yaml: &str) -> String {
         let mut result = String::new();
         let lines: Vec<&str> = yaml.lines().collect();
@@ -119,12 +120,12 @@ impl AmendmentFile {
 }
 
 impl Amendment {
-    /// Create a new amendment
+    /// Creates a new amendment.
     pub fn new(commit: String, message: String) -> Self {
         Self { commit, message }
     }
 
-    /// Validate amendment structure
+    /// Validates amendment structure.
     pub fn validate(&self) -> Result<()> {
         // Validate commit hash format
         if self.commit.len() != 40 {

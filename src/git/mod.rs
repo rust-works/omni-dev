@@ -1,4 +1,4 @@
-//! Git operations and repository management
+//! Git operations and repository management.
 
 use anyhow::{Context, Result};
 use git2::Repository;
@@ -13,13 +13,16 @@ pub use commit::{CommitAnalysis, CommitAnalysisForAI, CommitInfo, CommitInfoForA
 pub use remote::RemoteInfo;
 pub use repository::GitRepository;
 
-/// Check if the current directory is a git repository
+/// Number of hex characters to show in abbreviated commit hashes.
+pub const SHORT_HASH_LEN: usize = 8;
+
+/// Checks if the current directory is a git repository.
 pub fn check_git_repo() -> Result<()> {
     Repository::open(".").context("Not in a git repository")?;
     Ok(())
 }
 
-/// Check if working directory is clean
+/// Checks if the working directory is clean.
 pub fn check_working_directory_clean() -> Result<()> {
     let repo = Repository::open(".").context("Failed to open git repository")?;
 

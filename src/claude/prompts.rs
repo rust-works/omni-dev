@@ -1,12 +1,13 @@
-//! Prompt templates and engineering for Claude API
+//! Prompt templates and engineering for Claude API.
 
+use crate::claude::ai::PromptStyle;
 use crate::data::context::{CommitContext, VerbosityLevel, WorkPattern};
 
 /// Default commit guidelines embedded from markdown file at compile time.
 /// Used by both twiddle and check commands when no project-specific guidelines are provided.
 const DEFAULT_COMMIT_GUIDELINES: &str = include_str!("../templates/default-commit-guidelines.md");
 
-/// Basic system prompt for commit message improvement (Phase 1 & 2)
+/// Basic system prompt for commit message improvement (Phase 1 & 2).
 pub const BASIC_SYSTEM_PROMPT: &str = r#"You are an expert software engineer helping improve git commit messages. You will receive a YAML representation of a git repository with commit information and specific commit message guidelines to follow.
 
 Your task is to analyze the commits and suggest improvements based on:
@@ -90,18 +91,18 @@ CRITICAL YAML FORMATTING REQUIREMENTS:
 4. Use proper indentation and line breaks for readability
 5. Leave blank lines between sections for better formatting"#;
 
-/// Legacy alias for backward compatibility
+/// Legacy alias for backward compatibility.
 pub const SYSTEM_PROMPT: &str = BASIC_SYSTEM_PROMPT;
 
-/// Generate contextual system prompt based on project and commit context (Phase 3)
+/// Generates a contextual system prompt based on project and commit context (Phase 3).
 pub fn generate_contextual_system_prompt(context: &CommitContext) -> String {
-    generate_contextual_system_prompt_for_provider(context, "claude")
+    generate_contextual_system_prompt_for_provider(context, PromptStyle::Claude)
 }
 
-/// Generate contextual system prompt with provider-specific handling
+/// Generates a contextual system prompt with provider-specific handling.
 pub fn generate_contextual_system_prompt_for_provider(
     context: &CommitContext,
-    provider: &str,
+    provider: PromptStyle,
 ) -> String {
     let mut prompt = BASIC_SYSTEM_PROMPT.to_string();
 
@@ -153,7 +154,7 @@ pub fn generate_contextual_system_prompt_for_provider(
 
     // Add project-specific commit guidelines with provider-specific handling
     if let Some(guidelines) = &context.project.commit_guidelines {
-        if provider == "claude" {
+        if provider == PromptStyle::Claude {
             // Claude models handle "literal template" instructions correctly
             prompt.push_str("\n\n=== MANDATORY COMMIT MESSAGE TEMPLATE ===");
             prompt.push_str("\nThis is a LITERAL TEMPLATE that you must reproduce EXACTLY.");
@@ -267,7 +268,7 @@ pub fn generate_contextual_system_prompt_for_provider(
     prompt
 }
 
-/// Generate basic user prompt from repository view YAML (Phase 1 & 2)
+/// Generates a basic user prompt from repository view YAML (Phase 1 & 2).
 pub fn generate_user_prompt(repo_yaml: &str) -> String {
     format!(
         r#"Please analyze the following repository information and suggest commit message improvements:
@@ -297,7 +298,7 @@ CRITICAL: Even if a commit message is perfect and needs no changes, include it i
     )
 }
 
-/// Generate contextual user prompt with enhanced analysis (Phase 3)
+/// Generates a contextual user prompt with enhanced analysis (Phase 3).
 pub fn generate_contextual_user_prompt(repo_yaml: &str, context: &CommitContext) -> String {
     let mut prompt = format!(
         "Please analyze the following repository information and suggest commit message improvements:\n\n{}\n\n",
@@ -389,7 +390,7 @@ pub fn generate_contextual_user_prompt(repo_yaml: &str, context: &CommitContext)
     prompt
 }
 
-/// System prompt for PR description generation
+/// System prompt for PR description generation.
 pub const PR_GENERATION_SYSTEM_PROMPT: &str = r#"You are a software engineer generating pull request descriptions. You will receive git repository data and a PR template.
 
 Your task:
@@ -415,7 +416,7 @@ Requirements:
 - Remove template comments and instructions
 - Provide specific details about what was changed"#;
 
-/// Generate PR description using AI analysis
+/// Generates a PR description using AI analysis.
 pub fn generate_pr_description_prompt(repo_yaml: &str, pr_template: &str) -> String {
     format!(
         r#"Please analyze the following repository information and generate a comprehensive pull request description by filling in the provided template:
@@ -449,22 +450,22 @@ Start immediately with "title:" and provide only YAML content. Ensure the title 
     )
 }
 
-/// Generate PR system prompt with project context and guidelines  
+/// Generates a PR system prompt with project context and guidelines.
 pub fn generate_pr_system_prompt_with_context(
     context: &crate::data::context::CommitContext,
 ) -> String {
-    generate_pr_system_prompt_with_context_for_provider(context, "claude")
+    generate_pr_system_prompt_with_context_for_provider(context, PromptStyle::Claude)
 }
 
-/// Generate PR system prompt with provider-specific handling
+/// Generates a PR system prompt with provider-specific handling.
 pub fn generate_pr_system_prompt_with_context_for_provider(
     context: &crate::data::context::CommitContext,
-    provider: &str,
+    provider: PromptStyle,
 ) -> String {
     let mut prompt = PR_GENERATION_SYSTEM_PROMPT.to_string();
 
     // Add provider-specific template handling instructions
-    if provider == "claude" {
+    if provider == PromptStyle::Claude {
         prompt.push_str("\n\n=== TEMPLATE HANDLING FOR CLAUDE ===");
         prompt.push_str(
             "\nThe PR template provided is a TEMPLATE TO FILL OUT, not literal text to copy.",
@@ -510,7 +511,7 @@ pub fn generate_pr_system_prompt_with_context_for_provider(
     prompt
 }
 
-/// Generate PR description prompt with project context
+/// Generates a PR description prompt with project context.
 pub fn generate_pr_description_prompt_with_context(
     repo_yaml: &str,
     pr_template: &str,
@@ -569,7 +570,7 @@ Start immediately with "title:" and provide only YAML content. The title should 
     prompt
 }
 
-/// System prompt for commit message check/validation
+/// System prompt for commit message check/validation.
 pub const CHECK_SYSTEM_PROMPT: &str = r#"You are a commit message reviewer. Your task is to evaluate commit messages against project guidelines and report violations.
 
 You will receive:
@@ -651,12 +652,12 @@ IMPORTANT:
 - Set `passes: true` only if there are no error or warning level issues
 - Info-level issues do not affect the `passes` status"#;
 
-/// Generate check system prompt with project guidelines
+/// Generates a check system prompt with project guidelines.
 pub fn generate_check_system_prompt(guidelines: Option<&str>) -> String {
     generate_check_system_prompt_with_scopes(guidelines, &[])
 }
 
-/// Generate check system prompt with project guidelines and valid scopes
+/// Generates a check system prompt with project guidelines and valid scopes.
 pub fn generate_check_system_prompt_with_scopes(
     guidelines: Option<&str>,
     valid_scopes: &[crate::data::context::ScopeDefinition],
@@ -687,7 +688,7 @@ pub fn generate_check_system_prompt_with_scopes(
     prompt
 }
 
-/// Generate user prompt for check command
+/// Generates a user prompt for the check command.
 pub fn generate_check_user_prompt(repo_yaml: &str, include_suggestions: bool) -> String {
     let mut prompt = format!(
         r#"Please analyze the following commits and check their messages against the guidelines:
