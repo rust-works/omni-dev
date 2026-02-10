@@ -31,6 +31,7 @@ omni-dev is a powerful Git commit message analysis and amendment toolkit written
 - `README.md` - Main project documentation
 - `CHANGELOG.md` - Version history and changes
 - `CONTRIBUTING.md` - Contribution guidelines
+- `docs/STYLE_GUIDE.md` - Coding conventions (error handling, naming, visibility, imports, etc.)
 - `docs/RELEASE.md` - Release process documentation
 - `docs/plan/` - Project planning and specifications
 
@@ -64,9 +65,9 @@ Common types: `feat`, `fix`, `docs`, `chore`, `refactor`, `test`
 
 ### Code Changes
 1. **Read Before Writing**: Always read existing files before making changes
-2. **Follow Patterns**: Match existing code style and patterns
+2. **Follow the Style Guide**: Read [docs/STYLE_GUIDE.md](docs/STYLE_GUIDE.md) before writing code — it covers error handling, naming, visibility, imports, testing, and more
 3. **Test Changes**: Run tests after modifications
-4. **Conventional Commits**: Use proper commit message format
+4. **Conventional Commits**: Use proper commit message format (see `.omni-dev/commit-guidelines.md`)
 5. **Incremental Changes**: Make focused, reviewable changes
 
 ### Release Process
