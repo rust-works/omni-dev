@@ -14,13 +14,14 @@ by Michael Nygard.
 
 | Emoji | Status     | Meaning                               |
 |-------|------------|---------------------------------------|
-| 🟡    | Proposed   | Under discussion, not yet agreed upon |
-| ✅    | Accepted   | Agreed and in effect                  |
-| ❌    | Deprecated | No longer applies                     |
-| 🔄    | Superseded | Replaced by a newer ADR               |
+| 🟡    | Proposed   | Under discussion, not yet agreed upon  |
+| ✅    | Accepted   | Agreed and in effect                   |
+| ❌    | Deprecated | No longer applies                      |
+| 🔄    | Superseded | Replaced by a newer ADR                |
 
 ## Inventory
 
-| ADR                     | Status      | Date       | Title                             |
-|-------------------------|-------------|------------|-----------------------------------|
-| [ADR-0000](adr-0000.md) | ✅ Accepted | 2026-02-10 | Use Architecture Decision Records |
+| ADR                      | Status      | Date       | Title                                      |
+|--------------------------|-------------|------------|--------------------------------------------|
+| [ADR-0000](adr-0000.md)  | ✅ Accepted | 2026-02-10 | Use Architecture Decision Records          |
+| [ADR-0001](adr-0001.md)  | ✅ Accepted | 2026-02-10 | YAML as Primary Human Data Exchange Format |
