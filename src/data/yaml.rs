@@ -1,12 +1,13 @@
-//! YAML processing utilities
+//! YAML processing utilities.
+
+use std::fs;
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::Path;
 use yaml_rust_davvid::YamlEmitter;
 
-/// Serialize data structure to YAML string with proper multi-line formatting
+/// Serializes a data structure to a YAML string with proper multi-line formatting.
 pub fn to_yaml<T: Serialize>(data: &T) -> Result<String> {
     use tracing::debug;
 
@@ -38,7 +39,7 @@ pub fn to_yaml<T: Serialize>(data: &T) -> Result<String> {
     Ok(output)
 }
 
-/// Convert serde_yaml::Value to yaml_rust_davvid::Yaml
+/// Converts a `serde_yaml::Value` to `yaml_rust_davvid::Yaml`.
 fn convert_serde_to_yaml_rust(value: &serde_yaml::Value) -> Result<yaml_rust_davvid::Yaml> {
     use tracing::debug;
     use yaml_rust_davvid::Yaml;
@@ -84,7 +85,7 @@ fn convert_serde_to_yaml_rust(value: &serde_yaml::Value) -> Result<yaml_rust_dav
     }
 }
 
-/// Deserialize YAML string to data structure
+/// Deserializes a YAML string to a data structure.
 pub fn from_yaml<T: for<'de> Deserialize<'de>>(yaml: &str) -> Result<T> {
     use tracing::debug;
 
@@ -109,7 +110,7 @@ pub fn from_yaml<T: for<'de> Deserialize<'de>>(yaml: &str) -> Result<T> {
     result
 }
 
-/// Read and parse YAML file
+/// Reads and parses a YAML file.
 pub fn read_yaml_file<T: for<'de> Deserialize<'de>, P: AsRef<Path>>(path: P) -> Result<T> {
     let content = fs::read_to_string(&path)
         .with_context(|| format!("Failed to read file: {}", path.as_ref().display()))?;
@@ -117,7 +118,7 @@ pub fn read_yaml_file<T: for<'de> Deserialize<'de>, P: AsRef<Path>>(path: P) -> 
     from_yaml(&content)
 }
 
-/// Write data structure to YAML file
+/// Writes a data structure to a YAML file.
 pub fn write_yaml_file<T: Serialize, P: AsRef<Path>>(data: &T, path: P) -> Result<()> {
     let yaml_content = to_yaml(data)?;
 
@@ -139,7 +140,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multiline_yaml_with_literal_blocks() {
+    fn multiline_yaml_with_literal_blocks() {
         let test_data = TestDiffContent {
             diff_content: "diff --git a/file.txt b/file.txt\nindex 123..456 100644\n--- a/file.txt\n+++ b/file.txt\n@@ -1,3 +1,3 @@\n-old line\n+new line".to_string(),
             description: "This is a\nmultiline\ndescription".to_string(),
@@ -174,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn test_yaml_round_trip_preserves_content() {
+    fn yaml_round_trip_preserves_content() {
         let original = TestDiffContent {
             diff_content: "line1\nline2\nline3".to_string(),
             description: "desc line1\ndesc line2".to_string(),
@@ -192,7 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ai_response_like_yaml_parsing() {
+    fn ai_response_like_yaml_parsing() {
         // Simulate EXACTLY what the AI is generating based on the debug logs
         let ai_response_yaml = r#"title: "deps(test): upgrade hedgehog-extras to 0.10.0.0"
 description: |

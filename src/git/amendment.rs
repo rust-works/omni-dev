@@ -1,24 +1,28 @@
-//! Git commit amendment operations
+//! Git commit amendment operations.
 
-use crate::data::amendments::{Amendment, AmendmentFile};
-use anyhow::{Context, Result};
-use git2::{Oid, Repository};
 use std::collections::HashMap;
 use std::process::Command;
 
-/// Amendment operation handler
+use anyhow::{Context, Result};
+use git2::{Oid, Repository};
+use tracing::debug;
+
+use crate::data::amendments::{Amendment, AmendmentFile};
+use crate::git::SHORT_HASH_LEN;
+
+/// Amendment operation handler.
 pub struct AmendmentHandler {
     repo: Repository,
 }
 
 impl AmendmentHandler {
-    /// Create a new amendment handler
+    /// Creates a new amendment handler.
     pub fn new() -> Result<Self> {
         let repo = Repository::open(".").context("Failed to open git repository")?;
         Ok(Self { repo })
     }
 
-    /// Apply amendments from a YAML file
+    /// Applies amendments from a YAML file.
     pub fn apply_amendments(&self, yaml_file: &str) -> Result<()> {
         // Load and validate amendment file
         let amendment_file = AmendmentFile::load_from_file(yaml_file)?;
@@ -36,7 +40,10 @@ impl AmendmentHandler {
 
         // Check if we only need to amend HEAD
         if amendments.len() == 1 && self.is_head_commit(&amendments[0].0)? {
-            println!("Amending HEAD commit: {}", &amendments[0].0[..8]);
+            println!(
+                "Amending HEAD commit: {}",
+                &amendments[0].0[..SHORT_HASH_LEN]
+            );
             self.amend_head_commit(&amendments[0].1)?;
         } else {
             println!(
@@ -50,7 +57,7 @@ impl AmendmentHandler {
         Ok(())
     }
 
-    /// Perform safety checks before amendment
+    /// Performs safety checks before amendment.
     fn perform_safety_checks(&self, amendment_file: &AmendmentFile) -> Result<()> {
         // Check if working directory is clean
         self.check_working_directory_clean()
@@ -64,7 +71,7 @@ impl AmendmentHandler {
         Ok(())
     }
 
-    /// Validate that a commit can be safely amended
+    /// Validates that a commit can be safely amended.
     fn validate_commit_amendable(&self, commit_hash: &str) -> Result<()> {
         // Check if commit exists
         let oid = Oid::from_str(commit_hash)
@@ -82,7 +89,7 @@ impl AmendmentHandler {
         Ok(())
     }
 
-    /// Organize amendments by their order in git history
+    /// Organizes amendments by their order in git history.
     fn organize_amendments(&self, amendments: &[Amendment]) -> Result<Vec<(String, String)>> {
         let mut valid_amendments = Vec::new();
         let mut commit_depths = HashMap::new();
@@ -95,7 +102,7 @@ impl AmendmentHandler {
             } else {
                 println!(
                     "Warning: Skipping invalid commit {}",
-                    &amendment.commit[..8]
+                    &amendment.commit[..SHORT_HASH_LEN]
                 );
             }
         }
@@ -109,7 +116,7 @@ impl AmendmentHandler {
         Ok(valid_amendments)
     }
 
-    /// Get the depth of a commit from HEAD (0 = HEAD, 1 = HEAD~1, etc.)
+    /// Returns the depth of a commit from HEAD (0 = HEAD, 1 = HEAD~1, etc.).
     fn get_commit_depth_from_head(&self, commit_hash: &str) -> Result<usize> {
         let target_oid = Oid::from_str(commit_hash)?;
         let mut revwalk = self.repo.revwalk()?;
@@ -125,14 +132,14 @@ impl AmendmentHandler {
         anyhow::bail!("Commit {} not found in current branch history", commit_hash);
     }
 
-    /// Check if a commit hash is the current HEAD
+    /// Checks if a commit hash is the current HEAD.
     fn is_head_commit(&self, commit_hash: &str) -> Result<bool> {
         let head_oid = self.repo.head()?.target().context("HEAD has no target")?;
         let target_oid = Oid::from_str(commit_hash)?;
         Ok(head_oid == target_oid)
     }
 
-    /// Amend the HEAD commit message
+    /// Amends the HEAD commit message.
     fn amend_head_commit(&self, new_message: &str) -> Result<()> {
         let head_commit = self.repo.head()?.peel_to_commit()?;
 
@@ -152,14 +159,14 @@ impl AmendmentHandler {
 
         println!(
             "✅ Amended HEAD commit {} -> {}",
-            &head_commit.id().to_string()[..8],
-            &new_head.id().to_string()[..8]
+            &head_commit.id().to_string()[..SHORT_HASH_LEN],
+            &new_head.id().to_string()[..SHORT_HASH_LEN]
         );
 
         Ok(())
     }
 
-    /// Amend commits via individual interactive rebases (following shell script strategy)
+    /// Amends commits via individual interactive rebases (following shell script strategy).
     fn amend_via_rebase(&self, amendments: Vec<(String, String)>) -> Result<()> {
         if amendments.is_empty() {
             return Ok(());
@@ -178,11 +185,15 @@ impl AmendmentHandler {
 
             if depth == 0 {
                 // This is HEAD - simple amendment
-                println!("Amending HEAD commit: {}", &commit_hash[..8]);
+                println!("Amending HEAD commit: {}", &commit_hash[..SHORT_HASH_LEN]);
                 self.amend_head_commit(&new_message)?;
             } else {
                 // This is an older commit - use individual interactive rebase
-                println!("Amending commit at depth {}: {}", depth, &commit_hash[..8]);
+                println!(
+                    "Amending commit at depth {}: {}",
+                    depth,
+                    &commit_hash[..SHORT_HASH_LEN]
+                );
                 self.amend_single_commit_via_rebase(&commit_hash, &new_message)?;
             }
         }
@@ -190,7 +201,7 @@ impl AmendmentHandler {
         Ok(())
     }
 
-    /// Amend a single commit using individual interactive rebase (shell script strategy)
+    /// Amends a single commit using individual interactive rebase (shell script strategy).
     fn amend_single_commit_via_rebase(&self, commit_hash: &str, new_message: &str) -> Result<()> {
         // Get the parent of the target commit to use as rebase base
         let base_commit = format!("{}^", commit_hash);
@@ -241,7 +252,7 @@ impl AmendmentHandler {
 
         println!(
             "Starting interactive rebase to amend commit: {}",
-            &commit_hash[..8]
+            &commit_hash[..SHORT_HASH_LEN]
         );
 
         // Execute rebase with custom sequence editor
@@ -258,8 +269,10 @@ impl AmendmentHandler {
         if !rebase_result.status.success() {
             let error_msg = String::from_utf8_lossy(&rebase_result.stderr);
 
-            // Try to abort the rebase if it failed
-            let _ = Command::new("git").args(["rebase", "--abort"]).output();
+            // Best-effort cleanup; the rebase may not have started.
+            if let Err(e) = Command::new("git").args(["rebase", "--abort"]).output() {
+                debug!("Rebase abort during cleanup failed: {e}");
+            }
 
             anyhow::bail!("Interactive rebase failed: {}", error_msg);
         }
@@ -288,11 +301,14 @@ impl AmendmentHandler {
 
                 if !amend_result.status.success() {
                     let error_msg = String::from_utf8_lossy(&amend_result.stderr);
-                    let _ = Command::new("git").args(["rebase", "--abort"]).output();
+                    // Best-effort cleanup; abort so the repo isn't left mid-rebase.
+                    if let Err(e) = Command::new("git").args(["rebase", "--abort"]).output() {
+                        debug!("Rebase abort during cleanup failed: {e}");
+                    }
                     anyhow::bail!("Failed to amend commit: {}", error_msg);
                 }
 
-                println!("✅ Amended commit: {}", &commit_hash[..8]);
+                println!("✅ Amended commit: {}", &commit_hash[..SHORT_HASH_LEN]);
 
                 // Continue the rebase
                 let continue_result = Command::new("git")
@@ -302,17 +318,23 @@ impl AmendmentHandler {
 
                 if !continue_result.status.success() {
                     let error_msg = String::from_utf8_lossy(&continue_result.stderr);
-                    let _ = Command::new("git").args(["rebase", "--abort"]).output();
+                    // Best-effort cleanup; abort so the repo isn't left mid-rebase.
+                    if let Err(e) = Command::new("git").args(["rebase", "--abort"]).output() {
+                        debug!("Rebase abort during cleanup failed: {e}");
+                    }
                     anyhow::bail!("Failed to continue rebase: {}", error_msg);
                 }
 
                 println!("✅ Rebase completed successfully");
             } else {
-                let _ = Command::new("git").args(["rebase", "--abort"]).output();
+                // Best-effort cleanup; abort so the repo isn't left mid-rebase.
+                if let Err(e) = Command::new("git").args(["rebase", "--abort"]).output() {
+                    debug!("Rebase abort during cleanup failed: {e}");
+                }
                 anyhow::bail!(
                     "Unexpected commit during rebase. Expected {}, got {}",
-                    &commit_hash[..8],
-                    &current_commit[..8]
+                    &commit_hash[..SHORT_HASH_LEN],
+                    &current_commit[..SHORT_HASH_LEN]
                 );
             }
         } else if repo_state != git2::RepositoryState::Clean {
@@ -325,7 +347,7 @@ impl AmendmentHandler {
         Ok(())
     }
 
-    /// Check if working directory is clean (uses the repository instance)
+    /// Checks if the working directory is clean (uses the repository instance).
     fn check_working_directory_clean(&self) -> Result<()> {
         let statuses = self
             .repo

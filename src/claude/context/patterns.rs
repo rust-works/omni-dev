@@ -1,17 +1,18 @@
-//! Work pattern detection and analysis
+//! Work pattern detection and analysis.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 use crate::data::context::{
     ArchitecturalImpact, ChangeSignificance, CommitRangeContext, ScopeAnalysis, WorkPattern,
 };
 use crate::git::CommitInfo;
-use std::collections::HashMap;
-use std::path::PathBuf;
 
-/// Work pattern analyzer for commit ranges
+/// Work pattern analyzer for commit ranges.
 pub struct WorkPatternAnalyzer;
 
 impl WorkPatternAnalyzer {
-    /// Analyze a range of commits to detect work patterns
+    /// Analyzes a range of commits to detect work patterns.
     pub fn analyze_commit_range(commits: &[CommitInfo]) -> CommitRangeContext {
         let mut context = CommitRangeContext::default();
 
@@ -38,7 +39,7 @@ impl WorkPatternAnalyzer {
         context
     }
 
-    /// Find files that appear in multiple commits
+    /// Finds files that appear in multiple commits.
     fn find_common_files(commits: &[CommitInfo]) -> Vec<PathBuf> {
         let mut file_counts: HashMap<String, usize> = HashMap::new();
 
@@ -56,7 +57,7 @@ impl WorkPatternAnalyzer {
             .collect()
     }
 
-    /// Detect the overall work pattern across commits
+    /// Detects the overall work pattern across commits.
     fn detect_work_pattern(commits: &[CommitInfo]) -> WorkPattern {
         if commits.len() == 1 {
             return Self::detect_single_commit_pattern(&commits[0]);
@@ -91,7 +92,7 @@ impl WorkPatternAnalyzer {
         WorkPattern::Sequential
     }
 
-    /// Detect pattern for a single commit
+    /// Detects the pattern for a single commit.
     fn detect_single_commit_pattern(commit: &CommitInfo) -> WorkPattern {
         let message_lower = commit.original_message.to_lowercase();
         let file_changes = &commit.analysis.file_changes;
@@ -129,7 +130,7 @@ impl WorkPatternAnalyzer {
         WorkPattern::Sequential
     }
 
-    /// Check if commits follow a refactoring pattern
+    /// Checks if commits follow a refactoring pattern.
     fn is_refactoring_pattern(messages: &[&str]) -> bool {
         let refactor_keywords = [
             "refactor",
@@ -151,7 +152,7 @@ impl WorkPatternAnalyzer {
         refactor_count as f32 / messages.len() as f32 > 0.5
     }
 
-    /// Check if commits follow a documentation pattern
+    /// Checks if commits follow a documentation pattern.
     fn is_documentation_pattern(messages: &[&str]) -> bool {
         let doc_keywords = ["doc", "readme", "comment", "guide", "manual"];
         let doc_count = messages
@@ -167,7 +168,7 @@ impl WorkPatternAnalyzer {
         doc_count as f32 / messages.len() as f32 > 0.6
     }
 
-    /// Check if commits follow a bug hunting pattern
+    /// Checks if commits follow a bug hunting pattern.
     fn is_bug_hunt_pattern(messages: &[&str]) -> bool {
         let bug_keywords = ["fix", "bug", "issue", "error", "problem", "debug"];
         let bug_count = messages
@@ -183,7 +184,7 @@ impl WorkPatternAnalyzer {
         bug_count as f32 / messages.len() as f32 > 0.4
     }
 
-    /// Check if commits follow a configuration pattern
+    /// Checks if commits follow a configuration pattern.
     fn is_configuration_pattern(commits: &[CommitInfo]) -> bool {
         let config_file_count = commits
             .iter()
@@ -200,7 +201,7 @@ impl WorkPatternAnalyzer {
         config_file_count as f32 / commits.len() as f32 > 0.5
     }
 
-    /// Analyze consistency of scopes across commits
+    /// Analyzes consistency of scopes across commits.
     fn analyze_scope_consistency(commits: &[CommitInfo]) -> ScopeAnalysis {
         let mut scope_counts: HashMap<String, usize> = HashMap::new();
         let mut detected_scopes = Vec::new();
@@ -232,7 +233,7 @@ impl WorkPatternAnalyzer {
         }
     }
 
-    /// Determine the architectural impact of the commit range
+    /// Determines the architectural impact of the commit range.
     fn determine_architectural_impact(commits: &[CommitInfo]) -> ArchitecturalImpact {
         let total_files_changed: usize = commits
             .iter()
@@ -269,7 +270,7 @@ impl WorkPatternAnalyzer {
         }
     }
 
-    /// Determine the significance of changes for commit message detail
+    /// Determines the significance of changes for commit message detail.
     fn determine_change_significance(commits: &[CommitInfo]) -> ChangeSignificance {
         let total_lines_changed: i32 = commits
             .iter()
@@ -307,7 +308,7 @@ impl WorkPatternAnalyzer {
     }
 }
 
-/// Check if a file is a configuration file
+/// Checks if a file is a configuration file.
 fn is_config_file(file_path: &str) -> bool {
     let config_extensions = [".toml", ".json", ".yaml", ".yml", ".ini", ".cfg"];
     let config_names = ["Cargo.toml", "package.json", "go.mod", "pom.xml"];
@@ -316,7 +317,7 @@ fn is_config_file(file_path: &str) -> bool {
         || config_names.iter().any(|name| file_path.contains(name))
 }
 
-/// Check if a file is critical to the project
+/// Checks if a file is critical to the project.
 fn is_critical_file(file_path: &str) -> bool {
     let critical_files = [
         "main.rs",
@@ -335,7 +336,7 @@ fn is_critical_file(file_path: &str) -> bool {
         || file_path.contains("src/main.rs")
 }
 
-/// Check if a file is part of public interface
+/// Checks if a file is part of the public interface.
 fn is_public_interface(file_path: &str) -> bool {
     file_path.contains("lib.rs")
         || file_path.contains("mod.rs")
@@ -345,7 +346,7 @@ fn is_public_interface(file_path: &str) -> bool {
         || file_path.ends_with(".graphql")
 }
 
-/// Estimate lines changed from diff summary
+/// Estimates lines changed from a diff summary.
 fn estimate_lines_changed(diff_summary: &str) -> i32 {
     let mut total = 0;
 

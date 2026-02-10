@@ -1,96 +1,97 @@
-//! AI model configuration and specifications
+//! AI model configuration and specifications.
 //!
 //! This module provides model specifications loaded from embedded YAML templates
 //! to ensure correct API parameters for different AI models.
 
-use anyhow::Result;
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-/// Beta header that unlocks enhanced model limits
+use anyhow::Result;
+use serde::Deserialize;
+
+/// Beta header that unlocks enhanced model limits.
 #[derive(Debug, Deserialize, Clone)]
 pub struct BetaHeader {
-    /// HTTP header name (e.g., "anthropic-beta")
+    /// HTTP header name (e.g., "anthropic-beta").
     pub key: String,
-    /// Header value (e.g., "context-1m-2025-08-07")
+    /// Header value (e.g., "context-1m-2025-08-07").
     pub value: String,
-    /// Overridden max output tokens when this header is active
+    /// Overridden max output tokens when this header is active.
     #[serde(default)]
     pub max_output_tokens: Option<usize>,
-    /// Overridden input context when this header is active
+    /// Overridden input context when this header is active.
     #[serde(default)]
     pub input_context: Option<usize>,
 }
 
-/// Model specification from YAML configuration
+/// Model specification from YAML configuration.
 #[derive(Debug, Deserialize, Clone)]
 pub struct ModelSpec {
-    /// AI provider name (e.g., "claude")
+    /// AI provider name (e.g., "claude").
     pub provider: String,
-    /// Human-readable model name (e.g., "Claude Opus 4")
+    /// Human-readable model name (e.g., "Claude Opus 4").
     pub model: String,
-    /// API identifier used for requests (e.g., "claude-3-opus-20240229")
+    /// API identifier used for requests (e.g., "claude-3-opus-20240229").
     pub api_identifier: String,
-    /// Maximum number of tokens that can be generated in a single response
+    /// Maximum number of tokens that can be generated in a single response.
     pub max_output_tokens: usize,
-    /// Maximum number of tokens that can be included in the input context
+    /// Maximum number of tokens that can be included in the input context.
     pub input_context: usize,
-    /// Model generation number (e.g., 3.0, 3.5, 4.0)
+    /// Model generation number (e.g., 3.0, 3.5, 4.0).
     pub generation: f32,
-    /// Performance tier (e.g., "fast", "balanced", "flagship")
+    /// Performance tier (e.g., "fast", "balanced", "flagship").
     pub tier: String,
-    /// Whether this is a legacy model that may be deprecated
+    /// Whether this is a legacy model that may be deprecated.
     #[serde(default)]
     pub legacy: bool,
-    /// Beta headers that unlock enhanced limits for this model
+    /// Beta headers that unlock enhanced limits for this model.
     #[serde(default)]
     pub beta_headers: Vec<BetaHeader>,
 }
 
-/// Model tier information
+/// Model tier information.
 #[derive(Debug, Deserialize)]
 pub struct TierInfo {
-    /// Human-readable description of the tier
+    /// Human-readable description of the tier.
     pub description: String,
-    /// List of recommended use cases for this tier
+    /// List of recommended use cases for this tier.
     pub use_cases: Vec<String>,
 }
 
-/// Default fallback configuration for a provider
+/// Default fallback configuration for a provider.
 #[derive(Debug, Deserialize)]
 pub struct DefaultConfig {
-    /// Default maximum output tokens for unknown models from this provider
+    /// Default maximum output tokens for unknown models from this provider.
     pub max_output_tokens: usize,
-    /// Default input context limit for unknown models from this provider
+    /// Default input context limit for unknown models from this provider.
     pub input_context: usize,
 }
 
-/// Provider-specific configuration
+/// Provider-specific configuration.
 #[derive(Debug, Deserialize)]
 pub struct ProviderConfig {
-    /// Human-readable provider name
+    /// Human-readable provider name.
     pub name: String,
-    /// Base URL for API requests
+    /// Base URL for API requests.
     pub api_base: String,
-    /// Default model identifier to use if none specified
+    /// Default model identifier to use if none specified.
     pub default_model: String,
-    /// Available performance tiers and their descriptions
+    /// Available performance tiers and their descriptions.
     pub tiers: HashMap<String, TierInfo>,
-    /// Default configuration for unknown models
+    /// Default configuration for unknown models.
     pub defaults: DefaultConfig,
 }
 
-/// Complete model configuration
+/// Complete model configuration.
 #[derive(Debug, Deserialize)]
 pub struct ModelConfiguration {
-    /// List of all available models
+    /// List of all available models.
     pub models: Vec<ModelSpec>,
-    /// Provider-specific configurations
+    /// Provider-specific configurations.
     pub providers: HashMap<String, ProviderConfig>,
 }
 
-/// Model registry for looking up specifications
+/// Model registry for looking up specifications.
 pub struct ModelRegistry {
     config: ModelConfiguration,
     by_identifier: HashMap<String, ModelSpec>,
@@ -98,7 +99,7 @@ pub struct ModelRegistry {
 }
 
 impl ModelRegistry {
-    /// Load model registry from embedded YAML
+    /// Loads the model registry from embedded YAML.
     pub fn load() -> Result<Self> {
         let yaml_content = include_str!("../templates/models.yaml");
         let config: ModelConfiguration = serde_yaml::from_str(yaml_content)?;
@@ -122,7 +123,7 @@ impl ModelRegistry {
         })
     }
 
-    /// Get model specification by API identifier
+    /// Returns the model specification for the given API identifier.
     pub fn get_model_spec(&self, api_identifier: &str) -> Option<&ModelSpec> {
         // Try exact match first
         if let Some(spec) = self.by_identifier.get(api_identifier) {
@@ -133,7 +134,7 @@ impl ModelRegistry {
         self.find_model_by_fuzzy_match(api_identifier)
     }
 
-    /// Get max output tokens for a model, with fallback to provider defaults
+    /// Returns the max output tokens for a model, with fallback to provider defaults.
     pub fn get_max_output_tokens(&self, api_identifier: &str) -> usize {
         if let Some(spec) = self.get_model_spec(api_identifier) {
             return spec.max_output_tokens;
@@ -150,7 +151,7 @@ impl ModelRegistry {
         4096
     }
 
-    /// Get input context limit for a model, with fallback to provider defaults
+    /// Returns the input context limit for a model, with fallback to provider defaults.
     pub fn get_input_context(&self, api_identifier: &str) -> usize {
         if let Some(spec) = self.get_model_spec(api_identifier) {
             return spec.input_context;
@@ -167,7 +168,7 @@ impl ModelRegistry {
         100000
     }
 
-    /// Infer provider from model identifier
+    /// Infers the provider from a model identifier.
     fn infer_provider(&self, api_identifier: &str) -> Option<String> {
         if api_identifier.starts_with("claude") || api_identifier.contains("anthropic") {
             Some("claude".to_string())
@@ -176,7 +177,7 @@ impl ModelRegistry {
         }
     }
 
-    /// Find model by fuzzy matching for various identifier formats
+    /// Finds a model by fuzzy matching for various identifier formats.
     fn find_model_by_fuzzy_match(&self, api_identifier: &str) -> Option<&ModelSpec> {
         // Extract core model identifier from various formats:
         // - Bedrock: "us.anthropic.claude-3-7-sonnet-20250219-v1:0" -> "claude-3-7-sonnet-20250219"
@@ -200,7 +201,7 @@ impl ModelRegistry {
         None
     }
 
-    /// Extract core model identifier from various formats
+    /// Extracts the core model identifier from various formats.
     fn extract_core_model_identifier(&self, api_identifier: &str) -> String {
         let mut identifier = api_identifier.to_string();
 
@@ -227,26 +228,26 @@ impl ModelRegistry {
         identifier
     }
 
-    /// Check if two model identifiers represent the same model
+    /// Checks if two model identifiers represent the same model.
     fn models_match_fuzzy(&self, input_id: &str, stored_id: &str) -> bool {
         // For now, just check if they're the same after extraction
         // This could be enhanced with more sophisticated matching
         input_id == stored_id
     }
 
-    /// Check if a model is legacy
+    /// Checks if a model is legacy.
     pub fn is_legacy_model(&self, api_identifier: &str) -> bool {
         self.get_model_spec(api_identifier)
             .map(|spec| spec.legacy)
             .unwrap_or(false)
     }
 
-    /// Get all available models
+    /// Returns all available models.
     pub fn get_all_models(&self) -> &[ModelSpec] {
         &self.config.models
     }
 
-    /// Get models by provider
+    /// Returns models filtered by provider.
     pub fn get_models_by_provider(&self, provider: &str) -> Vec<&ModelSpec> {
         self.by_provider
             .get(provider)
@@ -254,7 +255,7 @@ impl ModelRegistry {
             .unwrap_or_default()
     }
 
-    /// Get models by provider and tier
+    /// Returns models filtered by provider and tier.
     pub fn get_models_by_provider_and_tier(&self, provider: &str, tier: &str) -> Vec<&ModelSpec> {
         self.get_models_by_provider(provider)
             .into_iter()
@@ -262,24 +263,24 @@ impl ModelRegistry {
             .collect()
     }
 
-    /// Get provider configuration
+    /// Returns the provider configuration.
     pub fn get_provider_config(&self, provider: &str) -> Option<&ProviderConfig> {
         self.config.providers.get(provider)
     }
 
-    /// Get tier information for a provider
+    /// Returns tier information for a provider.
     pub fn get_tier_info(&self, provider: &str, tier: &str) -> Option<&TierInfo> {
         self.config.providers.get(provider)?.tiers.get(tier)
     }
 
-    /// Get beta headers for a model
+    /// Returns the beta headers for a model.
     pub fn get_beta_headers(&self, api_identifier: &str) -> &[BetaHeader] {
         self.get_model_spec(api_identifier)
             .map(|spec| spec.beta_headers.as_slice())
             .unwrap_or_default()
     }
 
-    /// Get max output tokens for a model with a specific beta header active
+    /// Returns the max output tokens for a model with a specific beta header active.
     pub fn get_max_output_tokens_with_beta(&self, api_identifier: &str, beta_value: &str) -> usize {
         if let Some(spec) = self.get_model_spec(api_identifier) {
             if let Some(bh) = spec.beta_headers.iter().find(|b| b.value == beta_value) {
@@ -292,7 +293,7 @@ impl ModelRegistry {
         self.get_max_output_tokens(api_identifier)
     }
 
-    /// Get input context for a model with a specific beta header active
+    /// Returns the input context for a model with a specific beta header active.
     pub fn get_input_context_with_beta(&self, api_identifier: &str, beta_value: &str) -> usize {
         if let Some(spec) = self.get_model_spec(api_identifier) {
             if let Some(bh) = spec.beta_headers.iter().find(|b| b.value == beta_value) {
@@ -306,10 +307,10 @@ impl ModelRegistry {
     }
 }
 
-/// Global model registry instance
+/// Global model registry instance.
 static MODEL_REGISTRY: OnceLock<ModelRegistry> = OnceLock::new();
 
-/// Get the global model registry instance
+/// Returns the global model registry instance.
 pub fn get_model_registry() -> &'static ModelRegistry {
     MODEL_REGISTRY.get_or_init(|| ModelRegistry::load().expect("Failed to load model registry"))
 }
@@ -319,14 +320,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_load_model_registry() {
+    fn load_model_registry() {
         let registry = ModelRegistry::load().unwrap();
         assert!(!registry.config.models.is_empty());
         assert!(registry.config.providers.contains_key("claude"));
     }
 
     #[test]
-    fn test_claude_model_lookup() {
+    fn claude_model_lookup() {
         let registry = ModelRegistry::load().unwrap();
 
         // Test legacy Claude 3 Opus
@@ -351,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_filtering() {
+    fn provider_filtering() {
         let registry = ModelRegistry::load().unwrap();
 
         let claude_models = registry.get_models_by_provider("claude");
@@ -365,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_config() {
+    fn provider_config() {
         let registry = ModelRegistry::load().unwrap();
 
         let claude_config = registry.get_provider_config("claude");
@@ -374,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fuzzy_model_matching() {
+    fn fuzzy_model_matching() {
         let registry = ModelRegistry::load().unwrap();
 
         // Test Bedrock-style identifiers
@@ -412,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_core_model_identifier() {
+    fn extract_core_model_identifier() {
         let registry = ModelRegistry::load().unwrap();
 
         // Test various formats
@@ -438,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn test_beta_header_lookups() {
+    fn beta_header_lookups() {
         let registry = ModelRegistry::load().unwrap();
 
         // Opus 4.6 base limits

@@ -1,4 +1,4 @@
-//! Preflight validation checks for early failure detection
+//! Preflight validation checks for early failure detection.
 //!
 //! This module provides functions to validate required services and credentials
 //! before starting expensive operations. Commands should call these checks early
@@ -6,25 +6,25 @@
 
 use anyhow::{bail, Context, Result};
 
-/// Result of AI credential validation
+/// Result of AI credential validation.
 #[derive(Debug)]
 pub struct AiCredentialInfo {
-    /// The AI provider that will be used
+    /// The AI provider that will be used.
     pub provider: AiProvider,
-    /// The model that will be used
+    /// The model that will be used.
     pub model: String,
 }
 
-/// AI provider types
+/// AI provider types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AiProvider {
-    /// Anthropic Claude API
+    /// Anthropic Claude API.
     Claude,
-    /// AWS Bedrock with Claude
+    /// AWS Bedrock with Claude.
     Bedrock,
-    /// OpenAI API
+    /// OpenAI API.
     OpenAi,
-    /// Local Ollama
+    /// Local Ollama.
     Ollama,
 }
 
@@ -39,7 +39,7 @@ impl std::fmt::Display for AiProvider {
     }
 }
 
-/// Validate AI credentials are available before processing
+/// Validates that AI credentials are available before processing.
 ///
 /// This performs a lightweight check of environment variables without
 /// creating a full AI client. Use this at the start of commands that
@@ -152,7 +152,7 @@ pub fn check_ai_credentials(model_override: Option<&str>) -> Result<AiCredential
     })
 }
 
-/// Validate GitHub CLI is available and authenticated
+/// Validates that GitHub CLI is available and authenticated.
 ///
 /// This checks:
 /// 1. `gh` CLI is installed and in PATH
@@ -199,7 +199,7 @@ pub fn check_github_cli() -> Result<()> {
     }
 }
 
-/// Validate we're in a valid git repository
+/// Validates that the current directory is in a valid git repository.
 ///
 /// This is a lightweight check that opens the repository without
 /// loading any commit data.
@@ -210,7 +210,7 @@ pub fn check_git_repository() -> Result<()> {
     Ok(())
 }
 
-/// Validate working directory is clean (no uncommitted changes)
+/// Validates that the working directory is clean (no uncommitted changes).
 ///
 /// This checks for:
 /// - Staged changes
@@ -238,7 +238,7 @@ pub fn check_working_directory_clean() -> Result<()> {
     Ok(())
 }
 
-/// Combined preflight check for AI commands
+/// Performs combined preflight check for AI commands.
 ///
 /// Validates:
 /// - Git repository access
@@ -250,7 +250,7 @@ pub fn check_ai_command_prerequisites(model_override: Option<&str>) -> Result<Ai
     check_ai_credentials(model_override)
 }
 
-/// Combined preflight check for PR creation
+/// Performs combined preflight check for PR creation.
 ///
 /// Validates:
 /// - Git repository access
@@ -270,7 +270,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ai_provider_display() {
+    fn ai_provider_display() {
         assert_eq!(format!("{}", AiProvider::Claude), "Claude API");
         assert_eq!(format!("{}", AiProvider::Bedrock), "AWS Bedrock");
         assert_eq!(format!("{}", AiProvider::OpenAi), "OpenAI API");

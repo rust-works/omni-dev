@@ -1,6 +1,7 @@
+use std::process;
+
 use clap::Parser;
 use omni_dev::Cli;
-use std::process;
 
 fn main() {
     // Initialize tracing subscriber with RUST_LOG environment variable support

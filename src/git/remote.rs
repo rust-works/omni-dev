@@ -1,22 +1,22 @@
-//! Git remote operations
+//! Git remote operations.
 
 use anyhow::{Context, Result};
 use git2::{BranchType, Repository};
 use serde::{Deserialize, Serialize};
 
-/// Remote repository information
+/// Remote repository information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteInfo {
-    /// Name of the remote (e.g., "origin", "upstream")
+    /// Name of the remote (e.g., "origin", "upstream").
     pub name: String,
-    /// URI of the remote repository
+    /// URI of the remote repository.
     pub uri: String,
-    /// Detected main branch name for this remote
+    /// Detected main branch name for this remote.
     pub main_branch: String,
 }
 
 impl RemoteInfo {
-    /// Get all remotes for a repository
+    /// Returns all remotes for a repository.
     pub fn get_all_remotes(repo: &Repository) -> Result<Vec<Self>> {
         let mut remotes = Vec::new();
         let remote_names = repo.remotes().context("Failed to get remote names")?;
@@ -37,7 +37,7 @@ impl RemoteInfo {
         Ok(remotes)
     }
 
-    /// Detect the main branch for a remote
+    /// Detects the main branch for a remote.
     fn detect_main_branch(repo: &Repository, remote_name: &str) -> Result<String> {
         // First try to get the remote HEAD reference
         let head_ref_name = format!("refs/remotes/{}/HEAD", remote_name);
@@ -110,7 +110,7 @@ impl RemoteInfo {
         Ok("unknown".to_string())
     }
 
-    /// Get the default branch from GitHub using gh CLI
+    /// Returns the default branch from GitHub using gh CLI.
     fn get_github_default_branch(uri: &str) -> Result<String> {
         use std::process::Command;
 
@@ -143,7 +143,7 @@ impl RemoteInfo {
         }
     }
 
-    /// Extract GitHub repository name from URI
+    /// Extracts GitHub repository name from URI.
     fn extract_github_repo_name(uri: &str) -> Result<String> {
         // Handle both SSH and HTTPS GitHub URIs
         let repo_name = if uri.starts_with("git@github.com:") {
