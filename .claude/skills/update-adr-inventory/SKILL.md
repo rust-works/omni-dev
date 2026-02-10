@@ -31,17 +31,17 @@ The inventory table uses this structure:
 
 | ADR                      | Status      | Date       | Title                             |
 |--------------------------|-------------|------------|-----------------------------------|
-| [ADR-0000](adr-0000.md) | ✅ Accepted | 2026-02-10 | Use Architecture Decision Records |
+| [ADR-0000](adr-0000.md)  | ✅ Accepted | 2026-02-10 | Use Architecture Decision Records  |
 ```
 
 ### Column Details
 
-| Column | Source                              | Example                  |
-|--------|-------------------------------------|--------------------------|
-| ADR    | Filename, linked: `[ADR-NNNN](...)` | `[ADR-0000](adr-0000.md)` |
-| Status | Status section with emoji prefix    | `✅ Accepted`            |
-| Date   | Git first-commit date or today      | `2026-02-10`             |
-| Title  | H1 heading after `ADR-NNNN: `      | `Use Architecture Decision Records` |
+| Column | Source                              | Example                             |
+|--------|-------------------------------------|-------------------------------------|
+| ADR    | Filename, linked: `[ADR-NNNN](...)` | `[ADR-0000](adr-0000.md)`           |
+| Status | Status section with emoji prefix    | `✅ Accepted`                        |
+| Date   | Git first-commit date or today      | `2026-02-10`                        |
+| Title  | H1 heading after `ADR-NNNN: `       | `Use Architecture Decision Records` |
 
 ## Instructions
 
