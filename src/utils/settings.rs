@@ -1,31 +1,32 @@
-//! Settings and configuration utilities
+//! Settings and configuration utilities.
 //!
 //! This module provides functionality to read settings from $HOME/.omni-dev/settings.json
 //! and use them as a fallback for environment variables.
 
-use anyhow::{Context, Result};
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Settings loaded from $HOME/.omni-dev/settings.json
+use anyhow::{Context, Result};
+use serde::Deserialize;
+
+/// Settings loaded from $HOME/.omni-dev/settings.json.
 #[derive(Debug, Deserialize)]
 pub struct Settings {
-    /// Environment variable overrides
+    /// Environment variable overrides.
     #[serde(default)]
     pub env: HashMap<String, String>,
 }
 
 impl Settings {
-    /// Load settings from the default location
+    /// Loads settings from the default location.
     pub fn load() -> Result<Self> {
         let settings_path = Self::get_settings_path()?;
         Self::load_from_path(&settings_path)
     }
 
-    /// Load settings from a specific path
+    /// Loads settings from a specific path.
     pub fn load_from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
 
@@ -44,14 +45,14 @@ impl Settings {
             .with_context(|| format!("Failed to parse settings file: {}", path.display()))
     }
 
-    /// Get the default settings path
+    /// Returns the default settings path.
     pub fn get_settings_path() -> Result<PathBuf> {
         let home_dir = dirs::home_dir().context("Failed to determine home directory")?;
 
         Ok(home_dir.join(".omni-dev").join("settings.json"))
     }
 
-    /// Get an environment variable with fallback to settings
+    /// Returns an environment variable with fallback to settings.
     pub fn get_env_var(&self, key: &str) -> Option<String> {
         // Try to get from actual environment first
         match env::var(key) {
@@ -64,7 +65,7 @@ impl Settings {
     }
 }
 
-/// Get an environment variable with fallback to settings
+/// Returns an environment variable with fallback to settings.
 pub fn get_env_var(key: &str) -> Result<String> {
     // Try to get from actual environment first
     match env::var(key) {
@@ -86,7 +87,7 @@ pub fn get_env_var(key: &str) -> Result<String> {
     }
 }
 
-/// Try multiple environment variables with fallback to settings
+/// Tries multiple environment variables with fallback to settings.
 pub fn get_env_vars(keys: &[&str]) -> Result<String> {
     for key in keys {
         match get_env_var(key) {
@@ -108,7 +109,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_settings_load_from_path() {
+    fn settings_load_from_path() {
         // Create a temporary directory
         let temp_dir = TempDir::new().unwrap();
         let settings_path = temp_dir.path().join("settings.json");
@@ -131,7 +132,7 @@ mod tests {
     }
 
     #[test]
-    fn test_settings_get_env_var() {
+    fn settings_get_env_var() {
         // Create a temporary directory
         let temp_dir = TempDir::new().unwrap();
         let settings_path = temp_dir.path().join("settings.json");

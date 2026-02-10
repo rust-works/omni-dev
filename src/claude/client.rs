@@ -1,38 +1,39 @@
-//! Claude client for commit message improvement
+//! Claude client for commit message improvement.
+
+use anyhow::{Context, Result};
+use tracing::debug;
 
 use crate::claude::{ai::bedrock::BedrockAiClient, ai::claude::ClaudeAiClient};
 use crate::claude::{ai::AiClient, error::ClaudeError, prompts};
 use crate::data::{
     amendments::AmendmentFile, context::CommitContext, RepositoryView, RepositoryViewForAI,
 };
-use anyhow::{Context, Result};
-use tracing::debug;
 
-/// Claude client for commit message improvement
+/// Claude client for commit message improvement.
 pub struct ClaudeClient {
-    /// AI client implementation
+    /// AI client implementation.
     ai_client: Box<dyn AiClient>,
 }
 
 impl ClaudeClient {
-    /// Create new Claude client with provided AI client implementation
+    /// Creates a new Claude client with the provided AI client implementation.
     pub fn new(ai_client: Box<dyn AiClient>) -> Self {
         Self { ai_client }
     }
 
-    /// Get metadata about the AI client
+    /// Returns metadata about the AI client.
     pub fn get_ai_client_metadata(&self) -> crate::claude::ai::AiClientMetadata {
         self.ai_client.get_metadata()
     }
 
-    /// Send a raw prompt to the AI client and return the text response
+    /// Sends a raw prompt to the AI client and returns the text response.
     pub async fn send_message(&self, system_prompt: &str, user_prompt: &str) -> Result<String> {
         self.ai_client
             .send_request(system_prompt, user_prompt)
             .await
     }
 
-    /// Create new Claude client with API key from environment variables
+    /// Creates a new Claude client with API key from environment variables.
     pub fn from_env(model: String) -> Result<Self> {
         // Try to get API key from environment variables
         let api_key = std::env::var("CLAUDE_API_KEY")
@@ -43,13 +44,13 @@ impl ClaudeClient {
         Ok(Self::new(Box::new(ai_client)))
     }
 
-    /// Generate commit message amendments from repository view
+    /// Generates commit message amendments from repository view.
     pub async fn generate_amendments(&self, repo_view: &RepositoryView) -> Result<AmendmentFile> {
         self.generate_amendments_with_options(repo_view, false)
             .await
     }
 
-    /// Generate commit message amendments from repository view with options
+    /// Generates commit message amendments from repository view with options.
     ///
     /// If `fresh` is true, ignores existing commit messages and generates new ones
     /// based solely on the diff content.
@@ -80,7 +81,7 @@ impl ClaudeClient {
         self.parse_amendment_response(&content)
     }
 
-    /// Generate contextual commit message amendments with enhanced intelligence
+    /// Generates contextual commit message amendments with enhanced intelligence.
     pub async fn generate_contextual_amendments(
         &self,
         repo_view: &RepositoryView,
@@ -90,7 +91,7 @@ impl ClaudeClient {
             .await
     }
 
-    /// Generate contextual commit message amendments with options
+    /// Generates contextual commit message amendments with options.
     ///
     /// If `fresh` is true, ignores existing commit messages and generates new ones
     /// based solely on the diff content.
@@ -110,16 +111,9 @@ impl ClaudeClient {
             .context("Failed to serialize repository view to YAML")?;
 
         // Generate contextual prompts using intelligence
-        let provider = self.ai_client.get_metadata().provider;
-        let provider_name = if provider.to_lowercase().contains("openai")
-            || provider.to_lowercase().contains("ollama")
-        {
-            "openai"
-        } else {
-            "claude"
-        };
+        let prompt_style = self.ai_client.get_metadata().prompt_style();
         let system_prompt =
-            prompts::generate_contextual_system_prompt_for_provider(context, provider_name);
+            prompts::generate_contextual_system_prompt_for_provider(context, prompt_style);
         let user_prompt = prompts::generate_contextual_user_prompt(&repo_yaml, context);
 
         // Debug logging to troubleshoot custom commit type issue
@@ -143,7 +137,7 @@ impl ClaudeClient {
         self.parse_amendment_response(&content)
     }
 
-    /// Parse Claude's YAML response into AmendmentFile
+    /// Parses Claude's YAML response into an AmendmentFile.
     fn parse_amendment_response(&self, content: &str) -> Result<AmendmentFile> {
         // Extract YAML from potential markdown wrapper
         let yaml_content = self.extract_yaml_from_response(content);
@@ -177,7 +171,7 @@ impl ClaudeClient {
         Ok(amendment_file)
     }
 
-    /// Generate AI-powered PR content (title + description) from repository view and template
+    /// Generates AI-powered PR content (title + description) from repository view and template.
     pub async fn generate_pr_content(
         &self,
         repo_view: &RepositoryView,
@@ -211,7 +205,7 @@ impl ClaudeClient {
         Ok(pr_content)
     }
 
-    /// Generate AI-powered PR content with project context (title + description)
+    /// Generates AI-powered PR content with project context (title + description).
     pub async fn generate_pr_content_with_context(
         &self,
         repo_view: &RepositoryView,
@@ -227,16 +221,9 @@ impl ClaudeClient {
             .context("Failed to serialize repository view to YAML")?;
 
         // Generate contextual prompts for PR description with provider-specific handling
-        let provider = self.ai_client.get_metadata().provider;
-        let provider_name = if provider.to_lowercase().contains("openai")
-            || provider.to_lowercase().contains("ollama")
-        {
-            "openai"
-        } else {
-            "claude"
-        };
+        let prompt_style = self.ai_client.get_metadata().prompt_style();
         let system_prompt =
-            prompts::generate_pr_system_prompt_with_context_for_provider(context, provider_name);
+            prompts::generate_pr_system_prompt_with_context_for_provider(context, prompt_style);
         let user_prompt =
             prompts::generate_pr_description_prompt_with_context(&repo_yaml, pr_template, context);
 
@@ -271,7 +258,7 @@ impl ClaudeClient {
         Ok(pr_content)
     }
 
-    /// Check commit messages against guidelines and return a report
+    /// Checks commit messages against guidelines and returns a report.
     ///
     /// Validates commit messages against project guidelines or defaults,
     /// returning a structured report with issues and suggestions.
@@ -285,7 +272,7 @@ impl ClaudeClient {
             .await
     }
 
-    /// Check commit messages against guidelines with valid scopes and return a report
+    /// Checks commit messages against guidelines with valid scopes and returns a report.
     ///
     /// Validates commit messages against project guidelines or defaults,
     /// using the provided valid scopes for scope validation.
@@ -300,7 +287,7 @@ impl ClaudeClient {
             .await
     }
 
-    /// Check commit messages with retry logic for parse failures
+    /// Checks commit messages with retry logic for parse failures.
     async fn check_commits_with_retry(
         &self,
         repo_view: &RepositoryView,
@@ -365,7 +352,7 @@ impl ClaudeClient {
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Check failed after retries")))
     }
 
-    /// Parse the check response from AI
+    /// Parses the check response from AI.
     fn parse_check_response(
         &self,
         content: &str,
@@ -423,7 +410,7 @@ impl ClaudeClient {
         Ok(CheckReport::new(results))
     }
 
-    /// Extract YAML content from check response, handling markdown wrappers
+    /// Extracts YAML content from check response, handling markdown wrappers.
     fn extract_yaml_from_check_response(&self, content: &str) -> String {
         let content = content.trim();
 
@@ -454,7 +441,7 @@ impl ClaudeClient {
         content.to_string()
     }
 
-    /// Extract YAML content from Claude response, handling markdown wrappers
+    /// Extracts YAML content from Claude response, handling markdown wrappers.
     fn extract_yaml_from_response(&self, content: &str) -> String {
         let content = content.trim();
 
@@ -486,7 +473,7 @@ impl ClaudeClient {
     }
 }
 
-/// Validate a beta header against the model registry
+/// Validates a beta header against the model registry.
 fn validate_beta_header(model: &str, beta_header: &Option<(String, String)>) -> Result<()> {
     if let Some((ref key, ref value)) = beta_header {
         let registry = crate::claude::model_config::get_model_registry();
@@ -515,7 +502,7 @@ fn validate_beta_header(model: &str, beta_header: &Option<(String, String)>) -> 
     Ok(())
 }
 
-/// Create a default Claude client using environment variables and settings
+/// Creates a default Claude client using environment variables and settings.
 pub fn create_default_claude_client(
     model: Option<String>,
     beta_header: Option<(String, String)>,

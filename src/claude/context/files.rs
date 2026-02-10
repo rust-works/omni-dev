@@ -1,15 +1,16 @@
-//! File-based context analysis and architectural understanding
+//! File-based context analysis and architectural understanding.
+
+use std::path::{Path, PathBuf};
 
 use crate::data::context::{
     ArchitecturalLayer, ChangeImpact, FileContext, FilePurpose, ProjectSignificance,
 };
-use std::path::{Path, PathBuf};
 
-/// File context analyzer
+/// File context analyzer.
 pub struct FileAnalyzer;
 
 impl FileAnalyzer {
-    /// Analyze a file and determine its context within the project
+    /// Analyzes a file and determines its context within the project.
     pub fn analyze_file(path: &Path, change_type: &str) -> FileContext {
         let file_purpose = determine_file_purpose(path);
         let architectural_layer = determine_architectural_layer(path, &file_purpose);
@@ -25,7 +26,7 @@ impl FileAnalyzer {
         }
     }
 
-    /// Analyze multiple files to understand the scope of changes
+    /// Analyzes multiple files to understand the scope of changes.
     pub fn analyze_file_set(files: &[(PathBuf, String)]) -> Vec<FileContext> {
         files
             .iter()
@@ -33,7 +34,7 @@ impl FileAnalyzer {
             .collect()
     }
 
-    /// Determine the primary architectural impact of a set of file changes
+    /// Determines the primary architectural impact of a set of file changes.
     pub fn primary_architectural_impact(contexts: &[FileContext]) -> ArchitecturalLayer {
         use std::collections::HashMap;
 
@@ -61,7 +62,7 @@ impl FileAnalyzer {
             .unwrap_or(ArchitecturalLayer::Cross)
     }
 
-    /// Determine if the file changes suggest a significant architectural change
+    /// Determines if the file changes suggest a significant architectural change.
     pub fn is_architectural_change(contexts: &[FileContext]) -> bool {
         let critical_files = contexts
             .iter()
@@ -82,7 +83,7 @@ impl FileAnalyzer {
     }
 }
 
-/// Determine the purpose of a file based on its path and name
+/// Determines the purpose of a file based on its path and name.
 fn determine_file_purpose(path: &Path) -> FilePurpose {
     let path_str = path.to_string_lossy().to_lowercase();
     let file_name = path
@@ -125,7 +126,7 @@ fn determine_file_purpose(path: &Path) -> FilePurpose {
     FilePurpose::CoreLogic
 }
 
-/// Determine the architectural layer of a file
+/// Determines the architectural layer of a file.
 fn determine_architectural_layer(path: &Path, file_purpose: &FilePurpose) -> ArchitecturalLayer {
     let path_str = path.to_string_lossy().to_lowercase();
 
@@ -161,7 +162,7 @@ fn determine_architectural_layer(path: &Path, file_purpose: &FilePurpose) -> Arc
     }
 }
 
-/// Determine the impact of changes based on change type and file purpose
+/// Determines the impact of changes based on change type and file purpose.
 fn determine_change_impact(change_type: &str, file_purpose: &FilePurpose) -> ChangeImpact {
     match change_type {
         "A" => ChangeImpact::Additive, // Added file
@@ -187,7 +188,7 @@ fn determine_change_impact(change_type: &str, file_purpose: &FilePurpose) -> Cha
     }
 }
 
-/// Determine the significance of a file in the project
+/// Determines the significance of a file in the project.
 fn determine_project_significance(path: &Path, file_purpose: &FilePurpose) -> ProjectSignificance {
     let path_str = path.to_string_lossy().to_lowercase();
     let file_name = path
@@ -218,7 +219,7 @@ fn determine_project_significance(path: &Path, file_purpose: &FilePurpose) -> Pr
     }
 }
 
-/// Check if file is a configuration file
+/// Checks if a file is a configuration file.
 fn is_config_file(path_str: &str, file_name: &str) -> bool {
     let config_patterns = [
         ".toml",
@@ -256,7 +257,7 @@ fn is_config_file(path_str: &str, file_name: &str) -> bool {
         || path_str.contains(".github/workflows")
 }
 
-/// Check if file is a test file
+/// Checks if a file is a test file.
 fn is_test_file(path_str: &str, file_name: &str) -> bool {
     path_str.contains("test")
         || path_str.contains("spec")
@@ -268,7 +269,7 @@ fn is_test_file(path_str: &str, file_name: &str) -> bool {
         || file_name.ends_with("_test.go")
 }
 
-/// Check if file is documentation
+/// Checks if a file is documentation.
 fn is_documentation_file(path_str: &str, file_name: &str) -> bool {
     let doc_extensions = [".md", ".rst", ".txt", ".adoc"];
     let doc_names = ["readme", "changelog", "contributing", "license", "authors"];
@@ -280,7 +281,7 @@ fn is_documentation_file(path_str: &str, file_name: &str) -> bool {
         || path_str.contains("manual")
 }
 
-/// Check if file is build-related
+/// Checks if a file is build-related.
 fn is_build_file(path_str: &str, file_name: &str) -> bool {
     let build_names = [
         "makefile",
@@ -300,7 +301,7 @@ fn is_build_file(path_str: &str, file_name: &str) -> bool {
         || file_name.ends_with(".bat")
 }
 
-/// Check if file is tooling/development related
+/// Checks if a file is tooling/development related.
 fn is_tooling_file(path_str: &str, file_name: &str) -> bool {
     path_str.contains("tool")
         || path_str.contains("util")
@@ -312,7 +313,7 @@ fn is_tooling_file(path_str: &str, file_name: &str) -> bool {
         || file_name.contains("clippy")
 }
 
-/// Check if file defines interfaces/APIs
+/// Checks if a file defines interfaces/APIs.
 fn is_interface_file(path_str: &str, file_name: &str) -> bool {
     path_str.contains("api")
         || path_str.contains("interface")
@@ -324,7 +325,7 @@ fn is_interface_file(path_str: &str, file_name: &str) -> bool {
         || file_name.ends_with(".graphql")
 }
 
-/// Check if file is critical to project functionality
+/// Checks if a file is critical to project functionality.
 fn is_critical_file(path_str: &str, file_name: &str) -> bool {
     let critical_names = [
         "main.rs",

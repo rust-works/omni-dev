@@ -1168,7 +1168,6 @@ dependencies = [
  "git2",
  "globset",
  "insta",
- "once_cell",
  "regex",
  "reqwest",
  "serde",

@@ -1,22 +1,24 @@
-//! Claude API client implementation
+//! Claude API client implementation.
 
-use super::{AiClient, AiClientMetadata};
-use crate::claude::{error::ClaudeError, model_config::get_model_registry};
+use std::future::Future;
+use std::pin::Pin;
+
 use anyhow::Result;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::future::Future;
-use std::pin::Pin;
 use tracing::{debug, info};
 
-/// Claude API request message
+use super::{AiClient, AiClientMetadata};
+use crate::claude::{error::ClaudeError, model_config::get_model_registry};
+
+/// Claude API request message.
 #[derive(Serialize)]
 struct Message {
     role: String,
     content: String,
 }
 
-/// Claude API request body
+/// Claude API request body.
 #[derive(Serialize)]
 struct ClaudeRequest {
     model: String,
@@ -25,7 +27,7 @@ struct ClaudeRequest {
     messages: Vec<Message>,
 }
 
-/// Claude API response content
+/// Claude API response content.
 #[derive(Deserialize)]
 struct Content {
     #[serde(rename = "type")]
@@ -33,26 +35,26 @@ struct Content {
     text: String,
 }
 
-/// Claude API response
+/// Claude API response.
 #[derive(Deserialize)]
 struct ClaudeResponse {
     content: Vec<Content>,
 }
 
-/// Claude API client implementation
+/// Claude API client implementation.
 pub struct ClaudeAiClient {
-    /// HTTP client for API requests
+    /// HTTP client for API requests.
     client: Client,
-    /// API key for authentication
+    /// API key for authentication.
     api_key: String,
-    /// Model identifier
+    /// Model identifier.
     model: String,
-    /// Active beta header (key, value) if enabled
+    /// Active beta header (key, value) if enabled.
     active_beta: Option<(String, String)>,
 }
 
 impl ClaudeAiClient {
-    /// Create a new Claude AI client
+    /// Creates a new Claude AI client.
     pub fn new(model: String, api_key: String, active_beta: Option<(String, String)>) -> Self {
         let client = Client::new();
 
@@ -64,7 +66,7 @@ impl ClaudeAiClient {
         }
     }
 
-    /// Get max tokens from model registry
+    /// Returns the max tokens from the model registry.
     fn get_max_tokens(&self) -> i32 {
         let registry = get_model_registry();
         if let Some((_, ref value)) = self.active_beta {

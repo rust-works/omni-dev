@@ -1,64 +1,65 @@
-//! Check command result types for commit message validation
+//! Check command result types for commit message validation.
 
-use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// Complete check report containing all commit analysis results
+use serde::{Deserialize, Serialize};
+
+/// Complete check report containing all commit analysis results.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckReport {
-    /// Individual commit check results
+    /// Individual commit check results.
     pub commits: Vec<CommitCheckResult>,
-    /// Summary statistics
+    /// Summary statistics.
     pub summary: CheckSummary,
 }
 
-/// Result of checking a single commit
+/// Result of checking a single commit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitCheckResult {
-    /// Commit hash (short form)
+    /// Commit hash (short form).
     pub hash: String,
-    /// Original commit message (first line)
+    /// Original commit message (first line).
     pub message: String,
-    /// List of issues found
+    /// List of issues found.
     pub issues: Vec<CommitIssue>,
-    /// Suggested improved message (if issues were found)
+    /// Suggested improved message (if issues were found).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggestion: Option<CommitSuggestion>,
-    /// Whether the commit passes all checks
+    /// Whether the commit passes all checks.
     pub passes: bool,
 }
 
-/// A single issue found in a commit message
+/// A single issue found in a commit message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitIssue {
-    /// Severity level of the issue
+    /// Severity level of the issue.
     pub severity: IssueSeverity,
-    /// Which guideline section was violated
+    /// Which guideline section was violated.
     pub section: String,
-    /// Specific rule that was violated
+    /// Specific rule that was violated.
     pub rule: String,
-    /// Explanation of why this is a violation
+    /// Explanation of why this is a violation.
     pub explanation: String,
 }
 
-/// Suggested correction for a commit message
+/// Suggested correction for a commit message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitSuggestion {
-    /// The suggested improved commit message
+    /// The suggested improved commit message.
     pub message: String,
-    /// Explanation of why this message is better
+    /// Explanation of why this message is better.
     pub explanation: String,
 }
 
-/// Severity level for issues
+/// Severity level for issues.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IssueSeverity {
-    /// Errors block CI (exit code 1)
+    /// Errors block CI (exit code 1).
     Error,
-    /// Advisory issues (exit code 0, or 2 with --strict)
+    /// Advisory issues (exit code 0, or 2 with --strict).
     Warning,
-    /// Suggestions only (never affect exit code)
+    /// Suggestions only (never affect exit code).
     Info,
 }
 
@@ -86,31 +87,31 @@ impl std::str::FromStr for IssueSeverity {
 }
 
 impl IssueSeverity {
-    /// Parse severity from string (case-insensitive)
+    /// Parses severity from a string (case-insensitive).
     pub fn parse(s: &str) -> Self {
         s.parse().unwrap_or(IssueSeverity::Warning)
     }
 }
 
-/// Summary statistics for a check report
+/// Summary statistics for a check report.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckSummary {
-    /// Total number of commits checked
+    /// Total number of commits checked.
     pub total_commits: usize,
-    /// Number of commits that pass all checks
+    /// Number of commits that pass all checks.
     pub passing_commits: usize,
-    /// Number of commits with issues
+    /// Number of commits with issues.
     pub failing_commits: usize,
-    /// Total number of errors found
+    /// Total number of errors found.
     pub error_count: usize,
-    /// Total number of warnings found
+    /// Total number of warnings found.
     pub warning_count: usize,
-    /// Total number of info-level issues found
+    /// Total number of info-level issues found.
     pub info_count: usize,
 }
 
 impl CheckSummary {
-    /// Create a summary from a list of commit check results
+    /// Creates a summary from a list of commit check results.
     pub fn from_results(results: &[CommitCheckResult]) -> Self {
         let total_commits = results.len();
         let passing_commits = results.iter().filter(|r| r.passes).count();
@@ -142,23 +143,23 @@ impl CheckSummary {
 }
 
 impl CheckReport {
-    /// Create a new check report from commit results
+    /// Creates a new check report from commit results.
     pub fn new(commits: Vec<CommitCheckResult>) -> Self {
         let summary = CheckSummary::from_results(&commits);
         Self { commits, summary }
     }
 
-    /// Check if the report has any errors
+    /// Checks if the report has any errors.
     pub fn has_errors(&self) -> bool {
         self.summary.error_count > 0
     }
 
-    /// Check if the report has any warnings
+    /// Checks if the report has any warnings.
     pub fn has_warnings(&self) -> bool {
         self.summary.warning_count > 0
     }
 
-    /// Determine exit code based on report and options
+    /// Determines exit code based on report and options.
     pub fn exit_code(&self, strict: bool) -> i32 {
         if self.has_errors() {
             1
@@ -170,15 +171,15 @@ impl CheckReport {
     }
 }
 
-/// Output format for check results
+/// Output format for check results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OutputFormat {
-    /// Human-readable text format
+    /// Human-readable text format.
     #[default]
     Text,
-    /// JSON format
+    /// JSON format.
     Json,
-    /// YAML format
+    /// YAML format.
     Yaml,
 }
 
@@ -205,47 +206,47 @@ impl fmt::Display for OutputFormat {
     }
 }
 
-/// AI response structure for parsing check results
+/// AI response structure for parsing check results.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AiCheckResponse {
-    /// List of commit checks
+    /// List of commit checks.
     pub checks: Vec<AiCommitCheck>,
 }
 
-/// Single commit check from AI response
+/// Single commit check from AI response.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AiCommitCheck {
-    /// Commit hash (short or full)
+    /// Commit hash (short or full).
     pub commit: String,
-    /// Whether the commit passes all checks
+    /// Whether the commit passes all checks.
     pub passes: bool,
-    /// List of issues found
+    /// List of issues found.
     #[serde(default)]
     pub issues: Vec<AiIssue>,
-    /// Suggested message improvement
+    /// Suggested message improvement.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggestion: Option<AiSuggestion>,
 }
 
-/// Issue from AI response
+/// Issue from AI response.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AiIssue {
-    /// Severity level
+    /// Severity level.
     pub severity: String,
-    /// Guideline section
+    /// Guideline section.
     pub section: String,
-    /// Specific rule violated
+    /// Specific rule violated.
     pub rule: String,
-    /// Explanation
+    /// Explanation.
     pub explanation: String,
 }
 
-/// Suggestion from AI response
+/// Suggestion from AI response.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AiSuggestion {
-    /// Suggested message
+    /// Suggested message.
     pub message: String,
-    /// Explanation of improvements
+    /// Explanation of improvements.
     pub explanation: String,
 }
 

@@ -1,4 +1,6 @@
-//! AI commands
+//! AI commands.
+
+use std::io::{self, Write};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -6,25 +8,24 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     terminal::{disable_raw_mode, enable_raw_mode},
 };
-use std::io::{self, Write};
 
-/// AI operations
+/// AI operations.
 #[derive(Parser)]
 pub struct AiCommand {
-    /// The AI subcommand to execute
+    /// The AI subcommand to execute.
     #[command(subcommand)]
     pub command: AiSubcommand,
 }
 
-/// AI subcommands
+/// AI subcommands.
 #[derive(Subcommand)]
 pub enum AiSubcommand {
-    /// Interactive AI chat session
+    /// Interactive AI chat session.
     Chat(ChatCommand),
 }
 
 impl AiCommand {
-    /// Execute the AI command
+    /// Executes the AI command.
     pub fn execute(self) -> Result<()> {
         match self.command {
             AiSubcommand::Chat(cmd) => cmd.execute(),
@@ -32,16 +33,16 @@ impl AiCommand {
     }
 }
 
-/// Interactive AI chat session
+/// Interactive AI chat session.
 #[derive(Parser)]
 pub struct ChatCommand {
-    /// AI model to use (overrides environment configuration)
+    /// AI model to use (overrides environment configuration).
     #[arg(long)]
     pub model: Option<String>,
 }
 
 impl ChatCommand {
-    /// Execute the chat command
+    /// Executes the chat command.
     pub fn execute(self) -> Result<()> {
         let ai_info = crate::utils::preflight::check_ai_credentials(self.model.as_deref())?;
         eprintln!(
@@ -85,7 +86,7 @@ async fn chat_loop(client: &crate::claude::client::ClaudeClient) -> Result<()> {
     Ok(())
 }
 
-/// Guard that disables raw mode on drop
+/// Guard that disables raw mode on drop.
 struct RawModeGuard;
 
 impl Drop for RawModeGuard {
@@ -94,7 +95,7 @@ impl Drop for RawModeGuard {
     }
 }
 
-/// Read multiline user input with "> " prompt
+/// Reads multiline user input with "> " prompt.
 ///
 /// Returns `Ok(Some(text))` on Enter, `Ok(None)` on Ctrl+D/Ctrl+C.
 fn read_user_input() -> Result<Option<String>> {

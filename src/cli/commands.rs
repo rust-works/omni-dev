@@ -1,56 +1,57 @@
-//! Command template management
+//! Command template management.
+
+use std::fs;
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::fs;
-use std::path::Path;
 
 // Embed the template files as strings
 const COMMIT_TWIDDLE_TEMPLATE: &str = include_str!("../templates/commit-twiddle.md");
 const PR_CREATE_TEMPLATE: &str = include_str!("../templates/pr-create.md");
 const PR_UPDATE_TEMPLATE: &str = include_str!("../templates/pr-update.md");
 
-/// Command template management
+/// Command template management.
 #[derive(Parser)]
 pub struct CommandsCommand {
-    /// Commands subcommand to execute
+    /// Commands subcommand to execute.
     #[command(subcommand)]
     pub command: CommandsSubcommands,
 }
 
-/// Commands subcommands
+/// Commands subcommands.
 #[derive(Subcommand)]
 pub enum CommandsSubcommands {
-    /// Generate command templates
+    /// Generates command templates.
     Generate(GenerateCommand),
 }
 
-/// Generate command options
+/// Generate command options.
 #[derive(Parser)]
 pub struct GenerateCommand {
-    /// Generate subcommand to execute
+    /// Generate subcommand to execute.
     #[command(subcommand)]
     pub command: GenerateSubcommands,
 }
 
-/// Generate subcommands
+/// Generate subcommands.
 #[derive(Subcommand)]
 pub enum GenerateSubcommands {
-    /// Generate commit-twiddle command template
+    /// Generates commit-twiddle command template.
     #[command(name = "commit-twiddle")]
     CommitTwiddle,
-    /// Generate pr-create command template
+    /// Generates pr-create command template.
     #[command(name = "pr-create")]
     PrCreate,
-    /// Generate pr-update command template
+    /// Generates pr-update command template.
     #[command(name = "pr-update")]
     PrUpdate,
-    /// Generate all command templates
+    /// Generates all command templates.
     All,
 }
 
 impl CommandsCommand {
-    /// Execute commands command
+    /// Executes the commands command.
     pub fn execute(self) -> Result<()> {
         match self.command {
             CommandsSubcommands::Generate(generate_cmd) => generate_cmd.execute(),
@@ -59,7 +60,7 @@ impl CommandsCommand {
 }
 
 impl GenerateCommand {
-    /// Execute generate command
+    /// Executes the generate command.
     pub fn execute(self) -> Result<()> {
         match self.command {
             GenerateSubcommands::CommitTwiddle => {
@@ -88,7 +89,7 @@ impl GenerateCommand {
     }
 }
 
-/// Generate commit-twiddle command template
+/// Generates the commit-twiddle command template.
 fn generate_commit_twiddle() -> Result<()> {
     ensure_claude_commands_dir()?;
     fs::write(
@@ -99,7 +100,7 @@ fn generate_commit_twiddle() -> Result<()> {
     Ok(())
 }
 
-/// Generate pr-create command template
+/// Generates the pr-create command template.
 fn generate_pr_create() -> Result<()> {
     ensure_claude_commands_dir()?;
     fs::write(".claude/commands/pr-create.md", PR_CREATE_TEMPLATE)
@@ -107,7 +108,7 @@ fn generate_pr_create() -> Result<()> {
     Ok(())
 }
 
-/// Generate pr-update command template
+/// Generates the pr-update command template.
 fn generate_pr_update() -> Result<()> {
     ensure_claude_commands_dir()?;
     fs::write(".claude/commands/pr-update.md", PR_UPDATE_TEMPLATE)
@@ -115,7 +116,7 @@ fn generate_pr_update() -> Result<()> {
     Ok(())
 }
 
-/// Ensure the .claude/commands directory exists
+/// Ensures the .claude/commands directory exists.
 fn ensure_claude_commands_dir() -> Result<()> {
     let commands_dir = Path::new(".claude/commands");
     if !commands_dir.exists() {

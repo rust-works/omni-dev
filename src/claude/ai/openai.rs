@@ -1,22 +1,24 @@
-//! OpenAI-compatible API client implementation (works with OpenAI, Ollama, etc.)
+//! OpenAI-compatible API client implementation (works with OpenAI, Ollama, etc.).
 
-use super::{AiClient, AiClientMetadata};
-use crate::claude::{error::ClaudeError, model_config::get_model_registry};
+use std::future::Future;
+use std::pin::Pin;
+
 use anyhow::Result;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::future::Future;
-use std::pin::Pin;
 use tracing::{debug, info};
 
-/// OpenAI API request message
+use super::{AiClient, AiClientMetadata};
+use crate::claude::{error::ClaudeError, model_config::get_model_registry};
+
+/// OpenAI API request message.
 #[derive(Serialize, Debug)]
 struct Message {
     role: String,
     content: String,
 }
 
-/// OpenAI API request body
+/// OpenAI API request body.
 #[derive(Serialize, Debug)]
 struct OpenAiRequest {
     model: String,
@@ -30,7 +32,7 @@ struct OpenAiRequest {
     stream: bool,
 }
 
-/// OpenAI API response choice
+/// OpenAI API response choice.
 #[derive(Deserialize, Debug)]
 struct Choice {
     message: ResponseMessage,
@@ -38,7 +40,7 @@ struct Choice {
     finish_reason: Option<String>,
 }
 
-/// OpenAI API response message
+/// OpenAI API response message.
 #[derive(Deserialize, Debug)]
 struct ResponseMessage {
     #[allow(dead_code)]
@@ -46,7 +48,7 @@ struct ResponseMessage {
     content: String,
 }
 
-/// OpenAI API response
+/// OpenAI API response.
 #[derive(Deserialize, Debug)]
 struct OpenAiResponse {
     choices: Vec<Choice>,
@@ -54,7 +56,7 @@ struct OpenAiResponse {
     usage: Option<Usage>,
 }
 
-/// OpenAI API usage statistics
+/// OpenAI API usage statistics.
 #[derive(Deserialize, Debug)]
 #[allow(dead_code)]
 struct Usage {
@@ -63,26 +65,26 @@ struct Usage {
     total_tokens: Option<i32>,
 }
 
-/// OpenAI-compatible API client (works with OpenAI, Ollama, etc.)
+/// OpenAI-compatible API client (works with OpenAI, Ollama, etc.).
 pub struct OpenAiAiClient {
-    /// HTTP client for API requests
+    /// HTTP client for API requests.
     client: Client,
-    /// API key for authentication (optional for Ollama)
+    /// API key for authentication (optional for Ollama).
     api_key: Option<String>,
-    /// Model identifier
+    /// Model identifier.
     model: String,
-    /// Base URL for the API (e.g., "https://api.openai.com" or "http://localhost:11434")
+    /// Base URL for the API (e.g., "https://api.openai.com" or "http://localhost:11434").
     base_url: String,
-    /// Maximum tokens for responses
+    /// Maximum tokens for responses.
     max_tokens: Option<i32>,
-    /// Temperature for response generation
+    /// Temperature for response generation.
     temperature: Option<f32>,
-    /// Active beta header (key, value) if enabled
+    /// Active beta header (key, value) if enabled.
     active_beta: Option<(String, String)>,
 }
 
 impl OpenAiAiClient {
-    /// Create a new OpenAI-compatible API client
+    /// Creates a new OpenAI-compatible API client.
     pub fn new(
         model: String,
         api_key: Option<String>,
@@ -104,7 +106,7 @@ impl OpenAiAiClient {
         }
     }
 
-    /// Create a new client for Ollama with sensible defaults
+    /// Creates a new client for Ollama with sensible defaults.
     pub fn new_ollama(
         model: String,
         base_url: Option<String>,
@@ -120,7 +122,7 @@ impl OpenAiAiClient {
         )
     }
 
-    /// Create a new client for OpenAI with sensible defaults
+    /// Creates a new client for OpenAI with sensible defaults.
     pub fn new_openai(
         model: String,
         api_key: String,
@@ -136,7 +138,7 @@ impl OpenAiAiClient {
         )
     }
 
-    /// Get max tokens from model registry or fallback to configured value
+    /// Returns the max tokens from the model registry or falls back to the configured value.
     fn get_max_tokens(&self) -> i32 {
         if let Some(configured_max) = self.max_tokens {
             return configured_max;
@@ -150,7 +152,7 @@ impl OpenAiAiClient {
         }
     }
 
-    /// Build the full API URL
+    /// Builds the full API URL.
     fn get_api_url(&self) -> Result<String> {
         let mut base = self.base_url.clone();
 
@@ -167,14 +169,14 @@ impl OpenAiAiClient {
         Ok(url)
     }
 
-    /// Determine if this is likely an Ollama instance
+    /// Determines if this is likely an Ollama instance.
     fn is_ollama(&self) -> bool {
         self.base_url.contains("localhost")
             || self.base_url.contains("127.0.0.1")
             || self.api_key.is_none()
     }
 
-    /// Determine if this model is GPT-5 series (uses max_completion_tokens instead of max_tokens)
+    /// Determines if this model is GPT-5 series (uses max_completion_tokens instead of max_tokens).
     fn is_gpt5_series(&self) -> bool {
         self.model.starts_with("gpt-5") || self.model.starts_with("o1")
     }
@@ -345,7 +347,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_new_ollama() {
+    fn new_ollama() {
         let client = OpenAiAiClient::new_ollama("llama2".to_string(), None, None);
         assert_eq!(client.model, "llama2");
         assert_eq!(client.base_url, "http://localhost:11434");
@@ -354,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn test_new_ollama_custom_url() {
+    fn new_ollama_custom_url() {
         let client = OpenAiAiClient::new_ollama(
             "codellama".to_string(),
             Some("http://192.168.1.100:11434".to_string()),
@@ -365,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn test_new_openai() {
+    fn new_openai() {
         let client =
             OpenAiAiClient::new_openai("gpt-4".to_string(), "sk-test123".to_string(), None);
         assert_eq!(client.model, "gpt-4");
@@ -375,14 +377,14 @@ mod tests {
     }
 
     #[test]
-    fn test_get_api_url() {
+    fn get_api_url() {
         let client = OpenAiAiClient::new_ollama("llama2".to_string(), None, None);
         let url = client.get_api_url().unwrap();
         assert_eq!(url, "http://localhost:11434/v1/chat/completions");
     }
 
     #[test]
-    fn test_get_api_url_trailing_slash() {
+    fn get_api_url_trailing_slash() {
         let client = OpenAiAiClient::new(
             "test-model".to_string(),
             None,
@@ -396,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn test_is_ollama_detection() {
+    fn is_ollama_detection() {
         // Test localhost detection
         let ollama_client = OpenAiAiClient::new(
             "llama2".to_string(),

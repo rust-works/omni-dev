@@ -1,11 +1,13 @@
-use anyhow::Result;
-use git2::{Repository, Signature};
-use omni_dev::cli::git::AmendCommand;
-use omni_dev::data::amendments::{Amendment, AmendmentFile};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+
+use anyhow::Result;
+use git2::{Repository, Signature};
 use tempfile::TempDir;
+
+use omni_dev::cli::git::AmendCommand;
+use omni_dev::data::amendments::{Amendment, AmendmentFile};
 
 /// Test setup that creates a temporary git repository with test commits
 struct TestRepo {
@@ -100,7 +102,7 @@ impl TestRepo {
 }
 
 #[test]
-fn test_amend_command_with_temporary_repo() -> Result<()> {
+fn amend_command_with_temporary_repo() -> Result<()> {
     // Set up temporary repository with test commits
     let mut test_repo = TestRepo::new()?;
 
@@ -180,7 +182,7 @@ fn test_amend_command_with_temporary_repo() -> Result<()> {
 }
 
 #[test]
-fn test_amendment_file_parsing() -> Result<()> {
+fn amendment_file_parsing() -> Result<()> {
     // Test that amendment file parsing works correctly
     let temp_dir = tempfile::tempdir()?;
     let yaml_path = temp_dir.path().join("test_amendments.yaml");
@@ -205,7 +207,7 @@ amendments:
 }
 
 #[test]
-fn test_amendment_validation() -> Result<()> {
+fn amendment_validation() -> Result<()> {
     // Test amendment validation
     let temp_dir = tempfile::tempdir()?;
     let yaml_path = temp_dir.path().join("invalid_amendments.yaml");
@@ -228,7 +230,7 @@ amendments:
 }
 
 #[test]
-fn test_help_all_golden() -> Result<()> {
+fn help_all_golden() -> Result<()> {
     // Capture the help-all output using the help generator directly
     use omni_dev::cli::help::HelpGenerator;
 

@@ -1,23 +1,25 @@
-//! Bedrock API client implementation for Claude
+//! Bedrock API client implementation for Claude.
 
-use super::{AiClient, AiClientMetadata};
-use crate::claude::{error::ClaudeError, model_config::get_model_registry};
+use std::future::Future;
+use std::pin::Pin;
+
 use anyhow::Result;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::future::Future;
-use std::pin::Pin;
 use tracing::{debug, info};
 use url::Url;
 
-/// Bedrock API request message
+use super::{AiClient, AiClientMetadata};
+use crate::claude::{error::ClaudeError, model_config::get_model_registry};
+
+/// Bedrock API request message.
 #[derive(Serialize)]
 struct Message {
     role: String,
     content: String,
 }
 
-/// Bedrock API request body
+/// Bedrock API request body.
 #[derive(Serialize)]
 struct BedrockRequest {
     anthropic_version: String,
@@ -26,7 +28,7 @@ struct BedrockRequest {
     messages: Vec<Message>,
 }
 
-/// Bedrock API content
+/// Bedrock API content.
 #[derive(Deserialize, Debug)]
 struct Content {
     #[serde(rename = "type")]
@@ -34,7 +36,7 @@ struct Content {
     text: String,
 }
 
-/// Bedrock API response
+/// Bedrock API response.
 #[derive(Deserialize, Debug)]
 #[allow(dead_code)]
 struct BedrockResponse {
@@ -49,7 +51,7 @@ struct BedrockResponse {
     usage: Option<Usage>,
 }
 
-/// Bedrock API usage statistics
+/// Bedrock API usage statistics.
 #[derive(Deserialize, Debug)]
 #[allow(dead_code)]
 struct Usage {
@@ -61,22 +63,22 @@ struct Usage {
     cache_read_input_tokens: i32,
 }
 
-/// Bedrock API client implementation for Claude
+/// Bedrock API client implementation for Claude.
 pub struct BedrockAiClient {
-    /// HTTP client for API requests
+    /// HTTP client for API requests.
     client: Client,
-    /// Authorization token
+    /// Authorization token.
     auth_token: String,
-    /// Model identifier
+    /// Model identifier.
     model: String,
-    /// Base URL for the Bedrock API
+    /// Base URL for the Bedrock API.
     base_url: String,
-    /// Active beta header (key, value) if enabled
+    /// Active beta header (key, value) if enabled.
     active_beta: Option<(String, String)>,
 }
 
 impl BedrockAiClient {
-    /// Create a new Bedrock AI client
+    /// Creates a new Bedrock AI client.
     pub fn new(
         model: String,
         auth_token: String,
@@ -94,7 +96,7 @@ impl BedrockAiClient {
         }
     }
 
-    /// Get max tokens from model registry
+    /// Returns the max tokens from the model registry.
     fn get_max_tokens(&self) -> i32 {
         let registry = get_model_registry();
         if let Some((_, ref value)) = self.active_beta {
@@ -104,7 +106,7 @@ impl BedrockAiClient {
         }
     }
 
-    /// Build the full API URL
+    /// Builds the full API URL.
     fn get_api_url(&self) -> Result<String> {
         let mut url = Url::parse(&self.base_url)
             .map_err(|e| ClaudeError::NetworkError(format!("Invalid base URL: {}", e)))?;
@@ -289,7 +291,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_get_api_url() {
+    fn get_api_url() {
         let client = BedrockAiClient::new(
             "us.anthropic.claude-3-7-sonnet-20250219-v1:0".to_string(),
             "test_token".to_string(),
@@ -305,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_max_tokens() {
+    fn get_max_tokens() {
         // Test legacy Claude 3 Opus
         let client = BedrockAiClient::new(
             "claude-3-opus-20240229".to_string(),

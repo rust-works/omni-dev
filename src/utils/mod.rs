@@ -1,4 +1,4 @@
-//! Utility functions and helpers
+//! Utility functions and helpers.
 
 pub mod ai_scratch;
 pub mod general;

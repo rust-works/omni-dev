@@ -1,21 +1,21 @@
-//! Help command implementation for comprehensive CLI documentation
+//! Help command implementation for comprehensive CLI documentation.
 
 use anyhow::Result;
 use clap::{builder::StyledStr, Command, CommandFactory, Parser};
 
-/// Help command for displaying comprehensive usage information
+/// Help command for displaying comprehensive usage information.
 #[derive(Parser)]
 pub struct HelpCommand {
     // No subcommands needed - this command shows all help
 }
 
-/// Help generator for creating comprehensive CLI documentation
+/// Help generator for creating comprehensive CLI documentation.
 pub struct HelpGenerator {
     app: Command,
 }
 
 impl HelpGenerator {
-    /// Create a new help generator with the current CLI app
+    /// Creates a new help generator with the current CLI app.
     pub fn new() -> Self {
         use crate::cli::Cli;
 
@@ -33,7 +33,7 @@ impl Default for HelpGenerator {
 }
 
 impl HelpGenerator {
-    /// Generate comprehensive help for all commands
+    /// Generates comprehensive help for all commands.
     pub fn generate_all_help(&self) -> Result<String> {
         let mut help_sections = Vec::new();
 
@@ -49,7 +49,7 @@ impl HelpGenerator {
         Ok(help_sections.join(&separator))
     }
 
-    /// Recursively collect help for all subcommands
+    /// Recursively collects help for all subcommands.
     ///
     /// IMPORTANT: Commands are sorted lexicographically to ensure consistent,
     /// predictable output order. This is critical for:
@@ -84,7 +84,7 @@ impl HelpGenerator {
         }
     }
 
-    /// Render help for a specific command
+    /// Renders help for a specific command.
     fn render_command_help(&self, cmd: &Command, path: &str) -> String {
         let mut output = String::new();
 
@@ -109,14 +109,14 @@ impl HelpGenerator {
         output
     }
 
-    /// Convert StyledStr to regular String (removes ANSI codes for plain text)
+    /// Converts a `StyledStr` to a regular `String` (removes ANSI codes for plain text).
     fn styled_str_to_string(&self, styled: &StyledStr) -> String {
         styled.to_string()
     }
 }
 
 impl HelpCommand {
-    /// Execute the help command - shows comprehensive help for all commands
+    /// Executes the help command, showing comprehensive help for all commands.
     pub fn execute(self) -> Result<()> {
         let generator = HelpGenerator::new();
         let help_output = generator.generate_all_help()?;
