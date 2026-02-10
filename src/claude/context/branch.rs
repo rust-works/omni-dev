@@ -1,16 +1,18 @@
-//! Branch analysis and work pattern detection
+//! Branch analysis and work pattern detection.
+
+use std::str::FromStr;
+use std::sync::LazyLock;
+
+use anyhow::Result;
+use regex::Regex;
 
 use crate::data::context::{BranchContext, WorkType};
-use anyhow::Result;
-use once_cell::sync::Lazy;
-use regex::Regex;
-use std::str::FromStr;
 
-/// Branch naming pattern analyzer
+/// Branch naming pattern analyzer.
 pub struct BranchAnalyzer;
 
 impl BranchAnalyzer {
-    /// Analyze branch name and extract context information
+    /// Analyzes a branch name and extracts context information.
     pub fn analyze(branch_name: &str) -> Result<BranchContext> {
         let mut context = BranchContext::default();
 
@@ -70,7 +72,7 @@ impl BranchAnalyzer {
         Ok(context)
     }
 
-    /// Analyze multiple branch names to understand branching strategy
+    /// Analyzes multiple branch names to understand the branching strategy.
     pub fn analyze_branching_strategy(branches: &[String]) -> BranchingStrategy {
         let mut has_gitflow = false;
         let mut has_github_flow = false;
@@ -103,41 +105,41 @@ impl BranchAnalyzer {
     }
 }
 
-/// Branching strategy patterns
+/// Branching strategy patterns.
 #[derive(Debug, Clone)]
 pub enum BranchingStrategy {
-    /// Git Flow branching model with feature/, release/, hotfix/ branches
+    /// Git Flow branching model with feature/, release/, hotfix/ branches.
     GitFlow,
-    /// GitHub Flow with simple feature branches and main branch
+    /// GitHub Flow with simple feature branches and main branch.
     GitHubFlow,
-    /// Conventional commits with type-based branch naming
+    /// Conventional commits with type-based branch naming.
     ConventionalCommits,
-    /// Unknown or mixed branching strategy
+    /// Unknown or mixed branching strategy.
     Unknown,
 }
 
 // Branch naming pattern regexes
-static STANDARD_BRANCH_PATTERN: Lazy<Regex> = Lazy::new(|| {
+static STANDARD_BRANCH_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(?P<type>feature|feat|fix|bugfix|docs?|refactor|chore|test|ci|build|perf|hotfix|release)/(?:(?P<scope>[^/]+)/)?(?P<desc>.+)$").unwrap()
 });
 
-static TICKET_BRANCH_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^(?P<ticket>[A-Z]+-\d+|issue-\d+|#\d+)-(?P<desc>.+)$").unwrap());
+static TICKET_BRANCH_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(?P<ticket>[A-Z]+-\d+|issue-\d+|#\d+)-(?P<desc>.+)$").unwrap());
 
-static USER_BRANCH_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^[a-zA-Z0-9_-]+/(?P<desc>.+)$").unwrap());
+static USER_BRANCH_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9_-]+/(?P<desc>.+)$").unwrap());
 
-static TICKET_REFERENCE_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"([A-Z]+-\d+|#\d+|issue-\d+)").unwrap());
+static TICKET_REFERENCE_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"([A-Z]+-\d+|#\d+|issue-\d+)").unwrap());
 
-/// Extract ticket references from branch name
+/// Extracts ticket references from a branch name.
 fn extract_ticket_references(branch_name: &str) -> Option<String> {
     TICKET_REFERENCE_PATTERN
         .find(branch_name)
         .map(|m| m.as_str().to_string())
 }
 
-/// Infer work type from description keywords
+/// Infers the work type from description keywords.
 fn infer_work_type_from_description(description: &str) -> WorkType {
     let desc_lower = description.to_lowercase();
 
@@ -163,7 +165,7 @@ fn infer_work_type_from_description(description: &str) -> WorkType {
     }
 }
 
-/// Clean up and normalize description text
+/// Cleans up and normalizes description text.
 fn clean_description(description: &str) -> String {
     let mut cleaned = description.trim().to_string();
 

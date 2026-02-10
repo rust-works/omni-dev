@@ -30,5 +30,5 @@ pub mod utils;
 pub use crate::cli::Cli;
 pub use crate::core::*;
 
-/// The current version of omni-dev
+/// The current version of omni-dev.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

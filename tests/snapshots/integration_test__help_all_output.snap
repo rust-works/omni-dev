@@ -13,7 +13,7 @@ Commands:
   git       Git-related operations
   commands  Command template management
   config    Configuration and model information
-  help-all  Display comprehensive help for all commands
+  help-all  Displays comprehensive help for all commands
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -59,7 +59,7 @@ Command template management
 Usage: commands <COMMAND>
 
 Commands:
-  generate  Generate command templates
+  generate  Generates command templates
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -68,17 +68,17 @@ Options:
 
 ================================================================================
 
-omni-dev commands generate - Generate command templates
+omni-dev commands generate - Generates command templates
 
-Generate command templates
+Generates command templates
 
 Usage: generate <COMMAND>
 
 Commands:
-  commit-twiddle  Generate commit-twiddle command template
-  pr-create       Generate pr-create command template
-  pr-update       Generate pr-update command template
-  all             Generate all command templates
+  commit-twiddle  Generates commit-twiddle command template
+  pr-create       Generates pr-create command template
+  pr-update       Generates pr-update command template
+  all             Generates all command templates
   help            Print this message or the help of the given subcommand(s)
 
 Options:
@@ -87,9 +87,9 @@ Options:
 
 ================================================================================
 
-omni-dev commands generate all - Generate all command templates
+omni-dev commands generate all - Generates all command templates
 
-Generate all command templates
+Generates all command templates
 
 Usage: all
 
@@ -99,9 +99,9 @@ Options:
 
 ================================================================================
 
-omni-dev commands generate commit-twiddle - Generate commit-twiddle command template
+omni-dev commands generate commit-twiddle - Generates commit-twiddle command template
 
-Generate commit-twiddle command template
+Generates commit-twiddle command template
 
 Usage: commit-twiddle
 
@@ -111,9 +111,9 @@ Options:
 
 ================================================================================
 
-omni-dev commands generate pr-create - Generate pr-create command template
+omni-dev commands generate pr-create - Generates pr-create command template
 
-Generate pr-create command template
+Generates pr-create command template
 
 Usage: pr-create
 
@@ -123,9 +123,9 @@ Options:
 
 ================================================================================
 
-omni-dev commands generate pr-update - Generate pr-update command template
+omni-dev commands generate pr-update - Generates pr-update command template
 
-Generate pr-update command template
+Generates pr-update command template
 
 Usage: pr-update
 
@@ -158,7 +158,7 @@ AI model configuration and information
 Usage: models <COMMAND>
 
 Commands:
-  show  Show the embedded models.yaml configuration
+  show  Shows the embedded models.yaml configuration
   help  Print this message or the help of the given subcommand(s)
 
 Options:
@@ -167,9 +167,9 @@ Options:
 
 ================================================================================
 
-omni-dev config models show - Show the embedded models.yaml configuration
+omni-dev config models show - Shows the embedded models.yaml configuration
 
-Show the embedded models.yaml configuration
+Shows the embedded models.yaml configuration
 
 Usage: show
 
@@ -203,7 +203,7 @@ Branch-related operations
 Usage: branch <COMMAND>
 
 Commands:
-  info    Analyze branch commits and output repository information in YAML format
+  info    Analyzes branch commits and outputs repository information in YAML format
   create  Create operations
   help    Print this message or the help of the given subcommand(s)
 
@@ -220,7 +220,7 @@ Create operations
 Usage: create <COMMAND>
 
 Commands:
-  pr    Create a pull request with AI-generated description
+  pr    Creates a pull request with AI-generated description
   help  Print this message or the help of the given subcommand(s)
 
 Options:
@@ -229,27 +229,27 @@ Options:
 
 ================================================================================
 
-omni-dev git branch create pr - Create a pull request with AI-generated description
+omni-dev git branch create pr - Creates a pull request with AI-generated description
 
-Create a pull request with AI-generated description
+Creates a pull request with AI-generated description
 
 Usage: pr [OPTIONS]
 
 Options:
       --base <BRANCH>     Base branch for the PR to be merged into (defaults to main/master)
       --model <MODEL>     Claude API model to use (if not specified, uses settings or default)
-      --auto-apply        Skip confirmation prompt and create PR automatically
-      --save-only <FILE>  Save generated PR details to file without creating PR
-      --ready             Create PR as ready for review (overrides default)
-      --draft             Create PR as draft (overrides default)
+      --auto-apply        Skips confirmation prompt and creates PR automatically
+      --save-only <FILE>  Saves generated PR details to file without creating PR
+      --ready             Creates PR as ready for review (overrides default)
+      --draft             Creates PR as draft (overrides default)
   -h, --help              Print help
 
 
 ================================================================================
 
-omni-dev git branch info - Analyze branch commits and output repository information in YAML format
+omni-dev git branch info - Analyzes branch commits and outputs repository information in YAML format
 
-Analyze branch commits and output repository information in YAML format
+Analyzes branch commits and outputs repository information in YAML format
 
 Usage: info [BASE_BRANCH]
 
@@ -285,10 +285,10 @@ Commit message operations
 Usage: message <COMMAND>
 
 Commands:
-  view     Analyze commits and output repository information in YAML format
-  amend    Amend commit messages based on a YAML configuration file
+  view     Analyzes commits and outputs repository information in YAML format
+  amend    Amends commit messages based on a YAML configuration file
   twiddle  AI-powered commit message improvement using Claude
-  check    Check commit messages against guidelines without modifying them
+  check    Checks commit messages against guidelines without modifying them
   help     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -297,9 +297,9 @@ Options:
 
 ================================================================================
 
-omni-dev git commit message amend - Amend commit messages based on a YAML configuration file
+omni-dev git commit message amend - Amends commit messages based on a YAML configuration file
 
-Amend commit messages based on a YAML configuration file
+Amends commit messages based on a YAML configuration file
 
 Usage: amend <YAML_FILE>
 
@@ -312,28 +312,28 @@ Options:
 
 ================================================================================
 
-omni-dev git commit message check - Check commit messages against guidelines without modifying them
+omni-dev git commit message check - Checks commit messages against guidelines without modifying them
 
-Check commit messages against guidelines without modifying them
+Checks commit messages against guidelines without modifying them
 
 Usage: check [OPTIONS] [COMMIT_RANGE]
 
 Arguments:
-  [COMMIT_RANGE]  Commit range to check (e.g., HEAD~3..HEAD, abc123..def456) Defaults to commits ahead of main branch
+  [COMMIT_RANGE]  Commit range to check (e.g., HEAD~3..HEAD, abc123..def456). Defaults to commits ahead of main branch
 
 Options:
       --model <MODEL>              Claude API model to use (if not specified, uses settings or default)
-      --beta-header <KEY:VALUE>    Beta header to send with API requests (format: key:value) Only sent if the model supports it in the registry
+      --beta-header <KEY:VALUE>    Beta header to send with API requests (format: key:value). Only sent if the model supports it in the registry
       --context-dir <CONTEXT_DIR>  Path to custom context directory (defaults to .omni-dev/)
       --guidelines <GUIDELINES>    Explicit path to guidelines file
       --format <FORMAT>            Output format: text (default), json, yaml [default: text]
-      --strict                     Exit with error code if any issues found (including warnings)
-      --quiet                      Only show errors/warnings, suppress info-level output
-      --verbose                    Show detailed analysis including passing commits
-      --show-passing               Include passing commits in output (hidden by default)
+      --strict                     Exits with error code if any issues found (including warnings)
+      --quiet                      Only shows errors/warnings, suppresses info-level output
+      --verbose                    Shows detailed analysis including passing commits
+      --show-passing               Includes passing commits in output (hidden by default)
       --batch-size <BATCH_SIZE>    Number of commits to process per AI request (default: 4) [default: 4]
-      --no-suggestions             Skip generating corrected message suggestions
-      --twiddle                    Offer to apply suggested messages when issues are found
+      --no-suggestions             Skips generating corrected message suggestions
+      --twiddle                    Offers to apply suggested messages when issues are found
   -h, --help                       Print help
 
 
@@ -352,38 +352,38 @@ Options:
       --model <MODEL>
           Claude API model to use (if not specified, uses settings or default)
       --beta-header <KEY:VALUE>
-          Beta header to send with API requests (format: key:value) Only sent if the model supports it in the registry
+          Beta header to send with API requests (format: key:value). Only sent if the model supports it in the registry
       --auto-apply
-          Skip confirmation prompt and apply amendments automatically
+          Skips confirmation prompt and applies amendments automatically
       --save-only <FILE>
-          Save generated amendments to file without applying
+          Saves generated amendments to file without applying
       --use-context
-          Use additional project context for better suggestions (Phase 3)
+          Uses additional project context for better suggestions (Phase 3)
       --context-dir <CONTEXT_DIR>
           Path to custom context directory (defaults to .omni-dev/)
       --work-context <WORK_CONTEXT>
-          Specify work context (e.g., "feature: user authentication")
+          Specifies work context (e.g., "feature: user authentication")
       --branch-context <BRANCH_CONTEXT>
-          Override detected branch context
+          Overrides detected branch context
       --no-context
-          Disable contextual analysis (use basic prompting only)
+          Disables contextual analysis (uses basic prompting only)
       --batch-size <BATCH_SIZE>
           Maximum number of commits to process in a single batch (default: 4) [default: 4]
       --no-ai
-          Skip AI processing and only output repository YAML
+          Skips AI processing and only outputs repository YAML
       --fresh
-          Ignore existing commit messages and generate fresh ones based solely on diffs
+          Ignores existing commit messages and generates fresh ones based solely on diffs
       --check
-          Run commit message validation after applying amendments
+          Runs commit message validation after applying amendments
   -h, --help
           Print help
 
 
 ================================================================================
 
-omni-dev git commit message view - Analyze commits and output repository information in YAML format
+omni-dev git commit message view - Analyzes commits and outputs repository information in YAML format
 
-Analyze commits and output repository information in YAML format
+Analyzes commits and outputs repository information in YAML format
 
 Usage: view [COMMIT_RANGE]
 
@@ -396,9 +396,9 @@ Options:
 
 ================================================================================
 
-omni-dev help-all - Display comprehensive help for all commands
+omni-dev help-all - Displays comprehensive help for all commands
 
-Display comprehensive help for all commands
+Displays comprehensive help for all commands
 
 Usage: help-all
 

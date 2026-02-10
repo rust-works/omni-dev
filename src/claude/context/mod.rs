@@ -1,4 +1,4 @@
-//! Contextual intelligence system for enhanced commit message analysis
+//! Contextual intelligence system for enhanced commit message analysis.
 
 pub mod branch;
 pub mod discovery;

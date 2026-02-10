@@ -1,10 +1,10 @@
-//! Git-related CLI commands
+//! Git-related CLI commands.
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing::{debug, error};
 
-/// Parse a `--beta-header key:value` string into a `(key, value)` tuple.
+/// Parses a `--beta-header key:value` string into a `(key, value)` tuple.
 fn parse_beta_header(s: &str) -> Result<(String, String)> {
     let (k, v) = s.split_once(':').ok_or_else(|| {
         anyhow::anyhow!("Invalid --beta-header format '{}'. Expected key:value", s)
@@ -12,264 +12,264 @@ fn parse_beta_header(s: &str) -> Result<(String, String)> {
     Ok((k.to_string(), v.to_string()))
 }
 
-/// Git operations
+/// Git operations.
 #[derive(Parser)]
 pub struct GitCommand {
-    /// Git subcommand to execute
+    /// Git subcommand to execute.
     #[command(subcommand)]
     pub command: GitSubcommands,
 }
 
-/// Git subcommands
+/// Git subcommands.
 #[derive(Subcommand)]
 pub enum GitSubcommands {
-    /// Commit-related operations
+    /// Commit-related operations.
     Commit(CommitCommand),
-    /// Branch-related operations
+    /// Branch-related operations.
     Branch(BranchCommand),
 }
 
-/// Commit operations
+/// Commit operations.
 #[derive(Parser)]
 pub struct CommitCommand {
-    /// Commit subcommand to execute
+    /// Commit subcommand to execute.
     #[command(subcommand)]
     pub command: CommitSubcommands,
 }
 
-/// Commit subcommands
+/// Commit subcommands.
 #[derive(Subcommand)]
 pub enum CommitSubcommands {
-    /// Commit message operations
+    /// Commit message operations.
     Message(MessageCommand),
 }
 
-/// Message operations
+/// Message operations.
 #[derive(Parser)]
 pub struct MessageCommand {
-    /// Message subcommand to execute
+    /// Message subcommand to execute.
     #[command(subcommand)]
     pub command: MessageSubcommands,
 }
 
-/// Message subcommands
+/// Message subcommands.
 #[derive(Subcommand)]
 pub enum MessageSubcommands {
-    /// Analyze commits and output repository information in YAML format
+    /// Analyzes commits and outputs repository information in YAML format.
     View(ViewCommand),
-    /// Amend commit messages based on a YAML configuration file
+    /// Amends commit messages based on a YAML configuration file.
     Amend(AmendCommand),
-    /// AI-powered commit message improvement using Claude
+    /// AI-powered commit message improvement using Claude.
     Twiddle(TwiddleCommand),
-    /// Check commit messages against guidelines without modifying them
+    /// Checks commit messages against guidelines without modifying them.
     Check(CheckCommand),
 }
 
-/// View command options
+/// View command options.
 #[derive(Parser)]
 pub struct ViewCommand {
-    /// Commit range to analyze (e.g., HEAD~3..HEAD, abc123..def456)
+    /// Commit range to analyze (e.g., HEAD~3..HEAD, abc123..def456).
     #[arg(value_name = "COMMIT_RANGE")]
     pub commit_range: Option<String>,
 }
 
-/// Amend command options  
+/// Amend command options.
 #[derive(Parser)]
 pub struct AmendCommand {
-    /// YAML file containing commit amendments
+    /// YAML file containing commit amendments.
     #[arg(value_name = "YAML_FILE")]
     pub yaml_file: String,
 }
 
-/// Twiddle command options
+/// Twiddle command options.
 #[derive(Parser)]
 pub struct TwiddleCommand {
-    /// Commit range to analyze and improve (e.g., HEAD~3..HEAD, abc123..def456)
+    /// Commit range to analyze and improve (e.g., HEAD~3..HEAD, abc123..def456).
     #[arg(value_name = "COMMIT_RANGE")]
     pub commit_range: Option<String>,
 
-    /// Claude API model to use (if not specified, uses settings or default)
+    /// Claude API model to use (if not specified, uses settings or default).
     #[arg(long)]
     pub model: Option<String>,
 
-    /// Beta header to send with API requests (format: key:value)
-    /// Only sent if the model supports it in the registry
+    /// Beta header to send with API requests (format: key:value).
+    /// Only sent if the model supports it in the registry.
     #[arg(long, value_name = "KEY:VALUE")]
     pub beta_header: Option<String>,
 
-    /// Skip confirmation prompt and apply amendments automatically
+    /// Skips confirmation prompt and applies amendments automatically.
     #[arg(long)]
     pub auto_apply: bool,
 
-    /// Save generated amendments to file without applying
+    /// Saves generated amendments to file without applying.
     #[arg(long, value_name = "FILE")]
     pub save_only: Option<String>,
 
-    /// Use additional project context for better suggestions (Phase 3)
+    /// Uses additional project context for better suggestions (Phase 3).
     #[arg(long, default_value = "true")]
     pub use_context: bool,
 
-    /// Path to custom context directory (defaults to .omni-dev/)
+    /// Path to custom context directory (defaults to .omni-dev/).
     #[arg(long)]
     pub context_dir: Option<std::path::PathBuf>,
 
-    /// Specify work context (e.g., "feature: user authentication")
+    /// Specifies work context (e.g., "feature: user authentication").
     #[arg(long)]
     pub work_context: Option<String>,
 
-    /// Override detected branch context
+    /// Overrides detected branch context.
     #[arg(long)]
     pub branch_context: Option<String>,
 
-    /// Disable contextual analysis (use basic prompting only)
+    /// Disables contextual analysis (uses basic prompting only).
     #[arg(long)]
     pub no_context: bool,
 
-    /// Maximum number of commits to process in a single batch (default: 4)
+    /// Maximum number of commits to process in a single batch (default: 4).
     #[arg(long, default_value = "4")]
     pub batch_size: usize,
 
-    /// Skip AI processing and only output repository YAML
+    /// Skips AI processing and only outputs repository YAML.
     #[arg(long)]
     pub no_ai: bool,
 
-    /// Ignore existing commit messages and generate fresh ones based solely on diffs
+    /// Ignores existing commit messages and generates fresh ones based solely on diffs.
     #[arg(long)]
     pub fresh: bool,
 
-    /// Run commit message validation after applying amendments
+    /// Runs commit message validation after applying amendments.
     #[arg(long)]
     pub check: bool,
 }
 
-/// Check command options - validates commit messages against guidelines
+/// Check command options - validates commit messages against guidelines.
 #[derive(Parser)]
 pub struct CheckCommand {
-    /// Commit range to check (e.g., HEAD~3..HEAD, abc123..def456)
-    /// Defaults to commits ahead of main branch
+    /// Commit range to check (e.g., HEAD~3..HEAD, abc123..def456).
+    /// Defaults to commits ahead of main branch.
     #[arg(value_name = "COMMIT_RANGE")]
     pub commit_range: Option<String>,
 
-    /// Claude API model to use (if not specified, uses settings or default)
+    /// Claude API model to use (if not specified, uses settings or default).
     #[arg(long)]
     pub model: Option<String>,
 
-    /// Beta header to send with API requests (format: key:value)
-    /// Only sent if the model supports it in the registry
+    /// Beta header to send with API requests (format: key:value).
+    /// Only sent if the model supports it in the registry.
     #[arg(long, value_name = "KEY:VALUE")]
     pub beta_header: Option<String>,
 
-    /// Path to custom context directory (defaults to .omni-dev/)
+    /// Path to custom context directory (defaults to .omni-dev/).
     #[arg(long)]
     pub context_dir: Option<std::path::PathBuf>,
 
-    /// Explicit path to guidelines file
+    /// Explicit path to guidelines file.
     #[arg(long)]
     pub guidelines: Option<std::path::PathBuf>,
 
-    /// Output format: text (default), json, yaml
+    /// Output format: text (default), json, yaml.
     #[arg(long, default_value = "text")]
     pub format: String,
 
-    /// Exit with error code if any issues found (including warnings)
+    /// Exits with error code if any issues found (including warnings).
     #[arg(long)]
     pub strict: bool,
 
-    /// Only show errors/warnings, suppress info-level output
+    /// Only shows errors/warnings, suppresses info-level output.
     #[arg(long)]
     pub quiet: bool,
 
-    /// Show detailed analysis including passing commits
+    /// Shows detailed analysis including passing commits.
     #[arg(long)]
     pub verbose: bool,
 
-    /// Include passing commits in output (hidden by default)
+    /// Includes passing commits in output (hidden by default).
     #[arg(long)]
     pub show_passing: bool,
 
-    /// Number of commits to process per AI request (default: 4)
+    /// Number of commits to process per AI request (default: 4).
     #[arg(long, default_value = "4")]
     pub batch_size: usize,
 
-    /// Skip generating corrected message suggestions
+    /// Skips generating corrected message suggestions.
     #[arg(long)]
     pub no_suggestions: bool,
 
-    /// Offer to apply suggested messages when issues are found
+    /// Offers to apply suggested messages when issues are found.
     #[arg(long)]
     pub twiddle: bool,
 }
 
-/// Branch operations
+/// Branch operations.
 #[derive(Parser)]
 pub struct BranchCommand {
-    /// Branch subcommand to execute
+    /// Branch subcommand to execute.
     #[command(subcommand)]
     pub command: BranchSubcommands,
 }
 
-/// Branch subcommands
+/// Branch subcommands.
 #[derive(Subcommand)]
 pub enum BranchSubcommands {
-    /// Analyze branch commits and output repository information in YAML format
+    /// Analyzes branch commits and outputs repository information in YAML format.
     Info(InfoCommand),
-    /// Create operations
+    /// Create operations.
     Create(CreateCommand),
 }
 
-/// Info command options
+/// Info command options.
 #[derive(Parser)]
 pub struct InfoCommand {
-    /// Base branch to compare against (defaults to main/master)
+    /// Base branch to compare against (defaults to main/master).
     #[arg(value_name = "BASE_BRANCH")]
     pub base_branch: Option<String>,
 }
 
-/// Create operations
+/// Create operations.
 #[derive(Parser)]
 pub struct CreateCommand {
-    /// Create subcommand to execute
+    /// Create subcommand to execute.
     #[command(subcommand)]
     pub command: CreateSubcommands,
 }
 
-/// Create subcommands
+/// Create subcommands.
 #[derive(Subcommand)]
 pub enum CreateSubcommands {
-    /// Create a pull request with AI-generated description
+    /// Creates a pull request with AI-generated description.
     Pr(CreatePrCommand),
 }
 
-/// Create PR command options
+/// Create PR command options.
 #[derive(Parser)]
 pub struct CreatePrCommand {
-    /// Base branch for the PR to be merged into (defaults to main/master)
+    /// Base branch for the PR to be merged into (defaults to main/master).
     #[arg(long, value_name = "BRANCH")]
     pub base: Option<String>,
 
-    /// Claude API model to use (if not specified, uses settings or default)
+    /// Claude API model to use (if not specified, uses settings or default).
     #[arg(long)]
     pub model: Option<String>,
 
-    /// Skip confirmation prompt and create PR automatically
+    /// Skips confirmation prompt and creates PR automatically.
     #[arg(long)]
     pub auto_apply: bool,
 
-    /// Save generated PR details to file without creating PR
+    /// Saves generated PR details to file without creating PR.
     #[arg(long, value_name = "FILE")]
     pub save_only: Option<String>,
 
-    /// Create PR as ready for review (overrides default)
+    /// Creates PR as ready for review (overrides default).
     #[arg(long, conflicts_with = "draft")]
     pub ready: bool,
 
-    /// Create PR as draft (overrides default)
+    /// Creates PR as draft (overrides default).
     #[arg(long, conflicts_with = "ready")]
     pub draft: bool,
 }
 
 impl GitCommand {
-    /// Execute git command
+    /// Executes the git command.
     pub fn execute(self) -> Result<()> {
         match self.command {
             GitSubcommands::Commit(commit_cmd) => commit_cmd.execute(),
@@ -279,7 +279,7 @@ impl GitCommand {
 }
 
 impl CommitCommand {
-    /// Execute commit command
+    /// Executes the commit command.
     pub fn execute(self) -> Result<()> {
         match self.command {
             CommitSubcommands::Message(message_cmd) => message_cmd.execute(),
@@ -288,7 +288,7 @@ impl CommitCommand {
 }
 
 impl MessageCommand {
-    /// Execute message command
+    /// Executes the message command.
     pub fn execute(self) -> Result<()> {
         match self.command {
             MessageSubcommands::View(view_cmd) => view_cmd.execute(),
@@ -310,7 +310,7 @@ impl MessageCommand {
 }
 
 impl ViewCommand {
-    /// Execute view command
+    /// Executes the view command.
     pub fn execute(self) -> Result<()> {
         use crate::data::{
             AiInfo, FieldExplanation, FileStatusInfo, RepositoryView, VersionInfo,
@@ -383,7 +383,7 @@ impl ViewCommand {
 }
 
 impl AmendCommand {
-    /// Execute amend command
+    /// Executes the amend command.
     pub fn execute(self) -> Result<()> {
         use crate::git::AmendmentHandler;
 
@@ -402,7 +402,7 @@ impl AmendCommand {
 }
 
 impl TwiddleCommand {
-    /// Execute twiddle command with contextual intelligence
+    /// Executes the twiddle command with contextual intelligence.
     pub async fn execute(self) -> Result<()> {
         // If --no-ai flag is set, skip AI processing and output YAML directly
         if self.no_ai {
@@ -533,7 +533,7 @@ impl TwiddleCommand {
         Ok(())
     }
 
-    /// Execute twiddle command with automatic batching for large commit ranges
+    /// Executes the twiddle command with automatic batching for large commit ranges.
     async fn execute_with_batching(
         &self,
         use_contextual: bool,
@@ -668,7 +668,7 @@ impl TwiddleCommand {
         Ok(())
     }
 
-    /// Generate repository view (reuse ViewCommand logic)
+    /// Generates the repository view (reuses ViewCommand logic).
     async fn generate_repository_view(&self) -> Result<crate::data::RepositoryView> {
         use crate::data::{
             AiInfo, BranchInfo, FieldExplanation, FileStatusInfo, RepositoryView, VersionInfo,
@@ -742,7 +742,7 @@ impl TwiddleCommand {
         Ok(repo_view)
     }
 
-    /// Handle amendments file - show path and get user choice
+    /// Handles the amendments file by showing the path and getting the user choice.
     fn handle_amendments_file(
         &self,
         amendments_file: &std::path::Path,
@@ -784,7 +784,7 @@ impl TwiddleCommand {
         }
     }
 
-    /// Show the contents of the amendments file
+    /// Shows the contents of the amendments file.
     fn show_amendments_file(&self, amendments_file: &std::path::Path) -> Result<()> {
         use std::fs;
 
@@ -800,7 +800,7 @@ impl TwiddleCommand {
         Ok(())
     }
 
-    /// Open the amendments file in an external editor
+    /// Opens the amendments file in an external editor.
     fn edit_amendments_file(&self, amendments_file: &std::path::Path) -> Result<()> {
         use std::env;
         use std::io::{self, Write};
@@ -860,7 +860,7 @@ impl TwiddleCommand {
         Ok(())
     }
 
-    /// Apply amendments from a file path (re-reads from disk to capture user edits)
+    /// Applies amendments from a file path (re-reads from disk to capture user edits).
     async fn apply_amendments_from_file(&self, amendments_file: &std::path::Path) -> Result<()> {
         use crate::git::AmendmentHandler;
 
@@ -873,7 +873,7 @@ impl TwiddleCommand {
         Ok(())
     }
 
-    /// Collect contextual information for enhanced commit message generation
+    /// Collects contextual information for enhanced commit message generation.
     async fn collect_context(
         &self,
         repo_view: &crate::data::RepositoryView,
@@ -939,7 +939,7 @@ impl TwiddleCommand {
         Ok(context)
     }
 
-    /// Show context summary to user
+    /// Shows the context summary to the user.
     fn show_context_summary(&self, context: &crate::data::context::CommitContext) -> Result<()> {
         use crate::data::context::{VerbosityLevel, WorkPattern};
 
@@ -995,7 +995,7 @@ impl TwiddleCommand {
         Ok(())
     }
 
-    /// Show model information from actual AI client
+    /// Shows model information from the actual AI client.
     fn show_model_info_from_client(
         &self,
         client: &crate::claude::client::ClaudeClient,
@@ -1051,7 +1051,7 @@ impl TwiddleCommand {
         Ok(())
     }
 
-    /// Show diagnostic information about loaded guidance files
+    /// Shows diagnostic information about loaded guidance files.
     fn show_guidance_files_status(
         &self,
         project_context: &crate::data::context::ProjectContext,
@@ -1110,7 +1110,7 @@ impl TwiddleCommand {
         Ok(())
     }
 
-    /// Execute twiddle command without AI - create amendments with original messages
+    /// Executes the twiddle command without AI, creating amendments with original messages.
     async fn execute_no_ai(&self) -> Result<()> {
         use crate::data::amendments::{Amendment, AmendmentFile};
 
@@ -1168,7 +1168,7 @@ impl TwiddleCommand {
         Ok(())
     }
 
-    /// Run commit message validation after twiddle amendments are applied.
+    /// Runs commit message validation after twiddle amendments are applied.
     /// If the check finds errors with suggestions, automatically applies the
     /// suggestions and re-checks, up to 3 retries.
     async fn run_post_twiddle_check(&self) -> Result<()> {
@@ -1287,7 +1287,7 @@ impl TwiddleCommand {
         Ok(())
     }
 
-    /// Build amendments from check report suggestions for failing commits.
+    /// Builds amendments from check report suggestions for failing commits.
     /// Resolves short hashes from the AI response to full 40-char hashes
     /// from the repository view.
     fn build_amendments_from_suggestions(
@@ -1300,9 +1300,9 @@ impl TwiddleCommand {
         report
             .commits
             .iter()
-            .filter(|r| !r.passes && r.suggestion.is_some())
+            .filter(|r| !r.passes)
             .filter_map(|r| {
-                let suggestion = r.suggestion.as_ref().unwrap();
+                let suggestion = r.suggestion.as_ref()?;
                 // Resolve short hash to full 40-char hash
                 let full_hash = repo_view.commits.iter().find_map(|c| {
                     if c.hash.starts_with(&r.hash) || r.hash.starts_with(&c.hash) {
@@ -1316,7 +1316,7 @@ impl TwiddleCommand {
             .collect()
     }
 
-    /// Load commit guidelines for check (mirrors CheckCommand::load_guidelines)
+    /// Loads commit guidelines for check (mirrors `CheckCommand::load_guidelines`).
     fn load_check_guidelines(&self) -> Result<Option<String>> {
         use std::fs;
 
@@ -1354,7 +1354,7 @@ impl TwiddleCommand {
         Ok(None)
     }
 
-    /// Load valid scopes for check (mirrors CheckCommand::load_scopes)
+    /// Loads valid scopes for check (mirrors `CheckCommand::load_scopes`).
     fn load_check_scopes(&self) -> Vec<crate::data::context::ScopeDefinition> {
         use crate::data::context::ScopeDefinition;
         use std::fs;
@@ -1369,34 +1369,31 @@ impl TwiddleCommand {
             .clone()
             .unwrap_or_else(|| std::path::PathBuf::from(".omni-dev"));
 
-        // Try local override first
-        let local_path = context_dir.join("local").join("scopes.yaml");
-        if local_path.exists() {
-            if let Ok(content) = fs::read_to_string(&local_path) {
-                if let Ok(config) = serde_yaml::from_str::<ScopesConfig>(&content) {
-                    return config.scopes;
-                }
-            }
-        }
-
-        // Try project-level scopes
-        let project_path = context_dir.join("scopes.yaml");
-        if project_path.exists() {
-            if let Ok(content) = fs::read_to_string(&project_path) {
-                if let Ok(config) = serde_yaml::from_str::<ScopesConfig>(&content) {
-                    return config.scopes;
-                }
-            }
-        }
-
-        // Try global scopes
+        // Search paths in priority order: local override → project-level → global
+        let mut candidates: Vec<std::path::PathBuf> = vec![
+            context_dir.join("local").join("scopes.yaml"),
+            context_dir.join("scopes.yaml"),
+        ];
         if let Some(home) = dirs::home_dir() {
-            let home_path = home.join(".omni-dev").join("scopes.yaml");
-            if home_path.exists() {
-                if let Ok(content) = fs::read_to_string(&home_path) {
-                    if let Ok(config) = serde_yaml::from_str::<ScopesConfig>(&content) {
-                        return config.scopes;
+            candidates.push(home.join(".omni-dev").join("scopes.yaml"));
+        }
+
+        for path in &candidates {
+            if !path.exists() {
+                continue;
+            }
+            match fs::read_to_string(path) {
+                Ok(content) => match serde_yaml::from_str::<ScopesConfig>(&content) {
+                    Ok(config) => return config.scopes,
+                    Err(e) => {
+                        eprintln!(
+                            "warning: ignoring malformed scopes file {}: {e}",
+                            path.display()
+                        );
                     }
+                },
+                Err(e) => {
+                    eprintln!("warning: cannot read scopes file {}: {e}", path.display());
                 }
             }
         }
@@ -1404,7 +1401,7 @@ impl TwiddleCommand {
         Vec::new()
     }
 
-    /// Show guidance files status for check
+    /// Shows guidance files status for check.
     fn show_check_guidance_files_status(
         &self,
         guidelines: &Option<String>,
@@ -1467,7 +1464,7 @@ impl TwiddleCommand {
         println!();
     }
 
-    /// Check commits with batching (mirrors CheckCommand::check_with_batching)
+    /// Checks commits with batching (mirrors `CheckCommand::check_with_batching`).
     async fn check_commits_with_batching(
         &self,
         claude_client: &crate::claude::client::ClaudeClient,
@@ -1516,7 +1513,7 @@ impl TwiddleCommand {
         Ok(CheckReport::new(all_results))
     }
 
-    /// Output text format check report (mirrors CheckCommand::output_text_report)
+    /// Outputs the text format check report (mirrors `CheckCommand::output_text_report`).
     fn output_check_text_report(&self, report: &crate::data::check::CheckReport) -> Result<()> {
         use crate::data::check::IssueSeverity;
 
@@ -1591,7 +1588,7 @@ impl TwiddleCommand {
 }
 
 impl BranchCommand {
-    /// Execute branch command
+    /// Executes the branch command.
     pub fn execute(self) -> Result<()> {
         match self.command {
             BranchSubcommands::Info(info_cmd) => info_cmd.execute(),
@@ -1606,7 +1603,7 @@ impl BranchCommand {
 }
 
 impl InfoCommand {
-    /// Execute info command
+    /// Executes the info command.
     pub fn execute(self) -> Result<()> {
         use crate::data::{
             AiInfo, BranchInfo, FieldExplanation, FileStatusInfo, RepositoryView, VersionInfo,
@@ -1718,7 +1715,7 @@ impl InfoCommand {
         Ok(())
     }
 
-    /// Read PR template file if it exists, returning both content and location
+    /// Reads the PR template file if it exists, returning both content and location.
     fn read_pr_template() -> Result<(String, String)> {
         use std::fs;
         use std::path::Path;
@@ -1733,7 +1730,7 @@ impl InfoCommand {
         }
     }
 
-    /// Get pull requests for the current branch using gh CLI
+    /// Returns pull requests for the current branch using gh CLI.
     fn get_branch_prs(branch_name: &str) -> Result<Vec<crate::data::PullRequest>> {
         use serde_json::Value;
         use std::process::Command;
@@ -1795,7 +1792,7 @@ impl InfoCommand {
     }
 }
 
-/// PR action choices
+/// PR action choices.
 #[derive(Debug, PartialEq)]
 enum PrAction {
     CreateNew,
@@ -1803,17 +1800,17 @@ enum PrAction {
     Cancel,
 }
 
-/// AI-generated PR content with structured fields
+/// AI-generated PR content with structured fields.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct PrContent {
-    /// Concise PR title (ideally 50-80 characters)
+    /// Concise PR title (ideally 50-80 characters).
     pub title: String,
-    /// Full PR description in markdown format
+    /// Full PR description in markdown format.
     pub description: String,
 }
 
 impl CreateCommand {
-    /// Execute create command
+    /// Executes the create command.
     pub async fn execute(self) -> Result<()> {
         match self.command {
             CreateSubcommands::Pr(pr_cmd) => pr_cmd.execute().await,
@@ -1822,7 +1819,7 @@ impl CreateCommand {
 }
 
 impl CreatePrCommand {
-    /// Determine if PR should be created as draft
+    /// Determines if the PR should be created as draft.
     ///
     /// Priority order:
     /// 1. --ready flag (not draft)
@@ -1851,7 +1848,7 @@ impl CreatePrCommand {
             .unwrap_or(true) // Default to draft if not configured
     }
 
-    /// Execute create PR command
+    /// Executes the create PR command.
     pub async fn execute(self) -> Result<()> {
         // Preflight check: validate all prerequisites before any processing
         // This catches missing credentials/tools early before wasting time
@@ -2024,7 +2021,7 @@ impl CreatePrCommand {
         Ok(())
     }
 
-    /// Generate repository view (reuse InfoCommand logic)
+    /// Generates the repository view (reuses InfoCommand logic).
     fn generate_repository_view(&self) -> Result<crate::data::RepositoryView> {
         use crate::data::{
             AiInfo, BranchInfo, FieldExplanation, FileStatusInfo, RepositoryView, VersionInfo,
@@ -2169,7 +2166,7 @@ impl CreatePrCommand {
         Ok(repo_view)
     }
 
-    /// Validate branch state for PR creation
+    /// Validates the branch state for PR creation.
     fn validate_branch_state(&self, repo_view: &crate::data::RepositoryView) -> Result<()> {
         // Check if working directory is clean
         if !repo_view.working_directory.clean {
@@ -2216,7 +2213,7 @@ impl CreatePrCommand {
         Ok(())
     }
 
-    /// Show detailed context information (similar to twiddle command)
+    /// Shows detailed context information (similar to twiddle command).
     async fn show_context_information(
         &self,
         _repo_view: &crate::data::RepositoryView,
@@ -2228,7 +2225,7 @@ impl CreatePrCommand {
         Ok(())
     }
 
-    /// Show commit range and count information
+    /// Shows commit range and count information.
     fn show_commit_range_info(&self, repo_view: &crate::data::RepositoryView) -> Result<()> {
         // Recreate the base branch determination logic from generate_repository_view
         let base_branch = match self.base.as_ref() {
@@ -2280,7 +2277,7 @@ impl CreatePrCommand {
         Ok(())
     }
 
-    /// Collect contextual information for enhanced PR generation (adapted from twiddle)
+    /// Collects contextual information for enhanced PR generation (adapted from twiddle).
     async fn collect_context(
         &self,
         repo_view: &crate::data::RepositoryView,
@@ -2321,7 +2318,7 @@ impl CreatePrCommand {
         Ok(context)
     }
 
-    /// Show guidance files status (adapted from twiddle)
+    /// Shows guidance files status (adapted from twiddle).
     fn show_guidance_files_status(
         &self,
         project_context: &crate::data::context::ProjectContext,
@@ -2390,7 +2387,7 @@ impl CreatePrCommand {
         Ok(())
     }
 
-    /// Show context summary (adapted from twiddle)
+    /// Shows the context summary (adapted from twiddle).
     fn show_context_summary(&self, context: &crate::data::context::CommitContext) -> Result<()> {
         use crate::data::context::{VerbosityLevel, WorkPattern};
 
@@ -2441,7 +2438,7 @@ impl CreatePrCommand {
         Ok(())
     }
 
-    /// Generate PR content with pre-created client (internal method that doesn't show model info)
+    /// Generates PR content with a pre-created client (internal method that does not show model info).
     async fn generate_pr_content_with_client_internal(
         &self,
         repo_view: &crate::data::RepositoryView,
@@ -2503,7 +2500,7 @@ impl CreatePrCommand {
         }
     }
 
-    /// Get default PR template when none exists in the repository
+    /// Returns the default PR template when none exists in the repository.
     fn get_default_pr_template(&self) -> String {
         r#"# Pull Request
 
@@ -2536,7 +2533,7 @@ impl CreatePrCommand {
 "#.to_string()
     }
 
-    /// Enhance PR description with commit analysis
+    /// Enhances the PR description with commit analysis.
     fn enhance_description_with_commits(
         &self,
         description: &mut String,
@@ -2611,7 +2608,7 @@ impl CreatePrCommand {
         // Add commit list
         description.push_str("### Commits in this PR:\n");
         for commit in &repo_view.commits {
-            let short_hash = &commit.hash[..8];
+            let short_hash = &commit.hash[..crate::git::SHORT_HASH_LEN];
             let first_line = commit.original_message.lines().next().unwrap_or("").trim();
             description.push_str(&format!("- `{}` {}\n", short_hash, first_line));
         }
@@ -2630,7 +2627,7 @@ impl CreatePrCommand {
         Ok(())
     }
 
-    /// Handle PR description file - show path and get user choice
+    /// Handles the PR description file by showing the path and getting the user choice.
     fn handle_pr_file(
         &self,
         pr_file: &std::path::Path,
@@ -2695,7 +2692,7 @@ impl CreatePrCommand {
         }
     }
 
-    /// Show the contents of the PR details file
+    /// Shows the contents of the PR details file.
     fn show_pr_file(&self, pr_file: &std::path::Path) -> Result<()> {
         use std::fs;
 
@@ -2709,7 +2706,7 @@ impl CreatePrCommand {
         Ok(())
     }
 
-    /// Open the PR details file in an external editor
+    /// Opens the PR details file in an external editor.
     fn edit_pr_file(&self, pr_file: &std::path::Path) -> Result<()> {
         use std::env;
         use std::io::{self, Write};
@@ -2769,7 +2766,7 @@ impl CreatePrCommand {
         Ok(())
     }
 
-    /// Generate a concise title from commit analysis (fallback)
+    /// Generates a concise title from commit analysis (fallback).
     fn generate_title_from_commits(&self, repo_view: &crate::data::RepositoryView) -> String {
         if repo_view.commits.is_empty() {
             return "Pull Request".to_string();
@@ -2798,7 +2795,7 @@ impl CreatePrCommand {
         format!("feat: {}", cleaned_branch)
     }
 
-    /// Create new GitHub PR using gh CLI
+    /// Creates a new GitHub PR using gh CLI.
     fn create_github_pr(
         &self,
         repo_view: &crate::data::RepositoryView,
@@ -2897,7 +2894,7 @@ impl CreatePrCommand {
         Ok(())
     }
 
-    /// Update existing GitHub PR using gh CLI
+    /// Updates an existing GitHub PR using gh CLI.
     fn update_github_pr(
         &self,
         repo_view: &crate::data::RepositoryView,
@@ -2995,7 +2992,7 @@ impl CreatePrCommand {
         Ok(())
     }
 
-    /// Show model information from actual AI client
+    /// Shows model information from the actual AI client.
     fn show_model_info_from_client(
         &self,
         client: &crate::claude::client::ClaudeClient,
@@ -3053,7 +3050,7 @@ impl CreatePrCommand {
 }
 
 impl CheckCommand {
-    /// Execute check command - validates commit messages against guidelines
+    /// Executes the check command, validating commit messages against guidelines.
     pub async fn execute(self) -> Result<()> {
         use crate::data::check::OutputFormat;
 
@@ -3163,7 +3160,7 @@ impl CheckCommand {
         Ok(())
     }
 
-    /// Generate repository view (reuse logic from TwiddleCommand)
+    /// Generates the repository view (reuses logic from TwiddleCommand).
     async fn generate_repository_view(&self) -> Result<crate::data::RepositoryView> {
         use crate::data::{
             AiInfo, BranchInfo, FieldExplanation, FileStatusInfo, RepositoryView, VersionInfo,
@@ -3251,7 +3248,7 @@ impl CheckCommand {
         Ok(repo_view)
     }
 
-    /// Load commit guidelines from file or context directory
+    /// Loads commit guidelines from file or context directory.
     async fn load_guidelines(&self) -> Result<Option<String>> {
         use std::fs;
 
@@ -3299,7 +3296,7 @@ impl CheckCommand {
         Ok(None)
     }
 
-    /// Load valid scopes from context directory
+    /// Loads valid scopes from context directory.
     ///
     /// This ensures the check command uses the same scopes as the twiddle command,
     /// preventing false positives when validating commit messages.
@@ -3318,34 +3315,31 @@ impl CheckCommand {
             .clone()
             .unwrap_or_else(|| std::path::PathBuf::from(".omni-dev"));
 
-        // Try local override first
-        let local_path = context_dir.join("local").join("scopes.yaml");
-        if local_path.exists() {
-            if let Ok(content) = fs::read_to_string(&local_path) {
-                if let Ok(config) = serde_yaml::from_str::<ScopesConfig>(&content) {
-                    return config.scopes;
-                }
-            }
-        }
-
-        // Try project-level scopes
-        let project_path = context_dir.join("scopes.yaml");
-        if project_path.exists() {
-            if let Ok(content) = fs::read_to_string(&project_path) {
-                if let Ok(config) = serde_yaml::from_str::<ScopesConfig>(&content) {
-                    return config.scopes;
-                }
-            }
-        }
-
-        // Try global scopes
+        // Search paths in priority order: local override → project-level → global
+        let mut candidates: Vec<std::path::PathBuf> = vec![
+            context_dir.join("local").join("scopes.yaml"),
+            context_dir.join("scopes.yaml"),
+        ];
         if let Some(home) = dirs::home_dir() {
-            let home_path = home.join(".omni-dev").join("scopes.yaml");
-            if home_path.exists() {
-                if let Ok(content) = fs::read_to_string(&home_path) {
-                    if let Ok(config) = serde_yaml::from_str::<ScopesConfig>(&content) {
-                        return config.scopes;
+            candidates.push(home.join(".omni-dev").join("scopes.yaml"));
+        }
+
+        for path in &candidates {
+            if !path.exists() {
+                continue;
+            }
+            match fs::read_to_string(path) {
+                Ok(content) => match serde_yaml::from_str::<ScopesConfig>(&content) {
+                    Ok(config) => return config.scopes,
+                    Err(e) => {
+                        eprintln!(
+                            "warning: ignoring malformed scopes file {}: {e}",
+                            path.display()
+                        );
                     }
+                },
+                Err(e) => {
+                    eprintln!("warning: cannot read scopes file {}: {e}", path.display());
                 }
             }
         }
@@ -3354,7 +3348,7 @@ impl CheckCommand {
         Vec::new()
     }
 
-    /// Show diagnostic information about loaded guidance files
+    /// Shows diagnostic information about loaded guidance files.
     fn show_guidance_files_status(
         &self,
         guidelines: &Option<String>,
@@ -3417,7 +3411,7 @@ impl CheckCommand {
         println!();
     }
 
-    /// Check commits with batching for large commit ranges
+    /// Checks commits with batching for large commit ranges.
     async fn check_with_batching(
         &self,
         claude_client: &crate::claude::client::ClaudeClient,
@@ -3477,7 +3471,7 @@ impl CheckCommand {
         Ok(CheckReport::new(all_results))
     }
 
-    /// Output the check report in the specified format
+    /// Outputs the check report in the specified format.
     fn output_report(
         &self,
         report: &crate::data::check::CheckReport,
@@ -3502,7 +3496,7 @@ impl CheckCommand {
         }
     }
 
-    /// Output text format report
+    /// Outputs the text format report.
     fn output_text_report(&self, report: &crate::data::check::CheckReport) -> Result<()> {
         use crate::data::check::IssueSeverity;
 
@@ -3602,7 +3596,7 @@ impl CheckCommand {
         Ok(())
     }
 
-    /// Show model information
+    /// Shows model information.
     fn show_model_info(&self, client: &crate::claude::client::ClaudeClient) -> Result<()> {
         use crate::claude::model_config::get_model_registry;
 
@@ -3630,7 +3624,7 @@ impl CheckCommand {
         Ok(())
     }
 
-    /// Build amendments from check report suggestions for failing commits.
+    /// Builds amendments from check report suggestions for failing commits.
     fn build_amendments_from_suggestions(
         &self,
         report: &crate::data::check::CheckReport,
@@ -3641,9 +3635,9 @@ impl CheckCommand {
         report
             .commits
             .iter()
-            .filter(|r| !r.passes && r.suggestion.is_some())
+            .filter(|r| !r.passes)
             .filter_map(|r| {
-                let suggestion = r.suggestion.as_ref().unwrap();
+                let suggestion = r.suggestion.as_ref()?;
                 let full_hash = repo_view.commits.iter().find_map(|c| {
                     if c.hash.starts_with(&r.hash) || r.hash.starts_with(&c.hash) {
                         Some(c.hash.clone())
@@ -3656,7 +3650,7 @@ impl CheckCommand {
             .collect()
     }
 
-    /// Prompt user to apply suggested amendments and apply them if accepted.
+    /// Prompts the user to apply suggested amendments and applies them if accepted.
     /// Returns true if amendments were applied, false if user declined.
     async fn prompt_and_apply_suggestions(
         &self,
