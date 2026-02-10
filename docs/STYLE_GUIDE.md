@@ -10,7 +10,7 @@ A new convention needs to be added to this style guide.
 
 ### Guidance
 
-Assign the next sequential ID (currently next is `STYLE-0020`) and include three subheadings:
+Assign the next sequential ID (currently next is `STYLE-0021`) and include three subheadings:
 
 - **Situation** — when this rule applies
 - **Guidance** — what to do (with examples where helpful)
@@ -379,6 +379,49 @@ with the scope definitions in `.omni-dev/scopes.yaml`.
 Keeping the detailed commit specification in `.omni-dev/commit-guidelines.md` allows the AI
 context system to consume it directly, avoiding duplication between this style guide and the
 machine-readable guidelines.
+
+### STYLE-0020: Single-purpose commits
+
+#### Situation
+
+Preparing a set of changes that involves refactoring, new functionality, or bug fixes.
+
+#### Guidance
+
+Each commit should do **one kind of work**. Keep refactoring commits separate from
+implementation commits, and both separate from bug-fix commits.
+
+If a refactoring would make a subsequent implementation or fix cleaner, land the refactoring
+as an **earlier** commit so that:
+
+1. The refactoring can be reviewed on its own terms (no behaviour change expected).
+2. The implementation commit starts from a cleaner baseline and is easier to understand.
+3. Either commit can be reverted independently if needed.
+
+```
+# Good — reviewable, bisectable, revertible
+git log --oneline
+a1b2c3  refactor(cli): extract shared repository-view builder
+d4e5f6  feat(cli): add --json output to check command
+
+# Bad — mixed intent, hard to review or revert half of it
+git log --oneline
+f7g8h9  feat(cli): add --json output and refactor repo-view builder
+```
+
+**Acceptable exceptions:**
+
+- Trivial renames or import cleanups that are a natural by-product of the implementation
+  (a few lines, not a standalone refactoring effort).
+- Prototype or spike branches where commit hygiene is deferred to a squash before merge.
+
+#### Motivation
+
+Single-purpose commits make `git bisect` reliable, code review focused, and reverts
+surgical. When refactoring is interleaved with behaviour changes, reviewers cannot tell
+whether a difference is a deliberate new behaviour or a mechanical restructuring — so they
+must verify every line as if it were new logic. Separating the two cuts review effort
+roughly in half.
 
 ---
 
