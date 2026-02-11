@@ -137,7 +137,10 @@ impl AiClient for ClaudeAiClient {
 
             if !response.status().is_success() {
                 let status = response.status();
-                let error_text = response.text().await.unwrap_or_default();
+                let error_text = response.text().await.unwrap_or_else(|e| {
+                    tracing::debug!("Failed to read error response body: {e}");
+                    String::new()
+                });
                 return Err(ClaudeError::ApiRequestFailed(format!(
                     "HTTP {}: {}",
                     status, error_text

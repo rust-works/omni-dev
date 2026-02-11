@@ -94,9 +94,17 @@ impl ProjectDiscovery {
         // Load scopes configuration (with local override)
         let scopes_path = self.resolve_config_file(dir, "scopes.yaml");
         if scopes_path.exists() {
-            let scopes_yaml = fs::read_to_string(scopes_path)?;
-            if let Ok(scopes_config) = serde_yaml::from_str::<ScopesConfig>(&scopes_yaml) {
-                context.valid_scopes = scopes_config.scopes;
+            let scopes_yaml = fs::read_to_string(&scopes_path)?;
+            match serde_yaml::from_str::<ScopesConfig>(&scopes_yaml) {
+                Ok(scopes_config) => {
+                    context.valid_scopes = scopes_config.scopes;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Ignoring malformed scopes file {}: {e}",
+                        scopes_path.display()
+                    );
+                }
             }
         }
 
@@ -205,14 +213,22 @@ impl ProjectDiscovery {
         context: &mut ProjectContext,
         contexts_dir: &Path,
     ) -> Result<()> {
-        if let Ok(entries) = fs::read_dir(contexts_dir) {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if name.ends_with(".yaml") || name.ends_with(".yml") {
-                        let content = fs::read_to_string(entry.path())?;
-                        if let Ok(feature_context) =
-                            serde_yaml::from_str::<FeatureContext>(&content)
-                        {
+        let entries = match fs::read_dir(contexts_dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!(
+                    "Cannot read feature contexts dir {}: {e}",
+                    contexts_dir.display()
+                );
+                return Ok(());
+            }
+        };
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.ends_with(".yaml") || name.ends_with(".yml") {
+                    let content = fs::read_to_string(entry.path())?;
+                    match serde_yaml::from_str::<FeatureContext>(&content) {
+                        Ok(feature_context) => {
                             let feature_name = name
                                 .trim_end_matches(".yaml")
                                 .trim_end_matches(".yml")
@@ -220,6 +236,12 @@ impl ProjectDiscovery {
                             context
                                 .feature_contexts
                                 .insert(feature_name, feature_context);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Ignoring malformed feature context {}: {e}",
+                                entry.path().display()
+                            );
                         }
                     }
                 }
