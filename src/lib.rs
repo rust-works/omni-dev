@@ -22,13 +22,11 @@
 
 pub mod claude;
 pub mod cli;
-pub mod core;
 pub mod data;
 pub mod git;
 pub mod utils;
 
 pub use crate::cli::Cli;
-pub use crate::core::*;
 
 /// The current version of omni-dev.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
