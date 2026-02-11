@@ -81,15 +81,20 @@ impl std::str::FromStr for IssueSeverity {
             "error" => Ok(IssueSeverity::Error),
             "warning" => Ok(IssueSeverity::Warning),
             "info" => Ok(IssueSeverity::Info),
-            _ => Ok(IssueSeverity::Warning), // default
+            other => {
+                tracing::debug!("Unknown severity {other:?}, defaulting to Warning");
+                Ok(IssueSeverity::Warning)
+            }
         }
     }
 }
 
 impl IssueSeverity {
     /// Parses severity from a string (case-insensitive).
+    #[must_use]
     pub fn parse(s: &str) -> Self {
-        s.parse().unwrap_or(IssueSeverity::Warning)
+        // FromStr impl is infallible (unknown values default to Warning with a log).
+        s.parse().expect("IssueSeverity::from_str is infallible")
     }
 }
 
