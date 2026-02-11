@@ -63,6 +63,7 @@ impl FileAnalyzer {
     }
 
     /// Determines if the file changes suggest a significant architectural change.
+    #[must_use]
     pub fn is_architectural_change(contexts: &[FileContext]) -> bool {
         let critical_files = contexts
             .iter()

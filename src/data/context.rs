@@ -343,6 +343,7 @@ impl CommitContext {
     }
 
     /// Checks if this context suggests a significant change needing detailed commit message.
+    #[must_use]
     pub fn is_significant_change(&self) -> bool {
         matches!(
             self.range.change_significance,
