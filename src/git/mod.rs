@@ -16,6 +16,9 @@ pub use repository::GitRepository;
 /// Number of hex characters to show in abbreviated commit hashes.
 pub const SHORT_HASH_LEN: usize = 8;
 
+/// Length of a full SHA-1 commit hash in hex characters.
+pub const FULL_HASH_LEN: usize = 40;
+
 /// Checks if the current directory is a git repository.
 pub fn check_git_repo() -> Result<()> {
     Repository::open(".").context("Not in a git repository")?;

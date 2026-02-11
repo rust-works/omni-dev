@@ -155,11 +155,13 @@ impl CheckReport {
     }
 
     /// Checks if the report has any errors.
+    #[must_use]
     pub fn has_errors(&self) -> bool {
         self.summary.error_count > 0
     }
 
     /// Checks if the report has any warnings.
+    #[must_use]
     pub fn has_warnings(&self) -> bool {
         self.summary.warning_count > 0
     }
