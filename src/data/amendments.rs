@@ -128,9 +128,10 @@ impl Amendment {
     /// Validates amendment structure.
     pub fn validate(&self) -> Result<()> {
         // Validate commit hash format
-        if self.commit.len() != 40 {
+        if self.commit.len() != crate::git::FULL_HASH_LEN {
             anyhow::bail!(
-                "Commit hash must be exactly 40 characters long, got: {}",
+                "Commit hash must be exactly {} characters long, got: {}",
+                crate::git::FULL_HASH_LEN,
                 self.commit.len()
             );
         }
