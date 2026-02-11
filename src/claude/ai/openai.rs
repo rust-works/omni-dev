@@ -36,14 +36,14 @@ struct OpenAiRequest {
 #[derive(Deserialize, Debug)]
 struct Choice {
     message: ResponseMessage,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Populated by serde, retained for debug output
     finish_reason: Option<String>,
 }
 
 /// OpenAI API response message.
 #[derive(Deserialize, Debug)]
 struct ResponseMessage {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Populated by serde, retained for debug output
     role: String,
     content: String,
 }
@@ -58,7 +58,7 @@ struct OpenAiResponse {
 
 /// OpenAI API usage statistics.
 #[derive(Deserialize, Debug)]
-#[allow(dead_code)]
+#[allow(dead_code)] // Fields populated by serde deserialization, not accessed directly
 struct Usage {
     prompt_tokens: Option<i32>,
     completion_tokens: Option<i32>,
@@ -73,7 +73,7 @@ pub struct OpenAiAiClient {
     api_key: Option<String>,
     /// Model identifier.
     model: String,
-    /// Base URL for the API (e.g., "https://api.openai.com" or "http://localhost:11434").
+    /// Base URL for the API (e.g., `https://api.openai.com` or `http://localhost:11434`).
     base_url: String,
     /// Maximum tokens for responses.
     max_tokens: Option<i32>,
