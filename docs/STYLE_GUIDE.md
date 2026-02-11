@@ -234,10 +234,6 @@ intermediate types, and implementation details should stay private to their subm
 if they are `pub` there. A re-export is a promise that the type is part of the module's
 contract.
 
-> **Migration note:** The existing codebase uses `mod.rs` in some modules. Convert to
-> named-file layout opportunistically when making significant changes to a module, but do
-> not churn files solely to migrate.
-
 ### Motivation
 
 The named-file layout is recommended by the Rust Book and is the default assumed by
@@ -1072,13 +1068,14 @@ into its own submodule:
 src/cli/git.rs          # 3 700 lines, five commands + helpers
 
 # After — each command owns its module, shared code is explicit
-src/cli/git/
-├── mod.rs              # re-exports, shared types
-├── view.rs             # ViewCommand
-├── twiddle.rs          # TwiddleCommand
-├── check.rs            # CheckCommand
-├── create_pr.rs        # CreatePrCommand
-└── helpers.rs          # shared repo-view builder, guidance display
+src/cli/
+├── git.rs              # re-exports, shared types
+└── git/
+    ├── view.rs         # ViewCommand
+    ├── twiddle.rs      # TwiddleCommand
+    ├── check.rs        # CheckCommand
+    ├── create_pr.rs    # CreatePrCommand
+    └── helpers.rs      # shared repo-view builder, guidance display
 ```
 
 ### Motivation
