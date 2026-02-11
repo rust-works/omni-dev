@@ -236,6 +236,7 @@ impl ModelRegistry {
     }
 
     /// Checks if a model is legacy.
+    #[must_use]
     pub fn is_legacy_model(&self, api_identifier: &str) -> bool {
         self.get_model_spec(api_identifier)
             .map(|spec| spec.legacy)

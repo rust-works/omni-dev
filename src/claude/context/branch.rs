@@ -8,6 +8,9 @@ use regex::Regex;
 
 use crate::data::context::{BranchContext, WorkType};
 
+/// Maximum branch name length considered characteristic of GitHub Flow (short, flat names).
+const GITHUB_FLOW_MAX_BRANCH_LEN: usize = 50;
+
 /// Branch naming pattern analyzer.
 pub struct BranchAnalyzer;
 
@@ -88,7 +91,7 @@ impl BranchAnalyzer {
             if branch.contains("feat/") || branch.contains("fix/") || branch.contains("docs/") {
                 has_conventional = true;
             }
-            if branch.len() < 50 && !branch.contains('/') {
+            if branch.len() < GITHUB_FLOW_MAX_BRANCH_LEN && !branch.contains('/') {
                 has_github_flow = true;
             }
         }
