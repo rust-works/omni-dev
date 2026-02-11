@@ -38,7 +38,7 @@ struct Content {
 
 /// Bedrock API response.
 #[derive(Deserialize, Debug)]
-#[allow(dead_code)]
+#[allow(dead_code)] // Fields populated by serde deserialization, not accessed directly
 struct BedrockResponse {
     id: String,
     #[serde(rename = "type")]
@@ -53,7 +53,7 @@ struct BedrockResponse {
 
 /// Bedrock API usage statistics.
 #[derive(Deserialize, Debug)]
-#[allow(dead_code)]
+#[allow(dead_code)] // Fields populated by serde deserialization, not accessed directly
 struct Usage {
     input_tokens: i32,
     output_tokens: i32,
