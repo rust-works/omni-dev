@@ -117,11 +117,13 @@ pub(crate) fn plan_batches(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
+    use chrono::Utc;
+
     use super::*;
     use crate::claude::ai::AiClientMetadata;
     use crate::git::commit::{CommitAnalysis, FileChange, FileChanges};
-    use chrono::Utc;
-    use std::io::Write;
 
     fn make_metadata(context: usize, response: usize) -> AiClientMetadata {
         AiClientMetadata {
