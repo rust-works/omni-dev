@@ -65,7 +65,7 @@ Common types: `feat`, `fix`, `docs`, `chore`, `refactor`, `test`
 
 ### Code Changes
 1. **Read Before Writing**: Always read existing files before making changes
-2. **Follow the Style Guide**: Read [docs/STYLE_GUIDE.md](docs/STYLE_GUIDE.md) before writing code — it covers error handling, naming, visibility, imports, testing, and more
+2. **Follow the Style Guide**: Before writing or reviewing code, consult [docs/STYLE_GUIDE.md](docs/STYLE_GUIDE.md). Use the task-to-tag lookup table at the top of the guide to identify relevant tags, then search for those tags (e.g., `grep "Tags:.*code-style" docs/STYLE_GUIDE.md`). Read and follow the matched rules. Do not skip this step.
 3. **Test Changes**: Run tests after modifications
 4. **Conventional Commits**: Use proper commit message format (see `.omni-dev/commit-guidelines.md`)
 5. **Incremental Changes**: Make focused, reviewable changes
