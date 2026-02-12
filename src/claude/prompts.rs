@@ -61,8 +61,10 @@ Your response must follow this exact YAML structure:
 amendments:
   - commit: "full-40-character-sha1-hash"
     message: "improved commit message"
-  - commit: "another-full-40-character-sha1-hash"  
+    summary: "One sentence describing what this commit changes"
+  - commit: "another-full-40-character-sha1-hash"
     message: "another improved commit message"
+    summary: "One sentence describing what this commit changes"
 
 DO NOT include:
 - Any explanatory text before the YAML
@@ -293,7 +295,9 @@ For each commit, analyze whether improvements are needed:
 
 Remember: File paths and directory names are just hints. The diff content shows the real changes.
 
-CRITICAL: Even if a commit message is perfect and needs no changes, include it in the amendments array with its current message unchanged. This allows users to review all commits and make manual adjustments if desired. DO NOT skip any commits from the amendments array."#,
+CRITICAL: Even if a commit message is perfect and needs no changes, include it in the amendments array with its current message unchanged. This allows users to review all commits and make manual adjustments if desired. DO NOT skip any commits from the amendments array.
+
+SUMMARY FIELD: For each commit, include a `summary` field containing one sentence describing what the commit changes. Keep it factual and brief."#,
         repo_yaml
     )
 }
@@ -386,6 +390,7 @@ pub fn generate_contextual_user_prompt(repo_yaml: &str, context: &CommitContext)
     }
 
     prompt.push_str("\nCRITICAL: Include ALL commits in the amendments array. Even if a commit message is perfect and needs no changes, include it with its current message unchanged. This allows users to review all commits and make manual adjustments if desired. DO NOT skip any commits from the amendments array.");
+    prompt.push_str(SUMMARY_INSTRUCTION);
 
     prompt
 }
@@ -640,11 +645,13 @@ checks:
       explanation: |
         - Shortened subject to under 72 chars
         - Added body explaining the change
+    summary: "Add REST endpoint for user creation with input validation"
 
 For commits that pass all checks:
   - commit: "def456..."
     passes: true
     issues: []
+    summary: "Update CI pipeline to run tests in parallel"
 
 IMPORTANT:
 - Include ALL commits in the response, whether they pass or fail
@@ -688,6 +695,9 @@ pub fn generate_check_system_prompt_with_scopes(
     prompt
 }
 
+/// Summary field instruction appended to amendment and check prompts.
+const SUMMARY_INSTRUCTION: &str = "\n\nSUMMARY FIELD: For each commit, include a `summary` field containing one sentence describing what the commit changes. This is used for cross-commit coherence analysis. Keep it factual and brief — no diff details, just the functional intent.";
+
 /// Generates a user prompt for the check command.
 pub fn generate_check_user_prompt(repo_yaml: &str, include_suggestions: bool) -> String {
     let mut prompt = format!(
@@ -714,6 +724,128 @@ ANALYSIS STEPS:
     prompt.push_str(r#"MANDATORY: Include ALL commits in the checks array, whether they pass or fail.
 
 CRITICAL RESPONSE FORMAT: Respond with ONLY valid YAML content starting with "checks:". Do not include any explanatory text, markdown wrappers, or code blocks."#);
+
+    prompt.push_str(SUMMARY_INSTRUCTION);
+
+    prompt
+}
+
+/// System prompt for the amendment coherence pass.
+///
+/// Reviews individually-generated amendments for cross-commit consistency,
+/// normalizing scopes, detecting rename chains, and removing redundancy.
+pub const AMENDMENT_COHERENCE_SYSTEM_PROMPT: &str = r#"You are an expert software engineer reviewing a set of proposed commit message amendments for cross-commit coherence.
+
+Each commit was analyzed individually. You now see all the proposed messages and summaries together. Your task is to refine the messages for consistency across the entire set.
+
+Review for:
+1. **Scope normalization**: If related commits use different scopes for the same area, standardize them
+2. **Rename chains**: If commit A renames X→Y and commit B updates references to Y, note the relationship
+3. **Redundant descriptions**: Differentiate commits with similar descriptions (e.g., multiple "update dependencies")
+4. **Consistent terminology**: Use the same terms for the same concepts across commits
+5. **Logical grouping**: Ensure related commits have messages that reflect their relationship
+
+CRITICAL RESPONSE FORMAT: Respond with ONLY valid YAML content. Do not include explanatory text, markdown wrappers, or code blocks.
+
+Your response must follow this exact YAML structure:
+
+amendments:
+  - commit: "full-40-character-sha1-hash"
+    message: "refined commit message"
+  - commit: "another-full-40-character-sha1-hash"
+    message: "another refined commit message"
+
+IMPORTANT:
+- Include ALL commits from the input, even those that need no refinement
+- Preserve the original commit hashes exactly
+- Only change messages where cross-commit coherence improvements are needed
+- Keep changes minimal — do not rewrite messages that are already good
+- Your response must start with "amendments:" and be valid YAML only"#;
+
+/// System prompt for the check coherence pass.
+///
+/// Reviews individually-generated check results for cross-commit consistency.
+pub const CHECK_COHERENCE_SYSTEM_PROMPT: &str = r#"You are an expert commit message reviewer examining check results that were generated for individual commits. You now see all results together and should refine them for cross-commit coherence.
+
+Review for:
+1. **Scope consistency**: Flag if related commits use inconsistent scopes
+2. **Cross-commit accuracy**: Detect if commit messages reference changes in other commits incorrectly
+3. **Consistent severity**: Ensure similar issues get the same severity across commits
+4. **Missing cross-commit issues**: Flag coordination problems only visible when viewing all commits together
+
+CRITICAL RESPONSE FORMAT: Respond with ONLY valid YAML content. Do not include explanatory text, markdown wrappers, or code blocks.
+
+Your response must follow this exact YAML structure:
+
+checks:
+  - commit: "abc123..."
+    passes: true/false
+    issues:
+      - severity: error/warning/info
+        section: "Section Name"
+        rule: "Rule description"
+        explanation: "Why this is an issue"
+    suggestion:
+      message: |
+        refined commit message
+      explanation: |
+        - Reason for refinement
+
+IMPORTANT:
+- Include ALL commits from the input
+- Preserve original issues — only add cross-commit issues or adjust severity for consistency
+- Set `passes: true` only if there are no error or warning level issues
+- Your response must start with "checks:" and be valid YAML only"#;
+
+/// Generates the user prompt for an amendment coherence pass.
+pub fn generate_amendment_coherence_user_prompt(
+    items: &[(crate::data::amendments::Amendment, String)],
+) -> String {
+    let mut prompt = String::from(
+        "Review the following individually-generated commit message amendments for cross-commit coherence:\n\n",
+    );
+
+    for (i, (amendment, summary)) in items.iter().enumerate() {
+        prompt.push_str(&format!(
+            "{}. Commit: {}\n   Proposed message: {}\n   Summary: {}\n\n",
+            i + 1,
+            amendment.commit,
+            amendment
+                .message
+                .lines()
+                .next()
+                .unwrap_or(&amendment.message),
+            summary,
+        ));
+    }
+
+    prompt.push_str("Refine these amendments for cross-commit coherence. Return ALL commits in the amendments array, including those that need no changes.");
+
+    prompt
+}
+
+/// Generates the user prompt for a check coherence pass.
+pub fn generate_check_coherence_user_prompt(
+    items: &[(crate::data::check::CommitCheckResult, String)],
+) -> String {
+    let mut prompt = String::from(
+        "Review the following individually-generated check results for cross-commit coherence:\n\n",
+    );
+
+    for (i, (result, summary)) in items.iter().enumerate() {
+        prompt.push_str(&format!(
+            "{}. Commit: {} ({})\n   Message: {}\n   Passes: {}\n   Issues: {}\n   Summary: {}\n\n",
+            i + 1,
+            result.hash,
+            if result.passes { "PASS" } else { "FAIL" },
+            result.message,
+            result.passes,
+            result.issues.len(),
+            summary,
+        ));
+    }
+
+    prompt.push_str("Refine these check results for cross-commit coherence. Return ALL commits in the checks array.");
 
     prompt
 }

@@ -50,9 +50,17 @@ pub struct CheckCommand {
     #[arg(long)]
     pub show_passing: bool,
 
-    /// Number of commits to process per AI request (default: 4).
-    #[arg(long, default_value = "4")]
+    /// Deprecated: use --concurrency instead.
+    #[arg(long, default_value = "4", hide = true)]
     pub batch_size: usize,
+
+    /// Maximum number of concurrent AI requests (default: 4).
+    #[arg(long, default_value = "4")]
+    pub concurrency: usize,
+
+    /// Disables the cross-commit coherence pass.
+    #[arg(long)]
+    pub no_coherence: bool,
 
     /// Skips generating corrected message suggestions.
     #[arg(long)]
@@ -122,16 +130,16 @@ impl CheckCommand {
             self.show_model_info(&claude_client)?;
         }
 
-        // 5. Check if batching is needed
-        let report = if repo_view.commits.len() > self.batch_size {
+        // 5. Use parallel map-reduce for multiple commits, direct call for single
+        let report = if repo_view.commits.len() > 1 {
             if !self.quiet && output_format == OutputFormat::Text {
                 println!(
-                    "📦 Processing {} commits in batches of {}...",
+                    "🔄 Processing {} commits in parallel (concurrency: {})...",
                     repo_view.commits.len(),
-                    self.batch_size
+                    self.concurrency
                 );
             }
-            self.check_with_batching(
+            self.check_with_map_reduce(
                 &claude_client,
                 &repo_view,
                 guidelines.as_deref(),
@@ -139,7 +147,7 @@ impl CheckCommand {
             )
             .await?
         } else {
-            // 6. Single batch check
+            // Single commit — direct call
             if !self.quiet && output_format == OutputFormat::Text {
                 println!("🤖 Analyzing commits with AI...");
             }
@@ -425,62 +433,126 @@ impl CheckCommand {
         println!();
     }
 
-    /// Checks commits with batching for large commit ranges.
-    async fn check_with_batching(
+    /// Checks commits in parallel using map-reduce pattern.
+    async fn check_with_map_reduce(
         &self,
         claude_client: &crate::claude::client::ClaudeClient,
         full_repo_view: &crate::data::RepositoryView,
         guidelines: Option<&str>,
         valid_scopes: &[crate::data::context::ScopeDefinition],
     ) -> Result<crate::data::check::CheckReport> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
         use crate::data::check::{CheckReport, CommitCheckResult};
 
-        let commit_batches: Vec<_> = full_repo_view.commits.chunks(self.batch_size).collect();
-        let total_batches = commit_batches.len();
-        let mut all_results: Vec<CommitCheckResult> = Vec::new();
+        let total_commits = full_repo_view.commits.len();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(self.concurrency));
+        let completed = Arc::new(AtomicUsize::new(0));
 
-        for (batch_num, commit_batch) in commit_batches.into_iter().enumerate() {
-            if !self.quiet {
-                println!(
-                    "🔄 Processing batch {}/{} ({} commits)...",
-                    batch_num + 1,
-                    total_batches,
-                    commit_batch.len()
-                );
-            }
+        // Map phase: check each commit in parallel
+        let futs: Vec<_> = full_repo_view
+            .commits
+            .iter()
+            .map(|commit| {
+                let sem = semaphore.clone();
+                let completed = completed.clone();
 
-            // Create a repository view for just this batch
-            let batch_repo_view = crate::data::RepositoryView {
-                versions: full_repo_view.versions.clone(),
-                explanation: full_repo_view.explanation.clone(),
-                working_directory: full_repo_view.working_directory.clone(),
-                remotes: full_repo_view.remotes.clone(),
-                ai: full_repo_view.ai.clone(),
-                branch_info: full_repo_view.branch_info.clone(),
-                pr_template: full_repo_view.pr_template.clone(),
-                pr_template_location: full_repo_view.pr_template_location.clone(),
-                branch_prs: full_repo_view.branch_prs.clone(),
-                commits: commit_batch.to_vec(),
-            };
+                async move {
+                    let _permit = sem
+                        .acquire()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("semaphore closed: {e}"))?;
 
-            // Check this batch with scopes
-            let batch_report = claude_client
-                .check_commits_with_scopes(
-                    &batch_repo_view,
-                    guidelines,
-                    valid_scopes,
-                    !self.no_suggestions,
-                )
-                .await?;
+                    // Create single-commit view
+                    let single_view = crate::data::RepositoryView {
+                        versions: full_repo_view.versions.clone(),
+                        explanation: full_repo_view.explanation.clone(),
+                        working_directory: full_repo_view.working_directory.clone(),
+                        remotes: full_repo_view.remotes.clone(),
+                        ai: full_repo_view.ai.clone(),
+                        branch_info: full_repo_view.branch_info.clone(),
+                        pr_template: full_repo_view.pr_template.clone(),
+                        pr_template_location: full_repo_view.pr_template_location.clone(),
+                        branch_prs: full_repo_view.branch_prs.clone(),
+                        commits: vec![commit.clone()],
+                    };
 
-            // Merge results
-            all_results.extend(batch_report.commits);
+                    let report = claude_client
+                        .check_commits_with_scopes(
+                            &single_view,
+                            guidelines,
+                            valid_scopes,
+                            !self.no_suggestions,
+                        )
+                        .await?;
 
-            if batch_num + 1 < total_batches {
-                // Small delay between batches
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    if !self.quiet {
+                        println!("   ✅ {}/{} commits checked", done, total_commits);
+                    }
+
+                    let result = report.commits.into_iter().next().ok_or_else(|| {
+                        anyhow::anyhow!("AI returned no check result for commit {}", commit.hash)
+                    })?;
+
+                    let summary = result.summary.clone().unwrap_or_default();
+
+                    Ok::<_, anyhow::Error>((result, summary))
+                }
+            })
+            .collect();
+
+        let results = futures::future::join_all(futs).await;
+
+        // Partition successes and failures
+        let mut successes: Vec<(CommitCheckResult, String)> = Vec::new();
+        let mut failure_count = 0;
+
+        for result in results {
+            match result {
+                Ok(item) => successes.push(item),
+                Err(e) => {
+                    eprintln!("warning: failed to check commit: {e}");
+                    failure_count += 1;
+                }
             }
         }
+
+        if failure_count > 0 {
+            eprintln!("warning: {failure_count} commit(s) failed to check");
+        }
+
+        if successes.is_empty() {
+            anyhow::bail!("All commits failed to check");
+        }
+
+        // Reduce phase: optional coherence pass
+        if !self.no_coherence && successes.len() >= 2 {
+            if !self.quiet {
+                println!("🔗 Running cross-commit coherence pass...");
+            }
+            match claude_client
+                .refine_checks_coherence(&successes, full_repo_view)
+                .await
+            {
+                Ok(refined) => {
+                    if !self.quiet {
+                        println!("✅ All commits checked!");
+                    }
+                    return Ok(refined);
+                }
+                Err(e) => {
+                    eprintln!("warning: coherence pass failed, using individual results: {e}");
+                }
+            }
+        }
+
+        if !self.quiet {
+            println!("✅ All commits checked!");
+        }
+
+        let all_results: Vec<CommitCheckResult> = successes.into_iter().map(|(r, _)| r).collect();
 
         Ok(CheckReport::new(all_results))
     }
