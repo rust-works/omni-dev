@@ -292,7 +292,7 @@ package.json
 **Command with batching**:
 
 ```bash
-omni-dev git commit message twiddle 'HEAD~6..HEAD' --use-context --batch-size 3
+omni-dev git commit message twiddle 'HEAD~6..HEAD' --use-context --concurrency 3
 ```
 
 **Professional result**:
@@ -906,7 +906,7 @@ The key is proper configuration and understanding your project's context!
 
 1. **Set up project context** - Always configure `.omni-dev/scopes.yaml`
 2. **Use descriptive file patterns** - Help omni-dev understand your architecture
-3. **Process in batches** - Use `--batch-size` for large commit ranges
+3. **Tune concurrency** - Use `--concurrency` for large commit ranges
 4. **Review before applying** - Use `--save-only` for important changes
 5. **Iterate and improve** - Update configuration based on results
 

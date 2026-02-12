@@ -7,13 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-02-12
+
 ### Added
+- **Parallel Map-Reduce Processing**: Replaced sequential batch processing with concurrent commit processing
+  - Each commit processed individually in parallel using semaphore-based concurrency control
+  - New `--concurrency` flag (default: 4) replaces deprecated `--batch-size`
+  - Real-time progress feedback with atomic completion counters
+  - Graceful failure handling continues processing remaining commits
+- **Cross-Commit Coherence Pass**: Optional AI refinement for consistency across commit messages
+  - Ensures consistent scope usage, terminology, and message quality across a commit set
+  - New `--no-coherence` flag to skip the coherence pass when not needed
+  - Automatically skipped when all commits fit in a single batch
+- **Token-Budget-Aware Commit Batching**: Intelligent grouping using first-fit-decreasing bin-packing
+  - Groups commits into batches that fit within the AI model's token budget
+  - Estimates tokens from file metadata without reading full content
+  - Split-and-retry fallback for oversized batches with progressive diff reduction
+  - Reduces API calls from O(n) to O(batches) while maintaining quality
+- **Progressive Diff Reduction**: Four-level fallback for token budget optimization
+  - Automatically reduces diff detail when prompts exceed model limits: Full → Truncated → StatOnly → FileListOnly
+  - Precise truncation calculations with tokens-to-chars conversion
+  - Maximizes context sent to AI while respecting model constraints
 - **Token Budget Validation**: Pre-flight token estimation and budget check before all AI requests
   - Estimates prompt token count using a character-based heuristic with 10% safety margin
   - Validates prompts fit within the model's input context window minus reserved output tokens
   - Returns a clear `PromptTooLarge` error instead of letting the API reject oversized requests
   - Covers all AI call paths: twiddle, check, PR creation, and raw message sending
-  - Logs token utilization percentage at debug level for diagnostics
+- **HTTP Request Timeout Configuration**: Configurable timeout for AI client HTTP requests
+- **Enhanced YAML Formatting**: Improved multi-line commit message formatting in YAML output
+
+### Changed
+- **Deprecated `--batch-size`**: Replaced by `--concurrency` flag with clearer semantics; `--batch-size` remains as a hidden backward-compatible alias
+
+### Refactored
+- **Module Structure Flattening**: Converted `mod.rs` files to direct module files across claude, cli, data, and git modules
+- **Git CLI Split**: Split monolithic git module into focused subcommand modules
+- **YAML Payload Reduction**: Reduced per-commit YAML payload size for more efficient AI analysis
+- **Dead Code Removal**: Removed unused core module scaffolding
+
+### Fixed
+- **Error Handling**: Improved error handling and configuration parsing in AI client
+
+### Documentation
+- **Architecture Decision Records**: Introduced ADR framework with ADR-0001 (YAML as primary data exchange format)
+- **Style Guide Enhancements**: Added tag-based categorization system, task-to-tag lookup table, and STYLE-0020 single-purpose commit guidelines
+- **Commit Guidelines**: Enhanced with multi-scope support and practical examples
+- **Module Layout Guidance**: Refined examples and guidance for module organization
+- **Documentation Updates**: Updated all docs to reflect `--concurrency` replacing `--batch-size`
 
 ## [0.15.0] - 2026-02-08
 
@@ -493,7 +533,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation and community files (README, CONTRIBUTING, CODE_OF_CONDUCT)
 - BSD 3-Clause license
 
-[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/rust-works/omni-dev/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/rust-works/omni-dev/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/rust-works/omni-dev/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/rust-works/omni-dev/compare/v0.13.0...v0.13.1

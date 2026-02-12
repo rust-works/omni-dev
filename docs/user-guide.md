@@ -106,7 +106,8 @@ omni-dev git commit message twiddle [RANGE] [OPTIONS]
 | Option | Description | Example |
 |--------|-------------|---------|
 | `--use-context` | Enable AI contextual intelligence | `--use-context` |
-| `--batch-size N` | Process N commits at a time (default: 4) | `--batch-size 2` |
+| `--concurrency N` | Number of parallel commit processors (default: 4) | `--concurrency 2` |
+| `--no-coherence` | Skip cross-commit coherence refinement pass | `--no-coherence` |
 | `--auto-apply` | Apply changes without confirmation | `--auto-apply` |
 | `--save-only FILE` | Save suggestions to file instead of applying | `--save-only suggestions.yaml` |
 | `--context-dir PATH` | Custom context directory | `--context-dir ./config` |
@@ -455,8 +456,8 @@ omni-dev git branch create pr --save-only draft-pr.yaml
 Handle large commit ranges efficiently:
 
 ```bash
-# Process 100+ commits in manageable batches
-omni-dev git commit message twiddle 'HEAD~100..HEAD' --batch-size 5
+# Process 100+ commits with parallel processing
+omni-dev git commit message twiddle 'HEAD~100..HEAD' --concurrency 5
 
 # Save suggestions for review before applying
 omni-dev git commit message twiddle 'HEAD~50..HEAD' --save-only review.yaml
@@ -511,19 +512,19 @@ omni-dev git commit message twiddle 'HEAD~5..HEAD' --context-dir ./project-confi
 # ./project-config/commit-guidelines.md
 ```
 
-### Batch Size Optimization
+### Concurrency Configuration
 
-Adjust batch size based on your needs:
+Adjust parallel processing based on your needs:
 
 ```bash
-# Small batches for complex commits (more accurate)
-omni-dev git commit message twiddle 'HEAD~20..HEAD' --batch-size 2
+# Lower concurrency for complex commits (reduces API load)
+omni-dev git commit message twiddle 'HEAD~20..HEAD' --concurrency 2
 
-# Larger batches for simple commits (faster)
-omni-dev git commit message twiddle 'HEAD~20..HEAD' --batch-size 8
+# Higher concurrency for faster processing
+omni-dev git commit message twiddle 'HEAD~20..HEAD' --concurrency 8
 
-# Single batch (disable batching)
-omni-dev git commit message twiddle 'HEAD~10..HEAD' --batch-size 100
+# Skip coherence pass for independent commits
+omni-dev git commit message twiddle 'HEAD~10..HEAD' --no-coherence
 ```
 
 ### Integration with Git Hooks
