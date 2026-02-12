@@ -27,6 +27,9 @@ pub struct CommitCheckResult {
     pub suggestion: Option<CommitSuggestion>,
     /// Whether the commit passes all checks.
     pub passes: bool,
+    /// Brief summary of what this commit changes (for cross-commit coherence).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 /// A single issue found in a commit message.
@@ -233,6 +236,9 @@ pub struct AiCommitCheck {
     /// Suggested message improvement.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggestion: Option<AiSuggestion>,
+    /// Brief summary of what this commit changes (for cross-commit coherence).
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 /// Issue from AI response.
@@ -281,6 +287,7 @@ impl From<AiCommitCheck> for CommitCheckResult {
             issues,
             suggestion,
             passes: ai.passes,
+            summary: ai.summary,
         }
     }
 }
