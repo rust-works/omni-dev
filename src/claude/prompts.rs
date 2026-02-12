@@ -751,15 +751,20 @@ Your response must follow this exact YAML structure:
 
 amendments:
   - commit: "full-40-character-sha1-hash"
-    message: "refined commit message"
+    message: |
+      type(scope): subject line
+
+      Body paragraph preserved from input.
   - commit: "another-full-40-character-sha1-hash"
-    message: "another refined commit message"
+    message: "single-line message if input had no body"
 
 IMPORTANT:
 - Include ALL commits from the input, even those that need no refinement
 - Preserve the original commit hashes exactly
 - Only change messages where cross-commit coherence improvements are needed
 - Keep changes minimal — do not rewrite messages that are already good
+- PRESERVE MESSAGE BODIES: If a message has a multi-line body (subject + blank line + paragraphs), keep the body intact. Only refine the subject line or body wording where cross-commit coherence requires it. Do not strip bodies down to single-line messages.
+- Use YAML literal block scalar (|) for multi-line messages
 - Your response must start with "amendments:" and be valid YAML only"#;
 
 /// System prompt for the check coherence pass.
@@ -807,14 +812,10 @@ pub fn generate_amendment_coherence_user_prompt(
 
     for (i, (amendment, summary)) in items.iter().enumerate() {
         prompt.push_str(&format!(
-            "{}. Commit: {}\n   Proposed message: {}\n   Summary: {}\n\n",
+            "{}. Commit: {}\n   Proposed message: |\n{}\n   Summary: {}\n\n",
             i + 1,
             amendment.commit,
-            amendment
-                .message
-                .lines()
-                .next()
-                .unwrap_or(&amendment.message),
+            indent_message(&amendment.message, "     "),
             summary,
         ));
     }
@@ -848,4 +849,13 @@ pub fn generate_check_coherence_user_prompt(
     prompt.push_str("Refine these check results for cross-commit coherence. Return ALL commits in the checks array.");
 
     prompt
+}
+
+/// Indents each line of a message with the given prefix.
+fn indent_message(message: &str, prefix: &str) -> String {
+    message
+        .lines()
+        .map(|line| format!("{prefix}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
