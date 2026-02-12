@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use tracing::debug;
 
+use crate::claude::token_budget::TokenBudget;
 use crate::claude::{ai::bedrock::BedrockAiClient, ai::claude::ClaudeAiClient};
 use crate::claude::{ai::AiClient, error::ClaudeError, prompts};
 use crate::data::{
@@ -26,8 +27,29 @@ impl ClaudeClient {
         self.ai_client.get_metadata()
     }
 
+    /// Validates that the prompt fits within the model's token budget.
+    ///
+    /// Estimates token counts and logs utilization before each AI request.
+    /// Returns an error if the prompt exceeds available input tokens.
+    fn validate_prompt_budget(&self, system_prompt: &str, user_prompt: &str) -> Result<()> {
+        let metadata = self.ai_client.get_metadata();
+        let budget = TokenBudget::from_metadata(&metadata);
+        let estimate = budget.validate_prompt(system_prompt, user_prompt)?;
+
+        debug!(
+            model = %metadata.model,
+            estimated_tokens = estimate.estimated_tokens,
+            available_tokens = estimate.available_tokens,
+            utilization_pct = format!("{:.1}%", estimate.utilization_pct),
+            "Token budget check passed"
+        );
+
+        Ok(())
+    }
+
     /// Sends a raw prompt to the AI client and returns the text response.
     pub async fn send_message(&self, system_prompt: &str, user_prompt: &str) -> Result<String> {
+        self.validate_prompt_budget(system_prompt, user_prompt)?;
         self.ai_client
             .send_request(system_prompt, user_prompt)
             .await
@@ -70,6 +92,9 @@ impl ClaudeClient {
 
         // Generate user prompt
         let user_prompt = prompts::generate_user_prompt(&repo_yaml);
+
+        // Validate prompt fits within model's token budget
+        self.validate_prompt_budget(prompts::SYSTEM_PROMPT, &user_prompt)?;
 
         // Send request using AI client
         let content = self
@@ -126,6 +151,9 @@ impl ClaudeClient {
                 debug!("No project commit guidelines found");
             }
         }
+
+        // Validate prompt fits within model's token budget
+        self.validate_prompt_budget(&system_prompt, &user_prompt)?;
 
         // Send request using AI client
         let content = self
@@ -188,6 +216,9 @@ impl ClaudeClient {
         // Generate prompts for PR description
         let user_prompt = prompts::generate_pr_description_prompt(&repo_yaml, pr_template);
 
+        // Validate prompt fits within model's token budget
+        self.validate_prompt_budget(prompts::PR_GENERATION_SYSTEM_PROMPT, &user_prompt)?;
+
         // Send request using AI client
         let content = self
             .ai_client
@@ -226,6 +257,9 @@ impl ClaudeClient {
             prompts::generate_pr_system_prompt_with_context_for_provider(context, prompt_style);
         let user_prompt =
             prompts::generate_pr_description_prompt_with_context(&repo_yaml, pr_template, context);
+
+        // Validate prompt fits within model's token budget
+        self.validate_prompt_budget(&system_prompt, &user_prompt)?;
 
         // Send request using AI client
         let content = self
@@ -313,6 +347,9 @@ impl ClaudeClient {
         let system_prompt =
             prompts::generate_check_system_prompt_with_scopes(guidelines, valid_scopes);
         let user_prompt = prompts::generate_check_user_prompt(&repo_yaml, include_suggestions);
+
+        // Validate prompt fits within model's token budget (once, before retries)
+        self.validate_prompt_budget(&system_prompt, &user_prompt)?;
 
         let mut last_error = None;
 
