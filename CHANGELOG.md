@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Token Budget Validation**: Pre-flight token estimation and budget check before all AI requests
+  - Estimates prompt token count using a character-based heuristic with 10% safety margin
+  - Validates prompts fit within the model's input context window minus reserved output tokens
+  - Returns a clear `PromptTooLarge` error instead of letting the API reject oversized requests
+  - Covers all AI call paths: twiddle, check, PR creation, and raw message sending
+  - Logs token utilization percentage at debug level for diagnostics
+
 ## [0.15.0] - 2026-02-08
 
 ### Added
