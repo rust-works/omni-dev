@@ -11,6 +11,211 @@ use crate::data::context::{
     ScopeRequirements,
 };
 
+/// Resolves configuration file path with local override support and home fallback.
+///
+/// Priority:
+/// 1. {dir}/local/{filename} (local override)
+/// 2. {dir}/{filename} (shared project config)
+/// 3. $HOME/.omni-dev/{filename} (global user config)
+pub fn resolve_config_file(dir: &Path, filename: &str) -> PathBuf {
+    let local_path = dir.join("local").join(filename);
+    if local_path.exists() {
+        return local_path;
+    }
+
+    let project_path = dir.join(filename);
+    if project_path.exists() {
+        return project_path;
+    }
+
+    // Check home directory fallback
+    if let Ok(home_dir) = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("No home directory")) {
+        let home_path = home_dir.join(".omni-dev").join(filename);
+        if home_path.exists() {
+            return home_path;
+        }
+    }
+
+    // Return project path as default (even if it doesn't exist)
+    project_path
+}
+
+/// Loads project scopes from config files, merging ecosystem defaults.
+///
+/// Resolves `scopes.yaml` via the standard config priority (local → project → home),
+/// then detects the project ecosystem and merges default scopes for that ecosystem.
+pub fn load_project_scopes(context_dir: &Path, repo_path: &Path) -> Vec<ScopeDefinition> {
+    let scopes_path = resolve_config_file(context_dir, "scopes.yaml");
+    let mut scopes = if scopes_path.exists() {
+        let scopes_yaml = match fs::read_to_string(&scopes_path) {
+            Ok(content) => content,
+            Err(e) => {
+                tracing::warn!("Cannot read scopes file {}: {e}", scopes_path.display());
+                return vec![];
+            }
+        };
+        match serde_yaml::from_str::<ScopesConfig>(&scopes_yaml) {
+            Ok(config) => config.scopes,
+            Err(e) => {
+                tracing::warn!(
+                    "Ignoring malformed scopes file {}: {e}",
+                    scopes_path.display()
+                );
+                vec![]
+            }
+        }
+    } else {
+        vec![]
+    };
+
+    merge_ecosystem_scopes(&mut scopes, repo_path);
+    scopes
+}
+
+/// Merges ecosystem-detected default scopes into the given scope list.
+///
+/// Detects the project ecosystem from marker files (Cargo.toml, package.json, etc.)
+/// and adds default scopes for that ecosystem, skipping any that already exist by name.
+fn merge_ecosystem_scopes(scopes: &mut Vec<ScopeDefinition>, repo_path: &Path) {
+    let ecosystem_scopes: Vec<(&str, &str, Vec<&str>)> = if repo_path.join("Cargo.toml").exists() {
+        vec![
+            (
+                "cargo",
+                "Cargo.toml and dependency management",
+                vec!["Cargo.toml", "Cargo.lock"],
+            ),
+            (
+                "lib",
+                "Library code and public API",
+                vec!["src/lib.rs", "src/**"],
+            ),
+            (
+                "cli",
+                "Command-line interface",
+                vec!["src/main.rs", "src/cli/**"],
+            ),
+            (
+                "core",
+                "Core application logic",
+                vec!["src/core/**", "src/lib/**"],
+            ),
+            ("test", "Test code", vec!["tests/**", "src/**/test*"]),
+            (
+                "docs",
+                "Documentation",
+                vec!["docs/**", "README.md", "**/*.md"],
+            ),
+            (
+                "ci",
+                "Continuous integration",
+                vec![".github/**", ".gitlab-ci.yml"],
+            ),
+        ]
+    } else if repo_path.join("package.json").exists() {
+        vec![
+            (
+                "deps",
+                "Dependencies and package.json",
+                vec!["package.json", "package-lock.json"],
+            ),
+            (
+                "config",
+                "Configuration files",
+                vec!["*.config.js", "*.config.json", ".env*"],
+            ),
+            (
+                "build",
+                "Build system and tooling",
+                vec!["webpack.config.js", "rollup.config.js"],
+            ),
+            (
+                "test",
+                "Test files",
+                vec!["test/**", "tests/**", "**/*.test.js"],
+            ),
+            (
+                "docs",
+                "Documentation",
+                vec!["docs/**", "README.md", "**/*.md"],
+            ),
+        ]
+    } else if repo_path.join("pyproject.toml").exists()
+        || repo_path.join("requirements.txt").exists()
+    {
+        vec![
+            (
+                "deps",
+                "Dependencies and requirements",
+                vec!["requirements.txt", "pyproject.toml", "setup.py"],
+            ),
+            (
+                "config",
+                "Configuration files",
+                vec!["*.ini", "*.cfg", "*.toml"],
+            ),
+            (
+                "test",
+                "Test files",
+                vec!["test/**", "tests/**", "**/*_test.py"],
+            ),
+            (
+                "docs",
+                "Documentation",
+                vec!["docs/**", "README.md", "**/*.md", "**/*.rst"],
+            ),
+        ]
+    } else if repo_path.join("go.mod").exists() {
+        vec![
+            (
+                "mod",
+                "Go modules and dependencies",
+                vec!["go.mod", "go.sum"],
+            ),
+            ("cmd", "Command-line applications", vec!["cmd/**"]),
+            ("pkg", "Library packages", vec!["pkg/**"]),
+            ("internal", "Internal packages", vec!["internal/**"]),
+            ("test", "Test files", vec!["**/*_test.go"]),
+            (
+                "docs",
+                "Documentation",
+                vec!["docs/**", "README.md", "**/*.md"],
+            ),
+        ]
+    } else if repo_path.join("pom.xml").exists() || repo_path.join("build.gradle").exists() {
+        vec![
+            (
+                "build",
+                "Build system",
+                vec!["pom.xml", "build.gradle", "build.gradle.kts"],
+            ),
+            (
+                "config",
+                "Configuration",
+                vec!["src/main/resources/**", "application.properties"],
+            ),
+            ("test", "Test files", vec!["src/test/**"]),
+            (
+                "docs",
+                "Documentation",
+                vec!["docs/**", "README.md", "**/*.md"],
+            ),
+        ]
+    } else {
+        vec![]
+    };
+
+    for (name, description, patterns) in ecosystem_scopes {
+        if !scopes.iter().any(|s| s.name == name) {
+            scopes.push(ScopeDefinition {
+                name: name.to_string(),
+                description: description.to_string(),
+                examples: vec![],
+                file_patterns: patterns.into_iter().map(String::from).collect(),
+            });
+        }
+    }
+}
+
 /// Project context discovery system.
 pub struct ProjectDiscovery {
     repo_path: PathBuf,
@@ -60,7 +265,7 @@ impl ProjectDiscovery {
     /// Loads configuration from .omni-dev/ directory with local override support.
     fn load_omni_dev_config(&self, context: &mut ProjectContext, dir: &Path) -> Result<()> {
         // Load commit guidelines (with local override)
-        let guidelines_path = self.resolve_config_file(dir, "commit-guidelines.md");
+        let guidelines_path = resolve_config_file(dir, "commit-guidelines.md");
         debug!(
             path = ?guidelines_path,
             exists = guidelines_path.exists(),
@@ -75,7 +280,7 @@ impl ProjectDiscovery {
         }
 
         // Load PR guidelines (with local override)
-        let pr_guidelines_path = self.resolve_config_file(dir, "pr-guidelines.md");
+        let pr_guidelines_path = resolve_config_file(dir, "pr-guidelines.md");
         debug!(
             path = ?pr_guidelines_path,
             exists = pr_guidelines_path.exists(),
@@ -90,7 +295,7 @@ impl ProjectDiscovery {
         }
 
         // Load scopes configuration (with local override)
-        let scopes_path = self.resolve_config_file(dir, "scopes.yaml");
+        let scopes_path = resolve_config_file(dir, "scopes.yaml");
         if scopes_path.exists() {
             let scopes_yaml = fs::read_to_string(&scopes_path)?;
             match serde_yaml::from_str::<ScopesConfig>(&scopes_yaml) {
@@ -123,35 +328,6 @@ impl ProjectDiscovery {
         Ok(())
     }
 
-    /// Resolves configuration file path with local override support and home fallback.
-    ///
-    /// Priority:
-    /// 1. .omni-dev/local/{filename} (local override)
-    /// 2. .omni-dev/{filename} (shared project config)
-    /// 3. $HOME/.omni-dev/{filename} (global user config)
-    fn resolve_config_file(&self, dir: &Path, filename: &str) -> PathBuf {
-        let local_path = dir.join("local").join(filename);
-        if local_path.exists() {
-            return local_path;
-        }
-
-        let project_path = dir.join(filename);
-        if project_path.exists() {
-            return project_path;
-        }
-
-        // Check home directory fallback
-        if let Ok(home_dir) = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("No home directory")) {
-            let home_path = home_dir.join(".omni-dev").join(filename);
-            if home_path.exists() {
-                return home_path;
-            }
-        }
-
-        // Return project path as default (even if it doesn't exist)
-        project_path
-    }
-
     /// Loads git configuration files.
     fn load_git_config(&self, _context: &mut ProjectContext) -> Result<()> {
         // Git configuration loading can be extended here if needed
@@ -180,27 +356,24 @@ impl ProjectDiscovery {
     /// Detects project ecosystem and applies conventions.
     fn detect_ecosystem(&self, context: &mut ProjectContext) -> Result<()> {
         context.ecosystem = if self.repo_path.join("Cargo.toml").exists() {
-            self.apply_rust_conventions(context)?;
             Ecosystem::Rust
         } else if self.repo_path.join("package.json").exists() {
-            self.apply_node_conventions(context)?;
             Ecosystem::Node
         } else if self.repo_path.join("pyproject.toml").exists()
             || self.repo_path.join("requirements.txt").exists()
         {
-            self.apply_python_conventions(context)?;
             Ecosystem::Python
         } else if self.repo_path.join("go.mod").exists() {
-            self.apply_go_conventions(context)?;
             Ecosystem::Go
         } else if self.repo_path.join("pom.xml").exists()
             || self.repo_path.join("build.gradle").exists()
         {
-            self.apply_java_conventions(context)?;
             Ecosystem::Java
         } else {
             Ecosystem::Generic
         };
+
+        merge_ecosystem_scopes(&mut context.valid_scopes, &self.repo_path);
 
         Ok(())
     }
@@ -357,208 +530,6 @@ impl ProjectDiscovery {
         }
 
         requirements
-    }
-
-    /// Applies Rust ecosystem conventions.
-    fn apply_rust_conventions(&self, context: &mut ProjectContext) -> Result<()> {
-        // Add common Rust scopes if not already defined
-        let rust_scopes = vec![
-            (
-                "cargo",
-                "Cargo.toml and dependency management",
-                vec!["Cargo.toml", "Cargo.lock"],
-            ),
-            (
-                "lib",
-                "Library code and public API",
-                vec!["src/lib.rs", "src/**"],
-            ),
-            (
-                "cli",
-                "Command-line interface",
-                vec!["src/main.rs", "src/cli/**"],
-            ),
-            (
-                "core",
-                "Core application logic",
-                vec!["src/core/**", "src/lib/**"],
-            ),
-            ("test", "Test code", vec!["tests/**", "src/**/test*"]),
-            (
-                "docs",
-                "Documentation",
-                vec!["docs/**", "README.md", "**/*.md"],
-            ),
-            (
-                "ci",
-                "Continuous integration",
-                vec![".github/**", ".gitlab-ci.yml"],
-            ),
-        ];
-
-        for (name, description, patterns) in rust_scopes {
-            if !context.valid_scopes.iter().any(|s| s.name == name) {
-                context.valid_scopes.push(ScopeDefinition {
-                    name: name.to_string(),
-                    description: description.to_string(),
-                    examples: vec![],
-                    file_patterns: patterns.into_iter().map(String::from).collect(),
-                });
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Applies Node.js ecosystem conventions.
-    fn apply_node_conventions(&self, context: &mut ProjectContext) -> Result<()> {
-        let node_scopes = vec![
-            (
-                "deps",
-                "Dependencies and package.json",
-                vec!["package.json", "package-lock.json"],
-            ),
-            (
-                "config",
-                "Configuration files",
-                vec!["*.config.js", "*.config.json", ".env*"],
-            ),
-            (
-                "build",
-                "Build system and tooling",
-                vec!["webpack.config.js", "rollup.config.js"],
-            ),
-            (
-                "test",
-                "Test files",
-                vec!["test/**", "tests/**", "**/*.test.js"],
-            ),
-            (
-                "docs",
-                "Documentation",
-                vec!["docs/**", "README.md", "**/*.md"],
-            ),
-        ];
-
-        for (name, description, patterns) in node_scopes {
-            if !context.valid_scopes.iter().any(|s| s.name == name) {
-                context.valid_scopes.push(ScopeDefinition {
-                    name: name.to_string(),
-                    description: description.to_string(),
-                    examples: vec![],
-                    file_patterns: patterns.into_iter().map(String::from).collect(),
-                });
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Applies Python ecosystem conventions.
-    fn apply_python_conventions(&self, context: &mut ProjectContext) -> Result<()> {
-        let python_scopes = vec![
-            (
-                "deps",
-                "Dependencies and requirements",
-                vec!["requirements.txt", "pyproject.toml", "setup.py"],
-            ),
-            (
-                "config",
-                "Configuration files",
-                vec!["*.ini", "*.cfg", "*.toml"],
-            ),
-            (
-                "test",
-                "Test files",
-                vec!["test/**", "tests/**", "**/*_test.py"],
-            ),
-            (
-                "docs",
-                "Documentation",
-                vec!["docs/**", "README.md", "**/*.md", "**/*.rst"],
-            ),
-        ];
-
-        for (name, description, patterns) in python_scopes {
-            if !context.valid_scopes.iter().any(|s| s.name == name) {
-                context.valid_scopes.push(ScopeDefinition {
-                    name: name.to_string(),
-                    description: description.to_string(),
-                    examples: vec![],
-                    file_patterns: patterns.into_iter().map(String::from).collect(),
-                });
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Applies Go ecosystem conventions.
-    fn apply_go_conventions(&self, context: &mut ProjectContext) -> Result<()> {
-        let go_scopes = vec![
-            (
-                "mod",
-                "Go modules and dependencies",
-                vec!["go.mod", "go.sum"],
-            ),
-            ("cmd", "Command-line applications", vec!["cmd/**"]),
-            ("pkg", "Library packages", vec!["pkg/**"]),
-            ("internal", "Internal packages", vec!["internal/**"]),
-            ("test", "Test files", vec!["**/*_test.go"]),
-            (
-                "docs",
-                "Documentation",
-                vec!["docs/**", "README.md", "**/*.md"],
-            ),
-        ];
-
-        for (name, description, patterns) in go_scopes {
-            if !context.valid_scopes.iter().any(|s| s.name == name) {
-                context.valid_scopes.push(ScopeDefinition {
-                    name: name.to_string(),
-                    description: description.to_string(),
-                    examples: vec![],
-                    file_patterns: patterns.into_iter().map(String::from).collect(),
-                });
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Applies Java ecosystem conventions.
-    fn apply_java_conventions(&self, context: &mut ProjectContext) -> Result<()> {
-        let java_scopes = vec![
-            (
-                "build",
-                "Build system",
-                vec!["pom.xml", "build.gradle", "build.gradle.kts"],
-            ),
-            (
-                "config",
-                "Configuration",
-                vec!["src/main/resources/**", "application.properties"],
-            ),
-            ("test", "Test files", vec!["src/test/**"]),
-            (
-                "docs",
-                "Documentation",
-                vec!["docs/**", "README.md", "**/*.md"],
-            ),
-        ];
-
-        for (name, description, patterns) in java_scopes {
-            if !context.valid_scopes.iter().any(|s| s.name == name) {
-                context.valid_scopes.push(ScopeDefinition {
-                    name: name.to_string(),
-                    description: description.to_string(),
-                    examples: vec![],
-                    file_patterns: patterns.into_iter().map(String::from).collect(),
-                });
-            }
-        }
-
-        Ok(())
     }
 }
 
