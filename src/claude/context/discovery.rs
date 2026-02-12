@@ -41,11 +41,9 @@ impl ProjectDiscovery {
             exists = context_dir_path.exists(),
             "Looking for context directory"
         );
-        if context_dir_path.exists() {
-            debug!("Loading omni-dev config");
-            self.load_omni_dev_config(&mut context, &context_dir_path)?;
-            debug!("Config loading completed");
-        }
+        debug!("Loading omni-dev config");
+        self.load_omni_dev_config(&mut context, &context_dir_path)?;
+        debug!("Config loading completed");
 
         // 2. Standard git configuration files
         self.load_git_config(&mut context)?;
