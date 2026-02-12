@@ -202,11 +202,12 @@ impl TwiddleCommand {
         Ok(())
     }
 
-    /// Executes the twiddle command with parallel map-reduce for multiple commits.
+    /// Executes the twiddle command with batched parallel map-reduce for multiple commits.
     ///
-    /// Each commit is sent individually to the AI in parallel (map phase),
+    /// Commits are grouped into token-budget-aware batches (map phase),
     /// then an optional coherence pass refines results across all commits
-    /// (reduce phase).
+    /// (reduce phase). Coherence is skipped when all commits fit in a
+    /// single batch since the AI already saw them together.
     async fn execute_with_map_reduce(
         &self,
         use_contextual: bool,
@@ -215,6 +216,8 @@ impl TwiddleCommand {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
+        use crate::claude::batch;
+        use crate::claude::token_budget;
         use crate::data::amendments::AmendmentFile;
 
         let concurrency = self.concurrency;
@@ -260,22 +263,46 @@ impl TwiddleCommand {
             commit.analysis.refine_scope(&scope_defs);
         }
 
-        // Map phase: process each commit in parallel
+        // Plan batches based on token budget
+        let metadata = claude_client.get_ai_client_metadata();
+        let system_prompt_tokens = if let Some(ref ctx) = context {
+            let prompt_style = metadata.prompt_style();
+            let system_prompt =
+                crate::claude::prompts::generate_contextual_system_prompt_for_provider(
+                    ctx,
+                    prompt_style,
+                );
+            token_budget::estimate_tokens(&system_prompt)
+        } else {
+            token_budget::estimate_tokens(crate::claude::prompts::SYSTEM_PROMPT)
+        };
+        let batch_plan =
+            batch::plan_batches(&full_repo_view.commits, &metadata, system_prompt_tokens);
+
+        if batch_plan.batches.len() < total_commits {
+            println!(
+                "   📦 Grouped {} commits into {} batches by token budget",
+                total_commits,
+                batch_plan.batches.len()
+            );
+        }
+
+        // Map phase: process batches in parallel
         let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
         let completed = Arc::new(AtomicUsize::new(0));
 
-        // Take references to owned values so async move blocks capture Copy refs
         let repo_ref = &full_repo_view;
         let client_ref = &claude_client;
         let context_ref = &context;
         let fresh = self.fresh;
 
-        let futs: Vec<_> = full_repo_view
-            .commits
+        let futs: Vec<_> = batch_plan
+            .batches
             .iter()
-            .map(|commit| {
+            .map(|batch| {
                 let sem = semaphore.clone();
                 let completed = completed.clone();
+                let batch_indices = &batch.commit_indices;
 
                 async move {
                     let _permit = sem
@@ -283,51 +310,100 @@ impl TwiddleCommand {
                         .await
                         .map_err(|e| anyhow::anyhow!("semaphore closed: {e}"))?;
 
-                    // Create minimal single-commit view (strip redundant metadata)
-                    let single_view = repo_ref.single_commit_view(commit);
+                    let batch_size = batch_indices.len();
 
-                    // Generate amendment for this single commit
-                    let amendment_file = if let Some(ref ctx) = context_ref {
-                        client_ref
-                            .generate_contextual_amendments_with_options(&single_view, ctx, fresh)
-                            .await?
+                    // Create view for this batch
+                    let batch_view = if batch_size == 1 {
+                        repo_ref.single_commit_view(&repo_ref.commits[batch_indices[0]])
                     } else {
-                        client_ref
-                            .generate_amendments_with_options(&single_view, fresh)
-                            .await?
+                        let commits: Vec<_> = batch_indices
+                            .iter()
+                            .map(|&i| &repo_ref.commits[i])
+                            .collect();
+                        repo_ref.multi_commit_view(&commits)
                     };
 
-                    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                    println!("   ✅ {}/{} commits processed", done, total_commits);
+                    // Generate amendments for the batch
+                    let result = if let Some(ref ctx) = context_ref {
+                        client_ref
+                            .generate_contextual_amendments_with_options(&batch_view, ctx, fresh)
+                            .await
+                    } else {
+                        client_ref
+                            .generate_amendments_with_options(&batch_view, fresh)
+                            .await
+                    };
 
-                    let amendment =
-                        amendment_file
-                            .amendments
-                            .into_iter()
-                            .next()
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "AI returned no amendment for commit {}",
-                                    commit.hash
-                                )
-                            })?;
+                    match result {
+                        Ok(amendment_file) => {
+                            let done =
+                                completed.fetch_add(batch_size, Ordering::Relaxed) + batch_size;
+                            println!("   ✅ {}/{} commits processed", done, total_commits);
 
-                    let summary = amendment.summary.clone().unwrap_or_default();
-
-                    Ok::<_, anyhow::Error>((amendment, summary))
+                            let items: Vec<_> = amendment_file
+                                .amendments
+                                .into_iter()
+                                .map(|a| {
+                                    let summary = a.summary.clone().unwrap_or_default();
+                                    (a, summary)
+                                })
+                                .collect();
+                            Ok(items)
+                        }
+                        Err(e) if batch_size > 1 => {
+                            // Split-and-retry: fall back to individual commits
+                            eprintln!(
+                                "warning: batch of {} failed, retrying individually: {e}",
+                                batch_size
+                            );
+                            let mut items = Vec::new();
+                            for &idx in batch_indices {
+                                let single_view =
+                                    repo_ref.single_commit_view(&repo_ref.commits[idx]);
+                                let single_result = if let Some(ref ctx) = context_ref {
+                                    client_ref
+                                        .generate_contextual_amendments_with_options(
+                                            &single_view,
+                                            ctx,
+                                            fresh,
+                                        )
+                                        .await
+                                } else {
+                                    client_ref
+                                        .generate_amendments_with_options(&single_view, fresh)
+                                        .await
+                                };
+                                match single_result {
+                                    Ok(af) => {
+                                        if let Some(a) = af.amendments.into_iter().next() {
+                                            let summary = a.summary.clone().unwrap_or_default();
+                                            items.push((a, summary));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("warning: failed to process commit: {e}");
+                                    }
+                                }
+                                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                                println!("   ✅ {}/{} commits processed", done, total_commits);
+                            }
+                            Ok(items)
+                        }
+                        Err(e) => Err(e),
+                    }
                 }
             })
             .collect();
 
         let results = futures::future::join_all(futs).await;
 
-        // Partition successes and failures
+        // Flatten batch results
         let mut successes: Vec<(crate::data::amendments::Amendment, String)> = Vec::new();
         let mut failure_count = 0;
 
         for result in results {
             match result {
-                Ok(item) => successes.push(item),
+                Ok(items) => successes.extend(items),
                 Err(e) => {
                     eprintln!("warning: failed to process commit: {e}");
                     failure_count += 1;
@@ -344,7 +420,9 @@ impl TwiddleCommand {
         }
 
         // Reduce phase: optional coherence pass
-        let all_amendments = if !self.no_coherence && successes.len() >= 2 {
+        // Skip when all commits were in a single batch (AI already saw them together)
+        let single_batch = batch_plan.batches.len() <= 1;
+        let all_amendments = if !self.no_coherence && !single_batch && successes.len() >= 2 {
             println!("🔗 Running cross-commit coherence pass...");
             match claude_client.refine_amendments_coherence(&successes).await {
                 Ok(refined) => refined,
@@ -1199,7 +1277,7 @@ impl TwiddleCommand {
         println!();
     }
 
-    /// Checks commits using parallel map-reduce.
+    /// Checks commits using batched parallel map-reduce.
     async fn check_commits_map_reduce(
         &self,
         claude_client: &crate::claude::client::ClaudeClient,
@@ -1210,18 +1288,40 @@ impl TwiddleCommand {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
+        use crate::claude::batch;
+        use crate::claude::token_budget;
         use crate::data::check::{CheckReport, CommitCheckResult};
 
         let total_commits = full_repo_view.commits.len();
+
+        // Plan batches based on token budget
+        let metadata = claude_client.get_ai_client_metadata();
+        let system_prompt = crate::claude::prompts::generate_check_system_prompt_with_scopes(
+            guidelines,
+            valid_scopes,
+        );
+        let system_prompt_tokens = token_budget::estimate_tokens(&system_prompt);
+        let batch_plan =
+            batch::plan_batches(&full_repo_view.commits, &metadata, system_prompt_tokens);
+
+        if batch_plan.batches.len() < total_commits {
+            println!(
+                "   📦 Grouped {} commits into {} batches by token budget",
+                total_commits,
+                batch_plan.batches.len()
+            );
+        }
+
         let semaphore = Arc::new(tokio::sync::Semaphore::new(self.concurrency));
         let completed = Arc::new(AtomicUsize::new(0));
 
-        let futs: Vec<_> = full_repo_view
-            .commits
+        let futs: Vec<_> = batch_plan
+            .batches
             .iter()
-            .map(|commit| {
+            .map(|batch| {
                 let sem = semaphore.clone();
                 let completed = completed.clone();
+                let batch_indices = &batch.commit_indices;
 
                 async move {
                     let _permit = sem
@@ -1229,22 +1329,73 @@ impl TwiddleCommand {
                         .await
                         .map_err(|e| anyhow::anyhow!("semaphore closed: {e}"))?;
 
-                    let single_view = full_repo_view.single_commit_view(commit);
+                    let batch_size = batch_indices.len();
 
-                    let report = claude_client
-                        .check_commits_with_scopes(&single_view, guidelines, valid_scopes, true)
-                        .await?;
+                    let batch_view = if batch_size == 1 {
+                        full_repo_view.single_commit_view(&full_repo_view.commits[batch_indices[0]])
+                    } else {
+                        let commits: Vec<_> = batch_indices
+                            .iter()
+                            .map(|&i| &full_repo_view.commits[i])
+                            .collect();
+                        full_repo_view.multi_commit_view(&commits)
+                    };
 
-                    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                    println!("   ✅ {}/{} commits checked", done, total_commits);
+                    let result = claude_client
+                        .check_commits_with_scopes(&batch_view, guidelines, valid_scopes, true)
+                        .await;
 
-                    let result = report.commits.into_iter().next().ok_or_else(|| {
-                        anyhow::anyhow!("AI returned no check result for commit {}", commit.hash)
-                    })?;
+                    match result {
+                        Ok(report) => {
+                            let done =
+                                completed.fetch_add(batch_size, Ordering::Relaxed) + batch_size;
+                            println!("   ✅ {}/{} commits checked", done, total_commits);
 
-                    let summary = result.summary.clone().unwrap_or_default();
-
-                    Ok::<_, anyhow::Error>((result, summary))
+                            let items: Vec<_> = report
+                                .commits
+                                .into_iter()
+                                .map(|r| {
+                                    let summary = r.summary.clone().unwrap_or_default();
+                                    (r, summary)
+                                })
+                                .collect();
+                            Ok(items)
+                        }
+                        Err(e) if batch_size > 1 => {
+                            eprintln!(
+                                "warning: batch of {} failed, retrying individually: {e}",
+                                batch_size
+                            );
+                            let mut items = Vec::new();
+                            for &idx in batch_indices {
+                                let single_view =
+                                    full_repo_view.single_commit_view(&full_repo_view.commits[idx]);
+                                let single_result = claude_client
+                                    .check_commits_with_scopes(
+                                        &single_view,
+                                        guidelines,
+                                        valid_scopes,
+                                        true,
+                                    )
+                                    .await;
+                                match single_result {
+                                    Ok(report) => {
+                                        if let Some(r) = report.commits.into_iter().next() {
+                                            let summary = r.summary.clone().unwrap_or_default();
+                                            items.push((r, summary));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("warning: failed to check commit: {e}");
+                                    }
+                                }
+                                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                                println!("   ✅ {}/{} commits checked", done, total_commits);
+                            }
+                            Ok(items)
+                        }
+                        Err(e) => Err(e),
+                    }
                 }
             })
             .collect();
@@ -1256,7 +1407,7 @@ impl TwiddleCommand {
 
         for result in results {
             match result {
-                Ok(item) => successes.push(item),
+                Ok(items) => successes.extend(items),
                 Err(e) => {
                     eprintln!("warning: failed to check commit: {e}");
                     failure_count += 1;
@@ -1272,8 +1423,9 @@ impl TwiddleCommand {
             anyhow::bail!("All commits failed to check");
         }
 
-        // Coherence pass for checks
-        if !self.no_coherence && successes.len() >= 2 {
+        // Coherence pass: skip when all commits were in a single batch
+        let single_batch = batch_plan.batches.len() <= 1;
+        if !self.no_coherence && !single_batch && successes.len() >= 2 {
             println!("🔗 Running cross-commit coherence pass...");
             match claude_client
                 .refine_checks_coherence(&successes, full_repo_view)

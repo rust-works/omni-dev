@@ -28,8 +28,17 @@ const SAFETY_MARGIN: f64 = 1.10;
 /// underestimating.
 #[must_use]
 pub(crate) fn estimate_tokens(text: &str) -> usize {
-    let byte_count = text.len() as f64;
-    let raw_estimate = byte_count / CHARS_PER_TOKEN;
+    estimate_tokens_from_char_count(text.len())
+}
+
+/// Estimates token count from a byte count without requiring a string reference.
+///
+/// Same heuristic as [`estimate_tokens`] but accepts a pre-computed length.
+/// Useful for batch planning where file sizes are known from `fs::metadata`
+/// without reading file contents into memory.
+#[must_use]
+pub(crate) fn estimate_tokens_from_char_count(char_count: usize) -> usize {
+    let raw_estimate = char_count as f64 / CHARS_PER_TOKEN;
     (raw_estimate * SAFETY_MARGIN).ceil() as usize
 }
 
@@ -222,5 +231,19 @@ mod tests {
     #[test]
     fn tokens_to_chars_zero() {
         assert_eq!(tokens_to_chars(0), 0);
+    }
+
+    #[test]
+    fn estimate_tokens_from_char_count_matches_estimate_tokens() {
+        let text = "hello world, this is a test string for token estimation";
+        assert_eq!(
+            estimate_tokens(text),
+            estimate_tokens_from_char_count(text.len())
+        );
+    }
+
+    #[test]
+    fn estimate_tokens_from_char_count_zero() {
+        assert_eq!(estimate_tokens_from_char_count(0), 0);
     }
 }

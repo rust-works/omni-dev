@@ -249,6 +249,34 @@ impl RepositoryView {
             commits: vec![commit.clone()],
         }
     }
+
+    /// Creates a minimal view containing multiple commits for batched dispatch.
+    ///
+    /// Same metadata stripping as [`single_commit_view`] but with N commits.
+    /// Used by the batching system to group commits into a single AI request.
+    #[must_use]
+    pub fn multi_commit_view(&self, commits: &[&CommitInfo]) -> Self {
+        Self {
+            versions: None,
+            explanation: FieldExplanation {
+                text: String::new(),
+                fields: Vec::new(),
+            },
+            working_directory: WorkingDirectoryInfo {
+                clean: true,
+                untracked_changes: Vec::new(),
+            },
+            remotes: Vec::new(),
+            ai: AiInfo {
+                scratch: String::new(),
+            },
+            branch_info: self.branch_info.clone(),
+            pr_template: None,
+            pr_template_location: None,
+            branch_prs: None,
+            commits: commits.iter().map(|c| (*c).clone()).collect(),
+        }
+    }
 }
 
 impl Default for FieldExplanation {
