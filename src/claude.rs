@@ -1,6 +1,7 @@
 //! Claude API integration for commit message improvement.
 
 pub mod ai;
+pub(crate) mod batch;
 pub mod client;
 pub mod context;
 pub mod error;
