@@ -318,56 +318,13 @@ impl CheckCommand {
         Ok(None)
     }
 
-    /// Loads valid scopes from context directory.
-    ///
-    /// This ensures the check command uses the same scopes as the twiddle command,
-    /// preventing false positives when validating commit messages.
+    /// Loads valid scopes from context directory with ecosystem defaults.
     fn load_scopes(&self) -> Vec<crate::data::context::ScopeDefinition> {
-        use crate::data::context::ScopeDefinition;
-        use std::fs;
-
-        // Local config struct matching the YAML format
-        #[derive(serde::Deserialize)]
-        struct ScopesConfig {
-            scopes: Vec<ScopeDefinition>,
-        }
-
         let context_dir = self
             .context_dir
             .clone()
             .unwrap_or_else(|| std::path::PathBuf::from(".omni-dev"));
-
-        // Search paths in priority order: local override → project-level → global
-        let mut candidates: Vec<std::path::PathBuf> = vec![
-            context_dir.join("local").join("scopes.yaml"),
-            context_dir.join("scopes.yaml"),
-        ];
-        if let Some(home) = dirs::home_dir() {
-            candidates.push(home.join(".omni-dev").join("scopes.yaml"));
-        }
-
-        for path in &candidates {
-            if !path.exists() {
-                continue;
-            }
-            match fs::read_to_string(path) {
-                Ok(content) => match serde_yaml::from_str::<ScopesConfig>(&content) {
-                    Ok(config) => return config.scopes,
-                    Err(e) => {
-                        eprintln!(
-                            "warning: ignoring malformed scopes file {}: {e}",
-                            path.display()
-                        );
-                    }
-                },
-                Err(e) => {
-                    eprintln!("warning: cannot read scopes file {}: {e}", path.display());
-                }
-            }
-        }
-
-        // No scopes found
-        Vec::new()
+        crate::claude::context::load_project_scopes(&context_dir, &std::path::PathBuf::from("."))
     }
 
     /// Shows diagnostic information about loaded guidance files.
