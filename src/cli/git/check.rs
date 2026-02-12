@@ -464,19 +464,8 @@ impl CheckCommand {
                         .await
                         .map_err(|e| anyhow::anyhow!("semaphore closed: {e}"))?;
 
-                    // Create single-commit view
-                    let single_view = crate::data::RepositoryView {
-                        versions: full_repo_view.versions.clone(),
-                        explanation: full_repo_view.explanation.clone(),
-                        working_directory: full_repo_view.working_directory.clone(),
-                        remotes: full_repo_view.remotes.clone(),
-                        ai: full_repo_view.ai.clone(),
-                        branch_info: full_repo_view.branch_info.clone(),
-                        pr_template: full_repo_view.pr_template.clone(),
-                        pr_template_location: full_repo_view.pr_template_location.clone(),
-                        branch_prs: full_repo_view.branch_prs.clone(),
-                        commits: vec![commit.clone()],
-                    };
+                    // Create minimal single-commit view (strip redundant metadata)
+                    let single_view = full_repo_view.single_commit_view(commit);
 
                     let report = claude_client
                         .check_commits_with_scopes(
