@@ -23,6 +23,20 @@ pub enum ClaudeError {
     #[error("Failed to parse amendments from Claude response: {0}")]
     AmendmentParsingFailed(String),
 
+    /// Prompt exceeds the model's available input token budget.
+    #[error(
+        "Prompt too large for model '{model}': estimated {estimated_tokens} tokens, \
+         but only {max_tokens} input tokens available"
+    )]
+    PromptTooLarge {
+        /// Estimated token count of the assembled prompt.
+        estimated_tokens: usize,
+        /// Maximum available input tokens (context minus reserved output).
+        max_tokens: usize,
+        /// Model identifier.
+        model: String,
+    },
+
     /// Rate limit exceeded for Claude API.
     #[error("Rate limit exceeded. Please try again later")]
     RateLimitExceeded,

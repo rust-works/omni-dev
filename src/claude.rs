@@ -6,6 +6,7 @@ pub mod context;
 pub mod error;
 pub mod model_config;
 pub mod prompts;
+pub(crate) mod token_budget;
 
 pub use ai::bedrock::BedrockAiClient;
 pub use ai::claude::ClaudeAiClient;
