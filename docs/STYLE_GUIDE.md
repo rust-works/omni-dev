@@ -2,6 +2,28 @@
 
 Coding conventions for the omni-dev project. Each item has a unique ID for easy reference.
 
+## Tag-based lookup
+
+Before writing or reviewing code, identify which tags apply to the changes and search
+this file for those tags. Each rule has a **Tags** line immediately after its heading.
+
+**Search command:** `grep "Tags:.*<tag>" docs/STYLE_GUIDE.md` returns matching rule headings.
+
+| When you are…                                    | Search for tags                          |
+|--------------------------------------------------|------------------------------------------|
+| Adding or modifying a function                   | `code-style`, `naming`, `documentation`  |
+| Adding a type, enum, or trait                    | `api-design`, `naming`, `documentation`  |
+| Adding or changing error handling                | `error-handling`                         |
+| Creating or restructuring a module/file          | `module-organization`, `naming`          |
+| Writing or updating tests                        | `testing`                                |
+| Changing visibility (`pub`, `pub(crate)`)        | `api-design`, `module-organization`      |
+| Adding constants or replacing magic values       | `code-style`, `naming`                   |
+| Writing commit messages                          | `commits`                                |
+| Suppressing a lint or considering `unsafe`       | `code-style`, `unsafe`                   |
+| Reviewing code for style compliance              | All tags relevant to the changed code    |
+
+---
+
 ## STYLE-0000: Style guide structure
 
 **Tags:** `meta`
