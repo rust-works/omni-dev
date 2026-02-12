@@ -6,8 +6,15 @@ pub mod openai;
 
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 use anyhow::Result;
+
+/// HTTP request timeout for AI API calls.
+///
+/// Set to 5 minutes to accommodate large prompts and long model responses
+/// (up to 64k output tokens) while preventing indefinite hangs.
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Metadata about an AI client implementation.
 #[derive(Clone, Debug)]
