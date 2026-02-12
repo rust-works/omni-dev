@@ -193,6 +193,35 @@ impl RepositoryView {
             }
         }
     }
+
+    /// Creates a minimal view containing a single commit for parallel dispatch.
+    ///
+    /// Strips metadata not relevant to per-commit AI analysis (versions,
+    /// working directory status, remotes, PR templates) to reduce prompt size.
+    /// Only retains `branch_info` (for scope context) and the single commit.
+    #[must_use]
+    pub fn single_commit_view(&self, commit: &CommitInfo) -> Self {
+        Self {
+            versions: None,
+            explanation: FieldExplanation {
+                text: String::new(),
+                fields: Vec::new(),
+            },
+            working_directory: WorkingDirectoryInfo {
+                clean: true,
+                untracked_changes: Vec::new(),
+            },
+            remotes: Vec::new(),
+            ai: AiInfo {
+                scratch: String::new(),
+            },
+            branch_info: self.branch_info.clone(),
+            pr_template: None,
+            pr_template_location: None,
+            branch_prs: None,
+            commits: vec![commit.clone()],
+        }
+    }
 }
 
 impl Default for FieldExplanation {
