@@ -331,7 +331,8 @@ Options:
       --quiet                      Only shows errors/warnings, suppresses info-level output
       --verbose                    Shows detailed analysis including passing commits
       --show-passing               Includes passing commits in output (hidden by default)
-      --batch-size <BATCH_SIZE>    Number of commits to process per AI request (default: 4) [default: 4]
+      --concurrency <CONCURRENCY>  Maximum number of concurrent AI requests (default: 4) [default: 4]
+      --no-coherence               Disables the cross-commit coherence pass
       --no-suggestions             Skips generating corrected message suggestions
       --twiddle                    Offers to apply suggested messages when issues are found
   -h, --help                       Print help
@@ -367,8 +368,10 @@ Options:
           Overrides detected branch context
       --no-context
           Disables contextual analysis (uses basic prompting only)
-      --batch-size <BATCH_SIZE>
-          Maximum number of commits to process in a single batch (default: 4) [default: 4]
+      --concurrency <CONCURRENCY>
+          Maximum number of concurrent AI requests (default: 4) [default: 4]
+      --no-coherence
+          Disables the cross-commit coherence pass
       --no-ai
           Skips AI processing and only outputs repository YAML
       --fresh

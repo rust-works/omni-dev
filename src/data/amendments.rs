@@ -20,6 +20,9 @@ pub struct Amendment {
     pub commit: String,
     /// New commit message.
     pub message: String,
+    /// Brief summary of what this commit changes (for cross-commit coherence).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 impl AmendmentFile {
@@ -122,7 +125,11 @@ impl AmendmentFile {
 impl Amendment {
     /// Creates a new amendment.
     pub fn new(commit: String, message: String) -> Self {
-        Self { commit, message }
+        Self {
+            commit,
+            message,
+            summary: None,
+        }
     }
 
     /// Validates amendment structure.

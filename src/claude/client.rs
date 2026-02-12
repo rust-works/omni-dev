@@ -478,6 +478,50 @@ impl ClaudeClient {
         content.to_string()
     }
 
+    /// Refines individually-generated amendments for cross-commit coherence.
+    ///
+    /// Sends commit summaries and proposed messages to the AI for a second pass
+    /// that normalizes scopes, detects rename chains, and removes redundancy.
+    pub async fn refine_amendments_coherence(
+        &self,
+        items: &[(crate::data::amendments::Amendment, String)],
+    ) -> Result<AmendmentFile> {
+        let system_prompt = prompts::AMENDMENT_COHERENCE_SYSTEM_PROMPT;
+        let user_prompt = prompts::generate_amendment_coherence_user_prompt(items);
+
+        self.validate_prompt_budget(system_prompt, &user_prompt)?;
+
+        let content = self
+            .ai_client
+            .send_request(system_prompt, &user_prompt)
+            .await?;
+
+        self.parse_amendment_response(&content)
+    }
+
+    /// Refines individually-generated check results for cross-commit coherence.
+    ///
+    /// Sends commit summaries and check outcomes to the AI for a second pass
+    /// that ensures consistent severity, detects cross-commit issues, and
+    /// normalizes scope validation.
+    pub async fn refine_checks_coherence(
+        &self,
+        items: &[(crate::data::check::CommitCheckResult, String)],
+        repo_view: &RepositoryView,
+    ) -> Result<crate::data::check::CheckReport> {
+        let system_prompt = prompts::CHECK_COHERENCE_SYSTEM_PROMPT;
+        let user_prompt = prompts::generate_check_coherence_user_prompt(items);
+
+        self.validate_prompt_budget(system_prompt, &user_prompt)?;
+
+        let content = self
+            .ai_client
+            .send_request(system_prompt, &user_prompt)
+            .await?;
+
+        self.parse_check_response(&content, repo_view)
+    }
+
     /// Extracts YAML content from Claude response, handling markdown wrappers.
     fn extract_yaml_from_response(&self, content: &str) -> String {
         let content = content.trim();
