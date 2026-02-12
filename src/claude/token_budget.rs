@@ -33,6 +33,15 @@ pub(crate) fn estimate_tokens(text: &str) -> usize {
     (raw_estimate * SAFETY_MARGIN).ceil() as usize
 }
 
+/// Converts a token count back to an approximate character count.
+///
+/// Inverse of [`estimate_tokens`]. Uses `floor()` to be conservative —
+/// slightly fewer chars ensures we stay within budget after re-estimation.
+#[must_use]
+pub(crate) fn tokens_to_chars(tokens: usize) -> usize {
+    ((tokens as f64 / SAFETY_MARGIN) * CHARS_PER_TOKEN).floor() as usize
+}
+
 /// Result of a token budget validation.
 #[derive(Debug, Clone)]
 pub(crate) struct TokenEstimate {
@@ -72,7 +81,7 @@ impl TokenBudget {
     /// Returns the maximum number of input tokens available after reserving
     /// output tokens.
     #[must_use]
-    fn available_input_tokens(&self) -> usize {
+    pub(crate) fn available_input_tokens(&self) -> usize {
         self.max_context_length
             .saturating_sub(self.reserved_output_tokens)
     }
@@ -193,5 +202,25 @@ mod tests {
         let estimate = budget.validate_prompt("test prompt here", "").unwrap();
         assert!(estimate.utilization_pct > 0.0);
         assert!(estimate.utilization_pct < 100.0);
+    }
+
+    #[test]
+    fn tokens_to_chars_inverse_of_estimate() {
+        // 1100 tokens → should map back to approximately 3500 chars
+        // Forward: 3500 / 3.5 * 1.10 = 1100
+        // Reverse: 1100 / 1.10 * 3.5 ≈ 3500 (floor may give 3499 due to f64 precision)
+        let chars = tokens_to_chars(1100);
+        assert!((3499..=3500).contains(&chars), "got {chars}");
+    }
+
+    #[test]
+    fn tokens_to_chars_conservative_floor() {
+        // 2 tokens → 2 / 1.10 * 3.5 = 6.363... → floor = 6
+        assert_eq!(tokens_to_chars(2), 6);
+    }
+
+    #[test]
+    fn tokens_to_chars_zero() {
+        assert_eq!(tokens_to_chars(0), 0);
     }
 }

@@ -56,7 +56,10 @@ pub struct ClaudeAiClient {
 impl ClaudeAiClient {
     /// Creates a new Claude AI client.
     pub fn new(model: String, api_key: String, active_beta: Option<(String, String)>) -> Self {
-        let client = Client::new();
+        let client = Client::builder()
+            .timeout(super::REQUEST_TIMEOUT)
+            .build()
+            .expect("failed to build HTTP client");
 
         Self {
             client,

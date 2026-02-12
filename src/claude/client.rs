@@ -3,12 +3,28 @@
 use anyhow::{Context, Result};
 use tracing::debug;
 
-use crate::claude::token_budget::TokenBudget;
+use crate::claude::token_budget::{self, TokenBudget};
 use crate::claude::{ai::bedrock::BedrockAiClient, ai::claude::ClaudeAiClient};
 use crate::claude::{ai::AiClient, error::ClaudeError, prompts};
 use crate::data::{
-    amendments::AmendmentFile, context::CommitContext, RepositoryView, RepositoryViewForAI,
+    amendments::AmendmentFile, context::CommitContext, DiffDetail, RepositoryView,
+    RepositoryViewForAI,
 };
+
+/// Multiplier for YAML re-serialization overhead when calculating excess chars.
+///
+/// Accounts for indentation changes, literal block markers, and other
+/// formatting differences when YAML is re-serialized after diff truncation.
+const YAML_OVERHEAD_FACTOR: f64 = 1.10;
+
+/// Result of fitting a prompt within the model's token budget.
+struct PromptWithBudget {
+    /// The user prompt (serialized from a possibly-reduced view).
+    user_prompt: String,
+    /// The level of diff detail that was used.
+    #[allow(dead_code)] // Retained for future diagnostics; set by all budget-fitting levels
+    diff_detail: DiffDetail,
+}
 
 /// Claude client for commit message improvement.
 pub struct ClaudeClient {
@@ -45,6 +61,130 @@ impl ClaudeClient {
         );
 
         Ok(())
+    }
+
+    /// Builds a user prompt that fits within the model's token budget,
+    /// progressively reducing diff detail if necessary.
+    ///
+    /// Tries levels in order: Full → Truncated → StatOnly → FileListOnly.
+    /// Logs a warning at each reduction level so the user knows the AI
+    /// received less context.
+    fn build_prompt_fitting_budget(
+        &self,
+        ai_view: RepositoryViewForAI,
+        system_prompt: &str,
+        build_user_prompt: impl Fn(&str) -> String,
+    ) -> Result<PromptWithBudget> {
+        let metadata = self.ai_client.get_metadata();
+        let budget = TokenBudget::from_metadata(&metadata);
+
+        // Level 1: Full diff
+        let yaml = crate::data::to_yaml(&ai_view)
+            .context("Failed to serialize repository view to YAML")?;
+        let user_prompt = build_user_prompt(&yaml);
+
+        if let Ok(estimate) = budget.validate_prompt(system_prompt, &user_prompt) {
+            debug!(
+                model = %metadata.model,
+                estimated_tokens = estimate.estimated_tokens,
+                available_tokens = estimate.available_tokens,
+                utilization_pct = format!("{:.1}%", estimate.utilization_pct),
+                diff_detail = %DiffDetail::Full,
+                "Token budget check passed"
+            );
+            return Ok(PromptWithBudget {
+                user_prompt,
+                diff_detail: DiffDetail::Full,
+            });
+        }
+
+        // Level 2: Truncated diff — calculate excess and trim
+        let system_tokens = token_budget::estimate_tokens(system_prompt);
+        let user_tokens = token_budget::estimate_tokens(&user_prompt);
+        let excess_tokens =
+            (system_tokens + user_tokens).saturating_sub(budget.available_input_tokens());
+        let excess_chars = (token_budget::tokens_to_chars(excess_tokens) as f64
+            * YAML_OVERHEAD_FACTOR)
+            .ceil() as usize;
+
+        let mut truncated_view = ai_view.clone();
+        truncated_view.truncate_diffs(excess_chars);
+
+        let yaml = crate::data::to_yaml(&truncated_view)
+            .context("Failed to serialize truncated view to YAML")?;
+        let user_prompt = build_user_prompt(&yaml);
+
+        if let Ok(estimate) = budget.validate_prompt(system_prompt, &user_prompt) {
+            debug!(
+                model = %metadata.model,
+                estimated_tokens = estimate.estimated_tokens,
+                available_tokens = estimate.available_tokens,
+                utilization_pct = format!("{:.1}%", estimate.utilization_pct),
+                diff_detail = %DiffDetail::Truncated,
+                "Token budget check passed after diff truncation"
+            );
+            tracing::warn!(
+                "Diff content truncated to fit model context window ({})",
+                metadata.model
+            );
+            return Ok(PromptWithBudget {
+                user_prompt,
+                diff_detail: DiffDetail::Truncated,
+            });
+        }
+
+        // Level 3: Stat-only — replace diff content with stat summary
+        let mut stat_view = ai_view.clone();
+        stat_view.replace_diffs_with_stat();
+
+        let yaml = crate::data::to_yaml(&stat_view)
+            .context("Failed to serialize stat-only view to YAML")?;
+        let user_prompt = build_user_prompt(&yaml);
+
+        if let Ok(estimate) = budget.validate_prompt(system_prompt, &user_prompt) {
+            debug!(
+                model = %metadata.model,
+                estimated_tokens = estimate.estimated_tokens,
+                available_tokens = estimate.available_tokens,
+                utilization_pct = format!("{:.1}%", estimate.utilization_pct),
+                diff_detail = %DiffDetail::StatOnly,
+                "Token budget check passed with stat-only diff"
+            );
+            tracing::warn!(
+                "Full diff replaced with stat summary to fit model context window ({})",
+                metadata.model
+            );
+            return Ok(PromptWithBudget {
+                user_prompt,
+                diff_detail: DiffDetail::StatOnly,
+            });
+        }
+
+        // Level 4: File-list-only — remove all diff content
+        let mut minimal_view = ai_view;
+        minimal_view.remove_diffs();
+
+        let yaml = crate::data::to_yaml(&minimal_view)
+            .context("Failed to serialize minimal view to YAML")?;
+        let user_prompt = build_user_prompt(&yaml);
+
+        let estimate = budget.validate_prompt(system_prompt, &user_prompt)?;
+        debug!(
+            model = %metadata.model,
+            estimated_tokens = estimate.estimated_tokens,
+            available_tokens = estimate.available_tokens,
+            utilization_pct = format!("{:.1}%", estimate.utilization_pct),
+            diff_detail = %DiffDetail::FileListOnly,
+            "Token budget check passed with file-list-only"
+        );
+        tracing::warn!(
+            "All diff content removed to fit model context window — only file list available ({})",
+            metadata.model
+        );
+        Ok(PromptWithBudget {
+            user_prompt,
+            diff_detail: DiffDetail::FileListOnly,
+        })
     }
 
     /// Sends a raw prompt to the AI client and returns the text response.
@@ -86,20 +226,16 @@ impl ClaudeClient {
             RepositoryViewForAI::from_repository_view_with_options(repo_view.clone(), fresh)
                 .context("Failed to enhance repository view with diff content")?;
 
-        // Convert repository view to YAML
-        let repo_yaml = crate::data::to_yaml(&ai_repo_view)
-            .context("Failed to serialize repository view to YAML")?;
-
-        // Generate user prompt
-        let user_prompt = prompts::generate_user_prompt(&repo_yaml);
-
-        // Validate prompt fits within model's token budget
-        self.validate_prompt_budget(prompts::SYSTEM_PROMPT, &user_prompt)?;
+        // Build prompt with progressive diff reduction if needed
+        let fitted =
+            self.build_prompt_fitting_budget(ai_repo_view, prompts::SYSTEM_PROMPT, |yaml| {
+                prompts::generate_user_prompt(yaml)
+            })?;
 
         // Send request using AI client
         let content = self
             .ai_client
-            .send_request(prompts::SYSTEM_PROMPT, &user_prompt)
+            .send_request(prompts::SYSTEM_PROMPT, &fitted.user_prompt)
             .await?;
 
         // Parse YAML response to AmendmentFile
@@ -131,15 +267,10 @@ impl ClaudeClient {
             RepositoryViewForAI::from_repository_view_with_options(repo_view.clone(), fresh)
                 .context("Failed to enhance repository view with diff content")?;
 
-        // Convert repository view to YAML
-        let repo_yaml = crate::data::to_yaml(&ai_repo_view)
-            .context("Failed to serialize repository view to YAML")?;
-
         // Generate contextual prompts using intelligence
         let prompt_style = self.ai_client.get_metadata().prompt_style();
         let system_prompt =
             prompts::generate_contextual_system_prompt_for_provider(context, prompt_style);
-        let user_prompt = prompts::generate_contextual_user_prompt(&repo_yaml, context);
 
         // Debug logging to troubleshoot custom commit type issue
         match &context.project.commit_guidelines {
@@ -152,13 +283,15 @@ impl ClaudeClient {
             }
         }
 
-        // Validate prompt fits within model's token budget
-        self.validate_prompt_budget(&system_prompt, &user_prompt)?;
+        // Build prompt with progressive diff reduction if needed
+        let fitted = self.build_prompt_fitting_budget(ai_repo_view, &system_prompt, |yaml| {
+            prompts::generate_contextual_user_prompt(yaml, context)
+        })?;
 
         // Send request using AI client
         let content = self
             .ai_client
-            .send_request(&system_prompt, &user_prompt)
+            .send_request(&system_prompt, &fitted.user_prompt)
             .await?;
 
         // Parse YAML response to AmendmentFile
@@ -209,20 +342,17 @@ impl ClaudeClient {
         let ai_repo_view = RepositoryViewForAI::from_repository_view(repo_view.clone())
             .context("Failed to enhance repository view with diff content")?;
 
-        // Convert repository view to YAML
-        let repo_yaml = crate::data::to_yaml(&ai_repo_view)
-            .context("Failed to serialize repository view to YAML")?;
-
-        // Generate prompts for PR description
-        let user_prompt = prompts::generate_pr_description_prompt(&repo_yaml, pr_template);
-
-        // Validate prompt fits within model's token budget
-        self.validate_prompt_budget(prompts::PR_GENERATION_SYSTEM_PROMPT, &user_prompt)?;
+        // Build prompt with progressive diff reduction if needed
+        let fitted = self.build_prompt_fitting_budget(
+            ai_repo_view,
+            prompts::PR_GENERATION_SYSTEM_PROMPT,
+            |yaml| prompts::generate_pr_description_prompt(yaml, pr_template),
+        )?;
 
         // Send request using AI client
         let content = self
             .ai_client
-            .send_request(prompts::PR_GENERATION_SYSTEM_PROMPT, &user_prompt)
+            .send_request(prompts::PR_GENERATION_SYSTEM_PROMPT, &fitted.user_prompt)
             .await?;
 
         // The AI response should be treated as YAML directly
@@ -247,24 +377,20 @@ impl ClaudeClient {
         let ai_repo_view = RepositoryViewForAI::from_repository_view(repo_view.clone())
             .context("Failed to enhance repository view with diff content")?;
 
-        // Convert repository view to YAML
-        let repo_yaml = crate::data::to_yaml(&ai_repo_view)
-            .context("Failed to serialize repository view to YAML")?;
-
         // Generate contextual prompts for PR description with provider-specific handling
         let prompt_style = self.ai_client.get_metadata().prompt_style();
         let system_prompt =
             prompts::generate_pr_system_prompt_with_context_for_provider(context, prompt_style);
-        let user_prompt =
-            prompts::generate_pr_description_prompt_with_context(&repo_yaml, pr_template, context);
 
-        // Validate prompt fits within model's token budget
-        self.validate_prompt_budget(&system_prompt, &user_prompt)?;
+        // Build prompt with progressive diff reduction if needed
+        let fitted = self.build_prompt_fitting_budget(ai_repo_view, &system_prompt, |yaml| {
+            prompts::generate_pr_description_prompt_with_context(yaml, pr_template, context)
+        })?;
 
         // Send request using AI client
         let content = self
             .ai_client
-            .send_request(&system_prompt, &user_prompt)
+            .send_request(&system_prompt, &fitted.user_prompt)
             .await?;
 
         // The AI response should be treated as YAML directly
@@ -339,17 +465,14 @@ impl ClaudeClient {
             commit.run_pre_validation_checks();
         }
 
-        // Convert repository view to YAML
-        let repo_yaml = crate::data::to_yaml(&ai_repo_view)
-            .context("Failed to serialize repository view to YAML")?;
-
-        // Generate prompts with scopes
+        // Generate system prompt with scopes
         let system_prompt =
             prompts::generate_check_system_prompt_with_scopes(guidelines, valid_scopes);
-        let user_prompt = prompts::generate_check_user_prompt(&repo_yaml, include_suggestions);
 
-        // Validate prompt fits within model's token budget (once, before retries)
-        self.validate_prompt_budget(&system_prompt, &user_prompt)?;
+        // Build prompt with progressive diff reduction if needed
+        let fitted = self.build_prompt_fitting_budget(ai_repo_view, &system_prompt, |yaml| {
+            prompts::generate_check_user_prompt(yaml, include_suggestions)
+        })?;
 
         let mut last_error = None;
 
@@ -357,7 +480,7 @@ impl ClaudeClient {
             // Send request using AI client
             match self
                 .ai_client
-                .send_request(&system_prompt, &user_prompt)
+                .send_request(&system_prompt, &fitted.user_prompt)
                 .await
             {
                 Ok(content) => match self.parse_check_response(&content, repo_view) {
