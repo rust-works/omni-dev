@@ -136,11 +136,11 @@ Error: Claude API key not found
 
 **Solutions**:
 
-1. **Reduce Batch Size**
+1. **Reduce Concurrency**
 
    ```bash
-   # Use smaller batches
-   omni-dev git commit message twiddle 'HEAD~10..HEAD' --batch-size 1
+   # Lower parallel requests
+   omni-dev git commit message twiddle 'HEAD~10..HEAD' --concurrency 1
    ```
 
 2. **Wait and Retry**
@@ -385,11 +385,11 @@ Error: Invalid commit range: HEAD~100..HEAD
 
 **Solutions**:
 
-1. **Use Smaller Batch Sizes**
+1. **Reduce Concurrency**
 
    ```bash
-   # Process 2 commits at a time
-   omni-dev git commit message twiddle 'HEAD~20..HEAD' --batch-size 2
+   # Lower parallel requests
+   omni-dev git commit message twiddle 'HEAD~20..HEAD' --concurrency 2
    ```
 
 2. **Process in Stages**
@@ -414,10 +414,10 @@ Error: Invalid commit range: HEAD~100..HEAD
 
 **Solutions**:
 
-1. **Reduce Batch Size**
+1. **Reduce Concurrency**
 
    ```bash
-   omni-dev git commit message twiddle 'HEAD~10..HEAD' --batch-size 1
+   omni-dev git commit message twiddle 'HEAD~10..HEAD' --concurrency 1
    ```
 
 2. **Retry with Exponential Backoff**
@@ -531,7 +531,8 @@ error: unexpected argument '--unknown-flag' found
    ```bash
    # Common correct flags:
    --use-context
-   --batch-size 4
+   --concurrency 4
+   --no-coherence
    --auto-apply
    --save-only file.yaml
    --context-dir ./config

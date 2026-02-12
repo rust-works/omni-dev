@@ -854,7 +854,7 @@ If you're currently writing commit messages manually:
    omni-dev git commit message twiddle 'HEAD~5..HEAD' --use-context
    
    # Gradually clean up older commits
-   omni-dev git commit message twiddle 'HEAD~20..HEAD' --batch-size 3
+   omni-dev git commit message twiddle 'HEAD~20..HEAD' --concurrency 3
    ```
 
 ### From Other Tools

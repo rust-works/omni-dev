@@ -95,8 +95,8 @@ The star feature - intelligently improve your commit messages with real-time mod
 # Improve commits with contextual intelligence
 omni-dev git commit message twiddle 'origin/main..HEAD' --use-context
 
-# Process large commit ranges with automatic batching
-omni-dev git commit message twiddle 'HEAD~20..HEAD' --batch-size 5
+# Process large commit ranges with parallel processing
+omni-dev git commit message twiddle 'HEAD~20..HEAD' --concurrency 5
 
 # Save suggestions to file for review
 omni-dev git commit message twiddle 'HEAD~5..HEAD' \
@@ -220,8 +220,8 @@ Large commit ranges are automatically split into manageable batches:
 # Processes 50 commits in batches of 4 (default)
 omni-dev git commit message twiddle 'HEAD~50..HEAD' --use-context
 
-# Custom batch size for very large ranges
-omni-dev git commit message twiddle 'main..HEAD' --batch-size 2
+# Custom concurrency for very large ranges
+omni-dev git commit message twiddle 'main..HEAD' --concurrency 2
 ```
 
 ### Command Options
@@ -229,7 +229,8 @@ omni-dev git commit message twiddle 'main..HEAD' --batch-size 2
 | Option | Description | Example |
 |--------|-------------|---------|
 | `--use-context` | Enable contextual intelligence | `--use-context` |
-| `--batch-size N` | Set batch size for large ranges | `--batch-size 3` |
+| `--concurrency N` | Number of parallel commit processors (default: 4) | `--concurrency 3` |
+| `--no-coherence` | Skip cross-commit coherence refinement pass | `--no-coherence` |
 | `--context-dir PATH` | Custom context directory | `--context-dir ./config` |
 | `--auto-apply` | Apply without confirmation | `--auto-apply` |
 | `--save-only FILE` | Save to file without applying | `--save-only fixes.yaml` |
