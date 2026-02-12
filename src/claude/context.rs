@@ -6,6 +6,6 @@ pub mod files;
 pub mod patterns;
 
 pub use branch::BranchAnalyzer;
-pub use discovery::ProjectDiscovery;
+pub use discovery::{load_project_scopes, ProjectDiscovery};
 pub use files::FileAnalyzer;
 pub use patterns::WorkPatternAnalyzer;

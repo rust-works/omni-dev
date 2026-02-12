@@ -1167,51 +1167,13 @@ impl TwiddleCommand {
         Ok(None)
     }
 
-    /// Loads valid scopes for check (mirrors `CheckCommand::load_scopes`).
+    /// Loads valid scopes for check with ecosystem defaults.
     fn load_check_scopes(&self) -> Vec<crate::data::context::ScopeDefinition> {
-        use crate::data::context::ScopeDefinition;
-        use std::fs;
-
-        #[derive(serde::Deserialize)]
-        struct ScopesConfig {
-            scopes: Vec<ScopeDefinition>,
-        }
-
         let context_dir = self
             .context_dir
             .clone()
             .unwrap_or_else(|| std::path::PathBuf::from(".omni-dev"));
-
-        // Search paths in priority order: local override → project-level → global
-        let mut candidates: Vec<std::path::PathBuf> = vec![
-            context_dir.join("local").join("scopes.yaml"),
-            context_dir.join("scopes.yaml"),
-        ];
-        if let Some(home) = dirs::home_dir() {
-            candidates.push(home.join(".omni-dev").join("scopes.yaml"));
-        }
-
-        for path in &candidates {
-            if !path.exists() {
-                continue;
-            }
-            match fs::read_to_string(path) {
-                Ok(content) => match serde_yaml::from_str::<ScopesConfig>(&content) {
-                    Ok(config) => return config.scopes,
-                    Err(e) => {
-                        eprintln!(
-                            "warning: ignoring malformed scopes file {}: {e}",
-                            path.display()
-                        );
-                    }
-                },
-                Err(e) => {
-                    eprintln!("warning: cannot read scopes file {}: {e}", path.display());
-                }
-            }
-        }
-
-        Vec::new()
+        crate::claude::context::load_project_scopes(&context_dir, &std::path::PathBuf::from("."))
     }
 
     /// Shows guidance files status for check.
