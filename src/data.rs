@@ -255,7 +255,7 @@ impl RepositoryView {
     /// Same metadata stripping as [`single_commit_view`] but with N commits.
     /// Used by the batching system to group commits into a single AI request.
     #[must_use]
-    pub fn multi_commit_view(&self, commits: &[&CommitInfo]) -> Self {
+    pub(crate) fn multi_commit_view(&self, commits: &[&CommitInfo]) -> Self {
         Self {
             versions: None,
             explanation: FieldExplanation {
