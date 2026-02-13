@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-02-13
+
+### Added
+- **Ecosystem Default Scopes**: Automatic scope detection based on project ecosystem
+  - Detects Rust, Node.js, Python, Go, and Java projects from marker files (Cargo.toml, package.json, etc.)
+  - Merges ecosystem-specific default scopes (e.g., `cargo`, `lib`, `core`, `test` for Rust)
+  - Skips defaults that conflict with existing custom scopes in `scopes.yaml`
+  - Works consistently across twiddle, check, and PR creation commands
+- **Scope Pre-Validation**: Deterministic scope checks before AI processing
+  - Validates scope format (e.g., multi-scope comma separation without spaces)
+  - Verifies scope validity against the merged scope list before sending to AI
+  - Passing checks recorded in `pre_validated_checks` field so the AI skips re-checking them
+  - Prevents AI from contradicting deterministic validations
+
+### Fixed
+- **Config Loading**: Always load `.omni-dev/` configuration regardless of directory existence
+  - Previously skipped config loading when the context directory didn't exist as a directory
+  - Now correctly resolves individual config files even when the parent directory is absent
+  - Fixes scope and guideline loading in projects without an explicit `.omni-dev/` directory
+
+### Refactored
+- **Scope Loading Consolidation**: Unified scope loading across all commands
+  - Extracted `load_project_scopes()` as a single entry point for scope resolution
+  - Consistent config file priority (local override → project → home fallback) everywhere
+  - Eliminated duplicated scope loading logic between twiddle and check commands
+
+### Documentation
+- **Configuration Best Practices**: New guide for `.omni-dev/` configuration
+  - Scope definition patterns, file pattern matching, and local override workflows
+  - Troubleshooting guide for common configuration issues
+- **Configuration Internals**: New technical reference for configuration resolution
+  - Detailed explanation of config file priority, ecosystem detection, and scope merging
+  - Architecture diagrams for the discovery pipeline
+
 ## [0.16.0] - 2026-02-12
 
 ### Added
@@ -533,7 +567,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation and community files (README, CONTRIBUTING, CODE_OF_CONDUCT)
 - BSD 3-Clause license
 
-[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/rust-works/omni-dev/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/rust-works/omni-dev/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/rust-works/omni-dev/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/rust-works/omni-dev/compare/v0.13.1...v0.14.0
