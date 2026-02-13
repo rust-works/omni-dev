@@ -394,3 +394,133 @@ pub enum VerbosityLevel {
     /// Subject + detailed multi-paragraph body + lists.
     Comprehensive,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    // ── WorkType::from_str ───────────────────────────────────────────
+
+    #[test]
+    fn work_type_known_variants() {
+        assert!(matches!(
+            WorkType::from_str("feature").unwrap(),
+            WorkType::Feature
+        ));
+        assert!(matches!(
+            WorkType::from_str("feat").unwrap(),
+            WorkType::Feature
+        ));
+        assert!(matches!(WorkType::from_str("fix").unwrap(), WorkType::Fix));
+        assert!(matches!(
+            WorkType::from_str("bugfix").unwrap(),
+            WorkType::Fix
+        ));
+        assert!(matches!(
+            WorkType::from_str("docs").unwrap(),
+            WorkType::Docs
+        ));
+        assert!(matches!(WorkType::from_str("doc").unwrap(), WorkType::Docs));
+        assert!(matches!(
+            WorkType::from_str("refactor").unwrap(),
+            WorkType::Refactor
+        ));
+        assert!(matches!(
+            WorkType::from_str("chore").unwrap(),
+            WorkType::Chore
+        ));
+        assert!(matches!(
+            WorkType::from_str("test").unwrap(),
+            WorkType::Test
+        ));
+        assert!(matches!(WorkType::from_str("ci").unwrap(), WorkType::Ci));
+        assert!(matches!(
+            WorkType::from_str("build").unwrap(),
+            WorkType::Build
+        ));
+        assert!(matches!(
+            WorkType::from_str("perf").unwrap(),
+            WorkType::Perf
+        ));
+    }
+
+    #[test]
+    fn work_type_unknown() {
+        assert!(matches!(
+            WorkType::from_str("random").unwrap(),
+            WorkType::Unknown
+        ));
+        assert!(matches!(WorkType::from_str("").unwrap(), WorkType::Unknown));
+    }
+
+    #[test]
+    fn work_type_display() {
+        assert_eq!(WorkType::Feature.to_string(), "feature development");
+        assert_eq!(WorkType::Fix.to_string(), "bug fix");
+        assert_eq!(WorkType::Unknown.to_string(), "unknown work");
+    }
+
+    // ── CommitContext::is_significant_change ──────────────────────────
+
+    #[test]
+    fn significant_when_breaking_impact() {
+        let mut ctx = CommitContext::new();
+        ctx.range.architectural_impact = ArchitecturalImpact::Breaking;
+        assert!(ctx.is_significant_change());
+    }
+
+    #[test]
+    fn significant_when_critical_change() {
+        let mut ctx = CommitContext::new();
+        ctx.range.change_significance = ChangeSignificance::Critical;
+        assert!(ctx.is_significant_change());
+    }
+
+    #[test]
+    fn significant_when_critical_file() {
+        let mut ctx = CommitContext::new();
+        ctx.files.push(FileContext {
+            path: "src/main.rs".into(),
+            file_purpose: FilePurpose::CoreLogic,
+            architectural_layer: ArchitecturalLayer::Business,
+            change_impact: ChangeImpact::Breaking,
+            project_significance: ProjectSignificance::Critical,
+        });
+        assert!(ctx.is_significant_change());
+    }
+
+    #[test]
+    fn not_significant_when_minor() {
+        let ctx = CommitContext::new();
+        assert!(!ctx.is_significant_change());
+    }
+
+    // ── CommitContext::suggested_verbosity ────────────────────────────
+
+    #[test]
+    fn comprehensive_for_significant() {
+        let mut ctx = CommitContext::new();
+        ctx.range.architectural_impact = ArchitecturalImpact::Breaking;
+        assert!(matches!(
+            ctx.suggested_verbosity(),
+            VerbosityLevel::Comprehensive
+        ));
+    }
+
+    #[test]
+    fn detailed_for_moderate() {
+        let mut ctx = CommitContext::new();
+        ctx.range.change_significance = ChangeSignificance::Moderate;
+        assert!(matches!(
+            ctx.suggested_verbosity(),
+            VerbosityLevel::Detailed
+        ));
+    }
+
+    #[test]
+    fn concise_for_minor() {
+        let ctx = CommitContext::new();
+        assert!(matches!(ctx.suggested_verbosity(), VerbosityLevel::Concise));
+    }
+}
