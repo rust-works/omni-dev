@@ -23,7 +23,6 @@ jobs:
           fetch-depth: 0
       - uses: action-works/omni-dev-commit-check@v1
         with:
-          version: '0.14.0'
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
           guidelines: .omni-dev/commit-guidelines.md
           verbose: true
