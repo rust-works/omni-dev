@@ -651,7 +651,7 @@ impl CommitInfoForAI {
     /// Runs deterministic pre-validation checks on the commit message.
     /// Passing checks are recorded in pre_validated_checks so the LLM
     /// can skip re-checking them. Failing checks are not recorded.
-    pub fn run_pre_validation_checks(&mut self) {
+    pub fn run_pre_validation_checks(&mut self, valid_scopes: &[ScopeDefinition]) {
         if let Some(caps) = SCOPE_RE.captures(&self.original_message) {
             let scope = caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str());
             if let Some(scope) = scope {
@@ -660,6 +660,20 @@ impl CommitInfoForAI {
                         "Scope format verified: multi-scope '{}' correctly uses commas without spaces",
                         scope
                     ));
+                }
+
+                // Deterministic scope validity check
+                if !valid_scopes.is_empty() {
+                    let scope_parts: Vec<&str> = scope.split(',').collect();
+                    let all_valid = scope_parts
+                        .iter()
+                        .all(|part| valid_scopes.iter().any(|s| s.name == *part));
+                    if all_valid {
+                        self.pre_validated_checks.push(format!(
+                            "Scope validity verified: '{}' is in the valid scopes list",
+                            scope
+                        ));
+                    }
                 }
             }
         }

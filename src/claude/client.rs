@@ -462,7 +462,7 @@ impl ClaudeClient {
 
         // Run deterministic pre-validation checks before sending to AI
         for commit in &mut ai_repo_view.commits {
-            commit.run_pre_validation_checks();
+            commit.run_pre_validation_checks(valid_scopes);
         }
 
         // Generate system prompt with scopes
