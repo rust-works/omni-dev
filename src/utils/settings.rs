@@ -32,7 +32,7 @@ impl Settings {
 
         // If file doesn't exist, return default settings
         if !path.exists() {
-            return Ok(Settings {
+            return Ok(Self {
                 env: HashMap::new(),
             });
         }
@@ -41,7 +41,7 @@ impl Settings {
         let content = fs::read_to_string(path)
             .with_context(|| format!("Failed to read settings file: {}", path.display()))?;
 
-        serde_json::from_str::<Settings>(&content)
+        serde_json::from_str::<Self>(&content)
             .with_context(|| format!("Failed to parse settings file: {}", path.display()))
     }
 
@@ -90,9 +90,8 @@ pub fn get_env_var(key: &str) -> Result<String> {
 /// Tries multiple environment variables with fallback to settings.
 pub fn get_env_vars(keys: &[&str]) -> Result<String> {
     for key in keys {
-        match get_env_var(key) {
-            Ok(value) => return Ok(value),
-            Err(_) => continue,
+        if let Ok(value) = get_env_var(key) {
+            return Ok(value);
         }
     }
 

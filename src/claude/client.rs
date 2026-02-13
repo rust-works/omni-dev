@@ -320,14 +320,14 @@ impl ClaudeClient {
             } else if yaml_content.lines().any(|line| line.trim().starts_with('-') && !line.trim().starts_with("- ")) {
                 ClaudeError::AmendmentParsingFailed("YAML parsing error: List items must have a space after the dash (- item).".to_string())
             } else {
-                ClaudeError::AmendmentParsingFailed(format!("YAML parsing error: {}", e))
+                ClaudeError::AmendmentParsingFailed(format!("YAML parsing error: {e}"))
             }
         })?;
 
         // Validate the parsed amendments
         amendment_file
             .validate()
-            .map_err(|e| ClaudeError::AmendmentParsingFailed(format!("Validation error: {}", e)))?;
+            .map_err(|e| ClaudeError::AmendmentParsingFailed(format!("Validation error: {e}")))?;
 
         Ok(amendment_file)
     }
@@ -535,7 +535,7 @@ impl ClaudeClient {
             );
             debug!(content = %content, "Raw AI response");
             debug!(yaml = %yaml_content, "Extracted YAML content");
-            ClaudeError::AmendmentParsingFailed(format!("Check response parsing error: {}", e))
+            ClaudeError::AmendmentParsingFailed(format!("Check response parsing error: {e}"))
         })?;
 
         // Create a map of commit hashes to original messages for lookup
@@ -692,15 +692,14 @@ fn validate_beta_header(model: &str, beta_header: &Option<(String, String)>) -> 
                 .collect();
             if available.is_empty() {
                 anyhow::bail!("Model '{}' does not support any beta headers", model);
-            } else {
-                anyhow::bail!(
-                    "Beta header '{}:{}' is not supported for model '{}'. Supported: {}",
-                    key,
-                    value,
-                    model,
-                    available.join(", ")
-                );
             }
+            anyhow::bail!(
+                "Beta header '{}:{}' is not supported for model '{}'. Supported: {}",
+                key,
+                value,
+                model,
+                available.join(", ")
+            );
         }
     }
     Ok(())

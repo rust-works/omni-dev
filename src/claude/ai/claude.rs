@@ -144,11 +144,9 @@ impl AiClient for ClaudeAiClient {
                     tracing::debug!("Failed to read error response body: {e}");
                     String::new()
                 });
-                return Err(ClaudeError::ApiRequestFailed(format!(
-                    "HTTP {}: {}",
-                    status, error_text
-                ))
-                .into());
+                return Err(
+                    ClaudeError::ApiRequestFailed(format!("HTTP {status}: {error_text}")).into(),
+                );
             }
 
             let claude_response: ClaudeResponse = response

@@ -173,11 +173,11 @@ impl GitRepository {
             let start_obj = self
                 .repo
                 .revparse_single(start_spec)
-                .with_context(|| format!("Failed to parse start commit: {}", start_spec))?;
+                .with_context(|| format!("Failed to parse start commit: {start_spec}"))?;
             let end_obj = self
                 .repo
                 .revparse_single(end_spec)
-                .with_context(|| format!("Failed to parse end commit: {}", end_spec))?;
+                .with_context(|| format!("Failed to parse end commit: {end_spec}"))?;
 
             let start_commit = start_obj
                 .peel_to_commit()
@@ -217,7 +217,7 @@ impl GitRepository {
             let obj = self
                 .repo
                 .revparse_single(range)
-                .with_context(|| format!("Failed to parse commit: {}", range))?;
+                .with_context(|| format!("Failed to parse commit: {range}"))?;
             let commit = obj
                 .peel_to_commit()
                 .context("Failed to peel object to commit")?;
@@ -267,13 +267,13 @@ fn format_status_flags(flags: Status) -> String {
 fn extract_hostname_from_git_url(url: &str) -> Option<String> {
     if let Some(ssh_url) = url.strip_prefix("git@") {
         // SSH URL format: git@hostname:path
-        ssh_url.split(':').next().map(|s| s.to_string())
+        ssh_url.split(':').next().map(str::to_string)
     } else if let Some(https_url) = url.strip_prefix("https://") {
         // HTTPS URL format: https://hostname/path
-        https_url.split('/').next().map(|s| s.to_string())
+        https_url.split('/').next().map(str::to_string)
     } else if let Some(http_url) = url.strip_prefix("http://") {
         // HTTP URL format: http://hostname/path
-        http_url.split('/').next().map(|s| s.to_string())
+        http_url.split('/').next().map(str::to_string)
     } else {
         None
     }
@@ -305,15 +305,14 @@ fn get_ssh_identity_for_host(hostname: &str) -> Option<PathBuf> {
         if let Some(first_identity) = identity_files.first() {
             // Expand ~ to home directory
             let identity_str = first_identity.to_string_lossy();
-            let identity_path = identity_str.replace("~", &home);
+            let identity_path = identity_str.replace('~', &home);
             let path = PathBuf::from(identity_path);
 
             if path.exists() {
                 debug!("Found SSH key for host '{}': {:?}", hostname, path);
                 return Some(path);
-            } else {
-                debug!("SSH key specified in config but not found: {:?}", path);
             }
+            debug!("SSH key specified in config but not found: {:?}", path);
         }
     }
 
@@ -384,8 +383,8 @@ fn make_auth_callbacks(hostname: String) -> git2::RemoteCallbacks<'static> {
             // Try default SSH key locations as fallback
             let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
             let ssh_keys = [
-                format!("{}/.ssh/id_ed25519", home),
-                format!("{}/.ssh/id_rsa", home),
+                format!("{home}/.ssh/id_ed25519"),
+                format!("{home}/.ssh/id_rsa"),
             ];
 
             for key_path in &ssh_keys {
@@ -445,7 +444,7 @@ impl GitRepository {
         debug!("Remote URL: {}", remote_url);
 
         // Set up refspec for push
-        let refspec = format!("refs/heads/{}:refs/heads/{}", branch_name, branch_name);
+        let refspec = format!("refs/heads/{branch_name}:refs/heads/{branch_name}");
         debug!("Using refspec: {}", refspec);
 
         // Extract hostname from remote URL for SSH config lookup
@@ -464,7 +463,7 @@ impl GitRepository {
         // Perform the push
         debug!("Attempting to push to remote...");
         match remote.push(&[&refspec], Some(&mut push_options)) {
-            Ok(_) => {
+            Ok(()) => {
                 info!(
                     "Successfully pushed branch '{}' to remote '{}'",
                     branch_name, remote_name
@@ -474,9 +473,9 @@ impl GitRepository {
                 debug!("Setting upstream branch for '{}'", branch_name);
                 match self.repo.find_branch(branch_name, git2::BranchType::Local) {
                     Ok(mut branch) => {
-                        let remote_ref = format!("{}/{}", remote_name, branch_name);
+                        let remote_ref = format!("{remote_name}/{branch_name}");
                         match branch.set_upstream(Some(&remote_ref)) {
-                            Ok(_) => {
+                            Ok(()) => {
                                 info!(
                                     "Successfully set upstream to '{}'/{}",
                                     remote_name, branch_name
@@ -545,7 +544,7 @@ impl GitRepository {
         // Check if the remote branch exists
         debug!("Listing remote refs...");
         let refs = remote.list()?;
-        let remote_branch_ref = format!("refs/heads/{}", branch_name);
+        let remote_branch_ref = format!("refs/heads/{branch_name}");
         debug!("Looking for remote branch ref: {}", remote_branch_ref);
 
         for remote_head in refs {

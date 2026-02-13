@@ -16,12 +16,12 @@ fn main() {
     let cli = Cli::parse();
 
     if let Err(e) = cli.execute() {
-        eprintln!("Error: {}", e);
+        eprintln!("Error: {e}");
 
         // Print the full error chain if available
         let mut source = e.source();
         while let Some(err) = source {
-            eprintln!("  Caused by: {}", err);
+            eprintln!("  Caused by: {err}");
             source = err.source();
         }
 

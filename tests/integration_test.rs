@@ -31,7 +31,7 @@ impl TestRepo {
         config.set_str("user.name", "Test User")?;
         config.set_str("user.email", "test@example.com")?;
 
-        Ok(TestRepo {
+        Ok(Self {
             _temp_dir: temp_dir,
             repo_path,
             repo,
@@ -80,7 +80,7 @@ impl TestRepo {
     }
 
     fn get_commit_hash(&self, index: usize) -> Option<String> {
-        self.commits.get(index).map(|oid| oid.to_string())
+        self.commits.get(index).map(git2::Oid::to_string)
     }
 
     fn create_amendment_file(&self, amendments: Vec<(usize, &str)>) -> Result<PathBuf> {
@@ -89,7 +89,7 @@ impl TestRepo {
                 .iter()
                 .filter_map(|(index, message)| {
                     self.get_commit_hash(*index)
-                        .map(|hash| Amendment::new(hash, message.to_string()))
+                        .map(|hash| Amendment::new(hash, (*message).to_string()))
                 })
                 .collect(),
         };
@@ -115,14 +115,14 @@ fn amend_command_with_temporary_repo() -> Result<()> {
     println!("Created test repository at: {:?}", test_repo.repo_path);
     println!("Commits created:");
     for (i, commit_id) in test_repo.commits.iter().enumerate() {
-        println!("  {}: {}", i, commit_id);
+        println!("  {i}: {commit_id}");
     }
 
     // Create amendment file to modify HEAD commit (tested and working)
     let amendments = vec![(2, "Fix critical bug in the new feature")];
 
     let amendment_file_path = test_repo.create_amendment_file(amendments)?;
-    println!("Created amendment file at: {:?}", amendment_file_path);
+    println!("Created amendment file at: {amendment_file_path:?}");
 
     // Change to the test repository directory
     let original_dir = env::current_dir()?;
@@ -136,7 +136,7 @@ fn amend_command_with_temporary_repo() -> Result<()> {
 
         println!("Testing amend command...");
         let result = amend_cmd.execute();
-        println!("Amend command result: {:?}", result);
+        println!("Amend command result: {result:?}");
         result
     });
 
@@ -145,7 +145,7 @@ fn amend_command_with_temporary_repo() -> Result<()> {
 
     match result {
         Ok(cmd_result) => {
-            println!("Amend command completed: {:?}", cmd_result);
+            println!("Amend command completed: {cmd_result:?}");
 
             // The implementation should now actually work
             assert!(cmd_result.is_ok(), "Amend command should succeed");
@@ -173,7 +173,7 @@ fn amend_command_with_temporary_repo() -> Result<()> {
             println!("✅ Test passed: Amend command successfully amended the commit message");
         }
         Err(e) => {
-            println!("❌ Amend command panicked: {:?}", e);
+            println!("❌ Amend command panicked: {e:?}");
             panic!("Amend command should not panic");
         }
     }
