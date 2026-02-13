@@ -49,3 +49,53 @@ path = "src/lib.rs"
 name = "omni-dev"
 path = "src/main.rs"
 required-features = []
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+# Lint groups (priority -1 so individual overrides win)
+all      = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery  = { level = "warn", priority = -1 }
+
+# ── Pedantic: too noisy / low signal ─────────────────────────────────
+must_use_candidate      = "allow"
+module_name_repetitions = "allow"
+
+# ── Pedantic: documentation (defer to follow-up) ────────────────────
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+doc_markdown            = "allow"
+
+# ── Pedantic: public API stability ───────────────────────────────────
+unused_self             = "allow"  # removing &self is an API change
+unnecessary_wraps       = "allow"  # removing Result is an API change
+needless_pass_by_value  = "allow"  # changing to &T is an API change
+ref_option              = "allow"  # changing &Option<T> to Option<&T> is an API change
+
+# ── Pedantic: stylistic ─────────────────────────────────────────────
+if_not_else             = "allow"
+similar_names           = "allow"
+too_many_lines          = "allow"  # covered by STYLE-0017
+format_push_string      = "allow"  # write! alternative requires unwrap
+unused_async            = "allow"  # some async fns are async for API consistency
+items_after_statements  = "allow"  # sometimes clearer to declare near use
+struct_field_names      = "allow"  # naming convention matches domain
+struct_excessive_bools  = "allow"  # config structs use bool flags
+
+# ── Pedantic: numeric casts ─────────────────────────────────────────
+cast_precision_loss      = "allow"  # token/char counts within safe ranges
+cast_possible_truncation = "allow"
+cast_possible_wrap       = "allow"
+cast_sign_loss           = "allow"
+
+# ── Pedantic: file system ───────────────────────────────────────────
+case_sensitive_file_extension_comparisons = "allow"  # risky auto-fix
+
+# ── Nursery ──────────────────────────────────────────────────────────
+option_if_let_else           = "allow"  # often less readable than if-let
+redundant_pub_crate          = "allow"  # conflicts with STYLE-0005
+missing_const_for_fn         = "allow"
+or_fun_call                  = "allow"  # false positives
+significant_drop_tightening  = "allow"  # often produces wrong suggestions

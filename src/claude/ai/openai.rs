@@ -165,7 +165,7 @@ impl OpenAiAiClient {
         }
 
         // Add the chat completions endpoint
-        let url = format!("{}/v1/chat/completions", base);
+        let url = format!("{base}/v1/chat/completions");
 
         debug!(base_url = %self.base_url, full_url = %url, "Constructed OpenAI-compatible API URL");
 
@@ -259,7 +259,7 @@ impl AiClient for OpenAiAiClient {
 
             // Add authorization header if API key is provided
             if let Some(ref api_key) = self.api_key {
-                req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
+                req_builder = req_builder.header("Authorization", format!("Bearer {api_key}"));
             }
 
             let response = req_builder
@@ -273,11 +273,9 @@ impl AiClient for OpenAiAiClient {
                     tracing::debug!("Failed to read error response body: {e}");
                     String::new()
                 });
-                return Err(ClaudeError::ApiRequestFailed(format!(
-                    "HTTP {}: {}",
-                    status, error_text
-                ))
-                .into());
+                return Err(
+                    ClaudeError::ApiRequestFailed(format!("HTTP {status}: {error_text}")).into(),
+                );
             }
 
             let openai_response: OpenAiResponse = response

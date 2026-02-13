@@ -92,15 +92,15 @@ impl HelpGenerator {
         let cmd_name = if path.is_empty() {
             cmd.get_name().to_string()
         } else {
-            format!("omni-dev {}", path)
+            format!("omni-dev {path}")
         };
 
-        let about = cmd
-            .get_about()
-            .map(|s| self.styled_str_to_string(s))
-            .unwrap_or_else(|| "No description available".to_string());
+        let about = cmd.get_about().map_or_else(
+            || "No description available".to_string(),
+            |s| self.styled_str_to_string(s),
+        );
 
-        output.push_str(&format!("{} - {}\n\n", cmd_name, about));
+        output.push_str(&format!("{cmd_name} - {about}\n\n"));
 
         // Render the actual help content
         let help_str = cmd.clone().render_help();
@@ -120,7 +120,7 @@ impl HelpCommand {
     pub fn execute(self) -> Result<()> {
         let generator = HelpGenerator::new();
         let help_output = generator.generate_all_help()?;
-        println!("{}", help_output);
+        println!("{help_output}");
         Ok(())
     }
 }

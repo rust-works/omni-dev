@@ -31,10 +31,10 @@ pub enum AiProvider {
 impl std::fmt::Display for AiProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AiProvider::Claude => write!(f, "Claude API"),
-            AiProvider::Bedrock => write!(f, "AWS Bedrock"),
-            AiProvider::OpenAi => write!(f, "OpenAI API"),
-            AiProvider::Ollama => write!(f, "Ollama"),
+            Self::Claude => write!(f, "Claude API"),
+            Self::Bedrock => write!(f, "AWS Bedrock"),
+            Self::OpenAi => write!(f, "OpenAI API"),
+            Self::Ollama => write!(f, "Ollama"),
         }
     }
 }
@@ -181,13 +181,12 @@ pub fn check_github_cli() -> Result<()> {
                             "GitHub CLI authentication failed.\n\
                              Please run 'gh auth login' or set GITHUB_TOKEN environment variable."
                         )
-                    } else {
-                        bail!(
-                            "GitHub CLI cannot access this repository.\n\
-                             Error: {}",
-                            error_details.trim()
-                        )
                     }
+                    bail!(
+                        "GitHub CLI cannot access this repository.\n\
+                         Error: {}",
+                        error_details.trim()
+                    )
                 }
                 Err(e) => bail!("Failed to test GitHub CLI access: {}", e),
             }

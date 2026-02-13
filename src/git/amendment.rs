@@ -75,12 +75,12 @@ impl AmendmentHandler {
     fn validate_commit_amendable(&self, commit_hash: &str) -> Result<()> {
         // Check if commit exists
         let oid = Oid::from_str(commit_hash)
-            .with_context(|| format!("Invalid commit hash: {}", commit_hash))?;
+            .with_context(|| format!("Invalid commit hash: {commit_hash}"))?;
 
         let _commit = self
             .repo
             .find_commit(oid)
-            .with_context(|| format!("Commit not found: {}", commit_hash))?;
+            .with_context(|| format!("Commit not found: {commit_hash}"))?;
 
         // TODO: Check if commit is in remote main branches
         // This would require implementing main branch detection and remote checking
@@ -175,7 +175,7 @@ impl AmendmentHandler {
         println!("Amending commits individually in reverse order (newest to oldest)");
 
         // Sort amendments by commit depth (newest first, following shell script approach)
-        let mut sorted_amendments = amendments.clone();
+        let mut sorted_amendments = amendments;
         sorted_amendments
             .sort_by_key(|(hash, _)| self.get_commit_depth_from_head(hash).unwrap_or(usize::MAX));
 
@@ -204,7 +204,7 @@ impl AmendmentHandler {
     /// Amends a single commit using individual interactive rebase (shell script strategy).
     fn amend_single_commit_via_rebase(&self, commit_hash: &str, new_message: &str) -> Result<()> {
         // Get the parent of the target commit to use as rebase base
-        let base_commit = format!("{}^", commit_hash);
+        let base_commit = format!("{commit_hash}^");
 
         // Create temporary sequence file for this specific rebase
         let temp_dir = tempfile::tempdir()?;
@@ -213,7 +213,7 @@ impl AmendmentHandler {
         // Generate rebase sequence: edit the target commit, pick the rest
         let mut sequence_content = String::new();
         let commit_list_output = Command::new("git")
-            .args(["rev-list", "--reverse", &format!("{}..HEAD", base_commit)])
+            .args(["rev-list", "--reverse", &format!("{base_commit}..HEAD")])
             .output()
             .context("Failed to get commit list for rebase")?;
 
@@ -240,10 +240,10 @@ impl AmendmentHandler {
 
             if commit.starts_with(&commit_hash[..commit.len().min(commit_hash.len())]) {
                 // This is our target commit - mark it for editing
-                sequence_content.push_str(&format!("edit {} {}\n", commit, subject));
+                sequence_content.push_str(&format!("edit {commit} {subject}\n"));
             } else {
                 // Other commits - just pick them
-                sequence_content.push_str(&format!("pick {} {}\n", commit, subject));
+                sequence_content.push_str(&format!("pick {commit} {subject}\n"));
             }
         }
 
@@ -370,7 +370,7 @@ impl AmendmentHandler {
             for status_entry in &actual_changes {
                 let status = status_entry.status();
                 let file_path = status_entry.path().unwrap_or("unknown");
-                println!("  {} -> {:?}", file_path, status);
+                println!("  {file_path} -> {status:?}");
             }
 
             anyhow::bail!(

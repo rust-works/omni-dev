@@ -52,7 +52,7 @@ impl InfoCommand {
         };
 
         // Calculate commit range: [base_branch]..HEAD
-        let commit_range = format!("{}..HEAD", base_branch);
+        let commit_range = format!("{base_branch}..HEAD");
 
         // Get working directory status
         let wd_status = repo.get_working_directory_status()?;
@@ -119,7 +119,7 @@ impl InfoCommand {
 
         // Output as YAML
         let yaml_output = crate::data::to_yaml(&repo_view)?;
-        println!("{}", yaml_output);
+        println!("{yaml_output}");
 
         Ok(())
     }
@@ -174,7 +174,7 @@ impl InfoCommand {
         if let Some(prs_array) = prs_json.as_array() {
             for pr_json in prs_array {
                 if let (Some(number), Some(title), Some(state), Some(url), Some(body)) = (
-                    pr_json.get("number").and_then(|n| n.as_u64()),
+                    pr_json.get("number").and_then(serde_json::Value::as_u64),
                     pr_json.get("title").and_then(|t| t.as_str()),
                     pr_json.get("state").and_then(|s| s.as_str()),
                     pr_json.get("url").and_then(|u| u.as_str()),

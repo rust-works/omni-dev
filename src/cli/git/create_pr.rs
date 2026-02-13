@@ -154,7 +154,7 @@ impl CreatePrCommand {
             let pr_yaml = crate::data::to_yaml(&pr_content)
                 .context("Failed to serialize PR content to YAML")?;
             std::fs::write(&save_path, &pr_yaml).context("Failed to save PR details to file")?;
-            println!("💾 PR details saved to: {}", save_path);
+            println!("💾 PR details saved to: {save_path}");
             return Ok(());
         }
 
@@ -283,55 +283,52 @@ impl CreatePrCommand {
             .ok_or_else(|| anyhow::anyhow!("No remotes found in repository"))?;
 
         // Determine base branch (with remote prefix)
-        let base_branch = match self.base.as_ref() {
-            Some(branch) => {
-                // User specified base branch - try to resolve it
-                // First, check if it's already a valid remote ref (e.g., "origin/main")
-                let remote_ref = format!("refs/remotes/{}", branch);
+        let base_branch = if let Some(branch) = self.base.as_ref() {
+            // User specified base branch - try to resolve it
+            // First, check if it's already a valid remote ref (e.g., "origin/main")
+            let remote_ref = format!("refs/remotes/{branch}");
+            if repo.repository().find_reference(&remote_ref).is_ok() {
+                branch.clone()
+            } else {
+                // Try prepending the primary remote name (e.g., "main" -> "origin/main")
+                let with_remote = format!("{}/{}", primary_remote.name, branch);
+                let remote_ref = format!("refs/remotes/{with_remote}");
                 if repo.repository().find_reference(&remote_ref).is_ok() {
-                    branch.clone()
+                    with_remote
                 } else {
-                    // Try prepending the primary remote name (e.g., "main" -> "origin/main")
-                    let with_remote = format!("{}/{}", primary_remote.name, branch);
-                    let remote_ref = format!("refs/remotes/{}", with_remote);
-                    if repo.repository().find_reference(&remote_ref).is_ok() {
+                    anyhow::bail!(
+                        "Remote branch '{}' does not exist (also tried '{}')",
+                        branch,
                         with_remote
-                    } else {
-                        anyhow::bail!(
-                            "Remote branch '{}' does not exist (also tried '{}')",
-                            branch,
-                            with_remote
-                        );
-                    }
-                }
-            }
-            None => {
-                // Auto-detect using the primary remote's main branch
-                let main_branch = &primary_remote.main_branch;
-                if main_branch == "unknown" {
-                    anyhow::bail!(
-                        "Could not determine main branch for remote '{}'",
-                        primary_remote.name
                     );
                 }
-
-                let remote_main = format!("{}/{}", primary_remote.name, main_branch);
-
-                // Validate that the remote main branch exists
-                let remote_ref = format!("refs/remotes/{}", remote_main);
-                if repo.repository().find_reference(&remote_ref).is_err() {
-                    anyhow::bail!(
-                        "Remote main branch '{}' does not exist. Try running 'git fetch' first.",
-                        remote_main
-                    );
-                }
-
-                remote_main
             }
+        } else {
+            // Auto-detect using the primary remote's main branch
+            let main_branch = &primary_remote.main_branch;
+            if main_branch == "unknown" {
+                anyhow::bail!(
+                    "Could not determine main branch for remote '{}'",
+                    primary_remote.name
+                );
+            }
+
+            let remote_main = format!("{}/{}", primary_remote.name, main_branch);
+
+            // Validate that the remote main branch exists
+            let remote_ref = format!("refs/remotes/{remote_main}");
+            if repo.repository().find_reference(&remote_ref).is_err() {
+                anyhow::bail!(
+                    "Remote main branch '{}' does not exist. Try running 'git fetch' first.",
+                    remote_main
+                );
+            }
+
+            remote_main
         };
 
         // Calculate commit range: [remote_base]..HEAD
-        let commit_range = format!("{}..HEAD", base_branch);
+        let commit_range = format!("{base_branch}..HEAD");
 
         // Get working directory status
         let wd_status = repo.get_working_directory_status()?;
@@ -470,13 +467,12 @@ impl CreatePrCommand {
                     .iter()
                     .find(|r| r.name == "origin")
                     .or_else(|| repo_view.remotes.first())
-                    .map(|r| r.name.as_str())
-                    .unwrap_or("origin");
+                    .map_or("origin", |r| r.name.as_str());
                 // Check if already has remote prefix
-                if branch.starts_with(&format!("{}/", primary_remote_name)) {
+                if branch.starts_with(&format!("{primary_remote_name}/")) {
                     branch.clone()
                 } else {
-                    format!("{}/{}", primary_remote_name, branch)
+                    format!("{primary_remote_name}/{branch}")
                 }
             }
             None => {
@@ -486,25 +482,26 @@ impl CreatePrCommand {
                     .iter()
                     .find(|r| r.name == "origin")
                     .or_else(|| repo_view.remotes.first())
-                    .map(|r| format!("{}/{}", r.name, r.main_branch))
-                    .unwrap_or_else(|| "unknown".to_string())
+                    .map_or_else(
+                        || "unknown".to_string(),
+                        |r| format!("{}/{}", r.name, r.main_branch),
+                    )
             }
         };
 
-        let commit_range = format!("{}..HEAD", base_branch);
+        let commit_range = format!("{base_branch}..HEAD");
         let commit_count = repo_view.commits.len();
 
         // Get current branch name
         let current_branch = repo_view
             .branch_info
             .as_ref()
-            .map(|bi| bi.branch.as_str())
-            .unwrap_or("unknown");
+            .map_or("unknown", |bi| bi.branch.as_str());
 
         println!("📊 Branch Analysis:");
-        println!("   🌿 Current branch: {}", current_branch);
-        println!("   📏 Commit range: {}", commit_range);
-        println!("   📝 Commits found: {} commits", commit_count);
+        println!("   🌿 Current branch: {current_branch}");
+        println!("   📏 Commit range: {commit_range}");
+        println!("   📝 Commits found: {commit_count} commits");
         println!();
 
         Ok(())
@@ -516,7 +513,7 @@ impl CreatePrCommand {
         repo_view: &crate::data::RepositoryView,
     ) -> Result<crate::data::context::CommitContext> {
         use crate::claude::context::{BranchAnalyzer, ProjectDiscovery, WorkPatternAnalyzer};
-        use crate::data::context::CommitContext;
+        use crate::data::context::{CommitContext, ProjectContext};
         use crate::git::GitRepository;
 
         let mut context = CommitContext::new();
@@ -526,13 +523,13 @@ impl CreatePrCommand {
 
         // ProjectDiscovery takes repo root and context directory
         let repo_root = std::path::PathBuf::from(".");
-        let discovery = ProjectDiscovery::new(repo_root, context_dir.clone());
+        let discovery = ProjectDiscovery::new(repo_root, context_dir);
         match discovery.discover() {
             Ok(project_context) => {
                 context.project = project_context;
             }
             Err(_e) => {
-                context.project = Default::default();
+                context.project = ProjectContext::default();
             }
         }
 
@@ -581,7 +578,7 @@ impl CreatePrCommand {
         } else {
             "❌ None found".to_string()
         };
-        println!("   🔀 PR guidelines: {}", pr_guidelines_source);
+        println!("   🔀 PR guidelines: {pr_guidelines_source}");
 
         // Check scopes
         let scopes_count = project_context.valid_scopes.len();
@@ -601,11 +598,11 @@ impl CreatePrCommand {
             } else {
                 "(source unknown + ecosystem defaults)".to_string()
             };
-            format!("✅ {} ({} scopes)", source, scopes_count)
+            format!("✅ {source} ({scopes_count} scopes)")
         } else {
             "❌ None found".to_string()
         };
-        println!("   🎯 Valid scopes: {}", scopes_source);
+        println!("   🎯 Valid scopes: {scopes_source}");
 
         // Check PR template
         let pr_template_path = std::path::Path::new(".github/pull_request_template.md");
@@ -614,7 +611,7 @@ impl CreatePrCommand {
         } else {
             "❌ None found".to_string()
         };
-        println!("   📋 PR template: {}", pr_template_status);
+        println!("   📋 PR template: {pr_template_status}");
 
         println!();
         Ok(())
@@ -644,7 +641,7 @@ impl CreatePrCommand {
                 context.branch.description, context.branch.work_type
             );
             if let Some(ref ticket) = context.branch.ticket_id {
-                println!("   🎫 Ticket: {}", ticket);
+                println!("   🎫 Ticket: {ticket}");
             }
         }
 
@@ -661,7 +658,7 @@ impl CreatePrCommand {
         // Verbosity level
         match context.suggested_verbosity() {
             VerbosityLevel::Comprehensive => {
-                println!("   📝 Detail level: Comprehensive (significant changes detected)")
+                println!("   📝 Detail level: Comprehensive (significant changes detected)");
             }
             VerbosityLevel::Detailed => println!("   📝 Detail level: Detailed"),
             VerbosityLevel::Concise => println!("   📝 Detail level: Concise"),
@@ -843,7 +840,7 @@ impl CreatePrCommand {
         for commit in &repo_view.commits {
             let short_hash = &commit.hash[..crate::git::SHORT_HASH_LEN];
             let first_line = commit.original_message.lines().next().unwrap_or("").trim();
-            description.push_str(&format!("- `{}` {}\n", short_hash, first_line));
+            description.push_str(&format!("- `{short_hash}` {first_line}\n"));
         }
 
         // Add file change summary
@@ -854,7 +851,7 @@ impl CreatePrCommand {
             .sum();
 
         if total_files > 0 {
-            description.push_str(&format!("\n**Files changed:** {} files\n", total_files));
+            description.push_str(&format!("\n**Files changed:** {total_files} files\n"));
         }
 
         Ok(())
@@ -879,7 +876,7 @@ impl CreatePrCommand {
         } else {
             "ready for review"
         };
-        println!("{} PR will be created as: {}", status_icon, status_text);
+        println!("{status_icon} PR will be created as: {status_text}");
         println!();
 
         // Check if there are existing PRs and show different options
@@ -933,7 +930,7 @@ impl CreatePrCommand {
         println!("─────────────────────────────");
 
         let contents = fs::read_to_string(pr_file).context("Failed to read PR details file")?;
-        println!("{}", contents);
+        println!("{contents}");
         println!("─────────────────────────────");
 
         Ok(())
@@ -968,7 +965,7 @@ impl CreatePrCommand {
             return Ok(());
         }
 
-        println!("📝 Opening PR details file in editor: {}", editor);
+        println!("📝 Opening PR details file in editor: {editor}");
 
         // Split editor command to handle arguments
         let mut cmd_parts = editor.split_whitespace();
@@ -991,7 +988,7 @@ impl CreatePrCommand {
                 }
             }
             Err(e) => {
-                println!("❌ Failed to execute editor '{}': {}", editor, e);
+                println!("❌ Failed to execute editor '{editor}': {e}");
                 println!("   Please check that the editor command is correct and available in your PATH.");
             }
         }
@@ -1020,12 +1017,11 @@ impl CreatePrCommand {
         let branch_name = repo_view
             .branch_info
             .as_ref()
-            .map(|bi| bi.branch.as_str())
-            .unwrap_or("feature");
+            .map_or("feature", |bi| bi.branch.as_str());
 
         let cleaned_branch = branch_name.replace(['/', '-', '_'], " ");
 
-        format!("feat: {}", cleaned_branch)
+        format!("feat: {cleaned_branch}")
     }
 
     /// Creates a new GitHub PR using gh CLI.
@@ -1051,11 +1047,11 @@ impl CreatePrCommand {
         } else {
             "ready for review"
         };
-        println!("🚀 Creating pull request ({})...", pr_status);
-        println!("   📋 Title: {}", title);
-        println!("   🌿 Branch: {}", branch_name);
+        println!("🚀 Creating pull request ({pr_status})...");
+        println!("   📋 Title: {title}");
+        println!("   🌿 Branch: {branch_name}");
         if let Some(base) = new_base {
-            println!("   🎯 Base: {}", base);
+            println!("   🎯 Base: {base}");
         }
 
         // Check if branch is pushed to remote and push if needed
@@ -1117,7 +1113,7 @@ impl CreatePrCommand {
             let pr_url = String::from_utf8_lossy(&pr_result.stdout);
             let pr_url = pr_url.trim();
             debug!("PR created successfully with URL: {}", pr_url);
-            println!("🎉 Pull request created: {}", pr_url);
+            println!("🎉 Pull request created: {pr_url}");
         } else {
             let error_msg = String::from_utf8_lossy(&pr_result.stderr);
             error!("gh CLI failed to create PR: {}", error_msg);
@@ -1148,16 +1144,13 @@ impl CreatePrCommand {
         let pr_number = existing_pr.number;
         let current_base = &existing_pr.base;
 
-        println!("🚀 Updating pull request #{}...", pr_number);
-        println!("   📋 Title: {}", title);
+        println!("🚀 Updating pull request #{pr_number}...");
+        println!("   📋 Title: {title}");
 
         // Check if base branch should be changed
         let change_base = if let Some(base) = new_base {
             if !current_base.is_empty() && current_base != base {
-                print!(
-                    "   🎯 Current base: {} → New base: {}. Change? [y/N]: ",
-                    current_base, base
-                );
+                print!("   🎯 Current base: {current_base} → New base: {base}. Change? [y/N]: ");
                 io::stdout().flush()?;
 
                 let mut input = String::new();
@@ -1214,7 +1207,7 @@ impl CreatePrCommand {
             println!("🎉 Pull request updated: {}", existing_pr.url);
             if change_base {
                 if let Some(base) = new_base {
-                    println!("   🎯 Base branch changed to: {}", base);
+                    println!("   🎯 Base branch changed to: {base}");
                 }
             }
         } else {
@@ -1262,7 +1255,7 @@ impl CreatePrCommand {
             println!("   📥 Input context: {}", metadata.max_context_length);
 
             if let Some((ref key, ref value)) = metadata.active_beta {
-                println!("   🔬 Beta header: {}: {}", key, value);
+                println!("   🔬 Beta header: {key}: {value}");
             }
 
             if spec.legacy {

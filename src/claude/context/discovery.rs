@@ -458,7 +458,7 @@ impl ProjectDiscovery {
                         .push("Signed-off-by".to_string());
                 }
 
-                if line_lower.contains("fixes") && line_lower.contains("#") {
+                if line_lower.contains("fixes") && line_lower.contains('#') {
                     conventions.required_trailers.push("Fixes".to_string());
                 }
 
@@ -493,7 +493,7 @@ impl ProjectDiscovery {
                 if let Some(scope) = extract_scope_from_structure(line) {
                     context.valid_scopes.push(ScopeDefinition {
                         name: scope.clone(),
-                        description: format!("{} related changes", scope),
+                        description: format!("{scope} related changes"),
                         examples: vec![],
                         file_patterns: vec![format!("{}/**", scope)],
                     });
@@ -521,7 +521,7 @@ impl ProjectDiscovery {
             }
 
             // Extract scope examples
-            if line.contains(":")
+            if line.contains(':')
                 && (line.contains("auth") || line.contains("api") || line.contains("ui"))
             {
                 let scopes = extract_scopes_from_examples(line);

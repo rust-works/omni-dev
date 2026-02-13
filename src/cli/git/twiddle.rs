@@ -239,8 +239,7 @@ impl TwiddleCommand {
 
         let total_commits = full_repo_view.commits.len();
         println!(
-            "🔄 Processing {} commits in parallel (concurrency: {})...",
-            total_commits, concurrency
+            "🔄 Processing {total_commits} commits in parallel (concurrency: {concurrency})..."
         );
 
         // Collect context once (shared across all commits)
@@ -338,7 +337,7 @@ impl TwiddleCommand {
                         Ok(amendment_file) => {
                             let done =
                                 completed.fetch_add(batch_size, Ordering::Relaxed) + batch_size;
-                            println!("   ✅ {}/{} commits processed", done, total_commits);
+                            println!("   ✅ {done}/{total_commits} commits processed");
 
                             let items: Vec<_> = amendment_file
                                 .amendments
@@ -353,8 +352,7 @@ impl TwiddleCommand {
                         Err(e) if batch_size > 1 => {
                             // Split-and-retry: fall back to individual commits
                             eprintln!(
-                                "warning: batch of {} failed, retrying individually: {e}",
-                                batch_size
+                                "warning: batch of {batch_size} failed, retrying individually: {e}"
                             );
                             let mut items = Vec::new();
                             for &idx in batch_indices {
@@ -385,7 +383,7 @@ impl TwiddleCommand {
                                     }
                                 }
                                 let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                                println!("   ✅ {}/{} commits processed", done, total_commits);
+                                println!("   ✅ {done}/{total_commits} commits processed");
                             }
                             Ok(items)
                         }
@@ -603,7 +601,7 @@ impl TwiddleCommand {
         let contents =
             fs::read_to_string(amendments_file).context("Failed to read amendments file")?;
 
-        println!("{}", contents);
+        println!("{contents}");
         println!("─────────────────────────────");
 
         Ok(())
@@ -638,7 +636,7 @@ impl TwiddleCommand {
             return Ok(());
         }
 
-        println!("📝 Opening amendments file in editor: {}", editor);
+        println!("📝 Opening amendments file in editor: {editor}");
 
         // Split editor command to handle arguments
         let mut cmd_parts = editor.split_whitespace();
@@ -661,7 +659,7 @@ impl TwiddleCommand {
                 }
             }
             Err(e) => {
-                println!("❌ Failed to execute editor '{}': {}", editor, e);
+                println!("❌ Failed to execute editor '{editor}': {e}");
                 println!("   Please check that the editor command is correct and available in your PATH.");
             }
         }
@@ -695,8 +693,7 @@ impl TwiddleCommand {
         // 1. Discover project context
         let context_dir = self
             .context_dir
-            .as_ref()
-            .cloned()
+            .clone()
             .unwrap_or_else(|| std::path::PathBuf::from(".omni-dev"));
 
         // ProjectDiscovery takes repo root and context directory
@@ -714,7 +711,7 @@ impl TwiddleCommand {
             }
             Err(e) => {
                 debug!(error = %e, "Discovery failed");
-                context.project = Default::default();
+                context.project = crate::data::context::ProjectContext::default();
             }
         }
 
@@ -742,7 +739,7 @@ impl TwiddleCommand {
         }
 
         if let Some(ref branch_ctx) = self.branch_context {
-            context.branch.description = branch_ctx.clone();
+            context.branch.description.clone_from(branch_ctx);
         }
 
         Ok(context)
@@ -772,7 +769,7 @@ impl TwiddleCommand {
                 context.branch.description, context.branch.work_type
             );
             if let Some(ref ticket) = context.branch.ticket_id {
-                println!("   🎫 Ticket: {}", ticket);
+                println!("   🎫 Ticket: {ticket}");
             }
         }
 
@@ -789,7 +786,7 @@ impl TwiddleCommand {
         // Verbosity level
         match context.suggested_verbosity() {
             VerbosityLevel::Comprehensive => {
-                println!("   📝 Detail level: Comprehensive (significant changes detected)")
+                println!("   📝 Detail level: Comprehensive (significant changes detected)");
             }
             VerbosityLevel::Detailed => println!("   📝 Detail level: Detailed"),
             VerbosityLevel::Concise => println!("   📝 Detail level: Concise"),
@@ -797,7 +794,7 @@ impl TwiddleCommand {
 
         // User context
         if let Some(ref user_ctx) = context.user_provided {
-            println!("   👤 User context: {}", user_ctx);
+            println!("   👤 User context: {user_ctx}");
         }
 
         println!();
@@ -841,7 +838,7 @@ impl TwiddleCommand {
             println!("   📥 Input context: {}", metadata.max_context_length);
 
             if let Some((ref key, ref value)) = metadata.active_beta {
-                println!("   🔬 Beta header: {}: {}", key, value);
+                println!("   🔬 Beta header: {key}: {value}");
             }
 
             if spec.legacy {
@@ -889,7 +886,7 @@ impl TwiddleCommand {
         } else {
             "❌ None found".to_string()
         };
-        println!("   📝 Commit guidelines: {}", guidelines_source);
+        println!("   📝 Commit guidelines: {guidelines_source}");
 
         // Check scopes
         let scopes_count = project_context.valid_scopes.len();
@@ -909,11 +906,11 @@ impl TwiddleCommand {
             } else {
                 "(source unknown + ecosystem defaults)".to_string()
             };
-            format!("✅ {} ({} scopes)", source, scopes_count)
+            format!("✅ {source} ({scopes_count} scopes)")
         } else {
             "❌ None found".to_string()
         };
-        println!("   🎯 Valid scopes: {}", scopes_source);
+        println!("   🎯 Valid scopes: {scopes_source}");
 
         println!();
         Ok(())
@@ -1001,10 +998,7 @@ impl TwiddleCommand {
             if attempt == 0 {
                 println!("🔍 Running commit message validation...");
             } else {
-                println!(
-                    "🔍 Re-checking commit messages (retry {}/{})...",
-                    attempt, MAX_CHECK_RETRIES
-                );
+                println!("🔍 Re-checking commit messages (retry {attempt}/{MAX_CHECK_RETRIES})...");
             }
 
             // Generate fresh repository view to get updated commit messages
@@ -1067,8 +1061,7 @@ impl TwiddleCommand {
             // If we've exhausted retries, report and stop
             if attempt == MAX_CHECK_RETRIES {
                 println!(
-                    "⚠️  Some commit messages still have issues after {} retries",
-                    MAX_CHECK_RETRIES
+                    "⚠️  Some commit messages still have issues after {MAX_CHECK_RETRIES} retries"
                 );
                 return Ok(());
             }
@@ -1142,15 +1135,16 @@ impl TwiddleCommand {
         let local_path = context_dir.join("local").join("commit-guidelines.md");
         if local_path.exists() {
             let content = fs::read_to_string(&local_path)
-                .with_context(|| format!("Failed to read guidelines: {:?}", local_path))?;
+                .with_context(|| format!("Failed to read guidelines: {}", local_path.display()))?;
             return Ok(Some(content));
         }
 
         // Try project-level guidelines
         let project_path = context_dir.join("commit-guidelines.md");
         if project_path.exists() {
-            let content = fs::read_to_string(&project_path)
-                .with_context(|| format!("Failed to read guidelines: {:?}", project_path))?;
+            let content = fs::read_to_string(&project_path).with_context(|| {
+                format!("Failed to read guidelines: {}", project_path.display())
+            })?;
             return Ok(Some(content));
         }
 
@@ -1158,8 +1152,9 @@ impl TwiddleCommand {
         if let Some(home) = dirs::home_dir() {
             let home_path = home.join(".omni-dev").join("commit-guidelines.md");
             if home_path.exists() {
-                let content = fs::read_to_string(&home_path)
-                    .with_context(|| format!("Failed to read guidelines: {:?}", home_path))?;
+                let content = fs::read_to_string(&home_path).with_context(|| {
+                    format!("Failed to read guidelines: {}", home_path.display())
+                })?;
                 return Ok(Some(content));
             }
         }
@@ -1210,7 +1205,7 @@ impl TwiddleCommand {
         } else {
             "⚪ Using defaults".to_string()
         };
-        println!("   📝 Commit guidelines: {}", guidelines_source);
+        println!("   📝 Commit guidelines: {guidelines_source}");
 
         // Check scopes
         let scopes_count = valid_scopes.len();
@@ -1230,11 +1225,11 @@ impl TwiddleCommand {
             } else {
                 "(source unknown)".to_string()
             };
-            format!("✅ {} ({} scopes)", source, scopes_count)
+            format!("✅ {source} ({scopes_count} scopes)")
         } else {
             "⚪ None found (any scope accepted)".to_string()
         };
-        println!("   🎯 Valid scopes: {}", scopes_source);
+        println!("   🎯 Valid scopes: {scopes_source}");
 
         println!();
     }
@@ -1311,7 +1306,7 @@ impl TwiddleCommand {
                         Ok(report) => {
                             let done =
                                 completed.fetch_add(batch_size, Ordering::Relaxed) + batch_size;
-                            println!("   ✅ {}/{} commits checked", done, total_commits);
+                            println!("   ✅ {done}/{total_commits} commits checked");
 
                             let items: Vec<_> = report
                                 .commits
@@ -1325,8 +1320,7 @@ impl TwiddleCommand {
                         }
                         Err(e) if batch_size > 1 => {
                             eprintln!(
-                                "warning: batch of {} failed, retrying individually: {e}",
-                                batch_size
+                                "warning: batch of {batch_size} failed, retrying individually: {e}"
                             );
                             let mut items = Vec::new();
                             for &idx in batch_indices {
@@ -1352,7 +1346,7 @@ impl TwiddleCommand {
                                     }
                                 }
                                 let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                                println!("   ✅ {}/{} commits checked", done, total_commits);
+                                println!("   ✅ {done}/{total_commits} commits checked");
                             }
                             Ok(items)
                         }
@@ -1456,7 +1450,7 @@ impl TwiddleCommand {
                 println!();
                 println!("   Suggested message:");
                 for line in suggestion.message.lines() {
-                    println!("      {}", line);
+                    println!("      {line}");
                 }
             }
 

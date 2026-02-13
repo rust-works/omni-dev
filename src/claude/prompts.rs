@@ -162,7 +162,7 @@ pub fn generate_contextual_system_prompt_for_provider(
             prompt.push_str("\nThis is a LITERAL TEMPLATE that you must reproduce EXACTLY.");
             prompt.push_str("\nDo NOT treat this as guidance - it is a FORMAT SPECIFICATION.");
             prompt.push_str("\nEvery character, marker, and structure element must be preserved:");
-            prompt.push_str(&format!("\n\n{}", guidelines));
+            prompt.push_str(&format!("\n\n{guidelines}"));
             prompt.push_str("\n\nCRITICAL TEMPLATE REPRODUCTION RULES:");
             prompt.push_str(
                 "\n1. This is NOT a description of how to write commits - it IS the actual format",
@@ -193,7 +193,7 @@ pub fn generate_contextual_system_prompt_for_provider(
             prompt.push_str("\n\n=== PROJECT COMMIT GUIDELINES ===");
             prompt.push_str("\nThis project has specific commit guidelines that you MUST follow when improving commit messages.");
             prompt.push_str("\nThese are GUIDELINES for how to write commits, not text to copy:");
-            prompt.push_str(&format!("\n\n{}", guidelines));
+            prompt.push_str(&format!("\n\n{guidelines}"));
             prompt.push_str("\n\nCRITICAL GUIDELINES USAGE:");
             prompt.push_str(
                 "\n1. These are GUIDELINES that describe how to write commit messages for this project",
@@ -223,7 +223,7 @@ pub fn generate_contextual_system_prompt_for_provider(
             .map(|s| format!("- {}: {}", s.name, s.description))
             .collect::<Vec<_>>()
             .join("\n");
-        prompt.push_str(&format!("\n\nValid scopes for this project:\n{}", scopes));
+        prompt.push_str(&format!("\n\nValid scopes for this project:\n{scopes}"));
     }
 
     // Add branch context
@@ -261,8 +261,7 @@ pub fn generate_contextual_system_prompt_for_provider(
     if let Some(consistent_scope) = &context.range.scope_consistency.consistent_scope {
         if context.range.scope_consistency.confidence > 0.7 {
             prompt.push_str(&format!(
-                "\n\nScope consistency: Most changes appear to be in the '{}' scope. Consider using this scope consistently unless files clearly belong to different areas.",
-                consistent_scope
+                "\n\nScope consistency: Most changes appear to be in the '{consistent_scope}' scope. Consider using this scope consistently unless files clearly belong to different areas."
             ));
         }
     }
@@ -273,9 +272,9 @@ pub fn generate_contextual_system_prompt_for_provider(
 /// Generates a basic user prompt from repository view YAML (Phase 1 & 2).
 pub fn generate_user_prompt(repo_yaml: &str) -> String {
     format!(
-        r#"Please analyze the following repository information and suggest commit message improvements:
+        r"Please analyze the following repository information and suggest commit message improvements:
 
-{}
+{repo_yaml}
 
 CRITICAL ANALYSIS STEPS:
 1. **READ THE DIFF FILES**: For each commit, carefully read the diff_file content to understand exactly what code changes were made
@@ -297,16 +296,14 @@ Remember: File paths and directory names are just hints. The diff content shows 
 
 CRITICAL: Even if a commit message is perfect and needs no changes, include it in the amendments array with its current message unchanged. This allows users to review all commits and make manual adjustments if desired. DO NOT skip any commits from the amendments array.
 
-SUMMARY FIELD: For each commit, include a `summary` field containing one sentence describing what the commit changes. Keep it factual and brief."#,
-        repo_yaml
+SUMMARY FIELD: For each commit, include a `summary` field containing one sentence describing what the commit changes. Keep it factual and brief."
     )
 }
 
 /// Generates a contextual user prompt with enhanced analysis (Phase 3).
 pub fn generate_contextual_user_prompt(repo_yaml: &str, context: &CommitContext) -> String {
     let mut prompt = format!(
-        "Please analyze the following repository information and suggest commit message improvements:\n\n{}\n\n",
-        repo_yaml
+        "Please analyze the following repository information and suggest commit message improvements:\n\n{repo_yaml}\n\n"
     );
 
     // Commit guidelines are now handled in the system prompt for maximum authority
@@ -427,10 +424,10 @@ pub fn generate_pr_description_prompt(repo_yaml: &str, pr_template: &str) -> Str
         r#"Please analyze the following repository information and generate a comprehensive pull request description by filling in the provided template:
 
 Repository Information:
-{}
+{repo_yaml}
 
 PR Template to Fill:
-{}
+{pr_template}
 
 INSTRUCTIONS:
 1. **ANALYZE THE COMMITS AND DIFFS**: Read through all commits and their diff files to understand exactly what changes were made
@@ -450,8 +447,7 @@ title: "Your concise PR title here"
 description: |
   Your filled-in PR template in markdown format here.
 
-Start immediately with "title:" and provide only YAML content. Ensure the title is concise (50-80 characters) and the description contains the complete filled-in template."#,
-        repo_yaml, pr_template
+Start immediately with "title:" and provide only YAML content. Ensure the title is concise (50-80 characters) and the description contains the complete filled-in template."#
     )
 }
 
@@ -494,7 +490,7 @@ pub fn generate_pr_system_prompt_with_context_for_provider(
     if let Some(pr_guidelines) = &context.project.pr_guidelines {
         prompt.push_str("\n\n=== PROJECT PR GUIDELINES ===");
         prompt.push_str("\nThis project has specific guidelines for pull request descriptions:");
-        prompt.push_str(&format!("\n\n{}", pr_guidelines));
+        prompt.push_str(&format!("\n\n{pr_guidelines}"));
         prompt.push_str("\n\nIMPORTANT: Follow these project-specific guidelines when generating the PR description.");
         prompt.push_str("\nUse these guidelines to inform the style, level of detail, and specific sections to emphasize.");
     }
@@ -523,16 +519,15 @@ pub fn generate_pr_description_prompt_with_context(
     context: &crate::data::context::CommitContext,
 ) -> String {
     let mut prompt = format!(
-        r#"Please analyze the following repository information and generate a comprehensive pull request description following the project's specific guidelines:
+        r"Please analyze the following repository information and generate a comprehensive pull request description following the project's specific guidelines:
 
 Repository Information:
-{}
+{repo_yaml}
 
 PR Template:
-{}
+{pr_template}
 
-"#,
-        repo_yaml, pr_template
+"
     );
 
     // Add project context information
@@ -716,9 +711,9 @@ const SUMMARY_INSTRUCTION: &str = "\n\nSUMMARY FIELD: For each commit, include a
 /// Generates a user prompt for the check command.
 pub fn generate_check_user_prompt(repo_yaml: &str, include_suggestions: bool) -> String {
     let mut prompt = format!(
-        r#"Please analyze the following commits and check their messages against the guidelines:
+        r"Please analyze the following commits and check their messages against the guidelines:
 
-{}
+{repo_yaml}
 
 ANALYSIS STEPS:
 1. For each commit, read the diff content to understand what was actually changed
@@ -726,8 +721,7 @@ ANALYSIS STEPS:
 3. Report any violations with appropriate severity level from the guidelines
 4. Check accuracy: does the message accurately describe the actual code changes?
 
-"#,
-        repo_yaml
+"
     );
 
     if include_suggestions {

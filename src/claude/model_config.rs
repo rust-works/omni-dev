@@ -165,7 +165,7 @@ impl ModelRegistry {
         }
 
         // Ultimate fallback
-        100000
+        100_000
     }
 
     /// Infers the provider from a model identifier.
@@ -239,8 +239,7 @@ impl ModelRegistry {
     #[must_use]
     pub fn is_legacy_model(&self, api_identifier: &str) -> bool {
         self.get_model_spec(api_identifier)
-            .map(|spec| spec.legacy)
-            .unwrap_or(false)
+            .is_some_and(|spec| spec.legacy)
     }
 
     /// Returns all available models.
@@ -444,18 +443,18 @@ mod tests {
         let registry = ModelRegistry::load().unwrap();
 
         // Opus 4.6 base limits
-        assert_eq!(registry.get_max_output_tokens("claude-opus-4-6"), 128000);
-        assert_eq!(registry.get_input_context("claude-opus-4-6"), 200000);
+        assert_eq!(registry.get_max_output_tokens("claude-opus-4-6"), 128_000);
+        assert_eq!(registry.get_input_context("claude-opus-4-6"), 200_000);
 
         // Opus 4.6 with 1M context beta
         assert_eq!(
             registry.get_input_context_with_beta("claude-opus-4-6", "context-1m-2025-08-07"),
-            1000000
+            1_000_000
         );
         // max_output_tokens unchanged with context beta
         assert_eq!(
             registry.get_max_output_tokens_with_beta("claude-opus-4-6", "context-1m-2025-08-07"),
-            128000
+            128_000
         );
 
         // Sonnet 3.7 with output-128k beta
@@ -464,7 +463,7 @@ mod tests {
                 "claude-3-7-sonnet-20250219",
                 "output-128k-2025-02-19"
             ),
-            128000
+            128_000
         );
 
         // Sonnet 3.7 base max_output_tokens without beta

@@ -102,7 +102,7 @@ pub fn from_yaml<T: for<'de> Deserialize<'de>>(yaml: &str) -> Result<T> {
         error = result
             .as_ref()
             .err()
-            .map(|e| e.to_string())
+            .map(std::string::ToString::to_string)
             .unwrap_or_default(),
         "YAML deserialization result"
     );
@@ -147,7 +147,7 @@ mod tests {
         };
 
         let yaml_output = to_yaml(&test_data).unwrap();
-        println!("YAML Output:\n{}", yaml_output);
+        println!("YAML Output:\n{yaml_output}");
 
         // Should use literal block scalar (|) for multiline strings
         assert!(yaml_output.contains("diff_content: |"));

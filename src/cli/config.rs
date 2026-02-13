@@ -60,7 +60,7 @@ impl ShowCommand {
     pub fn execute(self) -> Result<()> {
         // Print the embedded models.yaml file
         let yaml_content = include_str!("../templates/models.yaml");
-        println!("{}", yaml_content);
+        println!("{yaml_content}");
         Ok(())
     }
 }
