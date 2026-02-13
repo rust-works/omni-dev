@@ -37,6 +37,20 @@ This allows developers to customize their personal workflow without affecting te
 
 **Important**: Add `.omni-dev/local/` to your `.gitignore` to keep personal configurations private.
 
+### Global Configuration Fallback
+
+If no configuration file is found in the project directory, omni-dev falls back
+to `$HOME/.omni-dev/`. This allows you to set up default configuration that
+applies to all projects without a project-level `.omni-dev/` directory.
+
+**Full Priority Order**:
+1. `.omni-dev/local/{filename}` - Local override (highest priority)
+2. `.omni-dev/{filename}` - Shared project configuration
+3. `$HOME/.omni-dev/{filename}` - Global user configuration
+
+See [Configuration Best Practices](configuration-best-practices.md) for
+guidance on writing effective configuration files.
+
 ### 1. Scope Definitions (`.omni-dev/scopes.yaml`)
 
 **Purpose**: Define project-specific scopes and their meanings for use in conventional commit messages.
@@ -800,7 +814,9 @@ cat .omni-dev/commit-guidelines.md
 
 ### CI/CD Integration
 
-Add commit message validation:
+**Recommended**: Use the [omni-dev-commit-check](https://github.com/action-works/omni-dev-commit-check) GitHub Action for PR commit validation with built-in PR integration.
+
+**Manual setup** (if you need more control):
 
 ```yaml
 # .github/workflows/commits.yml
@@ -814,20 +830,22 @@ jobs:
       - uses: actions/checkout@v3
         with:
           fetch-depth: 0
-      
+
       - name: Install omni-dev
         run: cargo install omni-dev
-        
+
       - name: Validate commit messages
         env:
           CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
         run: |
-          omni-dev git commit message view 'origin/main..HEAD' || {
-            echo "❌ Commit validation failed"
-            echo "💡 Run: omni-dev git commit message twiddle 'origin/main..HEAD' --use-context"
+          omni-dev git commit message check 'origin/main..HEAD' || {
+            echo "Commit validation failed"
+            echo "Run: omni-dev git commit message twiddle 'origin/main..HEAD' --use-context"
             exit 1
           }
 ```
+
+See [Configuration Best Practices](configuration-best-practices.md#enforcing-check-in-ci) for exit code semantics and how twiddle-generated commits interact with check.
 
 ## Migration Guide
 

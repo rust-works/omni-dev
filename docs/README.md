@@ -10,6 +10,7 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 - **[User Guide](user-guide.md)** - Comprehensive usage guide with examples
 - **[Configuration Guide](configuration.md)** - Set up contextual intelligence
 - **[Local Overrides](local-overrides.md)** - Personal configuration customization
+- **[Configuration Best Practices](configuration-best-practices.md)** - Writing effective scopes and guidelines
 - **[Examples](examples.md)** - Real-world usage examples across different project types
 
 ### Reference & Support
@@ -26,6 +27,7 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 - **[Twiddle Design](plan/twiddle.md)** - Complete design for the twiddle command phases
 - **[PR Creation](plan/pr-creation.md)** - Pull request creation workflow
 - **[Help All Command](plan/help-all-command.md)** - Comprehensive help system design
+- **[Config Internals](plan/config-internals.md)** - How configuration resolution works
 
 ### Development & Release
 
@@ -47,6 +49,9 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 
 **See real examples**
 → [Examples](examples.md) → [Your Project Type](examples.md#table-of-contents)
+
+**Write better configuration**
+→ [Best Practices](configuration-best-practices.md) → [Scope Guidelines](configuration-best-practices.md#writing-effective-scope-definitions)
 
 **Fix a problem**
 → [Troubleshooting](troubleshooting.md) → [Common Solutions](troubleshooting.md#common-solutions-checklist)
@@ -74,10 +79,12 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 | **Local Overrides** | [Local Overrides Guide](local-overrides.md) | [Configuration - Local Setup](configuration.md#local-override-examples) |
 | **Automatic Batching** | [User Guide - Batching](user-guide.md#automatic-batching) | [Troubleshooting - Performance](troubleshooting.md#performance-issues) |
 | **Workflow Integration** | [User Guide - Workflows](user-guide.md#workflows) | [Examples - Enterprise](examples.md#enterprise-monorepo) |
+| **Configuration Quality** | [Best Practices](configuration-best-practices.md) | [Config Internals](plan/config-internals.md) |
 
 ## 🔗 External Resources
 
 - **[GitHub Repository](https://github.com/rust-works/omni-dev)** - Source code and issues
+- **[omni-dev-commit-check Action](https://github.com/action-works/omni-dev-commit-check)** - GitHub Action for CI commit validation
 - **[Crates.io Page](https://crates.io/crates/omni-dev)** - Package information
 - **[Rust API Docs](https://docs.rs/omni-dev)** - Generated API documentation
 - **[GitHub Discussions](https://github.com/rust-works/omni-dev/discussions)** - Community support
