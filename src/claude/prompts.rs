@@ -657,7 +657,11 @@ IMPORTANT:
 - Include ALL commits in the response, whether they pass or fail
 - Use the exact severity from the guidelines' severity table
 - Set `passes: true` only if there are no error or warning level issues
-- Info-level issues do not affect the `passes` status"#;
+- Info-level issues do not affect the `passes` status
+
+## Pre-validated Checks
+
+Some commits include a `pre_validated_checks` field containing deterministic checks already performed. These are AUTHORITATIVE — do not contradict them. For example, if pre_validated_checks says "Scope validity verified: 'cli' is in the valid scopes list", do NOT report an error saying the scope is invalid."#;
 
 /// Generates a check system prompt with project guidelines.
 pub fn generate_check_system_prompt(guidelines: Option<&str>) -> String {
@@ -683,11 +687,22 @@ pub fn generate_check_system_prompt_with_scopes(
     // Add valid scopes if available (ensures check uses same scopes as twiddle)
     if !valid_scopes.is_empty() {
         prompt.push_str("\n\n=== VALID SCOPES FOR THIS PROJECT ===\n");
-        prompt.push_str("The following scopes are valid for this project. When checking scope validity, only these scopes should be considered correct:\n\n");
+        prompt.push_str("The following scopes are valid for this project:\n\n");
         for scope in valid_scopes {
             prompt.push_str(&format!("- `{}`: {}\n", scope.name, scope.description));
         }
-        prompt.push_str("\nIMPORTANT: Do NOT flag a commit as having an invalid scope if it uses one of the scopes listed above.");
+        prompt.push_str(concat!(
+            "\n## Scope Checking Rules\n\n",
+            "There are TWO distinct scope checks with different severities:\n\n",
+            "1. **Scope Validity** (severity: error, section: \"Accuracy\"): ",
+            "The scope is NOT in the valid scopes list above. ",
+            "Only report this if pre_validated_checks does NOT confirm the scope is valid.\n\n",
+            "2. **Scope Appropriateness** (severity: info, section: \"Scope Appropriateness\"): ",
+            "The scope IS in the valid list, but a different valid scope might better match ",
+            "the changed files. This is a suggestion only — never an error.\n\n",
+            "IMPORTANT: If pre_validated_checks says the scope is valid, you MUST NOT ",
+            "report it as an Accuracy error. You may suggest a more appropriate scope at info level.",
+        ));
     }
 
     prompt.push_str("\n\nCRITICAL: Use the Severity Levels table above to determine the severity of each violation. If a section is not listed, default to 'warning'.");
