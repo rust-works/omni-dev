@@ -69,9 +69,9 @@ pub enum IssueSeverity {
 impl fmt::Display for IssueSeverity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            IssueSeverity::Error => write!(f, "ERROR"),
-            IssueSeverity::Warning => write!(f, "WARNING"),
-            IssueSeverity::Info => write!(f, "INFO"),
+            Self::Error => write!(f, "ERROR"),
+            Self::Warning => write!(f, "WARNING"),
+            Self::Info => write!(f, "INFO"),
         }
     }
 }
@@ -81,12 +81,12 @@ impl std::str::FromStr for IssueSeverity {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "error" => Ok(IssueSeverity::Error),
-            "warning" => Ok(IssueSeverity::Warning),
-            "info" => Ok(IssueSeverity::Info),
+            "error" => Ok(Self::Error),
+            "warning" => Ok(Self::Warning),
+            "info" => Ok(Self::Info),
             other => {
                 tracing::debug!("Unknown severity {other:?}, defaulting to Warning");
-                Ok(IssueSeverity::Warning)
+                Ok(Self::Warning)
             }
         }
     }
@@ -198,9 +198,9 @@ impl std::str::FromStr for OutputFormat {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "text" => Ok(OutputFormat::Text),
-            "json" => Ok(OutputFormat::Json),
-            "yaml" => Ok(OutputFormat::Yaml),
+            "text" => Ok(Self::Text),
+            "json" => Ok(Self::Json),
+            "yaml" => Ok(Self::Yaml),
             _ => Err(()),
         }
     }
@@ -209,9 +209,9 @@ impl std::str::FromStr for OutputFormat {
 impl fmt::Display for OutputFormat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            OutputFormat::Text => write!(f, "text"),
-            OutputFormat::Json => write!(f, "json"),
-            OutputFormat::Yaml => write!(f, "yaml"),
+            Self::Text => write!(f, "text"),
+            Self::Json => write!(f, "json"),
+            Self::Yaml => write!(f, "yaml"),
         }
     }
 }

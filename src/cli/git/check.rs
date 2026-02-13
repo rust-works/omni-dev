@@ -201,19 +201,18 @@ impl CheckCommand {
             .unwrap_or_else(|_| "HEAD".to_string());
 
         // Determine commit range
-        let commit_range = match &self.commit_range {
-            Some(range) => range.clone(),
-            None => {
-                // Default to commits ahead of main branch
-                let base = if repo.branch_exists("main")? {
-                    "main"
-                } else if repo.branch_exists("master")? {
-                    "master"
-                } else {
-                    "HEAD~5"
-                };
-                format!("{}..HEAD", base)
-            }
+        let commit_range = if let Some(range) = &self.commit_range {
+            range.clone()
+        } else {
+            // Default to commits ahead of main branch
+            let base = if repo.branch_exists("main")? {
+                "main"
+            } else if repo.branch_exists("master")? {
+                "master"
+            } else {
+                "HEAD~5"
+            };
+            format!("{base}..HEAD")
         };
 
         // Get working directory status
@@ -277,7 +276,10 @@ impl CheckCommand {
         // If explicit guidelines path is provided, use it
         if let Some(guidelines_path) = &self.guidelines {
             let content = fs::read_to_string(guidelines_path).with_context(|| {
-                format!("Failed to read guidelines file: {:?}", guidelines_path)
+                format!(
+                    "Failed to read guidelines file: {}",
+                    guidelines_path.display()
+                )
             })?;
             return Ok(Some(content));
         }
@@ -292,15 +294,16 @@ impl CheckCommand {
         let local_path = context_dir.join("local").join("commit-guidelines.md");
         if local_path.exists() {
             let content = fs::read_to_string(&local_path)
-                .with_context(|| format!("Failed to read guidelines: {:?}", local_path))?;
+                .with_context(|| format!("Failed to read guidelines: {}", local_path.display()))?;
             return Ok(Some(content));
         }
 
         // Try project-level guidelines
         let project_path = context_dir.join("commit-guidelines.md");
         if project_path.exists() {
-            let content = fs::read_to_string(&project_path)
-                .with_context(|| format!("Failed to read guidelines: {:?}", project_path))?;
+            let content = fs::read_to_string(&project_path).with_context(|| {
+                format!("Failed to read guidelines: {}", project_path.display())
+            })?;
             return Ok(Some(content));
         }
 
@@ -308,8 +311,9 @@ impl CheckCommand {
         if let Some(home) = dirs::home_dir() {
             let home_path = home.join(".omni-dev").join("commit-guidelines.md");
             if home_path.exists() {
-                let content = fs::read_to_string(&home_path)
-                    .with_context(|| format!("Failed to read guidelines: {:?}", home_path))?;
+                let content = fs::read_to_string(&home_path).with_context(|| {
+                    format!("Failed to read guidelines: {}", home_path.display())
+                })?;
                 return Ok(Some(content));
             }
         }
@@ -361,7 +365,7 @@ impl CheckCommand {
         } else {
             "⚪ Using defaults".to_string()
         };
-        println!("   📝 Commit guidelines: {}", guidelines_source);
+        println!("   📝 Commit guidelines: {guidelines_source}");
 
         // Check scopes
         let scopes_count = valid_scopes.len();
@@ -381,11 +385,11 @@ impl CheckCommand {
             } else {
                 "(source unknown)".to_string()
             };
-            format!("✅ {} ({} scopes)", source, scopes_count)
+            format!("✅ {source} ({scopes_count} scopes)")
         } else {
             "⚪ None found (any scope accepted)".to_string()
         };
-        println!("   🎯 Valid scopes: {}", scopes_source);
+        println!("   🎯 Valid scopes: {scopes_source}");
 
         println!();
     }
@@ -474,7 +478,7 @@ impl CheckCommand {
                             let done =
                                 completed.fetch_add(batch_size, Ordering::Relaxed) + batch_size;
                             if !self.quiet {
-                                println!("   ✅ {}/{} commits checked", done, total_commits);
+                                println!("   ✅ {done}/{total_commits} commits checked");
                             }
 
                             let items: Vec<_> = report
@@ -490,8 +494,7 @@ impl CheckCommand {
                         Err(e) if batch_size > 1 => {
                             // Split-and-retry: fall back to individual commits
                             eprintln!(
-                                "warning: batch of {} failed, retrying individually: {e}",
-                                batch_size
+                                "warning: batch of {batch_size} failed, retrying individually: {e}"
                             );
                             let mut items = Vec::new();
                             for &idx in batch_indices {
@@ -518,7 +521,7 @@ impl CheckCommand {
                                 }
                                 let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                                 if !self.quiet {
-                                    println!("   ✅ {}/{} commits checked", done, total_commits);
+                                    println!("   ✅ {done}/{total_commits} commits checked");
                                 }
                             }
                             Ok(items)
@@ -598,13 +601,13 @@ impl CheckCommand {
             OutputFormat::Json => {
                 let json = serde_json::to_string_pretty(report)
                     .context("Failed to serialize report to JSON")?;
-                println!("{}", json);
+                println!("{json}");
                 Ok(())
             }
             OutputFormat::Yaml => {
                 let yaml =
                     crate::data::to_yaml(report).context("Failed to serialize report to YAML")?;
-                println!("{}", yaml);
+                println!("{yaml}");
                 Ok(())
             }
         }
@@ -680,13 +683,13 @@ impl CheckCommand {
                     println!();
                     println!("   Suggested message:");
                     for line in suggestion.message.lines() {
-                        println!("      {}", line);
+                        println!("      {line}");
                     }
                     if self.verbose {
                         println!();
                         println!("   Why this is better:");
                         for line in suggestion.explanation.lines() {
-                            println!("   {}", line);
+                            println!("   {line}");
                         }
                     }
                 }

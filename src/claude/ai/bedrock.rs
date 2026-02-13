@@ -112,7 +112,7 @@ impl BedrockAiClient {
     /// Builds the full API URL.
     fn get_api_url(&self) -> Result<String> {
         let mut url = Url::parse(&self.base_url)
-            .map_err(|e| ClaudeError::NetworkError(format!("Invalid base URL: {}", e)))?;
+            .map_err(|e| ClaudeError::NetworkError(format!("Invalid base URL: {e}")))?;
 
         // Ensure the base URL ends with a trailing slash to preserve all path components
         if !url.as_str().ends_with('/') {
@@ -122,7 +122,7 @@ impl BedrockAiClient {
         // Create the base URL with path to the model endpoint
         let model_url = url
             .join("model/")
-            .map_err(|e| ClaudeError::NetworkError(format!("Failed to build API URL: {}", e)))?;
+            .map_err(|e| ClaudeError::NetworkError(format!("Failed to build API URL: {e}")))?;
 
         // Now properly URL-encode the model ID and add it to the path
         let encoded_model =
@@ -131,11 +131,10 @@ impl BedrockAiClient {
 
         // Join the encoded model and invoke endpoint
         let full_url = model_url
-            .join(&format!("{}/invoke", encoded_model))
+            .join(&format!("{encoded_model}/invoke"))
             .map_err(|e| {
                 ClaudeError::NetworkError(format!(
-                    "Failed to build API URL with encoded model: {}",
-                    e
+                    "Failed to build API URL with encoded model: {e}"
                 ))
             })?;
 
@@ -222,11 +221,9 @@ impl AiClient for BedrockAiClient {
                     tracing::debug!("Failed to read error response body: {e}");
                     String::new()
                 });
-                return Err(ClaudeError::ApiRequestFailed(format!(
-                    "HTTP {}: {}",
-                    status, error_text
-                ))
-                .into());
+                return Err(
+                    ClaudeError::ApiRequestFailed(format!("HTTP {status}: {error_text}")).into(),
+                );
             }
 
             let bedrock_response: BedrockResponse = response

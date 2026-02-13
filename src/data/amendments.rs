@@ -32,7 +32,7 @@ impl AmendmentFile {
             format!("Failed to read amendment file: {}", path.as_ref().display())
         })?;
 
-        let amendment_file: AmendmentFile =
+        let amendment_file: Self =
             crate::data::from_yaml(&content).context("Failed to parse YAML amendment file")?;
 
         amendment_file.validate()?;
@@ -46,7 +46,7 @@ impl AmendmentFile {
         for (i, amendment) in self.amendments.iter().enumerate() {
             amendment
                 .validate()
-                .with_context(|| format!("Invalid amendment at index {}", i))?;
+                .with_context(|| format!("Invalid amendment at index {i}"))?;
         }
 
         Ok(())
@@ -93,7 +93,7 @@ impl AmendmentFile {
                             // Check if it contains newlines (multiline content)
                             if quoted_content.contains("\\n") {
                                 // Convert to literal block scalar format
-                                result.push_str(&format!("{}message: |\n", indent_str));
+                                result.push_str(&format!("{indent_str}message: |\n"));
 
                                 // Process the content, converting \n to actual newlines
                                 let unescaped = quoted_content.replace("\\n", "\n");
@@ -102,7 +102,7 @@ impl AmendmentFile {
                                         // Skip leading empty line
                                         continue;
                                     }
-                                    result.push_str(&format!("{}  {}\n", indent_str, content_line));
+                                    result.push_str(&format!("{indent_str}  {content_line}\n"));
                                 }
                                 i += 1;
                                 continue;

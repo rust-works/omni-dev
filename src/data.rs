@@ -186,25 +186,25 @@ impl RepositoryView {
     pub fn update_field_presence(&mut self) {
         for field in &mut self.explanation.fields {
             field.present = match field.name.as_str() {
-                "working_directory.clean" => true,             // Always present
-                "working_directory.untracked_changes" => true, // Always present
-                "remotes" => true,                             // Always present
-                "commits[].hash" => !self.commits.is_empty(),
-                "commits[].author" => !self.commits.is_empty(),
-                "commits[].date" => !self.commits.is_empty(),
-                "commits[].original_message" => !self.commits.is_empty(),
-                "commits[].in_main_branches" => !self.commits.is_empty(),
-                "commits[].analysis.detected_type" => !self.commits.is_empty(),
-                "commits[].analysis.detected_scope" => !self.commits.is_empty(),
-                "commits[].analysis.proposed_message" => !self.commits.is_empty(),
-                "commits[].analysis.file_changes.total_files" => !self.commits.is_empty(),
-                "commits[].analysis.file_changes.files_added" => !self.commits.is_empty(),
-                "commits[].analysis.file_changes.files_deleted" => !self.commits.is_empty(),
-                "commits[].analysis.file_changes.file_list" => !self.commits.is_empty(),
-                "commits[].analysis.diff_summary" => !self.commits.is_empty(),
-                "commits[].analysis.diff_file" => !self.commits.is_empty(),
+                "working_directory.clean"
+                | "working_directory.untracked_changes"
+                | "remotes"
+                | "ai.scratch" => true, // Always present
+                "commits[].hash"
+                | "commits[].author"
+                | "commits[].date"
+                | "commits[].original_message"
+                | "commits[].in_main_branches"
+                | "commits[].analysis.detected_type"
+                | "commits[].analysis.detected_scope"
+                | "commits[].analysis.proposed_message"
+                | "commits[].analysis.file_changes.total_files"
+                | "commits[].analysis.file_changes.files_added"
+                | "commits[].analysis.file_changes.files_deleted"
+                | "commits[].analysis.file_changes.file_list"
+                | "commits[].analysis.diff_summary"
+                | "commits[].analysis.diff_file" => !self.commits.is_empty(),
                 "versions.omni_dev" => self.versions.is_some(),
-                "ai.scratch" => true,
                 "branch_info.branch" => self.branch_info.is_some(),
                 "pr_template" => self.pr_template.is_some(),
                 "pr_template_location" => self.pr_template_location.is_some(),
@@ -555,8 +555,7 @@ impl RepositoryViewForAI {
             // Find nearest newline boundary at or before target_len (include the newline)
             let cut_point = commit.analysis.diff_content[..target_len]
                 .rfind('\n')
-                .map(|p| p + 1)
-                .unwrap_or(target_len);
+                .map_or(target_len, |p| p + 1);
 
             commit.analysis.diff_content.truncate(cut_point);
             commit
@@ -643,7 +642,7 @@ mod tests {
     fn truncate_diffs_at_newline_boundary() {
         // Create a diff with ~2000 chars across many lines (well above MIN_TRUNCATED_DIFF_LEN)
         let lines: Vec<String> = (0..100)
-            .map(|i| format!("+line {:03} with some padding content here\n", i))
+            .map(|i| format!("+line {i:03} with some padding content here\n"))
             .collect();
         let diff_content = lines.join("");
         let original_len = diff_content.len();

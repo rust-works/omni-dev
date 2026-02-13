@@ -58,8 +58,7 @@ impl FileAnalyzer {
                 };
                 priority + count
             })
-            .map(|(layer, _)| layer)
-            .unwrap_or(ArchitecturalLayer::Cross)
+            .map_or(ArchitecturalLayer::Cross, |(layer, _)| layer)
     }
 
     /// Determines if the file changes suggest a significant architectural change.
@@ -166,7 +165,7 @@ fn determine_architectural_layer(path: &Path, file_purpose: &FilePurpose) -> Arc
 /// Determines the impact of changes based on change type and file purpose.
 fn determine_change_impact(change_type: &str, file_purpose: &FilePurpose) -> ChangeImpact {
     match change_type {
-        "A" => ChangeImpact::Additive, // Added file
+        "A" | "C" => ChangeImpact::Additive, // Added or Copied
         "D" => {
             // Deleted file - could be breaking depending on purpose
             match file_purpose {
@@ -177,15 +176,12 @@ fn determine_change_impact(change_type: &str, file_purpose: &FilePurpose) -> Cha
         "M" => {
             // Modified file - depends on purpose
             match file_purpose {
-                FilePurpose::Config => ChangeImpact::Modification,
                 FilePurpose::Test | FilePurpose::Documentation => ChangeImpact::Style,
                 FilePurpose::Interface => ChangeImpact::Breaking, // Potentially breaking
                 _ => ChangeImpact::Modification,
             }
         }
-        "R" => ChangeImpact::Modification, // Renamed
-        "C" => ChangeImpact::Additive,     // Copied
-        _ => ChangeImpact::Modification,   // Unknown change type
+        _ => ChangeImpact::Modification, // Renamed, unknown, etc.
     }
 }
 
@@ -205,7 +201,9 @@ fn determine_project_significance(path: &Path, file_purpose: &FilePurpose) -> Pr
 
     // Important files based on purpose
     match file_purpose {
-        FilePurpose::Interface | FilePurpose::CoreLogic => ProjectSignificance::Important,
+        FilePurpose::Interface | FilePurpose::CoreLogic | FilePurpose::Build => {
+            ProjectSignificance::Important
+        }
         FilePurpose::Config => {
             if file_name.contains("cargo.toml") || file_name.contains("package.json") {
                 ProjectSignificance::Critical
@@ -216,7 +214,6 @@ fn determine_project_significance(path: &Path, file_purpose: &FilePurpose) -> Pr
         FilePurpose::Test | FilePurpose::Documentation | FilePurpose::Tooling => {
             ProjectSignificance::Routine
         }
-        FilePurpose::Build => ProjectSignificance::Important,
     }
 }
 
@@ -308,7 +305,7 @@ fn is_tooling_file(path_str: &str, file_name: &str) -> bool {
         || path_str.contains("util")
         || path_str.contains(".vscode")
         || path_str.contains(".idea")
-        || file_name.starts_with(".")
+        || file_name.starts_with('.')
         || file_name.contains("prettier")
         || file_name.contains("eslint")
         || file_name.contains("clippy")

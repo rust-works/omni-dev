@@ -17,8 +17,6 @@
 //! ```
 
 #![warn(missing_docs)]
-#![warn(clippy::all)]
-#![deny(unsafe_code)]
 
 pub mod claude;
 pub mod cli;

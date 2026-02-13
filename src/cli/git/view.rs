@@ -78,7 +78,7 @@ impl ViewCommand {
 
         // Output as YAML
         let yaml_output = crate::data::to_yaml(&repo_view)?;
-        println!("{}", yaml_output);
+        println!("{yaml_output}");
 
         Ok(())
     }

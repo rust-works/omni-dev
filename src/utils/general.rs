@@ -14,8 +14,8 @@ pub enum UtilError {
 impl fmt::Display for UtilError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            UtilError::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
-            UtilError::Io(err) => write!(f, "I/O error: {}", err),
+            Self::InvalidInput(msg) => write!(f, "Invalid input: {msg}"),
+            Self::Io(err) => write!(f, "I/O error: {err}"),
         }
     }
 }
@@ -23,15 +23,15 @@ impl fmt::Display for UtilError {
 impl std::error::Error for UtilError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            UtilError::InvalidInput(_) => None,
-            UtilError::Io(err) => Some(err),
+            Self::InvalidInput(_) => None,
+            Self::Io(err) => Some(err),
         }
     }
 }
 
 impl From<std::io::Error> for UtilError {
     fn from(err: std::io::Error) -> Self {
-        UtilError::Io(err)
+        Self::Io(err)
     }
 }
 
@@ -92,7 +92,7 @@ mod tests {
         assert_eq!(super::format_bytes(512), "512 B");
         assert_eq!(super::format_bytes(1024), "1.0 KB");
         assert_eq!(super::format_bytes(1536), "1.5 KB");
-        assert_eq!(super::format_bytes(1048576), "1.0 MB");
-        assert_eq!(super::format_bytes(1073741824), "1.0 GB");
+        assert_eq!(super::format_bytes(1_048_576), "1.0 MB");
+        assert_eq!(super::format_bytes(1_073_741_824), "1.0 GB");
     }
 }
