@@ -26,7 +26,7 @@ impl RemoteInfo {
                 let uri = remote.url().unwrap_or("").to_string();
                 let main_branch = Self::detect_main_branch(repo, name)?;
 
-                remotes.push(RemoteInfo {
+                remotes.push(Self {
                     name: name.to_string(),
                     uri,
                     main_branch,
@@ -40,12 +40,12 @@ impl RemoteInfo {
     /// Detects the main branch for a remote.
     fn detect_main_branch(repo: &Repository, remote_name: &str) -> Result<String> {
         // First try to get the remote HEAD reference
-        let head_ref_name = format!("refs/remotes/{}/HEAD", remote_name);
+        let head_ref_name = format!("refs/remotes/{remote_name}/HEAD");
         if let Ok(head_ref) = repo.find_reference(&head_ref_name) {
             if let Some(target) = head_ref.symbolic_target() {
                 // Extract branch name from refs/remotes/origin/main
                 if let Some(branch_name) =
-                    target.strip_prefix(&format!("refs/remotes/{}/", remote_name))
+                    target.strip_prefix(&format!("refs/remotes/{remote_name}/"))
                 {
                     return Ok(branch_name.to_string());
                 }
@@ -69,25 +69,25 @@ impl RemoteInfo {
         // First, check if this is the origin remote or if origin remote branches exist
         if remote_name == "origin" {
             for branch_name in &common_branches {
-                let reference_name = format!("refs/remotes/origin/{}", branch_name);
+                let reference_name = format!("refs/remotes/origin/{branch_name}");
                 if repo.find_reference(&reference_name).is_ok() {
-                    return Ok(branch_name.to_string());
+                    return Ok((*branch_name).to_string());
                 }
             }
         } else {
             // For non-origin remotes, first check if origin has these branches
             for branch_name in &common_branches {
-                let origin_reference = format!("refs/remotes/origin/{}", branch_name);
+                let origin_reference = format!("refs/remotes/origin/{branch_name}");
                 if repo.find_reference(&origin_reference).is_ok() {
-                    return Ok(branch_name.to_string());
+                    return Ok((*branch_name).to_string());
                 }
             }
 
             // Then check the actual remote
             for branch_name in &common_branches {
-                let reference_name = format!("refs/remotes/{}/{}", remote_name, branch_name);
+                let reference_name = format!("refs/remotes/{remote_name}/{branch_name}");
                 if repo.find_reference(&reference_name).is_ok() {
-                    return Ok(branch_name.to_string());
+                    return Ok((*branch_name).to_string());
                 }
             }
         }
@@ -97,9 +97,9 @@ impl RemoteInfo {
         for branch_result in branch_iter {
             let (branch, _) = branch_result?;
             if let Some(name) = branch.name()? {
-                if name.starts_with(&format!("{}/", remote_name)) {
+                if name.starts_with(&format!("{remote_name}/")) {
                     let branch_name = name
-                        .strip_prefix(&format!("{}/", remote_name))
+                        .strip_prefix(&format!("{remote_name}/"))
                         .unwrap_or(name);
                     return Ok(branch_name.to_string());
                 }

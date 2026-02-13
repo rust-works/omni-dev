@@ -369,7 +369,7 @@ impl CommitAnalysis {
         {
             "deps".to_string()
         } else {
-            "".to_string()
+            String::new()
         }
     }
 
@@ -438,9 +438,8 @@ impl CommitAnalysis {
 
         let mut max_specificity: Option<usize> = None;
         for pat in &positive {
-            let glob = match Glob::new(pat) {
-                Ok(g) => g,
-                Err(_) => continue,
+            let Ok(glob) = Glob::new(pat) else {
+                continue;
             };
             let matcher = glob.compile_matcher();
             for file in files {
@@ -491,9 +490,9 @@ impl CommitAnalysis {
 
         // Format with scope if available
         if scope.is_empty() {
-            format!("{}: {}", commit_type, description)
+            format!("{commit_type}: {description}")
         } else {
-            format!("{}({}): {}", commit_type, scope, description)
+            format!("{commit_type}({scope}): {description}")
         }
     }
 
@@ -576,7 +575,7 @@ impl CommitAnalysis {
 
         // Create filename with commit hash
         let commit_hash = commit.id().to_string();
-        let diff_filename = format!("{}.diff", commit_hash);
+        let diff_filename = format!("{commit_hash}.diff");
         let diff_path = diffs_dir.join(&diff_filename);
 
         let commit_tree = commit.tree().context("Failed to get commit tree")?;
@@ -610,11 +609,9 @@ impl CommitAnalysis {
                 '-' => "-",
                 ' ' => " ",
                 '@' => "@",
-                'H' => "", // Header
-                'F' => "", // File header
-                _ => "",
+                _ => "", // Header, file header, and other origins
             };
-            diff_content.push_str(&format!("{}{}", prefix, content));
+            diff_content.push_str(&format!("{prefix}{content}"));
             true
         })
         .context("Failed to format diff")?;
@@ -657,8 +654,7 @@ impl CommitInfoForAI {
             if let Some(scope) = scope {
                 if scope.contains(',') && !scope.contains(", ") {
                     self.pre_validated_checks.push(format!(
-                        "Scope format verified: multi-scope '{}' correctly uses commas without spaces",
-                        scope
+                        "Scope format verified: multi-scope '{scope}' correctly uses commas without spaces"
                     ));
                 }
 
@@ -670,8 +666,7 @@ impl CommitInfoForAI {
                         .all(|part| valid_scopes.iter().any(|s| s.name == *part));
                     if all_valid {
                         self.pre_validated_checks.push(format!(
-                            "Scope validity verified: '{}' is in the valid scopes list",
-                            scope
+                            "Scope validity verified: '{scope}' is in the valid scopes list"
                         ));
                     }
                 }

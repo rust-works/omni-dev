@@ -156,16 +156,16 @@ impl std::str::FromStr for WorkType {
 
     fn from_str(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
-            "feature" | "feat" => Ok(WorkType::Feature),
-            "fix" | "bugfix" => Ok(WorkType::Fix),
-            "docs" | "doc" => Ok(WorkType::Docs),
-            "refactor" | "refact" => Ok(WorkType::Refactor),
-            "chore" => Ok(WorkType::Chore),
-            "test" | "tests" => Ok(WorkType::Test),
-            "ci" => Ok(WorkType::Ci),
-            "build" => Ok(WorkType::Build),
-            "perf" | "performance" => Ok(WorkType::Perf),
-            _ => Ok(WorkType::Unknown),
+            "feature" | "feat" => Ok(Self::Feature),
+            "fix" | "bugfix" => Ok(Self::Fix),
+            "docs" | "doc" => Ok(Self::Docs),
+            "refactor" | "refact" => Ok(Self::Refactor),
+            "chore" => Ok(Self::Chore),
+            "test" | "tests" => Ok(Self::Test),
+            "ci" => Ok(Self::Ci),
+            "build" => Ok(Self::Build),
+            "perf" | "performance" => Ok(Self::Perf),
+            _ => Ok(Self::Unknown),
         }
     }
 }
@@ -173,16 +173,16 @@ impl std::str::FromStr for WorkType {
 impl std::fmt::Display for WorkType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WorkType::Unknown => write!(f, "unknown work"),
-            WorkType::Feature => write!(f, "feature development"),
-            WorkType::Fix => write!(f, "bug fix"),
-            WorkType::Docs => write!(f, "documentation update"),
-            WorkType::Refactor => write!(f, "refactoring"),
-            WorkType::Chore => write!(f, "maintenance"),
-            WorkType::Test => write!(f, "testing"),
-            WorkType::Ci => write!(f, "CI/CD"),
-            WorkType::Build => write!(f, "build system"),
-            WorkType::Perf => write!(f, "performance improvement"),
+            Self::Unknown => write!(f, "unknown work"),
+            Self::Feature => write!(f, "feature development"),
+            Self::Fix => write!(f, "bug fix"),
+            Self::Docs => write!(f, "documentation update"),
+            Self::Refactor => write!(f, "refactoring"),
+            Self::Chore => write!(f, "maintenance"),
+            Self::Test => write!(f, "testing"),
+            Self::Ci => write!(f, "CI/CD"),
+            Self::Build => write!(f, "build system"),
+            Self::Perf => write!(f, "performance improvement"),
         }
     }
 }

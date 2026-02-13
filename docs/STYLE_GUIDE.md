@@ -624,13 +624,16 @@ Configuring or overriding Clippy lints.
 
 ### Guidance
 
-The crate-level lints in `src/lib.rs` are the project's Clippy baseline:
+Lint configuration is centralized in `Cargo.toml` under `[lints.rust]` and `[lints.clippy]`.
+The project enables `clippy::all`, `clippy::pedantic`, and `clippy::nursery` as warnings, with
+specific lints allowed where they are too noisy or conflict with project conventions. See
+`Cargo.toml` for the full allow-list with justification comments.
 
-```rust
-#![warn(missing_docs)]
-#![warn(clippy::all)]
-#![deny(unsafe_code)]
-```
+Project-specific thresholds (argument count, cognitive complexity, etc.) are configured in
+`clippy.toml`. Formatting rules are documented in `rustfmt.toml`.
+
+The only lint attribute remaining in `src/lib.rs` is `#![warn(missing_docs)]`, which is
+kept there because it should only apply to the library crate, not to tests or the binary.
 
 When suppressing a lint on a specific item, use `#[allow(clippy::...)]` with a justification
 comment explaining why the suppression is necessary:
@@ -641,14 +644,16 @@ fn new(title: &str, description: &str, ...) -> Self { ... }
 ```
 
 Do not add blanket `#[allow(...)]` at module or crate level to silence warnings. Fix the
-warning or suppress it at the narrowest possible scope.
+warning or add the allow to `Cargo.toml` with a justification comment. Per-item suppression
+is preferred for one-off cases; `Cargo.toml` allows are for project-wide decisions.
 
 ### Motivation
 
-`clippy::all` enables the default set of correctness and style lints. Requiring justification
-comments on suppressions ensures each override is a deliberate decision rather than a way to
-silence noise. Narrow-scope suppression prevents accidentally disabling a lint for unrelated
-code.
+Enabling `pedantic` and `nursery` catches subtle issues that `clippy::all` misses, such as
+inefficient string conversions, redundant closures, and inconsistent formatting. Centralizing
+configuration in `Cargo.toml` makes the lint policy visible and auditable without searching
+through source files. The allow-list documents deliberate exceptions rather than silently
+suppressing noise.
 
 ---
 
