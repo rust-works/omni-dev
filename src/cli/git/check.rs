@@ -636,25 +636,8 @@ impl CheckCommand {
                 }
             }
 
-            // Determine icon
-            let icon = if result.passes {
-                "✅"
-            } else if result
-                .issues
-                .iter()
-                .any(|i| i.severity == IssueSeverity::Error)
-            {
-                "❌"
-            } else {
-                "⚠️ "
-            };
-
-            // Short hash
-            let short_hash = if result.hash.len() > 7 {
-                &result.hash[..7]
-            } else {
-                &result.hash
-            };
+            let icon = super::formatting::determine_commit_icon(result.passes, &result.issues);
+            let short_hash = super::formatting::truncate_hash(&result.hash);
 
             println!("{} {} - \"{}\"", icon, short_hash, result.message);
 
@@ -665,11 +648,7 @@ impl CheckCommand {
                     continue;
                 }
 
-                let severity_str = match issue.severity {
-                    IssueSeverity::Error => "\x1b[31mERROR\x1b[0m  ",
-                    IssueSeverity::Warning => "\x1b[33mWARNING\x1b[0m",
-                    IssueSeverity::Info => "\x1b[36mINFO\x1b[0m   ",
-                };
+                let severity_str = super::formatting::format_severity_label(issue.severity);
 
                 println!(
                     "   {} [{}] {}",
@@ -749,20 +728,20 @@ impl CheckCommand {
     ) -> Vec<crate::data::amendments::Amendment> {
         use crate::data::amendments::Amendment;
 
+        let candidate_hashes: Vec<String> =
+            repo_view.commits.iter().map(|c| c.hash.clone()).collect();
+
         report
             .commits
             .iter()
             .filter(|r| !r.passes)
             .filter_map(|r| {
                 let suggestion = r.suggestion.as_ref()?;
-                let full_hash = repo_view.commits.iter().find_map(|c| {
-                    if c.hash.starts_with(&r.hash) || r.hash.starts_with(&c.hash) {
-                        Some(c.hash.clone())
-                    } else {
-                        None
-                    }
-                });
-                full_hash.map(|hash| Amendment::new(hash, suggestion.message.clone()))
+                let full_hash = super::formatting::resolve_short_hash(&r.hash, &candidate_hashes)?;
+                Some(Amendment::new(
+                    full_hash.to_string(),
+                    suggestion.message.clone(),
+                ))
             })
             .collect()
     }
