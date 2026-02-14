@@ -343,3 +343,298 @@ fn is_critical_file(path_str: &str, file_name: &str) -> bool {
     critical_names.contains(&file_name)
         || (path_str.contains("src") && (file_name == "lib.rs" || file_name == "main.rs"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    // ── determine_file_purpose ─────────────────────────────────────
+
+    #[test]
+    fn purpose_config_toml() {
+        assert!(matches!(
+            determine_file_purpose(Path::new("Cargo.toml")),
+            FilePurpose::Config
+        ));
+    }
+
+    #[test]
+    fn purpose_config_json() {
+        assert!(matches!(
+            determine_file_purpose(Path::new("package.json")),
+            FilePurpose::Config
+        ));
+    }
+
+    #[test]
+    fn purpose_test_file() {
+        assert!(matches!(
+            determine_file_purpose(Path::new("tests/integration_test.rs")),
+            FilePurpose::Test
+        ));
+    }
+
+    #[test]
+    fn purpose_documentation() {
+        assert!(matches!(
+            determine_file_purpose(Path::new("README.md")),
+            FilePurpose::Documentation
+        ));
+    }
+
+    #[test]
+    fn purpose_build_file() {
+        assert!(matches!(
+            determine_file_purpose(Path::new("scripts/build.sh")),
+            FilePurpose::Build
+        ));
+    }
+
+    #[test]
+    fn purpose_interface_file() {
+        assert!(matches!(
+            determine_file_purpose(Path::new("src/api/handler.rs")),
+            FilePurpose::Interface
+        ));
+    }
+
+    #[test]
+    fn purpose_core_logic_default() {
+        assert!(matches!(
+            determine_file_purpose(Path::new("src/claude/prompts.rs")),
+            FilePurpose::CoreLogic
+        ));
+    }
+
+    // ── determine_architectural_layer ──────────────────────────────
+
+    #[test]
+    fn layer_config_is_infrastructure() {
+        let layer = determine_architectural_layer(Path::new("Cargo.toml"), &FilePurpose::Config);
+        assert_eq!(layer, ArchitecturalLayer::Infrastructure);
+    }
+
+    #[test]
+    fn layer_test_is_cross() {
+        let layer = determine_architectural_layer(Path::new("tests/test.rs"), &FilePurpose::Test);
+        assert_eq!(layer, ArchitecturalLayer::Cross);
+    }
+
+    #[test]
+    fn layer_interface_is_presentation() {
+        let layer =
+            determine_architectural_layer(Path::new("src/api/mod.rs"), &FilePurpose::Interface);
+        assert_eq!(layer, ArchitecturalLayer::Presentation);
+    }
+
+    #[test]
+    fn layer_cli_is_presentation() {
+        let layer =
+            determine_architectural_layer(Path::new("src/cli/git.rs"), &FilePurpose::CoreLogic);
+        assert_eq!(layer, ArchitecturalLayer::Presentation);
+    }
+
+    #[test]
+    fn layer_data_is_data() {
+        let layer =
+            determine_architectural_layer(Path::new("src/data/check.rs"), &FilePurpose::CoreLogic);
+        assert_eq!(layer, ArchitecturalLayer::Data);
+    }
+
+    #[test]
+    fn layer_core_is_business() {
+        let layer =
+            determine_architectural_layer(Path::new("src/core/engine.rs"), &FilePurpose::CoreLogic);
+        assert_eq!(layer, ArchitecturalLayer::Business);
+    }
+
+    #[test]
+    fn layer_unknown_defaults_business() {
+        let layer = determine_architectural_layer(
+            Path::new("src/claude/prompts.rs"),
+            &FilePurpose::CoreLogic,
+        );
+        assert_eq!(layer, ArchitecturalLayer::Business);
+    }
+
+    // ── determine_change_impact ────────────────────────────────────
+
+    #[test]
+    fn impact_added_is_additive() {
+        assert!(matches!(
+            determine_change_impact("A", &FilePurpose::CoreLogic),
+            ChangeImpact::Additive
+        ));
+    }
+
+    #[test]
+    fn impact_deleted_interface_is_breaking() {
+        assert!(matches!(
+            determine_change_impact("D", &FilePurpose::Interface),
+            ChangeImpact::Breaking
+        ));
+    }
+
+    #[test]
+    fn impact_deleted_test_is_modification() {
+        assert!(matches!(
+            determine_change_impact("D", &FilePurpose::Test),
+            ChangeImpact::Modification
+        ));
+    }
+
+    #[test]
+    fn impact_modified_test_is_style() {
+        assert!(matches!(
+            determine_change_impact("M", &FilePurpose::Test),
+            ChangeImpact::Style
+        ));
+    }
+
+    #[test]
+    fn impact_modified_core_is_modification() {
+        assert!(matches!(
+            determine_change_impact("M", &FilePurpose::CoreLogic),
+            ChangeImpact::Modification
+        ));
+    }
+
+    #[test]
+    fn impact_unknown_type_is_modification() {
+        assert!(matches!(
+            determine_change_impact("R", &FilePurpose::CoreLogic),
+            ChangeImpact::Modification
+        ));
+    }
+
+    // ── determine_project_significance ─────────────────────────────
+
+    #[test]
+    fn significance_main_rs_is_critical() {
+        assert!(matches!(
+            determine_project_significance(Path::new("src/main.rs"), &FilePurpose::CoreLogic),
+            ProjectSignificance::Critical
+        ));
+    }
+
+    #[test]
+    fn significance_cargo_toml_is_critical() {
+        assert!(matches!(
+            determine_project_significance(Path::new("Cargo.toml"), &FilePurpose::Config),
+            ProjectSignificance::Critical
+        ));
+    }
+
+    #[test]
+    fn significance_core_logic_is_important() {
+        assert!(matches!(
+            determine_project_significance(
+                Path::new("src/claude/prompts.rs"),
+                &FilePurpose::CoreLogic
+            ),
+            ProjectSignificance::Important
+        ));
+    }
+
+    #[test]
+    fn significance_test_is_routine() {
+        assert!(matches!(
+            determine_project_significance(Path::new("tests/test.rs"), &FilePurpose::Test),
+            ProjectSignificance::Routine
+        ));
+    }
+
+    // ── is_* helper functions ──────────────────────────────────────
+
+    #[test]
+    fn test_file_detected() {
+        assert!(is_test_file("tests/integration.rs", "integration.rs"));
+        assert!(is_test_file("src/foo_test.rs", "foo_test.rs"));
+        assert!(!is_test_file("src/main.rs", "main.rs"));
+    }
+
+    #[test]
+    fn documentation_file_detected() {
+        assert!(is_documentation_file("README.md", "readme.md"));
+        assert!(is_documentation_file("docs/guide.md", "guide.md"));
+        assert!(!is_documentation_file("src/main.rs", "main.rs"));
+    }
+
+    #[test]
+    fn build_file_detected() {
+        assert!(is_build_file("scripts/deploy.sh", "deploy.sh"));
+        assert!(is_build_file("Makefile", "makefile"));
+        assert!(!is_build_file("src/main.rs", "main.rs"));
+    }
+
+    #[test]
+    fn interface_file_detected() {
+        assert!(is_interface_file("src/api/routes.rs", "routes.rs"));
+        assert!(is_interface_file("protos/service.proto", "service.proto"));
+        assert!(!is_interface_file("src/claude/prompts.rs", "prompts.rs"));
+    }
+
+    // ── FileAnalyzer ───────────────────────────────────────────────
+
+    #[test]
+    fn analyze_file_rust_source() {
+        let ctx = FileAnalyzer::analyze_file(Path::new("src/claude/prompts.rs"), "M");
+        assert!(matches!(ctx.file_purpose, FilePurpose::CoreLogic));
+        assert!(matches!(ctx.change_impact, ChangeImpact::Modification));
+        assert!(matches!(
+            ctx.project_significance,
+            ProjectSignificance::Important
+        ));
+    }
+
+    #[test]
+    fn analyze_file_set_multiple() {
+        let files = vec![
+            (PathBuf::from("src/main.rs"), "M".to_string()),
+            (PathBuf::from("README.md"), "M".to_string()),
+        ];
+        let contexts = FileAnalyzer::analyze_file_set(&files);
+        assert_eq!(contexts.len(), 2);
+    }
+
+    #[test]
+    fn primary_architectural_impact_mixed() {
+        let contexts = vec![
+            FileAnalyzer::analyze_file(Path::new("src/data/check.rs"), "M"),
+            FileAnalyzer::analyze_file(Path::new("src/data/yaml.rs"), "M"),
+            FileAnalyzer::analyze_file(Path::new("README.md"), "M"),
+        ];
+        let layer = FileAnalyzer::primary_architectural_impact(&contexts);
+        assert_eq!(layer, ArchitecturalLayer::Data);
+    }
+
+    #[test]
+    fn primary_architectural_impact_empty() {
+        let layer = FileAnalyzer::primary_architectural_impact(&[]);
+        assert_eq!(layer, ArchitecturalLayer::Cross);
+    }
+
+    #[test]
+    fn is_architectural_change_critical_files() {
+        let contexts = vec![FileAnalyzer::analyze_file(Path::new("src/main.rs"), "D")];
+        assert!(FileAnalyzer::is_architectural_change(&contexts));
+    }
+
+    #[test]
+    fn is_architectural_change_many_files() {
+        let contexts: Vec<_> = (0..11)
+            .map(|i| FileAnalyzer::analyze_file(Path::new(&format!("src/file{i}.rs")), "M"))
+            .collect();
+        assert!(FileAnalyzer::is_architectural_change(&contexts));
+    }
+
+    #[test]
+    fn is_not_architectural_change_small() {
+        let contexts = vec![FileAnalyzer::analyze_file(
+            Path::new("src/claude/prompts.rs"),
+            "M",
+        )];
+        assert!(!FileAnalyzer::is_architectural_change(&contexts));
+    }
+}

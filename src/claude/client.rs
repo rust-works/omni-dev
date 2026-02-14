@@ -796,3 +796,168 @@ pub fn create_default_claude_client(
     debug!("Claude client created successfully");
     Ok(ClaudeClient::new(Box::new(ai_client)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::claude::ai::{AiClient, AiClientMetadata};
+    use std::future::Future;
+    use std::pin::Pin;
+
+    /// Mock AI client for testing — never makes real HTTP requests.
+    struct MockAiClient;
+
+    impl AiClient for MockAiClient {
+        fn send_request<'a>(
+            &'a self,
+            _system_prompt: &'a str,
+            _user_prompt: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+            Box::pin(async { Ok(String::new()) })
+        }
+
+        fn get_metadata(&self) -> AiClientMetadata {
+            AiClientMetadata {
+                provider: "Mock".to_string(),
+                model: "mock-model".to_string(),
+                max_context_length: 200_000,
+                max_response_length: 8_192,
+                active_beta: None,
+            }
+        }
+    }
+
+    fn make_client() -> ClaudeClient {
+        ClaudeClient::new(Box::new(MockAiClient))
+    }
+
+    // ── extract_yaml_from_response ─────────────────────────────────
+
+    #[test]
+    fn extract_yaml_pure_amendments() {
+        let client = make_client();
+        let content = "amendments:\n  - commit: abc123\n    message: test";
+        let result = client.extract_yaml_from_response(content);
+        assert!(result.starts_with("amendments:"));
+    }
+
+    #[test]
+    fn extract_yaml_with_markdown_yaml_block() {
+        let client = make_client();
+        let content = "Here is the result:\n```yaml\namendments:\n  - commit: abc\n```\n";
+        let result = client.extract_yaml_from_response(content);
+        assert!(result.starts_with("amendments:"));
+    }
+
+    #[test]
+    fn extract_yaml_with_generic_code_block() {
+        let client = make_client();
+        let content = "```\namendments:\n  - commit: abc\n```";
+        let result = client.extract_yaml_from_response(content);
+        assert!(result.starts_with("amendments:"));
+    }
+
+    #[test]
+    fn extract_yaml_with_whitespace() {
+        let client = make_client();
+        let content = "  \n  amendments:\n  - commit: abc\n  ";
+        let result = client.extract_yaml_from_response(content);
+        assert!(result.starts_with("amendments:"));
+    }
+
+    #[test]
+    fn extract_yaml_fallback_returns_trimmed() {
+        let client = make_client();
+        let content = "  some random text  ";
+        let result = client.extract_yaml_from_response(content);
+        assert_eq!(result, "some random text");
+    }
+
+    // ── extract_yaml_from_check_response ───────────────────────────
+
+    #[test]
+    fn extract_check_yaml_pure() {
+        let client = make_client();
+        let content = "checks:\n  - commit: abc123";
+        let result = client.extract_yaml_from_check_response(content);
+        assert!(result.starts_with("checks:"));
+    }
+
+    #[test]
+    fn extract_check_yaml_markdown_block() {
+        let client = make_client();
+        let content = "```yaml\nchecks:\n  - commit: abc\n```";
+        let result = client.extract_yaml_from_check_response(content);
+        assert!(result.starts_with("checks:"));
+    }
+
+    #[test]
+    fn extract_check_yaml_generic_block() {
+        let client = make_client();
+        let content = "```\nchecks:\n  - commit: abc\n```";
+        let result = client.extract_yaml_from_check_response(content);
+        assert!(result.starts_with("checks:"));
+    }
+
+    #[test]
+    fn extract_check_yaml_fallback() {
+        let client = make_client();
+        let content = "  unexpected content  ";
+        let result = client.extract_yaml_from_check_response(content);
+        assert_eq!(result, "unexpected content");
+    }
+
+    // ── parse_amendment_response ────────────────────────────────────
+
+    #[test]
+    fn parse_amendment_response_valid() {
+        let client = make_client();
+        let yaml = format!(
+            "amendments:\n  - commit: \"{}\"\n    message: \"test message\"",
+            "a".repeat(40)
+        );
+        let result = client.parse_amendment_response(&yaml);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().amendments.len(), 1);
+    }
+
+    #[test]
+    fn parse_amendment_response_invalid_yaml() {
+        let client = make_client();
+        let result = client.parse_amendment_response("not: valid: yaml: [{{");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_amendment_response_invalid_hash() {
+        let client = make_client();
+        let yaml = "amendments:\n  - commit: \"short\"\n    message: \"test\"";
+        let result = client.parse_amendment_response(yaml);
+        assert!(result.is_err());
+    }
+
+    // ── validate_beta_header ───────────────────────────────────────
+
+    #[test]
+    fn validate_beta_header_none_passes() {
+        let result = validate_beta_header("claude-opus-4-1-20250805", &None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_beta_header_unsupported_fails() {
+        let header = Some(("fake-key".to_string(), "fake-value".to_string()));
+        let result = validate_beta_header("claude-opus-4-1-20250805", &header);
+        assert!(result.is_err());
+    }
+
+    // ── ClaudeClient::new / get_ai_client_metadata ─────────────────
+
+    #[test]
+    fn client_metadata() {
+        let client = make_client();
+        let metadata = client.get_ai_client_metadata();
+        assert_eq!(metadata.provider, "Mock");
+        assert_eq!(metadata.model, "mock-model");
+    }
+}

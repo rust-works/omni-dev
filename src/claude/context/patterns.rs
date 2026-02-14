@@ -362,3 +362,339 @@ fn estimate_lines_changed(diff_summary: &str) -> i32 {
 
     total
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::commit::{CommitAnalysis, CommitInfo, FileChange, FileChanges};
+
+    fn make_commit(message: &str, files: Vec<(&str, &str)>) -> CommitInfo {
+        CommitInfo {
+            hash: "a".repeat(40),
+            author: "Test <test@test.com>".to_string(),
+            date: chrono::Utc::now().fixed_offset(),
+            original_message: message.to_string(),
+            in_main_branches: Vec::new(),
+            analysis: CommitAnalysis {
+                detected_type: String::new(),
+                detected_scope: String::new(),
+                proposed_message: String::new(),
+                file_changes: FileChanges {
+                    total_files: files.len(),
+                    files_added: files.iter().filter(|(s, _)| *s == "A").count(),
+                    files_deleted: files.iter().filter(|(s, _)| *s == "D").count(),
+                    file_list: files
+                        .into_iter()
+                        .map(|(status, file)| FileChange {
+                            status: status.to_string(),
+                            file: file.to_string(),
+                        })
+                        .collect(),
+                },
+                diff_summary: String::new(),
+                diff_file: String::new(),
+            },
+        }
+    }
+
+    fn make_commit_with_scope(message: &str, scope: &str) -> CommitInfo {
+        let mut commit = make_commit(message, vec![]);
+        commit.analysis.detected_scope = scope.to_string();
+        commit
+    }
+
+    // ── is_config_file ─────────────────────────────────────────────
+
+    #[test]
+    fn config_file_toml() {
+        assert!(is_config_file("Cargo.toml"));
+    }
+
+    #[test]
+    fn config_file_json() {
+        assert!(is_config_file("package.json"));
+    }
+
+    #[test]
+    fn config_file_yaml() {
+        assert!(is_config_file("config.yaml"));
+    }
+
+    #[test]
+    fn not_config_file_rs() {
+        assert!(!is_config_file("src/main.rs"));
+    }
+
+    // ── is_critical_file ───────────────────────────────────────────
+
+    #[test]
+    fn critical_file_main_rs() {
+        assert!(is_critical_file("src/main.rs"));
+    }
+
+    #[test]
+    fn critical_file_lib_rs() {
+        assert!(is_critical_file("src/lib.rs"));
+    }
+
+    #[test]
+    fn critical_file_cargo_toml() {
+        assert!(is_critical_file("Cargo.toml"));
+    }
+
+    #[test]
+    fn not_critical_file_helper() {
+        assert!(!is_critical_file("src/utils/helper.rs"));
+    }
+
+    // ── is_public_interface ────────────────────────────────────────
+
+    #[test]
+    fn public_interface_lib_rs() {
+        assert!(is_public_interface("src/lib.rs"));
+    }
+
+    #[test]
+    fn public_interface_mod_rs() {
+        assert!(is_public_interface("src/cli/mod.rs"));
+    }
+
+    #[test]
+    fn public_interface_proto() {
+        assert!(is_public_interface("api/service.proto"));
+    }
+
+    #[test]
+    fn not_public_interface_internal() {
+        assert!(!is_public_interface("src/utils/helper.rs"));
+    }
+
+    // ── estimate_lines_changed ─────────────────────────────────────
+
+    #[test]
+    fn estimate_lines_empty() {
+        assert_eq!(estimate_lines_changed(""), 0);
+    }
+
+    #[test]
+    fn estimate_lines_single_file() {
+        assert_eq!(estimate_lines_changed(" src/main.rs | 10 ++++"), 10);
+    }
+
+    #[test]
+    fn estimate_lines_multiple_files() {
+        let summary = " src/main.rs | 10 ++++\n src/lib.rs | 5 ++";
+        assert_eq!(estimate_lines_changed(summary), 15);
+    }
+
+    #[test]
+    fn estimate_lines_no_numbers() {
+        assert_eq!(estimate_lines_changed("no pipe here"), 0);
+    }
+
+    // ── detect_single_commit_pattern ───────────────────────────────
+
+    #[test]
+    fn single_commit_doc_pattern() {
+        let commit = make_commit("Update README", vec![("M", "README.md")]);
+        assert!(matches!(
+            WorkPatternAnalyzer::detect_work_pattern(&[commit]),
+            WorkPattern::Documentation
+        ));
+    }
+
+    #[test]
+    fn single_commit_config_pattern() {
+        let commit = make_commit("Update config", vec![("M", "settings.toml")]);
+        assert!(matches!(
+            WorkPatternAnalyzer::detect_work_pattern(&[commit]),
+            WorkPattern::Configuration
+        ));
+    }
+
+    #[test]
+    fn single_commit_refactor_pattern() {
+        let commit = make_commit("refactor: simplify logic", vec![("M", "src/core.rs")]);
+        assert!(matches!(
+            WorkPatternAnalyzer::detect_work_pattern(&[commit]),
+            WorkPattern::Refactoring
+        ));
+    }
+
+    #[test]
+    fn single_commit_bugfix_pattern() {
+        let commit = make_commit("fix: resolve crash", vec![("M", "src/handler.rs")]);
+        assert!(matches!(
+            WorkPatternAnalyzer::detect_work_pattern(&[commit]),
+            WorkPattern::BugHunt
+        ));
+    }
+
+    #[test]
+    fn single_commit_sequential_default() {
+        let commit = make_commit("feat: add feature", vec![("A", "src/new.rs")]);
+        assert!(matches!(
+            WorkPatternAnalyzer::detect_work_pattern(&[commit]),
+            WorkPattern::Sequential
+        ));
+    }
+
+    // ── multi-commit pattern detection ─────────────────────────────
+
+    #[test]
+    fn multi_commit_refactoring_pattern() {
+        let commits = vec![
+            make_commit("refactor: extract module", vec![]),
+            make_commit("cleanup: remove dead code", vec![]),
+            make_commit("simplify: reduce complexity", vec![]),
+        ];
+        assert!(matches!(
+            WorkPatternAnalyzer::detect_work_pattern(&commits),
+            WorkPattern::Refactoring
+        ));
+    }
+
+    #[test]
+    fn multi_commit_documentation_pattern() {
+        let commits = vec![
+            make_commit("doc: add API guide", vec![]),
+            make_commit("docs: update readme", vec![]),
+            make_commit("readme: add examples", vec![]),
+            make_commit("manual: update install guide", vec![]),
+        ];
+        assert!(matches!(
+            WorkPatternAnalyzer::detect_work_pattern(&commits),
+            WorkPattern::Documentation
+        ));
+    }
+
+    #[test]
+    fn multi_commit_bug_hunt_pattern() {
+        let commits = vec![
+            make_commit("fix: null pointer", vec![]),
+            make_commit("debug: add logging", vec![]),
+            make_commit("fix: race condition", vec![]),
+        ];
+        assert!(matches!(
+            WorkPatternAnalyzer::detect_work_pattern(&commits),
+            WorkPattern::BugHunt
+        ));
+    }
+
+    // ── scope consistency analysis ─────────────────────────────────
+
+    #[test]
+    fn scope_consistency_all_same() {
+        let commits = vec![
+            make_commit_with_scope("feat(cli): add flag", "cli"),
+            make_commit_with_scope("fix(cli): fix bug", "cli"),
+        ];
+        let analysis = WorkPatternAnalyzer::analyze_scope_consistency(&commits);
+        assert_eq!(analysis.consistent_scope, Some("cli".to_string()));
+        assert!(
+            (analysis.confidence - 1.0).abs() < f32::EPSILON,
+            "confidence should be 1.0 for consistent scope"
+        );
+    }
+
+    #[test]
+    fn scope_consistency_mixed() {
+        let commits = vec![
+            make_commit_with_scope("feat(cli): add flag", "cli"),
+            make_commit_with_scope("fix(git): fix bug", "git"),
+            make_commit_with_scope("feat(cli): another", "cli"),
+        ];
+        let analysis = WorkPatternAnalyzer::analyze_scope_consistency(&commits);
+        assert_eq!(analysis.consistent_scope, Some("cli".to_string()));
+    }
+
+    #[test]
+    fn scope_consistency_empty_scopes() {
+        let commits = vec![
+            make_commit_with_scope("update stuff", ""),
+            make_commit_with_scope("more stuff", ""),
+        ];
+        let analysis = WorkPatternAnalyzer::analyze_scope_consistency(&commits);
+        assert!(
+            analysis.confidence.abs() < f32::EPSILON,
+            "confidence should be 0.0 for empty scopes"
+        );
+    }
+
+    // ── architectural impact ───────────────────────────────────────
+
+    #[test]
+    fn architectural_impact_breaking() {
+        let commit = make_commit("remove API", vec![("D", "src/lib.rs")]);
+        let impact = WorkPatternAnalyzer::determine_architectural_impact(&[commit]);
+        assert!(matches!(impact, ArchitecturalImpact::Breaking));
+    }
+
+    #[test]
+    fn architectural_impact_significant_critical_files() {
+        let commit = make_commit("update main", vec![("M", "src/main.rs")]);
+        let impact = WorkPatternAnalyzer::determine_architectural_impact(&[commit]);
+        assert!(matches!(impact, ArchitecturalImpact::Significant));
+    }
+
+    #[test]
+    fn architectural_impact_minimal() {
+        let commit = make_commit("small fix", vec![("M", "src/utils/helper.rs")]);
+        let impact = WorkPatternAnalyzer::determine_architectural_impact(&[commit]);
+        assert!(matches!(impact, ArchitecturalImpact::Minimal));
+    }
+
+    // ── change significance ────────────────────────────────────────
+
+    #[test]
+    fn change_significance_critical_with_major_files() {
+        let commit = make_commit("big change", vec![("M", "src/main.rs")]);
+        let significance = WorkPatternAnalyzer::determine_change_significance(&[commit]);
+        assert!(matches!(significance, ChangeSignificance::Critical));
+    }
+
+    #[test]
+    fn change_significance_major_with_feat() {
+        let commit = make_commit("feat: add new feature", vec![("A", "src/new.rs")]);
+        let significance = WorkPatternAnalyzer::determine_change_significance(&[commit]);
+        assert!(matches!(significance, ChangeSignificance::Major));
+    }
+
+    #[test]
+    fn change_significance_minor_small_change() {
+        let commit = make_commit("tweak", vec![("M", "src/utils/helper.rs")]);
+        let significance = WorkPatternAnalyzer::determine_change_significance(&[commit]);
+        assert!(matches!(significance, ChangeSignificance::Minor));
+    }
+
+    // ── analyze_commit_range integration ───────────────────────────
+
+    #[test]
+    fn analyze_commit_range_empty() {
+        let context = WorkPatternAnalyzer::analyze_commit_range(&[]);
+        assert!(context.related_commits.is_empty());
+        assert!(context.common_files.is_empty());
+    }
+
+    #[test]
+    fn analyze_commit_range_single_commit() {
+        let commit = make_commit("feat: add feature", vec![("A", "src/new.rs")]);
+        let context = WorkPatternAnalyzer::analyze_commit_range(&[commit]);
+        assert_eq!(context.related_commits.len(), 1);
+        assert_eq!(context.common_files.len(), 1);
+    }
+
+    #[test]
+    fn analyze_commit_range_common_files() {
+        let commits = vec![
+            make_commit("first", vec![("M", "src/main.rs"), ("M", "src/lib.rs")]),
+            make_commit("second", vec![("M", "src/main.rs")]),
+        ];
+        let context = WorkPatternAnalyzer::analyze_commit_range(&commits);
+        // src/main.rs appears in both commits
+        assert!(context
+            .common_files
+            .iter()
+            .any(|f| f.to_string_lossy() == "src/main.rs"));
+    }
+}
