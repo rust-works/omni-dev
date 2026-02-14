@@ -163,3 +163,119 @@ impl Amendment {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // ── Amendment::validate ──────────────────────────────────────────
+
+    #[test]
+    fn valid_amendment() {
+        let amendment = Amendment::new("a".repeat(40), "feat: add feature".to_string());
+        assert!(amendment.validate().is_ok());
+    }
+
+    #[test]
+    fn short_hash_rejected() {
+        let amendment = Amendment::new("abc1234".to_string(), "feat: add feature".to_string());
+        let err = amendment.validate().unwrap_err();
+        assert!(err.to_string().contains("exactly"));
+    }
+
+    #[test]
+    fn uppercase_hash_rejected() {
+        let amendment = Amendment::new("A".repeat(40), "feat: add feature".to_string());
+        let err = amendment.validate().unwrap_err();
+        assert!(err.to_string().contains("lowercase"));
+    }
+
+    #[test]
+    fn non_hex_hash_rejected() {
+        let amendment = Amendment::new("g".repeat(40), "feat: add feature".to_string());
+        let err = amendment.validate().unwrap_err();
+        assert!(err.to_string().contains("hexadecimal"));
+    }
+
+    #[test]
+    fn empty_message_rejected() {
+        let amendment = Amendment::new("a".repeat(40), "   ".to_string());
+        let err = amendment.validate().unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn valid_hex_digits() {
+        // All valid hex chars: 0-9, a-f
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let amendment = Amendment::new(hash.to_string(), "fix: something".to_string());
+        assert!(amendment.validate().is_ok());
+    }
+
+    // ── AmendmentFile::validate ──────────────────────────────────────
+
+    #[test]
+    fn validate_empty_amendments_ok() {
+        let file = AmendmentFile { amendments: vec![] };
+        assert!(file.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_propagates_amendment_errors() {
+        let file = AmendmentFile {
+            amendments: vec![Amendment::new("short".to_string(), "msg".to_string())],
+        };
+        let err = file.validate().unwrap_err();
+        assert!(err.to_string().contains("index 0"));
+    }
+
+    // ── AmendmentFile round-trip ─────────────────────────────────────
+
+    #[test]
+    fn save_and_load_roundtrip() -> Result<()> {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("amendments.yaml");
+
+        let original = AmendmentFile {
+            amendments: vec![
+                Amendment {
+                    commit: "a".repeat(40),
+                    message: "feat(cli): add new command".to_string(),
+                    summary: Some("Adds the twiddle command".to_string()),
+                },
+                Amendment {
+                    commit: "b".repeat(40),
+                    message: "fix(git): resolve rebase issue\n\nDetailed body here.".to_string(),
+                    summary: None,
+                },
+            ],
+        };
+
+        original.save_to_file(&path)?;
+        let loaded = AmendmentFile::load_from_file(&path)?;
+
+        assert_eq!(loaded.amendments.len(), 2);
+        assert_eq!(loaded.amendments[0].commit, "a".repeat(40));
+        assert_eq!(loaded.amendments[0].message, "feat(cli): add new command");
+        assert_eq!(loaded.amendments[1].commit, "b".repeat(40));
+        assert!(loaded.amendments[1]
+            .message
+            .contains("resolve rebase issue"));
+        Ok(())
+    }
+
+    #[test]
+    fn load_invalid_yaml_fails() -> Result<()> {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("bad.yaml");
+        fs::write(&path, "not: valid: yaml: [{{")?;
+        assert!(AmendmentFile::load_from_file(&path).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn load_nonexistent_file_fails() {
+        assert!(AmendmentFile::load_from_file("/nonexistent/path.yaml").is_err());
+    }
+}

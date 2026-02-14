@@ -195,3 +195,228 @@ fn clean_description(description: &str) -> String {
 
     cleaned
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::context::WorkType;
+
+    // ── BranchAnalyzer::analyze ──────────────────────────────────────
+
+    #[test]
+    fn standard_branch_feat_with_scope() -> anyhow::Result<()> {
+        let ctx = BranchAnalyzer::analyze("feat/auth/add-login")?;
+        assert!(matches!(ctx.work_type, WorkType::Feature));
+        assert_eq!(ctx.scope, Some("auth".to_string()));
+        assert!(ctx.is_feature_branch);
+        Ok(())
+    }
+
+    #[test]
+    fn standard_branch_fix_no_scope() -> anyhow::Result<()> {
+        let ctx = BranchAnalyzer::analyze("fix/crash-on-startup")?;
+        assert!(matches!(ctx.work_type, WorkType::Fix));
+        assert!(ctx.scope.is_none());
+        assert!(ctx.is_feature_branch);
+        Ok(())
+    }
+
+    #[test]
+    fn standard_branch_refactor() -> anyhow::Result<()> {
+        let ctx = BranchAnalyzer::analyze("refactor/cleanup-modules")?;
+        assert!(matches!(ctx.work_type, WorkType::Refactor));
+        assert!(ctx.is_feature_branch);
+        Ok(())
+    }
+
+    #[test]
+    fn standard_branch_docs() -> anyhow::Result<()> {
+        let ctx = BranchAnalyzer::analyze("docs/update-readme")?;
+        assert!(matches!(ctx.work_type, WorkType::Docs));
+        assert!(!ctx.is_feature_branch); // Docs is not a feature branch
+        Ok(())
+    }
+
+    #[test]
+    fn ticket_branch_jira() -> anyhow::Result<()> {
+        let ctx = BranchAnalyzer::analyze("PROJ-123-add-feature")?;
+        assert_eq!(ctx.ticket_id, Some("PROJ-123".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn ticket_branch_issue() -> anyhow::Result<()> {
+        let ctx = BranchAnalyzer::analyze("issue-456-fix-bug")?;
+        assert_eq!(ctx.ticket_id, Some("issue-456".to_string()));
+        assert!(matches!(ctx.work_type, WorkType::Fix));
+        Ok(())
+    }
+
+    #[test]
+    fn user_branch() -> anyhow::Result<()> {
+        let ctx = BranchAnalyzer::analyze("johndoe/add-dark-mode")?;
+        assert!(matches!(ctx.work_type, WorkType::Feature));
+        Ok(())
+    }
+
+    #[test]
+    fn simple_branch_name() -> anyhow::Result<()> {
+        let ctx = BranchAnalyzer::analyze("add-login-page")?;
+        assert!(matches!(ctx.work_type, WorkType::Feature));
+        Ok(())
+    }
+
+    #[test]
+    fn main_branch() -> anyhow::Result<()> {
+        let ctx = BranchAnalyzer::analyze("main")?;
+        // "main" has no type keywords → defaults to Feature via infer_work_type_from_description
+        // but is_feature_branch is set based on work_type
+        assert!(matches!(ctx.work_type, WorkType::Feature));
+        Ok(())
+    }
+
+    // ── analyze_branching_strategy ───────────────────────────────────
+
+    #[test]
+    fn gitflow_branches() {
+        let branches: Vec<String> = vec![
+            "feature/add-auth".to_string(),
+            "release/1.0".to_string(),
+            "main".to_string(),
+        ];
+        assert!(matches!(
+            BranchAnalyzer::analyze_branching_strategy(&branches),
+            BranchingStrategy::GitFlow
+        ));
+    }
+
+    #[test]
+    fn conventional_branches() {
+        let branches: Vec<String> = vec!["feat/add-auth".to_string(), "fix/crash".to_string()];
+        assert!(matches!(
+            BranchAnalyzer::analyze_branching_strategy(&branches),
+            BranchingStrategy::ConventionalCommits
+        ));
+    }
+
+    #[test]
+    fn github_flow_branches() {
+        let branches: Vec<String> = vec!["short-name".to_string(), "another-branch".to_string()];
+        assert!(matches!(
+            BranchAnalyzer::analyze_branching_strategy(&branches),
+            BranchingStrategy::GitHubFlow
+        ));
+    }
+
+    #[test]
+    fn empty_branches_unknown() {
+        assert!(matches!(
+            BranchAnalyzer::analyze_branching_strategy(&[]),
+            BranchingStrategy::Unknown
+        ));
+    }
+
+    // ── infer_work_type_from_description ─────────────────────────────
+
+    #[test]
+    fn infer_fix_keywords() {
+        assert!(matches!(
+            infer_work_type_from_description("fix login bug"),
+            WorkType::Fix
+        ));
+        assert!(matches!(
+            infer_work_type_from_description("resolve issue"),
+            WorkType::Fix
+        ));
+    }
+
+    #[test]
+    fn infer_various_types() {
+        assert!(matches!(
+            infer_work_type_from_description("update docs"),
+            WorkType::Docs
+        ));
+        assert!(matches!(
+            infer_work_type_from_description("add test cases"),
+            WorkType::Test
+        ));
+        assert!(matches!(
+            infer_work_type_from_description("refactor modules"),
+            WorkType::Refactor
+        ));
+        assert!(matches!(
+            infer_work_type_from_description("ci pipeline"),
+            WorkType::Ci
+        ));
+        assert!(matches!(
+            infer_work_type_from_description("build config"),
+            WorkType::Build
+        ));
+        assert!(matches!(
+            infer_work_type_from_description("performance tuning"),
+            WorkType::Perf
+        ));
+        assert!(matches!(
+            infer_work_type_from_description("chore maintenance"),
+            WorkType::Chore
+        ));
+    }
+
+    #[test]
+    fn infer_default_feature() {
+        assert!(matches!(
+            infer_work_type_from_description("add login page"),
+            WorkType::Feature
+        ));
+    }
+
+    // ── clean_description ────────────────────────────────────────────
+
+    #[test]
+    fn clean_removes_prefixes() {
+        assert_eq!(clean_description("add login page"), "Login page");
+        assert_eq!(clean_description("implement auth"), "Auth");
+        assert_eq!(clean_description("fix crash"), "Crash");
+    }
+
+    #[test]
+    fn clean_capitalizes() {
+        assert_eq!(clean_description("some description"), "Some description");
+    }
+
+    #[test]
+    fn clean_trims_whitespace() {
+        assert_eq!(clean_description("  hello  "), "Hello");
+    }
+
+    // ── extract_ticket_references ────────────────────────────────────
+
+    #[test]
+    fn extract_jira_ticket() {
+        assert_eq!(
+            extract_ticket_references("PROJ-123-some-work"),
+            Some("PROJ-123".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_issue_reference() {
+        assert_eq!(
+            extract_ticket_references("issue-456-fix"),
+            Some("issue-456".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_hash_reference() {
+        assert_eq!(
+            extract_ticket_references("work-on-#789"),
+            Some("#789".to_string())
+        );
+    }
+
+    #[test]
+    fn no_ticket_reference() {
+        assert_eq!(extract_ticket_references("plain-branch-name"), None);
+    }
+}

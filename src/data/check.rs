@@ -291,3 +291,215 @@ impl From<AiCommitCheck> for CommitCheckResult {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── IssueSeverity ────────────────────────────────────────────────
+
+    #[test]
+    fn severity_parse_known() {
+        assert_eq!(IssueSeverity::parse("error"), IssueSeverity::Error);
+        assert_eq!(IssueSeverity::parse("warning"), IssueSeverity::Warning);
+        assert_eq!(IssueSeverity::parse("info"), IssueSeverity::Info);
+    }
+
+    #[test]
+    fn severity_parse_case_insensitive() {
+        assert_eq!(IssueSeverity::parse("ERROR"), IssueSeverity::Error);
+        assert_eq!(IssueSeverity::parse("Warning"), IssueSeverity::Warning);
+        assert_eq!(IssueSeverity::parse("INFO"), IssueSeverity::Info);
+    }
+
+    #[test]
+    fn severity_parse_unknown_defaults_warning() {
+        assert_eq!(IssueSeverity::parse("foo"), IssueSeverity::Warning);
+        assert_eq!(IssueSeverity::parse(""), IssueSeverity::Warning);
+    }
+
+    #[test]
+    fn severity_display() {
+        assert_eq!(IssueSeverity::Error.to_string(), "ERROR");
+        assert_eq!(IssueSeverity::Warning.to_string(), "WARNING");
+        assert_eq!(IssueSeverity::Info.to_string(), "INFO");
+    }
+
+    // ── OutputFormat ─────────────────────────────────────────────────
+
+    #[test]
+    fn output_format_parsing() {
+        assert_eq!("text".parse::<OutputFormat>(), Ok(OutputFormat::Text));
+        assert_eq!("json".parse::<OutputFormat>(), Ok(OutputFormat::Json));
+        assert_eq!("yaml".parse::<OutputFormat>(), Ok(OutputFormat::Yaml));
+        assert!("unknown".parse::<OutputFormat>().is_err());
+    }
+
+    #[test]
+    fn output_format_display() {
+        assert_eq!(OutputFormat::Text.to_string(), "text");
+        assert_eq!(OutputFormat::Json.to_string(), "json");
+        assert_eq!(OutputFormat::Yaml.to_string(), "yaml");
+    }
+
+    // ── CheckSummary ─────────────────────────────────────────────────
+
+    fn make_result(passes: bool, issues: Vec<CommitIssue>) -> CommitCheckResult {
+        CommitCheckResult {
+            hash: "abc123".to_string(),
+            message: "test".to_string(),
+            issues,
+            suggestion: None,
+            passes,
+            summary: None,
+        }
+    }
+
+    fn make_issue(severity: IssueSeverity) -> CommitIssue {
+        CommitIssue {
+            severity,
+            section: "Format".to_string(),
+            rule: "test-rule".to_string(),
+            explanation: "test explanation".to_string(),
+        }
+    }
+
+    #[test]
+    fn summary_empty_results() {
+        let summary = CheckSummary::from_results(&[]);
+        assert_eq!(summary.total_commits, 0);
+        assert_eq!(summary.passing_commits, 0);
+        assert_eq!(summary.failing_commits, 0);
+        assert_eq!(summary.error_count, 0);
+        assert_eq!(summary.warning_count, 0);
+        assert_eq!(summary.info_count, 0);
+    }
+
+    #[test]
+    fn summary_mixed_results() {
+        let results = vec![
+            make_result(
+                false,
+                vec![
+                    make_issue(IssueSeverity::Error),
+                    make_issue(IssueSeverity::Warning),
+                ],
+            ),
+            make_result(true, vec![make_issue(IssueSeverity::Info)]),
+        ];
+        let summary = CheckSummary::from_results(&results);
+        assert_eq!(summary.total_commits, 2);
+        assert_eq!(summary.passing_commits, 1);
+        assert_eq!(summary.failing_commits, 1);
+        assert_eq!(summary.error_count, 1);
+        assert_eq!(summary.warning_count, 1);
+        assert_eq!(summary.info_count, 1);
+    }
+
+    #[test]
+    fn summary_all_passing() {
+        let results = vec![make_result(true, vec![]), make_result(true, vec![])];
+        let summary = CheckSummary::from_results(&results);
+        assert_eq!(summary.passing_commits, 2);
+        assert_eq!(summary.failing_commits, 0);
+    }
+
+    // ── CheckReport::exit_code ───────────────────────────────────────
+
+    #[test]
+    fn exit_code_no_issues() {
+        let report = CheckReport::new(vec![make_result(true, vec![])]);
+        assert_eq!(report.exit_code(false), 0);
+        assert_eq!(report.exit_code(true), 0);
+    }
+
+    #[test]
+    fn exit_code_errors() {
+        let report = CheckReport::new(vec![make_result(
+            false,
+            vec![make_issue(IssueSeverity::Error)],
+        )]);
+        assert_eq!(report.exit_code(false), 1);
+        assert_eq!(report.exit_code(true), 1);
+    }
+
+    #[test]
+    fn exit_code_warnings_strict() {
+        let report = CheckReport::new(vec![make_result(
+            false,
+            vec![make_issue(IssueSeverity::Warning)],
+        )]);
+        assert_eq!(report.exit_code(false), 0);
+        assert_eq!(report.exit_code(true), 2);
+    }
+
+    #[test]
+    fn has_errors_and_warnings() {
+        let report = CheckReport::new(vec![make_result(
+            false,
+            vec![
+                make_issue(IssueSeverity::Error),
+                make_issue(IssueSeverity::Warning),
+            ],
+        )]);
+        assert!(report.has_errors());
+        assert!(report.has_warnings());
+    }
+
+    // ── From<AiCommitCheck> ──────────────────────────────────────────
+
+    #[test]
+    fn ai_check_converts_issues() {
+        let ai = AiCommitCheck {
+            commit: "abc123".to_string(),
+            passes: false,
+            issues: vec![AiIssue {
+                severity: "error".to_string(),
+                section: "Format".to_string(),
+                rule: "subject-line".to_string(),
+                explanation: "too long".to_string(),
+            }],
+            suggestion: None,
+            summary: Some("Added feature".to_string()),
+        };
+        let result: CommitCheckResult = ai.into();
+        assert_eq!(result.hash, "abc123");
+        assert!(!result.passes);
+        assert_eq!(result.issues.len(), 1);
+        assert_eq!(result.issues[0].severity, IssueSeverity::Error);
+        assert_eq!(result.issues[0].section, "Format");
+        assert_eq!(result.summary, Some("Added feature".to_string()));
+    }
+
+    #[test]
+    fn ai_check_converts_suggestion() {
+        let ai = AiCommitCheck {
+            commit: "def456".to_string(),
+            passes: false,
+            issues: vec![],
+            suggestion: Some(AiSuggestion {
+                message: "feat(cli): better message".to_string(),
+                explanation: "improved clarity".to_string(),
+            }),
+            summary: None,
+        };
+        let result: CommitCheckResult = ai.into();
+        let suggestion = result.suggestion.unwrap();
+        assert_eq!(suggestion.message, "feat(cli): better message");
+        assert_eq!(suggestion.explanation, "improved clarity");
+    }
+
+    #[test]
+    fn ai_check_no_suggestion() {
+        let ai = AiCommitCheck {
+            commit: "abc".to_string(),
+            passes: true,
+            issues: vec![],
+            suggestion: None,
+            summary: None,
+        };
+        let result: CommitCheckResult = ai.into();
+        assert!(result.suggestion.is_none());
+        assert!(result.passes);
+    }
+}

@@ -693,3 +693,352 @@ impl CommitAnalysisForAI {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::context::ScopeDefinition;
+
+    // ── extract_conventional_type ────────────────────────────────────
+
+    #[test]
+    fn conventional_type_feat_with_scope() {
+        assert_eq!(
+            CommitAnalysis::extract_conventional_type("feat(cli): add flag"),
+            Some("feat".to_string())
+        );
+    }
+
+    #[test]
+    fn conventional_type_without_scope() {
+        assert_eq!(
+            CommitAnalysis::extract_conventional_type("fix: resolve bug"),
+            Some("fix".to_string())
+        );
+    }
+
+    #[test]
+    fn conventional_type_invalid_message() {
+        assert_eq!(
+            CommitAnalysis::extract_conventional_type("random message without colon"),
+            None
+        );
+    }
+
+    #[test]
+    fn conventional_type_unknown_type() {
+        assert_eq!(
+            CommitAnalysis::extract_conventional_type("yolo(scope): stuff"),
+            None
+        );
+    }
+
+    #[test]
+    fn conventional_type_all_valid_types() {
+        let types = [
+            "feat", "fix", "docs", "style", "refactor", "test", "chore", "build", "ci", "perf",
+        ];
+        for t in types {
+            let msg = format!("{t}: description");
+            assert_eq!(
+                CommitAnalysis::extract_conventional_type(&msg),
+                Some(t.to_string()),
+                "expected Some for type '{t}'"
+            );
+        }
+    }
+
+    // ── is_valid_conventional_type ───────────────────────────────────
+
+    #[test]
+    fn valid_conventional_types() {
+        for t in [
+            "feat", "fix", "docs", "style", "refactor", "test", "chore", "build", "ci", "perf",
+        ] {
+            assert!(
+                CommitAnalysis::is_valid_conventional_type(t),
+                "'{t}' should be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_conventional_types() {
+        for t in ["yolo", "Feat", "", "FEAT", "feature", "bugfix"] {
+            assert!(
+                !CommitAnalysis::is_valid_conventional_type(t),
+                "'{t}' should be invalid"
+            );
+        }
+    }
+
+    // ── detect_scope ─────────────────────────────────────────────────
+
+    fn make_file_changes(files: &[(&str, &str)]) -> FileChanges {
+        FileChanges {
+            total_files: files.len(),
+            files_added: files.iter().filter(|(s, _)| *s == "A").count(),
+            files_deleted: files.iter().filter(|(s, _)| *s == "D").count(),
+            file_list: files
+                .iter()
+                .map(|(status, file)| FileChange {
+                    status: (*status).to_string(),
+                    file: (*file).to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn scope_from_cli_files() {
+        let changes = make_file_changes(&[("M", "src/cli/commands.rs")]);
+        assert_eq!(CommitAnalysis::detect_scope(&changes), "cli");
+    }
+
+    #[test]
+    fn scope_from_git_files() {
+        let changes = make_file_changes(&[("M", "src/git/remote.rs")]);
+        assert_eq!(CommitAnalysis::detect_scope(&changes), "git");
+    }
+
+    #[test]
+    fn scope_from_docs_files() {
+        let changes = make_file_changes(&[("M", "docs/README.md")]);
+        assert_eq!(CommitAnalysis::detect_scope(&changes), "docs");
+    }
+
+    #[test]
+    fn scope_from_data_files() {
+        let changes = make_file_changes(&[("M", "src/data/yaml.rs")]);
+        assert_eq!(CommitAnalysis::detect_scope(&changes), "data");
+    }
+
+    #[test]
+    fn scope_from_test_files() {
+        let changes = make_file_changes(&[("A", "tests/new_test.rs")]);
+        assert_eq!(CommitAnalysis::detect_scope(&changes), "test");
+    }
+
+    #[test]
+    fn scope_from_deps_files() {
+        let changes = make_file_changes(&[("M", "Cargo.toml")]);
+        assert_eq!(CommitAnalysis::detect_scope(&changes), "deps");
+    }
+
+    #[test]
+    fn scope_unknown_files() {
+        let changes = make_file_changes(&[("M", "random/path/file.txt")]);
+        assert_eq!(CommitAnalysis::detect_scope(&changes), "");
+    }
+
+    // ── count_specificity ────────────────────────────────────────────
+
+    #[test]
+    fn count_specificity_deep_path() {
+        assert_eq!(CommitAnalysis::count_specificity("src/main/scala/**"), 3);
+    }
+
+    #[test]
+    fn count_specificity_shallow() {
+        assert_eq!(CommitAnalysis::count_specificity("docs/**"), 1);
+    }
+
+    #[test]
+    fn count_specificity_wildcard_only() {
+        assert_eq!(CommitAnalysis::count_specificity("*.md"), 0);
+    }
+
+    #[test]
+    fn count_specificity_no_wildcards() {
+        assert_eq!(CommitAnalysis::count_specificity("src/lib.rs"), 2);
+    }
+
+    // ── scope_matches_files ──────────────────────────────────────────
+
+    #[test]
+    fn scope_matches_positive_patterns() {
+        let patterns = vec!["src/cli/**".to_string()];
+        let files = &["src/cli/commands.rs"];
+        assert!(CommitAnalysis::scope_matches_files(files, &patterns).is_some());
+    }
+
+    #[test]
+    fn scope_matches_no_match() {
+        let patterns = vec!["src/cli/**".to_string()];
+        let files = &["src/git/remote.rs"];
+        assert!(CommitAnalysis::scope_matches_files(files, &patterns).is_none());
+    }
+
+    #[test]
+    fn scope_matches_with_negation() {
+        let patterns = vec!["src/**".to_string(), "!src/test/**".to_string()];
+        // File in src/ but not in src/test/ should match
+        let files = &["src/lib.rs"];
+        assert!(CommitAnalysis::scope_matches_files(files, &patterns).is_some());
+
+        // File in src/test/ should be excluded
+        let test_files = &["src/test/helper.rs"];
+        assert!(CommitAnalysis::scope_matches_files(test_files, &patterns).is_none());
+    }
+
+    // ── refine_scope ─────────────────────────────────────────────────
+
+    fn make_scope_def(name: &str, patterns: &[&str]) -> ScopeDefinition {
+        ScopeDefinition {
+            name: name.to_string(),
+            description: String::new(),
+            examples: vec![],
+            file_patterns: patterns.iter().map(|p| (*p).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn refine_scope_empty_defs() {
+        let mut analysis = CommitAnalysis {
+            detected_type: "feat".to_string(),
+            detected_scope: "original".to_string(),
+            proposed_message: String::new(),
+            file_changes: make_file_changes(&[("M", "src/cli/commands.rs")]),
+            diff_summary: String::new(),
+            diff_file: String::new(),
+        };
+        analysis.refine_scope(&[]);
+        assert_eq!(analysis.detected_scope, "original");
+    }
+
+    #[test]
+    fn refine_scope_most_specific_wins() {
+        let scope_defs = vec![
+            make_scope_def("lib", &["src/**"]),
+            make_scope_def("cli", &["src/cli/**"]),
+        ];
+        let mut analysis = CommitAnalysis {
+            detected_type: "feat".to_string(),
+            detected_scope: String::new(),
+            proposed_message: String::new(),
+            file_changes: make_file_changes(&[("M", "src/cli/commands.rs")]),
+            diff_summary: String::new(),
+            diff_file: String::new(),
+        };
+        analysis.refine_scope(&scope_defs);
+        assert_eq!(analysis.detected_scope, "cli");
+    }
+
+    #[test]
+    fn refine_scope_no_matching_files() {
+        let scope_defs = vec![make_scope_def("cli", &["src/cli/**"])];
+        let mut analysis = CommitAnalysis {
+            detected_type: "feat".to_string(),
+            detected_scope: "original".to_string(),
+            proposed_message: String::new(),
+            file_changes: make_file_changes(&[("M", "README.md")]),
+            diff_summary: String::new(),
+            diff_file: String::new(),
+        };
+        analysis.refine_scope(&scope_defs);
+        // No match → keeps original
+        assert_eq!(analysis.detected_scope, "original");
+    }
+
+    #[test]
+    fn refine_scope_equal_specificity_joins() {
+        let scope_defs = vec![
+            make_scope_def("cli", &["src/cli/**"]),
+            make_scope_def("git", &["src/git/**"]),
+        ];
+        let mut analysis = CommitAnalysis {
+            detected_type: "feat".to_string(),
+            detected_scope: String::new(),
+            proposed_message: String::new(),
+            file_changes: make_file_changes(&[
+                ("M", "src/cli/commands.rs"),
+                ("M", "src/git/remote.rs"),
+            ]),
+            diff_summary: String::new(),
+            diff_file: String::new(),
+        };
+        analysis.refine_scope(&scope_defs);
+        // Both have specificity 2 and both match → joined
+        assert!(
+            analysis.detected_scope == "cli, git" || analysis.detected_scope == "git, cli",
+            "expected joined scopes, got: {}",
+            analysis.detected_scope
+        );
+    }
+
+    // ── run_pre_validation_checks ────────────────────────────────────
+
+    fn make_commit_info_for_ai(message: &str) -> CommitInfoForAI {
+        CommitInfoForAI {
+            hash: "a".repeat(40),
+            author: "Test <test@example.com>".to_string(),
+            date: chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00+00:00").unwrap(),
+            original_message: message.to_string(),
+            in_main_branches: vec![],
+            analysis: CommitAnalysisForAI {
+                detected_type: "feat".to_string(),
+                detected_scope: String::new(),
+                proposed_message: String::new(),
+                file_changes: make_file_changes(&[]),
+                diff_summary: String::new(),
+                diff_file: String::new(),
+                diff_content: String::new(),
+            },
+            pre_validated_checks: vec![],
+        }
+    }
+
+    #[test]
+    fn pre_validation_valid_single_scope() {
+        let scopes = vec![make_scope_def("cli", &["src/cli/**"])];
+        let mut info = make_commit_info_for_ai("feat(cli): add command");
+        info.run_pre_validation_checks(&scopes);
+        assert!(
+            info.pre_validated_checks
+                .iter()
+                .any(|c| c.contains("Scope validity verified")),
+            "expected scope validity check, got: {:?}",
+            info.pre_validated_checks
+        );
+    }
+
+    #[test]
+    fn pre_validation_multi_scope() {
+        let scopes = vec![
+            make_scope_def("cli", &["src/cli/**"]),
+            make_scope_def("git", &["src/git/**"]),
+        ];
+        let mut info = make_commit_info_for_ai("feat(cli,git): cross-cutting change");
+        info.run_pre_validation_checks(&scopes);
+        assert!(info
+            .pre_validated_checks
+            .iter()
+            .any(|c| c.contains("Scope validity verified")),);
+        assert!(info
+            .pre_validated_checks
+            .iter()
+            .any(|c| c.contains("multi-scope")),);
+    }
+
+    #[test]
+    fn pre_validation_invalid_scope_not_added() {
+        let scopes = vec![make_scope_def("cli", &["src/cli/**"])];
+        let mut info = make_commit_info_for_ai("feat(unknown): something");
+        info.run_pre_validation_checks(&scopes);
+        assert!(
+            !info
+                .pre_validated_checks
+                .iter()
+                .any(|c| c.contains("Scope validity verified")),
+            "should not validate unknown scope"
+        );
+    }
+
+    #[test]
+    fn pre_validation_no_scope_message() {
+        let scopes = vec![make_scope_def("cli", &["src/cli/**"])];
+        let mut info = make_commit_info_for_ai("feat: no scope here");
+        info.run_pre_validation_checks(&scopes);
+        assert!(info.pre_validated_checks.is_empty());
+    }
+}
