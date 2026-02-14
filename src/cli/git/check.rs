@@ -165,7 +165,7 @@ impl CheckCommand {
         self.output_report(&report, output_format)?;
 
         // 8. If --twiddle and there are errors with suggestions, offer to apply them
-        if self.twiddle && report.has_errors() && output_format == OutputFormat::Text {
+        if should_offer_twiddle(self.twiddle, report.has_errors(), output_format) {
             let amendments = self.build_amendments_from_suggestions(&report, &repo_view);
             if !amendments.is_empty() && self.prompt_and_apply_suggestions(amendments).await? {
                 // Amendments applied — exit successfully
@@ -620,26 +620,18 @@ impl CheckCommand {
         println!();
 
         for result in &report.commits {
-            // Skip passing commits unless --show-passing is set
-            if result.passes && !self.show_passing {
+            if !should_display_commit(result.passes, self.show_passing) {
                 continue;
             }
 
             // Skip info-only commits in quiet mode
-            if self.quiet {
-                let has_errors_or_warnings = result
-                    .issues
-                    .iter()
-                    .any(|i| matches!(i.severity, IssueSeverity::Error | IssueSeverity::Warning));
-                if !has_errors_or_warnings {
-                    continue;
-                }
+            if self.quiet && !has_errors_or_warnings(&result.issues) {
+                continue;
             }
 
             let icon = super::formatting::determine_commit_icon(result.passes, &result.issues);
             let short_hash = super::formatting::truncate_hash(&result.hash);
-
-            println!("{} {} - \"{}\"", icon, short_hash, result.message);
+            println!("{}", format_commit_line(icon, short_hash, &result.message));
 
             // Print issues
             for issue in &result.issues {
@@ -649,7 +641,6 @@ impl CheckCommand {
                 }
 
                 let severity_str = super::formatting::format_severity_label(issue.severity);
-
                 println!(
                     "   {} [{}] {}",
                     severity_str, issue.section, issue.explanation
@@ -660,17 +651,7 @@ impl CheckCommand {
             if !self.quiet {
                 if let Some(suggestion) = &result.suggestion {
                     println!();
-                    println!("   Suggested message:");
-                    for line in suggestion.message.lines() {
-                        println!("      {line}");
-                    }
-                    if self.verbose {
-                        println!();
-                        println!("   Why this is better:");
-                        for line in suggestion.explanation.lines() {
-                            println!("   {line}");
-                        }
-                    }
+                    print!("{}", format_suggestion_text(suggestion, self.verbose));
                 }
             }
 
@@ -678,16 +659,7 @@ impl CheckCommand {
         }
 
         // Print summary
-        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        println!("Summary: {} commits checked", report.summary.total_commits);
-        println!(
-            "  {} errors, {} warnings",
-            report.summary.error_count, report.summary.warning_count
-        );
-        println!(
-            "  {} passed, {} with issues",
-            report.summary.passing_commits, report.summary.failing_commits
-        );
+        println!("{}", format_summary_text(&report.summary));
 
         Ok(())
     }
@@ -793,5 +765,210 @@ impl CheckCommand {
                 }
             }
         }
+    }
+}
+
+// --- Extracted pure functions ---
+
+/// Returns whether a commit should be displayed based on its pass status.
+fn should_display_commit(passes: bool, show_passing: bool) -> bool {
+    !passes || show_passing
+}
+
+/// Returns whether any issues have Error or Warning severity.
+fn has_errors_or_warnings(issues: &[crate::data::check::CommitIssue]) -> bool {
+    use crate::data::check::IssueSeverity;
+    issues
+        .iter()
+        .any(|i| matches!(i.severity, IssueSeverity::Error | IssueSeverity::Warning))
+}
+
+/// Returns whether the twiddle (auto-fix) flow should be offered.
+fn should_offer_twiddle(
+    twiddle_flag: bool,
+    has_errors: bool,
+    format: crate::data::check::OutputFormat,
+) -> bool {
+    twiddle_flag && has_errors && format == crate::data::check::OutputFormat::Text
+}
+
+/// Formats a commit suggestion as indented text.
+fn format_suggestion_text(
+    suggestion: &crate::data::check::CommitSuggestion,
+    verbose: bool,
+) -> String {
+    let mut output = String::new();
+    output.push_str("   Suggested message:\n");
+    for line in suggestion.message.lines() {
+        output.push_str(&format!("      {line}\n"));
+    }
+    if verbose {
+        output.push('\n');
+        output.push_str("   Why this is better:\n");
+        for line in suggestion.explanation.lines() {
+            output.push_str(&format!("   {line}\n"));
+        }
+    }
+    output
+}
+
+/// Formats the summary section of a check report.
+fn format_summary_text(summary: &crate::data::check::CheckSummary) -> String {
+    format!(
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
+         Summary: {} commits checked\n\
+         \x20 {} errors, {} warnings\n\
+         \x20 {} passed, {} with issues",
+        summary.total_commits,
+        summary.error_count,
+        summary.warning_count,
+        summary.passing_commits,
+        summary.failing_commits,
+    )
+}
+
+/// Formats a single commit line for text output.
+fn format_commit_line(icon: &str, short_hash: &str, message: &str) -> String {
+    format!("{icon} {short_hash} - \"{message}\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::check::{
+        CheckSummary, CommitIssue, CommitSuggestion, IssueSeverity, OutputFormat,
+    };
+
+    // --- should_display_commit ---
+
+    #[test]
+    fn display_commit_passing_hidden() {
+        assert!(!should_display_commit(true, false));
+    }
+
+    #[test]
+    fn display_commit_passing_shown() {
+        assert!(should_display_commit(true, true));
+    }
+
+    #[test]
+    fn display_commit_failing() {
+        assert!(should_display_commit(false, false));
+        assert!(should_display_commit(false, true));
+    }
+
+    // --- has_errors_or_warnings ---
+
+    #[test]
+    fn errors_or_warnings_with_error() {
+        let issues = vec![CommitIssue {
+            severity: IssueSeverity::Error,
+            section: "subject".to_string(),
+            rule: "length".to_string(),
+            explanation: "too long".to_string(),
+        }];
+        assert!(has_errors_or_warnings(&issues));
+    }
+
+    #[test]
+    fn errors_or_warnings_with_warning() {
+        let issues = vec![CommitIssue {
+            severity: IssueSeverity::Warning,
+            section: "body".to_string(),
+            rule: "style".to_string(),
+            explanation: "minor issue".to_string(),
+        }];
+        assert!(has_errors_or_warnings(&issues));
+    }
+
+    #[test]
+    fn errors_or_warnings_info_only() {
+        let issues = vec![CommitIssue {
+            severity: IssueSeverity::Info,
+            section: "body".to_string(),
+            rule: "suggestion".to_string(),
+            explanation: "consider adding more detail".to_string(),
+        }];
+        assert!(!has_errors_or_warnings(&issues));
+    }
+
+    #[test]
+    fn errors_or_warnings_empty() {
+        assert!(!has_errors_or_warnings(&[]));
+    }
+
+    // --- should_offer_twiddle ---
+
+    #[test]
+    fn offer_twiddle_all_conditions_met() {
+        assert!(should_offer_twiddle(true, true, OutputFormat::Text));
+    }
+
+    #[test]
+    fn offer_twiddle_flag_off() {
+        assert!(!should_offer_twiddle(false, true, OutputFormat::Text));
+    }
+
+    #[test]
+    fn offer_twiddle_no_errors() {
+        assert!(!should_offer_twiddle(true, false, OutputFormat::Text));
+    }
+
+    #[test]
+    fn offer_twiddle_json_format() {
+        assert!(!should_offer_twiddle(true, true, OutputFormat::Json));
+    }
+
+    // --- format_suggestion_text ---
+
+    #[test]
+    fn suggestion_text_basic() {
+        let suggestion = CommitSuggestion {
+            message: "feat(cli): add new flag".to_string(),
+            explanation: "uses conventional format".to_string(),
+        };
+        let result = format_suggestion_text(&suggestion, false);
+        assert!(result.contains("Suggested message:"));
+        assert!(result.contains("feat(cli): add new flag"));
+        assert!(!result.contains("Why this is better"));
+    }
+
+    #[test]
+    fn suggestion_text_verbose() {
+        let suggestion = CommitSuggestion {
+            message: "fix: resolve crash".to_string(),
+            explanation: "clear description of fix".to_string(),
+        };
+        let result = format_suggestion_text(&suggestion, true);
+        assert!(result.contains("Suggested message:"));
+        assert!(result.contains("fix: resolve crash"));
+        assert!(result.contains("Why this is better:"));
+        assert!(result.contains("clear description of fix"));
+    }
+
+    // --- format_summary_text ---
+
+    #[test]
+    fn summary_text_formatting() {
+        let summary = CheckSummary {
+            total_commits: 5,
+            passing_commits: 3,
+            failing_commits: 2,
+            error_count: 1,
+            warning_count: 4,
+            info_count: 0,
+        };
+        let result = format_summary_text(&summary);
+        assert!(result.contains("5 commits checked"));
+        assert!(result.contains("1 errors, 4 warnings"));
+        assert!(result.contains("3 passed, 2 with issues"));
+    }
+
+    // --- format_commit_line ---
+
+    #[test]
+    fn commit_line_formatting() {
+        let line = format_commit_line("✅", "abc1234", "feat: add feature");
+        assert_eq!(line, "✅ abc1234 - \"feat: add feature\"");
     }
 }
