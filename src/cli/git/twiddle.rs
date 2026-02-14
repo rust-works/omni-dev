@@ -688,10 +688,7 @@ impl TwiddleCommand {
         let mut context = CommitContext::new();
 
         // 1. Discover project context
-        let context_dir = self
-            .context_dir
-            .clone()
-            .unwrap_or_else(|| std::path::PathBuf::from(".omni-dev"));
+        let context_dir = resolve_context_dir(self.context_dir.as_deref());
 
         // ProjectDiscovery takes repo root and context directory
         let repo_root = std::path::PathBuf::from(".");
@@ -744,19 +741,14 @@ impl TwiddleCommand {
 
     /// Shows the context summary to the user.
     fn show_context_summary(&self, context: &crate::data::context::CommitContext) -> Result<()> {
-        use crate::data::context::{VerbosityLevel, WorkPattern};
-
         println!("🔍 Context Analysis:");
 
         // Project context
         if !context.project.valid_scopes.is_empty() {
-            let scope_names: Vec<&str> = context
-                .project
-                .valid_scopes
-                .iter()
-                .map(|s| s.name.as_str())
-                .collect();
-            println!("   📁 Valid scopes: {}", scope_names.join(", "));
+            println!(
+                "   📁 Valid scopes: {}",
+                format_scope_list(&context.project.valid_scopes)
+            );
         }
 
         // Branch context
@@ -771,23 +763,15 @@ impl TwiddleCommand {
         }
 
         // Work pattern
-        match context.range.work_pattern {
-            WorkPattern::Sequential => println!("   🔄 Pattern: Sequential development"),
-            WorkPattern::Refactoring => println!("   🧹 Pattern: Refactoring work"),
-            WorkPattern::BugHunt => println!("   🐛 Pattern: Bug investigation"),
-            WorkPattern::Documentation => println!("   📖 Pattern: Documentation updates"),
-            WorkPattern::Configuration => println!("   ⚙️  Pattern: Configuration changes"),
-            WorkPattern::Unknown => {}
+        if let Some(label) = format_work_pattern(&context.range.work_pattern) {
+            println!("   {label}");
         }
 
         // Verbosity level
-        match context.suggested_verbosity() {
-            VerbosityLevel::Comprehensive => {
-                println!("   📝 Detail level: Comprehensive (significant changes detected)");
-            }
-            VerbosityLevel::Detailed => println!("   📝 Detail level: Detailed"),
-            VerbosityLevel::Concise => println!("   📝 Detail level: Concise"),
-        }
+        println!(
+            "   {}",
+            format_verbosity_level(context.suggested_verbosity())
+        );
 
         // User context
         if let Some(ref user_ctx) = context.user_provided {
@@ -1122,10 +1106,7 @@ impl TwiddleCommand {
     fn load_check_guidelines(&self) -> Result<Option<String>> {
         use std::fs;
 
-        let context_dir = self
-            .context_dir
-            .clone()
-            .unwrap_or_else(|| std::path::PathBuf::from(".omni-dev"));
+        let context_dir = resolve_context_dir(self.context_dir.as_deref());
 
         // Try local override first
         let local_path = context_dir.join("local").join("commit-guidelines.md");
@@ -1160,10 +1141,7 @@ impl TwiddleCommand {
 
     /// Loads valid scopes for check with ecosystem defaults.
     fn load_check_scopes(&self) -> Vec<crate::data::context::ScopeDefinition> {
-        let context_dir = self
-            .context_dir
-            .clone()
-            .unwrap_or_else(|| std::path::PathBuf::from(".omni-dev"));
+        let context_dir = resolve_context_dir(self.context_dir.as_deref());
         crate::claude::context::load_project_scopes(&context_dir, &std::path::PathBuf::from("."))
     }
 
@@ -1173,10 +1151,7 @@ impl TwiddleCommand {
         guidelines: &Option<String>,
         valid_scopes: &[crate::data::context::ScopeDefinition],
     ) {
-        let context_dir = self
-            .context_dir
-            .clone()
-            .unwrap_or_else(|| std::path::PathBuf::from(".omni-dev"));
+        let context_dir = resolve_context_dir(self.context_dir.as_deref());
 
         println!("📋 Project guidance files status:");
 
@@ -1445,5 +1420,173 @@ impl TwiddleCommand {
         );
 
         Ok(())
+    }
+}
+
+// --- Extracted pure functions ---
+
+/// Formats a work pattern as a display label with emoji.
+///
+/// Returns `None` for `WorkPattern::Unknown` since it should not be displayed.
+fn format_work_pattern(pattern: &crate::data::context::WorkPattern) -> Option<&'static str> {
+    use crate::data::context::WorkPattern;
+    match pattern {
+        WorkPattern::Sequential => Some("\u{1f504} Pattern: Sequential development"),
+        WorkPattern::Refactoring => Some("\u{1f9f9} Pattern: Refactoring work"),
+        WorkPattern::BugHunt => Some("\u{1f41b} Pattern: Bug investigation"),
+        WorkPattern::Documentation => Some("\u{1f4d6} Pattern: Documentation updates"),
+        WorkPattern::Configuration => Some("\u{2699}\u{fe0f}  Pattern: Configuration changes"),
+        WorkPattern::Unknown => None,
+    }
+}
+
+/// Formats a verbosity level as a display label with emoji.
+fn format_verbosity_level(level: crate::data::context::VerbosityLevel) -> &'static str {
+    use crate::data::context::VerbosityLevel;
+    match level {
+        VerbosityLevel::Comprehensive => {
+            "\u{1f4dd} Detail level: Comprehensive (significant changes detected)"
+        }
+        VerbosityLevel::Detailed => "\u{1f4dd} Detail level: Detailed",
+        VerbosityLevel::Concise => "\u{1f4dd} Detail level: Concise",
+    }
+}
+
+/// Formats a list of scope definitions as a comma-separated string of names.
+fn format_scope_list(scopes: &[crate::data::context::ScopeDefinition]) -> String {
+    scopes
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Resolves the context directory, falling back to `.omni-dev` if not overridden.
+fn resolve_context_dir(override_dir: Option<&std::path::Path>) -> std::path::PathBuf {
+    override_dir.map_or_else(
+        || std::path::PathBuf::from(".omni-dev"),
+        std::path::Path::to_path_buf,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::context::{ScopeDefinition, VerbosityLevel, WorkPattern};
+
+    // --- format_work_pattern ---
+
+    #[test]
+    fn work_pattern_sequential() {
+        let result = format_work_pattern(&WorkPattern::Sequential);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("Sequential development"));
+    }
+
+    #[test]
+    fn work_pattern_refactoring() {
+        let result = format_work_pattern(&WorkPattern::Refactoring);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("Refactoring work"));
+    }
+
+    #[test]
+    fn work_pattern_bug_hunt() {
+        let result = format_work_pattern(&WorkPattern::BugHunt);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("Bug investigation"));
+    }
+
+    #[test]
+    fn work_pattern_docs() {
+        let result = format_work_pattern(&WorkPattern::Documentation);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("Documentation updates"));
+    }
+
+    #[test]
+    fn work_pattern_config() {
+        let result = format_work_pattern(&WorkPattern::Configuration);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("Configuration changes"));
+    }
+
+    #[test]
+    fn work_pattern_unknown() {
+        assert!(format_work_pattern(&WorkPattern::Unknown).is_none());
+    }
+
+    // --- format_verbosity_level ---
+
+    #[test]
+    fn verbosity_comprehensive() {
+        let label = format_verbosity_level(VerbosityLevel::Comprehensive);
+        assert!(label.contains("Comprehensive"));
+        assert!(label.contains("significant changes"));
+    }
+
+    #[test]
+    fn verbosity_detailed() {
+        let label = format_verbosity_level(VerbosityLevel::Detailed);
+        assert!(label.contains("Detailed"));
+    }
+
+    #[test]
+    fn verbosity_concise() {
+        let label = format_verbosity_level(VerbosityLevel::Concise);
+        assert!(label.contains("Concise"));
+    }
+
+    // --- format_scope_list ---
+
+    #[test]
+    fn scope_list_single() {
+        let scopes = vec![ScopeDefinition {
+            name: "cli".to_string(),
+            description: String::new(),
+            examples: vec![],
+            file_patterns: vec![],
+        }];
+        assert_eq!(format_scope_list(&scopes), "cli");
+    }
+
+    #[test]
+    fn scope_list_multiple() {
+        let scopes = vec![
+            ScopeDefinition {
+                name: "cli".to_string(),
+                description: String::new(),
+                examples: vec![],
+                file_patterns: vec![],
+            },
+            ScopeDefinition {
+                name: "git".to_string(),
+                description: String::new(),
+                examples: vec![],
+                file_patterns: vec![],
+            },
+            ScopeDefinition {
+                name: "docs".to_string(),
+                description: String::new(),
+                examples: vec![],
+                file_patterns: vec![],
+            },
+        ];
+        assert_eq!(format_scope_list(&scopes), "cli, git, docs");
+    }
+
+    // --- resolve_context_dir ---
+
+    #[test]
+    fn context_dir_default() {
+        let result = resolve_context_dir(None);
+        assert_eq!(result, std::path::PathBuf::from(".omni-dev"));
+    }
+
+    #[test]
+    fn context_dir_override() {
+        let custom = std::path::PathBuf::from("custom-dir");
+        let result = resolve_context_dir(Some(&custom));
+        assert_eq!(result, custom);
     }
 }
