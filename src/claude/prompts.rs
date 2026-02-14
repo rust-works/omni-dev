@@ -868,3 +868,324 @@ fn indent_message(message: &str, prefix: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::context::*;
+
+    fn make_context() -> CommitContext {
+        CommitContext {
+            project: ProjectContext {
+                commit_guidelines: None,
+                pr_guidelines: None,
+                valid_scopes: Vec::new(),
+                ..ProjectContext::default()
+            },
+            branch: BranchContext {
+                work_type: WorkType::Feature,
+                description: "add feature".to_string(),
+                is_feature_branch: true,
+                ..BranchContext::default()
+            },
+            range: CommitRangeContext::default(),
+            files: Vec::new(),
+            user_provided: None,
+        }
+    }
+
+    // ── indent_message ─────────────────────────────────────────────
+
+    #[test]
+    fn indent_single_line() {
+        assert_eq!(indent_message("hello", "  "), "  hello");
+    }
+
+    #[test]
+    fn indent_multiple_lines() {
+        let result = indent_message("line1\nline2\nline3", ">> ");
+        assert_eq!(result, ">> line1\n>> line2\n>> line3");
+    }
+
+    #[test]
+    fn indent_empty_string() {
+        // "".lines() yields zero items, so join produces ""
+        assert_eq!(indent_message("", "  "), "");
+    }
+
+    // ── generate_user_prompt ───────────────────────────────────────
+
+    #[test]
+    fn user_prompt_contains_yaml() {
+        let prompt = generate_user_prompt("commits:\n  - hash: abc123");
+        assert!(prompt.contains("commits:\n  - hash: abc123"));
+        assert!(prompt.contains("CRITICAL ANALYSIS STEPS"));
+    }
+
+    #[test]
+    fn user_prompt_requires_all_commits() {
+        let prompt = generate_user_prompt("test");
+        assert!(prompt.contains("Include ALL commits"));
+    }
+
+    // ── generate_contextual_system_prompt ──────────────────────────
+
+    #[test]
+    fn contextual_system_prompt_contains_base() {
+        let context = make_context();
+        let prompt = generate_contextual_system_prompt(&context);
+        assert!(prompt.contains("expert software engineer"));
+        assert!(prompt.contains("CONTEXTUAL INTELLIGENCE GUIDELINES"));
+    }
+
+    #[test]
+    fn contextual_system_prompt_with_branch_context() {
+        let context = make_context();
+        let prompt = generate_contextual_system_prompt(&context);
+        assert!(prompt.contains("add feature"));
+    }
+
+    #[test]
+    fn contextual_system_prompt_with_guidelines_claude() {
+        let mut context = make_context();
+        context.project.commit_guidelines = Some("Use type(scope): desc".to_string());
+        let prompt = generate_contextual_system_prompt_for_provider(&context, PromptStyle::Claude);
+        assert!(prompt.contains("MANDATORY COMMIT MESSAGE TEMPLATE"));
+        assert!(prompt.contains("Use type(scope): desc"));
+    }
+
+    #[test]
+    fn contextual_system_prompt_with_guidelines_openai() {
+        let mut context = make_context();
+        context.project.commit_guidelines = Some("Use type(scope): desc".to_string());
+        let prompt = generate_contextual_system_prompt_for_provider(&context, PromptStyle::OpenAi);
+        assert!(prompt.contains("PROJECT COMMIT GUIDELINES"));
+        assert!(!prompt.contains("MANDATORY COMMIT MESSAGE TEMPLATE"));
+    }
+
+    #[test]
+    fn contextual_system_prompt_with_scopes() {
+        let mut context = make_context();
+        context.project.valid_scopes = vec![ScopeDefinition {
+            name: "cli".to_string(),
+            description: "CLI module".to_string(),
+            examples: Vec::new(),
+            file_patterns: Vec::new(),
+        }];
+        let prompt = generate_contextual_system_prompt(&context);
+        assert!(prompt.contains("cli: CLI module"));
+    }
+
+    #[test]
+    fn contextual_system_prompt_work_pattern_refactoring() {
+        let mut context = make_context();
+        context.range.work_pattern = WorkPattern::Refactoring;
+        let prompt = generate_contextual_system_prompt(&context);
+        assert!(prompt.contains("Refactoring work"));
+    }
+
+    #[test]
+    fn contextual_system_prompt_scope_consistency() {
+        let mut context = make_context();
+        context.range.scope_consistency = ScopeAnalysis {
+            consistent_scope: Some("cli".to_string()),
+            scope_changes: vec!["cli".to_string()],
+            confidence: 0.9,
+        };
+        let prompt = generate_contextual_system_prompt(&context);
+        assert!(prompt.contains("'cli' scope"));
+    }
+
+    // ── generate_contextual_user_prompt ────────────────────────────
+
+    #[test]
+    fn contextual_user_prompt_no_guidelines_uses_default() {
+        let context = make_context();
+        let prompt = generate_contextual_user_prompt("yaml-data", &context);
+        assert!(prompt.contains("COMMIT GUIDELINES"));
+    }
+
+    #[test]
+    fn contextual_user_prompt_with_guidelines_skips_default() {
+        let mut context = make_context();
+        context.project.commit_guidelines = Some("custom guidelines".to_string());
+        let prompt = generate_contextual_user_prompt("yaml-data", &context);
+        assert!(!prompt.contains("=== COMMIT GUIDELINES ==="));
+    }
+
+    #[test]
+    fn contextual_user_prompt_significant_change() {
+        let mut context = make_context();
+        context.range.architectural_impact = ArchitecturalImpact::Breaking;
+        let prompt = generate_contextual_user_prompt("yaml-data", &context);
+        assert!(prompt.contains("significant changes"));
+    }
+
+    // ── generate_check_system_prompt ───────────────────────────────
+
+    #[test]
+    fn check_system_prompt_default_guidelines() {
+        let prompt = generate_check_system_prompt(None);
+        assert!(prompt.contains("commit message reviewer"));
+        assert!(prompt.contains("PROJECT COMMIT GUIDELINES"));
+    }
+
+    #[test]
+    fn check_system_prompt_custom_guidelines() {
+        let prompt = generate_check_system_prompt(Some("My custom rules"));
+        assert!(prompt.contains("My custom rules"));
+    }
+
+    #[test]
+    fn check_system_prompt_with_scopes() {
+        let scopes = vec![ScopeDefinition {
+            name: "cli".to_string(),
+            description: "CLI module".to_string(),
+            examples: Vec::new(),
+            file_patterns: Vec::new(),
+        }];
+        let prompt = generate_check_system_prompt_with_scopes(None, &scopes);
+        assert!(prompt.contains("VALID SCOPES"));
+        assert!(prompt.contains("`cli`: CLI module"));
+    }
+
+    // ── generate_check_user_prompt ─────────────────────────────────
+
+    #[test]
+    fn check_user_prompt_with_suggestions() {
+        let prompt = generate_check_user_prompt("yaml-data", true);
+        assert!(prompt.contains("provide a corrected message"));
+    }
+
+    #[test]
+    fn check_user_prompt_without_suggestions() {
+        let prompt = generate_check_user_prompt("yaml-data", false);
+        assert!(prompt.contains("Do NOT include suggestion"));
+    }
+
+    // ── generate_pr_description_prompt ─────────────────────────────
+
+    #[test]
+    fn pr_description_prompt_contains_template() {
+        let prompt = generate_pr_description_prompt("repo-yaml", "## Description\n");
+        assert!(prompt.contains("repo-yaml"));
+        assert!(prompt.contains("## Description"));
+    }
+
+    // ── generate_pr_system_prompt_with_context ─────────────────────
+
+    #[test]
+    fn pr_system_prompt_claude_provider() {
+        let context = make_context();
+        let prompt =
+            generate_pr_system_prompt_with_context_for_provider(&context, PromptStyle::Claude);
+        assert!(prompt.contains("TEMPLATE HANDLING FOR CLAUDE"));
+    }
+
+    #[test]
+    fn pr_system_prompt_openai_provider() {
+        let context = make_context();
+        let prompt =
+            generate_pr_system_prompt_with_context_for_provider(&context, PromptStyle::OpenAi);
+        assert!(prompt.contains("TEMPLATE FILLING INSTRUCTIONS"));
+    }
+
+    #[test]
+    fn pr_system_prompt_with_pr_guidelines() {
+        let mut context = make_context();
+        context.project.pr_guidelines = Some("Always include screenshots".to_string());
+        let prompt = generate_pr_system_prompt_with_context(&context);
+        assert!(prompt.contains("PROJECT PR GUIDELINES"));
+        assert!(prompt.contains("Always include screenshots"));
+    }
+
+    // ── generate_pr_description_prompt_with_context ─────────────────
+
+    #[test]
+    fn pr_description_with_context_branch_info() {
+        let context = make_context();
+        let prompt = generate_pr_description_prompt_with_context("yaml", "template", &context);
+        assert!(prompt.contains("BRANCH CONTEXT"));
+        assert!(prompt.contains("add feature"));
+    }
+
+    // ── coherence prompts ──────────────────────────────────────────
+
+    #[test]
+    fn amendment_coherence_prompt_lists_commits() {
+        use crate::data::amendments::Amendment;
+
+        let items = vec![
+            (
+                Amendment::new("a".repeat(40), "feat(cli): add flag".to_string()),
+                "Add CLI flag".to_string(),
+            ),
+            (
+                Amendment::new("b".repeat(40), "fix(git): fix bug".to_string()),
+                "Fix git bug".to_string(),
+            ),
+        ];
+        let prompt = generate_amendment_coherence_user_prompt(&items);
+        assert!(prompt.contains(&"a".repeat(40)));
+        assert!(prompt.contains(&"b".repeat(40)));
+        assert!(prompt.contains("Add CLI flag"));
+        assert!(prompt.contains("Fix git bug"));
+    }
+
+    #[test]
+    fn check_coherence_prompt_lists_results() {
+        use crate::data::check::CommitCheckResult;
+
+        let items = vec![(
+            CommitCheckResult {
+                hash: "a".repeat(40),
+                message: "feat: test".to_string(),
+                passes: true,
+                issues: Vec::new(),
+                suggestion: None,
+                summary: None,
+            },
+            "Test commit".to_string(),
+        )];
+        let prompt = generate_check_coherence_user_prompt(&items);
+        assert!(prompt.contains(&"a".repeat(40)));
+        assert!(prompt.contains("PASS"));
+        assert!(prompt.contains("Test commit"));
+    }
+
+    // ── constants ──────────────────────────────────────────────────
+
+    #[test]
+    fn basic_system_prompt_not_empty() {
+        assert!(BASIC_SYSTEM_PROMPT.len() > 100);
+        assert!(BASIC_SYSTEM_PROMPT.contains("amendments:"));
+    }
+
+    #[test]
+    fn pr_generation_system_prompt_not_empty() {
+        assert!(PR_GENERATION_SYSTEM_PROMPT.len() > 100);
+        assert!(PR_GENERATION_SYSTEM_PROMPT.contains("pull request"));
+    }
+
+    #[test]
+    fn check_system_prompt_constant_not_empty() {
+        assert!(CHECK_SYSTEM_PROMPT.len() > 100);
+        assert!(CHECK_SYSTEM_PROMPT.contains("commit message reviewer"));
+    }
+
+    #[test]
+    fn amendment_coherence_system_prompt_not_empty() {
+        assert!(AMENDMENT_COHERENCE_SYSTEM_PROMPT.len() > 100);
+        assert!(AMENDMENT_COHERENCE_SYSTEM_PROMPT.contains("coherence"));
+    }
+
+    #[test]
+    fn check_coherence_system_prompt_not_empty() {
+        assert!(CHECK_COHERENCE_SYSTEM_PROMPT.len() > 100);
+    }
+
+    #[test]
+    fn system_prompt_alias() {
+        assert_eq!(SYSTEM_PROMPT, BASIC_SYSTEM_PROMPT);
+    }
+}

@@ -275,4 +275,35 @@ mod tests {
         assert_eq!(format!("{}", AiProvider::OpenAi), "OpenAI API");
         assert_eq!(format!("{}", AiProvider::Ollama), "Ollama");
     }
+
+    #[test]
+    fn ai_provider_equality() {
+        assert_eq!(AiProvider::Claude, AiProvider::Claude);
+        assert_ne!(AiProvider::Claude, AiProvider::OpenAi);
+        assert_ne!(AiProvider::Bedrock, AiProvider::Ollama);
+    }
+
+    #[test]
+    fn ai_provider_clone() {
+        let provider = AiProvider::Bedrock;
+        let cloned = provider;
+        assert_eq!(provider, cloned);
+    }
+
+    #[test]
+    fn ai_provider_debug() {
+        let debug_str = format!("{:?}", AiProvider::Claude);
+        assert_eq!(debug_str, "Claude");
+    }
+
+    #[test]
+    fn ai_credential_info_debug() {
+        let info = AiCredentialInfo {
+            provider: AiProvider::Ollama,
+            model: "llama2".to_string(),
+        };
+        let debug_str = format!("{info:?}");
+        assert!(debug_str.contains("Ollama"));
+        assert!(debug_str.contains("llama2"));
+    }
 }
