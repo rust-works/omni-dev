@@ -168,3 +168,51 @@ impl RemoteInfo {
         Ok(repo_name.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── extract_github_repo_name ─────────────────────────────────────
+
+    #[test]
+    fn ssh_url() {
+        let result = RemoteInfo::extract_github_repo_name("git@github.com:owner/repo.git");
+        assert_eq!(result.unwrap(), "owner/repo");
+    }
+
+    #[test]
+    fn https_url() {
+        let result = RemoteInfo::extract_github_repo_name("https://github.com/owner/repo.git");
+        assert_eq!(result.unwrap(), "owner/repo");
+    }
+
+    #[test]
+    fn https_url_no_git_suffix() {
+        let result = RemoteInfo::extract_github_repo_name("https://github.com/owner/repo");
+        assert_eq!(result.unwrap(), "owner/repo");
+    }
+
+    #[test]
+    fn ssh_url_no_git_suffix() {
+        let result = RemoteInfo::extract_github_repo_name("git@github.com:owner/repo");
+        assert_eq!(result.unwrap(), "owner/repo");
+    }
+
+    #[test]
+    fn non_github_url_fails() {
+        let result = RemoteInfo::extract_github_repo_name("git@gitlab.com:owner/repo.git");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Not a GitHub URI"));
+    }
+
+    #[test]
+    fn invalid_format_fails() {
+        let result = RemoteInfo::extract_github_repo_name("git@github.com:invalid");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid GitHub repository format"));
+    }
+}

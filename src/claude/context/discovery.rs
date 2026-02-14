@@ -581,3 +581,199 @@ fn extract_scopes_from_examples(line: &str) -> Vec<String> {
 
     scopes
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // ── resolve_config_file ──────────────────────────────────────────
+
+    #[test]
+    fn local_override_wins() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let base = dir.path();
+
+        // Create both local and project files
+        std::fs::create_dir_all(base.join("local"))?;
+        std::fs::write(base.join("local").join("scopes.yaml"), "local")?;
+        std::fs::write(base.join("scopes.yaml"), "project")?;
+
+        let resolved = resolve_config_file(base, "scopes.yaml");
+        assert_eq!(resolved, base.join("local").join("scopes.yaml"));
+        Ok(())
+    }
+
+    #[test]
+    fn project_fallback() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let base = dir.path();
+
+        // Create only project-level file (no local/)
+        std::fs::write(base.join("scopes.yaml"), "project")?;
+
+        let resolved = resolve_config_file(base, "scopes.yaml");
+        assert_eq!(resolved, base.join("scopes.yaml"));
+        Ok(())
+    }
+
+    #[test]
+    fn returns_default_when_nothing_exists() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path();
+
+        let resolved = resolve_config_file(base, "scopes.yaml");
+        // When no local or project file exists, it either returns:
+        // - the home directory path if $HOME/.omni-dev/scopes.yaml exists
+        // - the project path as fallback default
+        // Either way, the resolved path should NOT be the local override path.
+        assert_ne!(resolved, base.join("local").join("scopes.yaml"));
+    }
+
+    // ── merge_ecosystem_scopes ───────────────────────────────────────
+
+    #[test]
+    fn rust_ecosystem_detected() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]")?;
+
+        let mut scopes = vec![];
+        merge_ecosystem_scopes(&mut scopes, dir.path());
+
+        let names: Vec<&str> = scopes.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"cargo"), "missing 'cargo' scope");
+        assert!(names.contains(&"cli"), "missing 'cli' scope");
+        assert!(names.contains(&"core"), "missing 'core' scope");
+        assert!(names.contains(&"test"), "missing 'test' scope");
+        assert!(names.contains(&"docs"), "missing 'docs' scope");
+        assert!(names.contains(&"ci"), "missing 'ci' scope");
+        Ok(())
+    }
+
+    #[test]
+    fn node_ecosystem_detected() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        std::fs::write(dir.path().join("package.json"), "{}")?;
+
+        let mut scopes = vec![];
+        merge_ecosystem_scopes(&mut scopes, dir.path());
+
+        let names: Vec<&str> = scopes.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"deps"), "missing 'deps' scope");
+        assert!(names.contains(&"config"), "missing 'config' scope");
+        Ok(())
+    }
+
+    #[test]
+    fn go_ecosystem_detected() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        std::fs::write(dir.path().join("go.mod"), "module example")?;
+
+        let mut scopes = vec![];
+        merge_ecosystem_scopes(&mut scopes, dir.path());
+
+        let names: Vec<&str> = scopes.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"mod"), "missing 'mod' scope");
+        assert!(names.contains(&"cmd"), "missing 'cmd' scope");
+        assert!(names.contains(&"pkg"), "missing 'pkg' scope");
+        Ok(())
+    }
+
+    #[test]
+    fn existing_scope_not_overridden() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]")?;
+
+        let mut scopes = vec![ScopeDefinition {
+            name: "cli".to_string(),
+            description: "Custom CLI scope".to_string(),
+            examples: vec![],
+            file_patterns: vec!["custom/**".to_string()],
+        }];
+        merge_ecosystem_scopes(&mut scopes, dir.path());
+
+        // The custom "cli" scope should be preserved, not replaced
+        let cli_scope = scopes.iter().find(|s| s.name == "cli").unwrap();
+        assert_eq!(cli_scope.description, "Custom CLI scope");
+        assert_eq!(cli_scope.file_patterns, vec!["custom/**"]);
+        Ok(())
+    }
+
+    #[test]
+    fn no_marker_files_produces_empty() {
+        let dir = TempDir::new().unwrap();
+        let mut scopes = vec![];
+        merge_ecosystem_scopes(&mut scopes, dir.path());
+        assert!(scopes.is_empty());
+    }
+
+    // ── load_project_scopes ──────────────────────────────────────────
+
+    #[test]
+    fn load_project_scopes_with_yaml() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let config_dir = dir.path().join("config");
+        std::fs::create_dir_all(&config_dir)?;
+
+        let scopes_yaml = r#"
+scopes:
+  - name: custom
+    description: Custom scope
+    examples: []
+    file_patterns:
+      - "src/custom/**"
+"#;
+        std::fs::write(config_dir.join("scopes.yaml"), scopes_yaml)?;
+
+        // Also create Cargo.toml so ecosystem scopes get merged
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]")?;
+
+        let scopes = load_project_scopes(&config_dir, dir.path());
+        let names: Vec<&str> = scopes.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"custom"), "missing custom scope");
+        // Ecosystem scopes should also be merged
+        assert!(names.contains(&"cargo"), "missing ecosystem scope");
+        Ok(())
+    }
+
+    #[test]
+    fn load_project_scopes_no_file() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]")?;
+
+        let scopes = load_project_scopes(dir.path(), dir.path());
+        // Should still get ecosystem defaults
+        assert!(!scopes.is_empty());
+        Ok(())
+    }
+
+    // ── Helper functions ─────────────────────────────────────────────
+
+    #[test]
+    fn extract_scope_from_structure_src() {
+        assert_eq!(
+            extract_scope_from_structure("- `src/auth/` - Authentication"),
+            Some("auth".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_scope_from_structure_no_match() {
+        assert_eq!(extract_scope_from_structure("No source paths here"), None);
+    }
+
+    #[test]
+    fn extract_commit_types_from_line() {
+        let types = extract_commit_types("feat, fix, docs, test");
+        assert!(types.contains(&"feat".to_string()));
+        assert!(types.contains(&"fix".to_string()));
+        assert!(types.contains(&"docs".to_string()));
+        assert!(types.contains(&"test".to_string()));
+    }
+
+    #[test]
+    fn extract_commit_types_empty_line() {
+        let types = extract_commit_types("no types here");
+        assert!(types.is_empty());
+    }
+}
