@@ -967,10 +967,7 @@ impl CreatePrCommand {
 
         println!("📝 Opening PR details file in editor: {editor}");
 
-        // Split editor command to handle arguments
-        let mut cmd_parts = editor.split_whitespace();
-        let editor_cmd = cmd_parts.next().unwrap_or(&editor);
-        let args: Vec<&str> = cmd_parts.collect();
+        let (editor_cmd, args) = super::formatting::parse_editor_command(&editor);
 
         let mut command = Command::new(editor_cmd);
         command.args(args);
