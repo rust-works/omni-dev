@@ -447,4 +447,171 @@ mod tests {
         );
         assert!(!openai_client.is_ollama());
     }
+
+    // ── is_gpt5_series ───────────────────────────────────────────────
+
+    #[test]
+    fn gpt5_series_gpt5_models() {
+        let client = OpenAiAiClient::new(
+            "gpt-5-preview".to_string(),
+            Some("key".to_string()),
+            "https://api.openai.com".to_string(),
+            None,
+            None,
+            None,
+        );
+        assert!(client.is_gpt5_series());
+
+        let client2 = OpenAiAiClient::new(
+            "gpt-5".to_string(),
+            Some("key".to_string()),
+            "https://api.openai.com".to_string(),
+            None,
+            None,
+            None,
+        );
+        assert!(client2.is_gpt5_series());
+    }
+
+    #[test]
+    fn gpt5_series_o1_models() {
+        let client = OpenAiAiClient::new(
+            "o1-mini".to_string(),
+            Some("key".to_string()),
+            "https://api.openai.com".to_string(),
+            None,
+            None,
+            None,
+        );
+        assert!(client.is_gpt5_series());
+
+        let client2 = OpenAiAiClient::new(
+            "o1-preview".to_string(),
+            Some("key".to_string()),
+            "https://api.openai.com".to_string(),
+            None,
+            None,
+            None,
+        );
+        assert!(client2.is_gpt5_series());
+    }
+
+    #[test]
+    fn gpt5_series_regular_models_not_matched() {
+        let client = OpenAiAiClient::new(
+            "gpt-4".to_string(),
+            Some("key".to_string()),
+            "https://api.openai.com".to_string(),
+            None,
+            None,
+            None,
+        );
+        assert!(!client.is_gpt5_series());
+
+        let client2 = OpenAiAiClient::new(
+            "gpt-4o-mini".to_string(),
+            Some("key".to_string()),
+            "https://api.openai.com".to_string(),
+            None,
+            None,
+            None,
+        );
+        assert!(!client2.is_gpt5_series());
+    }
+
+    // ── get_max_tokens ───────────────────────────────────────────────
+
+    #[test]
+    fn get_max_tokens_configured_value_wins() {
+        let client = OpenAiAiClient::new(
+            "gpt-4".to_string(),
+            Some("key".to_string()),
+            "https://api.openai.com".to_string(),
+            Some(8192),
+            None,
+            None,
+        );
+        assert_eq!(client.get_max_tokens(), 8192);
+    }
+
+    #[test]
+    fn get_max_tokens_from_registry() {
+        // Ollama with no configured max → falls back to registry
+        let client = OpenAiAiClient::new_openai("gpt-4o".to_string(), "key".to_string(), None);
+        let tokens = client.get_max_tokens();
+        // Registry should return a positive value for a known model
+        assert!(tokens > 0, "expected positive token limit, got {tokens}");
+    }
+
+    // ── get_metadata ─────────────────────────────────────────────────
+
+    #[test]
+    fn get_metadata_openai() {
+        let client = OpenAiAiClient::new_openai("gpt-4o".to_string(), "key".to_string(), None);
+        let metadata = client.get_metadata();
+        assert_eq!(metadata.provider, "OpenAI");
+        assert_eq!(metadata.model, "gpt-4o");
+        assert!(metadata.active_beta.is_none());
+    }
+
+    #[test]
+    fn get_metadata_ollama() {
+        let client = OpenAiAiClient::new_ollama("llama2".to_string(), None, None);
+        let metadata = client.get_metadata();
+        assert_eq!(metadata.provider, "Ollama");
+        assert_eq!(metadata.model, "llama2");
+    }
+
+    #[test]
+    fn get_metadata_with_beta() {
+        let beta = Some(("anthropic-beta".to_string(), "output-128k".to_string()));
+        let client = OpenAiAiClient::new_openai("gpt-4o".to_string(), "key".to_string(), beta);
+        let metadata = client.get_metadata();
+        assert!(metadata.active_beta.is_some());
+        let (key, value) = metadata.active_beta.unwrap();
+        assert_eq!(key, "anthropic-beta");
+        assert_eq!(value, "output-128k");
+    }
+
+    // ── OpenAiRequest serialization ──────────────────────────────────
+
+    #[test]
+    fn request_gpt5_uses_max_completion_tokens() {
+        let request = OpenAiRequest {
+            model: "gpt-5".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            max_tokens: None,
+            max_completion_tokens: Some(4096),
+            temperature: None,
+            stream: false,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("max_completion_tokens"));
+        // max_tokens should be None and thus skipped
+        assert!(!json.contains("\"max_tokens\""));
+    }
+
+    #[test]
+    fn request_regular_model_uses_max_tokens() {
+        let request = OpenAiRequest {
+            model: "gpt-4".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            max_tokens: Some(4096),
+            max_completion_tokens: None,
+            temperature: Some(0.1),
+            stream: false,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"max_tokens\""));
+        assert!(!json.contains("max_completion_tokens"));
+        assert!(json.contains("\"temperature\""));
+    }
 }

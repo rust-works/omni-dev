@@ -338,4 +338,79 @@ mod tests {
         );
         assert_eq!(client.get_max_tokens(), 4096); // Claude provider default
     }
+
+    #[test]
+    fn get_api_url_with_trailing_slash() {
+        let client = BedrockAiClient::new(
+            "us.anthropic.claude-3-7-sonnet-20250219-v1:0".to_string(),
+            "test_token".to_string(),
+            "https://bedrock-api.com/bedrock/".to_string(),
+            None,
+        );
+
+        let url = client.get_api_url().unwrap();
+        assert_eq!(
+            url,
+            "https://bedrock-api.com/bedrock/model/us.anthropic.claude-3-7-sonnet-20250219-v1%3A0/invoke"
+        );
+    }
+
+    #[test]
+    fn get_api_url_simple_model() {
+        let client = BedrockAiClient::new(
+            "claude-sonnet-4-20250514".to_string(),
+            "test_token".to_string(),
+            "https://bedrock-api.com/api".to_string(),
+            None,
+        );
+
+        let url = client.get_api_url().unwrap();
+        assert!(url.contains("model/claude-sonnet-4-20250514/invoke"));
+    }
+
+    #[test]
+    fn get_metadata_without_beta() {
+        let client = BedrockAiClient::new(
+            "claude-sonnet-4-20250514".to_string(),
+            "token".to_string(),
+            "https://example.com".to_string(),
+            None,
+        );
+        let metadata = client.get_metadata();
+        assert_eq!(metadata.provider, "Anthropic Bedrock");
+        assert_eq!(metadata.model, "claude-sonnet-4-20250514");
+        assert!(metadata.active_beta.is_none());
+        assert!(metadata.max_context_length > 0);
+        assert!(metadata.max_response_length > 0);
+    }
+
+    #[test]
+    fn get_metadata_with_beta() {
+        let beta = Some((
+            "anthropic-beta".to_string(),
+            "output-128k-2025-02-19".to_string(),
+        ));
+        let client = BedrockAiClient::new(
+            "claude-sonnet-4-20250514".to_string(),
+            "token".to_string(),
+            "https://example.com".to_string(),
+            beta,
+        );
+        let metadata = client.get_metadata();
+        assert!(metadata.active_beta.is_some());
+    }
+
+    #[test]
+    fn bedrock_client_new() {
+        let client = BedrockAiClient::new(
+            "claude-sonnet-4-20250514".to_string(),
+            "my-token".to_string(),
+            "https://bedrock.us-east-1.amazonaws.com".to_string(),
+            None,
+        );
+        assert_eq!(client.model, "claude-sonnet-4-20250514");
+        assert_eq!(client.auth_token, "my-token");
+        assert_eq!(client.base_url, "https://bedrock.us-east-1.amazonaws.com");
+        assert!(client.active_beta.is_none());
+    }
 }

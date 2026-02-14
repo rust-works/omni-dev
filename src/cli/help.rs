@@ -124,3 +124,71 @@ impl HelpCommand {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn help_generator_default() {
+        let gen = HelpGenerator::default();
+        assert_eq!(gen.app.get_name(), "omni-dev");
+    }
+
+    #[test]
+    fn generate_all_help_contains_all_top_level_commands() {
+        let gen = HelpGenerator::new();
+        let output = gen.generate_all_help().unwrap();
+        assert!(output.contains("omni-dev ai"));
+        assert!(output.contains("omni-dev git"));
+        assert!(output.contains("omni-dev commands"));
+        assert!(output.contains("omni-dev config"));
+        assert!(output.contains("omni-dev help-all"));
+    }
+
+    #[test]
+    fn generate_all_help_contains_nested_commands() {
+        let gen = HelpGenerator::new();
+        let output = gen.generate_all_help().unwrap();
+        // Deeply nested commands should be present
+        assert!(output.contains("omni-dev git commit message view"));
+        assert!(output.contains("omni-dev git commit message amend"));
+        assert!(output.contains("omni-dev git commit message twiddle"));
+        assert!(output.contains("omni-dev git commit message check"));
+        assert!(output.contains("omni-dev git branch info"));
+        assert!(output.contains("omni-dev git branch create pr"));
+    }
+
+    #[test]
+    fn generate_all_help_uses_section_separators() {
+        let gen = HelpGenerator::new();
+        let output = gen.generate_all_help().unwrap();
+        let separator = "=".repeat(80);
+        assert!(output.contains(&separator));
+    }
+
+    #[test]
+    fn generate_all_help_is_deterministic() {
+        let gen1 = HelpGenerator::new();
+        let gen2 = HelpGenerator::new();
+        let output1 = gen1.generate_all_help().unwrap();
+        let output2 = gen2.generate_all_help().unwrap();
+        assert_eq!(output1, output2, "Help output should be deterministic");
+    }
+
+    #[test]
+    fn render_command_help_includes_about() {
+        let gen = HelpGenerator::new();
+        let help = gen.render_command_help(&gen.app, "");
+        // The main app help should include the about text
+        assert!(help.contains("comprehensive development toolkit"));
+    }
+
+    #[test]
+    fn styled_str_to_string_plain_text() {
+        let gen = HelpGenerator::new();
+        let styled = StyledStr::from("hello world");
+        let result = gen.styled_str_to_string(&styled);
+        assert_eq!(result, "hello world");
+    }
+}

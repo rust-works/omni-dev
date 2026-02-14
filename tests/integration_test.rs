@@ -243,3 +243,159 @@ fn help_all_golden() -> Result<()> {
     println!("✅ Golden test for help-all command completed");
     Ok(())
 }
+
+// ── CLI binary invocation tests ─────────────────────────────────
+
+#[test]
+fn binary_help_flag_succeeds() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .arg("--help")
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("comprehensive development toolkit"));
+}
+
+#[test]
+fn binary_version_flag_succeeds() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .arg("--version")
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("omni-dev"));
+}
+
+#[test]
+fn binary_unknown_command_fails() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .arg("nonexistent")
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+}
+
+#[test]
+fn binary_config_models_show_succeeds() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .args(["config", "models", "show"])
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The models.yaml template should contain model definitions
+    assert!(stdout.contains("claude"));
+}
+
+#[test]
+fn binary_help_all_succeeds() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .arg("help-all")
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("omni-dev git"));
+    assert!(stdout.contains("omni-dev ai"));
+}
+
+#[test]
+fn binary_git_help_succeeds() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .args(["git", "--help"])
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("commit"));
+    assert!(stdout.contains("branch"));
+}
+
+#[test]
+fn binary_commands_generate_in_temp_dir() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .args(["commands", "generate", "all"])
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success());
+
+    // Verify templates were written
+    assert!(temp_dir
+        .path()
+        .join(".claude/commands/commit-twiddle.md")
+        .exists());
+    assert!(temp_dir
+        .path()
+        .join(".claude/commands/pr-create.md")
+        .exists());
+    assert!(temp_dir
+        .path()
+        .join(".claude/commands/pr-update.md")
+        .exists());
+}
+
+// ── TestRepo builder coverage ───────────────────────────────────
+
+#[test]
+fn test_repo_multiple_commits() -> Result<()> {
+    let mut repo = TestRepo::new()?;
+    repo.add_commit("first", "content1")?;
+    repo.add_commit("second", "content2")?;
+    repo.add_commit("third", "content3")?;
+
+    assert_eq!(repo.commits.len(), 3);
+    assert!(repo.get_commit_hash(0).is_some());
+    assert!(repo.get_commit_hash(1).is_some());
+    assert!(repo.get_commit_hash(2).is_some());
+    assert!(repo.get_commit_hash(3).is_none());
+
+    // Hashes should be 40-character hex
+    let hash = repo.get_commit_hash(0).unwrap();
+    assert_eq!(hash.len(), 40);
+    assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+
+    Ok(())
+}
+
+#[test]
+fn test_repo_create_amendment_file_roundtrip() -> Result<()> {
+    let mut repo = TestRepo::new()?;
+    repo.add_commit("initial", "hello")?;
+    repo.add_commit("second", "world")?;
+
+    // Verify commits were actually created before relying on them
+    assert_eq!(repo.commits.len(), 2, "should have 2 commits");
+    let hash0 = repo
+        .get_commit_hash(0)
+        .expect("commit 0 must exist after add_commit");
+    let hash1 = repo
+        .get_commit_hash(1)
+        .expect("commit 1 must exist after add_commit");
+
+    // Build the AmendmentFile directly (avoid filter_map silently dropping items)
+    let amendment_file = AmendmentFile {
+        amendments: vec![
+            Amendment::new(hash0, "improved initial".to_string()),
+            Amendment::new(hash1, "improved second".to_string()),
+        ],
+    };
+
+    // Use a unique filename to avoid collisions with other tests
+    let yaml_path = repo
+        .repo_path
+        .parent()
+        .unwrap()
+        .join("roundtrip_amendments.yaml");
+    amendment_file.save_to_file(&yaml_path)?;
+
+    let loaded = AmendmentFile::load_from_file(&yaml_path)?;
+    assert_eq!(loaded.amendments.len(), 2);
+    assert_eq!(loaded.amendments[0].message, "improved initial");
+    assert_eq!(loaded.amendments[1].message, "improved second");
+
+    Ok(())
+}
