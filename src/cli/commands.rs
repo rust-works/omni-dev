@@ -124,3 +124,63 @@ fn ensure_claude_commands_dir() -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commit_twiddle_template_has_content() {
+        assert!(COMMIT_TWIDDLE_TEMPLATE.len() > 10);
+    }
+
+    #[test]
+    fn pr_create_template_has_content() {
+        assert!(PR_CREATE_TEMPLATE.len() > 10);
+    }
+
+    #[test]
+    fn pr_update_template_has_content() {
+        assert!(PR_UPDATE_TEMPLATE.len() > 10);
+    }
+
+    #[test]
+    fn templates_contain_expected_content() {
+        // commit-twiddle template should reference commit messages
+        assert!(
+            COMMIT_TWIDDLE_TEMPLATE.contains("commit")
+                || COMMIT_TWIDDLE_TEMPLATE.contains("twiddle")
+        );
+
+        // pr-create template should reference pull request
+        assert!(
+            PR_CREATE_TEMPLATE.contains("pull request")
+                || PR_CREATE_TEMPLATE.contains("PR")
+                || PR_CREATE_TEMPLATE.contains("pr")
+        );
+
+        // pr-update template should reference update
+        assert!(
+            PR_UPDATE_TEMPLATE.contains("update")
+                || PR_UPDATE_TEMPLATE.contains("PR")
+                || PR_UPDATE_TEMPLATE.contains("pr")
+        );
+    }
+
+    #[test]
+    fn templates_are_valid_markdown() {
+        // Templates should be valid markdown — basic check: they contain text
+        // and don't start with binary content
+        assert!(COMMIT_TWIDDLE_TEMPLATE.is_ascii() || COMMIT_TWIDDLE_TEMPLATE.contains('#'));
+        assert!(PR_CREATE_TEMPLATE.is_ascii() || PR_CREATE_TEMPLATE.contains('#'));
+        assert!(PR_UPDATE_TEMPLATE.is_ascii() || PR_UPDATE_TEMPLATE.contains('#'));
+    }
+
+    #[test]
+    fn templates_are_distinct() {
+        // Each template should be unique
+        assert_ne!(COMMIT_TWIDDLE_TEMPLATE, PR_CREATE_TEMPLATE);
+        assert_ne!(COMMIT_TWIDDLE_TEMPLATE, PR_UPDATE_TEMPLATE);
+        assert_ne!(PR_CREATE_TEMPLATE, PR_UPDATE_TEMPLATE);
+    }
+}

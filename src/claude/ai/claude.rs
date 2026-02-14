@@ -207,3 +207,88 @@ impl AiClient for ClaudeAiClient {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_client_new() {
+        let client = ClaudeAiClient::new(
+            "claude-sonnet-4-20250514".to_string(),
+            "sk-ant-test".to_string(),
+            None,
+        );
+        assert_eq!(client.model, "claude-sonnet-4-20250514");
+        assert_eq!(client.api_key, "sk-ant-test");
+        assert!(client.active_beta.is_none());
+    }
+
+    #[test]
+    fn claude_client_with_beta() {
+        let beta = Some((
+            "anthropic-beta".to_string(),
+            "output-128k-2025-02-19".to_string(),
+        ));
+        let client = ClaudeAiClient::new(
+            "claude-sonnet-4-20250514".to_string(),
+            "key".to_string(),
+            beta,
+        );
+        assert!(client.active_beta.is_some());
+        let (key, value) = client.active_beta.unwrap();
+        assert_eq!(key, "anthropic-beta");
+        assert_eq!(value, "output-128k-2025-02-19");
+    }
+
+    #[test]
+    fn get_max_tokens_known_model() {
+        let client = ClaudeAiClient::new(
+            "claude-sonnet-4-20250514".to_string(),
+            "key".to_string(),
+            None,
+        );
+        let tokens = client.get_max_tokens();
+        assert!(tokens > 0, "expected positive token limit, got {tokens}");
+    }
+
+    #[test]
+    fn get_max_tokens_legacy_model() {
+        let client = ClaudeAiClient::new(
+            "claude-3-opus-20240229".to_string(),
+            "key".to_string(),
+            None,
+        );
+        assert_eq!(client.get_max_tokens(), 4096);
+    }
+
+    #[test]
+    fn get_metadata_without_beta() {
+        let client = ClaudeAiClient::new(
+            "claude-sonnet-4-20250514".to_string(),
+            "key".to_string(),
+            None,
+        );
+        let metadata = client.get_metadata();
+        assert_eq!(metadata.provider, "Anthropic");
+        assert_eq!(metadata.model, "claude-sonnet-4-20250514");
+        assert!(metadata.active_beta.is_none());
+        assert!(metadata.max_context_length > 0);
+        assert!(metadata.max_response_length > 0);
+    }
+
+    #[test]
+    fn get_metadata_with_beta() {
+        let beta = Some((
+            "anthropic-beta".to_string(),
+            "output-128k-2025-02-19".to_string(),
+        ));
+        let client = ClaudeAiClient::new(
+            "claude-sonnet-4-20250514".to_string(),
+            "key".to_string(),
+            beta,
+        );
+        let metadata = client.get_metadata();
+        assert!(metadata.active_beta.is_some());
+    }
+}
