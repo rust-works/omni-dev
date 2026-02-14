@@ -755,4 +755,244 @@ mod tests {
         assert_eq!(DiffDetail::StatOnly.to_string(), "stat summary only");
         assert_eq!(DiffDetail::FileListOnly.to_string(), "file list only");
     }
+
+    // ── update_field_presence ────────────────────────────────────────
+
+    fn make_repo_view(commits: Vec<crate::git::CommitInfo>) -> RepositoryView {
+        RepositoryView {
+            versions: None,
+            explanation: FieldExplanation::default(),
+            working_directory: WorkingDirectoryInfo {
+                clean: true,
+                untracked_changes: Vec::new(),
+            },
+            remotes: Vec::new(),
+            ai: AiInfo {
+                scratch: String::new(),
+            },
+            branch_info: None,
+            pr_template: None,
+            pr_template_location: None,
+            branch_prs: None,
+            commits,
+        }
+    }
+
+    fn field_present(view: &RepositoryView, name: &str) -> Option<bool> {
+        view.explanation
+            .fields
+            .iter()
+            .find(|f| f.name == name)
+            .map(|f| f.present)
+    }
+
+    #[test]
+    fn field_presence_no_commits() {
+        let mut view = make_repo_view(vec![]);
+        view.update_field_presence();
+
+        // Always-present fields
+        assert_eq!(field_present(&view, "working_directory.clean"), Some(true));
+        assert_eq!(field_present(&view, "remotes"), Some(true));
+        assert_eq!(field_present(&view, "ai.scratch"), Some(true));
+
+        // Commit-dependent fields
+        assert_eq!(field_present(&view, "commits[].hash"), Some(false));
+        assert_eq!(
+            field_present(&view, "commits[].analysis.detected_type"),
+            Some(false)
+        );
+
+        // Optional fields
+        assert_eq!(field_present(&view, "versions.omni_dev"), Some(false));
+        assert_eq!(field_present(&view, "branch_info.branch"), Some(false));
+        assert_eq!(field_present(&view, "pr_template"), Some(false));
+        assert_eq!(field_present(&view, "branch_prs"), Some(false));
+    }
+
+    #[test]
+    fn field_presence_with_versions() {
+        let mut view = make_repo_view(vec![]);
+        view.versions = Some(VersionInfo {
+            omni_dev: "1.0.0".to_string(),
+        });
+        view.update_field_presence();
+
+        assert_eq!(field_present(&view, "versions.omni_dev"), Some(true));
+    }
+
+    #[test]
+    fn field_presence_with_branch_info() {
+        let mut view = make_repo_view(vec![]);
+        view.branch_info = Some(BranchInfo {
+            branch: "main".to_string(),
+        });
+        view.update_field_presence();
+
+        assert_eq!(field_present(&view, "branch_info.branch"), Some(true));
+    }
+
+    #[test]
+    fn field_presence_with_pr_template() {
+        let mut view = make_repo_view(vec![]);
+        view.pr_template = Some("template content".to_string());
+        view.pr_template_location = Some(".github/pull_request_template.md".to_string());
+        view.update_field_presence();
+
+        assert_eq!(field_present(&view, "pr_template"), Some(true));
+        assert_eq!(field_present(&view, "pr_template_location"), Some(true));
+    }
+
+    #[test]
+    fn field_presence_with_branch_prs() {
+        let mut view = make_repo_view(vec![]);
+        view.branch_prs = Some(vec![PullRequest {
+            number: 42,
+            title: "Test PR".to_string(),
+            state: "open".to_string(),
+            url: "https://github.com/test/test/pull/42".to_string(),
+            body: "PR body".to_string(),
+            base: "main".to_string(),
+        }]);
+        view.update_field_presence();
+
+        assert_eq!(field_present(&view, "branch_prs"), Some(true));
+        assert_eq!(field_present(&view, "branch_prs[].number"), Some(true));
+        assert_eq!(field_present(&view, "branch_prs[].title"), Some(true));
+    }
+
+    #[test]
+    fn field_presence_empty_branch_prs() {
+        let mut view = make_repo_view(vec![]);
+        view.branch_prs = Some(vec![]);
+        view.update_field_presence();
+
+        assert_eq!(field_present(&view, "branch_prs"), Some(true));
+        assert_eq!(field_present(&view, "branch_prs[].number"), Some(false));
+    }
+
+    #[test]
+    fn field_presence_unknown_field_is_false() {
+        let mut view = make_repo_view(vec![]);
+        view.explanation.fields.push(FieldDocumentation {
+            name: "nonexistent.field".to_string(),
+            text: "should be false".to_string(),
+            command: None,
+            present: true, // Start true, should become false
+        });
+        view.update_field_presence();
+
+        assert_eq!(field_present(&view, "nonexistent.field"), Some(false));
+    }
+
+    // ── single_commit_view / multi_commit_view ───────────────────────
+
+    fn make_commit_info(hash: &str) -> crate::git::CommitInfo {
+        crate::git::CommitInfo {
+            hash: hash.to_string(),
+            author: "Test <test@test.com>".to_string(),
+            date: chrono::Utc::now().fixed_offset(),
+            original_message: "test".to_string(),
+            in_main_branches: Vec::new(),
+            analysis: crate::git::CommitAnalysis {
+                detected_type: "feat".to_string(),
+                detected_scope: "test".to_string(),
+                proposed_message: String::new(),
+                file_changes: crate::git::commit::FileChanges {
+                    total_files: 0,
+                    files_added: 0,
+                    files_deleted: 0,
+                    file_list: Vec::new(),
+                },
+                diff_summary: String::new(),
+                diff_file: String::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn single_commit_view_strips_metadata() {
+        let mut view = make_repo_view(vec![make_commit_info("aaa"), make_commit_info("bbb")]);
+        view.versions = Some(VersionInfo {
+            omni_dev: "1.0.0".to_string(),
+        });
+        view.branch_info = Some(BranchInfo {
+            branch: "feature/test".to_string(),
+        });
+        view.pr_template = Some("template".to_string());
+
+        let single = view.single_commit_view(&view.commits[0].clone());
+
+        assert!(single.versions.is_none());
+        assert!(single.pr_template.is_none());
+        assert!(single.remotes.is_empty());
+        assert_eq!(single.commits.len(), 1);
+        assert_eq!(single.commits[0].hash, "aaa");
+        // branch_info IS preserved
+        assert!(single.branch_info.is_some());
+        assert_eq!(single.branch_info.unwrap().branch, "feature/test");
+    }
+
+    #[test]
+    fn multi_commit_view_preserves_order() {
+        let commits = vec![
+            make_commit_info("aaa"),
+            make_commit_info("bbb"),
+            make_commit_info("ccc"),
+        ];
+        let view = make_repo_view(commits.clone());
+
+        let refs: Vec<&crate::git::CommitInfo> = commits.iter().collect();
+        let multi = view.multi_commit_view(&refs);
+
+        assert_eq!(multi.commits.len(), 3);
+        assert_eq!(multi.commits[0].hash, "aaa");
+        assert_eq!(multi.commits[1].hash, "bbb");
+        assert_eq!(multi.commits[2].hash, "ccc");
+    }
+
+    #[test]
+    fn multi_commit_view_empty() {
+        let view = make_repo_view(vec![]);
+        let multi = view.multi_commit_view(&[]);
+
+        assert!(multi.commits.is_empty());
+        assert!(multi.versions.is_none());
+    }
+
+    // ── FieldExplanation::default ────────────────────────────────────
+
+    #[test]
+    fn field_explanation_default_has_all_expected_fields() {
+        let explanation = FieldExplanation::default();
+
+        let field_names: Vec<&str> = explanation.fields.iter().map(|f| f.name.as_str()).collect();
+
+        // Core fields that must be documented
+        assert!(field_names.contains(&"working_directory.clean"));
+        assert!(field_names.contains(&"remotes"));
+        assert!(field_names.contains(&"commits[].hash"));
+        assert!(field_names.contains(&"commits[].author"));
+        assert!(field_names.contains(&"commits[].date"));
+        assert!(field_names.contains(&"commits[].original_message"));
+        assert!(field_names.contains(&"commits[].analysis.detected_type"));
+        assert!(field_names.contains(&"commits[].analysis.diff_file"));
+        assert!(field_names.contains(&"ai.scratch"));
+        assert!(field_names.contains(&"versions.omni_dev"));
+        assert!(field_names.contains(&"branch_info.branch"));
+        assert!(field_names.contains(&"pr_template"));
+        assert!(field_names.contains(&"branch_prs"));
+    }
+
+    #[test]
+    fn field_explanation_default_all_start_not_present() {
+        let explanation = FieldExplanation::default();
+        for field in &explanation.fields {
+            assert!(
+                !field.present,
+                "field '{}' should start as present=false",
+                field.name
+            );
+        }
+    }
 }
