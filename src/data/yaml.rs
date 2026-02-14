@@ -303,4 +303,136 @@ description: |
             pr_content.description.len()
         );
     }
+
+    // ── Edge cases for YAML serialization ────────────────────────────
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct NullableFields {
+        required: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        optional: Option<String>,
+    }
+
+    #[test]
+    fn yaml_optional_field_none_skipped() {
+        let data = NullableFields {
+            required: "present".to_string(),
+            optional: None,
+        };
+        let yaml = to_yaml(&data).unwrap();
+        assert!(yaml.contains("required:"));
+        assert!(!yaml.contains("optional:"));
+    }
+
+    #[test]
+    fn yaml_optional_field_some_included() {
+        let data = NullableFields {
+            required: "present".to_string(),
+            optional: Some("also present".to_string()),
+        };
+        let yaml = to_yaml(&data).unwrap();
+        assert!(yaml.contains("required:"));
+        assert!(yaml.contains("optional:"));
+        assert!(yaml.contains("also present"));
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct NestedData {
+        outer: String,
+        inner: InnerData,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct InnerData {
+        value: i32,
+        items: Vec<String>,
+    }
+
+    #[test]
+    fn yaml_nested_structure_roundtrip() {
+        let data = NestedData {
+            outer: "top".to_string(),
+            inner: InnerData {
+                value: 42,
+                items: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            },
+        };
+        let yaml = to_yaml(&data).unwrap();
+        let restored: NestedData = from_yaml(&yaml).unwrap();
+        assert_eq!(restored, data);
+    }
+
+    #[test]
+    fn yaml_empty_sequence() {
+        let data = InnerData {
+            value: 0,
+            items: vec![],
+        };
+        let yaml = to_yaml(&data).unwrap();
+        let restored: InnerData = from_yaml(&yaml).unwrap();
+        assert_eq!(restored.items.len(), 0);
+    }
+
+    #[test]
+    fn yaml_special_characters_roundtrip() {
+        let data = TestDiffContent {
+            diff_content: "line with 'quotes' and \"double quotes\"".to_string(),
+            description: "colons: here, #hashes, [brackets], {braces}".to_string(),
+        };
+        let yaml = to_yaml(&data).unwrap();
+        let restored: TestDiffContent = from_yaml(&yaml).unwrap();
+        assert_eq!(restored.diff_content, data.diff_content);
+        assert_eq!(restored.description, data.description);
+    }
+
+    #[test]
+    fn yaml_boolean_and_numeric_roundtrip() {
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct MixedTypes {
+            flag: bool,
+            count: i64,
+            ratio: f64,
+            name: String,
+        }
+
+        let data = MixedTypes {
+            flag: true,
+            count: 42,
+            ratio: 1.5,
+            name: "test".to_string(),
+        };
+        let yaml = to_yaml(&data).unwrap();
+        let restored: MixedTypes = from_yaml(&yaml).unwrap();
+        assert_eq!(restored, data);
+    }
+
+    #[test]
+    fn yaml_file_roundtrip() -> Result<()> {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new()?;
+        let path = dir.path().join("test.yaml");
+
+        let data = TestDiffContent {
+            diff_content: "diff content here\nwith lines".to_string(),
+            description: "a description".to_string(),
+        };
+
+        write_yaml_file(&data, &path)?;
+        let restored: TestDiffContent = read_yaml_file(&path)?;
+        assert_eq!(restored.description, data.description);
+        Ok(())
+    }
+
+    #[test]
+    fn yaml_read_nonexistent_file_fails() {
+        let result: Result<TestDiffContent> = read_yaml_file("/nonexistent/path.yaml");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn from_yaml_invalid_input() {
+        let result: Result<TestDiffContent> = from_yaml("not: valid: yaml: [{{");
+        assert!(result.is_err());
+    }
 }
