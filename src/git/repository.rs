@@ -565,3 +565,145 @@ impl GitRepository {
         Ok(false)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── extract_hostname_from_git_url ──────────────────────────────
+
+    #[test]
+    fn hostname_from_ssh_url() {
+        let hostname = extract_hostname_from_git_url("git@github.com:user/repo.git");
+        assert_eq!(hostname, Some("github.com".to_string()));
+    }
+
+    #[test]
+    fn hostname_from_https_url() {
+        let hostname = extract_hostname_from_git_url("https://github.com/user/repo.git");
+        assert_eq!(hostname, Some("github.com".to_string()));
+    }
+
+    #[test]
+    fn hostname_from_http_url() {
+        let hostname = extract_hostname_from_git_url("http://gitlab.com/user/repo.git");
+        assert_eq!(hostname, Some("gitlab.com".to_string()));
+    }
+
+    #[test]
+    fn hostname_from_unknown_scheme() {
+        let hostname = extract_hostname_from_git_url("ftp://example.com/repo");
+        assert_eq!(hostname, None);
+    }
+
+    #[test]
+    fn hostname_from_ssh_custom_host() {
+        let hostname = extract_hostname_from_git_url("git@gitlab.example.com:org/project.git");
+        assert_eq!(hostname, Some("gitlab.example.com".to_string()));
+    }
+
+    // ── format_status_flags ────────────────────────────────────────
+
+    #[test]
+    fn status_flags_new_index() {
+        let status = format_status_flags(Status::INDEX_NEW);
+        assert_eq!(status, "A ");
+    }
+
+    #[test]
+    fn status_flags_modified_index() {
+        let status = format_status_flags(Status::INDEX_MODIFIED);
+        assert_eq!(status, "M ");
+    }
+
+    #[test]
+    fn status_flags_deleted_index() {
+        let status = format_status_flags(Status::INDEX_DELETED);
+        assert_eq!(status, "D ");
+    }
+
+    #[test]
+    fn status_flags_wt_new() {
+        let status = format_status_flags(Status::WT_NEW);
+        assert_eq!(status, " ?");
+    }
+
+    #[test]
+    fn status_flags_wt_modified() {
+        let status = format_status_flags(Status::WT_MODIFIED);
+        assert_eq!(status, " M");
+    }
+
+    #[test]
+    fn status_flags_combined() {
+        let status = format_status_flags(Status::INDEX_NEW | Status::WT_MODIFIED);
+        assert_eq!(status, "AM");
+    }
+
+    #[test]
+    fn status_flags_empty() {
+        let status = format_status_flags(Status::empty());
+        assert_eq!(status, "  ");
+    }
+
+    // ── format_auth_error ──────────────────────────────────────────
+
+    #[test]
+    fn auth_error_with_ssh_message() {
+        let error = git2::Error::from_str("SSH authentication failed");
+        let msg = format_auth_error("push", &error);
+        assert!(msg.contains("Troubleshooting steps"));
+        assert!(msg.contains("ssh-add -l"));
+    }
+
+    #[test]
+    fn auth_error_without_auth_message() {
+        let error = git2::Error::from_str("network timeout");
+        let msg = format_auth_error("fetch", &error);
+        assert!(msg.contains("Failed to fetch"));
+        assert!(!msg.contains("Troubleshooting"));
+    }
+
+    // ── GitRepository with temp repo ───────────────────────────────
+
+    #[test]
+    fn open_at_temp_repo() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        git2::Repository::init(temp_dir.path())?;
+        let repo = GitRepository::open_at(temp_dir.path())?;
+        assert!(repo.path().exists());
+        Ok(())
+    }
+
+    #[test]
+    fn working_directory_clean_empty_repo() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        git2::Repository::init(temp_dir.path())?;
+        let repo = GitRepository::open_at(temp_dir.path())?;
+        let status = repo.get_working_directory_status()?;
+        assert!(status.clean);
+        assert!(status.untracked_changes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn working_directory_dirty_with_file() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        git2::Repository::init(temp_dir.path())?;
+        std::fs::write(temp_dir.path().join("new_file.txt"), "content")?;
+        let repo = GitRepository::open_at(temp_dir.path())?;
+        let status = repo.get_working_directory_status()?;
+        assert!(!status.clean);
+        assert!(!status.untracked_changes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn is_working_directory_clean_delegator() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        git2::Repository::init(temp_dir.path())?;
+        let repo = GitRepository::open_at(temp_dir.path())?;
+        assert!(repo.is_working_directory_clean()?);
+        Ok(())
+    }
+}
