@@ -1,0 +1,4 @@
+# Seeds for failure cases propance has generated in the past. It is
+# temporary recommended to check this file in until the failing case
+# has been fixed.
+cc 284ebd1e31ca9ec01b9ac8634905e4c9e2e8c349e126b482c6e0c0d7500fafe7

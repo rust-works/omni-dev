@@ -52,6 +52,7 @@ fn find_git_root_from_path(start_path: &Path) -> Result<PathBuf> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use std::env;

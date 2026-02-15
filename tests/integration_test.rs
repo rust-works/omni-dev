@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::env;
 use std::fs;
 use std::path::PathBuf;

@@ -312,10 +312,12 @@ static MODEL_REGISTRY: OnceLock<ModelRegistry> = OnceLock::new();
 
 /// Returns the global model registry instance.
 pub fn get_model_registry() -> &'static ModelRegistry {
+    #[allow(clippy::expect_used)] // YAML is embedded via include_str! at compile time
     MODEL_REGISTRY.get_or_init(|| ModelRegistry::load().expect("Failed to load model registry"))
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

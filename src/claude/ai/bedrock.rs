@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
@@ -84,19 +84,19 @@ impl BedrockAiClient {
         auth_token: String,
         base_url: String,
         active_beta: Option<(String, String)>,
-    ) -> Self {
+    ) -> Result<Self> {
         let client = Client::builder()
             .timeout(super::REQUEST_TIMEOUT)
             .build()
-            .expect("failed to build HTTP client");
+            .context("Failed to build HTTP client")?;
 
-        Self {
+        Ok(Self {
             client,
             auth_token,
             model,
             base_url,
             active_beta,
-        }
+        })
     }
 
     /// Returns the max tokens from the model registry.
@@ -290,6 +290,7 @@ impl AiClient for BedrockAiClient {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -300,7 +301,8 @@ mod tests {
             "test_token".to_string(),
             "https://bedrock-api.com/bedrock".to_string(),
             None,
-        );
+        )
+        .unwrap();
 
         let url = client.get_api_url().unwrap();
         assert_eq!(
@@ -317,7 +319,8 @@ mod tests {
             "test_token".to_string(),
             "https://example.com".to_string(),
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(client.get_max_tokens(), 4096); // Correct legacy limit
 
         // Test Claude Sonnet 4
@@ -326,7 +329,8 @@ mod tests {
             "test_token".to_string(),
             "https://example.com".to_string(),
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(client.get_max_tokens(), 64000); // New high limit
 
         // Test unknown model falls back to provider defaults
@@ -335,7 +339,8 @@ mod tests {
             "test_token".to_string(),
             "https://example.com".to_string(),
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(client.get_max_tokens(), 4096); // Claude provider default
     }
 
@@ -346,7 +351,8 @@ mod tests {
             "test_token".to_string(),
             "https://bedrock-api.com/bedrock/".to_string(),
             None,
-        );
+        )
+        .unwrap();
 
         let url = client.get_api_url().unwrap();
         assert_eq!(
@@ -362,7 +368,8 @@ mod tests {
             "test_token".to_string(),
             "https://bedrock-api.com/api".to_string(),
             None,
-        );
+        )
+        .unwrap();
 
         let url = client.get_api_url().unwrap();
         assert!(url.contains("model/claude-sonnet-4-20250514/invoke"));
@@ -375,7 +382,8 @@ mod tests {
             "token".to_string(),
             "https://example.com".to_string(),
             None,
-        );
+        )
+        .unwrap();
         let metadata = client.get_metadata();
         assert_eq!(metadata.provider, "Anthropic Bedrock");
         assert_eq!(metadata.model, "claude-sonnet-4-20250514");
@@ -395,7 +403,8 @@ mod tests {
             "token".to_string(),
             "https://example.com".to_string(),
             beta,
-        );
+        )
+        .unwrap();
         let metadata = client.get_metadata();
         assert!(metadata.active_beta.is_some());
     }
@@ -407,7 +416,8 @@ mod tests {
             "my-token".to_string(),
             "https://bedrock.us-east-1.amazonaws.com".to_string(),
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(client.model, "claude-sonnet-4-20250514");
         assert_eq!(client.auth_token, "my-token");
         assert_eq!(client.base_url, "https://bedrock.us-east-1.amazonaws.com");
