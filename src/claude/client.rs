@@ -202,7 +202,7 @@ impl ClaudeClient {
             .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
             .map_err(|_| ClaudeError::ApiKeyNotFound)?;
 
-        let ai_client = ClaudeAiClient::new(model, api_key, None);
+        let ai_client = ClaudeAiClient::new(model, api_key, None)?;
         Ok(Self::new(Box::new(ai_client)))
     }
 
@@ -741,7 +741,7 @@ pub fn create_default_claude_client(
             .unwrap_or_else(|| "llama2".to_string());
         validate_beta_header(&ollama_model, &beta_header)?;
         let base_url = get_env_var("OLLAMA_BASE_URL").ok();
-        let ai_client = OpenAiAiClient::new_ollama(ollama_model, base_url, beta_header);
+        let ai_client = OpenAiAiClient::new_ollama(ollama_model, base_url, beta_header)?;
         return Ok(ClaudeClient::new(Box::new(ai_client)));
     }
 
@@ -760,7 +760,7 @@ pub fn create_default_claude_client(
         })?;
         debug!("OpenAI API key found");
 
-        let ai_client = OpenAiAiClient::new_openai(openai_model, api_key, beta_header);
+        let ai_client = OpenAiAiClient::new_openai(openai_model, api_key, beta_header)?;
         debug!("OpenAI client created successfully");
         return Ok(ClaudeClient::new(Box::new(ai_client)));
     }
@@ -779,7 +779,7 @@ pub fn create_default_claude_client(
         let base_url =
             get_env_var("ANTHROPIC_BEDROCK_BASE_URL").map_err(|_| ClaudeError::ApiKeyNotFound)?;
 
-        let ai_client = BedrockAiClient::new(claude_model, auth_token, base_url, beta_header);
+        let ai_client = BedrockAiClient::new(claude_model, auth_token, base_url, beta_header)?;
         return Ok(ClaudeClient::new(Box::new(ai_client)));
     }
 
@@ -792,12 +792,13 @@ pub fn create_default_claude_client(
     ])
     .map_err(|_| ClaudeError::ApiKeyNotFound)?;
 
-    let ai_client = ClaudeAiClient::new(claude_model, api_key, beta_header);
+    let ai_client = ClaudeAiClient::new(claude_model, api_key, beta_header)?;
     debug!("Claude client created successfully");
     Ok(ClaudeClient::new(Box::new(ai_client)))
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::claude::ai::{AiClient, AiClientMetadata};

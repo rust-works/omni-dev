@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::data::context::ScopeDefinition;
 
 /// Matches conventional commit scope patterns including breaking-change syntax.
+#[allow(clippy::unwrap_used)] // Compile-time constant regex pattern
 static SCOPE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-z]+!\(([^)]+)\):|^[a-z]+\(([^)]+)\):").unwrap());
 
@@ -126,6 +127,7 @@ impl CommitInfo {
         let date = DateTime::from_timestamp(timestamp.seconds(), 0)
             .context("Invalid commit timestamp")?
             .with_timezone(
+                #[allow(clippy::unwrap_used)] // Offset 0 is always valid
                 &FixedOffset::east_opt(timestamp.offset_minutes() * 60)
                     .unwrap_or_else(|| FixedOffset::east_opt(0).unwrap()),
             );
@@ -405,6 +407,7 @@ impl CommitAnalysis {
         }
 
         // SAFETY: matches is non-empty (guarded by early return above)
+        #[allow(clippy::expect_used)] // Guarded by is_empty() check above
         let max_specificity = matches.iter().map(|(_, s)| *s).max().expect("non-empty");
         let best: Vec<&str> = matches
             .into_iter()
@@ -695,6 +698,7 @@ impl CommitAnalysisForAI {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::data::context::ScopeDefinition;
