@@ -73,11 +73,7 @@ impl CreatePrCommand {
         // Check configuration setting
         get_env_var("OMNI_DEV_DEFAULT_DRAFT_PR")
             .ok()
-            .and_then(|val| match val.to_lowercase().as_str() {
-                "true" | "1" | "yes" => Some(true),
-                "false" | "0" | "no" => Some(false),
-                _ => None,
-            })
+            .and_then(|val| parse_bool_string(&val))
             .unwrap_or(true) // Default to draft if not configured
     }
 
@@ -787,9 +783,7 @@ impl CreatePrCommand {
         for commit in &repo_view.commits {
             let detected_type = &commit.analysis.detected_type;
             types_found.insert(detected_type.clone());
-            if detected_type.contains("BREAKING")
-                || commit.original_message.contains("BREAKING CHANGE")
-            {
+            if is_breaking_change(detected_type, &commit.original_message) {
                 has_breaking_changes = true;
             }
 
@@ -800,48 +794,40 @@ impl CreatePrCommand {
         }
 
         // Update type checkboxes based on detected types
-        if let Some(feat_pos) = description.find("- [ ] New feature") {
-            if types_found.contains("feat") {
-                description.replace_range(feat_pos..feat_pos + 5, "- [x]");
-            }
+        if types_found.contains("feat") {
+            check_checkbox(description, "- [ ] New feature");
         }
-        if let Some(fix_pos) = description.find("- [ ] Bug fix") {
-            if types_found.contains("fix") {
-                description.replace_range(fix_pos..fix_pos + 5, "- [x]");
-            }
+        if types_found.contains("fix") {
+            check_checkbox(description, "- [ ] Bug fix");
         }
-        if let Some(docs_pos) = description.find("- [ ] Documentation update") {
-            if types_found.contains("docs") {
-                description.replace_range(docs_pos..docs_pos + 5, "- [x]");
-            }
+        if types_found.contains("docs") {
+            check_checkbox(description, "- [ ] Documentation update");
         }
-        if let Some(refactor_pos) = description.find("- [ ] Refactoring") {
-            if types_found.contains("refactor") {
-                description.replace_range(refactor_pos..refactor_pos + 5, "- [x]");
-            }
+        if types_found.contains("refactor") {
+            check_checkbox(description, "- [ ] Refactoring");
         }
-        if let Some(breaking_pos) = description.find("- [ ] Breaking change") {
-            if has_breaking_changes {
-                description.replace_range(breaking_pos..breaking_pos + 5, "- [x]");
-            }
+        if has_breaking_changes {
+            check_checkbox(description, "- [ ] Breaking change");
         }
 
         // Add detected scopes
-        if !scopes_found.is_empty() {
-            let scopes_list: Vec<_> = scopes_found.into_iter().collect();
-            description.push_str(&format!(
-                "**Affected areas:** {}\n\n",
-                scopes_list.join(", ")
-            ));
+        let scopes_list: Vec<_> = scopes_found.into_iter().collect();
+        let scopes_section = format_scopes_section(&scopes_list);
+        if !scopes_section.is_empty() {
+            description.push_str(&scopes_section);
         }
 
         // Add commit list
-        description.push_str("### Commits in this PR:\n");
-        for commit in &repo_view.commits {
-            let short_hash = &commit.hash[..crate::git::SHORT_HASH_LEN];
-            let first_line = commit.original_message.lines().next().unwrap_or("").trim();
-            description.push_str(&format!("- `{short_hash}` {first_line}\n"));
-        }
+        let commit_entries: Vec<(&str, &str)> = repo_view
+            .commits
+            .iter()
+            .map(|c| {
+                let short = &c.hash[..crate::git::SHORT_HASH_LEN];
+                let first = extract_first_line(&c.original_message);
+                (short, first)
+            })
+            .collect();
+        description.push_str(&format_commit_list(&commit_entries));
 
         // Add file change summary
         let total_files: usize = repo_view
@@ -870,12 +856,7 @@ impl CreatePrCommand {
 
         // Show draft status
         let is_draft = self.should_create_as_draft();
-        let status_icon = if is_draft { "📋" } else { "✅" };
-        let status_text = if is_draft {
-            "draft"
-        } else {
-            "ready for review"
-        };
+        let (status_icon, status_text) = format_draft_status(is_draft);
         println!("{status_icon} PR will be created as: {status_text}");
         println!();
 
@@ -967,10 +948,7 @@ impl CreatePrCommand {
 
         println!("📝 Opening PR details file in editor: {editor}");
 
-        // Split editor command to handle arguments
-        let mut cmd_parts = editor.split_whitespace();
-        let editor_cmd = cmd_parts.next().unwrap_or(&editor);
-        let args: Vec<&str> = cmd_parts.collect();
+        let (editor_cmd, args) = super::formatting::parse_editor_command(&editor);
 
         let mut command = Command::new(editor_cmd);
         command.args(args);
@@ -1004,13 +982,13 @@ impl CreatePrCommand {
 
         // For single commit, use its first line
         if repo_view.commits.len() == 1 {
-            return repo_view.commits[0]
-                .original_message
-                .lines()
-                .next()
-                .unwrap_or("Pull Request")
-                .trim()
-                .to_string();
+            let first = extract_first_line(&repo_view.commits[0].original_message);
+            let trimmed = first.trim();
+            return if trimmed.is_empty() {
+                "Pull Request".to_string()
+            } else {
+                trimmed.to_string()
+            };
         }
 
         // For multiple commits, generate from branch name
@@ -1019,9 +997,7 @@ impl CreatePrCommand {
             .as_ref()
             .map_or("feature", |bi| bi.branch.as_str());
 
-        let cleaned_branch = branch_name.replace(['/', '-', '_'], " ");
-
-        format!("feat: {cleaned_branch}")
+        format!("feat: {}", clean_branch_name(branch_name))
     }
 
     /// Creates a new GitHub PR using gh CLI.
@@ -1272,5 +1248,223 @@ impl CreatePrCommand {
 
         println!();
         Ok(())
+    }
+}
+
+// --- Extracted pure functions ---
+
+/// Parses a boolean-like string value.
+///
+/// Accepts "true"/"1"/"yes" as `true` and "false"/"0"/"no" as `false`.
+/// Returns `None` for unrecognized values.
+fn parse_bool_string(val: &str) -> Option<bool> {
+    match val.to_lowercase().as_str() {
+        "true" | "1" | "yes" => Some(true),
+        "false" | "0" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// Returns whether a commit represents a breaking change.
+fn is_breaking_change(detected_type: &str, original_message: &str) -> bool {
+    detected_type.contains("BREAKING") || original_message.contains("BREAKING CHANGE")
+}
+
+/// Checks a markdown checkbox in the description by replacing `- [ ]` with `- [x]`.
+fn check_checkbox(description: &mut String, search_text: &str) {
+    if let Some(pos) = description.find(search_text) {
+        description.replace_range(pos..pos + 5, "- [x]");
+    }
+}
+
+/// Formats a list of scopes as a markdown "Affected areas" section.
+///
+/// Returns an empty string if the list is empty.
+fn format_scopes_section(scopes: &[String]) -> String {
+    if scopes.is_empty() {
+        return String::new();
+    }
+    format!("**Affected areas:** {}\n\n", scopes.join(", "))
+}
+
+/// Formats commit entries as a markdown list with short hashes.
+fn format_commit_list(entries: &[(&str, &str)]) -> String {
+    let mut output = String::from("### Commits in this PR:\n");
+    for (hash, message) in entries {
+        output.push_str(&format!("- `{hash}` {message}\n"));
+    }
+    output
+}
+
+/// Replaces path separators (`/`, `-`, `_`) in a branch name with spaces.
+fn clean_branch_name(branch: &str) -> String {
+    branch.replace(['/', '-', '_'], " ")
+}
+
+/// Returns the first line of a text block, trimmed.
+fn extract_first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or("").trim()
+}
+
+/// Returns an (icon, label) pair for a PR's draft status.
+fn format_draft_status(is_draft: bool) -> (&'static str, &'static str) {
+    if is_draft {
+        ("\u{1f4cb}", "draft")
+    } else {
+        ("\u{2705}", "ready for review")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- parse_bool_string ---
+
+    #[test]
+    fn parse_bool_true_variants() {
+        assert_eq!(parse_bool_string("true"), Some(true));
+        assert_eq!(parse_bool_string("1"), Some(true));
+        assert_eq!(parse_bool_string("yes"), Some(true));
+    }
+
+    #[test]
+    fn parse_bool_false_variants() {
+        assert_eq!(parse_bool_string("false"), Some(false));
+        assert_eq!(parse_bool_string("0"), Some(false));
+        assert_eq!(parse_bool_string("no"), Some(false));
+    }
+
+    #[test]
+    fn parse_bool_invalid() {
+        assert_eq!(parse_bool_string("maybe"), None);
+        assert_eq!(parse_bool_string(""), None);
+    }
+
+    #[test]
+    fn parse_bool_case_insensitive() {
+        assert_eq!(parse_bool_string("TRUE"), Some(true));
+        assert_eq!(parse_bool_string("Yes"), Some(true));
+        assert_eq!(parse_bool_string("FALSE"), Some(false));
+        assert_eq!(parse_bool_string("No"), Some(false));
+    }
+
+    // --- is_breaking_change ---
+
+    #[test]
+    fn breaking_change_type_contains() {
+        assert!(is_breaking_change("BREAKING", "normal message"));
+    }
+
+    #[test]
+    fn breaking_change_message_contains() {
+        assert!(is_breaking_change("feat", "BREAKING CHANGE: removed API"));
+    }
+
+    #[test]
+    fn breaking_change_none() {
+        assert!(!is_breaking_change("feat", "add new feature"));
+    }
+
+    // --- check_checkbox ---
+
+    #[test]
+    fn check_checkbox_found() {
+        let mut desc = "- [ ] New feature\n- [ ] Bug fix".to_string();
+        check_checkbox(&mut desc, "- [ ] New feature");
+        assert!(desc.contains("- [x] New feature"));
+        assert!(desc.contains("- [ ] Bug fix"));
+    }
+
+    #[test]
+    fn check_checkbox_not_found() {
+        let mut desc = "- [ ] Bug fix".to_string();
+        let original = desc.clone();
+        check_checkbox(&mut desc, "- [ ] New feature");
+        assert_eq!(desc, original);
+    }
+
+    // --- format_scopes_section ---
+
+    #[test]
+    fn scopes_section_single() {
+        let scopes = vec!["cli".to_string()];
+        assert_eq!(
+            format_scopes_section(&scopes),
+            "**Affected areas:** cli\n\n"
+        );
+    }
+
+    #[test]
+    fn scopes_section_multiple() {
+        let scopes = vec!["cli".to_string(), "git".to_string()];
+        let result = format_scopes_section(&scopes);
+        assert!(result.contains("cli"));
+        assert!(result.contains("git"));
+        assert!(result.starts_with("**Affected areas:**"));
+    }
+
+    #[test]
+    fn scopes_section_empty() {
+        assert_eq!(format_scopes_section(&[]), "");
+    }
+
+    // --- format_commit_list ---
+
+    #[test]
+    fn commit_list_formatting() {
+        let entries = vec![
+            ("abc12345", "feat: add feature"),
+            ("def67890", "fix: resolve bug"),
+        ];
+        let result = format_commit_list(&entries);
+        assert!(result.contains("### Commits in this PR:"));
+        assert!(result.contains("- `abc12345` feat: add feature"));
+        assert!(result.contains("- `def67890` fix: resolve bug"));
+    }
+
+    // --- clean_branch_name ---
+
+    #[test]
+    fn clean_branch_simple() {
+        assert_eq!(clean_branch_name("feat/add-login"), "feat add login");
+    }
+
+    #[test]
+    fn clean_branch_underscores() {
+        assert_eq!(clean_branch_name("user_name/fix_bug"), "user name fix bug");
+    }
+
+    // --- extract_first_line ---
+
+    #[test]
+    fn first_line_multiline() {
+        assert_eq!(extract_first_line("first\nsecond\nthird"), "first");
+    }
+
+    #[test]
+    fn first_line_single() {
+        assert_eq!(extract_first_line("only line"), "only line");
+    }
+
+    #[test]
+    fn first_line_empty() {
+        assert_eq!(extract_first_line(""), "");
+    }
+
+    // --- format_draft_status ---
+
+    #[test]
+    fn draft_status_true() {
+        let (icon, text) = format_draft_status(true);
+        assert_eq!(text, "draft");
+        assert!(!icon.is_empty());
+    }
+
+    #[test]
+    fn draft_status_false() {
+        let (icon, text) = format_draft_status(false);
+        assert_eq!(text, "ready for review");
+        assert!(!icon.is_empty());
     }
 }
