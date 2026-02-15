@@ -637,4 +637,74 @@ mod tests {
         )];
         assert!(!FileAnalyzer::is_architectural_change(&contexts));
     }
+
+    // ── property tests ────────────────────────────────────────────
+
+    mod prop {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_file_purpose() -> impl Strategy<Value = FilePurpose> {
+            prop_oneof![
+                Just(FilePurpose::Config),
+                Just(FilePurpose::Test),
+                Just(FilePurpose::Documentation),
+                Just(FilePurpose::Build),
+                Just(FilePurpose::Tooling),
+                Just(FilePurpose::Interface),
+                Just(FilePurpose::CoreLogic),
+            ]
+        }
+
+        proptest! {
+            #[test]
+            fn file_purpose_deterministic(s in "[a-zA-Z0-9_/\\.]{0,100}") {
+                let p = Path::new(&s);
+                let a = format!("{:?}", determine_file_purpose(p));
+                let b = format!("{:?}", determine_file_purpose(p));
+                prop_assert_eq!(a, b);
+            }
+
+            #[test]
+            fn config_extensions_classified(
+                name in "[a-z]{1,10}",
+                ext in prop_oneof![
+                    Just(".toml"),
+                    Just(".json"),
+                    Just(".yaml"),
+                    Just(".yml"),
+                    Just(".ini"),
+                    Just(".cfg"),
+                ],
+            ) {
+                let path_str = format!("{name}{ext}");
+                let purpose = determine_file_purpose(Path::new(&path_str));
+                prop_assert!(matches!(purpose, FilePurpose::Config));
+            }
+
+            #[test]
+            fn test_paths_classified(name in "[a-z_]{1,20}\\.rs") {
+                let path_str = format!("tests/{name}");
+                let purpose = determine_file_purpose(Path::new(&path_str));
+                prop_assert!(matches!(purpose, FilePurpose::Test));
+            }
+
+            #[test]
+            fn change_impact_added_always_additive(purpose in arb_file_purpose()) {
+                let impact = determine_change_impact("A", &purpose);
+                prop_assert!(matches!(impact, ChangeImpact::Additive));
+            }
+
+            #[test]
+            fn architectural_layer_deterministic(
+                s in "[a-zA-Z0-9_/\\.]{0,100}",
+                purpose in arb_file_purpose(),
+            ) {
+                let p = Path::new(&s);
+                let a = format!("{:?}", determine_architectural_layer(p, &purpose));
+                let b = format!("{:?}", determine_architectural_layer(p, &purpose));
+                prop_assert_eq!(a, b);
+            }
+        }
+    }
 }

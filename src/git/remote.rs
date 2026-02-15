@@ -215,4 +215,42 @@ mod tests {
             .to_string()
             .contains("Invalid GitHub repository format"));
     }
+
+    // ── property tests ────────────────────────────────────────────
+
+    mod prop {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn ssh_url_extracts_repo(
+                owner in "[a-z]{3,10}",
+                repo in "[a-z]{3,10}",
+            ) {
+                let url = format!("git@github.com:{owner}/{repo}.git");
+                let result = RemoteInfo::extract_github_repo_name(&url).unwrap();
+                prop_assert_eq!(result, format!("{owner}/{repo}"));
+            }
+
+            #[test]
+            fn https_url_extracts_repo(
+                owner in "[a-z]{3,10}",
+                repo in "[a-z]{3,10}",
+            ) {
+                let url = format!("https://github.com/{owner}/{repo}.git");
+                let result = RemoteInfo::extract_github_repo_name(&url).unwrap();
+                prop_assert_eq!(result, format!("{owner}/{repo}"));
+            }
+
+            #[test]
+            fn non_github_url_errors(
+                host in "(gitlab|bitbucket|codeberg)",
+                path in "[a-z]{3,10}/[a-z]{3,10}",
+            ) {
+                let url = format!("git@{host}.com:{path}.git");
+                prop_assert!(RemoteInfo::extract_github_repo_name(&url).is_err());
+            }
+        }
+    }
 }

@@ -697,4 +697,32 @@ mod tests {
             .iter()
             .any(|f| f.to_string_lossy() == "src/main.rs"));
     }
+
+    // ── property tests ────────────────────────────────────────────
+
+    mod prop {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn estimate_lines_nonnegative(s in ".*") {
+                prop_assert!(estimate_lines_changed(&s) >= 0);
+            }
+
+            #[test]
+            fn estimate_lines_structured_input(n in 0_u16..10000) {
+                let input = format!(" src/main.rs | {n} ++++");
+                let result = estimate_lines_changed(&input);
+                prop_assert!(result >= i32::from(n));
+            }
+
+            #[test]
+            fn classification_deterministic(s in ".*") {
+                prop_assert_eq!(is_config_file(&s), is_config_file(&s));
+                prop_assert_eq!(is_critical_file(&s), is_critical_file(&s));
+                prop_assert_eq!(is_public_interface(&s), is_public_interface(&s));
+            }
+        }
+    }
 }

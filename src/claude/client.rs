@@ -960,4 +960,46 @@ mod tests {
         assert_eq!(metadata.provider, "Mock");
         assert_eq!(metadata.model, "mock-model");
     }
+
+    // ── property tests ────────────────────────────────────────────
+
+    mod prop {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn yaml_response_output_trimmed(s in ".*") {
+                let client = make_client();
+                let result = client.extract_yaml_from_response(&s);
+                prop_assert_eq!(&result, result.trim());
+            }
+
+            #[test]
+            fn yaml_response_amendments_prefix_preserved(tail in ".*") {
+                let client = make_client();
+                let input = format!("amendments:{tail}");
+                let result = client.extract_yaml_from_response(&input);
+                prop_assert!(result.starts_with("amendments:"));
+            }
+
+            #[test]
+            fn check_response_checks_prefix_preserved(tail in ".*") {
+                let client = make_client();
+                let input = format!("checks:{tail}");
+                let result = client.extract_yaml_from_check_response(&input);
+                prop_assert!(result.starts_with("checks:"));
+            }
+
+            #[test]
+            fn yaml_fenced_block_strips_fences(
+                content in "[a-zA-Z0-9: _\\-\n]{1,100}",
+            ) {
+                let client = make_client();
+                let input = format!("```yaml\n{content}\n```");
+                let result = client.extract_yaml_from_response(&input);
+                prop_assert!(!result.contains("```"));
+            }
+        }
+    }
 }
