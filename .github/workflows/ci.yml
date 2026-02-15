@@ -74,11 +74,12 @@ jobs:
     - name: Install cargo-tarpaulin
       run: cargo install cargo-tarpaulin
     - name: Generate coverage report
-      run: cargo tarpaulin --verbose --all-features --workspace --timeout 120 --out xml
+      run: cargo tarpaulin --verbose --all-features --workspace --timeout 120 --out xml --fail-under 30
     - name: Upload to codecov.io
       uses: codecov/codecov-action@v3
       with:
-        fail_ci_if_error: false
+        token: ${{ secrets.CODECOV_TOKEN }}
+        fail_ci_if_error: true
 
   nix:
     name: Nix Build
