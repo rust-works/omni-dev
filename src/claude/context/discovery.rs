@@ -583,6 +583,7 @@ fn extract_scopes_from_examples(line: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use tempfile::TempDir;

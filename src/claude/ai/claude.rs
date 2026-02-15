@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
@@ -55,18 +55,22 @@ pub struct ClaudeAiClient {
 
 impl ClaudeAiClient {
     /// Creates a new Claude AI client.
-    pub fn new(model: String, api_key: String, active_beta: Option<(String, String)>) -> Self {
+    pub fn new(
+        model: String,
+        api_key: String,
+        active_beta: Option<(String, String)>,
+    ) -> Result<Self> {
         let client = Client::builder()
             .timeout(super::REQUEST_TIMEOUT)
             .build()
-            .expect("failed to build HTTP client");
+            .context("Failed to build HTTP client")?;
 
-        Self {
+        Ok(Self {
             client,
             api_key,
             model,
             active_beta,
-        }
+        })
     }
 
     /// Returns the max tokens from the model registry.
@@ -209,6 +213,7 @@ impl AiClient for ClaudeAiClient {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -218,7 +223,8 @@ mod tests {
             "claude-sonnet-4-20250514".to_string(),
             "sk-ant-test".to_string(),
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(client.model, "claude-sonnet-4-20250514");
         assert_eq!(client.api_key, "sk-ant-test");
         assert!(client.active_beta.is_none());
@@ -234,7 +240,8 @@ mod tests {
             "claude-sonnet-4-20250514".to_string(),
             "key".to_string(),
             beta,
-        );
+        )
+        .unwrap();
         assert!(client.active_beta.is_some());
         let (key, value) = client.active_beta.unwrap();
         assert_eq!(key, "anthropic-beta");
@@ -247,7 +254,8 @@ mod tests {
             "claude-sonnet-4-20250514".to_string(),
             "key".to_string(),
             None,
-        );
+        )
+        .unwrap();
         let tokens = client.get_max_tokens();
         assert!(tokens > 0, "expected positive token limit, got {tokens}");
     }
@@ -258,7 +266,8 @@ mod tests {
             "claude-3-opus-20240229".to_string(),
             "key".to_string(),
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(client.get_max_tokens(), 4096);
     }
 
@@ -268,7 +277,8 @@ mod tests {
             "claude-sonnet-4-20250514".to_string(),
             "key".to_string(),
             None,
-        );
+        )
+        .unwrap();
         let metadata = client.get_metadata();
         assert_eq!(metadata.provider, "Anthropic");
         assert_eq!(metadata.model, "claude-sonnet-4-20250514");
@@ -287,7 +297,8 @@ mod tests {
             "claude-sonnet-4-20250514".to_string(),
             "key".to_string(),
             beta,
-        );
+        )
+        .unwrap();
         let metadata = client.get_metadata();
         assert!(metadata.active_beta.is_some());
     }

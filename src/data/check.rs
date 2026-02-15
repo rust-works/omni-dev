@@ -97,6 +97,7 @@ impl IssueSeverity {
     #[must_use]
     pub fn parse(s: &str) -> Self {
         // FromStr impl is infallible (unknown values default to Warning with a log).
+        #[allow(clippy::expect_used)] // FromStr for IssueSeverity always returns Ok
         s.parse().expect("IssueSeverity::from_str is infallible")
     }
 }
@@ -293,6 +294,7 @@ impl From<AiCommitCheck> for CommitCheckResult {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

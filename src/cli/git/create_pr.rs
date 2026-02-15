@@ -924,22 +924,20 @@ impl CreatePrCommand {
         use std::process::Command;
 
         // Try to get editor from environment variables
-        let editor = env::var("OMNI_DEV_EDITOR")
-            .or_else(|_| env::var("EDITOR"))
-            .unwrap_or_else(|_| {
-                // Prompt user for editor if neither environment variable is set
-                println!(
-                    "🔧 Neither OMNI_DEV_EDITOR nor EDITOR environment variables are defined."
-                );
-                print!("Please enter the command to use as your editor: ");
-                io::stdout().flush().expect("Failed to flush stdout");
+        let editor = if let Ok(e) = env::var("OMNI_DEV_EDITOR").or_else(|_| env::var("EDITOR")) {
+            e
+        } else {
+            // Prompt user for editor if neither environment variable is set
+            println!("🔧 Neither OMNI_DEV_EDITOR nor EDITOR environment variables are defined.");
+            print!("Please enter the command to use as your editor: ");
+            io::stdout().flush().context("Failed to flush stdout")?;
 
-                let mut input = String::new();
-                io::stdin()
-                    .read_line(&mut input)
-                    .expect("Failed to read user input");
-                input.trim().to_string()
-            });
+            let mut input = String::new();
+            io::stdin()
+                .read_line(&mut input)
+                .context("Failed to read user input")?;
+            input.trim().to_string()
+        };
 
         if editor.is_empty() {
             println!("❌ No editor specified. Returning to menu.");
