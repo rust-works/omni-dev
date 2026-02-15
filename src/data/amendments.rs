@@ -278,4 +278,77 @@ mod tests {
     fn load_nonexistent_file_fails() {
         assert!(AmendmentFile::load_from_file("/nonexistent/path.yaml").is_err());
     }
+
+    // ── property tests ────────────────────────────────────────────
+
+    mod prop {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn valid_hex_hash_nonempty_msg_validates(
+                hash in "[0-9a-f]{40}",
+                msg in "[^\t\n ].{0,200}",
+            ) {
+                let amendment = Amendment::new(hash, msg);
+                prop_assert!(amendment.validate().is_ok());
+            }
+
+            #[test]
+            fn wrong_length_hash_rejects(
+                len in (1_usize..80).prop_filter("not 40", |l| *l != 40),
+            ) {
+                let hash: String = "a".repeat(len);
+                let amendment = Amendment::new(hash, "valid message".to_string());
+                prop_assert!(amendment.validate().is_err());
+            }
+
+            #[test]
+            fn non_hex_char_in_hash_rejects(
+                pos in 0_usize..40,
+                bad_idx in 0_usize..20,
+            ) {
+                let bad_chars = "ghijklmnopqrstuvwxyz";
+                let bad_char = bad_chars.as_bytes()[bad_idx % bad_chars.len()] as char;
+                let mut chars: Vec<char> = "a".repeat(40).chars().collect();
+                chars[pos] = bad_char;
+                let hash: String = chars.into_iter().collect();
+                let amendment = Amendment::new(hash, "valid message".to_string());
+                prop_assert!(amendment.validate().is_err());
+            }
+
+            #[test]
+            fn whitespace_only_message_rejects(
+                hash in "[0-9a-f]{40}",
+                ws in "[ \t\n]{1,20}",
+            ) {
+                let amendment = Amendment::new(hash, ws);
+                prop_assert!(amendment.validate().is_err());
+            }
+
+            #[test]
+            fn roundtrip_save_load(
+                count in 1_usize..5,
+            ) {
+                let dir = tempfile::TempDir::new().unwrap();
+                let path = dir.path().join("amendments.yaml");
+                let amendments: Vec<Amendment> = (0..count)
+                    .map(|i| {
+                        let hash = format!("{i:0>40x}");
+                        Amendment::new(hash, format!("feat: message {i}"))
+                    })
+                    .collect();
+                let original = AmendmentFile { amendments };
+                original.save_to_file(&path).unwrap();
+                let loaded = AmendmentFile::load_from_file(&path).unwrap();
+                prop_assert_eq!(loaded.amendments.len(), original.amendments.len());
+                for (orig, load) in original.amendments.iter().zip(loaded.amendments.iter()) {
+                    prop_assert_eq!(&orig.commit, &load.commit);
+                    // Messages may differ slightly due to YAML block scalar formatting
+                    prop_assert!(load.message.contains(orig.message.lines().next().unwrap()));
+                }
+            }
+        }
+    }
 }
