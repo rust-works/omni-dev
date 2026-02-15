@@ -502,4 +502,85 @@ mod tests {
         assert!(result.suggestion.is_none());
         assert!(result.passes);
     }
+
+    // ── property tests ────────────────────────────────────────────
+
+    mod prop {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_severity() -> impl Strategy<Value = IssueSeverity> {
+            prop_oneof![
+                Just(IssueSeverity::Error),
+                Just(IssueSeverity::Warning),
+                Just(IssueSeverity::Info),
+            ]
+        }
+
+        fn arb_issue() -> impl Strategy<Value = CommitIssue> {
+            arb_severity().prop_map(make_issue)
+        }
+
+        fn arb_result() -> impl Strategy<Value = CommitCheckResult> {
+            (any::<bool>(), proptest::collection::vec(arb_issue(), 0..5))
+                .prop_map(|(passes, issues)| make_result(passes, issues))
+        }
+
+        proptest! {
+            #[test]
+            fn severity_display_roundtrip(sev in arb_severity()) {
+                let displayed = sev.to_string();
+                let parsed: IssueSeverity = displayed.parse().unwrap();
+                prop_assert_eq!(parsed, sev);
+            }
+
+            #[test]
+            fn severity_from_str_never_errors(s in ".*") {
+                let result: Result<IssueSeverity, ()> = s.parse();
+                prop_assert!(result.is_ok());
+            }
+
+            #[test]
+            fn summary_total_is_passing_plus_failing(
+                results in proptest::collection::vec(arb_result(), 0..20),
+            ) {
+                let summary = CheckSummary::from_results(&results);
+                prop_assert_eq!(summary.total_commits, summary.passing_commits + summary.failing_commits);
+                prop_assert_eq!(summary.total_commits, results.len());
+            }
+
+            #[test]
+            fn summary_issue_counts_match(
+                results in proptest::collection::vec(arb_result(), 0..20),
+            ) {
+                let summary = CheckSummary::from_results(&results);
+                let total_issues: usize = results.iter().map(|r| r.issues.len()).sum();
+                prop_assert_eq!(
+                    summary.error_count + summary.warning_count + summary.info_count,
+                    total_issues
+                );
+            }
+
+            #[test]
+            fn exit_code_bounded(
+                results in proptest::collection::vec(arb_result(), 0..10),
+                strict in any::<bool>(),
+            ) {
+                let report = CheckReport::new(results);
+                let code = report.exit_code(strict);
+                prop_assert!(code == 0 || code == 1 || code == 2);
+            }
+
+            #[test]
+            fn exit_code_errors_always_one(
+                mut results in proptest::collection::vec(arb_result(), 0..10),
+                strict in any::<bool>(),
+            ) {
+                // Ensure at least one result with an error
+                results.push(make_result(false, vec![make_issue(IssueSeverity::Error)]));
+                let report = CheckReport::new(results);
+                prop_assert_eq!(report.exit_code(strict), 1);
+            }
+        }
+    }
 }
