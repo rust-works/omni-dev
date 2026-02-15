@@ -122,16 +122,20 @@ pub enum BranchingStrategy {
 }
 
 // Branch naming pattern regexes
+#[allow(clippy::unwrap_used)] // Compile-time constant regex pattern
 static STANDARD_BRANCH_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(?P<type>feature|feat|fix|bugfix|docs?|refactor|chore|test|ci|build|perf|hotfix|release)/(?:(?P<scope>[^/]+)/)?(?P<desc>.+)$").unwrap()
 });
 
+#[allow(clippy::unwrap_used)] // Compile-time constant regex pattern
 static TICKET_BRANCH_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(?P<ticket>[A-Z]+-\d+|issue-\d+|#\d+)-(?P<desc>.+)$").unwrap());
 
+#[allow(clippy::unwrap_used)] // Compile-time constant regex pattern
 static USER_BRANCH_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9_-]+/(?P<desc>.+)$").unwrap());
 
+#[allow(clippy::unwrap_used)] // Compile-time constant regex pattern
 static TICKET_REFERENCE_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"([A-Z]+-\d+|#\d+|issue-\d+)").unwrap());
 

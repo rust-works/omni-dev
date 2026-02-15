@@ -129,6 +129,7 @@ pub fn write_yaml_file<T: Serialize, P: AsRef<Path>>(data: &T, path: P) -> Resul
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};

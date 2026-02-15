@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
@@ -92,13 +92,13 @@ impl OpenAiAiClient {
         max_tokens: Option<i32>,
         temperature: Option<f32>,
         active_beta: Option<(String, String)>,
-    ) -> Self {
+    ) -> Result<Self> {
         let client = Client::builder()
             .timeout(super::REQUEST_TIMEOUT)
             .build()
-            .expect("failed to build HTTP client");
+            .context("Failed to build HTTP client")?;
 
-        Self {
+        Ok(Self {
             client,
             api_key,
             model,
@@ -106,7 +106,7 @@ impl OpenAiAiClient {
             max_tokens,
             temperature,
             active_beta,
-        }
+        })
     }
 
     /// Creates a new client for Ollama with sensible defaults.
@@ -114,7 +114,7 @@ impl OpenAiAiClient {
         model: String,
         base_url: Option<String>,
         active_beta: Option<(String, String)>,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::new(
             model,
             None, // No API key needed for Ollama
@@ -130,7 +130,7 @@ impl OpenAiAiClient {
         model: String,
         api_key: String,
         active_beta: Option<(String, String)>,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::new(
             model,
             Some(api_key),
@@ -347,12 +347,13 @@ impl AiClient for OpenAiAiClient {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
     #[test]
     fn new_ollama() {
-        let client = OpenAiAiClient::new_ollama("llama2".to_string(), None, None);
+        let client = OpenAiAiClient::new_ollama("llama2".to_string(), None, None).unwrap();
         assert_eq!(client.model, "llama2");
         assert_eq!(client.base_url, "http://localhost:11434");
         assert!(client.api_key.is_none());
@@ -365,7 +366,8 @@ mod tests {
             "codellama".to_string(),
             Some("http://192.168.1.100:11434".to_string()),
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(client.base_url, "http://192.168.1.100:11434");
         assert!(client.is_ollama());
     }
@@ -373,7 +375,8 @@ mod tests {
     #[test]
     fn new_openai() {
         let client =
-            OpenAiAiClient::new_openai("gpt-4".to_string(), "sk-test123".to_string(), None);
+            OpenAiAiClient::new_openai("gpt-4".to_string(), "sk-test123".to_string(), None)
+                .unwrap();
         assert_eq!(client.model, "gpt-4");
         assert_eq!(client.base_url, "https://api.openai.com");
         assert_eq!(client.api_key, Some("sk-test123".to_string()));
@@ -382,7 +385,7 @@ mod tests {
 
     #[test]
     fn get_api_url() {
-        let client = OpenAiAiClient::new_ollama("llama2".to_string(), None, None);
+        let client = OpenAiAiClient::new_ollama("llama2".to_string(), None, None).unwrap();
         let url = client.get_api_url().unwrap();
         assert_eq!(url, "http://localhost:11434/v1/chat/completions");
     }
@@ -396,7 +399,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         let url = client.get_api_url().unwrap();
         assert_eq!(url, "http://localhost:11434/v1/chat/completions");
     }
@@ -411,7 +415,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         assert!(ollama_client.is_ollama());
 
         // Test 127.0.0.1 detection
@@ -422,7 +427,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         assert!(local_client.is_ollama());
 
         // Test no API key detection
@@ -433,7 +439,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         assert!(no_key_client.is_ollama());
 
         // Test OpenAI detection
@@ -444,7 +451,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         assert!(!openai_client.is_ollama());
     }
 
@@ -459,7 +467,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         assert!(client.is_gpt5_series());
 
         let client2 = OpenAiAiClient::new(
@@ -469,7 +478,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         assert!(client2.is_gpt5_series());
     }
 
@@ -482,7 +492,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         assert!(client.is_gpt5_series());
 
         let client2 = OpenAiAiClient::new(
@@ -492,7 +503,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         assert!(client2.is_gpt5_series());
     }
 
@@ -505,7 +517,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         assert!(!client.is_gpt5_series());
 
         let client2 = OpenAiAiClient::new(
@@ -515,7 +528,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         assert!(!client2.is_gpt5_series());
     }
 
@@ -530,14 +544,16 @@ mod tests {
             Some(8192),
             None,
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(client.get_max_tokens(), 8192);
     }
 
     #[test]
     fn get_max_tokens_from_registry() {
         // Ollama with no configured max → falls back to registry
-        let client = OpenAiAiClient::new_openai("gpt-4o".to_string(), "key".to_string(), None);
+        let client =
+            OpenAiAiClient::new_openai("gpt-4o".to_string(), "key".to_string(), None).unwrap();
         let tokens = client.get_max_tokens();
         // Registry should return a positive value for a known model
         assert!(tokens > 0, "expected positive token limit, got {tokens}");
@@ -547,7 +563,8 @@ mod tests {
 
     #[test]
     fn get_metadata_openai() {
-        let client = OpenAiAiClient::new_openai("gpt-4o".to_string(), "key".to_string(), None);
+        let client =
+            OpenAiAiClient::new_openai("gpt-4o".to_string(), "key".to_string(), None).unwrap();
         let metadata = client.get_metadata();
         assert_eq!(metadata.provider, "OpenAI");
         assert_eq!(metadata.model, "gpt-4o");
@@ -556,7 +573,7 @@ mod tests {
 
     #[test]
     fn get_metadata_ollama() {
-        let client = OpenAiAiClient::new_ollama("llama2".to_string(), None, None);
+        let client = OpenAiAiClient::new_ollama("llama2".to_string(), None, None).unwrap();
         let metadata = client.get_metadata();
         assert_eq!(metadata.provider, "Ollama");
         assert_eq!(metadata.model, "llama2");
@@ -565,7 +582,8 @@ mod tests {
     #[test]
     fn get_metadata_with_beta() {
         let beta = Some(("anthropic-beta".to_string(), "output-128k".to_string()));
-        let client = OpenAiAiClient::new_openai("gpt-4o".to_string(), "key".to_string(), beta);
+        let client =
+            OpenAiAiClient::new_openai("gpt-4o".to_string(), "key".to_string(), beta).unwrap();
         let metadata = client.get_metadata();
         assert!(metadata.active_beta.is_some());
         let (key, value) = metadata.active_beta.unwrap();

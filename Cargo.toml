@@ -94,6 +94,10 @@ cast_sign_loss           = "allow"
 # ── Pedantic: file system ───────────────────────────────────────────
 case_sensitive_file_extension_comparisons = "allow"  # risky auto-fix
 
+# ── Restriction: panicking operations (STYLE-0003) ────────────────────
+unwrap_used  = "warn"
+expect_used  = "warn"
+
 # ── Nursery ──────────────────────────────────────────────────────────
 option_if_let_else           = "allow"  # often less readable than if-let
 redundant_pub_crate          = "allow"  # conflicts with STYLE-0005
