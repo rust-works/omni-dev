@@ -3,6 +3,7 @@
 mod amend;
 mod check;
 mod create_pr;
+mod formatting;
 mod info;
 mod twiddle;
 mod view;
