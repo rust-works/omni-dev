@@ -1041,4 +1041,60 @@ mod tests {
         info.run_pre_validation_checks(&scopes);
         assert!(info.pre_validated_checks.is_empty());
     }
+
+    // ── property tests ────────────────────────────────────────────
+
+    mod prop {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_conventional_type() -> impl Strategy<Value = &'static str> {
+            prop_oneof![
+                Just("feat"),
+                Just("fix"),
+                Just("docs"),
+                Just("style"),
+                Just("refactor"),
+                Just("test"),
+                Just("chore"),
+                Just("build"),
+                Just("ci"),
+                Just("perf"),
+            ]
+        }
+
+        proptest! {
+            #[test]
+            fn valid_conventional_format_extracts_type(
+                ctype in arb_conventional_type(),
+                scope in "[a-z]{1,10}",
+                desc in "[a-zA-Z ]{1,50}",
+            ) {
+                let message = format!("{ctype}({scope}): {desc}");
+                let result = CommitAnalysis::extract_conventional_type(&message);
+                prop_assert_eq!(result, Some(ctype.to_string()));
+            }
+
+            #[test]
+            fn no_colon_returns_none(s in "[^:]{0,100}") {
+                let result = CommitAnalysis::extract_conventional_type(&s);
+                prop_assert!(result.is_none());
+            }
+
+            #[test]
+            fn count_specificity_nonnegative(pattern in ".*") {
+                // usize is always >= 0; this test catches panics on arbitrary input
+                let _ = CommitAnalysis::count_specificity(&pattern);
+            }
+
+            #[test]
+            fn count_specificity_bounded_by_segments(
+                segments in proptest::collection::vec("[a-z*?]{1,10}", 1..6),
+            ) {
+                let pattern = segments.join("/");
+                let result = CommitAnalysis::count_specificity(&pattern);
+                prop_assert!(result <= segments.len());
+            }
+        }
+    }
 }
