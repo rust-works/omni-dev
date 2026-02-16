@@ -110,8 +110,8 @@ mod tests {
 
     #[test]
     fn settings_load_from_path() {
-        // Create a temporary directory
-        let temp_dir = TempDir::new().unwrap();
+        // Create a temporary directory (use current dir to avoid TMPDIR issues in tarpaulin)
+        let temp_dir = TempDir::new_in(".").unwrap();
         let settings_path = temp_dir.path().join("settings.json");
 
         // Create a test settings file
@@ -133,8 +133,8 @@ mod tests {
 
     #[test]
     fn settings_get_env_var() {
-        // Create a temporary directory
-        let temp_dir = TempDir::new().unwrap();
+        // Create a temporary directory (use current dir to avoid TMPDIR issues in tarpaulin)
+        let temp_dir = TempDir::new_in(".").unwrap();
         let settings_path = temp_dir.path().join("settings.json");
 
         // Create a test settings file

@@ -22,7 +22,7 @@ struct TestRepo {
 impl TestRepo {
     fn new() -> Result<Self> {
         // Create temporary directory
-        let temp_dir = tempfile::tempdir()?;
+        let temp_dir = tempfile::tempdir_in(".")?;
         let repo_path = temp_dir.path().to_path_buf();
 
         // Initialize git repository
@@ -186,7 +186,7 @@ fn amend_command_with_temporary_repo() -> Result<()> {
 #[test]
 fn amendment_file_parsing() -> Result<()> {
     // Test that amendment file parsing works correctly
-    let temp_dir = tempfile::tempdir()?;
+    let temp_dir = tempfile::tempdir_in(".")?;
     let yaml_path = temp_dir.path().join("test_amendments.yaml");
 
     // Create a test amendment file
@@ -211,7 +211,7 @@ amendments:
 #[test]
 fn amendment_validation() -> Result<()> {
     // Test amendment validation
-    let temp_dir = tempfile::tempdir()?;
+    let temp_dir = tempfile::tempdir_in(".")?;
     let yaml_path = temp_dir.path().join("invalid_amendments.yaml");
 
     // Test with invalid commit hash (too short)
@@ -317,7 +317,7 @@ fn binary_git_help_succeeds() {
 
 #[test]
 fn binary_commands_generate_in_temp_dir() {
-    let temp_dir = tempfile::tempdir().unwrap();
+    let temp_dir = tempfile::tempdir_in(".").unwrap();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
         .args(["commands", "generate", "all"])
         .current_dir(temp_dir.path())
