@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn save_and_load_roundtrip() -> Result<()> {
-        let dir = TempDir::new()?;
+        let dir = TempDir::new_in(".")?;
         let path = dir.path().join("amendments.yaml");
 
         let original = AmendmentFile {
@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn load_invalid_yaml_fails() -> Result<()> {
-        let dir = TempDir::new()?;
+        let dir = TempDir::new_in(".")?;
         let path = dir.path().join("bad.yaml");
         fs::write(&path, "not: valid: yaml: [{{")?;
         assert!(AmendmentFile::load_from_file(&path).is_err());
@@ -332,7 +332,7 @@ mod tests {
             fn roundtrip_save_load(
                 count in 1_usize..5,
             ) {
-                let dir = tempfile::TempDir::new().unwrap();
+                let dir = tempfile::TempDir::new_in(".").unwrap();
                 let path = dir.path().join("amendments.yaml");
                 let amendments: Vec<Amendment> = (0..count)
                     .map(|i| {
