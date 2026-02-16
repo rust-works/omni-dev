@@ -411,7 +411,7 @@ description: |
     fn yaml_file_roundtrip() -> Result<()> {
         use tempfile::TempDir;
 
-        let dir = TempDir::new()?;
+        let dir = TempDir::new_in(".")?;
         let path = dir.path().join("test.yaml");
 
         let data = TestDiffContent {
