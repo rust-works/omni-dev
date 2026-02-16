@@ -592,7 +592,7 @@ mod tests {
 
     #[test]
     fn local_override_wins() -> anyhow::Result<()> {
-        let dir = TempDir::new()?;
+        let dir = TempDir::new_in(".")?;
         let base = dir.path();
 
         // Create both local and project files
@@ -607,7 +607,7 @@ mod tests {
 
     #[test]
     fn project_fallback() -> anyhow::Result<()> {
-        let dir = TempDir::new()?;
+        let dir = TempDir::new_in(".")?;
         let base = dir.path();
 
         // Create only project-level file (no local/)
@@ -620,7 +620,7 @@ mod tests {
 
     #[test]
     fn returns_default_when_nothing_exists() {
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new_in(".").unwrap();
         let base = dir.path();
 
         let resolved = resolve_config_file(base, "scopes.yaml");
@@ -635,7 +635,7 @@ mod tests {
 
     #[test]
     fn rust_ecosystem_detected() -> anyhow::Result<()> {
-        let dir = TempDir::new()?;
+        let dir = TempDir::new_in(".")?;
         std::fs::write(dir.path().join("Cargo.toml"), "[package]")?;
 
         let mut scopes = vec![];
@@ -653,7 +653,7 @@ mod tests {
 
     #[test]
     fn node_ecosystem_detected() -> anyhow::Result<()> {
-        let dir = TempDir::new()?;
+        let dir = TempDir::new_in(".")?;
         std::fs::write(dir.path().join("package.json"), "{}")?;
 
         let mut scopes = vec![];
@@ -667,7 +667,7 @@ mod tests {
 
     #[test]
     fn go_ecosystem_detected() -> anyhow::Result<()> {
-        let dir = TempDir::new()?;
+        let dir = TempDir::new_in(".")?;
         std::fs::write(dir.path().join("go.mod"), "module example")?;
 
         let mut scopes = vec![];
@@ -682,7 +682,7 @@ mod tests {
 
     #[test]
     fn existing_scope_not_overridden() -> anyhow::Result<()> {
-        let dir = TempDir::new()?;
+        let dir = TempDir::new_in(".")?;
         std::fs::write(dir.path().join("Cargo.toml"), "[package]")?;
 
         let mut scopes = vec![ScopeDefinition {
@@ -702,7 +702,7 @@ mod tests {
 
     #[test]
     fn no_marker_files_produces_empty() {
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new_in(".").unwrap();
         let mut scopes = vec![];
         merge_ecosystem_scopes(&mut scopes, dir.path());
         assert!(scopes.is_empty());
@@ -712,7 +712,7 @@ mod tests {
 
     #[test]
     fn load_project_scopes_with_yaml() -> anyhow::Result<()> {
-        let dir = TempDir::new()?;
+        let dir = TempDir::new_in(".")?;
         let config_dir = dir.path().join("config");
         std::fs::create_dir_all(&config_dir)?;
 
@@ -739,7 +739,7 @@ scopes:
 
     #[test]
     fn load_project_scopes_no_file() -> anyhow::Result<()> {
-        let dir = TempDir::new()?;
+        let dir = TempDir::new_in(".")?;
         std::fs::write(dir.path().join("Cargo.toml"), "[package]")?;
 
         let scopes = load_project_scopes(dir.path(), dir.path());

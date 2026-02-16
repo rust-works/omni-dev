@@ -668,7 +668,7 @@ mod tests {
 
     #[test]
     fn open_at_temp_repo() -> Result<()> {
-        let temp_dir = tempfile::tempdir()?;
+        let temp_dir = tempfile::tempdir_in(".")?;
         git2::Repository::init(temp_dir.path())?;
         let repo = GitRepository::open_at(temp_dir.path())?;
         assert!(repo.path().exists());
@@ -677,7 +677,7 @@ mod tests {
 
     #[test]
     fn working_directory_clean_empty_repo() -> Result<()> {
-        let temp_dir = tempfile::tempdir()?;
+        let temp_dir = tempfile::tempdir_in(".")?;
         git2::Repository::init(temp_dir.path())?;
         let repo = GitRepository::open_at(temp_dir.path())?;
         let status = repo.get_working_directory_status()?;
@@ -688,7 +688,7 @@ mod tests {
 
     #[test]
     fn working_directory_dirty_with_file() -> Result<()> {
-        let temp_dir = tempfile::tempdir()?;
+        let temp_dir = tempfile::tempdir_in(".")?;
         git2::Repository::init(temp_dir.path())?;
         std::fs::write(temp_dir.path().join("new_file.txt"), "content")?;
         let repo = GitRepository::open_at(temp_dir.path())?;
@@ -700,7 +700,7 @@ mod tests {
 
     #[test]
     fn is_working_directory_clean_delegator() -> Result<()> {
-        let temp_dir = tempfile::tempdir()?;
+        let temp_dir = tempfile::tempdir_in(".")?;
         git2::Repository::init(temp_dir.path())?;
         let repo = GitRepository::open_at(temp_dir.path())?;
         assert!(repo.is_working_directory_clean()?);
