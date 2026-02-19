@@ -127,7 +127,10 @@ mod tests {
     fn find_git_root_from_path() {
         let _guard = EnvGuard::new(); // Ensure clean environment
 
-        let temp_dir = TempDir::new_in(".").unwrap();
+        let temp_dir = {
+            std::fs::create_dir_all("tmp").ok();
+            TempDir::new_in("tmp").unwrap()
+        };
         let git_dir = temp_dir.path().join(".git");
         std::fs::create_dir(&git_dir).unwrap();
 
