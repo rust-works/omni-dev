@@ -20,9 +20,9 @@ use clap::{Parser, Subcommand};
 
 /// Parses a `--beta-header key:value` string into a `(key, value)` tuple.
 pub(crate) fn parse_beta_header(s: &str) -> Result<(String, String)> {
-    let (k, v) = s.split_once(':').ok_or_else(|| {
-        anyhow::anyhow!("Invalid --beta-header format '{}'. Expected key:value", s)
-    })?;
+    let (k, v) = s
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("Invalid --beta-header format '{s}'. Expected key:value"))?;
     Ok((k.to_string(), v.to_string()))
 }
 

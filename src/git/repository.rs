@@ -163,7 +163,7 @@ impl GitRepository {
             // Range format like HEAD~3..HEAD
             let parts: Vec<&str> = range.split("..").collect();
             if parts.len() != 2 {
-                anyhow::bail!("Invalid range format: {}", range);
+                anyhow::bail!("Invalid range format: {range}");
             }
 
             let start_spec = parts[0];
