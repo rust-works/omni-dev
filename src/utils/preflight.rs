@@ -188,7 +188,7 @@ pub fn check_github_cli() -> Result<()> {
                         error_details.trim()
                     )
                 }
-                Err(e) => bail!("Failed to test GitHub CLI access: {}", e),
+                Err(e) => bail!("Failed to test GitHub CLI access: {e}"),
             }
         }
         _ => bail!(

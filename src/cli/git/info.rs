@@ -35,7 +35,7 @@ impl InfoCommand {
             Some(branch) => {
                 // Validate that the specified base branch exists
                 if !repo.branch_exists(&branch)? {
-                    anyhow::bail!("Base branch '{}' does not exist", branch);
+                    anyhow::bail!("Base branch '{branch}' does not exist");
                 }
                 branch
             }

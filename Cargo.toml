@@ -14,7 +14,7 @@ categories = ["development-tools", "command-line-utilities"]
 rust-version = "1.80.0"
 
 [dependencies]
-clap = { version = "4.0", features = ["derive", "color"] }
+clap = { version = "4.5", features = ["derive", "color"] }
 git2 = "0.20"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
@@ -24,22 +24,22 @@ serde_json = "1.0"
 termcolor = "1.1"
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
-tempfile = "3.0"
+tempfile = "3.25"
 reqwest = { version = "0.13", features = ["json"] }
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.49", features = ["full"] }
 thiserror = "2.0"
-regex = "1.11.2"
+regex = "1.12.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 dirs = "6.0.0"
 globset = "0.4"
 crossterm = "0.28"
-url = "2.5.0"
+url = "2.5.8"
 futures = "0.3"
 
 [dev-dependencies]
-tempfile = "3.0"
-insta = "1.34"
+tempfile = "3.25"
+insta = "1.46"
 proptest = "1"
 
 [lib]
