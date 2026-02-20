@@ -3,14 +3,14 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 use url::Url;
 
 use super::{AiClient, AiClientMetadata};
-use crate::claude::{error::ClaudeError, model_config::get_model_registry};
+use crate::claude::error::ClaudeError;
 
 /// Bedrock API request message.
 #[derive(Serialize)]
@@ -85,10 +85,7 @@ impl BedrockAiClient {
         base_url: String,
         active_beta: Option<(String, String)>,
     ) -> Result<Self> {
-        let client = Client::builder()
-            .timeout(super::REQUEST_TIMEOUT)
-            .build()
-            .context("Failed to build HTTP client")?;
+        let client = super::build_http_client()?;
 
         Ok(Self {
             client,
@@ -101,12 +98,7 @@ impl BedrockAiClient {
 
     /// Returns the max tokens from the model registry.
     fn get_max_tokens(&self) -> i32 {
-        let registry = get_model_registry();
-        if let Some((_, ref value)) = self.active_beta {
-            registry.get_max_output_tokens_with_beta(&self.model, value) as i32
-        } else {
-            registry.get_max_output_tokens(&self.model) as i32
-        }
+        super::registry_max_output_tokens(&self.model, &self.active_beta)
     }
 
     /// Builds the full API URL.
@@ -215,16 +207,7 @@ impl AiClient for BedrockAiClient {
                 .await
                 .map_err(|e| ClaudeError::NetworkError(e.to_string()))?;
 
-            if !response.status().is_success() {
-                let status = response.status();
-                let error_text = response.text().await.unwrap_or_else(|e| {
-                    tracing::debug!("Failed to read error response body: {e}");
-                    String::new()
-                });
-                return Err(
-                    ClaudeError::ApiRequestFailed(format!("HTTP {status}: {error_text}")).into(),
-                );
-            }
+            let response = super::check_error_response(response).await?;
 
             let bedrock_response: BedrockResponse = response
                 .json()
@@ -251,33 +234,15 @@ impl AiClient for BedrockAiClient {
                         .into()
                 });
 
-            if let Ok(ref text) = result {
-                debug!(
-                    response_len = text.len(),
-                    "Successfully extracted text content from Bedrock API response"
-                );
-                debug!(
-                    response_content = %text,
-                    "Bedrock API response content"
-                );
-            }
+            super::log_response_success("Bedrock", &result);
 
             result
         })
     }
 
     fn get_metadata(&self) -> AiClientMetadata {
-        let registry = get_model_registry();
-        let (max_context_length, max_response_length) = match &self.active_beta {
-            Some((_, value)) => (
-                registry.get_input_context_with_beta(&self.model, value),
-                registry.get_max_output_tokens_with_beta(&self.model, value),
-            ),
-            None => (
-                registry.get_input_context(&self.model),
-                registry.get_max_output_tokens(&self.model),
-            ),
-        };
+        let (max_context_length, max_response_length) =
+            super::registry_model_limits(&self.model, &self.active_beta);
 
         AiClientMetadata {
             provider: "Anthropic Bedrock".to_string(),
