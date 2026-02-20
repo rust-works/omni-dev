@@ -21,7 +21,8 @@ by Michael Nygard.
 
 ## Inventory
 
-| ADR                      | Status      | Date       | Title                                      |
-|--------------------------|-------------|------------|--------------------------------------------|
-| [ADR-0000](adr-0000.md)  | ✅ Accepted | 2026-02-10 | Use Architecture Decision Records          |
-| [ADR-0001](adr-0001.md)  | ✅ Accepted | 2026-02-10 | YAML as Primary Human Data Exchange Format |
+| ADR                      | Status      | Date       | Title                                            |
+|--------------------------|-------------|------------|--------------------------------------------------|
+| [ADR-0000](adr-0000.md)  | ✅ Accepted | 2026-02-10 | Use Architecture Decision Records                 |
+| [ADR-0001](adr-0001.md)  | ✅ Accepted | 2026-02-10 | YAML as Primary Human Data Exchange Format        |
+| [ADR-0002](adr-0002.md)  | 🟡 Proposed | 2026-02-20 | Multi-Provider AI Abstraction via Trait Objects   |
