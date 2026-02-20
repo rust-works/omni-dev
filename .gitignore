@@ -39,6 +39,9 @@ tarpaulin-report.html
 cobertura.xml
 lcov.info
 
+# Test temp directory
+/tmp/
+
 .ai
 
 # Local omni-dev configuration overrides (personal settings)

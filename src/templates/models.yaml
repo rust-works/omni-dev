@@ -4,7 +4,7 @@
 # Last updated: February 2026
 
 models:
-  # Claude 4.6 (Current Flagship)
+  # Claude 4.6 Series (Current Generation)
   - provider: "claude"
     model: "Claude Opus 4.6"
     api_identifier: "claude-opus-4-6"
@@ -12,6 +12,18 @@ models:
     input_context: 200000
     generation: 4.6
     tier: "flagship"
+    beta_headers:
+      - key: "anthropic-beta"
+        value: "context-1m-2025-08-07"
+        input_context: 1000000
+
+  - provider: "claude"
+    model: "Claude Sonnet 4.6"
+    api_identifier: "claude-sonnet-4-6"
+    max_output_tokens: 64000
+    input_context: 200000
+    generation: 4.6
+    tier: "balanced"
     beta_headers:
       - key: "anthropic-beta"
         value: "context-1m-2025-08-07"
@@ -394,7 +406,7 @@ providers:
   claude:
     name: "Anthropic Claude"
     api_base: "https://api.anthropic.com/v1"
-    default_model: "claude-sonnet-4-5-20250929"
+    default_model: "claude-sonnet-4-6"
 
     # Model tier descriptions for Claude
     tiers:

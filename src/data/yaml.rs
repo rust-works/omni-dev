@@ -411,7 +411,10 @@ description: |
     fn yaml_file_roundtrip() -> Result<()> {
         use tempfile::TempDir;
 
-        let dir = TempDir::new_in(".")?;
+        let dir = {
+            std::fs::create_dir_all("tmp")?;
+            TempDir::new_in("tmp")?
+        };
         let path = dir.path().join("test.yaml");
 
         let data = TestDiffContent {
