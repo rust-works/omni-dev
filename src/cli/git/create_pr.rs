@@ -293,9 +293,7 @@ impl CreatePrCommand {
                     with_remote
                 } else {
                     anyhow::bail!(
-                        "Remote branch '{}' does not exist (also tried '{}')",
-                        branch,
-                        with_remote
+                        "Remote branch '{branch}' does not exist (also tried '{with_remote}')"
                     );
                 }
             }
@@ -303,10 +301,8 @@ impl CreatePrCommand {
             // Auto-detect using the primary remote's main branch
             let main_branch = &primary_remote.main_branch;
             if main_branch == "unknown" {
-                anyhow::bail!(
-                    "Could not determine main branch for remote '{}'",
-                    primary_remote.name
-                );
+                let remote_name = &primary_remote.name;
+                anyhow::bail!("Could not determine main branch for remote '{remote_name}'");
             }
 
             let remote_main = format!("{}/{}", primary_remote.name, main_branch);
@@ -315,8 +311,7 @@ impl CreatePrCommand {
             let remote_ref = format!("refs/remotes/{remote_main}");
             if repo.repository().find_reference(&remote_ref).is_err() {
                 anyhow::bail!(
-                    "Remote main branch '{}' does not exist. Try running 'git fetch' first.",
-                    remote_main
+                    "Remote main branch '{remote_main}' does not exist. Try running 'git fetch' first."
                 );
             }
 
@@ -1091,7 +1086,7 @@ impl CreatePrCommand {
         } else {
             let error_msg = String::from_utf8_lossy(&pr_result.stderr);
             error!("gh CLI failed to create PR: {}", error_msg);
-            anyhow::bail!("Failed to create pull request: {}", error_msg);
+            anyhow::bail!("Failed to create pull request: {error_msg}");
         }
 
         Ok(())
@@ -1186,7 +1181,7 @@ impl CreatePrCommand {
             }
         } else {
             let error_msg = String::from_utf8_lossy(&pr_result.stderr);
-            anyhow::bail!("Failed to update pull request: {}", error_msg);
+            anyhow::bail!("Failed to update pull request: {error_msg}");
         }
 
         Ok(())
