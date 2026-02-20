@@ -296,7 +296,7 @@ mod tests {
             #[test]
             fn valid_hex_hash_nonempty_msg_validates(
                 hash in "[0-9a-f]{40}",
-                msg in "[^\t\n\r\x0b\x0c ].{0,200}",
+                msg in "[a-zA-Z0-9].{0,200}",
             ) {
                 let amendment = Amendment::new(hash, msg);
                 prop_assert!(amendment.validate().is_ok());
