@@ -691,13 +691,10 @@ fn validate_beta_header(model: &str, beta_header: &Option<(String, String)>) -> 
                 .map(|bh| format!("{}:{}", bh.key, bh.value))
                 .collect();
             if available.is_empty() {
-                anyhow::bail!("Model '{}' does not support any beta headers", model);
+                anyhow::bail!("Model '{model}' does not support any beta headers");
             }
             anyhow::bail!(
-                "Beta header '{}:{}' is not supported for model '{}'. Supported: {}",
-                key,
-                value,
-                model,
+                "Beta header '{key}:{value}' is not supported for model '{model}'. Supported: {}",
                 available.join(", ")
             );
         }

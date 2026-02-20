@@ -129,7 +129,7 @@ impl AmendmentHandler {
             }
         }
 
-        anyhow::bail!("Commit {} not found in current branch history", commit_hash);
+        anyhow::bail!("Commit {commit_hash} not found in current branch history");
     }
 
     /// Checks if a commit hash is the current HEAD.
@@ -151,7 +151,7 @@ impl AmendmentHandler {
 
         if !output.status.success() {
             let error_msg = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("Failed to amend HEAD commit: {}", error_msg);
+            anyhow::bail!("Failed to amend HEAD commit: {error_msg}");
         }
 
         // Get the new commit ID for logging
@@ -274,7 +274,7 @@ impl AmendmentHandler {
                 debug!("Rebase abort during cleanup failed: {e}");
             }
 
-            anyhow::bail!("Interactive rebase failed: {}", error_msg);
+            anyhow::bail!("Interactive rebase failed: {error_msg}");
         }
 
         // Check if we're now in a rebase state where we can amend
@@ -305,7 +305,7 @@ impl AmendmentHandler {
                     if let Err(e) = Command::new("git").args(["rebase", "--abort"]).output() {
                         debug!("Rebase abort during cleanup failed: {e}");
                     }
-                    anyhow::bail!("Failed to amend commit: {}", error_msg);
+                    anyhow::bail!("Failed to amend commit: {error_msg}");
                 }
 
                 println!("✅ Amended commit: {}", &commit_hash[..SHORT_HASH_LEN]);
@@ -322,7 +322,7 @@ impl AmendmentHandler {
                     if let Err(e) = Command::new("git").args(["rebase", "--abort"]).output() {
                         debug!("Rebase abort during cleanup failed: {e}");
                     }
-                    anyhow::bail!("Failed to continue rebase: {}", error_msg);
+                    anyhow::bail!("Failed to continue rebase: {error_msg}");
                 }
 
                 println!("✅ Rebase completed successfully");
@@ -338,10 +338,7 @@ impl AmendmentHandler {
                 );
             }
         } else if repo_state != git2::RepositoryState::Clean {
-            anyhow::bail!(
-                "Repository in unexpected state after rebase: {:?}",
-                repo_state
-            );
+            anyhow::bail!("Repository in unexpected state after rebase: {repo_state:?}");
         }
 
         Ok(())

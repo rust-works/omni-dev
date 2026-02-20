@@ -77,10 +77,10 @@ pub fn get_env_var(key: &str) -> Result<String> {
                     .env
                     .get(key)
                     .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("Environment variable not found: {}", key)),
+                    .ok_or_else(|| anyhow::anyhow!("Environment variable not found: {key}")),
                 Err(err) => {
                     // If we couldn't load settings, just return the original env var error
-                    Err(anyhow::anyhow!("Environment variable not found: {}", key).context(err))
+                    Err(anyhow::anyhow!("Environment variable not found: {key}").context(err))
                 }
             }
         }
@@ -96,8 +96,7 @@ pub fn get_env_vars(keys: &[&str]) -> Result<String> {
     }
 
     Err(anyhow::anyhow!(
-        "None of the environment variables found: {:?}",
-        keys
+        "None of the environment variables found: {keys:?}"
     ))
 }
 

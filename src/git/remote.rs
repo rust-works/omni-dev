@@ -158,11 +158,11 @@ impl RemoteInfo {
                 .and_then(|s| s.strip_suffix(".git"))
                 .unwrap_or(uri.split("github.com/").nth(1).unwrap_or(uri))
         } else {
-            anyhow::bail!("Not a GitHub URI: {}", uri);
+            anyhow::bail!("Not a GitHub URI: {uri}");
         };
 
         if repo_name.split('/').count() != 2 {
-            anyhow::bail!("Invalid GitHub repository format: {}", repo_name);
+            anyhow::bail!("Invalid GitHub repository format: {repo_name}");
         }
 
         Ok(repo_name.to_string())
