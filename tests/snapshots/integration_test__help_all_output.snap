@@ -236,13 +236,14 @@ Creates a pull request with AI-generated description
 Usage: pr [OPTIONS]
 
 Options:
-      --base <BRANCH>     Base branch for the PR to be merged into (defaults to main/master)
-      --model <MODEL>     Claude API model to use (if not specified, uses settings or default)
-      --auto-apply        Skips confirmation prompt and creates PR automatically
-      --save-only <FILE>  Saves generated PR details to file without creating PR
-      --ready             Creates PR as ready for review (overrides default)
-      --draft             Creates PR as draft (overrides default)
-  -h, --help              Print help
+      --base <BRANCH>              Base branch for the PR to be merged into (defaults to main/master)
+      --model <MODEL>              Claude API model to use (if not specified, uses settings or default)
+      --auto-apply                 Skips confirmation prompt and creates PR automatically
+      --save-only <FILE>           Saves generated PR details to file without creating PR
+      --ready                      Creates PR as ready for review (overrides default)
+      --draft                      Creates PR as draft (overrides default)
+      --context-dir <CONTEXT_DIR>  Path to custom context directory (defaults to .omni-dev/)
+  -h, --help                       Print help
 
 
 ================================================================================
