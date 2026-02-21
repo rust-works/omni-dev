@@ -1,11 +1,13 @@
 # Style Guide
 
-Coding conventions for the omni-dev project. Each item has a unique ID for easy reference.
+Conventions for code, documentation, and other project artifacts in the omni-dev project.
+Each item has a unique ID for easy reference.
 
 ## Tag-based lookup
 
-Before writing or reviewing code, identify which tags apply to the changes and search
-this file for those tags. Each rule has a **Tags** line immediately after its heading.
+Before writing or reviewing code, documentation, or other project artifacts, identify
+which tags apply to the changes and search this file for those tags. Each rule has a
+**Tags** line immediately after its heading.
 
 **Search command:** `grep "Tags:.*<tag>" docs/STYLE_GUIDE.md` returns matching rule headings.
 
@@ -20,6 +22,7 @@ this file for those tags. Each rule has a **Tags** line immediately after its he
 | Adding constants or replacing magic values       | `code-style`, `naming`                   |
 | Writing commit messages                          | `commits`                                |
 | Suppressing a lint or considering `unsafe`       | `code-style`, `unsafe`                   |
+| Writing or updating an ADR                       | `adrs`                                   |
 | Reviewing code for style compliance              | All tags relevant to the changed code    |
 
 ---
@@ -34,7 +37,7 @@ A new convention needs to be added to this style guide.
 
 ### Guidance
 
-Assign the next sequential ID (currently next is `STYLE-0022`) and include:
+Assign the next sequential ID (currently next is `STYLE-0023`) and include:
 
 1. A **Tags** line immediately after the heading — a comma-separated list of category labels
    from the tag vocabulary below.
@@ -57,6 +60,7 @@ Assign the next sequential ID (currently next is `STYLE-0022`) and include:
 | `code-style`         | Imports, clippy, constants, function length        |
 | `api-design`         | Ownership, must_use, type safety, string params   |
 | `unsafe`             | Unsafe code policy                                |
+| `adrs`               | Architecture Decision Record format and process   |
 
 A rule may have **multiple tags** — e.g., a rule about error messages in tests could be
 tagged `error-handling, testing`.
@@ -1113,3 +1117,32 @@ makes each file's purpose obvious from its name, keeps diffs focused on the chan
 and lets reviewers evaluate one concern at a time. The emphasis on cohesion rather than a
 rigid line limit avoids unnecessary churn on files that are large but focused, while still
 flagging files that are large *because* they mix concerns.
+
+---
+
+## STYLE-0022: ADR format
+
+**Tags:** `adrs`
+
+### Situation
+
+Writing a new Architecture Decision Record or reviewing an existing one.
+
+### Guidance
+
+Every ADR must use exactly the structure prescribed by
+[ADR-0000](adrs/adr-0000.md): **Title**, **Status**, **Context**, **Decision**,
+**Consequences**. Do not add extra top-level sections (e.g., "Recommendations",
+"Alternatives", "References"). Content that might seem like a separate section should be
+incorporated into the appropriate prescribed section — alternatives belong in Context,
+recommendations belong in Decision or Consequences.
+
+The Decision section must be stated in active voice ("We will ..."). The Consequences
+section should cover positive, negative, and neutral outcomes.
+
+### Motivation
+
+A consistent structure makes ADRs scannable and sets clear expectations for both authors
+and reviewers. Extra sections blur the boundary between architectural decisions and
+operational guidance (which belongs in the style guide) or implementation detail (which
+belongs in code comments or docs).
