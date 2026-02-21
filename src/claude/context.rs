@@ -8,7 +8,7 @@ pub mod patterns;
 pub use branch::BranchAnalyzer;
 pub use discovery::{
     config_source_label, load_config_content, load_project_scopes, resolve_context_dir,
-    ConfigSourceLabel, ProjectDiscovery,
+    resolve_context_dir_with_source, ConfigDirSource, ConfigSourceLabel, ProjectDiscovery,
 };
 pub use files::FileAnalyzer;
 pub use patterns::WorkPatternAnalyzer;

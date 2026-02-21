@@ -686,7 +686,8 @@ impl TwiddleCommand {
         let mut context = CommitContext::new();
 
         // 1. Discover project context
-        let context_dir = crate::claude::context::resolve_context_dir(self.context_dir.as_deref());
+        let (context_dir, dir_source) =
+            crate::claude::context::resolve_context_dir_with_source(self.context_dir.as_deref());
 
         // ProjectDiscovery takes repo root and context directory
         let repo_root = std::path::PathBuf::from(".");
@@ -697,7 +698,7 @@ impl TwiddleCommand {
                 debug!("Discovery successful");
 
                 // Show diagnostic information about loaded guidance files
-                self.show_guidance_files_status(&project_context, &context_dir)?;
+                self.show_guidance_files_status(&project_context, &context_dir, &dir_source)?;
 
                 context.project = project_context;
             }
@@ -841,10 +842,12 @@ impl TwiddleCommand {
         &self,
         project_context: &crate::data::context::ProjectContext,
         context_dir: &std::path::Path,
+        dir_source: &crate::claude::context::ConfigDirSource,
     ) -> Result<()> {
         use crate::claude::context::{config_source_label, ConfigSourceLabel};
 
         println!("📋 Project guidance files status:");
+        println!("   📂 Config dir: {} ({dir_source})", context_dir.display());
 
         // Check commit guidelines
         let guidelines_source = if project_context.commit_guidelines.is_some() {
@@ -1098,11 +1101,15 @@ impl TwiddleCommand {
         guidelines: &Option<String>,
         valid_scopes: &[crate::data::context::ScopeDefinition],
     ) {
-        use crate::claude::context::{config_source_label, ConfigSourceLabel};
+        use crate::claude::context::{
+            config_source_label, resolve_context_dir_with_source, ConfigSourceLabel,
+        };
 
-        let context_dir = crate::claude::context::resolve_context_dir(self.context_dir.as_deref());
+        let (context_dir, dir_source) =
+            resolve_context_dir_with_source(self.context_dir.as_deref());
 
         println!("📋 Project guidance files status:");
+        println!("   📂 Config dir: {} ({dir_source})", context_dir.display());
 
         // Check commit guidelines
         let guidelines_source = if guidelines.is_some() {
