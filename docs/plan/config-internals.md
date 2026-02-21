@@ -50,19 +50,56 @@ Re-exported from `src/claude/context.rs`:
 pub use discovery::{load_project_scopes, ProjectDiscovery};
 ```
 
-## Resolution Chain
+## Config Directory Resolution
 
-The `resolve_config_file(dir, filename)` function implements the three-tier
-priority chain:
+The `resolve_context_dir_with_source(override_dir)` function determines
+which `.omni-dev/` directory to use. It returns both the resolved path and
+a `ConfigDirSource` enum indicating how it was selected:
 
 ```
-1. {dir}/local/{filename}     — local override (highest priority)
-2. {dir}/{filename}            — shared project config
-3. $HOME/.omni-dev/{filename}  — global user defaults (lowest priority)
+1. --context-dir CLI flag        — explicit override (ConfigDirSource::CliFlag)
+2. OMNI_DEV_CONFIG_DIR env var   — environment override (ConfigDirSource::EnvVar)
+3. Walk-up discovery             — nearest .omni-dev/ from CWD to repo root (ConfigDirSource::WalkUp)
+4. .omni-dev (CWD-relative)      — default fallback (ConfigDirSource::Default)
+```
+
+The convenience wrapper `resolve_context_dir(override_dir)` returns just
+the path, discarding the source.
+
+### Walk-up discovery
+
+The `walk_up_find_config_dir(start)` function walks from `start` upward
+through parent directories. At each level it checks for a `.omni-dev/`
+subdirectory. It stops at the repository root (identified by `.git`
+directory or `.git` file for worktrees) and never escapes the repo. Returns
+`None` if no `.omni-dev/` is found within the boundary.
+
+Walk-up is disabled when `--context-dir` or `OMNI_DEV_CONFIG_DIR` is set,
+ensuring explicit overrides have full control.
+
+## Config File Resolution Chain
+
+The `resolve_config_file(dir, filename)` function implements the four-tier
+file priority chain:
+
+```
+1. {dir}/local/{filename}                    — local override (highest priority)
+2. {dir}/{filename}                           — shared project config
+3. $XDG_CONFIG_HOME/omni-dev/{filename}       — XDG global config
+4. $HOME/.omni-dev/{filename}                 — legacy global defaults (lowest priority)
 ```
 
 If no file exists at any tier, the function returns the project path
 (`{dir}/{filename}`) as a default — callers check `.exists()` before reading.
+
+### XDG compliance
+
+The `xdg_config_dir()` helper returns the XDG config path for omni-dev.
+It checks `$XDG_CONFIG_HOME/omni-dev/` first; if the variable is unset or
+empty, it defaults to `$HOME/.config/omni-dev/`. It uses `std::env::var`
+directly rather than `dirs::config_dir()`, which returns
+`~/Library/Application Support/` on macOS — not the expected location for
+a CLI tool.
 
 Key design decisions:
 
@@ -74,6 +111,8 @@ Key design decisions:
   file-loading operation checks existence individually.
 - **Home directory fallback**: Uses the `dirs` crate for cross-platform
   home directory detection.
+- **XDG before legacy**: The XDG path is checked before `$HOME/.omni-dev/`
+  to encourage migration to the standard location.
 
 ## Ecosystem Detection and Merge
 
@@ -249,17 +288,20 @@ error and warning levels. It may receive info-level scope suggestions.
 
 ## Key Source Files
 
-| Concept                  | File                              | Key Items                                                                      |
-|--------------------------|-----------------------------------|--------------------------------------------------------------------------------|
-| Config resolution        | `src/claude/context/discovery.rs` | `resolve_config_file()`, `load_project_scopes()`, `merge_ecosystem_scopes()`   |
-| Full discovery pipeline  | `src/claude/context/discovery.rs` | `ProjectDiscovery::discover()`, `load_omni_dev_config()`, `detect_ecosystem()` |
-| Module re-exports        | `src/claude/context.rs`           | `pub use discovery::{load_project_scopes, ProjectDiscovery}`                   |
-| Pre-validation           | `src/git/commit.rs`               | `CommitInfoForAI::run_pre_validation_checks()`, `pre_validated_checks` field   |
-| Pre-validation call site | `src/claude/client.rs`            | Loop calling `run_pre_validation_checks(valid_scopes)`                         |
-| Check prompt             | `src/claude/prompts.rs`           | `CHECK_SYSTEM_PROMPT`, `generate_check_system_prompt_with_scopes()`            |
-| Scope data structure     | `src/data/context.rs`             | `ScopeDefinition`, `ProjectContext`                                            |
-| Check command scopes     | `src/cli/git/check.rs`            | `CheckCommand::load_scopes()` (delegates to `load_project_scopes`)             |
-| Twiddle command scopes   | `src/cli/git/twiddle.rs`          | `TwiddleCommand::load_check_scopes()` (delegates to `load_project_scopes`)     |
+| Concept                  | File                              | Key Items                                                                                                          |
+|--------------------------|-----------------------------------|--------------------------------------------------------------------------------------------------------------------|
+| Config dir resolution    | `src/claude/context/discovery.rs` | `resolve_context_dir_with_source()`, `resolve_context_dir()`, `walk_up_find_config_dir()`, `ConfigDirSource`       |
+| Config file resolution   | `src/claude/context/discovery.rs` | `resolve_config_file()`, `xdg_config_dir()`, `load_config_content()`, `ConfigSourceLabel`                          |
+| Scope loading            | `src/claude/context/discovery.rs` | `load_project_scopes()`, `merge_ecosystem_scopes()`                                                                |
+| Full discovery pipeline  | `src/claude/context/discovery.rs` | `ProjectDiscovery::discover()`, `load_omni_dev_config()`, `detect_ecosystem()`                                     |
+| Module re-exports        | `src/claude/context.rs`           | `pub use discovery::{load_project_scopes, resolve_context_dir_with_source, ConfigDirSource, ConfigSourceLabel, …}` |
+| Pre-validation           | `src/git/commit.rs`               | `CommitInfoForAI::run_pre_validation_checks()`, `pre_validated_checks` field                                       |
+| Pre-validation call site | `src/claude/client.rs`            | Loop calling `run_pre_validation_checks(valid_scopes)`                                                             |
+| Check prompt             | `src/claude/prompts.rs`           | `CHECK_SYSTEM_PROMPT`, `generate_check_system_prompt_with_scopes()`                                                |
+| Scope data structure     | `src/data/context.rs`             | `ScopeDefinition`, `ProjectContext`                                                                                |
+| Diagnostic display       | `src/cli/git/check.rs`            | `show_guidance_files_status()` — uses `resolve_context_dir_with_source()` and `config_source_label()`              |
+| Diagnostic display       | `src/cli/git/twiddle.rs`          | `show_guidance_files_status()`, `show_check_guidance_files_status()`                                               |
+| Diagnostic display       | `src/cli/git/create_pr.rs`        | `show_guidance_files_status()`                                                                                     |
 
 ## Related Issues
 
@@ -267,3 +309,8 @@ error and warning levels. It may receive info-level scope suggestions.
 - **#135**: Unified three divergent scope-loading code paths into `load_project_scopes()`.
 - **#136**: Added pre-validated scope checks and two-tier severity model.
 - **#137**: This documentation (capturing learnings from #134–#136).
+- **#173**: Consolidated duplicated config resolution into `discovery.rs`.
+- **#174**: Added `OMNI_DEV_CONFIG_DIR` environment variable support.
+- **#175**: Added XDG Base Directory compliance for global config tier.
+- **#176**: Added walk-up discovery for `.omni-dev/` config directory.
+- **#177**: Added `ConfigDirSource` diagnostic output showing how the config dir was selected.

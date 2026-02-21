@@ -26,27 +26,49 @@ export CLAUDE_API_KEY="your-api-key-here"
 
 ### Local Override Support
 
-**NEW**: All configuration files now support local overrides! If a file exists in `.omni-dev/local/`, it will take precedence over the shared project configuration in `.omni-dev/`.
+All configuration files support local overrides. If a file exists in
+`.omni-dev/local/`, it takes precedence over the shared project
+configuration in `.omni-dev/`.
 
-**Priority Order**:
+**Important**: Add `.omni-dev/local/` to your `.gitignore` to keep personal
+configurations private.
 
-1. `.omni-dev/local/{filename}` - **Local override (highest priority)**
-2. `.omni-dev/{filename}` - Shared project configuration
+### Config File Resolution
 
-This allows developers to customize their personal workflow without affecting team settings.
+For each configuration file (e.g., `scopes.yaml`, `commit-guidelines.md`),
+omni-dev checks the following locations in order and uses the first match:
 
-**Important**: Add `.omni-dev/local/` to your `.gitignore` to keep personal configurations private.
+| Priority | Location                                     | Purpose                         |
+|----------|----------------------------------------------|---------------------------------|
+| 1        | `{dir}/local/{filename}`                     | Personal overrides (gitignored) |
+| 2        | `{dir}/{filename}`                           | Shared project configuration    |
+| 3        | `$XDG_CONFIG_HOME/omni-dev/{filename}`       | XDG global config               |
+| 4        | `$HOME/.omni-dev/{filename}`                 | Legacy global fallback          |
 
-### Global Configuration Fallback
+Where `{dir}` is the active config directory, resolved as follows:
 
-If no configuration file is found in the project directory, omni-dev falls back
-to `$HOME/.omni-dev/`. This allows you to set up default configuration that
-applies to all projects without a project-level `.omni-dev/` directory.
+### Config Directory Resolution
 
-**Full Priority Order**:
-1. `.omni-dev/local/{filename}` - Local override (highest priority)
-2. `.omni-dev/{filename}` - Shared project configuration
-3. `$HOME/.omni-dev/{filename}` - Global user configuration
+The config directory (`.omni-dev/`) is itself resolved through a priority
+chain:
+
+| Priority | Source                              | Description                                  |
+|----------|-------------------------------------|----------------------------------------------|
+| 1        | `--context-dir` CLI flag            | Explicit override; disables walk-up           |
+| 2        | `OMNI_DEV_CONFIG_DIR` env var       | Environment override; disables walk-up        |
+| 3        | Walk-up discovery                   | Nearest `.omni-dev/` from CWD to repo root   |
+| 4        | `.omni-dev` (relative to CWD)       | Default fallback                              |
+
+**Walk-up discovery** searches from the current working directory upward
+through parent directories, stopping at the repository root (`.git`
+boundary). The first directory containing a `.omni-dev/` subdirectory wins.
+This is especially useful in monorepos where subdirectories need different
+configuration.
+
+**XDG compliance**: When `$XDG_CONFIG_HOME` is set, omni-dev checks
+`$XDG_CONFIG_HOME/omni-dev/` for global config files. When unset, it
+defaults to `$HOME/.config/omni-dev/`. The legacy `$HOME/.omni-dev/` path
+is still supported as a final fallback.
 
 See [Configuration Best Practices](configuration-best-practices.md) for
 guidance on writing effective configuration files.
@@ -545,42 +567,49 @@ scopes:
 Use a different directory for configuration:
 
 ```bash
-# Use custom directory
+# Use CLI flag
 omni-dev git commit message twiddle 'HEAD~5..HEAD' \
   --context-dir ./config
 
-# Configuration files would be:
-# ./config/scopes.yaml
-# ./config/commit-guidelines.md
+# Or use environment variable
+export OMNI_DEV_CONFIG_DIR=./config
+omni-dev git commit message twiddle 'HEAD~5..HEAD'
 ```
 
-### Multiple Configuration Sets
+Both `--context-dir` and `OMNI_DEV_CONFIG_DIR` disable walk-up discovery,
+giving you full control over which config directory is used.
 
-For monorepos with different standards per service:
+### Multiple Configuration Sets (Monorepos)
+
+For monorepos, walk-up discovery automatically selects the right config.
+Place `.omni-dev/` directories at each package level:
 
 ```
-configs/
-├── frontend/
-│   ├── scopes.yaml
-│   └── commit-guidelines.md
-├── backend/  
-│   ├── scopes.yaml
-│   └── commit-guidelines.md
-└── shared/
-    ├── scopes.yaml
-    └── commit-guidelines.md
+repo/
+├── .git/
+├── .omni-dev/                    # Root config (fallback)
+│   └── scopes.yaml
+├── packages/
+│   ├── frontend/
+│   │   ├── .omni-dev/            # Frontend-specific config
+│   │   │   └── scopes.yaml
+│   │   └── src/
+│   └── backend/
+│       ├── .omni-dev/            # Backend-specific config
+│       │   └── scopes.yaml
+│       └── src/
 ```
 
-Usage:
+Running from `repo/packages/frontend/src/` automatically uses the frontend
+config. Running from `repo/` uses the root config. No `--context-dir`
+needed.
+
+If you prefer explicit control, you can still use `--context-dir`:
 
 ```bash
-# Frontend commits
+# Explicit override
 omni-dev git commit message twiddle 'HEAD~5..HEAD' \
-  --context-dir ./configs/frontend
-
-# Backend commits
-omni-dev git commit message twiddle 'HEAD~5..HEAD' \
-  --context-dir ./configs/backend
+  --context-dir ./packages/frontend/.omni-dev
 ```
 
 ### File Pattern Matching

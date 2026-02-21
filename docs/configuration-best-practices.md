@@ -15,21 +15,45 @@ real lessons learned from the project's own development.
 
 ## Config Resolution Priority
 
-omni-dev resolves each configuration file through a three-tier priority
-chain. The first file that exists wins:
+### Config directory selection
 
-| Priority    | Location                     | Purpose                         |
-|-------------|------------------------------|---------------------------------|
-| 1 (highest) | `.omni-dev/local/{filename}` | Personal overrides (gitignored) |
-| 2           | `.omni-dev/{filename}`       | Shared project configuration    |
-| 3 (lowest)  | `$HOME/.omni-dev/{filename}` | Global user defaults            |
+omni-dev first determines *which* `.omni-dev/` directory to use:
+
+| Priority | Source                        | Description                                |
+|----------|-------------------------------|--------------------------------------------|
+| 1        | `--context-dir` CLI flag      | Explicit override; disables walk-up        |
+| 2        | `OMNI_DEV_CONFIG_DIR` env var | Environment override; disables walk-up     |
+| 3        | Walk-up discovery             | Nearest `.omni-dev/` from CWD to repo root |
+| 4        | `.omni-dev` (CWD-relative)    | Default fallback                           |
+
+Walk-up discovery searches from the current working directory upward,
+stopping at the repository root (`.git` boundary). The first directory
+containing `.omni-dev/` wins. This makes monorepo subdirectories
+automatically pick up their nearest config without needing `--context-dir`.
+
+### Config file resolution
+
+Once the config directory is selected, each configuration file is resolved
+through a four-tier priority chain. The first file that exists wins:
+
+| Priority    | Location                                 | Purpose                         |
+|-------------|------------------------------------------|---------------------------------|
+| 1 (highest) | `{dir}/local/{filename}`                 | Personal overrides (gitignored) |
+| 2           | `{dir}/{filename}`                       | Shared project configuration    |
+| 3           | `$XDG_CONFIG_HOME/omni-dev/{filename}`   | XDG global config               |
+| 4 (lowest)  | `$HOME/.omni-dev/{filename}`             | Legacy global defaults          |
 
 ### How global config works
 
-The global fallback at `$HOME/.omni-dev/` applies to **all repositories**
-that don't have their own `.omni-dev/` directory. This means you can set up
-sensible defaults once and have them work everywhere — no per-project setup
-required for basic functionality.
+Global config applies to **all repositories** that don't have their own
+config files. omni-dev checks two global locations:
+
+1. **XDG path** (recommended): `$XDG_CONFIG_HOME/omni-dev/` — defaults to
+   `$HOME/.config/omni-dev/` when `$XDG_CONFIG_HOME` is unset.
+2. **Legacy path**: `$HOME/.omni-dev/` — still supported for backwards
+   compatibility.
+
+The XDG path is checked first. For new installations, use the XDG location.
 
 A project does **not** need a `.omni-dev/` directory for omni-dev to work.
 If none exists, the tool falls back to your global config. If neither exists,
@@ -37,13 +61,21 @@ ecosystem defaults are still applied (see below).
 
 ### When to use each tier
 
-- **Global** (`$HOME/.omni-dev/`): Generic defaults that work across most
-  projects. Keep these lightweight and broadly applicable.
+- **XDG global** (`$XDG_CONFIG_HOME/omni-dev/`): Generic defaults that work
+  across most projects. Recommended for new installations. Keep these
+  lightweight and broadly applicable.
+- **Legacy global** (`$HOME/.omni-dev/`): Same purpose as XDG global.
+  Existing setups continue to work.
 - **Project** (`.omni-dev/`): Project-specific scopes, guidelines, and
   conventions. Commit this to version control so all team members share the
   same configuration.
 - **Local** (`.omni-dev/local/`): Personal preferences that shouldn't be
   shared. Add `.omni-dev/local/` to `.gitignore`.
+- **Env var** (`OMNI_DEV_CONFIG_DIR`): Useful for CI/CD or scripting when
+  you need to point at a specific config directory without modifying
+  command-line arguments.
+- **Walk-up**: Automatic monorepo support — place `.omni-dev/` directories
+  at package boundaries and run from within the package.
 
 ## Ecosystem Defaults
 
@@ -389,10 +421,10 @@ confusion. Define one clear rule for the total subject line length.
 
 ### 4. Stale global config
 
-If you set up `$HOME/.omni-dev/` once and forget about it, the global
-config becomes a stale template that doesn't reflect your current
-conventions. Periodically review your global config, especially after
-updating project-level configurations.
+If you set up global config (at `$XDG_CONFIG_HOME/omni-dev/` or
+`$HOME/.omni-dev/`) once and forget about it, it becomes a stale template
+that doesn't reflect your current conventions. Periodically review your
+global config, especially after updating project-level configurations.
 
 ### 5. Duplicate scope definitions between tiers
 
@@ -433,6 +465,7 @@ Use this checklist to assess your configuration quality:
 ### Overall configuration
 
 - [ ] `.omni-dev/local/` is in `.gitignore`
-- [ ] Global config (`$HOME/.omni-dev/`) is reviewed periodically
+- [ ] Global config (`$XDG_CONFIG_HOME/omni-dev/` or `$HOME/.omni-dev/`) is reviewed periodically
 - [ ] Project config is committed to version control
 - [ ] Team members know where to find and how to update configuration
+- [ ] Monorepo packages have `.omni-dev/` at the right directory level (if using walk-up)
