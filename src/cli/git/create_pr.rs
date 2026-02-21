@@ -544,27 +544,17 @@ impl CreatePrCommand {
         &self,
         project_context: &crate::data::context::ProjectContext,
     ) -> Result<()> {
-        let context_dir = std::path::PathBuf::from(".omni-dev");
+        use crate::claude::context::{config_source_label, ConfigSourceLabel};
+
+        let context_dir = crate::claude::context::resolve_context_dir(None);
 
         println!("📋 Project guidance files status:");
 
         // Check PR guidelines (for PR commands)
-        let pr_guidelines_found = project_context.pr_guidelines.is_some();
-        let pr_guidelines_source = if pr_guidelines_found {
-            let local_path = context_dir.join("local").join("pr-guidelines.md");
-            let project_path = context_dir.join("pr-guidelines.md");
-            let home_path = dirs::home_dir()
-                .map(|h| h.join(".omni-dev").join("pr-guidelines.md"))
-                .unwrap_or_default();
-
-            if local_path.exists() {
-                format!("✅ Local override: {}", local_path.display())
-            } else if project_path.exists() {
-                format!("✅ Project: {}", project_path.display())
-            } else if home_path.exists() {
-                format!("✅ Global: {}", home_path.display())
-            } else {
-                "✅ (source unknown)".to_string()
+        let pr_guidelines_source = if project_context.pr_guidelines.is_some() {
+            match config_source_label(&context_dir, "pr-guidelines.md") {
+                ConfigSourceLabel::NotFound => "✅ (source unknown)".to_string(),
+                label => format!("✅ {label}"),
             }
         } else {
             "❌ None found".to_string()
@@ -574,22 +564,12 @@ impl CreatePrCommand {
         // Check scopes
         let scopes_count = project_context.valid_scopes.len();
         let scopes_source = if scopes_count > 0 {
-            let local_path = context_dir.join("local").join("scopes.yaml");
-            let project_path = context_dir.join("scopes.yaml");
-            let home_path = dirs::home_dir()
-                .map(|h| h.join(".omni-dev").join("scopes.yaml"))
-                .unwrap_or_default();
-
-            let source = if local_path.exists() {
-                format!("Local override: {}", local_path.display())
-            } else if project_path.exists() {
-                format!("Project: {}", project_path.display())
-            } else if home_path.exists() {
-                format!("Global: {}", home_path.display())
-            } else {
-                "(source unknown + ecosystem defaults)".to_string()
-            };
-            format!("✅ {source} ({scopes_count} scopes)")
+            match config_source_label(&context_dir, "scopes.yaml") {
+                ConfigSourceLabel::NotFound => {
+                    format!("✅ (source unknown + ecosystem defaults) ({scopes_count} scopes)")
+                }
+                label => format!("✅ {label} ({scopes_count} scopes)"),
+            }
         } else {
             "❌ None found".to_string()
         };
