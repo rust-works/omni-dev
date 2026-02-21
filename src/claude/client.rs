@@ -731,6 +731,8 @@ pub fn create_default_claude_client(
         "Client selection flags"
     );
 
+    let registry = crate::claude::model_config::get_model_registry();
+
     // Handle Ollama configuration
     if use_ollama {
         let ollama_model = model
@@ -747,7 +749,12 @@ pub fn create_default_claude_client(
         debug!("Creating OpenAI client");
         let openai_model = model
             .or_else(|| get_env_var("OPENAI_MODEL").ok())
-            .unwrap_or_else(|| "gpt-5".to_string());
+            .unwrap_or_else(|| {
+                registry
+                    .get_default_model("openai")
+                    .unwrap_or("gpt-5")
+                    .to_string()
+            });
         debug!(openai_model = %openai_model, "Selected OpenAI model");
         validate_beta_header(&openai_model, &beta_header)?;
 
@@ -765,7 +772,12 @@ pub fn create_default_claude_client(
     // For Claude clients, try to get model from env vars or use default
     let claude_model = model
         .or_else(|| get_env_var("ANTHROPIC_MODEL").ok())
-        .unwrap_or_else(|| "claude-opus-4-1-20250805".to_string());
+        .unwrap_or_else(|| {
+            registry
+                .get_default_model("claude")
+                .unwrap_or("claude-sonnet-4-6")
+                .to_string()
+        });
     validate_beta_header(&claude_model, &beta_header)?;
 
     if use_bedrock {
