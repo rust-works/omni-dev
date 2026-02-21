@@ -6,6 +6,9 @@ pub mod files;
 pub mod patterns;
 
 pub use branch::BranchAnalyzer;
-pub use discovery::{load_project_scopes, ProjectDiscovery};
+pub use discovery::{
+    config_source_label, load_config_content, load_project_scopes, resolve_context_dir,
+    ConfigSourceLabel, ProjectDiscovery,
+};
 pub use files::FileAnalyzer;
 pub use patterns::WorkPatternAnalyzer;
