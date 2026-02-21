@@ -299,11 +299,15 @@ impl CheckCommand {
         guidelines: &Option<String>,
         valid_scopes: &[crate::data::context::ScopeDefinition],
     ) {
-        use crate::claude::context::{config_source_label, resolve_context_dir, ConfigSourceLabel};
+        use crate::claude::context::{
+            config_source_label, resolve_context_dir_with_source, ConfigSourceLabel,
+        };
 
-        let context_dir = resolve_context_dir(self.context_dir.as_deref());
+        let (context_dir, dir_source) =
+            resolve_context_dir_with_source(self.context_dir.as_deref());
 
         println!("📋 Project guidance files status:");
+        println!("   📂 Config dir: {} ({dir_source})", context_dir.display());
 
         // Check commit guidelines
         let guidelines_source = if guidelines.is_some() {
