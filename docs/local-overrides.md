@@ -8,8 +8,15 @@ All `.omni-dev` configuration files now support local overrides through the `.om
 
 ## Priority Order
 
+Local overrides are the highest-priority tier in the full resolution chain:
+
 1. `.omni-dev/local/{filename}` - **Local override (highest priority)**
 2. `.omni-dev/{filename}` - Shared project configuration
+3. `$XDG_CONFIG_HOME/omni-dev/{filename}` - XDG global config
+4. `$HOME/.omni-dev/{filename}` - Legacy global fallback
+
+See [Configuration Guide](configuration.md) for the full resolution chain
+including config directory selection (walk-up discovery, env var, CLI flag).
 
 ## Supported Override Files
 
