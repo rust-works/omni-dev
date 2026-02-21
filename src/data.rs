@@ -14,9 +14,9 @@ pub use check::*;
 pub use context::*;
 pub use yaml::*;
 
-/// Complete repository view output structure.
+/// Complete repository view output structure, generic over commit type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RepositoryView {
+pub struct RepositoryView<C = CommitInfo> {
     /// Version information for the omni-dev tool.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub versions: Option<VersionInfo>,
@@ -41,38 +41,11 @@ pub struct RepositoryView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch_prs: Option<Vec<PullRequest>>,
     /// List of analyzed commits with metadata and analysis.
-    pub commits: Vec<CommitInfo>,
+    pub commits: Vec<C>,
 }
 
 /// Enhanced repository view for AI processing with full diff content.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RepositoryViewForAI {
-    /// Version information for the omni-dev tool.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub versions: Option<VersionInfo>,
-    /// Explanation of field meanings and structure.
-    pub explanation: FieldExplanation,
-    /// Working directory status information.
-    pub working_directory: WorkingDirectoryInfo,
-    /// List of remote repositories and their main branches.
-    pub remotes: Vec<RemoteInfo>,
-    /// AI-related information.
-    pub ai: AiInfo,
-    /// Branch information (only present when using branch commands).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub branch_info: Option<BranchInfo>,
-    /// Pull request template content (only present in branch commands when template exists).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pr_template: Option<String>,
-    /// Location of the pull request template file (only present when pr_template exists).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pr_template_location: Option<String>,
-    /// Pull requests created from the current branch (only present in branch commands).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub branch_prs: Option<Vec<PullRequest>>,
-    /// List of analyzed commits with enhanced metadata including full diff content.
-    pub commits: Vec<CommitInfoForAI>,
-}
+pub type RepositoryViewForAI = RepositoryView<CommitInfoForAI>;
 
 /// Field explanation for the YAML output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -476,6 +449,28 @@ const DIFF_TRUNCATION_MARKER: &str = "\n\n[... diff truncated to fit model conte
 /// Below this threshold, stat-only is preferred.
 const MIN_TRUNCATED_DIFF_LEN: usize = 500;
 
+impl<C> RepositoryView<C> {
+    /// Transforms commits while preserving all other fields.
+    pub fn map_commits<D>(
+        self,
+        f: impl FnMut(C) -> anyhow::Result<D>,
+    ) -> anyhow::Result<RepositoryView<D>> {
+        let commits: anyhow::Result<Vec<D>> = self.commits.into_iter().map(f).collect();
+        Ok(RepositoryView {
+            versions: self.versions,
+            explanation: self.explanation,
+            working_directory: self.working_directory,
+            remotes: self.remotes,
+            ai: self.ai,
+            branch_info: self.branch_info,
+            pr_template: self.pr_template,
+            pr_template_location: self.pr_template_location,
+            branch_prs: self.branch_prs,
+            commits: commits?,
+        })
+    }
+}
+
 impl RepositoryViewForAI {
     /// Converts from basic RepositoryView by loading diff content for all commits.
     pub fn from_repository_view(repo_view: RepositoryView) -> anyhow::Result<Self> {
@@ -490,31 +485,13 @@ impl RepositoryViewForAI {
         repo_view: RepositoryView,
         fresh: bool,
     ) -> anyhow::Result<Self> {
-        // Convert all commits to AI-enhanced versions
-        let commits: anyhow::Result<Vec<_>> = repo_view
-            .commits
-            .into_iter()
-            .map(|commit| {
-                let mut ai_commit = CommitInfoForAI::from_commit_info(commit)?;
-                if fresh {
-                    ai_commit.original_message =
-                        "(Original message hidden - generate fresh message from diff)".to_string();
-                }
-                Ok(ai_commit)
-            })
-            .collect();
-
-        Ok(Self {
-            versions: repo_view.versions,
-            explanation: repo_view.explanation,
-            working_directory: repo_view.working_directory,
-            remotes: repo_view.remotes,
-            ai: repo_view.ai,
-            branch_info: repo_view.branch_info,
-            pr_template: repo_view.pr_template,
-            pr_template_location: repo_view.pr_template_location,
-            branch_prs: repo_view.branch_prs,
-            commits: commits?,
+        repo_view.map_commits(|commit| {
+            let mut ai_commit = CommitInfoForAI::from_commit_info(commit)?;
+            if fresh {
+                ai_commit.base.original_message =
+                    "(Original message hidden - generate fresh message from diff)".to_string();
+            }
+            Ok(ai_commit)
         })
     }
 
@@ -529,7 +506,7 @@ impl RepositoryViewForAI {
         let total_diff_len: usize = self
             .commits
             .iter()
-            .map(|c| c.analysis.diff_content.len())
+            .map(|c| c.base.analysis.diff_content.len())
             .sum();
 
         if total_diff_len == 0 {
@@ -537,7 +514,7 @@ impl RepositoryViewForAI {
         }
 
         for commit in &mut self.commits {
-            let diff_len = commit.analysis.diff_content.len();
+            let diff_len = commit.base.analysis.diff_content.len();
             if diff_len == 0 {
                 continue;
             }
@@ -553,12 +530,13 @@ impl RepositoryViewForAI {
             }
 
             // Find nearest newline boundary at or before target_len (include the newline)
-            let cut_point = commit.analysis.diff_content[..target_len]
+            let cut_point = commit.base.analysis.diff_content[..target_len]
                 .rfind('\n')
                 .map_or(target_len, |p| p + 1);
 
-            commit.analysis.diff_content.truncate(cut_point);
+            commit.base.analysis.diff_content.truncate(cut_point);
             commit
+                .base
                 .analysis
                 .diff_content
                 .push_str(DIFF_TRUNCATION_MARKER);
@@ -568,9 +546,9 @@ impl RepositoryViewForAI {
     /// Replaces full diff content with the `diff --stat` summary for all commits.
     pub(crate) fn replace_diffs_with_stat(&mut self) {
         for commit in &mut self.commits {
-            commit.analysis.diff_content = format!(
+            commit.base.analysis.diff_content = format!(
                 "[diff replaced with stat summary to fit model context window]\n\n{}",
-                commit.analysis.diff_summary
+                commit.base.analysis.base.diff_summary
             );
         }
     }
@@ -578,10 +556,10 @@ impl RepositoryViewForAI {
     /// Removes all diff content, keeping only file list metadata.
     pub(crate) fn remove_diffs(&mut self) {
         for commit in &mut self.commits {
-            commit.analysis.diff_content =
+            commit.base.analysis.diff_content =
                 "[diff content removed to fit model context window — only file list available]"
                     .to_string();
-            commit.analysis.diff_summary = String::new();
+            commit.base.analysis.base.diff_summary = String::new();
         }
     }
 }
@@ -591,36 +569,40 @@ impl RepositoryViewForAI {
 mod tests {
     use super::*;
     use crate::git::commit::FileChanges;
-    use crate::git::{CommitAnalysisForAI, CommitInfoForAI};
+    use crate::git::{CommitAnalysis, CommitAnalysisForAI, CommitInfo, CommitInfoForAI};
     use chrono::Utc;
 
     fn make_commit(hash: &str, diff_content: &str, diff_summary: &str) -> CommitInfoForAI {
         CommitInfoForAI {
-            hash: hash.to_string(),
-            author: "Test <test@test.com>".to_string(),
-            date: Utc::now().fixed_offset(),
-            original_message: "test commit".to_string(),
-            in_main_branches: Vec::new(),
-            analysis: CommitAnalysisForAI {
-                detected_type: "feat".to_string(),
-                detected_scope: "test".to_string(),
-                proposed_message: "feat(test): test".to_string(),
-                file_changes: FileChanges {
-                    total_files: 1,
-                    files_added: 0,
-                    files_deleted: 0,
-                    file_list: Vec::new(),
+            base: CommitInfo {
+                hash: hash.to_string(),
+                author: "Test <test@test.com>".to_string(),
+                date: Utc::now().fixed_offset(),
+                original_message: "test commit".to_string(),
+                in_main_branches: Vec::new(),
+                analysis: CommitAnalysisForAI {
+                    base: CommitAnalysis {
+                        detected_type: "feat".to_string(),
+                        detected_scope: "test".to_string(),
+                        proposed_message: "feat(test): test".to_string(),
+                        file_changes: FileChanges {
+                            total_files: 1,
+                            files_added: 0,
+                            files_deleted: 0,
+                            file_list: Vec::new(),
+                        },
+                        diff_summary: diff_summary.to_string(),
+                        diff_file: "/tmp/test.diff".to_string(),
+                    },
+                    diff_content: diff_content.to_string(),
                 },
-                diff_summary: diff_summary.to_string(),
-                diff_file: "/tmp/test.diff".to_string(),
-                diff_content: diff_content.to_string(),
             },
             pre_validated_checks: Vec::new(),
         }
     }
 
     fn make_view(commits: Vec<CommitInfoForAI>) -> RepositoryViewForAI {
-        RepositoryViewForAI {
+        RepositoryView {
             versions: None,
             explanation: FieldExplanation::default(),
             working_directory: WorkingDirectoryInfo {
@@ -658,7 +640,7 @@ mod tests {
         // Remove ~500 chars
         view.truncate_diffs(500);
 
-        let result = &view.commits[0].analysis.diff_content;
+        let result = &view.commits[0].base.analysis.diff_content;
         // Should be shorter than original
         assert!(result.len() < original_len);
         // Should end with truncation marker
@@ -680,7 +662,7 @@ mod tests {
         view.truncate_diffs(500);
 
         // Should be left unchanged since remainder < 500
-        assert_eq!(view.commits[0].analysis.diff_content.len(), 600);
+        assert_eq!(view.commits[0].base.analysis.diff_content.len(), 600);
     }
 
     #[test]
@@ -693,14 +675,14 @@ mod tests {
         let c2 = make_commit("bbb", &large_diff, "large.rs | 3 +++");
         let mut view = make_view(vec![c1, c2]);
 
-        let orig_small = view.commits[0].analysis.diff_content.len();
-        let orig_large = view.commits[1].analysis.diff_content.len();
+        let orig_small = view.commits[0].base.analysis.diff_content.len();
+        let orig_large = view.commits[1].base.analysis.diff_content.len();
 
         // Remove 1000 chars total — should remove ~250 from small, ~750 from large
         view.truncate_diffs(1000);
 
-        let new_small = view.commits[0].analysis.diff_content.len();
-        let new_large = view.commits[1].analysis.diff_content.len();
+        let new_small = view.commits[0].base.analysis.diff_content.len();
+        let new_large = view.commits[1].base.analysis.diff_content.len();
 
         // Both should be reduced
         assert!(new_small < orig_small);
@@ -720,7 +702,7 @@ mod tests {
 
         view.replace_diffs_with_stat();
 
-        let result = &view.commits[0].analysis.diff_content;
+        let result = &view.commits[0].base.analysis.diff_content;
         assert!(result.contains("stat summary"));
         assert!(result.contains("file.rs | 10 +++++++---"));
         assert!(!result.contains("full diff content here"));
@@ -733,10 +715,10 @@ mod tests {
 
         view.remove_diffs();
 
-        let result = &view.commits[0].analysis.diff_content;
+        let result = &view.commits[0].base.analysis.diff_content;
         assert!(result.contains("only file list available"));
         assert!(!result.contains("full diff"));
-        assert!(view.commits[0].analysis.diff_summary.is_empty());
+        assert!(view.commits[0].base.analysis.base.diff_summary.is_empty());
     }
 
     #[test]
@@ -746,7 +728,7 @@ mod tests {
 
         view.truncate_diffs(1000);
 
-        assert!(view.commits[0].analysis.diff_content.is_empty());
+        assert!(view.commits[0].base.analysis.diff_content.is_empty());
     }
 
     #[test]
@@ -995,5 +977,97 @@ mod tests {
                 field.name
             );
         }
+    }
+
+    // ── map_commits / from_repository_view ──────────────────────────
+
+    fn make_human_view_with_diff_files(
+        dir: &tempfile::TempDir,
+        messages: &[&str],
+    ) -> RepositoryView {
+        let commits = messages
+            .iter()
+            .enumerate()
+            .map(|(i, msg)| {
+                let diff_path = dir.path().join(format!("{i}.diff"));
+                std::fs::write(&diff_path, format!("+line from commit {i}\n")).unwrap();
+                CommitInfo {
+                    hash: format!("{:0>40}", i),
+                    author: "Test <test@test.com>".to_string(),
+                    date: Utc::now().fixed_offset(),
+                    original_message: msg.to_string(),
+                    in_main_branches: Vec::new(),
+                    analysis: CommitAnalysis {
+                        detected_type: "feat".to_string(),
+                        detected_scope: "test".to_string(),
+                        proposed_message: format!("feat(test): {msg}"),
+                        file_changes: FileChanges {
+                            total_files: 1,
+                            files_added: 0,
+                            files_deleted: 0,
+                            file_list: Vec::new(),
+                        },
+                        diff_summary: "file.rs | 1 +".to_string(),
+                        diff_file: diff_path.to_string_lossy().to_string(),
+                    },
+                }
+            })
+            .collect();
+
+        RepositoryView {
+            versions: None,
+            explanation: FieldExplanation::default(),
+            working_directory: WorkingDirectoryInfo {
+                clean: true,
+                untracked_changes: Vec::new(),
+            },
+            remotes: Vec::new(),
+            ai: AiInfo {
+                scratch: String::new(),
+            },
+            branch_info: None,
+            pr_template: None,
+            pr_template_location: None,
+            branch_prs: None,
+            commits,
+        }
+    }
+
+    #[test]
+    fn map_commits_transforms_all_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let view = make_human_view_with_diff_files(&dir, &["first", "second"]);
+        assert_eq!(view.commits.len(), 2);
+
+        let mapped: RepositoryView<String> = view
+            .map_commits(|c| Ok(c.original_message.clone()))
+            .unwrap();
+        assert_eq!(
+            mapped.commits,
+            vec!["first".to_string(), "second".to_string()]
+        );
+    }
+
+    #[test]
+    fn from_repository_view_loads_diffs() {
+        let dir = tempfile::tempdir().unwrap();
+        let view = make_human_view_with_diff_files(&dir, &["commit one"]);
+
+        let ai_view = RepositoryViewForAI::from_repository_view(view).unwrap();
+        assert_eq!(ai_view.commits.len(), 1);
+        assert_eq!(
+            ai_view.commits[0].base.analysis.diff_content,
+            "+line from commit 0\n"
+        );
+        assert_eq!(ai_view.commits[0].base.original_message, "commit one");
+    }
+
+    #[test]
+    fn from_repository_view_fresh_hides_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let view = make_human_view_with_diff_files(&dir, &["original msg"]);
+
+        let ai_view = RepositoryViewForAI::from_repository_view_with_options(view, true).unwrap();
+        assert!(ai_view.commits[0].base.original_message.contains("hidden"));
     }
 }
