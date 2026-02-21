@@ -6,6 +6,8 @@
 
 use anyhow::{bail, Context, Result};
 
+use crate::claude::model_config::get_model_registry;
+
 /// Result of AI credential validation.
 #[derive(Debug)]
 pub struct AiCredentialInfo {
@@ -75,10 +77,16 @@ pub fn check_ai_credentials(model_override: Option<&str>) -> Result<AiCredential
 
     // Check OpenAI
     if use_openai {
+        let registry = get_model_registry();
         let model = model_override
             .map(String::from)
             .or_else(|| get_env_var("OPENAI_MODEL").ok())
-            .unwrap_or_else(|| "gpt-5".to_string());
+            .unwrap_or_else(|| {
+                registry
+                    .get_default_model("openai")
+                    .unwrap_or("gpt-5")
+                    .to_string()
+            });
 
         // Verify API key exists
         get_env_vars(&["OPENAI_API_KEY", "OPENAI_AUTH_TOKEN"]).map_err(|_| {
@@ -98,10 +106,16 @@ pub fn check_ai_credentials(model_override: Option<&str>) -> Result<AiCredential
 
     // Check Bedrock
     if use_bedrock {
+        let registry = get_model_registry();
         let model = model_override
             .map(String::from)
             .or_else(|| get_env_var("ANTHROPIC_MODEL").ok())
-            .unwrap_or_else(|| "claude-opus-4-1-20250805".to_string());
+            .unwrap_or_else(|| {
+                registry
+                    .get_default_model("claude")
+                    .unwrap_or("claude-sonnet-4-6")
+                    .to_string()
+            });
 
         // Verify Bedrock configuration
         get_env_var("ANTHROPIC_AUTH_TOKEN").map_err(|_| {
@@ -125,10 +139,16 @@ pub fn check_ai_credentials(model_override: Option<&str>) -> Result<AiCredential
     }
 
     // Default: Claude API
+    let registry = get_model_registry();
     let model = model_override
         .map(String::from)
         .or_else(|| get_env_var("ANTHROPIC_MODEL").ok())
-        .unwrap_or_else(|| "claude-opus-4-1-20250805".to_string());
+        .unwrap_or_else(|| {
+            registry
+                .get_default_model("claude")
+                .unwrap_or("claude-sonnet-4-6")
+                .to_string()
+        });
 
     // Verify API key exists
     get_env_vars(&[
@@ -265,8 +285,55 @@ pub fn check_pr_command_prerequisites(model_override: Option<&str>) -> Result<Ai
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    use std::env;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    /// Global lock to ensure environment variable tests don't interfere with each other.
+    static ENV_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    /// Manages environment variables in tests to avoid interference.
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        vars: Vec<(String, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn new() -> Self {
+            let lock = ENV_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+            Self {
+                _lock: lock,
+                vars: Vec::new(),
+            }
+        }
+
+        fn set(&mut self, key: &str, value: &str) {
+            let original = env::var(key).ok();
+            self.vars.push((key.to_string(), original));
+            env::set_var(key, value);
+        }
+
+        fn remove(&mut self, key: &str) {
+            let original = env::var(key).ok();
+            self.vars.push((key.to_string(), original));
+            env::remove_var(key);
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, original_value) in self.vars.drain(..).rev() {
+                match original_value {
+                    Some(value) => env::set_var(&key, value),
+                    None => env::remove_var(&key),
+                }
+            }
+        }
+    }
 
     #[test]
     fn ai_provider_display() {
@@ -305,5 +372,61 @@ mod tests {
         let debug_str = format!("{info:?}");
         assert!(debug_str.contains("Ollama"));
         assert!(debug_str.contains("llama2"));
+    }
+
+    #[test]
+    fn claude_default_model_from_registry() {
+        let mut guard = EnvGuard::new();
+        // Enable Claude API path with a dummy key, no model override
+        guard.remove("USE_OPENAI");
+        guard.remove("USE_OLLAMA");
+        guard.remove("CLAUDE_CODE_USE_BEDROCK");
+        guard.remove("ANTHROPIC_MODEL");
+        guard.set("ANTHROPIC_API_KEY", "sk-test-dummy");
+
+        let info = check_ai_credentials(None).unwrap();
+        assert_eq!(info.provider, AiProvider::Claude);
+        assert_eq!(info.model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn openai_default_model_from_registry() {
+        let mut guard = EnvGuard::new();
+        guard.set("USE_OPENAI", "true");
+        guard.remove("USE_OLLAMA");
+        guard.remove("OPENAI_MODEL");
+        guard.set("OPENAI_API_KEY", "sk-test-dummy");
+
+        let info = check_ai_credentials(None).unwrap();
+        assert_eq!(info.provider, AiProvider::OpenAi);
+        assert_eq!(info.model, "gpt-5-mini");
+    }
+
+    #[test]
+    fn bedrock_default_model_from_registry() {
+        let mut guard = EnvGuard::new();
+        guard.remove("USE_OPENAI");
+        guard.remove("USE_OLLAMA");
+        guard.set("CLAUDE_CODE_USE_BEDROCK", "true");
+        guard.remove("ANTHROPIC_MODEL");
+        guard.set("ANTHROPIC_AUTH_TOKEN", "test-token");
+        guard.set("ANTHROPIC_BEDROCK_BASE_URL", "https://bedrock.example.com");
+
+        let info = check_ai_credentials(None).unwrap();
+        assert_eq!(info.provider, AiProvider::Bedrock);
+        assert_eq!(info.model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn model_override_takes_precedence() {
+        let mut guard = EnvGuard::new();
+        guard.remove("USE_OPENAI");
+        guard.remove("USE_OLLAMA");
+        guard.remove("CLAUDE_CODE_USE_BEDROCK");
+        guard.remove("ANTHROPIC_MODEL");
+        guard.set("ANTHROPIC_API_KEY", "sk-test-dummy");
+
+        let info = check_ai_credentials(Some("claude-opus-4-6")).unwrap();
+        assert_eq!(info.model, "claude-opus-4-6");
     }
 }
