@@ -16,6 +16,10 @@ impl AmendCommand {
     pub fn execute(self) -> Result<()> {
         use crate::git::AmendmentHandler;
 
+        // Preflight checks: validate prerequisites before any processing
+        crate::utils::check_git_repository()?;
+        crate::utils::check_working_directory_clean()?;
+
         println!("🔄 Starting commit amendment process...");
         println!("📄 Loading amendments from: {}", self.yaml_file);
 
