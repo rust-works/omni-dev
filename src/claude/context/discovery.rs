@@ -3,7 +3,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use std::fmt;
+
+use anyhow::{Context, Result};
 use tracing::debug;
 
 use crate::data::context::{
@@ -38,6 +40,77 @@ pub fn resolve_config_file(dir: &Path, filename: &str) -> PathBuf {
 
     // Return project path as default (even if it doesn't exist)
     project_path
+}
+
+/// Resolves the context directory from an optional CLI override.
+///
+/// Returns the override path if provided, otherwise defaults to `.omni-dev`.
+pub fn resolve_context_dir(override_dir: Option<&Path>) -> PathBuf {
+    override_dir.map_or_else(|| PathBuf::from(".omni-dev"), Path::to_path_buf)
+}
+
+/// Loads a config file's content via the standard resolution chain.
+///
+/// Uses [`resolve_config_file`] to find the file, then reads its content.
+/// Returns `Ok(None)` if no file exists at any tier.
+pub fn load_config_content(dir: &Path, filename: &str) -> Result<Option<String>> {
+    let path = resolve_config_file(dir, filename);
+    if path.exists() {
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+        Ok(Some(content))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Identifies which resolution tier a config file was found in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigSourceLabel {
+    /// Found in `{dir}/local/{filename}`.
+    LocalOverride(PathBuf),
+    /// Found in `{dir}/{filename}`.
+    Project(PathBuf),
+    /// Found in `$HOME/.omni-dev/{filename}`.
+    Global(PathBuf),
+    /// Not found at any tier.
+    NotFound,
+}
+
+impl fmt::Display for ConfigSourceLabel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LocalOverride(p) => write!(f, "Local override: {}", p.display()),
+            Self::Project(p) => write!(f, "Project: {}", p.display()),
+            Self::Global(p) => write!(f, "Global: {}", p.display()),
+            Self::NotFound => write!(f, "(not found)"),
+        }
+    }
+}
+
+/// Returns the source tier for a config file (for diagnostic display).
+///
+/// Checks each tier in priority order and returns the first match.
+/// Does not read file content — only checks existence.
+pub fn config_source_label(dir: &Path, filename: &str) -> ConfigSourceLabel {
+    let local_path = dir.join("local").join(filename);
+    if local_path.exists() {
+        return ConfigSourceLabel::LocalOverride(local_path);
+    }
+
+    let project_path = dir.join(filename);
+    if project_path.exists() {
+        return ConfigSourceLabel::Project(project_path);
+    }
+
+    if let Some(home_dir) = dirs::home_dir() {
+        let home_path = home_dir.join(".omni-dev").join(filename);
+        if home_path.exists() {
+            return ConfigSourceLabel::Global(home_path);
+        }
+    }
+
+    ConfigSourceLabel::NotFound
 }
 
 /// Loads project scopes from config files, merging ecosystem defaults.
@@ -806,5 +879,149 @@ scopes:
     fn extract_commit_types_empty_line() {
         let types = extract_commit_types("no types here");
         assert!(types.is_empty());
+    }
+
+    // ── resolve_context_dir ────────────────────────────────────────────
+
+    #[test]
+    fn context_dir_defaults_to_omni_dev() {
+        let result = resolve_context_dir(None);
+        assert_eq!(result, PathBuf::from(".omni-dev"));
+    }
+
+    #[test]
+    fn context_dir_uses_override() {
+        let custom = PathBuf::from("custom-config");
+        let result = resolve_context_dir(Some(&custom));
+        assert_eq!(result, custom);
+    }
+
+    // ── load_config_content ────────────────────────────────────────────
+
+    #[test]
+    fn load_config_content_reads_project_file() -> anyhow::Result<()> {
+        let dir = {
+            std::fs::create_dir_all("tmp")?;
+            TempDir::new_in("tmp")?
+        };
+        let base = dir.path();
+
+        std::fs::write(
+            base.join("commit-guidelines.md"),
+            "# Guidelines\nBe concise.",
+        )?;
+
+        let content = load_config_content(base, "commit-guidelines.md")?;
+        assert_eq!(content, Some("# Guidelines\nBe concise.".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn load_config_content_prefers_local_override() -> anyhow::Result<()> {
+        let dir = {
+            std::fs::create_dir_all("tmp")?;
+            TempDir::new_in("tmp")?
+        };
+        let base = dir.path();
+
+        std::fs::create_dir_all(base.join("local"))?;
+        std::fs::write(base.join("local").join("guidelines.md"), "local content")?;
+        std::fs::write(base.join("guidelines.md"), "project content")?;
+
+        let content = load_config_content(base, "guidelines.md")?;
+        assert_eq!(content, Some("local content".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn load_config_content_returns_none_when_missing() -> anyhow::Result<()> {
+        let dir = {
+            std::fs::create_dir_all("tmp")?;
+            TempDir::new_in("tmp")?
+        };
+
+        let content = load_config_content(dir.path(), "nonexistent.md")?;
+        assert_eq!(content, None);
+        Ok(())
+    }
+
+    // ── config_source_label ────────────────────────────────────────────
+
+    #[test]
+    fn source_label_local_override() -> anyhow::Result<()> {
+        let dir = {
+            std::fs::create_dir_all("tmp")?;
+            TempDir::new_in("tmp")?
+        };
+        let base = dir.path();
+
+        std::fs::create_dir_all(base.join("local"))?;
+        std::fs::write(base.join("local").join("scopes.yaml"), "local")?;
+        std::fs::write(base.join("scopes.yaml"), "project")?;
+
+        let label = config_source_label(base, "scopes.yaml");
+        assert_eq!(
+            label,
+            ConfigSourceLabel::LocalOverride(base.join("local").join("scopes.yaml"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn source_label_project() -> anyhow::Result<()> {
+        let dir = {
+            std::fs::create_dir_all("tmp")?;
+            TempDir::new_in("tmp")?
+        };
+        let base = dir.path();
+
+        std::fs::write(base.join("scopes.yaml"), "project")?;
+
+        let label = config_source_label(base, "scopes.yaml");
+        assert_eq!(label, ConfigSourceLabel::Project(base.join("scopes.yaml")));
+        Ok(())
+    }
+
+    #[test]
+    fn source_label_not_found() {
+        let dir = {
+            std::fs::create_dir_all("tmp").ok();
+            TempDir::new_in("tmp").unwrap()
+        };
+
+        let label = config_source_label(dir.path(), "nonexistent.yaml");
+        assert_eq!(label, ConfigSourceLabel::NotFound);
+    }
+
+    // ── ConfigSourceLabel Display ──────────────────────────────────────
+
+    #[test]
+    fn display_local_override() {
+        let label = ConfigSourceLabel::LocalOverride(PathBuf::from(".omni-dev/local/scopes.yaml"));
+        assert_eq!(
+            label.to_string(),
+            "Local override: .omni-dev/local/scopes.yaml"
+        );
+    }
+
+    #[test]
+    fn display_project() {
+        let label = ConfigSourceLabel::Project(PathBuf::from(".omni-dev/scopes.yaml"));
+        assert_eq!(label.to_string(), "Project: .omni-dev/scopes.yaml");
+    }
+
+    #[test]
+    fn display_global() {
+        let label = ConfigSourceLabel::Global(PathBuf::from("/home/user/.omni-dev/scopes.yaml"));
+        assert_eq!(
+            label.to_string(),
+            "Global: /home/user/.omni-dev/scopes.yaml"
+        );
+    }
+
+    #[test]
+    fn display_not_found() {
+        let label = ConfigSourceLabel::NotFound;
+        assert_eq!(label.to_string(), "(not found)");
     }
 }
