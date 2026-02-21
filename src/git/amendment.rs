@@ -60,7 +60,7 @@ impl AmendmentHandler {
     /// Performs safety checks before amendment.
     fn perform_safety_checks(&self, amendment_file: &AmendmentFile) -> Result<()> {
         // Check if working directory is clean
-        self.check_working_directory_clean()
+        crate::utils::preflight::check_working_directory_clean()
             .context("Cannot amend commits with uncommitted changes")?;
 
         // Check if commits exist and are not in remote main branches
@@ -339,40 +339,6 @@ impl AmendmentHandler {
             }
         } else if repo_state != git2::RepositoryState::Clean {
             anyhow::bail!("Repository in unexpected state after rebase: {repo_state:?}");
-        }
-
-        Ok(())
-    }
-
-    /// Checks if the working directory is clean (uses the repository instance).
-    fn check_working_directory_clean(&self) -> Result<()> {
-        let statuses = self
-            .repo
-            .statuses(None)
-            .context("Failed to get repository status")?;
-
-        // Filter out ignored files and only check for actual uncommitted changes
-        let actual_changes: Vec<_> = statuses
-            .iter()
-            .filter(|entry| {
-                let status = entry.status();
-                // Only consider files that have actual changes, not ignored files
-                !status.is_ignored()
-            })
-            .collect();
-
-        if !actual_changes.is_empty() {
-            // Print details about what's unclean for debugging
-            println!("Working directory has uncommitted changes:");
-            for status_entry in &actual_changes {
-                let status = status_entry.status();
-                let file_path = status_entry.path().unwrap_or("unknown");
-                println!("  {file_path} -> {status:?}");
-            }
-
-            anyhow::bail!(
-                "Working directory is not clean. Please commit or stash changes before amending commit messages."
-            );
         }
 
         Ok(())
