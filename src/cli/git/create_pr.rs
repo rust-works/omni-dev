@@ -544,11 +544,14 @@ impl CreatePrCommand {
         &self,
         project_context: &crate::data::context::ProjectContext,
     ) -> Result<()> {
-        use crate::claude::context::{config_source_label, ConfigSourceLabel};
+        use crate::claude::context::{
+            config_source_label, resolve_context_dir_with_source, ConfigSourceLabel,
+        };
 
-        let context_dir = crate::claude::context::resolve_context_dir(None);
+        let (context_dir, dir_source) = resolve_context_dir_with_source(None);
 
         println!("📋 Project guidance files status:");
+        println!("   📂 Config dir: {} ({dir_source})", context_dir.display());
 
         // Check PR guidelines (for PR commands)
         let pr_guidelines_source = if project_context.pr_guidelines.is_some() {
