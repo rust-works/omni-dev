@@ -686,7 +686,7 @@ impl TwiddleCommand {
         let mut context = CommitContext::new();
 
         // 1. Discover project context
-        let context_dir = resolve_context_dir(self.context_dir.as_deref());
+        let context_dir = crate::claude::context::resolve_context_dir(self.context_dir.as_deref());
 
         // ProjectDiscovery takes repo root and context directory
         let repo_root = std::path::PathBuf::from(".");
@@ -842,25 +842,15 @@ impl TwiddleCommand {
         project_context: &crate::data::context::ProjectContext,
         context_dir: &std::path::Path,
     ) -> Result<()> {
+        use crate::claude::context::{config_source_label, ConfigSourceLabel};
+
         println!("📋 Project guidance files status:");
 
         // Check commit guidelines
-        let guidelines_found = project_context.commit_guidelines.is_some();
-        let guidelines_source = if guidelines_found {
-            let local_path = context_dir.join("local").join("commit-guidelines.md");
-            let project_path = context_dir.join("commit-guidelines.md");
-            let home_path = dirs::home_dir()
-                .map(|h| h.join(".omni-dev").join("commit-guidelines.md"))
-                .unwrap_or_default();
-
-            if local_path.exists() {
-                format!("✅ Local override: {}", local_path.display())
-            } else if project_path.exists() {
-                format!("✅ Project: {}", project_path.display())
-            } else if home_path.exists() {
-                format!("✅ Global: {}", home_path.display())
-            } else {
-                "✅ (source unknown)".to_string()
+        let guidelines_source = if project_context.commit_guidelines.is_some() {
+            match config_source_label(context_dir, "commit-guidelines.md") {
+                ConfigSourceLabel::NotFound => "✅ (source unknown)".to_string(),
+                label => format!("✅ {label}"),
             }
         } else {
             "❌ None found".to_string()
@@ -870,22 +860,12 @@ impl TwiddleCommand {
         // Check scopes
         let scopes_count = project_context.valid_scopes.len();
         let scopes_source = if scopes_count > 0 {
-            let local_path = context_dir.join("local").join("scopes.yaml");
-            let project_path = context_dir.join("scopes.yaml");
-            let home_path = dirs::home_dir()
-                .map(|h| h.join(".omni-dev").join("scopes.yaml"))
-                .unwrap_or_default();
-
-            let source = if local_path.exists() {
-                format!("Local override: {}", local_path.display())
-            } else if project_path.exists() {
-                format!("Project: {}", project_path.display())
-            } else if home_path.exists() {
-                format!("Global: {}", home_path.display())
-            } else {
-                "(source unknown + ecosystem defaults)".to_string()
-            };
-            format!("✅ {source} ({scopes_count} scopes)")
+            match config_source_label(context_dir, "scopes.yaml") {
+                ConfigSourceLabel::NotFound => {
+                    format!("✅ (source unknown + ecosystem defaults) ({scopes_count} scopes)")
+                }
+                label => format!("✅ {label} ({scopes_count} scopes)"),
+            }
         } else {
             "❌ None found".to_string()
         };
@@ -1100,46 +1080,15 @@ impl TwiddleCommand {
             .collect()
     }
 
-    /// Loads commit guidelines for check (mirrors `CheckCommand::load_guidelines`).
+    /// Loads commit guidelines for check via the standard resolution chain.
     fn load_check_guidelines(&self) -> Result<Option<String>> {
-        use std::fs;
-
-        let context_dir = resolve_context_dir(self.context_dir.as_deref());
-
-        // Try local override first
-        let local_path = context_dir.join("local").join("commit-guidelines.md");
-        if local_path.exists() {
-            let content = fs::read_to_string(&local_path)
-                .with_context(|| format!("Failed to read guidelines: {}", local_path.display()))?;
-            return Ok(Some(content));
-        }
-
-        // Try project-level guidelines
-        let project_path = context_dir.join("commit-guidelines.md");
-        if project_path.exists() {
-            let content = fs::read_to_string(&project_path).with_context(|| {
-                format!("Failed to read guidelines: {}", project_path.display())
-            })?;
-            return Ok(Some(content));
-        }
-
-        // Try global guidelines
-        if let Some(home) = dirs::home_dir() {
-            let home_path = home.join(".omni-dev").join("commit-guidelines.md");
-            if home_path.exists() {
-                let content = fs::read_to_string(&home_path).with_context(|| {
-                    format!("Failed to read guidelines: {}", home_path.display())
-                })?;
-                return Ok(Some(content));
-            }
-        }
-
-        Ok(None)
+        let context_dir = crate::claude::context::resolve_context_dir(self.context_dir.as_deref());
+        crate::claude::context::load_config_content(&context_dir, "commit-guidelines.md")
     }
 
     /// Loads valid scopes for check with ecosystem defaults.
     fn load_check_scopes(&self) -> Vec<crate::data::context::ScopeDefinition> {
-        let context_dir = resolve_context_dir(self.context_dir.as_deref());
+        let context_dir = crate::claude::context::resolve_context_dir(self.context_dir.as_deref());
         crate::claude::context::load_project_scopes(&context_dir, &std::path::PathBuf::from("."))
     }
 
@@ -1149,27 +1098,17 @@ impl TwiddleCommand {
         guidelines: &Option<String>,
         valid_scopes: &[crate::data::context::ScopeDefinition],
     ) {
-        let context_dir = resolve_context_dir(self.context_dir.as_deref());
+        use crate::claude::context::{config_source_label, ConfigSourceLabel};
+
+        let context_dir = crate::claude::context::resolve_context_dir(self.context_dir.as_deref());
 
         println!("📋 Project guidance files status:");
 
         // Check commit guidelines
-        let guidelines_found = guidelines.is_some();
-        let guidelines_source = if guidelines_found {
-            let local_path = context_dir.join("local").join("commit-guidelines.md");
-            let project_path = context_dir.join("commit-guidelines.md");
-            let home_path = dirs::home_dir()
-                .map(|h| h.join(".omni-dev").join("commit-guidelines.md"))
-                .unwrap_or_default();
-
-            if local_path.exists() {
-                format!("✅ Local override: {}", local_path.display())
-            } else if project_path.exists() {
-                format!("✅ Project: {}", project_path.display())
-            } else if home_path.exists() {
-                format!("✅ Global: {}", home_path.display())
-            } else {
-                "✅ (source unknown)".to_string()
+        let guidelines_source = if guidelines.is_some() {
+            match config_source_label(&context_dir, "commit-guidelines.md") {
+                ConfigSourceLabel::NotFound => "✅ (source unknown)".to_string(),
+                label => format!("✅ {label}"),
             }
         } else {
             "⚪ Using defaults".to_string()
@@ -1179,22 +1118,12 @@ impl TwiddleCommand {
         // Check scopes
         let scopes_count = valid_scopes.len();
         let scopes_source = if scopes_count > 0 {
-            let local_path = context_dir.join("local").join("scopes.yaml");
-            let project_path = context_dir.join("scopes.yaml");
-            let home_path = dirs::home_dir()
-                .map(|h| h.join(".omni-dev").join("scopes.yaml"))
-                .unwrap_or_default();
-
-            let source = if local_path.exists() {
-                format!("Local override: {}", local_path.display())
-            } else if project_path.exists() {
-                format!("Project: {}", project_path.display())
-            } else if home_path.exists() {
-                format!("Global: {}", home_path.display())
-            } else {
-                "(source unknown)".to_string()
-            };
-            format!("✅ {source} ({scopes_count} scopes)")
+            match config_source_label(&context_dir, "scopes.yaml") {
+                ConfigSourceLabel::NotFound => {
+                    format!("✅ (source unknown) ({scopes_count} scopes)")
+                }
+                label => format!("✅ {label} ({scopes_count} scopes)"),
+            }
         } else {
             "⚪ None found (any scope accepted)".to_string()
         };
@@ -1459,14 +1388,6 @@ fn format_scope_list(scopes: &[crate::data::context::ScopeDefinition]) -> String
         .join(", ")
 }
 
-/// Resolves the context directory, falling back to `.omni-dev` if not overridden.
-fn resolve_context_dir(override_dir: Option<&std::path::Path>) -> std::path::PathBuf {
-    override_dir.map_or_else(
-        || std::path::PathBuf::from(".omni-dev"),
-        std::path::Path::to_path_buf,
-    )
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1578,14 +1499,14 @@ mod tests {
 
     #[test]
     fn context_dir_default() {
-        let result = resolve_context_dir(None);
+        let result = crate::claude::context::resolve_context_dir(None);
         assert_eq!(result, std::path::PathBuf::from(".omni-dev"));
     }
 
     #[test]
     fn context_dir_override() {
         let custom = std::path::PathBuf::from("custom-dir");
-        let result = resolve_context_dir(Some(&custom));
+        let result = crate::claude::context::resolve_context_dir(Some(&custom));
         assert_eq!(result, custom);
     }
 }
