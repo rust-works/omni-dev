@@ -67,8 +67,14 @@ pub struct TwiddleCommand {
     pub no_ai: bool,
 
     /// Ignores existing commit messages and generates fresh ones based solely on diffs.
-    #[arg(long)]
+    /// This is the default behavior.
+    #[arg(long, conflicts_with = "refine")]
     pub fresh: bool,
+
+    /// Uses existing commit messages as a starting point for AI refinement
+    /// instead of generating fresh messages from scratch.
+    #[arg(long, conflicts_with = "fresh")]
+    pub refine: bool,
 
     /// Runs commit message validation after applying amendments.
     #[arg(long)]
@@ -76,6 +82,12 @@ pub struct TwiddleCommand {
 }
 
 impl TwiddleCommand {
+    /// Returns true when existing messages should be hidden from the AI.
+    /// Fresh is the default; `--refine` overrides it.
+    fn is_fresh(&self) -> bool {
+        !self.refine
+    }
+
     /// Executes the twiddle command with contextual intelligence.
     pub async fn execute(self) -> Result<()> {
         // If --no-ai flag is set, skip AI processing and output YAML directly
@@ -148,8 +160,8 @@ impl TwiddleCommand {
         self.show_model_info_from_client(&claude_client)?;
 
         // 6. Generate amendments via Claude API with context
-        if self.fresh {
-            println!("🔄 Fresh mode: ignoring existing commit messages...");
+        if self.refine {
+            println!("🔄 Refine mode: using existing commit messages as starting point...");
         }
         if use_contextual && context.is_some() {
             println!("🤖 Analyzing commits with enhanced contextual intelligence...");
@@ -159,11 +171,11 @@ impl TwiddleCommand {
 
         let amendments = if let Some(ctx) = context {
             claude_client
-                .generate_contextual_amendments_with_options(&full_repo_view, &ctx, self.fresh)
+                .generate_contextual_amendments_with_options(&full_repo_view, &ctx, self.is_fresh())
                 .await?
         } else {
             claude_client
-                .generate_amendments_with_options(&full_repo_view, self.fresh)
+                .generate_amendments_with_options(&full_repo_view, self.is_fresh())
                 .await?
         };
 
@@ -233,8 +245,8 @@ impl TwiddleCommand {
         // Show model information
         self.show_model_info_from_client(&claude_client)?;
 
-        if self.fresh {
-            println!("🔄 Fresh mode: ignoring existing commit messages...");
+        if self.refine {
+            println!("🔄 Refine mode: using existing commit messages as starting point...");
         }
 
         let total_commits = full_repo_view.commits.len();
@@ -293,7 +305,7 @@ impl TwiddleCommand {
         let repo_ref = &full_repo_view;
         let client_ref = &claude_client;
         let context_ref = &context;
-        let fresh = self.fresh;
+        let fresh = self.is_fresh();
 
         let futs: Vec<_> = batch_plan
             .batches
@@ -1519,5 +1531,37 @@ mod tests {
         let custom = std::path::PathBuf::from("custom-dir");
         let result = crate::claude::context::resolve_context_dir(Some(&custom));
         assert_eq!(result, custom);
+    }
+
+    // --- is_fresh ---
+
+    fn parse_twiddle(args: &[&str]) -> TwiddleCommand {
+        let mut full_args = vec!["twiddle"];
+        full_args.extend_from_slice(args);
+        TwiddleCommand::try_parse_from(full_args).unwrap()
+    }
+
+    #[test]
+    fn default_is_fresh() {
+        let cmd = parse_twiddle(&[]);
+        assert!(cmd.is_fresh(), "default should be fresh mode");
+    }
+
+    #[test]
+    fn refine_disables_fresh() {
+        let cmd = parse_twiddle(&["--refine"]);
+        assert!(!cmd.is_fresh(), "--refine should disable fresh mode");
+    }
+
+    #[test]
+    fn explicit_fresh_is_fresh() {
+        let cmd = parse_twiddle(&["--fresh"]);
+        assert!(cmd.is_fresh(), "--fresh should be fresh mode");
+    }
+
+    #[test]
+    fn fresh_and_refine_conflict() {
+        let result = TwiddleCommand::try_parse_from(["twiddle", "--fresh", "--refine"]);
+        assert!(result.is_err(), "--fresh and --refine should conflict");
     }
 }

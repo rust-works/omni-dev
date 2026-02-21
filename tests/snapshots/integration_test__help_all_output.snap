@@ -375,7 +375,9 @@ Options:
       --no-ai
           Skips AI processing and only outputs repository YAML
       --fresh
-          Ignores existing commit messages and generates fresh ones based solely on diffs
+          Ignores existing commit messages and generates fresh ones based solely on diffs. This is the default behavior
+      --refine
+          Uses existing commit messages as a starting point for AI refinement instead of generating fresh messages from scratch
       --check
           Runs commit message validation after applying amendments
   -h, --help
