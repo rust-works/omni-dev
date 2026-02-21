@@ -13,12 +13,33 @@ use crate::data::context::{
     ScopeRequirements,
 };
 
-/// Resolves configuration file path with local override support and home fallback.
+/// Returns the XDG-compliant config directory for omni-dev.
+///
+/// Uses `$XDG_CONFIG_HOME/omni-dev/` if the variable is set, otherwise
+/// defaults to `$HOME/.config/omni-dev/` per the XDG Base Directory
+/// Specification. Returns `None` if neither can be determined.
+///
+/// Uses `std::env::var` directly rather than `dirs::config_dir()`, which
+/// returns `~/Library/Application Support/` on macOS — not the expected
+/// location for a CLI tool.
+fn xdg_config_dir() -> Option<PathBuf> {
+    if let Ok(xdg_home) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg_home.is_empty() {
+            return Some(PathBuf::from(xdg_home).join("omni-dev"));
+        }
+    }
+
+    // Default: $HOME/.config/omni-dev/
+    dirs::home_dir().map(|home| home.join(".config").join("omni-dev"))
+}
+
+/// Resolves configuration file path with local override support and global fallback.
 ///
 /// Priority:
-/// 1. {dir}/local/{filename} (local override)
-/// 2. {dir}/{filename} (shared project config)
-/// 3. $HOME/.omni-dev/{filename} (global user config)
+/// 1. `{dir}/local/{filename}` (local override)
+/// 2. `{dir}/{filename}` (shared project config)
+/// 3. `$XDG_CONFIG_HOME/omni-dev/{filename}` (XDG global config)
+/// 4. `$HOME/.omni-dev/{filename}` (legacy global fallback)
 pub fn resolve_config_file(dir: &Path, filename: &str) -> PathBuf {
     let local_path = dir.join("local").join(filename);
     if local_path.exists() {
@@ -30,7 +51,15 @@ pub fn resolve_config_file(dir: &Path, filename: &str) -> PathBuf {
         return project_path;
     }
 
-    // Check home directory fallback
+    // Check XDG config directory
+    if let Some(xdg_dir) = xdg_config_dir() {
+        let xdg_path = xdg_dir.join(filename);
+        if xdg_path.exists() {
+            return xdg_path;
+        }
+    }
+
+    // Check legacy home directory fallback
     if let Ok(home_dir) = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("No home directory")) {
         let home_path = home_dir.join(".omni-dev").join(filename);
         if home_path.exists() {
@@ -84,6 +113,8 @@ pub enum ConfigSourceLabel {
     LocalOverride(PathBuf),
     /// Found in `{dir}/{filename}`.
     Project(PathBuf),
+    /// Found in `$XDG_CONFIG_HOME/omni-dev/{filename}`.
+    Xdg(PathBuf),
     /// Found in `$HOME/.omni-dev/{filename}`.
     Global(PathBuf),
     /// Not found at any tier.
@@ -95,6 +126,7 @@ impl fmt::Display for ConfigSourceLabel {
         match self {
             Self::LocalOverride(p) => write!(f, "Local override: {}", p.display()),
             Self::Project(p) => write!(f, "Project: {}", p.display()),
+            Self::Xdg(p) => write!(f, "Global (XDG): {}", p.display()),
             Self::Global(p) => write!(f, "Global: {}", p.display()),
             Self::NotFound => write!(f, "(not found)"),
         }
@@ -114,6 +146,13 @@ pub fn config_source_label(dir: &Path, filename: &str) -> ConfigSourceLabel {
     let project_path = dir.join(filename);
     if project_path.exists() {
         return ConfigSourceLabel::Project(project_path);
+    }
+
+    if let Some(xdg_dir) = xdg_config_dir() {
+        let xdg_path = xdg_dir.join(filename);
+        if xdg_path.exists() {
+            return ConfigSourceLabel::Xdg(xdg_path);
+        }
     }
 
     if let Some(home_dir) = dirs::home_dir() {
@@ -1067,8 +1106,163 @@ scopes:
     }
 
     #[test]
+    fn display_xdg() {
+        let label =
+            ConfigSourceLabel::Xdg(PathBuf::from("/home/user/.config/omni-dev/scopes.yaml"));
+        assert_eq!(
+            label.to_string(),
+            "Global (XDG): /home/user/.config/omni-dev/scopes.yaml"
+        );
+    }
+
+    #[test]
     fn display_not_found() {
         let label = ConfigSourceLabel::NotFound;
         assert_eq!(label.to_string(), "(not found)");
+    }
+
+    // ── xdg_config_dir ─────────────────────────────────────────────────
+
+    #[test]
+    fn xdg_config_dir_uses_env_var() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", "/tmp/xdg-test");
+        let result = xdg_config_dir();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        assert_eq!(result, Some(PathBuf::from("/tmp/xdg-test/omni-dev")));
+    }
+
+    #[test]
+    fn xdg_config_dir_ignores_empty_env_var() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", "");
+        let result = xdg_config_dir();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        // Falls back to $HOME/.config/omni-dev
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(result, Some(home.join(".config").join("omni-dev")));
+        }
+    }
+
+    #[test]
+    fn xdg_config_dir_defaults_to_home_config() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let result = xdg_config_dir();
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(result, Some(home.join(".config").join("omni-dev")));
+        }
+    }
+
+    // ── resolve_config_file XDG integration ─────────────────────────────
+
+    #[test]
+    fn resolve_config_file_finds_xdg() -> anyhow::Result<()> {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
+        let xdg_dir = {
+            std::fs::create_dir_all("tmp")?;
+            TempDir::new_in("tmp")?
+        };
+        let xdg_omni = xdg_dir.path().join("omni-dev");
+        std::fs::create_dir_all(&xdg_omni)?;
+        std::fs::write(xdg_omni.join("commit-guidelines.md"), "xdg content")?;
+
+        std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
+        let project_dir = {
+            std::fs::create_dir_all("tmp")?;
+            TempDir::new_in("tmp")?
+        };
+        let resolved = resolve_config_file(project_dir.path(), "commit-guidelines.md");
+        std::env::remove_var("XDG_CONFIG_HOME");
+
+        assert_eq!(resolved, xdg_omni.join("commit-guidelines.md"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_file_xdg_beats_home() -> anyhow::Result<()> {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
+        // Set up XDG config
+        let xdg_dir = {
+            std::fs::create_dir_all("tmp")?;
+            TempDir::new_in("tmp")?
+        };
+        let xdg_omni = xdg_dir.path().join("omni-dev");
+        std::fs::create_dir_all(&xdg_omni)?;
+        std::fs::write(xdg_omni.join("scopes.yaml"), "xdg")?;
+
+        std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
+
+        // Project dir with no local config
+        let project_dir = {
+            std::fs::create_dir_all("tmp")?;
+            TempDir::new_in("tmp")?
+        };
+
+        let resolved = resolve_config_file(project_dir.path(), "scopes.yaml");
+        std::env::remove_var("XDG_CONFIG_HOME");
+
+        // XDG path should win (home path only wins if XDG doesn't have the file)
+        assert_eq!(resolved, xdg_omni.join("scopes.yaml"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_file_project_beats_xdg() -> anyhow::Result<()> {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
+        // Set up XDG config
+        let xdg_dir = {
+            std::fs::create_dir_all("tmp")?;
+            TempDir::new_in("tmp")?
+        };
+        let xdg_omni = xdg_dir.path().join("omni-dev");
+        std::fs::create_dir_all(&xdg_omni)?;
+        std::fs::write(xdg_omni.join("scopes.yaml"), "xdg")?;
+
+        std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
+
+        // Project dir with project-level config
+        let project_dir = {
+            std::fs::create_dir_all("tmp")?;
+            TempDir::new_in("tmp")?
+        };
+        std::fs::write(project_dir.path().join("scopes.yaml"), "project")?;
+
+        let resolved = resolve_config_file(project_dir.path(), "scopes.yaml");
+        std::env::remove_var("XDG_CONFIG_HOME");
+
+        // Project path should win over XDG
+        assert_eq!(resolved, project_dir.path().join("scopes.yaml"));
+        Ok(())
+    }
+
+    // ── config_source_label XDG integration ────────────────────────────
+
+    #[test]
+    fn source_label_xdg() -> anyhow::Result<()> {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
+        let xdg_dir = {
+            std::fs::create_dir_all("tmp")?;
+            TempDir::new_in("tmp")?
+        };
+        let xdg_omni = xdg_dir.path().join("omni-dev");
+        std::fs::create_dir_all(&xdg_omni)?;
+        std::fs::write(xdg_omni.join("scopes.yaml"), "xdg")?;
+
+        std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
+
+        let project_dir = {
+            std::fs::create_dir_all("tmp")?;
+            TempDir::new_in("tmp")?
+        };
+        let label = config_source_label(project_dir.path(), "scopes.yaml");
+        std::env::remove_var("XDG_CONFIG_HOME");
+
+        assert_eq!(label, ConfigSourceLabel::Xdg(xdg_omni.join("scopes.yaml")));
+        Ok(())
     }
 }
