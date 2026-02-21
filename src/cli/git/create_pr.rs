@@ -32,6 +32,10 @@ pub struct CreatePrCommand {
     /// Creates PR as draft (overrides default).
     #[arg(long, conflicts_with = "ready")]
     pub draft: bool,
+
+    /// Path to custom context directory (defaults to .omni-dev/).
+    #[arg(long)]
+    pub context_dir: Option<std::path::PathBuf>,
 }
 
 /// PR action choices.
@@ -99,7 +103,7 @@ impl CreatePrCommand {
         // 3. Show guidance files status early (before AI processing)
         use crate::claude::context::ProjectDiscovery;
         let repo_root = std::path::PathBuf::from(".");
-        let context_dir = std::path::PathBuf::from(".omni-dev");
+        let context_dir = crate::claude::context::resolve_context_dir(self.context_dir.as_deref());
         let discovery = ProjectDiscovery::new(repo_root, context_dir);
         let project_context = discovery.discover().unwrap_or_default();
         self.show_guidance_files_status(&project_context)?;
@@ -510,7 +514,7 @@ impl CreatePrCommand {
         let mut context = CommitContext::new();
 
         // 1. Discover project context
-        let context_dir = std::path::PathBuf::from(".omni-dev");
+        let context_dir = crate::claude::context::resolve_context_dir(self.context_dir.as_deref());
 
         // ProjectDiscovery takes repo root and context directory
         let repo_root = std::path::PathBuf::from(".");
@@ -548,7 +552,8 @@ impl CreatePrCommand {
             config_source_label, resolve_context_dir_with_source, ConfigSourceLabel,
         };
 
-        let (context_dir, dir_source) = resolve_context_dir_with_source(None);
+        let (context_dir, dir_source) =
+            resolve_context_dir_with_source(self.context_dir.as_deref());
 
         println!("📋 Project guidance files status:");
         println!("   📂 Config dir: {} ({dir_source})", context_dir.display());
