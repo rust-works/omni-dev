@@ -3,6 +3,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use crate::claude::model_config::MODELS_YAML;
+
 /// Configuration operations.
 #[derive(Parser)]
 pub struct ConfigCommand {
@@ -58,9 +60,7 @@ impl ModelsCommand {
 impl ShowCommand {
     /// Executes the show command.
     pub fn execute(self) -> Result<()> {
-        // Print the embedded models.yaml file
-        let yaml_content = include_str!("../templates/models.yaml");
-        println!("{yaml_content}");
+        println!("{MODELS_YAML}");
         Ok(())
     }
 }
