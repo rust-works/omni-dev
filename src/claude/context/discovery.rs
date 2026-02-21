@@ -44,9 +44,22 @@ pub fn resolve_config_file(dir: &Path, filename: &str) -> PathBuf {
 
 /// Resolves the context directory from an optional CLI override.
 ///
-/// Returns the override path if provided, otherwise defaults to `.omni-dev`.
+/// Priority:
+/// 1. `override_dir` (from `--context-dir` CLI flag)
+/// 2. `OMNI_DEV_CONFIG_DIR` environment variable
+/// 3. `.omni-dev` default
 pub fn resolve_context_dir(override_dir: Option<&Path>) -> PathBuf {
-    override_dir.map_or_else(|| PathBuf::from(".omni-dev"), Path::to_path_buf)
+    if let Some(dir) = override_dir {
+        return dir.to_path_buf();
+    }
+
+    if let Ok(env_dir) = std::env::var("OMNI_DEV_CONFIG_DIR") {
+        if !env_dir.is_empty() {
+            return PathBuf::from(env_dir);
+        }
+    }
+
+    PathBuf::from(".omni-dev")
 }
 
 /// Loads a config file's content via the standard resolution chain.
@@ -883,17 +896,51 @@ scopes:
 
     // ── resolve_context_dir ────────────────────────────────────────────
 
+    // Use a mutex to serialize tests that modify OMNI_DEV_CONFIG_DIR.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn context_dir_defaults_to_omni_dev() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        std::env::remove_var("OMNI_DEV_CONFIG_DIR");
         let result = resolve_context_dir(None);
         assert_eq!(result, PathBuf::from(".omni-dev"));
     }
 
     #[test]
     fn context_dir_uses_override() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let custom = PathBuf::from("custom-config");
         let result = resolve_context_dir(Some(&custom));
         assert_eq!(result, custom);
+    }
+
+    #[test]
+    fn context_dir_env_var() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("OMNI_DEV_CONFIG_DIR", "/tmp/my-config");
+        let result = resolve_context_dir(None);
+        std::env::remove_var("OMNI_DEV_CONFIG_DIR");
+        assert_eq!(result, PathBuf::from("/tmp/my-config"));
+    }
+
+    #[test]
+    fn context_dir_cli_flag_beats_env_var() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("OMNI_DEV_CONFIG_DIR", "/tmp/env-config");
+        let cli = PathBuf::from("cli-config");
+        let result = resolve_context_dir(Some(&cli));
+        std::env::remove_var("OMNI_DEV_CONFIG_DIR");
+        assert_eq!(result, cli);
+    }
+
+    #[test]
+    fn context_dir_ignores_empty_env_var() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("OMNI_DEV_CONFIG_DIR", "");
+        let result = resolve_context_dir(None);
+        std::env::remove_var("OMNI_DEV_CONFIG_DIR");
+        assert_eq!(result, PathBuf::from(".omni-dev"));
     }
 
     // ── load_config_content ────────────────────────────────────────────
