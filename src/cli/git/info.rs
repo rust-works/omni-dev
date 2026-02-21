@@ -21,6 +21,9 @@ impl InfoCommand {
         use crate::git::{GitRepository, RemoteInfo};
         use crate::utils::ai_scratch;
 
+        // Preflight check: validate git repository before any processing
+        crate::utils::check_git_repository()?;
+
         // Open git repository
         let repo = GitRepository::open()
             .context("Failed to open git repository. Make sure you're in a git repository.")?;
