@@ -94,32 +94,64 @@ fn walk_up_find_config_dir(start: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Resolves the context directory from an optional CLI override.
+/// Identifies how the context directory was resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigDirSource {
+    /// Explicitly set via `--context-dir` CLI flag.
+    CliFlag,
+    /// Set via `OMNI_DEV_CONFIG_DIR` environment variable.
+    EnvVar,
+    /// Found via walk-up discovery from CWD.
+    WalkUp,
+    /// Default `.omni-dev` (no explicit override, no walk-up match).
+    Default,
+}
+
+impl fmt::Display for ConfigDirSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CliFlag => write!(f, "--context-dir"),
+            Self::EnvVar => write!(f, "OMNI_DEV_CONFIG_DIR"),
+            Self::WalkUp => write!(f, "walk-up"),
+            Self::Default => write!(f, "default"),
+        }
+    }
+}
+
+/// Resolves the context directory and reports how it was selected.
 ///
 /// Priority:
 /// 1. `override_dir` (from `--context-dir` CLI flag; disables walk-up)
 /// 2. `OMNI_DEV_CONFIG_DIR` environment variable (disables walk-up)
 /// 3. Walk-up: nearest `.omni-dev/` from CWD to repo root
 /// 4. `.omni-dev` default
-pub fn resolve_context_dir(override_dir: Option<&Path>) -> PathBuf {
+pub fn resolve_context_dir_with_source(override_dir: Option<&Path>) -> (PathBuf, ConfigDirSource) {
     if let Some(dir) = override_dir {
-        return dir.to_path_buf();
+        return (dir.to_path_buf(), ConfigDirSource::CliFlag);
     }
 
     if let Ok(env_dir) = std::env::var("OMNI_DEV_CONFIG_DIR") {
         if !env_dir.is_empty() {
-            return PathBuf::from(env_dir);
+            return (PathBuf::from(env_dir), ConfigDirSource::EnvVar);
         }
     }
 
     // Walk-up discovery: search from CWD upward to repo root
     if let Ok(cwd) = std::env::current_dir() {
         if let Some(config_dir) = walk_up_find_config_dir(&cwd) {
-            return config_dir;
+            return (config_dir, ConfigDirSource::WalkUp);
         }
     }
 
-    PathBuf::from(".omni-dev")
+    (PathBuf::from(".omni-dev"), ConfigDirSource::Default)
+}
+
+/// Resolves the context directory from an optional CLI override.
+///
+/// Convenience wrapper around [`resolve_context_dir_with_source`] that
+/// discards the source information.
+pub fn resolve_context_dir(override_dir: Option<&Path>) -> PathBuf {
+    resolve_context_dir_with_source(override_dir).0
 }
 
 /// Loads a config file's content via the standard resolution chain.
@@ -1019,6 +1051,76 @@ scopes:
             result.ends_with(".omni-dev"),
             "expected path ending in .omni-dev, got {result:?}"
         );
+    }
+
+    // ── resolve_context_dir_with_source ─────────────────────────────────
+
+    #[test]
+    fn with_source_cli_flag() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let custom = PathBuf::from("custom-config");
+        let (path, source) = resolve_context_dir_with_source(Some(&custom));
+        assert_eq!(path, custom);
+        assert_eq!(source, ConfigDirSource::CliFlag);
+    }
+
+    #[test]
+    fn with_source_env_var() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("OMNI_DEV_CONFIG_DIR", "/tmp/env-config");
+        let (path, source) = resolve_context_dir_with_source(None);
+        std::env::remove_var("OMNI_DEV_CONFIG_DIR");
+        assert_eq!(path, PathBuf::from("/tmp/env-config"));
+        assert_eq!(source, ConfigDirSource::EnvVar);
+    }
+
+    #[test]
+    fn with_source_cli_beats_env() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("OMNI_DEV_CONFIG_DIR", "/tmp/env-config");
+        let custom = PathBuf::from("cli-config");
+        let (path, source) = resolve_context_dir_with_source(Some(&custom));
+        std::env::remove_var("OMNI_DEV_CONFIG_DIR");
+        assert_eq!(path, custom);
+        assert_eq!(source, ConfigDirSource::CliFlag);
+    }
+
+    #[test]
+    fn with_source_walk_up_or_default() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        std::env::remove_var("OMNI_DEV_CONFIG_DIR");
+        let (path, source) = resolve_context_dir_with_source(None);
+        // Inside this repo, walk-up finds .omni-dev; outside, falls back to default
+        assert!(
+            path.ends_with(".omni-dev"),
+            "expected path ending in .omni-dev, got {path:?}"
+        );
+        assert!(
+            source == ConfigDirSource::WalkUp || source == ConfigDirSource::Default,
+            "expected WalkUp or Default, got {source:?}"
+        );
+    }
+
+    // ── ConfigDirSource Display ──────────────────────────────────────────
+
+    #[test]
+    fn display_config_dir_source_cli_flag() {
+        assert_eq!(ConfigDirSource::CliFlag.to_string(), "--context-dir");
+    }
+
+    #[test]
+    fn display_config_dir_source_env_var() {
+        assert_eq!(ConfigDirSource::EnvVar.to_string(), "OMNI_DEV_CONFIG_DIR");
+    }
+
+    #[test]
+    fn display_config_dir_source_walk_up() {
+        assert_eq!(ConfigDirSource::WalkUp.to_string(), "walk-up");
+    }
+
+    #[test]
+    fn display_config_dir_source_default() {
+        assert_eq!(ConfigDirSource::Default.to_string(), "default");
     }
 
     // ── load_config_content ────────────────────────────────────────────
