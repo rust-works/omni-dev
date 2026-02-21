@@ -265,6 +265,14 @@ impl ModelRegistry {
             .collect()
     }
 
+    /// Returns the default model identifier for a provider, as defined in `models.yaml`.
+    pub fn get_default_model(&self, provider: &str) -> Option<&str> {
+        self.config
+            .providers
+            .get(provider)
+            .map(|p| p.default_model.as_str())
+    }
+
     /// Returns the provider configuration.
     pub fn get_provider_config(&self, provider: &str) -> Option<&ProviderConfig> {
         self.config.providers.get(provider)
@@ -376,6 +384,22 @@ mod tests {
         let claude_config = registry.get_provider_config("claude");
         assert!(claude_config.is_some());
         assert_eq!(claude_config.unwrap().name, "Anthropic Claude");
+    }
+
+    #[test]
+    fn default_model_per_provider() {
+        let registry = ModelRegistry::load().unwrap();
+
+        assert_eq!(
+            registry.get_default_model("claude"),
+            Some("claude-sonnet-4-6")
+        );
+        assert_eq!(registry.get_default_model("openai"), Some("gpt-5-mini"));
+        assert_eq!(
+            registry.get_default_model("gemini"),
+            Some("gemini-2.5-flash")
+        );
+        assert_eq!(registry.get_default_model("nonexistent"), None);
     }
 
     #[test]
