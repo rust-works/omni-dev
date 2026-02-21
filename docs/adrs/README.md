@@ -28,3 +28,4 @@ by Michael Nygard.
 | [ADR-0002](adr-0002.md)  | ✅ Accepted | 2026-02-20 | Multi-Provider AI Abstraction via Trait Objects                      |
 | [ADR-0003](adr-0003.md)  | ✅ Accepted | 2026-02-20 | Hybrid Git Integration — git2 for Reads, Shell for Complex Mutations |
 | [ADR-0004](adr-0004.md)  | ✅ Accepted | 2026-02-21 | Embedded Templates via `include_str!`                                |
+| [ADR-0005](adr-0005.md)  | 🟡 Proposed | 2026-02-21 | Hierarchical Configuration Resolution with Walk-Up Discovery         |
