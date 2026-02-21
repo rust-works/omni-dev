@@ -9,6 +9,9 @@ use std::sync::OnceLock;
 use anyhow::Result;
 use serde::Deserialize;
 
+/// Embedded models YAML configuration, loaded at compile time.
+pub(crate) const MODELS_YAML: &str = include_str!("../templates/models.yaml");
+
 /// Beta header that unlocks enhanced model limits.
 #[derive(Debug, Deserialize, Clone)]
 pub struct BetaHeader {
@@ -101,8 +104,7 @@ pub struct ModelRegistry {
 impl ModelRegistry {
     /// Loads the model registry from embedded YAML.
     pub fn load() -> Result<Self> {
-        let yaml_content = include_str!("../templates/models.yaml");
-        let config: ModelConfiguration = serde_yaml::from_str(yaml_content)?;
+        let config: ModelConfiguration = serde_yaml::from_str(MODELS_YAML)?;
 
         // Build lookup maps
         let mut by_identifier = HashMap::new();
