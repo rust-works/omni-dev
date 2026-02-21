@@ -71,12 +71,36 @@ pub fn resolve_config_file(dir: &Path, filename: &str) -> PathBuf {
     project_path
 }
 
+/// Walks up from `start` toward the repository root, looking for `.omni-dev/`.
+///
+/// Returns the first `.omni-dev/` directory found. Stops at the repository
+/// root (identified by a `.git` directory or file). Returns `None` if no
+/// `.omni-dev/` is found within the repository boundary.
+fn walk_up_find_config_dir(start: &Path) -> Option<PathBuf> {
+    let mut current = start.to_path_buf();
+    loop {
+        let candidate = current.join(".omni-dev");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        // Stop at repo root — don't escape the repository
+        if current.join(".git").exists() {
+            break;
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    None
+}
+
 /// Resolves the context directory from an optional CLI override.
 ///
 /// Priority:
-/// 1. `override_dir` (from `--context-dir` CLI flag)
-/// 2. `OMNI_DEV_CONFIG_DIR` environment variable
-/// 3. `.omni-dev` default
+/// 1. `override_dir` (from `--context-dir` CLI flag; disables walk-up)
+/// 2. `OMNI_DEV_CONFIG_DIR` environment variable (disables walk-up)
+/// 3. Walk-up: nearest `.omni-dev/` from CWD to repo root
+/// 4. `.omni-dev` default
 pub fn resolve_context_dir(override_dir: Option<&Path>) -> PathBuf {
     if let Some(dir) = override_dir {
         return dir.to_path_buf();
@@ -85,6 +109,13 @@ pub fn resolve_context_dir(override_dir: Option<&Path>) -> PathBuf {
     if let Ok(env_dir) = std::env::var("OMNI_DEV_CONFIG_DIR") {
         if !env_dir.is_empty() {
             return PathBuf::from(env_dir);
+        }
+    }
+
+    // Walk-up discovery: search from CWD upward to repo root
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(config_dir) = walk_up_find_config_dir(&cwd) {
+            return config_dir;
         }
     }
 
@@ -943,7 +974,11 @@ scopes:
         let _lock = ENV_MUTEX.lock().unwrap();
         std::env::remove_var("OMNI_DEV_CONFIG_DIR");
         let result = resolve_context_dir(None);
-        assert_eq!(result, PathBuf::from(".omni-dev"));
+        // Walk-up may find .omni-dev in the real repo, or fall back to ".omni-dev"
+        assert!(
+            result.ends_with(".omni-dev"),
+            "expected path ending in .omni-dev, got {result:?}"
+        );
     }
 
     #[test]
@@ -979,7 +1014,11 @@ scopes:
         std::env::set_var("OMNI_DEV_CONFIG_DIR", "");
         let result = resolve_context_dir(None);
         std::env::remove_var("OMNI_DEV_CONFIG_DIR");
-        assert_eq!(result, PathBuf::from(".omni-dev"));
+        // Walk-up may find .omni-dev in the real repo, or fall back to ".omni-dev"
+        assert!(
+            result.ends_with(".omni-dev"),
+            "expected path ending in .omni-dev, got {result:?}"
+        );
     }
 
     // ── load_config_content ────────────────────────────────────────────
@@ -1263,6 +1302,133 @@ scopes:
         std::env::remove_var("XDG_CONFIG_HOME");
 
         assert_eq!(label, ConfigSourceLabel::Xdg(xdg_omni.join("scopes.yaml")));
+        Ok(())
+    }
+
+    // ── walk_up_find_config_dir ─────────────────────────────────────────
+
+    /// Creates a mock repo tree with `.git` at the root.
+    /// Returns (root_dir, TempDir handle).
+    fn make_repo_tree() -> anyhow::Result<TempDir> {
+        let dir = {
+            std::fs::create_dir_all("tmp")?;
+            TempDir::new_in("tmp")?
+        };
+        // Create .git marker at root
+        std::fs::create_dir(dir.path().join(".git"))?;
+        Ok(dir)
+    }
+
+    #[test]
+    fn walk_up_finds_omni_dev_in_start_dir() -> anyhow::Result<()> {
+        let repo = make_repo_tree()?;
+        let sub = repo.path().join("packages").join("frontend");
+        std::fs::create_dir_all(&sub)?;
+        std::fs::create_dir(sub.join(".omni-dev"))?;
+
+        let result = walk_up_find_config_dir(&sub);
+        assert_eq!(result, Some(sub.join(".omni-dev")));
+        Ok(())
+    }
+
+    #[test]
+    fn walk_up_finds_omni_dev_in_parent() -> anyhow::Result<()> {
+        let repo = make_repo_tree()?;
+        let pkg = repo.path().join("packages").join("frontend");
+        let src = pkg.join("src");
+        std::fs::create_dir_all(&src)?;
+        std::fs::create_dir(pkg.join(".omni-dev"))?;
+
+        let result = walk_up_find_config_dir(&src);
+        assert_eq!(result, Some(pkg.join(".omni-dev")));
+        Ok(())
+    }
+
+    #[test]
+    fn walk_up_finds_omni_dev_at_repo_root() -> anyhow::Result<()> {
+        let repo = make_repo_tree()?;
+        let deep = repo.path().join("a").join("b").join("c");
+        std::fs::create_dir_all(&deep)?;
+        std::fs::create_dir(repo.path().join(".omni-dev"))?;
+
+        let result = walk_up_find_config_dir(&deep);
+        assert_eq!(result, Some(repo.path().join(".omni-dev")));
+        Ok(())
+    }
+
+    #[test]
+    fn walk_up_nearest_wins() -> anyhow::Result<()> {
+        let repo = make_repo_tree()?;
+        let pkg = repo.path().join("packages").join("frontend");
+        let src = pkg.join("src");
+        std::fs::create_dir_all(&src)?;
+        // Both root and package have .omni-dev
+        std::fs::create_dir(repo.path().join(".omni-dev"))?;
+        std::fs::create_dir(pkg.join(".omni-dev"))?;
+
+        let result = walk_up_find_config_dir(&src);
+        // Nearest (packages/frontend/.omni-dev) should win
+        assert_eq!(result, Some(pkg.join(".omni-dev")));
+        Ok(())
+    }
+
+    #[test]
+    fn walk_up_stops_at_git_boundary() -> anyhow::Result<()> {
+        let dir = {
+            std::fs::create_dir_all("tmp")?;
+            TempDir::new_in("tmp")?
+        };
+        // Parent has .omni-dev but is outside the repo
+        std::fs::create_dir(dir.path().join(".omni-dev"))?;
+        // Repo root is a subdirectory
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root)?;
+        std::fs::create_dir(repo_root.join(".git"))?;
+        let sub = repo_root.join("sub");
+        std::fs::create_dir(&sub)?;
+
+        let result = walk_up_find_config_dir(&sub);
+        // Should NOT find the .omni-dev above .git
+        assert_eq!(result, None);
+        Ok(())
+    }
+
+    #[test]
+    fn walk_up_returns_none_when_no_omni_dev() -> anyhow::Result<()> {
+        let repo = make_repo_tree()?;
+        let sub = repo.path().join("src");
+        std::fs::create_dir(&sub)?;
+
+        let result = walk_up_find_config_dir(&sub);
+        assert_eq!(result, None);
+        Ok(())
+    }
+
+    #[test]
+    fn walk_up_handles_git_worktree_file() -> anyhow::Result<()> {
+        let dir = {
+            std::fs::create_dir_all("tmp")?;
+            TempDir::new_in("tmp")?
+        };
+        // .git as a file (worktree)
+        std::fs::write(dir.path().join(".git"), "gitdir: /some/path")?;
+        std::fs::create_dir(dir.path().join(".omni-dev"))?;
+        let sub = dir.path().join("src");
+        std::fs::create_dir(&sub)?;
+
+        let result = walk_up_find_config_dir(&sub);
+        assert_eq!(result, Some(dir.path().join(".omni-dev")));
+        Ok(())
+    }
+
+    #[test]
+    fn walk_up_no_omni_dev_in_repo_returns_none() -> anyhow::Result<()> {
+        // Repo with .git but no .omni-dev anywhere
+        let repo = make_repo_tree()?;
+        let sub = repo.path().join("a").join("b");
+        std::fs::create_dir_all(&sub)?;
+        let result = walk_up_find_config_dir(&sub);
+        assert_eq!(result, None);
         Ok(())
     }
 }
