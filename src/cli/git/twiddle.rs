@@ -1500,7 +1500,11 @@ mod tests {
     #[test]
     fn context_dir_default() {
         let result = crate::claude::context::resolve_context_dir(None);
-        assert_eq!(result, std::path::PathBuf::from(".omni-dev"));
+        // Walk-up may find .omni-dev in the real repo, or fall back to ".omni-dev"
+        assert!(
+            result.ends_with(".omni-dev"),
+            "expected path ending in .omni-dev, got {result:?}"
+        );
     }
 
     #[test]
