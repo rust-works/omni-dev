@@ -21,6 +21,9 @@ impl ViewCommand {
         use crate::git::{GitRepository, RemoteInfo};
         use crate::utils::ai_scratch;
 
+        // Preflight check: validate git repository before any processing
+        crate::utils::check_git_repository()?;
+
         let commit_range = self.commit_range.as_deref().unwrap_or("HEAD");
 
         // Open git repository
