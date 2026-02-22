@@ -1012,4 +1012,135 @@ mod tests {
             }
         }
     }
+
+    // ── ConfigurableMockAiClient tests ──────────────────────────────
+
+    fn make_configurable_client(responses: Vec<Result<String>>) -> ClaudeClient {
+        ClaudeClient::new(Box::new(
+            crate::claude::test_utils::ConfigurableMockAiClient::new(responses),
+        ))
+    }
+
+    fn make_test_repo_view(dir: &tempfile::TempDir) -> crate::data::RepositoryView {
+        use crate::data::{AiInfo, FieldExplanation, WorkingDirectoryInfo};
+        use crate::git::commit::FileChanges;
+        use crate::git::{CommitAnalysis, CommitInfo};
+
+        let diff_path = dir.path().join("0.diff");
+        std::fs::write(&diff_path, "+added line\n").unwrap();
+
+        crate::data::RepositoryView {
+            versions: None,
+            explanation: FieldExplanation::default(),
+            working_directory: WorkingDirectoryInfo {
+                clean: true,
+                untracked_changes: Vec::new(),
+            },
+            remotes: Vec::new(),
+            ai: AiInfo {
+                scratch: String::new(),
+            },
+            branch_info: None,
+            pr_template: None,
+            pr_template_location: None,
+            branch_prs: None,
+            commits: vec![CommitInfo {
+                hash: format!("{:0>40}", 0),
+                author: "Test <test@test.com>".to_string(),
+                date: chrono::Utc::now().fixed_offset(),
+                original_message: "feat(test): add something".to_string(),
+                in_main_branches: Vec::new(),
+                analysis: CommitAnalysis {
+                    detected_type: "feat".to_string(),
+                    detected_scope: "test".to_string(),
+                    proposed_message: "feat(test): add something".to_string(),
+                    file_changes: FileChanges {
+                        total_files: 1,
+                        files_added: 1,
+                        files_deleted: 0,
+                        file_list: Vec::new(),
+                    },
+                    diff_summary: "file.rs | 1 +".to_string(),
+                    diff_file: diff_path.to_string_lossy().to_string(),
+                },
+            }],
+        }
+    }
+
+    fn valid_check_yaml() -> String {
+        format!(
+            "checks:\n  - commit: \"{hash}\"\n    passes: true\n    issues: []\n",
+            hash = format!("{:0>40}", 0)
+        )
+    }
+
+    #[tokio::test]
+    async fn send_message_propagates_ai_error() {
+        let client = make_configurable_client(vec![Err(anyhow::anyhow!("mock error"))]);
+        let result = client.send_message("sys", "usr").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("mock error"));
+    }
+
+    #[tokio::test]
+    async fn check_commits_succeeds_after_request_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_test_repo_view(&dir);
+        // First attempt: request error; retries return valid response.
+        let client = make_configurable_client(vec![
+            Err(anyhow::anyhow!("rate limit")),
+            Ok(valid_check_yaml()),
+            Ok(valid_check_yaml()),
+        ]);
+        let result = client
+            .check_commits_with_scopes(&repo_view, None, &[], false)
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn check_commits_succeeds_after_parse_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_test_repo_view(&dir);
+        // First attempt: AI returns malformed YAML; retry succeeds.
+        let client = make_configurable_client(vec![
+            Ok("not: valid: yaml: [[".to_string()),
+            Ok(valid_check_yaml()),
+            Ok(valid_check_yaml()),
+        ]);
+        let result = client
+            .check_commits_with_scopes(&repo_view, None, &[], false)
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn check_commits_fails_after_all_retries_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_test_repo_view(&dir);
+        let client = make_configurable_client(vec![
+            Err(anyhow::anyhow!("first failure")),
+            Err(anyhow::anyhow!("second failure")),
+            Err(anyhow::anyhow!("final failure")),
+        ]);
+        let result = client
+            .check_commits_with_scopes(&repo_view, None, &[], false)
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn check_commits_fails_when_all_parses_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_test_repo_view(&dir);
+        let client = make_configurable_client(vec![
+            Ok("bad yaml [[".to_string()),
+            Ok("bad yaml [[".to_string()),
+            Ok("bad yaml [[".to_string()),
+        ]);
+        let result = client
+            .check_commits_with_scopes(&repo_view, None, &[], false)
+            .await;
+        assert!(result.is_err());
+    }
 }
