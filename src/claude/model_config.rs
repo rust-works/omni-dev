@@ -179,28 +179,13 @@ impl ModelRegistry {
         }
     }
 
-    /// Finds a model by fuzzy matching for various identifier formats.
+    /// Finds a model by normalizing the identifier and performing an exact lookup.
+    ///
+    /// Handles Bedrock-style (`us.anthropic.claude-3-7-sonnet-20250219-v1:0`),
+    /// AWS-style (`anthropic.claude-3-haiku-20240307-v1:0`), and standard identifiers.
     fn find_model_by_fuzzy_match(&self, api_identifier: &str) -> Option<&ModelSpec> {
-        // Extract core model identifier from various formats:
-        // - Bedrock: "us.anthropic.claude-3-7-sonnet-20250219-v1:0" -> "claude-3-7-sonnet-20250219"
-        // - AWS: "anthropic.claude-3-haiku-20240307-v1:0" -> "claude-3-haiku-20240307"
-        // - Standard: "claude-3-opus-20240229" -> "claude-3-opus-20240229"
-
         let core_identifier = self.extract_core_model_identifier(api_identifier);
-
-        // Try to find exact match with core identifier
-        if let Some(spec) = self.by_identifier.get(&core_identifier) {
-            return Some(spec);
-        }
-
-        // Try partial matching - look for models that contain the core parts
-        for (stored_id, spec) in &self.by_identifier {
-            if self.models_match_fuzzy(&core_identifier, stored_id) {
-                return Some(spec);
-            }
-        }
-
-        None
+        self.by_identifier.get(&core_identifier)
     }
 
     /// Extracts the core model identifier from various formats.
@@ -228,13 +213,6 @@ impl ModelRegistry {
         }
 
         identifier
-    }
-
-    /// Checks if two model identifiers represent the same model.
-    fn models_match_fuzzy(&self, input_id: &str, stored_id: &str) -> bool {
-        // For now, just check if they're the same after extraction
-        // This could be enhanced with more sophisticated matching
-        input_id == stored_id
     }
 
     /// Checks if a model is legacy.
