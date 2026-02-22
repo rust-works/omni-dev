@@ -514,72 +514,16 @@ impl CheckCommand {
 
         // Offer interactive retry for commits that failed
         if !failed_indices.is_empty() && !self.quiet {
-            use std::io::Write as _;
-            println!("\n⚠️  {} commit(s) failed to check:", failed_indices.len());
-            for &idx in &failed_indices {
-                let commit = &full_repo_view.commits[idx];
-                let subject = commit
-                    .original_message
-                    .lines()
-                    .next()
-                    .unwrap_or("(no message)");
-                println!("  - {}: {}", &commit.hash[..8], subject);
-            }
-            loop {
-                print!("\n❓ [R]etry failed commits, or [S]kip? [R/s] ");
-                std::io::stdout().flush()?;
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input)?;
-                match input.trim().to_lowercase().as_str() {
-                    "r" | "retry" | "" => {
-                        let mut still_failed = Vec::new();
-                        for &idx in &failed_indices {
-                            let single_view =
-                                full_repo_view.single_commit_view(&full_repo_view.commits[idx]);
-                            match claude_client
-                                .check_commits_with_scopes(
-                                    &single_view,
-                                    guidelines,
-                                    valid_scopes,
-                                    !self.no_suggestions,
-                                )
-                                .await
-                            {
-                                Ok(report) => {
-                                    if let Some(r) = report.commits.into_iter().next() {
-                                        let summary = r.summary.clone().unwrap_or_default();
-                                        successes.push((r, summary));
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("warning: still failed: {e}");
-                                    still_failed.push(idx);
-                                }
-                            }
-                        }
-                        failed_indices = still_failed;
-                        if failed_indices.is_empty() {
-                            println!("✅ All retried commits succeeded.");
-                            break;
-                        }
-                        println!("\n⚠️  {} commit(s) still failed:", failed_indices.len());
-                        for &idx in &failed_indices {
-                            let commit = &full_repo_view.commits[idx];
-                            let subject = commit
-                                .original_message
-                                .lines()
-                                .next()
-                                .unwrap_or("(no message)");
-                            println!("  - {}: {}", &commit.hash[..8], subject);
-                        }
-                    }
-                    "s" | "skip" => {
-                        println!("Skipping {} failed commit(s).", failed_indices.len());
-                        break;
-                    }
-                    _ => println!("Please enter 'r' to retry or 's' to skip."),
-                }
-            }
+            self.run_interactive_retry_check(
+                &mut failed_indices,
+                full_repo_view,
+                claude_client,
+                guidelines,
+                valid_scopes,
+                &mut successes,
+                &mut std::io::BufReader::new(std::io::stdin()),
+            )
+            .await?;
         } else if !failed_indices.is_empty() {
             eprintln!(
                 "warning: {} commit(s) failed to check",
@@ -807,6 +751,93 @@ impl CheckCommand {
                 }
             }
         }
+    }
+}
+
+// --- Interactive retry helper ---
+
+impl CheckCommand {
+    /// Prompts the user to retry or skip failed commits, reading responses
+    /// from `reader` so tests can inject a [`std::io::Cursor`] instead of
+    /// blocking on stdin.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_interactive_retry_check(
+        &self,
+        failed_indices: &mut Vec<usize>,
+        full_repo_view: &crate::data::RepositoryView,
+        claude_client: &crate::claude::client::ClaudeClient,
+        guidelines: Option<&str>,
+        valid_scopes: &[crate::data::context::ScopeDefinition],
+        successes: &mut Vec<(crate::data::check::CommitCheckResult, String)>,
+        reader: &mut (dyn std::io::BufRead + Send),
+    ) -> Result<()> {
+        use std::io::Write as _;
+        println!("\n⚠️  {} commit(s) failed to check:", failed_indices.len());
+        for &idx in failed_indices.iter() {
+            let commit = &full_repo_view.commits[idx];
+            let subject = commit
+                .original_message
+                .lines()
+                .next()
+                .unwrap_or("(no message)");
+            println!("  - {}: {}", &commit.hash[..8], subject);
+        }
+        loop {
+            print!("\n❓ [R]etry failed commits, or [S]kip? [R/s] ");
+            std::io::stdout().flush()?;
+            let mut input = String::new();
+            reader.read_line(&mut input)?;
+            match input.trim().to_lowercase().as_str() {
+                "r" | "retry" | "" => {
+                    let mut still_failed = Vec::new();
+                    for &idx in failed_indices.iter() {
+                        let single_view =
+                            full_repo_view.single_commit_view(&full_repo_view.commits[idx]);
+                        match claude_client
+                            .check_commits_with_scopes(
+                                &single_view,
+                                guidelines,
+                                valid_scopes,
+                                !self.no_suggestions,
+                            )
+                            .await
+                        {
+                            Ok(report) => {
+                                if let Some(r) = report.commits.into_iter().next() {
+                                    let summary = r.summary.clone().unwrap_or_default();
+                                    successes.push((r, summary));
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("warning: still failed: {e}");
+                                still_failed.push(idx);
+                            }
+                        }
+                    }
+                    *failed_indices = still_failed;
+                    if failed_indices.is_empty() {
+                        println!("✅ All retried commits succeeded.");
+                        break;
+                    }
+                    println!("\n⚠️  {} commit(s) still failed:", failed_indices.len());
+                    for &idx in failed_indices.iter() {
+                        let commit = &full_repo_view.commits[idx];
+                        let subject = commit
+                            .original_message
+                            .lines()
+                            .next()
+                            .unwrap_or("(no message)");
+                        println!("  - {}: {}", &commit.hash[..8], subject);
+                    }
+                }
+                "s" | "skip" => {
+                    println!("Skipping {} failed commit(s).", failed_indices.len());
+                    break;
+                }
+                _ => println!("Please enter 'r' to retry or 's' to skip."),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1187,5 +1218,166 @@ mod tests {
             .check_with_map_reduce(&client, &repo_view, None, &[])
             .await;
         assert!(result.is_err(), "no successes should bail");
+    }
+
+    // Non-quiet variants: cover the `if !self.quiet { println!(...) }` branches
+    // that are skipped when quiet=true. With quiet=false and all commits
+    // ultimately succeeding, failed_indices stays empty so the interactive
+    // stdin loop is never entered.
+
+    #[tokio::test]
+    async fn check_with_map_reduce_non_quiet_single_commit_succeeds() {
+        // quiet=false covers the "✅ All commits checked!" and multi-batch
+        // grouping print paths. Two commits in one batch → batches(1) < total(2)
+        // triggers the "📦 Grouped..." message.
+        let (c1, _t1) = make_check_commit("abc00000");
+        let (c2, _t2) = make_check_commit("def00000");
+        let cmd = make_check_cmd(false);
+        let repo_view = make_check_repo_view(vec![c1, c2]);
+        let mut responses = errs(3); // batch failure → split-and-retry
+        responses.push(Ok(check_yaml("abc00000")));
+        responses.push(Ok(check_yaml("def00000")));
+        let client = make_client(responses);
+        let result = cmd
+            .check_with_map_reduce(&client, &repo_view, None, &[])
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().commits.len(), 2);
+    }
+
+    // --- run_interactive_retry_check ---
+
+    #[tokio::test]
+    async fn interactive_retry_skip_immediately() {
+        // "s" input → loop exits without calling the AI client at all.
+        let (commit, _tmp) = make_check_commit("abc00000");
+        let cmd = make_check_cmd(false);
+        let repo_view = make_check_repo_view(vec![commit]);
+        let client = make_client(vec![]); // no responses needed
+        let mut failed = vec![0usize];
+        let mut successes = vec![];
+        let mut stdin = std::io::Cursor::new(b"s\n" as &[u8]);
+        cmd.run_interactive_retry_check(
+            &mut failed,
+            &repo_view,
+            &client,
+            None,
+            &[],
+            &mut successes,
+            &mut stdin,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            failed,
+            vec![0],
+            "skip should leave failed_indices unchanged"
+        );
+        assert!(successes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn interactive_retry_retry_succeeds() {
+        // "r" input → retries the failed commit, which succeeds.
+        let (commit, _tmp) = make_check_commit("abc00000");
+        let cmd = make_check_cmd(false);
+        let repo_view = make_check_repo_view(vec![commit]);
+        let client = make_client(vec![Ok(check_yaml("abc00000"))]);
+        let mut failed = vec![0usize];
+        let mut successes = vec![];
+        let mut stdin = std::io::Cursor::new(b"r\n" as &[u8]);
+        cmd.run_interactive_retry_check(
+            &mut failed,
+            &repo_view,
+            &client,
+            None,
+            &[],
+            &mut successes,
+            &mut stdin,
+        )
+        .await
+        .unwrap();
+        assert!(
+            failed.is_empty(),
+            "retry succeeded → failed_indices cleared"
+        );
+        assert_eq!(successes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn interactive_retry_default_input_retries() {
+        // Empty input (just Enter) is treated as "r" (retry).
+        let (commit, _tmp) = make_check_commit("abc00000");
+        let cmd = make_check_cmd(false);
+        let repo_view = make_check_repo_view(vec![commit]);
+        let client = make_client(vec![Ok(check_yaml("abc00000"))]);
+        let mut failed = vec![0usize];
+        let mut successes = vec![];
+        let mut stdin = std::io::Cursor::new(b"\n" as &[u8]);
+        cmd.run_interactive_retry_check(
+            &mut failed,
+            &repo_view,
+            &client,
+            None,
+            &[],
+            &mut successes,
+            &mut stdin,
+        )
+        .await
+        .unwrap();
+        assert!(failed.is_empty());
+        assert_eq!(successes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn interactive_retry_still_fails_then_skip() {
+        // "r" → retry fails → still in failed_indices → "s" → skip.
+        let (commit, _tmp) = make_check_commit("abc00000");
+        let cmd = make_check_cmd(false);
+        let repo_view = make_check_repo_view(vec![commit]);
+        // Retry fails (3 attempts), then skip.
+        let responses = errs(3);
+        let client = make_client(responses);
+        let mut failed = vec![0usize];
+        let mut successes = vec![];
+        let mut stdin = std::io::Cursor::new(b"r\ns\n" as &[u8]);
+        cmd.run_interactive_retry_check(
+            &mut failed,
+            &repo_view,
+            &client,
+            None,
+            &[],
+            &mut successes,
+            &mut stdin,
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed, vec![0], "commit still failed after retry");
+        assert!(successes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn interactive_retry_invalid_input_then_skip() {
+        // Unrecognised input → "please enter r or s" message → "s" exits.
+        let (commit, _tmp) = make_check_commit("abc00000");
+        let cmd = make_check_cmd(false);
+        let repo_view = make_check_repo_view(vec![commit]);
+        let client = make_client(vec![]);
+        let mut failed = vec![0usize];
+        let mut successes = vec![];
+        let mut stdin = std::io::Cursor::new(b"x\ns\n" as &[u8]);
+        cmd.run_interactive_retry_check(
+            &mut failed,
+            &repo_view,
+            &client,
+            None,
+            &[],
+            &mut successes,
+            &mut stdin,
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed, vec![0]);
+        assert!(successes.is_empty());
     }
 }
