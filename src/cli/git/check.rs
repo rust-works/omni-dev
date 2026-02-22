@@ -432,7 +432,7 @@ impl CheckCommand {
                                     (r, summary)
                                 })
                                 .collect();
-                            Ok(items)
+                            Ok::<_, anyhow::Error>((items, vec![]))
                         }
                         Err(e) if batch_size > 1 => {
                             // Split-and-retry: fall back to individual commits
@@ -440,6 +440,7 @@ impl CheckCommand {
                                 "warning: batch of {batch_size} failed, retrying individually: {e}"
                             );
                             let mut items = Vec::new();
+                            let mut failed_indices = Vec::new();
                             for &idx in batch_indices {
                                 let single_view =
                                     full_repo_view.single_commit_view(&full_repo_view.commits[idx]);
@@ -451,25 +452,42 @@ impl CheckCommand {
                                         !self.no_suggestions,
                                     )
                                     .await;
+                                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                                 match single_result {
                                     Ok(report) => {
                                         if let Some(r) = report.commits.into_iter().next() {
                                             let summary = r.summary.clone().unwrap_or_default();
                                             items.push((r, summary));
                                         }
+                                        if !self.quiet {
+                                            println!("   ✅ {done}/{total_commits} commits checked");
+                                        }
                                     }
                                     Err(e) => {
                                         eprintln!("warning: failed to check commit: {e}");
+                                        failed_indices.push(idx);
+                                        if !self.quiet {
+                                            println!(
+                                                "   ❌ {done}/{total_commits} commits checked (failed)"
+                                            );
+                                        }
                                     }
                                 }
-                                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                                if !self.quiet {
-                                    println!("   ✅ {done}/{total_commits} commits checked");
-                                }
                             }
-                            Ok(items)
+                            Ok((items, failed_indices))
                         }
-                        Err(e) => Err(e),
+                        Err(e) => {
+                            // Single-commit batch failed; record the index so the user can retry
+                            let idx = batch_indices[0];
+                            eprintln!("warning: failed to check commit: {e}");
+                            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                            if !self.quiet {
+                                println!(
+                                    "   ❌ {done}/{total_commits} commits checked (failed)"
+                                );
+                            }
+                            Ok((vec![], vec![idx]))
+                        }
                     }
                 }
             })
@@ -479,20 +497,101 @@ impl CheckCommand {
 
         // Flatten batch results
         let mut successes: Vec<(CommitCheckResult, String)> = Vec::new();
-        let mut failure_count = 0;
+        let mut failed_indices: Vec<usize> = Vec::new();
 
         for result in results {
             match result {
-                Ok(items) => successes.extend(items),
+                Ok((items, failed)) => {
+                    successes.extend(items);
+                    failed_indices.extend(failed);
+                }
                 Err(e) => {
-                    eprintln!("warning: failed to check commit: {e}");
-                    failure_count += 1;
+                    // Semaphore errors: can't identify which commits were affected
+                    eprintln!("warning: batch processing error: {e}");
                 }
             }
         }
 
-        if failure_count > 0 {
-            eprintln!("warning: {failure_count} commit(s) failed to check");
+        // Offer interactive retry for commits that failed
+        if !failed_indices.is_empty() && !self.quiet {
+            use std::io::Write as _;
+            println!("\n⚠️  {} commit(s) failed to check:", failed_indices.len());
+            for &idx in &failed_indices {
+                let commit = &full_repo_view.commits[idx];
+                let subject = commit
+                    .original_message
+                    .lines()
+                    .next()
+                    .unwrap_or("(no message)");
+                println!("  - {}: {}", &commit.hash[..8], subject);
+            }
+            loop {
+                print!("\n❓ [R]etry failed commits, or [S]kip? [R/s] ");
+                std::io::stdout().flush()?;
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                match input.trim().to_lowercase().as_str() {
+                    "r" | "retry" | "" => {
+                        let mut still_failed = Vec::new();
+                        for &idx in &failed_indices {
+                            let single_view =
+                                full_repo_view.single_commit_view(&full_repo_view.commits[idx]);
+                            match claude_client
+                                .check_commits_with_scopes(
+                                    &single_view,
+                                    guidelines,
+                                    valid_scopes,
+                                    !self.no_suggestions,
+                                )
+                                .await
+                            {
+                                Ok(report) => {
+                                    if let Some(r) = report.commits.into_iter().next() {
+                                        let summary = r.summary.clone().unwrap_or_default();
+                                        successes.push((r, summary));
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("warning: still failed: {e}");
+                                    still_failed.push(idx);
+                                }
+                            }
+                        }
+                        failed_indices = still_failed;
+                        if failed_indices.is_empty() {
+                            println!("✅ All retried commits succeeded.");
+                            break;
+                        }
+                        println!("\n⚠️  {} commit(s) still failed:", failed_indices.len());
+                        for &idx in &failed_indices {
+                            let commit = &full_repo_view.commits[idx];
+                            let subject = commit
+                                .original_message
+                                .lines()
+                                .next()
+                                .unwrap_or("(no message)");
+                            println!("  - {}: {}", &commit.hash[..8], subject);
+                        }
+                    }
+                    "s" | "skip" => {
+                        println!("Skipping {} failed commit(s).", failed_indices.len());
+                        break;
+                    }
+                    _ => println!("Please enter 'r' to retry or 's' to skip."),
+                }
+            }
+        } else if !failed_indices.is_empty() {
+            eprintln!(
+                "warning: {} commit(s) failed to check",
+                failed_indices.len()
+            );
+        }
+
+        if !failed_indices.is_empty() {
+            eprintln!(
+                "warning: {} commit(s) ultimately failed to check",
+                failed_indices.len()
+            );
         }
 
         if successes.is_empty() {
@@ -913,5 +1012,180 @@ mod tests {
     fn commit_line_formatting() {
         let line = format_commit_line("✅", "abc1234", "feat: add feature");
         assert_eq!(line, "✅ abc1234 - \"feat: add feature\"");
+    }
+
+    // --- check_with_map_reduce (error path coverage) ---
+
+    fn make_check_cmd(quiet: bool) -> CheckCommand {
+        CheckCommand {
+            commit_range: None,
+            model: None,
+            beta_header: None,
+            context_dir: None,
+            guidelines: None,
+            format: "text".to_string(),
+            strict: false,
+            quiet,
+            verbose: false,
+            show_passing: false,
+            batch_size: 4,
+            concurrency: 4,
+            no_coherence: true,
+            no_suggestions: false,
+            twiddle: false,
+        }
+    }
+
+    fn make_check_commit(hash: &str) -> (crate::git::CommitInfo, tempfile::NamedTempFile) {
+        use crate::git::commit::FileChanges;
+        use crate::git::{CommitAnalysis, CommitInfo};
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let commit = CommitInfo {
+            hash: hash.to_string(),
+            author: "Test <test@test.com>".to_string(),
+            date: chrono::Utc::now().fixed_offset(),
+            original_message: format!("feat: commit {hash}"),
+            in_main_branches: vec![],
+            analysis: CommitAnalysis {
+                detected_type: "feat".to_string(),
+                detected_scope: String::new(),
+                proposed_message: format!("feat: commit {hash}"),
+                file_changes: FileChanges {
+                    total_files: 0,
+                    files_added: 0,
+                    files_deleted: 0,
+                    file_list: vec![],
+                },
+                diff_summary: String::new(),
+                diff_file: tmp.path().to_string_lossy().to_string(),
+            },
+        };
+        (commit, tmp)
+    }
+
+    fn make_check_repo_view(commits: Vec<crate::git::CommitInfo>) -> crate::data::RepositoryView {
+        use crate::data::{AiInfo, FieldExplanation, RepositoryView, WorkingDirectoryInfo};
+        RepositoryView {
+            versions: None,
+            explanation: FieldExplanation::default(),
+            working_directory: WorkingDirectoryInfo {
+                clean: true,
+                untracked_changes: vec![],
+            },
+            remotes: vec![],
+            ai: AiInfo {
+                scratch: String::new(),
+            },
+            branch_info: None,
+            pr_template: None,
+            pr_template_location: None,
+            branch_prs: None,
+            commits,
+        }
+    }
+
+    fn check_yaml(hash: &str) -> String {
+        format!("checks:\n  - commit: {hash}\n    passes: true\n    issues: []\n")
+    }
+
+    fn make_client(responses: Vec<anyhow::Result<String>>) -> crate::claude::client::ClaudeClient {
+        crate::claude::client::ClaudeClient::new(Box::new(
+            crate::claude::test_utils::ConfigurableMockAiClient::new(responses),
+        ))
+    }
+
+    // check_commits_with_retry uses max_retries=2 (3 total attempts), so a
+    // batch or individual commit needs 3 consecutive Err responses to fail.
+    fn errs(n: usize) -> Vec<anyhow::Result<String>> {
+        (0..n)
+            .map(|_| Err(anyhow::anyhow!("mock failure")))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn check_with_map_reduce_single_commit_fails_returns_err() {
+        // A single-commit batch that exhausts all retries records the index in
+        // failed_indices and returns Ok(([], [idx])). With successes empty the
+        // method bails, so the overall result is Err.
+        let (commit, _tmp) = make_check_commit("abc00000");
+        let cmd = make_check_cmd(true);
+        let repo_view = make_check_repo_view(vec![commit]);
+        let client = make_client(errs(3));
+        let result = cmd
+            .check_with_map_reduce(&client, &repo_view, None, &[])
+            .await;
+        assert!(result.is_err(), "empty successes should bail");
+    }
+
+    #[tokio::test]
+    async fn check_with_map_reduce_single_commit_succeeds() {
+        // Happy path: one commit, one successful batch response.
+        let (commit, _tmp) = make_check_commit("abc00000");
+        let cmd = make_check_cmd(true);
+        let repo_view = make_check_repo_view(vec![commit]);
+        let client = make_client(vec![Ok(check_yaml("abc00000"))]);
+        let result = cmd
+            .check_with_map_reduce(&client, &repo_view, None, &[])
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().commits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn check_with_map_reduce_batch_fails_split_retry_both_succeed() {
+        // Two commits fit into one batch. The batch fails (3 retries exhausted),
+        // triggering split-and-retry. Both individual commits then succeed.
+        let (c1, _t1) = make_check_commit("abc00000");
+        let (c2, _t2) = make_check_commit("def00000");
+        let cmd = make_check_cmd(true);
+        let repo_view = make_check_repo_view(vec![c1, c2]);
+        let mut responses = errs(3); // batch failure
+        responses.push(Ok(check_yaml("abc00000"))); // abc individual
+        responses.push(Ok(check_yaml("def00000"))); // def individual
+        let client = make_client(responses);
+        let result = cmd
+            .check_with_map_reduce(&client, &repo_view, None, &[])
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().commits.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn check_with_map_reduce_batch_fails_split_one_individual_fails_quiet() {
+        // Batch fails → split-and-retry. abc succeeds; def exhausts its retries
+        // and is recorded in failed_indices. In quiet mode the method returns
+        // Ok with partial results rather than bailing (successes is non-empty).
+        let (c1, _t1) = make_check_commit("abc00000");
+        let (c2, _t2) = make_check_commit("def00000");
+        let cmd = make_check_cmd(true);
+        let repo_view = make_check_repo_view(vec![c1, c2]);
+        let mut responses = errs(3); // batch failure
+        responses.push(Ok(check_yaml("abc00000"))); // abc individual succeeds
+        responses.extend(errs(3)); // def individual exhausts retries
+        let client = make_client(responses);
+        let result = cmd
+            .check_with_map_reduce(&client, &repo_view, None, &[])
+            .await;
+        // abc succeeded, so successes is non-empty and the method returns Ok
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().commits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn check_with_map_reduce_all_fail_in_split_retry_returns_err() {
+        // Batch fails → split-and-retry. Both individual commits also fail.
+        // successes stays empty so the method bails.
+        let (c1, _t1) = make_check_commit("abc00000");
+        let (c2, _t2) = make_check_commit("def00000");
+        let cmd = make_check_cmd(true);
+        let repo_view = make_check_repo_view(vec![c1, c2]);
+        let mut responses = errs(3); // batch failure
+        responses.extend(errs(3)); // abc individual exhausts retries
+        responses.extend(errs(3)); // def individual exhausts retries
+        let client = make_client(responses);
+        let result = cmd
+            .check_with_map_reduce(&client, &repo_view, None, &[])
+            .await;
+        assert!(result.is_err(), "no successes should bail");
     }
 }
