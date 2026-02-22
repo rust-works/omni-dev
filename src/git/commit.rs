@@ -17,9 +17,9 @@ use crate::data::context::ScopeDefinition;
 static SCOPE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-z]+!\(([^)]+)\):|^[a-z]+\(([^)]+)\):").unwrap());
 
-/// Commit information structure.
+/// Commit information structure, generic over analysis type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CommitInfo {
+pub struct CommitInfo<A = CommitAnalysis> {
     /// Full SHA-1 hash of the commit.
     pub hash: String,
     /// Commit author name and email address.
@@ -31,7 +31,7 @@ pub struct CommitInfo {
     /// Array of remote main branches that contain this commit.
     pub in_main_branches: Vec<String>,
     /// Automated analysis of the commit including type detection and proposed message.
-    pub analysis: CommitAnalysis,
+    pub analysis: A,
 }
 
 /// Commit analysis information.
@@ -54,18 +54,9 @@ pub struct CommitAnalysis {
 /// Enhanced commit analysis for AI processing with full diff content.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitAnalysisForAI {
-    /// Automatically detected conventional commit type (feat, fix, docs, test, chore, etc.).
-    pub detected_type: String,
-    /// Automatically detected scope based on file paths (cli, git, data, etc.).
-    pub detected_scope: String,
-    /// AI-generated conventional commit message based on file changes.
-    pub proposed_message: String,
-    /// Detailed statistics about file changes in this commit.
-    pub file_changes: FileChanges,
-    /// Git diff --stat output showing lines changed per file.
-    pub diff_summary: String,
-    /// Path to diff file showing line-by-line changes.
-    pub diff_file: String,
+    /// Base commit analysis fields.
+    #[serde(flatten)]
+    pub base: CommitAnalysis,
     /// Full diff content for AI analysis.
     pub diff_content: String,
 }
@@ -73,18 +64,9 @@ pub struct CommitAnalysisForAI {
 /// Commit information with enhanced analysis for AI processing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitInfoForAI {
-    /// Full SHA-1 hash of the commit.
-    pub hash: String,
-    /// Commit author name and email address.
-    pub author: String,
-    /// Commit date in ISO format with timezone.
-    pub date: DateTime<FixedOffset>,
-    /// The original commit message as written by the author.
-    pub original_message: String,
-    /// Array of remote main branches that contain this commit.
-    pub in_main_branches: Vec<String>,
-    /// Enhanced automated analysis of the commit including diff content.
-    pub analysis: CommitAnalysisForAI,
+    /// Base commit information with AI-enhanced analysis.
+    #[serde(flatten)]
+    pub base: CommitInfo<CommitAnalysisForAI>,
     /// Deterministic checks already performed; the LLM should treat these as authoritative.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pre_validated_checks: Vec<String>,
@@ -638,12 +620,14 @@ impl CommitInfoForAI {
         let analysis = CommitAnalysisForAI::from_commit_analysis(commit_info.analysis)?;
 
         Ok(Self {
-            hash: commit_info.hash,
-            author: commit_info.author,
-            date: commit_info.date,
-            original_message: commit_info.original_message,
-            in_main_branches: commit_info.in_main_branches,
-            analysis,
+            base: CommitInfo {
+                hash: commit_info.hash,
+                author: commit_info.author,
+                date: commit_info.date,
+                original_message: commit_info.original_message,
+                in_main_branches: commit_info.in_main_branches,
+                analysis,
+            },
             pre_validated_checks: Vec::new(),
         })
     }
@@ -652,7 +636,7 @@ impl CommitInfoForAI {
     /// Passing checks are recorded in pre_validated_checks so the LLM
     /// can skip re-checking them. Failing checks are not recorded.
     pub fn run_pre_validation_checks(&mut self, valid_scopes: &[ScopeDefinition]) {
-        if let Some(caps) = SCOPE_RE.captures(&self.original_message) {
+        if let Some(caps) = SCOPE_RE.captures(&self.base.original_message) {
             let scope = caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str());
             if let Some(scope) = scope {
                 if scope.contains(',') && !scope.contains(", ") {
@@ -686,12 +670,7 @@ impl CommitAnalysisForAI {
             .with_context(|| format!("Failed to read diff file: {}", analysis.diff_file))?;
 
         Ok(Self {
-            detected_type: analysis.detected_type,
-            detected_scope: analysis.detected_scope,
-            proposed_message: analysis.proposed_message,
-            file_changes: analysis.file_changes,
-            diff_summary: analysis.diff_summary,
-            diff_file: analysis.diff_file,
+            base: analysis,
             diff_content,
         })
     }
@@ -974,19 +953,23 @@ mod tests {
 
     fn make_commit_info_for_ai(message: &str) -> CommitInfoForAI {
         CommitInfoForAI {
-            hash: "a".repeat(40),
-            author: "Test <test@example.com>".to_string(),
-            date: chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00+00:00").unwrap(),
-            original_message: message.to_string(),
-            in_main_branches: vec![],
-            analysis: CommitAnalysisForAI {
-                detected_type: "feat".to_string(),
-                detected_scope: String::new(),
-                proposed_message: String::new(),
-                file_changes: make_file_changes(&[]),
-                diff_summary: String::new(),
-                diff_file: String::new(),
-                diff_content: String::new(),
+            base: CommitInfo {
+                hash: "a".repeat(40),
+                author: "Test <test@example.com>".to_string(),
+                date: chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00+00:00").unwrap(),
+                original_message: message.to_string(),
+                in_main_branches: vec![],
+                analysis: CommitAnalysisForAI {
+                    base: CommitAnalysis {
+                        detected_type: "feat".to_string(),
+                        detected_scope: String::new(),
+                        proposed_message: String::new(),
+                        file_changes: make_file_changes(&[]),
+                        diff_summary: String::new(),
+                        diff_file: String::new(),
+                    },
+                    diff_content: String::new(),
+                },
             },
             pre_validated_checks: vec![],
         }
@@ -1100,5 +1083,57 @@ mod tests {
                 prop_assert!(result <= segments.len());
             }
         }
+    }
+
+    // ── conversion tests ────────────────────────────────────────────
+
+    #[test]
+    fn from_commit_analysis_loads_diff_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let diff_path = dir.path().join("test.diff");
+        std::fs::write(&diff_path, "+added line\n-removed line\n").unwrap();
+
+        let analysis = CommitAnalysis {
+            detected_type: "feat".to_string(),
+            detected_scope: "cli".to_string(),
+            proposed_message: "feat(cli): test".to_string(),
+            file_changes: make_file_changes(&[]),
+            diff_summary: "file.rs | 2 +-".to_string(),
+            diff_file: diff_path.to_string_lossy().to_string(),
+        };
+
+        let ai = CommitAnalysisForAI::from_commit_analysis(analysis.clone()).unwrap();
+        assert_eq!(ai.diff_content, "+added line\n-removed line\n");
+        assert_eq!(ai.base.detected_type, analysis.detected_type);
+        assert_eq!(ai.base.diff_file, analysis.diff_file);
+    }
+
+    #[test]
+    fn from_commit_info_wraps_and_loads_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let diff_path = dir.path().join("test.diff");
+        std::fs::write(&diff_path, "diff content").unwrap();
+
+        let info = CommitInfo {
+            hash: "a".repeat(40),
+            author: "Test <test@example.com>".to_string(),
+            date: chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00+00:00").unwrap(),
+            original_message: "feat(cli): add flag".to_string(),
+            in_main_branches: vec!["origin/main".to_string()],
+            analysis: CommitAnalysis {
+                detected_type: "feat".to_string(),
+                detected_scope: "cli".to_string(),
+                proposed_message: "feat(cli): add flag".to_string(),
+                file_changes: make_file_changes(&[("M", "src/cli.rs")]),
+                diff_summary: "cli.rs | 1 +".to_string(),
+                diff_file: diff_path.to_string_lossy().to_string(),
+            },
+        };
+
+        let ai = CommitInfoForAI::from_commit_info(info).unwrap();
+        assert_eq!(ai.base.analysis.diff_content, "diff content");
+        assert_eq!(ai.base.hash, "a".repeat(40));
+        assert_eq!(ai.base.original_message, "feat(cli): add flag");
+        assert!(ai.pre_validated_checks.is_empty());
     }
 }
