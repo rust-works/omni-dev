@@ -162,8 +162,17 @@ impl CheckCommand {
 
         // 8. If --twiddle and there are errors with suggestions, offer to apply them
         if should_offer_twiddle(self.twiddle, report.has_errors(), output_format) {
+            use std::io::IsTerminal;
             let amendments = self.build_amendments_from_suggestions(&report, &repo_view);
-            if !amendments.is_empty() && self.prompt_and_apply_suggestions(amendments).await? {
+            if !amendments.is_empty()
+                && self
+                    .prompt_and_apply_suggestions(
+                        amendments,
+                        std::io::stdin().is_terminal(),
+                        &mut std::io::BufReader::new(std::io::stdin()),
+                    )
+                    .await?
+            {
                 // Amendments applied — exit successfully
                 return Ok(());
             }
@@ -345,6 +354,7 @@ impl CheckCommand {
         guidelines: Option<&str>,
         valid_scopes: &[crate::data::context::ScopeDefinition],
     ) -> Result<crate::data::check::CheckReport> {
+        use std::io::IsTerminal;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
@@ -509,7 +519,7 @@ impl CheckCommand {
         }
 
         // Offer interactive retry for commits that failed
-        if !failed_indices.is_empty() && !self.quiet {
+        if !failed_indices.is_empty() && !self.quiet && std::io::stdin().is_terminal() {
             self.run_interactive_retry_check(
                 &mut failed_indices,
                 full_repo_view,
@@ -702,9 +712,14 @@ impl CheckCommand {
 
     /// Prompts the user to apply suggested amendments and applies them if accepted.
     /// Returns true if amendments were applied, false if user declined.
+    ///
+    /// `is_terminal` and `reader` are injected so tests can drive the function
+    /// without blocking on real stdin.
     async fn prompt_and_apply_suggestions(
         &self,
         amendments: Vec<crate::data::amendments::Amendment>,
+        is_terminal: bool,
+        reader: &mut (dyn std::io::BufRead + Send),
     ) -> Result<bool> {
         use crate::data::amendments::AmendmentFile;
         use crate::git::AmendmentHandler;
@@ -716,12 +731,21 @@ impl CheckCommand {
             amendments.len()
         );
 
+        if !is_terminal {
+            eprintln!("warning: stdin is not interactive, cannot prompt to apply suggested fixes");
+            return Ok(false);
+        }
+
         loop {
             print!("❓ [A]pply suggested fixes, or [Q]uit? [A/q] ");
             io::stdout().flush()?;
 
             let mut input = String::new();
-            io::stdin().read_line(&mut input)?;
+            let bytes = reader.read_line(&mut input)?;
+            if bytes == 0 {
+                eprintln!("warning: stdin closed, not applying suggested fixes");
+                return Ok(false);
+            }
 
             match input.trim().to_lowercase().as_str() {
                 "a" | "apply" | "" => {
@@ -782,7 +806,11 @@ impl CheckCommand {
             print!("\n❓ [R]etry failed commits, or [S]kip? [R/s] ");
             std::io::stdout().flush()?;
             let mut input = String::new();
-            reader.read_line(&mut input)?;
+            let bytes = reader.read_line(&mut input)?;
+            if bytes == 0 {
+                eprintln!("warning: stdin closed, skipping failed commit(s)");
+                break;
+            }
             match input.trim().to_lowercase().as_str() {
                 "r" | "retry" | "" => {
                     let mut still_failed = Vec::new();
@@ -1374,5 +1402,89 @@ mod tests {
         .unwrap();
         assert_eq!(failed, vec![0]);
         assert!(successes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn interactive_retry_eof_breaks_immediately() {
+        // EOF (empty reader) → read_line returns Ok(0) → loop breaks without
+        // calling the AI client. failed_indices stays unchanged.
+        let (commit, _tmp) = make_check_commit("abc00000");
+        let cmd = make_check_cmd(false);
+        let repo_view = make_check_repo_view(vec![commit]);
+        let client = make_client(vec![]); // no responses consumed
+        let mut failed = vec![0usize];
+        let mut successes = vec![];
+        let mut stdin = std::io::Cursor::new(b"" as &[u8]);
+        cmd.run_interactive_retry_check(
+            &mut failed,
+            &repo_view,
+            &client,
+            None,
+            &[],
+            &mut successes,
+            &mut stdin,
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed, vec![0], "EOF should leave failed_indices unchanged");
+        assert!(successes.is_empty());
+    }
+
+    // --- prompt_and_apply_suggestions ---
+
+    fn make_amendment() -> crate::data::amendments::Amendment {
+        crate::data::amendments::Amendment {
+            commit: "abc0000000000000000000000000000000000001".to_string(),
+            message: "feat: improved commit message".to_string(),
+            summary: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_and_apply_suggestions_non_terminal_returns_false() {
+        // is_terminal=false → non-interactive warning, returns Ok(false) immediately.
+        let cmd = make_check_cmd(false);
+        let mut reader = std::io::Cursor::new(b"" as &[u8]);
+        let result = cmd
+            .prompt_and_apply_suggestions(vec![make_amendment()], false, &mut reader)
+            .await
+            .unwrap();
+        assert!(!result, "non-terminal should return false");
+    }
+
+    #[tokio::test]
+    async fn prompt_and_apply_suggestions_eof_returns_false() {
+        // is_terminal=true, EOF reader → read_line returns 0, returns Ok(false).
+        let cmd = make_check_cmd(false);
+        let mut reader = std::io::Cursor::new(b"" as &[u8]);
+        let result = cmd
+            .prompt_and_apply_suggestions(vec![make_amendment()], true, &mut reader)
+            .await
+            .unwrap();
+        assert!(!result, "EOF should return false");
+    }
+
+    #[tokio::test]
+    async fn prompt_and_apply_suggestions_quit_returns_false() {
+        // is_terminal=true, "q\n" → user quits, returns Ok(false).
+        let cmd = make_check_cmd(false);
+        let mut reader = std::io::Cursor::new(b"q\n" as &[u8]);
+        let result = cmd
+            .prompt_and_apply_suggestions(vec![make_amendment()], true, &mut reader)
+            .await
+            .unwrap();
+        assert!(!result, "quit should return false");
+    }
+
+    #[tokio::test]
+    async fn prompt_and_apply_suggestions_invalid_then_quit_returns_false() {
+        // is_terminal=true, invalid input then "q\n" → prints error, then user quits.
+        let cmd = make_check_cmd(false);
+        let mut reader = std::io::Cursor::new(b"x\nq\n" as &[u8]);
+        let result = cmd
+            .prompt_and_apply_suggestions(vec![make_amendment()], true, &mut reader)
+            .await
+            .unwrap();
+        assert!(!result, "invalid then quit should return false");
     }
 }
