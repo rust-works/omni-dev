@@ -195,6 +195,18 @@ impl RepositoryView {
         }
     }
 
+    /// Serializes this view to YAML, calling [`update_field_presence`] first.
+    ///
+    /// Use this instead of calling `update_field_presence` followed by
+    /// `crate::data::to_yaml` separately.  Keeping the two steps together
+    /// prevents the explanation section from being stale in the output.
+    ///
+    /// [`update_field_presence`]: Self::update_field_presence
+    pub fn to_yaml_output(&mut self) -> anyhow::Result<String> {
+        self.update_field_presence();
+        yaml::to_yaml(self)
+    }
+
     /// Creates a minimal view containing a single commit for parallel dispatch.
     ///
     /// Strips metadata not relevant to per-commit AI analysis (versions,
