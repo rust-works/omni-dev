@@ -190,9 +190,19 @@ impl TwiddleCommand {
             amendments.save_to_file(&amendments_file)?;
 
             // Show file path and get user choice
-            if !self.auto_apply && !self.handle_amendments_file(&amendments_file, &amendments)? {
-                println!("❌ Amendment cancelled by user");
-                return Ok(());
+            {
+                use std::io::IsTerminal;
+                if !self.auto_apply
+                    && !self.handle_amendments_file(
+                        &amendments_file,
+                        &amendments,
+                        std::io::stdin().is_terminal(),
+                        &mut std::io::BufReader::new(std::io::stdin()),
+                    )?
+                {
+                    println!("❌ Amendment cancelled by user");
+                    return Ok(());
+                }
             }
 
             // 8. Apply amendments (re-read from file to capture any user edits)
@@ -436,80 +446,18 @@ impl TwiddleCommand {
 
         // Offer interactive retry for commits that failed
         if !failed_indices.is_empty() {
-            use std::io::Write as _;
-            println!(
-                "\n⚠️  {} commit(s) failed to process:",
-                failed_indices.len()
-            );
-            for &idx in &failed_indices {
-                let commit = &full_repo_view.commits[idx];
-                let subject = commit
-                    .original_message
-                    .lines()
-                    .next()
-                    .unwrap_or("(no message)");
-                println!("  - {}: {}", &commit.hash[..8], subject);
-            }
-            loop {
-                print!("\n❓ [R]etry failed commits, or [S]kip? [R/s] ");
-                std::io::stdout().flush()?;
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input)?;
-                match input.trim().to_lowercase().as_str() {
-                    "r" | "retry" | "" => {
-                        let mut still_failed = Vec::new();
-                        for &idx in &failed_indices {
-                            let single_view =
-                                full_repo_view.single_commit_view(&full_repo_view.commits[idx]);
-                            let result = if let Some(ref ctx) = context {
-                                claude_client
-                                    .generate_contextual_amendments_with_options(
-                                        &single_view,
-                                        ctx,
-                                        fresh,
-                                    )
-                                    .await
-                            } else {
-                                claude_client
-                                    .generate_amendments_with_options(&single_view, fresh)
-                                    .await
-                            };
-                            match result {
-                                Ok(af) => {
-                                    if let Some(a) = af.amendments.into_iter().next() {
-                                        let summary = a.summary.clone().unwrap_or_default();
-                                        successes.push((a, summary));
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("warning: still failed: {e}");
-                                    still_failed.push(idx);
-                                }
-                            }
-                        }
-                        failed_indices = still_failed;
-                        if failed_indices.is_empty() {
-                            println!("✅ All retried commits succeeded.");
-                            break;
-                        }
-                        println!("\n⚠️  {} commit(s) still failed:", failed_indices.len());
-                        for &idx in &failed_indices {
-                            let commit = &full_repo_view.commits[idx];
-                            let subject = commit
-                                .original_message
-                                .lines()
-                                .next()
-                                .unwrap_or("(no message)");
-                            println!("  - {}: {}", &commit.hash[..8], subject);
-                        }
-                    }
-                    "s" | "skip" => {
-                        println!("Skipping {} failed commit(s).", failed_indices.len());
-                        break;
-                    }
-                    _ => println!("Please enter 'r' to retry or 's' to skip."),
-                }
-            }
+            use std::io::IsTerminal;
+            self.run_interactive_retry_generate_amendments(
+                &mut failed_indices,
+                &full_repo_view,
+                &claude_client,
+                context.as_ref(),
+                fresh,
+                &mut successes,
+                std::io::stdin().is_terminal(),
+                &mut std::io::BufReader::new(std::io::stdin()),
+            )
+            .await?;
         }
 
         if !failed_indices.is_empty() {
@@ -561,11 +509,19 @@ impl TwiddleCommand {
             let amendments_file = temp_dir.path().join("twiddle_amendments.yaml");
             all_amendments.save_to_file(&amendments_file)?;
 
-            if !self.auto_apply
-                && !self.handle_amendments_file(&amendments_file, &all_amendments)?
             {
-                println!("❌ Amendment cancelled by user");
-                return Ok(());
+                use std::io::IsTerminal;
+                if !self.auto_apply
+                    && !self.handle_amendments_file(
+                        &amendments_file,
+                        &all_amendments,
+                        std::io::stdin().is_terminal(),
+                        &mut std::io::BufReader::new(std::io::stdin()),
+                    )?
+                {
+                    println!("❌ Amendment cancelled by user");
+                    return Ok(());
+                }
             }
 
             self.apply_amendments_from_file(&amendments_file).await?;
@@ -656,10 +612,15 @@ impl TwiddleCommand {
     }
 
     /// Handles the amendments file by showing the path and getting the user choice.
+    ///
+    /// `is_terminal` and `reader` are injected so tests can drive the function
+    /// without blocking on real stdin.
     fn handle_amendments_file(
         &self,
         amendments_file: &std::path::Path,
         amendments: &crate::data::amendments::AmendmentFile,
+        is_terminal: bool,
+        reader: &mut (dyn std::io::BufRead + Send),
     ) -> Result<bool> {
         use std::io::{self, Write};
 
@@ -670,12 +631,21 @@ impl TwiddleCommand {
         println!("💾 Amendments saved to: {}", amendments_file.display());
         println!();
 
+        if !is_terminal {
+            eprintln!("warning: stdin is not interactive, cannot prompt for amendments");
+            return Ok(false);
+        }
+
         loop {
             print!("❓ [A]pply amendments, [S]how file, [E]dit file, or [Q]uit? [A/s/e/q] ");
             io::stdout().flush()?;
 
             let mut input = String::new();
-            io::stdin().read_line(&mut input)?;
+            let bytes = reader.read_line(&mut input)?;
+            if bytes == 0 {
+                eprintln!("warning: stdin closed, cancelling amendments");
+                return Ok(false);
+            }
 
             match input.trim().to_lowercase().as_str() {
                 "a" | "apply" | "" => return Ok(true),
@@ -1021,11 +991,19 @@ impl TwiddleCommand {
             amendment_file.save_to_file(&amendments_file)?;
 
             // Show file path and get user choice
-            if !self.auto_apply
-                && !self.handle_amendments_file(&amendments_file, &amendment_file)?
             {
-                println!("❌ Amendment cancelled by user");
-                return Ok(());
+                use std::io::IsTerminal;
+                if !self.auto_apply
+                    && !self.handle_amendments_file(
+                        &amendments_file,
+                        &amendment_file,
+                        std::io::stdin().is_terminal(),
+                        &mut std::io::BufReader::new(std::io::stdin()),
+                    )?
+                {
+                    println!("❌ Amendment cancelled by user");
+                    return Ok(());
+                }
             }
 
             // Apply amendments (re-read from file to capture any user edits)
@@ -1399,16 +1377,24 @@ impl TwiddleCommand {
 
         // Offer interactive retry for commits that failed
         if !failed_indices.is_empty() {
-            self.run_interactive_retry_twiddle_check(
-                &mut failed_indices,
-                full_repo_view,
-                claude_client,
-                guidelines,
-                valid_scopes,
-                &mut successes,
-                &mut std::io::BufReader::new(std::io::stdin()),
-            )
-            .await?;
+            use std::io::IsTerminal;
+            if std::io::stdin().is_terminal() {
+                self.run_interactive_retry_twiddle_check(
+                    &mut failed_indices,
+                    full_repo_view,
+                    claude_client,
+                    guidelines,
+                    valid_scopes,
+                    &mut successes,
+                    &mut std::io::BufReader::new(std::io::stdin()),
+                )
+                .await?;
+            } else {
+                eprintln!(
+                    "warning: stdin is not interactive, skipping retry prompt for {} failed commit(s)",
+                    failed_indices.len()
+                );
+            }
         }
 
         if !failed_indices.is_empty() {
@@ -1471,7 +1457,11 @@ impl TwiddleCommand {
             print!("\n❓ [R]etry failed commits, or [S]kip? [R/s] ");
             std::io::stdout().flush()?;
             let mut input = String::new();
-            reader.read_line(&mut input)?;
+            let bytes = reader.read_line(&mut input)?;
+            if bytes == 0 {
+                eprintln!("warning: stdin closed, skipping failed commit(s)");
+                break;
+            }
             match input.trim().to_lowercase().as_str() {
                 "r" | "retry" | "" => {
                     let mut still_failed = Vec::new();
@@ -1486,6 +1476,111 @@ impl TwiddleCommand {
                                 if let Some(r) = report.commits.into_iter().next() {
                                     let summary = r.summary.clone().unwrap_or_default();
                                     successes.push((r, summary));
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("warning: still failed: {e}");
+                                still_failed.push(idx);
+                            }
+                        }
+                    }
+                    *failed_indices = still_failed;
+                    if failed_indices.is_empty() {
+                        println!("✅ All retried commits succeeded.");
+                        break;
+                    }
+                    println!("\n⚠️  {} commit(s) still failed:", failed_indices.len());
+                    for &idx in failed_indices.iter() {
+                        let commit = &full_repo_view.commits[idx];
+                        let subject = commit
+                            .original_message
+                            .lines()
+                            .next()
+                            .unwrap_or("(no message)");
+                        println!("  - {}: {}", &commit.hash[..8], subject);
+                    }
+                }
+                "s" | "skip" => {
+                    println!("Skipping {} failed commit(s).", failed_indices.len());
+                    break;
+                }
+                _ => println!("Please enter 'r' to retry or 's' to skip."),
+            }
+        }
+        Ok(())
+    }
+
+    /// Prompts the user to retry or skip commits that failed amendment generation,
+    /// updating `failed_indices` and `successes` in place.
+    ///
+    /// `is_terminal` and `reader` are injected so tests can drive the function
+    /// without blocking on real stdin.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_interactive_retry_generate_amendments(
+        &self,
+        failed_indices: &mut Vec<usize>,
+        full_repo_view: &crate::data::RepositoryView,
+        claude_client: &crate::claude::client::ClaudeClient,
+        context: Option<&crate::data::context::CommitContext>,
+        fresh: bool,
+        successes: &mut Vec<(crate::data::amendments::Amendment, String)>,
+        is_terminal: bool,
+        reader: &mut (dyn std::io::BufRead + Send),
+    ) -> Result<()> {
+        use std::io::Write as _;
+        println!(
+            "\n⚠️  {} commit(s) failed to process:",
+            failed_indices.len()
+        );
+        for &idx in failed_indices.iter() {
+            let commit = &full_repo_view.commits[idx];
+            let subject = commit
+                .original_message
+                .lines()
+                .next()
+                .unwrap_or("(no message)");
+            println!("  - {}: {}", &commit.hash[..8], subject);
+        }
+        if !is_terminal {
+            eprintln!(
+                "warning: stdin is not interactive, skipping retry prompt for {} failed commit(s)",
+                failed_indices.len()
+            );
+            return Ok(());
+        }
+        loop {
+            print!("\n❓ [R]etry failed commits, or [S]kip? [R/s] ");
+            std::io::stdout().flush()?;
+            let mut input = String::new();
+            let bytes = reader.read_line(&mut input)?;
+            if bytes == 0 {
+                eprintln!("warning: stdin closed, skipping failed commit(s)");
+                break;
+            }
+            match input.trim().to_lowercase().as_str() {
+                "r" | "retry" | "" => {
+                    let mut still_failed = Vec::new();
+                    for &idx in failed_indices.iter() {
+                        let single_view =
+                            full_repo_view.single_commit_view(&full_repo_view.commits[idx]);
+                        let result = if let Some(ctx) = context {
+                            claude_client
+                                .generate_contextual_amendments_with_options(
+                                    &single_view,
+                                    ctx,
+                                    fresh,
+                                )
+                                .await
+                        } else {
+                            claude_client
+                                .generate_amendments_with_options(&single_view, fresh)
+                                .await
+                        };
+                        match result {
+                            Ok(af) => {
+                                if let Some(a) = af.amendments.into_iter().next() {
+                                    let summary = a.summary.clone().unwrap_or_default();
+                                    successes.push((a, summary));
                                 }
                             }
                             Err(e) => {
@@ -2021,5 +2116,277 @@ mod tests {
         .unwrap();
         assert_eq!(failed, vec![0]);
         assert!(successes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn interactive_retry_twiddle_eof_breaks_immediately() {
+        // EOF (empty reader) → read_line returns Ok(0) → loop breaks without
+        // calling the AI client. failed_indices stays unchanged.
+        let (commit, _tmp) = make_twiddle_commit("abc00000");
+        let cmd = make_twiddle_cmd();
+        let repo_view = make_twiddle_repo_view(vec![commit]);
+        let client = make_mock_client(vec![]); // no responses consumed
+        let mut failed = vec![0usize];
+        let mut successes = vec![];
+        let mut stdin = std::io::Cursor::new(b"" as &[u8]);
+        cmd.run_interactive_retry_twiddle_check(
+            &mut failed,
+            &repo_view,
+            &client,
+            None,
+            &[],
+            &mut successes,
+            &mut stdin,
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed, vec![0], "EOF should leave failed_indices unchanged");
+        assert!(successes.is_empty());
+    }
+
+    // --- handle_amendments_file ---
+
+    fn make_amendment_file() -> crate::data::amendments::AmendmentFile {
+        crate::data::amendments::AmendmentFile {
+            amendments: vec![crate::data::amendments::Amendment {
+                commit: "abc0000000000000000000000000000000000001".to_string(),
+                message: "feat: improved commit message".to_string(),
+                summary: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn handle_amendments_file_non_terminal_returns_false() {
+        // is_terminal=false → non-interactive warning, returns Ok(false) immediately.
+        let cmd = make_twiddle_cmd();
+        let amendments = make_amendment_file();
+        let dummy_path = std::path::Path::new("/tmp/dummy_amendments.yaml");
+        let mut reader = std::io::Cursor::new(b"" as &[u8]);
+        let result = cmd
+            .handle_amendments_file(dummy_path, &amendments, false, &mut reader)
+            .unwrap();
+        assert!(!result, "non-terminal should return false");
+    }
+
+    #[test]
+    fn handle_amendments_file_eof_returns_false() {
+        // is_terminal=true, EOF reader → read_line returns 0, returns Ok(false).
+        let cmd = make_twiddle_cmd();
+        let amendments = make_amendment_file();
+        let dummy_path = std::path::Path::new("/tmp/dummy_amendments.yaml");
+        let mut reader = std::io::Cursor::new(b"" as &[u8]);
+        let result = cmd
+            .handle_amendments_file(dummy_path, &amendments, true, &mut reader)
+            .unwrap();
+        assert!(!result, "EOF should return false");
+    }
+
+    #[test]
+    fn handle_amendments_file_quit_returns_false() {
+        // is_terminal=true, "q\n" → user quits, returns Ok(false).
+        let cmd = make_twiddle_cmd();
+        let amendments = make_amendment_file();
+        let dummy_path = std::path::Path::new("/tmp/dummy_amendments.yaml");
+        let mut reader = std::io::Cursor::new(b"q\n" as &[u8]);
+        let result = cmd
+            .handle_amendments_file(dummy_path, &amendments, true, &mut reader)
+            .unwrap();
+        assert!(!result, "quit should return false");
+    }
+
+    #[test]
+    fn handle_amendments_file_apply_returns_true() {
+        // is_terminal=true, "a\n" → user applies, returns Ok(true).
+        let cmd = make_twiddle_cmd();
+        let amendments = make_amendment_file();
+        let dummy_path = std::path::Path::new("/tmp/dummy_amendments.yaml");
+        let mut reader = std::io::Cursor::new(b"a\n" as &[u8]);
+        let result = cmd
+            .handle_amendments_file(dummy_path, &amendments, true, &mut reader)
+            .unwrap();
+        assert!(result, "apply should return true");
+    }
+
+    #[test]
+    fn handle_amendments_file_invalid_then_quit_returns_false() {
+        // is_terminal=true, invalid input then "q\n" → prints error, then user quits.
+        let cmd = make_twiddle_cmd();
+        let amendments = make_amendment_file();
+        let dummy_path = std::path::Path::new("/tmp/dummy_amendments.yaml");
+        let mut reader = std::io::Cursor::new(b"x\nq\n" as &[u8]);
+        let result = cmd
+            .handle_amendments_file(dummy_path, &amendments, true, &mut reader)
+            .unwrap();
+        assert!(!result, "invalid then quit should return false");
+    }
+
+    // --- run_interactive_retry_generate_amendments ---
+
+    /// Full 40-char hex hash used for amendment retry tests (validation requires ≥40 chars).
+    const HASH_40: &str = "abc0000000000000000000000000000000000000";
+
+    fn twiddle_amendment_yaml(hash: &str) -> String {
+        format!("amendments:\n  - commit: \"{hash}\"\n    message: \"feat: improved message\"\n")
+    }
+
+    #[tokio::test]
+    async fn retry_generate_amendments_non_terminal_returns_immediately() {
+        // is_terminal=false → warning printed, returns Ok(()) without prompting.
+        let (commit, _tmp) = make_twiddle_commit("abc00000");
+        let cmd = make_twiddle_cmd();
+        let repo_view = make_twiddle_repo_view(vec![commit]);
+        let client = make_mock_client(vec![]); // no calls expected
+        let mut failed = vec![0usize];
+        let mut successes = vec![];
+        let mut reader = std::io::Cursor::new(b"" as &[u8]);
+        cmd.run_interactive_retry_generate_amendments(
+            &mut failed,
+            &repo_view,
+            &client,
+            None,
+            false,
+            &mut successes,
+            false, // is_terminal
+            &mut reader,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            failed,
+            vec![0],
+            "non-terminal should leave failed unchanged"
+        );
+        assert!(successes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retry_generate_amendments_eof_breaks_immediately() {
+        // is_terminal=true, EOF → read_line returns 0 → breaks without AI calls.
+        let (commit, _tmp) = make_twiddle_commit("abc00000");
+        let cmd = make_twiddle_cmd();
+        let repo_view = make_twiddle_repo_view(vec![commit]);
+        let client = make_mock_client(vec![]); // no calls expected
+        let mut failed = vec![0usize];
+        let mut successes = vec![];
+        let mut reader = std::io::Cursor::new(b"" as &[u8]);
+        cmd.run_interactive_retry_generate_amendments(
+            &mut failed,
+            &repo_view,
+            &client,
+            None,
+            false,
+            &mut successes,
+            true, // is_terminal
+            &mut reader,
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed, vec![0], "EOF should leave failed unchanged");
+        assert!(successes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retry_generate_amendments_skip_breaks_immediately() {
+        // is_terminal=true, "s\n" → user skips, failed stays unchanged.
+        let (commit, _tmp) = make_twiddle_commit("abc00000");
+        let cmd = make_twiddle_cmd();
+        let repo_view = make_twiddle_repo_view(vec![commit]);
+        let client = make_mock_client(vec![]); // no calls expected
+        let mut failed = vec![0usize];
+        let mut successes = vec![];
+        let mut reader = std::io::Cursor::new(b"s\n" as &[u8]);
+        cmd.run_interactive_retry_generate_amendments(
+            &mut failed,
+            &repo_view,
+            &client,
+            None,
+            false,
+            &mut successes,
+            true,
+            &mut reader,
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed, vec![0], "skip should leave failed unchanged");
+        assert!(successes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retry_generate_amendments_invalid_then_skip() {
+        // Unrecognised input → "please enter r or s" message → "s" exits.
+        let (commit, _tmp) = make_twiddle_commit("abc00000");
+        let cmd = make_twiddle_cmd();
+        let repo_view = make_twiddle_repo_view(vec![commit]);
+        let client = make_mock_client(vec![]);
+        let mut failed = vec![0usize];
+        let mut successes = vec![];
+        let mut reader = std::io::Cursor::new(b"x\ns\n" as &[u8]);
+        cmd.run_interactive_retry_generate_amendments(
+            &mut failed,
+            &repo_view,
+            &client,
+            None,
+            false,
+            &mut successes,
+            true,
+            &mut reader,
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed, vec![0]);
+        assert!(successes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retry_generate_amendments_retry_fails_then_skip() {
+        // "r" → AI call fails → still in failed → "s" → skips.
+        let (commit, _tmp) = make_twiddle_commit("abc00000");
+        let cmd = make_twiddle_cmd();
+        let repo_view = make_twiddle_repo_view(vec![commit]);
+        let client = make_mock_client(vec![Err(anyhow::anyhow!("mock fail"))]);
+        let mut failed = vec![0usize];
+        let mut successes = vec![];
+        let mut reader = std::io::Cursor::new(b"r\ns\n" as &[u8]);
+        cmd.run_interactive_retry_generate_amendments(
+            &mut failed,
+            &repo_view,
+            &client,
+            None,
+            false,
+            &mut successes,
+            true,
+            &mut reader,
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed, vec![0], "commit still failed after retry");
+        assert!(successes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retry_generate_amendments_retry_succeeds() {
+        // "r" → AI returns valid amendment → failed cleared, success recorded.
+        let (commit, _tmp) = make_twiddle_commit(HASH_40);
+        let cmd = make_twiddle_cmd();
+        let repo_view = make_twiddle_repo_view(vec![commit]);
+        let client = make_mock_client(vec![Ok(twiddle_amendment_yaml(HASH_40))]);
+        let mut failed = vec![0usize];
+        let mut successes = vec![];
+        let mut reader = std::io::Cursor::new(b"r\n" as &[u8]);
+        cmd.run_interactive_retry_generate_amendments(
+            &mut failed,
+            &repo_view,
+            &client,
+            None,
+            false,
+            &mut successes,
+            true,
+            &mut reader,
+        )
+        .await
+        .unwrap();
+        assert!(failed.is_empty(), "retry succeeded → failed cleared");
+        assert_eq!(successes.len(), 1);
     }
 }
