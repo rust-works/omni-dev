@@ -50,13 +50,17 @@ pub enum PromptStyle {
 
 impl AiClientMetadata {
     /// Derives the prompt style from the provider name.
+    ///
+    /// Matches against the exact strings set by each [`AiClient`] implementation:
+    /// - `"OpenAI"` and `"Ollama"` → [`PromptStyle::OpenAi`]
+    /// - `"Anthropic"` and `"Anthropic Bedrock"` → [`PromptStyle::Claude`]
+    ///
+    /// Unrecognised provider strings default to [`PromptStyle::Claude`].
     #[must_use]
     pub fn prompt_style(&self) -> PromptStyle {
-        let p = self.provider.to_lowercase();
-        if p.contains("openai") || p.contains("ollama") {
-            PromptStyle::OpenAi
-        } else {
-            PromptStyle::Claude
+        match self.provider.as_str() {
+            "OpenAI" | "Ollama" => PromptStyle::OpenAi,
+            _ => PromptStyle::Claude,
         }
     }
 }
@@ -151,4 +155,55 @@ pub trait AiClient: Send + Sync {
 
     /// Returns metadata about the AI client implementation.
     fn get_metadata(&self) -> AiClientMetadata;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta(provider: &str) -> AiClientMetadata {
+        AiClientMetadata {
+            provider: provider.to_string(),
+            model: "test-model".to_string(),
+            max_context_length: 1024,
+            max_response_length: 1024,
+            active_beta: None,
+        }
+    }
+
+    #[test]
+    fn prompt_style_openai() {
+        assert_eq!(meta("OpenAI").prompt_style(), PromptStyle::OpenAi);
+    }
+
+    #[test]
+    fn prompt_style_ollama() {
+        assert_eq!(meta("Ollama").prompt_style(), PromptStyle::OpenAi);
+    }
+
+    #[test]
+    fn prompt_style_anthropic() {
+        assert_eq!(meta("Anthropic").prompt_style(), PromptStyle::Claude);
+    }
+
+    #[test]
+    fn prompt_style_bedrock() {
+        assert_eq!(
+            meta("Anthropic Bedrock").prompt_style(),
+            PromptStyle::Claude
+        );
+    }
+
+    #[test]
+    fn prompt_style_unknown_defaults_to_claude() {
+        assert_eq!(meta("SomeNewProvider").prompt_style(), PromptStyle::Claude);
+    }
+
+    /// Ensure case-sensitive matching: "openai" (lowercase) is not a known provider
+    /// string and must not silently match as OpenAI.
+    #[test]
+    fn prompt_style_case_sensitive() {
+        assert_eq!(meta("openai").prompt_style(), PromptStyle::Claude);
+        assert_eq!(meta("ollama").prompt_style(), PromptStyle::Claude);
+    }
 }
