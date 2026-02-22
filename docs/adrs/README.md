@@ -35,3 +35,4 @@ by Michael Nygard.
 | [ADR-0009](adr-0009.md)  | ✅ Accepted | 2026-02-22 | Token-Budget-Aware Batch Planning                                    |
 | [ADR-0010](adr-0010.md)  | ✅ Accepted | 2026-02-22 | Multi-Layer Retry Strategy                                           |
 | [ADR-0011](adr-0011.md)  | ✅ Accepted | 2026-02-23 | Compile-Time Model Registry with Identifier Normalization            |
+| [ADR-0012](adr-0012.md)  | ✅ Accepted | 2026-02-23 | Three-Level Issue Severity with `--strict` Exit-Code Promotion       |
