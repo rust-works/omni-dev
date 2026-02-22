@@ -1403,72 +1403,16 @@ impl TwiddleCommand {
 
         // Offer interactive retry for commits that failed
         if !failed_indices.is_empty() {
-            use std::io::Write as _;
-            println!("\n⚠️  {} commit(s) failed to check:", failed_indices.len());
-            for &idx in &failed_indices {
-                let commit = &full_repo_view.commits[idx];
-                let subject = commit
-                    .original_message
-                    .lines()
-                    .next()
-                    .unwrap_or("(no message)");
-                println!("  - {}: {}", &commit.hash[..8], subject);
-            }
-            loop {
-                print!("\n❓ [R]etry failed commits, or [S]kip? [R/s] ");
-                std::io::stdout().flush()?;
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input)?;
-                match input.trim().to_lowercase().as_str() {
-                    "r" | "retry" | "" => {
-                        let mut still_failed = Vec::new();
-                        for &idx in &failed_indices {
-                            let single_view =
-                                full_repo_view.single_commit_view(&full_repo_view.commits[idx]);
-                            match claude_client
-                                .check_commits_with_scopes(
-                                    &single_view,
-                                    guidelines,
-                                    valid_scopes,
-                                    true,
-                                )
-                                .await
-                            {
-                                Ok(report) => {
-                                    if let Some(r) = report.commits.into_iter().next() {
-                                        let summary = r.summary.clone().unwrap_or_default();
-                                        successes.push((r, summary));
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("warning: still failed: {e}");
-                                    still_failed.push(idx);
-                                }
-                            }
-                        }
-                        failed_indices = still_failed;
-                        if failed_indices.is_empty() {
-                            println!("✅ All retried commits succeeded.");
-                            break;
-                        }
-                        println!("\n⚠️  {} commit(s) still failed:", failed_indices.len());
-                        for &idx in &failed_indices {
-                            let commit = &full_repo_view.commits[idx];
-                            let subject = commit
-                                .original_message
-                                .lines()
-                                .next()
-                                .unwrap_or("(no message)");
-                            println!("  - {}: {}", &commit.hash[..8], subject);
-                        }
-                    }
-                    "s" | "skip" => {
-                        println!("Skipping {} failed commit(s).", failed_indices.len());
-                        break;
-                    }
-                    _ => println!("Please enter 'r' to retry or 's' to skip."),
-                }
-            }
+            self.run_interactive_retry_twiddle_check(
+                &mut failed_indices,
+                full_repo_view,
+                claude_client,
+                guidelines,
+                valid_scopes,
+                &mut successes,
+                &mut std::io::BufReader::new(std::io::stdin()),
+            )
+            .await?;
         }
 
         if !failed_indices.is_empty() {
@@ -1500,6 +1444,84 @@ impl TwiddleCommand {
         Ok(CheckReport::new(
             successes.into_iter().map(|(r, _)| r).collect(),
         ))
+    }
+
+    /// Prompts the user to retry or skip failed commits, updating `failed_indices` and `successes`.
+    ///
+    /// Accepts `reader` for stdin injection so the interactive loop can be unit-tested.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_interactive_retry_twiddle_check(
+        &self,
+        failed_indices: &mut Vec<usize>,
+        full_repo_view: &crate::data::RepositoryView,
+        claude_client: &crate::claude::client::ClaudeClient,
+        guidelines: Option<&str>,
+        valid_scopes: &[crate::data::context::ScopeDefinition],
+        successes: &mut Vec<(crate::data::check::CommitCheckResult, String)>,
+        reader: &mut (dyn std::io::BufRead + Send),
+    ) -> Result<()> {
+        use std::io::Write as _;
+        println!("\n⚠️  {} commit(s) failed to check:", failed_indices.len());
+        for &idx in failed_indices.iter() {
+            let commit = &full_repo_view.commits[idx];
+            let subject = commit
+                .original_message
+                .lines()
+                .next()
+                .unwrap_or("(no message)");
+            println!("  - {}: {}", &commit.hash[..8], subject);
+        }
+        loop {
+            print!("\n❓ [R]etry failed commits, or [S]kip? [R/s] ");
+            std::io::stdout().flush()?;
+            let mut input = String::new();
+            reader.read_line(&mut input)?;
+            match input.trim().to_lowercase().as_str() {
+                "r" | "retry" | "" => {
+                    let mut still_failed = Vec::new();
+                    for &idx in failed_indices.iter() {
+                        let single_view =
+                            full_repo_view.single_commit_view(&full_repo_view.commits[idx]);
+                        match claude_client
+                            .check_commits_with_scopes(&single_view, guidelines, valid_scopes, true)
+                            .await
+                        {
+                            Ok(report) => {
+                                if let Some(r) = report.commits.into_iter().next() {
+                                    let summary = r.summary.clone().unwrap_or_default();
+                                    successes.push((r, summary));
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("warning: still failed: {e}");
+                                still_failed.push(idx);
+                            }
+                        }
+                    }
+                    *failed_indices = still_failed;
+                    if failed_indices.is_empty() {
+                        println!("✅ All retried commits succeeded.");
+                        break;
+                    }
+                    println!("\n⚠️  {} commit(s) still failed:", failed_indices.len());
+                    for &idx in failed_indices.iter() {
+                        let commit = &full_repo_view.commits[idx];
+                        let subject = commit
+                            .original_message
+                            .lines()
+                            .next()
+                            .unwrap_or("(no message)");
+                        println!("  - {}: {}", &commit.hash[..8], subject);
+                    }
+                }
+                "s" | "skip" => {
+                    println!("Skipping {} failed commit(s).", failed_indices.len());
+                    break;
+                }
+                _ => println!("Please enter 'r' to retry or 's' to skip."),
+            }
+        }
+        Ok(())
     }
 
     /// Outputs the text format check report (mirrors `CheckCommand::output_text_report`).
@@ -1752,11 +1774,6 @@ mod tests {
     }
 
     // --- check_commits_map_reduce (success paths via mock client) ---
-    //
-    // Failure-path tests for check_commits_map_reduce are not included here
-    // because the method reads from stdin unconditionally when commits fail,
-    // which would block in a test process. See issue #202 (--batch-size) and
-    // the twiddle quiet-mode inconsistency noted in PR #204.
 
     fn make_twiddle_cmd() -> TwiddleCommand {
         TwiddleCommand {
@@ -1873,5 +1890,141 @@ mod tests {
             .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().commits.len(), 2);
+    }
+
+    // --- run_interactive_retry_twiddle_check ---
+
+    #[tokio::test]
+    async fn interactive_retry_twiddle_skip_immediately() {
+        // "s" input → loop exits without calling the AI client at all.
+        let (commit, _tmp) = make_twiddle_commit("abc00000");
+        let cmd = make_twiddle_cmd();
+        let repo_view = make_twiddle_repo_view(vec![commit]);
+        let client = make_mock_client(vec![]);
+        let mut failed = vec![0usize];
+        let mut successes = vec![];
+        let mut stdin = std::io::Cursor::new(b"s\n" as &[u8]);
+        cmd.run_interactive_retry_twiddle_check(
+            &mut failed,
+            &repo_view,
+            &client,
+            None,
+            &[],
+            &mut successes,
+            &mut stdin,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            failed,
+            vec![0],
+            "skip should leave failed_indices unchanged"
+        );
+        assert!(successes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn interactive_retry_twiddle_retry_succeeds() {
+        // "r" input → retries the failed commit, which succeeds.
+        let (commit, _tmp) = make_twiddle_commit("abc00000");
+        let cmd = make_twiddle_cmd();
+        let repo_view = make_twiddle_repo_view(vec![commit]);
+        let client = make_mock_client(vec![Ok(twiddle_check_yaml("abc00000"))]);
+        let mut failed = vec![0usize];
+        let mut successes = vec![];
+        let mut stdin = std::io::Cursor::new(b"r\n" as &[u8]);
+        cmd.run_interactive_retry_twiddle_check(
+            &mut failed,
+            &repo_view,
+            &client,
+            None,
+            &[],
+            &mut successes,
+            &mut stdin,
+        )
+        .await
+        .unwrap();
+        assert!(
+            failed.is_empty(),
+            "retry succeeded → failed_indices cleared"
+        );
+        assert_eq!(successes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn interactive_retry_twiddle_default_input_retries() {
+        // Empty input (just Enter) is treated as "r" (retry).
+        let (commit, _tmp) = make_twiddle_commit("abc00000");
+        let cmd = make_twiddle_cmd();
+        let repo_view = make_twiddle_repo_view(vec![commit]);
+        let client = make_mock_client(vec![Ok(twiddle_check_yaml("abc00000"))]);
+        let mut failed = vec![0usize];
+        let mut successes = vec![];
+        let mut stdin = std::io::Cursor::new(b"\n" as &[u8]);
+        cmd.run_interactive_retry_twiddle_check(
+            &mut failed,
+            &repo_view,
+            &client,
+            None,
+            &[],
+            &mut successes,
+            &mut stdin,
+        )
+        .await
+        .unwrap();
+        assert!(failed.is_empty());
+        assert_eq!(successes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn interactive_retry_twiddle_still_fails_then_skip() {
+        // "r" → retry fails → still in failed_indices → "s" → skip.
+        let (commit, _tmp) = make_twiddle_commit("abc00000");
+        let cmd = make_twiddle_cmd();
+        let repo_view = make_twiddle_repo_view(vec![commit]);
+        // Retry attempt hits max_retries=2 (3 total attempts).
+        let responses = (0..3).map(|_| Err(anyhow::anyhow!("mock fail"))).collect();
+        let client = make_mock_client(responses);
+        let mut failed = vec![0usize];
+        let mut successes = vec![];
+        let mut stdin = std::io::Cursor::new(b"r\ns\n" as &[u8]);
+        cmd.run_interactive_retry_twiddle_check(
+            &mut failed,
+            &repo_view,
+            &client,
+            None,
+            &[],
+            &mut successes,
+            &mut stdin,
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed, vec![0], "commit still failed after retry");
+        assert!(successes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn interactive_retry_twiddle_invalid_input_then_skip() {
+        // Unrecognised input → "please enter r or s" message → "s" exits.
+        let (commit, _tmp) = make_twiddle_commit("abc00000");
+        let cmd = make_twiddle_cmd();
+        let repo_view = make_twiddle_repo_view(vec![commit]);
+        let client = make_mock_client(vec![]);
+        let mut failed = vec![0usize];
+        let mut successes = vec![];
+        let mut stdin = std::io::Cursor::new(b"x\ns\n" as &[u8]);
+        cmd.run_interactive_retry_twiddle_check(
+            &mut failed,
+            &repo_view,
+            &client,
+            None,
+            &[],
+            &mut successes,
+            &mut stdin,
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed, vec![0]);
+        assert!(successes.is_empty());
     }
 }
