@@ -29,3 +29,4 @@ by Michael Nygard.
 | [ADR-0003](adr-0003.md)  | ✅ Accepted | 2026-02-20 | Hybrid Git Integration — git2 for Reads, Shell for Complex Mutations |
 | [ADR-0004](adr-0004.md)  | ✅ Accepted | 2026-02-21 | Embedded Templates via `include_str!`                                |
 | [ADR-0005](adr-0005.md)  | ✅ Accepted | 2026-02-21 | Hierarchical Configuration Resolution with Walk-Up Discovery         |
+| [ADR-0006](adr-0006.md)  | ✅ Accepted | 2026-02-22 | Two-View Repository Data Model via Generics and Composition          |
