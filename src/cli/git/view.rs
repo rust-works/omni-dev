@@ -76,11 +76,7 @@ impl ViewCommand {
             commits,
         };
 
-        // Update field presence based on actual data
-        repo_view.update_field_presence();
-
-        // Output as YAML
-        let yaml_output = crate::data::to_yaml(&repo_view)?;
+        let yaml_output = repo_view.to_yaml_output()?;
         println!("{yaml_output}");
 
         Ok(())

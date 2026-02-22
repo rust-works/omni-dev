@@ -182,16 +182,29 @@ impl RepositoryView {
                 "pr_template" => self.pr_template.is_some(),
                 "pr_template_location" => self.pr_template_location.is_some(),
                 "branch_prs" => self.branch_prs.is_some(),
-                "branch_prs[].number" => {
+                "branch_prs[].number"
+                | "branch_prs[].title"
+                | "branch_prs[].state"
+                | "branch_prs[].url"
+                | "branch_prs[].body"
+                | "branch_prs[].base" => {
                     self.branch_prs.as_ref().is_some_and(|prs| !prs.is_empty())
                 }
-                "branch_prs[].title" => self.branch_prs.as_ref().is_some_and(|prs| !prs.is_empty()),
-                "branch_prs[].state" => self.branch_prs.as_ref().is_some_and(|prs| !prs.is_empty()),
-                "branch_prs[].url" => self.branch_prs.as_ref().is_some_and(|prs| !prs.is_empty()),
-                "branch_prs[].body" => self.branch_prs.as_ref().is_some_and(|prs| !prs.is_empty()),
                 _ => false, // Unknown fields are not present
             }
         }
+    }
+
+    /// Serializes this view to YAML, calling [`update_field_presence`] first.
+    ///
+    /// Use this instead of calling `update_field_presence` followed by
+    /// `crate::data::to_yaml` separately.  Keeping the two steps together
+    /// prevents the explanation section from being stale in the output.
+    ///
+    /// [`update_field_presence`]: Self::update_field_presence
+    pub fn to_yaml_output(&mut self) -> anyhow::Result<String> {
+        self.update_field_presence();
+        yaml::to_yaml(self)
     }
 
     /// Creates a minimal view containing a single commit for parallel dispatch.
@@ -434,6 +447,12 @@ impl Default for FieldExplanation {
                 FieldDocumentation {
                     name: "branch_prs[].body".to_string(),
                     text: "Pull request description/body content".to_string(),
+                    command: None,
+                    present: false,
+                },
+                FieldDocumentation {
+                    name: "branch_prs[].base".to_string(),
+                    text: "Base branch the pull request targets".to_string(),
                     command: None,
                     present: false,
                 },
@@ -866,6 +885,42 @@ mod tests {
         view.update_field_presence();
 
         assert_eq!(field_present(&view, "nonexistent.field"), Some(false));
+    }
+
+    #[test]
+    fn all_documented_fields_present_with_full_data() {
+        // Build a view where every optional field is populated and commits are
+        // non-empty.  After update_field_presence() every documented field must
+        // be present=true.  If a new FieldDocumentation entry is added without
+        // a corresponding match arm the catch-all arm returns false and this
+        // test fails, catching the drift at test time.
+        let commit = make_commit_info("abc123");
+        let mut view = make_repo_view(vec![commit]);
+        view.versions = Some(VersionInfo {
+            omni_dev: "1.0.0".to_string(),
+        });
+        view.branch_info = Some(BranchInfo {
+            branch: "main".to_string(),
+        });
+        view.pr_template = Some("template".to_string());
+        view.pr_template_location = Some(".github/pull_request_template.md".to_string());
+        view.branch_prs = Some(vec![PullRequest {
+            number: 1,
+            title: "Test".to_string(),
+            state: "open".to_string(),
+            url: "https://github.com/example/repo/pull/1".to_string(),
+            body: "body".to_string(),
+            base: "main".to_string(),
+        }]);
+        view.update_field_presence();
+
+        for field in &view.explanation.fields {
+            assert!(
+                field.present,
+                "Field '{}' is documented but not matched in update_field_presence()",
+                field.name
+            );
+        }
     }
 
     // ── single_commit_view / multi_commit_view ───────────────────────
