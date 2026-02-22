@@ -875,6 +875,42 @@ mod tests {
         assert_eq!(field_present(&view, "nonexistent.field"), Some(false));
     }
 
+    #[test]
+    fn all_documented_fields_present_with_full_data() {
+        // Build a view where every optional field is populated and commits are
+        // non-empty.  After update_field_presence() every documented field must
+        // be present=true.  If a new FieldDocumentation entry is added without
+        // a corresponding match arm the catch-all arm returns false and this
+        // test fails, catching the drift at test time.
+        let commit = make_commit_info("abc123");
+        let mut view = make_repo_view(vec![commit]);
+        view.versions = Some(VersionInfo {
+            omni_dev: "1.0.0".to_string(),
+        });
+        view.branch_info = Some(BranchInfo {
+            branch: "main".to_string(),
+        });
+        view.pr_template = Some("template".to_string());
+        view.pr_template_location = Some(".github/pull_request_template.md".to_string());
+        view.branch_prs = Some(vec![PullRequest {
+            number: 1,
+            title: "Test".to_string(),
+            state: "open".to_string(),
+            url: "https://github.com/example/repo/pull/1".to_string(),
+            body: "body".to_string(),
+            base: "main".to_string(),
+        }]);
+        view.update_field_presence();
+
+        for field in &view.explanation.fields {
+            assert!(
+                field.present,
+                "Field '{}' is documented but not matched in update_field_presence()",
+                field.name
+            );
+        }
+    }
+
     // ── single_commit_view / multi_commit_view ───────────────────────
 
     fn make_commit_info(hash: &str) -> crate::git::CommitInfo {
