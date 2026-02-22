@@ -7,6 +7,8 @@ pub mod context;
 pub mod error;
 pub mod model_config;
 pub mod prompts;
+#[cfg(test)]
+pub(crate) mod test_utils;
 pub(crate) mod token_budget;
 
 pub use ai::bedrock::BedrockAiClient;
