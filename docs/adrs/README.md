@@ -32,3 +32,5 @@ by Michael Nygard.
 | [ADR-0006](adr-0006.md)  | ✅ Accepted | 2026-02-22 | Two-View Repository Data Model via Generics and Composition          |
 | [ADR-0007](adr-0007.md)  | ✅ Accepted | 2026-02-22 | Preflight Validation Pattern                                         |
 | [ADR-0008](adr-0008.md)  | ✅ Accepted | 2026-02-22 | Deterministic Pre-Validation Before AI Analysis                      |
+| [ADR-0009](adr-0009.md)  | ✅ Accepted | 2026-02-22 | Token-Budget-Aware Batch Planning                                    |
+| [ADR-0010](adr-0010.md)  | ✅ Accepted | 2026-02-22 | Multi-Layer Retry Strategy                                           |
