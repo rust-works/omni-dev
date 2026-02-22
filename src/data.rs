@@ -182,13 +182,13 @@ impl RepositoryView {
                 "pr_template" => self.pr_template.is_some(),
                 "pr_template_location" => self.pr_template_location.is_some(),
                 "branch_prs" => self.branch_prs.is_some(),
-                "branch_prs[].number" => {
+                "branch_prs[].number"
+                | "branch_prs[].title"
+                | "branch_prs[].state"
+                | "branch_prs[].url"
+                | "branch_prs[].body" => {
                     self.branch_prs.as_ref().is_some_and(|prs| !prs.is_empty())
                 }
-                "branch_prs[].title" => self.branch_prs.as_ref().is_some_and(|prs| !prs.is_empty()),
-                "branch_prs[].state" => self.branch_prs.as_ref().is_some_and(|prs| !prs.is_empty()),
-                "branch_prs[].url" => self.branch_prs.as_ref().is_some_and(|prs| !prs.is_empty()),
-                "branch_prs[].body" => self.branch_prs.as_ref().is_some_and(|prs| !prs.is_empty()),
                 _ => false, // Unknown fields are not present
             }
         }
