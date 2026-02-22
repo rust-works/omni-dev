@@ -50,10 +50,6 @@ pub struct CheckCommand {
     #[arg(long)]
     pub show_passing: bool,
 
-    /// Deprecated: use --concurrency instead.
-    #[arg(long, default_value = "4", hide = true)]
-    pub batch_size: usize,
-
     /// Maximum number of concurrent AI requests (default: 4).
     #[arg(long, default_value = "4")]
     pub concurrency: usize,
@@ -1059,7 +1055,6 @@ mod tests {
             quiet,
             verbose: false,
             show_passing: false,
-            batch_size: 4,
             concurrency: 4,
             no_coherence: true,
             no_suggestions: false,
