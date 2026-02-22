@@ -86,14 +86,10 @@ This skill performs the complete end-to-end release process for omni-dev, from v
     ```bash
     git add Cargo.toml Cargo.lock CHANGELOG.md docs/
     git commit -m "$(cat <<'EOF'
-    chore: prepare release vX.Y.Z
+    chore(release): prepare release vX.Y.Z
 
     - Update version from PREV to X.Y.Z
     - Update CHANGELOG.md with release notes
-
-    🤖 Generated with [Claude Code](https://claude.com/claude-code)
-
-    Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
     EOF
     )"
     ```
