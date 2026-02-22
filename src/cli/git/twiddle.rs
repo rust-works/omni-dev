@@ -50,10 +50,6 @@ pub struct TwiddleCommand {
     #[arg(long)]
     pub no_context: bool,
 
-    /// Deprecated: use --concurrency instead.
-    #[arg(long, default_value = "4", hide = true)]
-    pub batch_size: usize,
-
     /// Maximum number of concurrent AI requests (default: 4).
     #[arg(long, default_value = "4")]
     pub concurrency: usize,
@@ -1787,7 +1783,6 @@ mod tests {
             work_context: None,
             branch_context: None,
             no_context: true,
-            batch_size: 4,
             concurrency: 4,
             no_coherence: true,
             no_ai: false,
