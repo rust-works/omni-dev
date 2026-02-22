@@ -139,8 +139,8 @@ impl ModelRegistry {
             return Some(spec);
         }
 
-        // Try fuzzy matching for Bedrock-style identifiers
-        self.find_model_by_fuzzy_match(api_identifier)
+        // Try normalizing the identifier and looking up again
+        self.find_model_by_normalized_id(api_identifier)
     }
 
     /// Returns the max output tokens for a model, with fallback to provider defaults.
@@ -192,7 +192,7 @@ impl ModelRegistry {
     ///
     /// Handles Bedrock-style (`us.anthropic.claude-3-7-sonnet-20250219-v1:0`),
     /// AWS-style (`anthropic.claude-3-haiku-20240307-v1:0`), and standard identifiers.
-    fn find_model_by_fuzzy_match(&self, api_identifier: &str) -> Option<&ModelSpec> {
+    fn find_model_by_normalized_id(&self, api_identifier: &str) -> Option<&ModelSpec> {
         let core_identifier = self.extract_core_model_identifier(api_identifier);
         self.by_identifier.get(&core_identifier)
     }
@@ -400,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn fuzzy_model_matching() {
+    fn normalized_id_matching() {
         let registry = ModelRegistry::load().unwrap();
 
         // Test Bedrock-style identifiers
