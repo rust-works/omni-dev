@@ -359,7 +359,7 @@ impl TwiddleCommand {
                                     (a, summary)
                                 })
                                 .collect();
-                            Ok(items)
+                            Ok::<_, anyhow::Error>((items, vec![]))
                         }
                         Err(e) if batch_size > 1 => {
                             // Split-and-retry: fall back to individual commits
@@ -367,6 +367,7 @@ impl TwiddleCommand {
                                 "warning: batch of {batch_size} failed, retrying individually: {e}"
                             );
                             let mut items = Vec::new();
+                            let mut failed_indices = Vec::new();
                             for &idx in batch_indices {
                                 let single_view =
                                     repo_ref.single_commit_view(&repo_ref.commits[idx]);
@@ -383,23 +384,36 @@ impl TwiddleCommand {
                                         .generate_amendments_with_options(&single_view, fresh)
                                         .await
                                 };
+                                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                                 match single_result {
                                     Ok(af) => {
                                         if let Some(a) = af.amendments.into_iter().next() {
                                             let summary = a.summary.clone().unwrap_or_default();
                                             items.push((a, summary));
                                         }
+                                        println!("   ✅ {done}/{total_commits} commits processed");
                                     }
                                     Err(e) => {
                                         eprintln!("warning: failed to process commit: {e}");
+                                        failed_indices.push(idx);
+                                        println!(
+                                            "   ❌ {done}/{total_commits} commits processed (failed)"
+                                        );
                                     }
                                 }
-                                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                                println!("   ✅ {done}/{total_commits} commits processed");
                             }
-                            Ok(items)
+                            Ok((items, failed_indices))
                         }
-                        Err(e) => Err(e),
+                        Err(e) => {
+                            // Single-commit batch failed; record the index so the user can retry
+                            let idx = batch_indices[0];
+                            eprintln!("warning: failed to process commit: {e}");
+                            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                            println!(
+                                "   ❌ {done}/{total_commits} commits processed (failed)"
+                            );
+                            Ok((vec![], vec![idx]))
+                        }
                     }
                 }
             })
@@ -409,20 +423,104 @@ impl TwiddleCommand {
 
         // Flatten batch results
         let mut successes: Vec<(crate::data::amendments::Amendment, String)> = Vec::new();
-        let mut failure_count = 0;
+        let mut failed_indices: Vec<usize> = Vec::new();
 
         for result in results {
             match result {
-                Ok(items) => successes.extend(items),
+                Ok((items, failed)) => {
+                    successes.extend(items);
+                    failed_indices.extend(failed);
+                }
                 Err(e) => {
-                    eprintln!("warning: failed to process commit: {e}");
-                    failure_count += 1;
+                    // Semaphore errors: can't identify which commits were affected
+                    eprintln!("warning: batch processing error: {e}");
                 }
             }
         }
 
-        if failure_count > 0 {
-            eprintln!("warning: {failure_count} commit(s) failed to process");
+        // Offer interactive retry for commits that failed
+        if !failed_indices.is_empty() {
+            use std::io::Write as _;
+            println!(
+                "\n⚠️  {} commit(s) failed to process:",
+                failed_indices.len()
+            );
+            for &idx in &failed_indices {
+                let commit = &full_repo_view.commits[idx];
+                let subject = commit
+                    .original_message
+                    .lines()
+                    .next()
+                    .unwrap_or("(no message)");
+                println!("  - {}: {}", &commit.hash[..8], subject);
+            }
+            loop {
+                print!("\n❓ [R]etry failed commits, or [S]kip? [R/s] ");
+                std::io::stdout().flush()?;
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                match input.trim().to_lowercase().as_str() {
+                    "r" | "retry" | "" => {
+                        let mut still_failed = Vec::new();
+                        for &idx in &failed_indices {
+                            let single_view =
+                                full_repo_view.single_commit_view(&full_repo_view.commits[idx]);
+                            let result = if let Some(ref ctx) = context {
+                                claude_client
+                                    .generate_contextual_amendments_with_options(
+                                        &single_view,
+                                        ctx,
+                                        fresh,
+                                    )
+                                    .await
+                            } else {
+                                claude_client
+                                    .generate_amendments_with_options(&single_view, fresh)
+                                    .await
+                            };
+                            match result {
+                                Ok(af) => {
+                                    if let Some(a) = af.amendments.into_iter().next() {
+                                        let summary = a.summary.clone().unwrap_or_default();
+                                        successes.push((a, summary));
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("warning: still failed: {e}");
+                                    still_failed.push(idx);
+                                }
+                            }
+                        }
+                        failed_indices = still_failed;
+                        if failed_indices.is_empty() {
+                            println!("✅ All retried commits succeeded.");
+                            break;
+                        }
+                        println!("\n⚠️  {} commit(s) still failed:", failed_indices.len());
+                        for &idx in &failed_indices {
+                            let commit = &full_repo_view.commits[idx];
+                            let subject = commit
+                                .original_message
+                                .lines()
+                                .next()
+                                .unwrap_or("(no message)");
+                            println!("  - {}: {}", &commit.hash[..8], subject);
+                        }
+                    }
+                    "s" | "skip" => {
+                        println!("Skipping {} failed commit(s).", failed_indices.len());
+                        break;
+                    }
+                    _ => println!("Please enter 'r' to retry or 's' to skip."),
+                }
+            }
+        }
+
+        if !failed_indices.is_empty() {
+            eprintln!(
+                "warning: {} commit(s) ultimately failed to process",
+                failed_indices.len()
+            );
         }
 
         if successes.is_empty() {
@@ -1233,13 +1331,14 @@ impl TwiddleCommand {
                                     (r, summary)
                                 })
                                 .collect();
-                            Ok(items)
+                            Ok::<_, anyhow::Error>((items, vec![]))
                         }
                         Err(e) if batch_size > 1 => {
                             eprintln!(
                                 "warning: batch of {batch_size} failed, retrying individually: {e}"
                             );
                             let mut items = Vec::new();
+                            let mut failed_indices = Vec::new();
                             for &idx in batch_indices {
                                 let single_view =
                                     full_repo_view.single_commit_view(&full_repo_view.commits[idx]);
@@ -1251,23 +1350,34 @@ impl TwiddleCommand {
                                         true,
                                     )
                                     .await;
+                                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                                 match single_result {
                                     Ok(report) => {
                                         if let Some(r) = report.commits.into_iter().next() {
                                             let summary = r.summary.clone().unwrap_or_default();
                                             items.push((r, summary));
                                         }
+                                        println!("   ✅ {done}/{total_commits} commits checked");
                                     }
                                     Err(e) => {
                                         eprintln!("warning: failed to check commit: {e}");
+                                        failed_indices.push(idx);
+                                        println!(
+                                            "   ❌ {done}/{total_commits} commits checked (failed)"
+                                        );
                                     }
                                 }
-                                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                                println!("   ✅ {done}/{total_commits} commits checked");
                             }
-                            Ok(items)
+                            Ok((items, failed_indices))
                         }
-                        Err(e) => Err(e),
+                        Err(e) => {
+                            // Single-commit batch failed; record the index so the user can retry
+                            let idx = batch_indices[0];
+                            eprintln!("warning: failed to check commit: {e}");
+                            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                            println!("   ❌ {done}/{total_commits} commits checked (failed)");
+                            Ok((vec![], vec![idx]))
+                        }
                     }
                 }
             })
@@ -1276,20 +1386,40 @@ impl TwiddleCommand {
         let results = futures::future::join_all(futs).await;
 
         let mut successes: Vec<(CommitCheckResult, String)> = Vec::new();
-        let mut failure_count = 0;
+        let mut failed_indices: Vec<usize> = Vec::new();
 
         for result in results {
             match result {
-                Ok(items) => successes.extend(items),
+                Ok((items, failed)) => {
+                    successes.extend(items);
+                    failed_indices.extend(failed);
+                }
                 Err(e) => {
-                    eprintln!("warning: failed to check commit: {e}");
-                    failure_count += 1;
+                    // Semaphore errors: can't identify which commits were affected
+                    eprintln!("warning: batch processing error: {e}");
                 }
             }
         }
 
-        if failure_count > 0 {
-            eprintln!("warning: {failure_count} commit(s) failed to check");
+        // Offer interactive retry for commits that failed
+        if !failed_indices.is_empty() {
+            self.run_interactive_retry_twiddle_check(
+                &mut failed_indices,
+                full_repo_view,
+                claude_client,
+                guidelines,
+                valid_scopes,
+                &mut successes,
+                &mut std::io::BufReader::new(std::io::stdin()),
+            )
+            .await?;
+        }
+
+        if !failed_indices.is_empty() {
+            eprintln!(
+                "warning: {} commit(s) ultimately failed to check",
+                failed_indices.len()
+            );
         }
 
         if successes.is_empty() {
@@ -1314,6 +1444,84 @@ impl TwiddleCommand {
         Ok(CheckReport::new(
             successes.into_iter().map(|(r, _)| r).collect(),
         ))
+    }
+
+    /// Prompts the user to retry or skip failed commits, updating `failed_indices` and `successes`.
+    ///
+    /// Accepts `reader` for stdin injection so the interactive loop can be unit-tested.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_interactive_retry_twiddle_check(
+        &self,
+        failed_indices: &mut Vec<usize>,
+        full_repo_view: &crate::data::RepositoryView,
+        claude_client: &crate::claude::client::ClaudeClient,
+        guidelines: Option<&str>,
+        valid_scopes: &[crate::data::context::ScopeDefinition],
+        successes: &mut Vec<(crate::data::check::CommitCheckResult, String)>,
+        reader: &mut (dyn std::io::BufRead + Send),
+    ) -> Result<()> {
+        use std::io::Write as _;
+        println!("\n⚠️  {} commit(s) failed to check:", failed_indices.len());
+        for &idx in failed_indices.iter() {
+            let commit = &full_repo_view.commits[idx];
+            let subject = commit
+                .original_message
+                .lines()
+                .next()
+                .unwrap_or("(no message)");
+            println!("  - {}: {}", &commit.hash[..8], subject);
+        }
+        loop {
+            print!("\n❓ [R]etry failed commits, or [S]kip? [R/s] ");
+            std::io::stdout().flush()?;
+            let mut input = String::new();
+            reader.read_line(&mut input)?;
+            match input.trim().to_lowercase().as_str() {
+                "r" | "retry" | "" => {
+                    let mut still_failed = Vec::new();
+                    for &idx in failed_indices.iter() {
+                        let single_view =
+                            full_repo_view.single_commit_view(&full_repo_view.commits[idx]);
+                        match claude_client
+                            .check_commits_with_scopes(&single_view, guidelines, valid_scopes, true)
+                            .await
+                        {
+                            Ok(report) => {
+                                if let Some(r) = report.commits.into_iter().next() {
+                                    let summary = r.summary.clone().unwrap_or_default();
+                                    successes.push((r, summary));
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("warning: still failed: {e}");
+                                still_failed.push(idx);
+                            }
+                        }
+                    }
+                    *failed_indices = still_failed;
+                    if failed_indices.is_empty() {
+                        println!("✅ All retried commits succeeded.");
+                        break;
+                    }
+                    println!("\n⚠️  {} commit(s) still failed:", failed_indices.len());
+                    for &idx in failed_indices.iter() {
+                        let commit = &full_repo_view.commits[idx];
+                        let subject = commit
+                            .original_message
+                            .lines()
+                            .next()
+                            .unwrap_or("(no message)");
+                        println!("  - {}: {}", &commit.hash[..8], subject);
+                    }
+                }
+                "s" | "skip" => {
+                    println!("Skipping {} failed commit(s).", failed_indices.len());
+                    break;
+                }
+                _ => println!("Please enter 'r' to retry or 's' to skip."),
+            }
+        }
+        Ok(())
     }
 
     /// Outputs the text format check report (mirrors `CheckCommand::output_text_report`).
@@ -1563,5 +1771,260 @@ mod tests {
     fn fresh_and_refine_conflict() {
         let result = TwiddleCommand::try_parse_from(["twiddle", "--fresh", "--refine"]);
         assert!(result.is_err(), "--fresh and --refine should conflict");
+    }
+
+    // --- check_commits_map_reduce (success paths via mock client) ---
+
+    fn make_twiddle_cmd() -> TwiddleCommand {
+        TwiddleCommand {
+            commit_range: None,
+            model: None,
+            beta_header: None,
+            auto_apply: false,
+            save_only: None,
+            use_context: false,
+            context_dir: None,
+            work_context: None,
+            branch_context: None,
+            no_context: true,
+            batch_size: 4,
+            concurrency: 4,
+            no_coherence: true,
+            no_ai: false,
+            fresh: false,
+            refine: false,
+            check: false,
+        }
+    }
+
+    fn make_twiddle_commit(hash: &str) -> (crate::git::CommitInfo, tempfile::NamedTempFile) {
+        use crate::git::commit::FileChanges;
+        use crate::git::{CommitAnalysis, CommitInfo};
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let commit = CommitInfo {
+            hash: hash.to_string(),
+            author: "Test <test@test.com>".to_string(),
+            date: chrono::Utc::now().fixed_offset(),
+            original_message: format!("feat: commit {hash}"),
+            in_main_branches: vec![],
+            analysis: CommitAnalysis {
+                detected_type: "feat".to_string(),
+                detected_scope: String::new(),
+                proposed_message: format!("feat: commit {hash}"),
+                file_changes: FileChanges {
+                    total_files: 0,
+                    files_added: 0,
+                    files_deleted: 0,
+                    file_list: vec![],
+                },
+                diff_summary: String::new(),
+                diff_file: tmp.path().to_string_lossy().to_string(),
+            },
+        };
+        (commit, tmp)
+    }
+
+    fn make_twiddle_repo_view(commits: Vec<crate::git::CommitInfo>) -> crate::data::RepositoryView {
+        use crate::data::{AiInfo, FieldExplanation, RepositoryView, WorkingDirectoryInfo};
+        RepositoryView {
+            versions: None,
+            explanation: FieldExplanation::default(),
+            working_directory: WorkingDirectoryInfo {
+                clean: true,
+                untracked_changes: vec![],
+            },
+            remotes: vec![],
+            ai: AiInfo {
+                scratch: String::new(),
+            },
+            branch_info: None,
+            pr_template: None,
+            pr_template_location: None,
+            branch_prs: None,
+            commits,
+        }
+    }
+
+    fn twiddle_check_yaml(hash: &str) -> String {
+        format!("checks:\n  - commit: {hash}\n    passes: true\n    issues: []\n")
+    }
+
+    fn make_mock_client(
+        responses: Vec<anyhow::Result<String>>,
+    ) -> crate::claude::client::ClaudeClient {
+        crate::claude::client::ClaudeClient::new(Box::new(
+            crate::claude::test_utils::ConfigurableMockAiClient::new(responses),
+        ))
+    }
+
+    #[tokio::test]
+    async fn check_commits_map_reduce_single_commit_succeeds() {
+        // Happy path: one commit, batch succeeds on first attempt.
+        let (commit, _tmp) = make_twiddle_commit("abc00000");
+        let cmd = make_twiddle_cmd();
+        let repo_view = make_twiddle_repo_view(vec![commit]);
+        let client = make_mock_client(vec![Ok(twiddle_check_yaml("abc00000"))]);
+        let result = cmd
+            .check_commits_map_reduce(&client, &repo_view, None, &[])
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().commits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn check_commits_map_reduce_batch_fails_split_retry_both_succeed() {
+        // Two commits in one batch. Batch fails (3 retries), then each commit
+        // succeeds individually via split-and-retry. No stdin interaction since
+        // failed_indices stays empty after both retries succeed.
+        let (c1, _t1) = make_twiddle_commit("abc00000");
+        let (c2, _t2) = make_twiddle_commit("def00000");
+        let cmd = make_twiddle_cmd();
+        let repo_view = make_twiddle_repo_view(vec![c1, c2]);
+        let mut responses: Vec<anyhow::Result<String>> =
+            (0..3).map(|_| Err(anyhow::anyhow!("batch fail"))).collect();
+        responses.push(Ok(twiddle_check_yaml("abc00000")));
+        responses.push(Ok(twiddle_check_yaml("def00000")));
+        let client = make_mock_client(responses);
+        let result = cmd
+            .check_commits_map_reduce(&client, &repo_view, None, &[])
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().commits.len(), 2);
+    }
+
+    // --- run_interactive_retry_twiddle_check ---
+
+    #[tokio::test]
+    async fn interactive_retry_twiddle_skip_immediately() {
+        // "s" input → loop exits without calling the AI client at all.
+        let (commit, _tmp) = make_twiddle_commit("abc00000");
+        let cmd = make_twiddle_cmd();
+        let repo_view = make_twiddle_repo_view(vec![commit]);
+        let client = make_mock_client(vec![]);
+        let mut failed = vec![0usize];
+        let mut successes = vec![];
+        let mut stdin = std::io::Cursor::new(b"s\n" as &[u8]);
+        cmd.run_interactive_retry_twiddle_check(
+            &mut failed,
+            &repo_view,
+            &client,
+            None,
+            &[],
+            &mut successes,
+            &mut stdin,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            failed,
+            vec![0],
+            "skip should leave failed_indices unchanged"
+        );
+        assert!(successes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn interactive_retry_twiddle_retry_succeeds() {
+        // "r" input → retries the failed commit, which succeeds.
+        let (commit, _tmp) = make_twiddle_commit("abc00000");
+        let cmd = make_twiddle_cmd();
+        let repo_view = make_twiddle_repo_view(vec![commit]);
+        let client = make_mock_client(vec![Ok(twiddle_check_yaml("abc00000"))]);
+        let mut failed = vec![0usize];
+        let mut successes = vec![];
+        let mut stdin = std::io::Cursor::new(b"r\n" as &[u8]);
+        cmd.run_interactive_retry_twiddle_check(
+            &mut failed,
+            &repo_view,
+            &client,
+            None,
+            &[],
+            &mut successes,
+            &mut stdin,
+        )
+        .await
+        .unwrap();
+        assert!(
+            failed.is_empty(),
+            "retry succeeded → failed_indices cleared"
+        );
+        assert_eq!(successes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn interactive_retry_twiddle_default_input_retries() {
+        // Empty input (just Enter) is treated as "r" (retry).
+        let (commit, _tmp) = make_twiddle_commit("abc00000");
+        let cmd = make_twiddle_cmd();
+        let repo_view = make_twiddle_repo_view(vec![commit]);
+        let client = make_mock_client(vec![Ok(twiddle_check_yaml("abc00000"))]);
+        let mut failed = vec![0usize];
+        let mut successes = vec![];
+        let mut stdin = std::io::Cursor::new(b"\n" as &[u8]);
+        cmd.run_interactive_retry_twiddle_check(
+            &mut failed,
+            &repo_view,
+            &client,
+            None,
+            &[],
+            &mut successes,
+            &mut stdin,
+        )
+        .await
+        .unwrap();
+        assert!(failed.is_empty());
+        assert_eq!(successes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn interactive_retry_twiddle_still_fails_then_skip() {
+        // "r" → retry fails → still in failed_indices → "s" → skip.
+        let (commit, _tmp) = make_twiddle_commit("abc00000");
+        let cmd = make_twiddle_cmd();
+        let repo_view = make_twiddle_repo_view(vec![commit]);
+        // Retry attempt hits max_retries=2 (3 total attempts).
+        let responses = (0..3).map(|_| Err(anyhow::anyhow!("mock fail"))).collect();
+        let client = make_mock_client(responses);
+        let mut failed = vec![0usize];
+        let mut successes = vec![];
+        let mut stdin = std::io::Cursor::new(b"r\ns\n" as &[u8]);
+        cmd.run_interactive_retry_twiddle_check(
+            &mut failed,
+            &repo_view,
+            &client,
+            None,
+            &[],
+            &mut successes,
+            &mut stdin,
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed, vec![0], "commit still failed after retry");
+        assert!(successes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn interactive_retry_twiddle_invalid_input_then_skip() {
+        // Unrecognised input → "please enter r or s" message → "s" exits.
+        let (commit, _tmp) = make_twiddle_commit("abc00000");
+        let cmd = make_twiddle_cmd();
+        let repo_view = make_twiddle_repo_view(vec![commit]);
+        let client = make_mock_client(vec![]);
+        let mut failed = vec![0usize];
+        let mut successes = vec![];
+        let mut stdin = std::io::Cursor::new(b"x\ns\n" as &[u8]);
+        cmd.run_interactive_retry_twiddle_check(
+            &mut failed,
+            &repo_view,
+            &client,
+            None,
+            &[],
+            &mut successes,
+            &mut stdin,
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed, vec![0]);
+        assert!(successes.is_empty());
     }
 }
