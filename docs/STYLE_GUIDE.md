@@ -21,6 +21,7 @@ which tags apply to the changes and search this file for those tags. Each rule h
 | Changing visibility (`pub`, `pub(crate)`)        | `api-design`, `module-organization`      |
 | Adding constants or replacing magic values       | `code-style`, `naming`                   |
 | Writing commit messages                          | `commits`                                |
+| After creating commits (before push / PR)        | `commits`                                |
 | Suppressing a lint or considering `unsafe`       | `code-style`, `unsafe`                   |
 | Writing or updating an ADR                       | `adrs`                                   |
 | Reviewing code for style compliance              | All tags relevant to the changed code    |
@@ -37,7 +38,7 @@ A new convention needs to be added to this style guide.
 
 ### Guidance
 
-Assign the next sequential ID (currently next is `STYLE-0023`) and include:
+Assign the next sequential ID (currently next is `STYLE-0024`) and include:
 
 1. A **Tags** line immediately after the heading — a comma-separated list of category labels
    from the tag vocabulary below.
@@ -48,19 +49,19 @@ Assign the next sequential ID (currently next is `STYLE-0023`) and include:
 
 **Tag vocabulary** (extend as needed):
 
-| Tag                  | Covers                                            |
-|----------------------|---------------------------------------------------|
-| `meta`               | Style guide structure and process                 |
+| Tag                  | Covers                                             |
+|----------------------|----------------------------------------------------|
+| `meta`               | Style guide structure and process                  |
 | `error-handling`     | Error types, context messages, panics, suppression |
-| `module-organization`| File layout, visibility, cohesion                 |
-| `naming`             | Naming conventions for types, functions, files    |
-| `commits`            | Commit message format, scope rules, discipline    |
-| `documentation`      | Doc comments, examples                            |
-| `testing`            | Test structure, fixtures, snapshots               |
+| `module-organization`| File layout, visibility, cohesion                  |
+| `naming`             | Naming conventions for types, functions, files     |
+| `commits`            | Commit message format, scope rules, discipline     |
+| `documentation`      | Doc comments, examples                             |
+| `testing`            | Test structure, fixtures, snapshots                |
 | `code-style`         | Imports, clippy, constants, function length        |
-| `api-design`         | Ownership, must_use, type safety, string params   |
-| `unsafe`             | Unsafe code policy                                |
-| `adrs`               | Architecture Decision Record format and process   |
+| `api-design`         | Ownership, must_use, type safety, string params    |
+| `unsafe`             | Unsafe code policy                                 |
+| `adrs`               | Architecture Decision Record format and process    |
 
 A rule may have **multiple tags** — e.g., a rule about error messages in tests could be
 tagged `error-handling, testing`.
@@ -1146,3 +1147,35 @@ A consistent structure makes ADRs scannable and sets clear expectations for both
 and reviewers. Extra sections blur the boundary between architectural decisions and
 operational guidance (which belongs in the style guide) or implementation detail (which
 belongs in code comments or docs).
+
+---
+
+## STYLE-0023: Validate commit messages with omni-dev after creation
+
+**Tags:** `commits`
+
+### Situation
+
+After creating one or more commits and before pushing or opening a pull request.
+
+### Guidance
+
+After every `git commit`, invoke the `commit-twiddle` skill to validate and fix the
+message against the guidelines in `.omni-dev/commit-guidelines.md`. The skill calls
+`omni-dev git commit message view` to analyse the commit, then
+`omni-dev git commit message amend` to rewrite the message if needed.
+
+**Constraints to observe:**
+
+- The target commit must be at the branch tip with **no merge commit above it**. If a
+  merge commit is present the amend step will fail — work on a branch before merging.
+- The amendments file requires the **exact 40-character SHA** from the commit output.
+  An abbreviated hash silently skips the amendment or errors.
+- Do **not** include a `Co-Authored-By` footer unless a human co-author contributed.
+  AI tool attribution footers must not be added to commit messages.
+
+### Motivation
+
+Running the twiddle step after commit creation catches scope, casing, and footer
+violations before they reach the remote, avoiding the costly reset-and-redo cycle
+required to rewrite history once a commit has been merged to `main`.
