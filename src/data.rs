@@ -186,7 +186,8 @@ impl RepositoryView {
                 | "branch_prs[].title"
                 | "branch_prs[].state"
                 | "branch_prs[].url"
-                | "branch_prs[].body" => {
+                | "branch_prs[].body"
+                | "branch_prs[].base" => {
                     self.branch_prs.as_ref().is_some_and(|prs| !prs.is_empty())
                 }
                 _ => false, // Unknown fields are not present
@@ -434,6 +435,12 @@ impl Default for FieldExplanation {
                 FieldDocumentation {
                     name: "branch_prs[].body".to_string(),
                     text: "Pull request description/body content".to_string(),
+                    command: None,
+                    present: false,
+                },
+                FieldDocumentation {
+                    name: "branch_prs[].base".to_string(),
+                    text: "Base branch the pull request targets".to_string(),
                     command: None,
                     present: false,
                 },
