@@ -97,11 +97,28 @@ CRITICAL YAML FORMATTING REQUIREMENTS:
 pub const SYSTEM_PROMPT: &str = BASIC_SYSTEM_PROMPT;
 
 /// Generates a contextual system prompt based on project and commit context (Phase 3).
+///
+/// # Note
+///
+/// This is a convenience wrapper that hardcodes [`PromptStyle::Claude`].
+/// Use [`generate_contextual_system_prompt_for_provider`] when the active provider is
+/// known at the call site (i.e. via [`crate::claude::ai::AiClientMetadata::prompt_style`]).
 pub fn generate_contextual_system_prompt(context: &CommitContext) -> String {
     generate_contextual_system_prompt_for_provider(context, PromptStyle::Claude)
 }
 
 /// Generates a contextual system prompt with provider-specific handling.
+///
+/// Provider-specific behaviour is limited to the commit-guidelines section:
+/// - [`PromptStyle::Claude`]: frames guidelines as a literal template to reproduce exactly.
+/// - [`PromptStyle::OpenAi`]: frames guidelines as guidance to follow, with explicit
+///   bullet-point instructions to avoid copying the guideline text verbatim.
+///
+/// The base prompt (`BASIC_SYSTEM_PROMPT`), verbosity hints, branch context, work-pattern
+/// context, and scope-consistency guidance are identical across providers.  Check prompts,
+/// coherence prompts, and user prompts are not provider-specific because the observed
+/// behavioural difference (template-reproduction vs. guidance-interpretation) only manifests
+/// when the guidelines section is present.
 pub fn generate_contextual_system_prompt_for_provider(
     context: &CommitContext,
     provider: PromptStyle,
@@ -452,6 +469,12 @@ Start immediately with "title:" and provide only YAML content. Ensure the title 
 }
 
 /// Generates a PR system prompt with project context and guidelines.
+///
+/// # Note
+///
+/// This is a convenience wrapper that hardcodes [`PromptStyle::Claude`].
+/// Use [`generate_pr_system_prompt_with_context_for_provider`] when the active provider is
+/// known at the call site (i.e. via [`crate::claude::ai::AiClientMetadata::prompt_style`]).
 pub fn generate_pr_system_prompt_with_context(
     context: &crate::data::context::CommitContext,
 ) -> String {
@@ -459,6 +482,13 @@ pub fn generate_pr_system_prompt_with_context(
 }
 
 /// Generates a PR system prompt with provider-specific handling.
+///
+/// Provider-specific behaviour applies to the template-filling instructions:
+/// - [`PromptStyle::Claude`]: brief reminder that the PR template is to be filled out,
+///   not copied — Claude handles this correctly with minimal instruction.
+/// - [`PromptStyle::OpenAi`]: explicit bullet-point instructions with a concrete example
+///   of what "fill out" means, because OpenAI models need more explicit guidance to avoid
+///   reproducing placeholder text verbatim.
 pub fn generate_pr_system_prompt_with_context_for_provider(
     context: &crate::data::context::CommitContext,
     provider: PromptStyle,
