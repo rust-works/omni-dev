@@ -36,3 +36,4 @@ by Michael Nygard.
 | [ADR-0010](adr-0010.md)  | ✅ Accepted | 2026-02-22 | Multi-Layer Retry Strategy                                           |
 | [ADR-0011](adr-0011.md)  | ✅ Accepted | 2026-02-23 | Compile-Time Model Registry with Identifier Normalization            |
 | [ADR-0012](adr-0012.md)  | ✅ Accepted | 2026-02-23 | Three-Level Issue Severity with `--strict` Exit-Code Promotion       |
+| [ADR-0013](adr-0013.md)  | ✅ Accepted | 2026-02-23 | Self-Describing YAML Output with Field Presence Tracking             |
