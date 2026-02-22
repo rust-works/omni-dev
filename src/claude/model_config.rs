@@ -12,6 +12,12 @@ use serde::Deserialize;
 /// Embedded models YAML configuration, loaded at compile time.
 pub(crate) const MODELS_YAML: &str = include_str!("../templates/models.yaml");
 
+/// Ultimate fallback max output tokens when no model or provider config matches.
+const FALLBACK_MAX_OUTPUT_TOKENS: usize = 4096;
+
+/// Ultimate fallback input context when no model or provider config matches.
+const FALLBACK_INPUT_CONTEXT: usize = 100_000;
+
 /// Beta header that unlocks enhanced model limits.
 #[derive(Debug, Deserialize, Clone)]
 pub struct BetaHeader {
@@ -126,17 +132,19 @@ impl ModelRegistry {
     }
 
     /// Returns the model specification for the given API identifier.
+    #[must_use]
     pub fn get_model_spec(&self, api_identifier: &str) -> Option<&ModelSpec> {
         // Try exact match first
         if let Some(spec) = self.by_identifier.get(api_identifier) {
             return Some(spec);
         }
 
-        // Try fuzzy matching for Bedrock-style identifiers
-        self.find_model_by_fuzzy_match(api_identifier)
+        // Try normalizing the identifier and looking up again
+        self.find_model_by_normalized_id(api_identifier)
     }
 
     /// Returns the max output tokens for a model, with fallback to provider defaults.
+    #[must_use]
     pub fn get_max_output_tokens(&self, api_identifier: &str) -> usize {
         if let Some(spec) = self.get_model_spec(api_identifier) {
             return spec.max_output_tokens;
@@ -150,10 +158,11 @@ impl ModelRegistry {
         }
 
         // Ultimate fallback
-        4096
+        FALLBACK_MAX_OUTPUT_TOKENS
     }
 
     /// Returns the input context limit for a model, with fallback to provider defaults.
+    #[must_use]
     pub fn get_input_context(&self, api_identifier: &str) -> usize {
         if let Some(spec) = self.get_model_spec(api_identifier) {
             return spec.input_context;
@@ -167,7 +176,7 @@ impl ModelRegistry {
         }
 
         // Ultimate fallback
-        100_000
+        FALLBACK_INPUT_CONTEXT
     }
 
     /// Infers the provider from a model identifier.
@@ -179,28 +188,13 @@ impl ModelRegistry {
         }
     }
 
-    /// Finds a model by fuzzy matching for various identifier formats.
-    fn find_model_by_fuzzy_match(&self, api_identifier: &str) -> Option<&ModelSpec> {
-        // Extract core model identifier from various formats:
-        // - Bedrock: "us.anthropic.claude-3-7-sonnet-20250219-v1:0" -> "claude-3-7-sonnet-20250219"
-        // - AWS: "anthropic.claude-3-haiku-20240307-v1:0" -> "claude-3-haiku-20240307"
-        // - Standard: "claude-3-opus-20240229" -> "claude-3-opus-20240229"
-
+    /// Finds a model by normalizing the identifier and performing an exact lookup.
+    ///
+    /// Handles Bedrock-style (`us.anthropic.claude-3-7-sonnet-20250219-v1:0`),
+    /// AWS-style (`anthropic.claude-3-haiku-20240307-v1:0`), and standard identifiers.
+    fn find_model_by_normalized_id(&self, api_identifier: &str) -> Option<&ModelSpec> {
         let core_identifier = self.extract_core_model_identifier(api_identifier);
-
-        // Try to find exact match with core identifier
-        if let Some(spec) = self.by_identifier.get(&core_identifier) {
-            return Some(spec);
-        }
-
-        // Try partial matching - look for models that contain the core parts
-        for (stored_id, spec) in &self.by_identifier {
-            if self.models_match_fuzzy(&core_identifier, stored_id) {
-                return Some(spec);
-            }
-        }
-
-        None
+        self.by_identifier.get(&core_identifier)
     }
 
     /// Extracts the core model identifier from various formats.
@@ -230,13 +224,6 @@ impl ModelRegistry {
         identifier
     }
 
-    /// Checks if two model identifiers represent the same model.
-    fn models_match_fuzzy(&self, input_id: &str, stored_id: &str) -> bool {
-        // For now, just check if they're the same after extraction
-        // This could be enhanced with more sophisticated matching
-        input_id == stored_id
-    }
-
     /// Checks if a model is legacy.
     #[must_use]
     pub fn is_legacy_model(&self, api_identifier: &str) -> bool {
@@ -245,11 +232,13 @@ impl ModelRegistry {
     }
 
     /// Returns all available models.
+    #[must_use]
     pub fn get_all_models(&self) -> &[ModelSpec] {
         &self.config.models
     }
 
     /// Returns models filtered by provider.
+    #[must_use]
     pub fn get_models_by_provider(&self, provider: &str) -> Vec<&ModelSpec> {
         self.by_provider
             .get(provider)
@@ -258,6 +247,7 @@ impl ModelRegistry {
     }
 
     /// Returns models filtered by provider and tier.
+    #[must_use]
     pub fn get_models_by_provider_and_tier(&self, provider: &str, tier: &str) -> Vec<&ModelSpec> {
         self.get_models_by_provider(provider)
             .into_iter()
@@ -266,6 +256,7 @@ impl ModelRegistry {
     }
 
     /// Returns the default model identifier for a provider, as defined in `models.yaml`.
+    #[must_use]
     pub fn get_default_model(&self, provider: &str) -> Option<&str> {
         self.config
             .providers
@@ -274,16 +265,19 @@ impl ModelRegistry {
     }
 
     /// Returns the provider configuration.
+    #[must_use]
     pub fn get_provider_config(&self, provider: &str) -> Option<&ProviderConfig> {
         self.config.providers.get(provider)
     }
 
     /// Returns tier information for a provider.
+    #[must_use]
     pub fn get_tier_info(&self, provider: &str, tier: &str) -> Option<&TierInfo> {
         self.config.providers.get(provider)?.tiers.get(tier)
     }
 
     /// Returns the beta headers for a model.
+    #[must_use]
     pub fn get_beta_headers(&self, api_identifier: &str) -> &[BetaHeader] {
         self.get_model_spec(api_identifier)
             .map(|spec| spec.beta_headers.as_slice())
@@ -291,6 +285,7 @@ impl ModelRegistry {
     }
 
     /// Returns the max output tokens for a model with a specific beta header active.
+    #[must_use]
     pub fn get_max_output_tokens_with_beta(&self, api_identifier: &str, beta_value: &str) -> usize {
         if let Some(spec) = self.get_model_spec(api_identifier) {
             if let Some(bh) = spec.beta_headers.iter().find(|b| b.value == beta_value) {
@@ -304,6 +299,7 @@ impl ModelRegistry {
     }
 
     /// Returns the input context for a model with a specific beta header active.
+    #[must_use]
     pub fn get_input_context_with_beta(&self, api_identifier: &str, beta_value: &str) -> usize {
         if let Some(spec) = self.get_model_spec(api_identifier) {
             if let Some(bh) = spec.beta_headers.iter().find(|b| b.value == beta_value) {
@@ -321,6 +317,7 @@ impl ModelRegistry {
 static MODEL_REGISTRY: OnceLock<ModelRegistry> = OnceLock::new();
 
 /// Returns the global model registry instance.
+#[must_use]
 pub fn get_model_registry() -> &'static ModelRegistry {
     #[allow(clippy::expect_used)] // YAML is embedded via include_str! at compile time
     MODEL_REGISTRY.get_or_init(|| ModelRegistry::load().expect("Failed to load model registry"))
@@ -403,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn fuzzy_model_matching() {
+    fn normalized_id_matching() {
         let registry = ModelRegistry::load().unwrap();
 
         // Test Bedrock-style identifiers
