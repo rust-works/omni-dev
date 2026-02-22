@@ -12,6 +12,12 @@ use serde::Deserialize;
 /// Embedded models YAML configuration, loaded at compile time.
 pub(crate) const MODELS_YAML: &str = include_str!("../templates/models.yaml");
 
+/// Ultimate fallback max output tokens when no model or provider config matches.
+const FALLBACK_MAX_OUTPUT_TOKENS: usize = 4096;
+
+/// Ultimate fallback input context when no model or provider config matches.
+const FALLBACK_INPUT_CONTEXT: usize = 100_000;
+
 /// Beta header that unlocks enhanced model limits.
 #[derive(Debug, Deserialize, Clone)]
 pub struct BetaHeader {
@@ -152,7 +158,7 @@ impl ModelRegistry {
         }
 
         // Ultimate fallback
-        4096
+        FALLBACK_MAX_OUTPUT_TOKENS
     }
 
     /// Returns the input context limit for a model, with fallback to provider defaults.
@@ -170,7 +176,7 @@ impl ModelRegistry {
         }
 
         // Ultimate fallback
-        100_000
+        FALLBACK_INPUT_CONTEXT
     }
 
     /// Infers the provider from a model identifier.
