@@ -126,6 +126,7 @@ impl ModelRegistry {
     }
 
     /// Returns the model specification for the given API identifier.
+    #[must_use]
     pub fn get_model_spec(&self, api_identifier: &str) -> Option<&ModelSpec> {
         // Try exact match first
         if let Some(spec) = self.by_identifier.get(api_identifier) {
@@ -137,6 +138,7 @@ impl ModelRegistry {
     }
 
     /// Returns the max output tokens for a model, with fallback to provider defaults.
+    #[must_use]
     pub fn get_max_output_tokens(&self, api_identifier: &str) -> usize {
         if let Some(spec) = self.get_model_spec(api_identifier) {
             return spec.max_output_tokens;
@@ -154,6 +156,7 @@ impl ModelRegistry {
     }
 
     /// Returns the input context limit for a model, with fallback to provider defaults.
+    #[must_use]
     pub fn get_input_context(&self, api_identifier: &str) -> usize {
         if let Some(spec) = self.get_model_spec(api_identifier) {
             return spec.input_context;
@@ -223,11 +226,13 @@ impl ModelRegistry {
     }
 
     /// Returns all available models.
+    #[must_use]
     pub fn get_all_models(&self) -> &[ModelSpec] {
         &self.config.models
     }
 
     /// Returns models filtered by provider.
+    #[must_use]
     pub fn get_models_by_provider(&self, provider: &str) -> Vec<&ModelSpec> {
         self.by_provider
             .get(provider)
@@ -236,6 +241,7 @@ impl ModelRegistry {
     }
 
     /// Returns models filtered by provider and tier.
+    #[must_use]
     pub fn get_models_by_provider_and_tier(&self, provider: &str, tier: &str) -> Vec<&ModelSpec> {
         self.get_models_by_provider(provider)
             .into_iter()
@@ -244,6 +250,7 @@ impl ModelRegistry {
     }
 
     /// Returns the default model identifier for a provider, as defined in `models.yaml`.
+    #[must_use]
     pub fn get_default_model(&self, provider: &str) -> Option<&str> {
         self.config
             .providers
@@ -252,16 +259,19 @@ impl ModelRegistry {
     }
 
     /// Returns the provider configuration.
+    #[must_use]
     pub fn get_provider_config(&self, provider: &str) -> Option<&ProviderConfig> {
         self.config.providers.get(provider)
     }
 
     /// Returns tier information for a provider.
+    #[must_use]
     pub fn get_tier_info(&self, provider: &str, tier: &str) -> Option<&TierInfo> {
         self.config.providers.get(provider)?.tiers.get(tier)
     }
 
     /// Returns the beta headers for a model.
+    #[must_use]
     pub fn get_beta_headers(&self, api_identifier: &str) -> &[BetaHeader] {
         self.get_model_spec(api_identifier)
             .map(|spec| spec.beta_headers.as_slice())
@@ -269,6 +279,7 @@ impl ModelRegistry {
     }
 
     /// Returns the max output tokens for a model with a specific beta header active.
+    #[must_use]
     pub fn get_max_output_tokens_with_beta(&self, api_identifier: &str, beta_value: &str) -> usize {
         if let Some(spec) = self.get_model_spec(api_identifier) {
             if let Some(bh) = spec.beta_headers.iter().find(|b| b.value == beta_value) {
@@ -282,6 +293,7 @@ impl ModelRegistry {
     }
 
     /// Returns the input context for a model with a specific beta header active.
+    #[must_use]
     pub fn get_input_context_with_beta(&self, api_identifier: &str, beta_value: &str) -> usize {
         if let Some(spec) = self.get_model_spec(api_identifier) {
             if let Some(bh) = spec.beta_headers.iter().find(|b| b.value == beta_value) {
@@ -299,6 +311,7 @@ impl ModelRegistry {
 static MODEL_REGISTRY: OnceLock<ModelRegistry> = OnceLock::new();
 
 /// Returns the global model registry instance.
+#[must_use]
 pub fn get_model_registry() -> &'static ModelRegistry {
     #[allow(clippy::expect_used)] // YAML is embedded via include_str! at compile time
     MODEL_REGISTRY.get_or_init(|| ModelRegistry::load().expect("Failed to load model registry"))
