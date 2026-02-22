@@ -25,7 +25,7 @@ omni-dev is a powerful Git commit message analysis and amendment toolkit written
 ### Configuration
 - `Cargo.toml` - Rust package configuration and dependencies
 - `.github/` - GitHub Actions CI/CD workflows
-- `.claude/commands/` - Claude-specific command definitions
+- `.claude/skills/` - Claude skill definitions
 
 ### Documentation
 - `README.md` - Main project documentation
@@ -125,11 +125,8 @@ The project includes a comprehensive model registry system:
 - **Configuration Commands**: Use `omni-dev config models show` to view available models
 - **Dynamic Limits**: Token limits are automatically applied based on model specifications
 
-### Command Structure
-Claude commands are organized in `.claude/commands/`:
-- `commit-twiddle*` - Commit message modification commands
-- `pr-create*` - Pull request creation commands
-- Variants include debug, release, and standard modes
+### Skill Structure
+Claude skills are organized in `.claude/skills/`, one subdirectory per skill with a `SKILL.md` file.
 
 ### Working with Git
 Common git operations in this project:
