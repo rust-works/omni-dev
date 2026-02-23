@@ -15,7 +15,7 @@ pub use info::InfoCommand;
 pub use twiddle::TwiddleCommand;
 pub use view::ViewCommand;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 /// Parses a `--beta-header key:value` string into a `(key, value)` tuple.
@@ -113,56 +113,41 @@ pub enum CreateSubcommands {
 
 impl GitCommand {
     /// Executes the git command.
-    pub fn execute(self) -> Result<()> {
+    pub async fn execute(self) -> Result<()> {
         match self.command {
-            GitSubcommands::Commit(commit_cmd) => commit_cmd.execute(),
-            GitSubcommands::Branch(branch_cmd) => branch_cmd.execute(),
+            GitSubcommands::Commit(commit_cmd) => commit_cmd.execute().await,
+            GitSubcommands::Branch(branch_cmd) => branch_cmd.execute().await,
         }
     }
 }
 
 impl CommitCommand {
     /// Executes the commit command.
-    pub fn execute(self) -> Result<()> {
+    pub async fn execute(self) -> Result<()> {
         match self.command {
-            CommitSubcommands::Message(message_cmd) => message_cmd.execute(),
+            CommitSubcommands::Message(message_cmd) => message_cmd.execute().await,
         }
     }
 }
 
 impl MessageCommand {
     /// Executes the message command.
-    pub fn execute(self) -> Result<()> {
+    pub async fn execute(self) -> Result<()> {
         match self.command {
             MessageSubcommands::View(view_cmd) => view_cmd.execute(),
             MessageSubcommands::Amend(amend_cmd) => amend_cmd.execute(),
-            MessageSubcommands::Twiddle(twiddle_cmd) => {
-                // Use tokio runtime for async execution
-                let rt =
-                    tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
-                rt.block_on(twiddle_cmd.execute())
-            }
-            MessageSubcommands::Check(check_cmd) => {
-                // Use tokio runtime for async execution
-                let rt =
-                    tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
-                rt.block_on(check_cmd.execute())
-            }
+            MessageSubcommands::Twiddle(twiddle_cmd) => twiddle_cmd.execute().await,
+            MessageSubcommands::Check(check_cmd) => check_cmd.execute().await,
         }
     }
 }
 
 impl BranchCommand {
     /// Executes the branch command.
-    pub fn execute(self) -> Result<()> {
+    pub async fn execute(self) -> Result<()> {
         match self.command {
             BranchSubcommands::Info(info_cmd) => info_cmd.execute(),
-            BranchSubcommands::Create(create_cmd) => {
-                // Use tokio runtime for async execution
-                let rt = tokio::runtime::Runtime::new()
-                    .context("Failed to create tokio runtime for PR creation")?;
-                rt.block_on(create_cmd.execute())
-            }
+            BranchSubcommands::Create(create_cmd) => create_cmd.execute().await,
         }
     }
 }
