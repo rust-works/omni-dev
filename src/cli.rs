@@ -38,10 +38,10 @@ pub enum Commands {
 
 impl Cli {
     /// Executes the CLI command.
-    pub fn execute(self) -> Result<()> {
+    pub async fn execute(self) -> Result<()> {
         match self.command {
-            Commands::Ai(ai_cmd) => ai_cmd.execute(),
-            Commands::Git(git_cmd) => git_cmd.execute(),
+            Commands::Ai(ai_cmd) => ai_cmd.execute().await,
+            Commands::Git(git_cmd) => git_cmd.execute().await,
             Commands::Commands(commands_cmd) => commands_cmd.execute(),
             Commands::Config(config_cmd) => config_cmd.execute(),
             Commands::HelpAll(help_cmd) => help_cmd.execute(),

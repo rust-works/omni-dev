@@ -3,7 +3,8 @@ use std::process;
 use clap::Parser;
 use omni_dev::Cli;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     // Initialize tracing subscriber with RUST_LOG environment variable support
     // Default to "warn" level if RUST_LOG is not set
     tracing_subscriber::fmt()
@@ -15,7 +16,7 @@ fn main() {
 
     let cli = Cli::parse();
 
-    if let Err(e) = cli.execute() {
+    if let Err(e) = cli.execute().await {
         eprintln!("Error: {e}");
 
         // Print the full error chain if available

@@ -2,7 +2,7 @@
 
 use std::io::{self, Write};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
@@ -26,9 +26,9 @@ pub enum AiSubcommand {
 
 impl AiCommand {
     /// Executes the AI command.
-    pub fn execute(self) -> Result<()> {
+    pub async fn execute(self) -> Result<()> {
         match self.command {
-            AiSubcommand::Chat(cmd) => cmd.execute(),
+            AiSubcommand::Chat(cmd) => cmd.execute().await,
         }
     }
 }
@@ -43,7 +43,7 @@ pub struct ChatCommand {
 
 impl ChatCommand {
     /// Executes the chat command.
-    pub fn execute(self) -> Result<()> {
+    pub async fn execute(self) -> Result<()> {
         let ai_info = crate::utils::preflight::check_ai_credentials(self.model.as_deref())?;
         eprintln!(
             "Connected to {} (model: {})",
@@ -53,8 +53,7 @@ impl ChatCommand {
 
         let client = crate::claude::create_default_claude_client(self.model, None)?;
 
-        let rt = tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
-        rt.block_on(chat_loop(&client))
+        chat_loop(&client).await
     }
 }
 
