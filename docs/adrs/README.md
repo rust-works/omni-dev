@@ -37,3 +37,4 @@ by Michael Nygard.
 | [ADR-0011](adr-0011.md)  | ✅ Accepted | 2026-02-23 | Compile-Time Model Registry with Identifier Normalization            |
 | [ADR-0012](adr-0012.md)  | ✅ Accepted | 2026-02-23 | Three-Level Issue Severity with `--strict` Exit-Code Promotion       |
 | [ADR-0013](adr-0013.md)  | ✅ Accepted | 2026-02-23 | Self-Describing YAML Output with Field Presence Tracking             |
+| [ADR-0014](adr-0014.md)  | ✅ Accepted | 2026-02-23 | Provider-Specific Prompt Engineering                                 |
