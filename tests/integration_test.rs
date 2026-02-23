@@ -4,6 +4,13 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+// Serialises the window where amend_command_with_temporary_repo mutates the
+// process-wide CWD via env::set_current_dir.  That mutation is visible to all
+// threads; without serialisation any concurrently-running test that creates a
+// git2 Repository via a relative path (including TestRepo::new) races against
+// it.  See <https://github.com/rust-works/omni-dev/issues/230>.
+static CWD_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 use anyhow::Result;
 use git2::{Repository, Signature};
 use tempfile::TempDir;
@@ -21,10 +28,14 @@ struct TestRepo {
 
 impl TestRepo {
     fn new() -> Result<Self> {
-        // Create temporary directory
+        // Use an absolute base so TempDir::path() (and therefore repo_path)
+        // is absolute.  A relative "tmp" would make repo_path relative to
+        // the process CWD at creation time; if another test changes CWD
+        // concurrently, libgit2 can no longer locate the repository.
+        let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
         let temp_dir = {
-            std::fs::create_dir_all("tmp")?;
-            tempfile::tempdir_in("tmp")?
+            std::fs::create_dir_all(&tmp_root)?;
+            tempfile::tempdir_in(&tmp_root)?
         };
         let repo_path = temp_dir.path().to_path_buf();
 
@@ -129,24 +140,31 @@ fn amend_command_with_temporary_repo() -> Result<()> {
     let amendment_file_path = test_repo.create_amendment_file(amendments)?;
     println!("Created amendment file at: {amendment_file_path:?}");
 
-    // Change to the test repository directory
+    // AmendCommand::execute → AmendmentHandler::new → Repository::open(".")
+    // requires the process CWD to equal the repository root.  env::set_current_dir
+    // is process-wide, so we hold CWD_MUTEX for the entire mutation window to
+    // prevent concurrent tests from observing an unexpected CWD.
     let original_dir = env::current_dir()?;
-    env::set_current_dir(&test_repo.repo_path)?;
+    let result = {
+        let _cwd_guard = CWD_MUTEX.lock().unwrap();
+        env::set_current_dir(&test_repo.repo_path)?;
 
-    // Test the amend command
-    let result = std::panic::catch_unwind(|| {
-        let amend_cmd = AmendCommand {
-            yaml_file: amendment_file_path.to_string_lossy().to_string(),
-        };
+        let outcome = std::panic::catch_unwind(|| {
+            let amend_cmd = AmendCommand {
+                yaml_file: amendment_file_path.to_string_lossy().to_string(),
+            };
 
-        println!("Testing amend command...");
-        let result = amend_cmd.execute();
-        println!("Amend command result: {result:?}");
-        result
-    });
+            println!("Testing amend command...");
+            let result = amend_cmd.execute();
+            println!("Amend command result: {result:?}");
+            result
+        });
 
-    // Restore original directory
-    env::set_current_dir(&original_dir)?;
+        // Restore CWD before releasing the mutex.
+        env::set_current_dir(&original_dir)?;
+        outcome
+        // _cwd_guard dropped here — other threads may now change or read CWD.
+    };
 
     match result {
         Ok(cmd_result) => {
@@ -155,18 +173,15 @@ fn amend_command_with_temporary_repo() -> Result<()> {
             // The implementation should now actually work
             assert!(cmd_result.is_ok(), "Amend command should succeed");
 
-            // Verify that amendments were actually made
-            env::set_current_dir(&test_repo.repo_path)?;
-            let repo = Repository::open(".")?;
+            // Verify that amendments were actually made.  Use the absolute
+            // repo_path directly so this does not depend on process CWD.
+            let repo = Repository::open(&test_repo.repo_path)?;
             let head = repo.head()?.target().unwrap();
             let commit = repo.find_commit(head)?;
             println!(
                 "Current HEAD commit message after amendment: {}",
                 commit.message().unwrap_or("")
             );
-
-            // Restore directory again
-            env::set_current_dir(&original_dir)?;
 
             // The HEAD commit message should have been amended
             let head_message = commit.message().unwrap_or("").trim();
@@ -189,9 +204,10 @@ fn amend_command_with_temporary_repo() -> Result<()> {
 #[test]
 fn amendment_file_parsing() -> Result<()> {
     // Test that amendment file parsing works correctly
+    let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
     let temp_dir = {
-        std::fs::create_dir_all("tmp")?;
-        tempfile::tempdir_in("tmp")?
+        std::fs::create_dir_all(&tmp_root)?;
+        tempfile::tempdir_in(&tmp_root)?
     };
     let yaml_path = temp_dir.path().join("test_amendments.yaml");
 
@@ -217,9 +233,10 @@ amendments:
 #[test]
 fn amendment_validation() -> Result<()> {
     // Test amendment validation
+    let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
     let temp_dir = {
-        std::fs::create_dir_all("tmp")?;
-        tempfile::tempdir_in("tmp")?
+        std::fs::create_dir_all(&tmp_root)?;
+        tempfile::tempdir_in(&tmp_root)?
     };
     let yaml_path = temp_dir.path().join("invalid_amendments.yaml");
 
@@ -326,9 +343,10 @@ fn binary_git_help_succeeds() {
 
 #[test]
 fn binary_commands_generate_in_temp_dir() {
+    let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
     let temp_dir = {
-        std::fs::create_dir_all("tmp").ok();
-        tempfile::tempdir_in("tmp").unwrap()
+        std::fs::create_dir_all(&tmp_root).ok();
+        tempfile::tempdir_in(&tmp_root).unwrap()
     };
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
         .args(["commands", "generate", "all"])
