@@ -39,3 +39,4 @@ by Michael Nygard.
 | [ADR-0013](adr-0013.md)  | ✅ Accepted | 2026-02-23 | Self-Describing YAML Output with Field Presence Tracking                               |
 | [ADR-0014](adr-0014.md)  | ✅ Accepted | 2026-02-23 | Provider-Specific Prompt Engineering                                                   |
 | [ADR-0015](adr-0015.md)  | ✅ Accepted | 2026-02-23 | Dual Error Handling Strategy — `thiserror` for Domain Errors, `anyhow` for Propagation |
+| [ADR-0016](adr-0016.md)  | ✅ Accepted | 2026-02-24 | Clap Derive Macros with Hierarchical Subcommand Structure                              |
