@@ -413,3 +413,64 @@ fn test_repo_create_amendment_file_roundtrip() -> Result<()> {
 
     Ok(())
 }
+
+// ── Async dispatch coverage ──────────────────────────────────────
+//
+// These tests exercise the async execute() dispatch chain introduced in #222.
+// They run in the omni-dev repo itself (a valid git repository), so commands
+// that require a git repo succeed without needing a temporary repo setup.
+
+#[tokio::test]
+async fn cli_execute_dispatches_git_commit_message_view() {
+    use omni_dev::cli::git::{
+        CommitCommand, CommitSubcommands, GitCommand, GitSubcommands, MessageCommand,
+        MessageSubcommands, ViewCommand,
+    };
+    use omni_dev::cli::{Cli, Commands};
+
+    let cli = Cli {
+        command: Commands::Git(GitCommand {
+            command: GitSubcommands::Commit(CommitCommand {
+                command: CommitSubcommands::Message(MessageCommand {
+                    command: MessageSubcommands::View(ViewCommand {
+                        commit_range: Some("HEAD".to_string()),
+                    }),
+                }),
+            }),
+        }),
+    };
+    let _ = cli.execute().await;
+}
+
+#[tokio::test]
+async fn cli_execute_dispatches_git_branch_info() {
+    use omni_dev::cli::git::{
+        BranchCommand, BranchSubcommands, GitCommand, GitSubcommands, InfoCommand,
+    };
+    use omni_dev::cli::{Cli, Commands};
+
+    let cli = Cli {
+        command: Commands::Git(GitCommand {
+            command: GitSubcommands::Branch(BranchCommand {
+                command: BranchSubcommands::Info(InfoCommand { base_branch: None }),
+            }),
+        }),
+    };
+    let _ = cli.execute().await;
+}
+
+#[tokio::test]
+async fn cli_execute_dispatches_ai_chat() {
+    use omni_dev::cli::ai::{AiCommand, AiSubcommand, ChatCommand};
+    use omni_dev::cli::{Cli, Commands};
+
+    let cli = Cli {
+        command: Commands::Ai(AiCommand {
+            command: AiSubcommand::Chat(ChatCommand { model: None }),
+        }),
+    };
+    // Without API credentials this returns Err at the preflight check;
+    // with credentials it returns Err in a non-TTY environment.
+    // Either way the async dispatch chain is exercised.
+    let _ = cli.execute().await;
+}
