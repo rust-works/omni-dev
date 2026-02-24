@@ -46,16 +46,21 @@ pub(crate) struct BatchPlan {
 
 /// Estimates the token cost of a single commit for batching purposes.
 ///
-/// Uses `fs::metadata` (stat syscall) for the diff file size to avoid
-/// reading all diff files into memory during planning. Falls back to
-/// zero if the file is inaccessible.
+/// When per-file diff references are available, sums their pre-computed
+/// `byte_len` values to avoid a filesystem syscall. Falls back to
+/// `fs::metadata` on the flat diff file when `file_diffs` is empty
+/// (e.g. data produced before per-file storage was introduced).
 #[must_use]
 fn estimate_commit_tokens(commit: &CommitInfo) -> usize {
-    let diff_file_size = std::fs::metadata(&commit.analysis.diff_file)
-        .map(|m| m.len() as usize)
-        .unwrap_or(0);
+    let diff_byte_len = if commit.analysis.file_diffs.is_empty() {
+        std::fs::metadata(&commit.analysis.diff_file)
+            .map(|m| m.len() as usize)
+            .unwrap_or(0)
+    } else {
+        commit.analysis.file_diffs.iter().map(|f| f.byte_len).sum()
+    };
 
-    let text_len = diff_file_size
+    let text_len = diff_byte_len
         + commit.analysis.diff_summary.len()
         + commit.original_message.len()
         + commit.analysis.proposed_message.len();
@@ -124,7 +129,7 @@ mod tests {
 
     use super::*;
     use crate::claude::ai::AiClientMetadata;
-    use crate::git::commit::{CommitAnalysis, FileChange, FileChanges};
+    use crate::git::commit::{CommitAnalysis, FileChange, FileChanges, FileDiffRef};
 
     fn make_metadata(context: usize, response: usize) -> AiClientMetadata {
         AiClientMetadata {
@@ -240,6 +245,93 @@ mod tests {
         assert!(
             large_tokens > small_tokens,
             "large diff ({large_tokens}) should have more tokens than small ({small_tokens})"
+        );
+    }
+
+    #[test]
+    fn estimate_uses_file_diffs_when_populated() {
+        // diff_file points to a nonexistent path — if the function tried
+        // fs::metadata it would fall back to zero.
+        let commit = CommitInfo {
+            hash: "abc123".to_string(),
+            author: "Test Author <test@example.com>".to_string(),
+            date: Utc::now().fixed_offset(),
+            original_message: "test commit".to_string(),
+            in_main_branches: vec![],
+            analysis: CommitAnalysis {
+                detected_type: "feat".to_string(),
+                detected_scope: "test".to_string(),
+                proposed_message: "feat(test): test".to_string(),
+                file_changes: FileChanges {
+                    total_files: 2,
+                    files_added: 0,
+                    files_deleted: 0,
+                    file_list: vec![
+                        FileChange {
+                            status: "M".to_string(),
+                            file: "a.rs".to_string(),
+                        },
+                        FileChange {
+                            status: "M".to_string(),
+                            file: "b.rs".to_string(),
+                        },
+                    ],
+                },
+                diff_summary: "a.rs | 5 ++\nb.rs | 3 +".to_string(),
+                diff_file: "/nonexistent/path.diff".to_string(),
+                file_diffs: vec![
+                    FileDiffRef {
+                        path: "a.rs".to_string(),
+                        diff_file: "/nonexistent/0000.diff".to_string(),
+                        byte_len: 500,
+                    },
+                    FileDiffRef {
+                        path: "b.rs".to_string(),
+                        diff_file: "/nonexistent/0001.diff".to_string(),
+                        byte_len: 300,
+                    },
+                ],
+            },
+        };
+
+        let tokens = estimate_commit_tokens(&commit);
+
+        // If file_diffs were ignored, diff_byte_len would be 0 (nonexistent file).
+        // With file_diffs, diff_byte_len = 800. The estimate must reflect that.
+        let expected_without_diff = token_budget::estimate_tokens_from_char_count(
+            commit.analysis.diff_summary.len()
+                + commit.original_message.len()
+                + commit.analysis.proposed_message.len(),
+        ) + PER_COMMIT_METADATA_OVERHEAD_TOKENS;
+        assert!(
+            tokens > expected_without_diff,
+            "estimate ({tokens}) should exceed the no-diff baseline ({expected_without_diff})"
+        );
+    }
+
+    #[test]
+    fn estimate_with_file_diffs_matches_flat_file() {
+        let (mut commit, _tmp) = make_commit_with_diff_file(1000);
+        let tokens_via_metadata = estimate_commit_tokens(&commit);
+
+        // Now populate file_diffs with the same total byte_len as the flat file.
+        commit.analysis.file_diffs = vec![
+            FileDiffRef {
+                path: "a.rs".to_string(),
+                diff_file: "/unused.diff".to_string(),
+                byte_len: 600,
+            },
+            FileDiffRef {
+                path: "b.rs".to_string(),
+                diff_file: "/unused.diff".to_string(),
+                byte_len: 400,
+            },
+        ];
+        let tokens_via_file_diffs = estimate_commit_tokens(&commit);
+
+        assert_eq!(
+            tokens_via_metadata, tokens_via_file_diffs,
+            "both paths should produce the same estimate when byte totals match"
         );
     }
 }
