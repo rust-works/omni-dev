@@ -34,6 +34,12 @@ pub(crate) struct DiffChunk {
     pub file_paths: Vec<String>,
     /// Estimated total tokens for all diffs in this chunk.
     pub estimated_tokens: usize,
+    /// Pre-sliced diff content for hunk items in this chunk.
+    ///
+    /// Parallel to `file_paths`: `diff_overrides[i]` is `Some(content)` when
+    /// `file_paths[i]` was produced by hunk splitting, or `None` when the
+    /// full per-file diff should be loaded from disk.
+    pub diff_overrides: Vec<Option<String>>,
 }
 
 /// Result of splitting one commit's diff across N chunks.
@@ -54,6 +60,8 @@ struct PackableItem {
     path: String,
     /// Estimated token cost of this item.
     estimated_tokens: usize,
+    /// Pre-sliced diff content for hunk items. `None` for whole-file items.
+    diff_override: Option<String>,
 }
 
 /// Packs file diffs for a single commit into chunks fitting
@@ -97,6 +105,7 @@ fn build_packable_items(file_diffs: &[FileDiffRef], capacity: usize) -> Result<V
             items.push(PackableItem {
                 path: file_ref.path.clone(),
                 estimated_tokens: file_tokens,
+                diff_override: None,
             });
         } else {
             let hunk_items = split_oversized_file(file_ref)?;
@@ -132,6 +141,7 @@ fn split_oversized_file(file_ref: &FileDiffRef) -> Result<Vec<PackableItem>> {
         return Ok(vec![PackableItem {
             path: file_ref.path.clone(),
             estimated_tokens: token_budget::estimate_tokens_from_char_count(file_ref.byte_len),
+            diff_override: None,
         }]);
     }
 
@@ -140,6 +150,7 @@ fn split_oversized_file(file_ref: &FileDiffRef) -> Result<Vec<PackableItem>> {
         .map(|hunk| PackableItem {
             path: file_ref.path.clone(),
             estimated_tokens: token_budget::estimate_tokens_from_char_count(hunk.byte_len),
+            diff_override: Some(format!("{}{}", hunk.file_header, hunk.content)),
         })
         .collect())
 }
@@ -167,6 +178,9 @@ fn first_fit_decreasing(items: &[PackableItem], capacity: usize) -> Vec<DiffChun
         for chunk in &mut chunks {
             if chunk.estimated_tokens + item_tokens <= capacity {
                 chunk.file_paths.push(items[item_idx].path.clone());
+                chunk
+                    .diff_overrides
+                    .push(items[item_idx].diff_override.clone());
                 chunk.estimated_tokens += item_tokens;
                 placed = true;
                 break;
@@ -175,6 +189,7 @@ fn first_fit_decreasing(items: &[PackableItem], capacity: usize) -> Vec<DiffChun
         if !placed {
             chunks.push(DiffChunk {
                 file_paths: vec![items[item_idx].path.clone()],
+                diff_overrides: vec![items[item_idx].diff_override.clone()],
                 estimated_tokens: item_tokens,
             });
         }
@@ -263,6 +278,8 @@ mod tests {
         let plan = pack_file_diffs("abc123", &[f], 10_000)?;
         assert_eq!(plan.chunks.len(), 1);
         assert_eq!(plan.chunks[0].file_paths, vec!["src/main.rs"]);
+        // Whole-file items should have no diff override.
+        assert_eq!(plan.chunks[0].diff_overrides, vec![None]);
         Ok(())
     }
 
@@ -308,6 +325,20 @@ mod tests {
         // All chunks should reference the same file
         for chunk in &plan.chunks {
             assert!(chunk.file_paths.iter().all(|p| p == "big.rs"));
+            // Hunk items must carry pre-sliced diff content.
+            assert_eq!(chunk.file_paths.len(), chunk.diff_overrides.len());
+            for ovr in &chunk.diff_overrides {
+                assert!(ovr.is_some(), "hunk items should have diff_override set");
+                let content = ovr.as_ref().unwrap();
+                assert!(
+                    content.contains("diff --git"),
+                    "override should contain file header"
+                );
+                assert!(
+                    content.contains("@@"),
+                    "override should contain hunk marker"
+                );
+            }
         }
         Ok(())
     }
@@ -340,6 +371,17 @@ mod tests {
             total_paths >= 4,
             "expected at least 4 items (2 small + 3 hunks from big), got {total_paths}"
         );
+        // Verify overrides: whole-file items = None, hunk items = Some.
+        for chunk in &plan.chunks {
+            assert_eq!(chunk.file_paths.len(), chunk.diff_overrides.len());
+            for (path, ovr) in chunk.file_paths.iter().zip(chunk.diff_overrides.iter()) {
+                if path == "big.rs" {
+                    assert!(ovr.is_some(), "hunk items for big.rs should have override");
+                } else {
+                    assert!(ovr.is_none(), "whole-file items should have no override");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -408,14 +450,17 @@ mod tests {
             PackableItem {
                 path: "small.rs".to_string(),
                 estimated_tokens: 10,
+                diff_override: None,
             },
             PackableItem {
                 path: "large.rs".to_string(),
                 estimated_tokens: 90,
+                diff_override: Some("large-content".to_string()),
             },
             PackableItem {
                 path: "medium.rs".to_string(),
                 estimated_tokens: 50,
+                diff_override: None,
             },
         ];
         let chunks = first_fit_decreasing(&items, 100);
@@ -425,11 +470,88 @@ mod tests {
         assert!(chunks[0].file_paths.contains(&"large.rs".to_string()));
         assert!(chunks[0].file_paths.contains(&"small.rs".to_string()));
         assert_eq!(chunks[1].file_paths, vec!["medium.rs"]);
+        // Verify diff_overrides are parallel and propagated correctly.
+        for chunk in &chunks {
+            assert_eq!(chunk.file_paths.len(), chunk.diff_overrides.len());
+        }
+        // large.rs has override, small.rs does not
+        let large_idx = chunks[0]
+            .file_paths
+            .iter()
+            .position(|p| p == "large.rs")
+            .unwrap();
+        assert!(chunks[0].diff_overrides[large_idx].is_some());
+        let small_idx = chunks[0]
+            .file_paths
+            .iter()
+            .position(|p| p == "small.rs")
+            .unwrap();
+        assert!(chunks[0].diff_overrides[small_idx].is_none());
     }
 
     #[test]
     fn ffd_empty_items() {
         let chunks = first_fit_decreasing(&[], 100);
         assert!(chunks.is_empty());
+    }
+
+    // ── diff_override preservation ────────────────────────────────
+
+    #[test]
+    fn split_oversized_preserves_each_hunk_content() -> Result<()> {
+        // 3 hunks, each ~500 bytes. Capacity set so the file must be split.
+        let (f, _tmp) = make_multi_hunk_file_diff_ref("big.rs", 3, 500);
+        let plan = pack_file_diffs("abc123", &[f], 200)?;
+
+        // Collect all overrides across chunks.
+        let all_overrides: Vec<&String> = plan
+            .chunks
+            .iter()
+            .flat_map(|c| c.diff_overrides.iter())
+            .filter_map(|o| o.as_ref())
+            .collect();
+
+        assert_eq!(all_overrides.len(), 3, "should have 3 hunk overrides");
+        // Each override should be self-contained with file header + hunk.
+        for (i, ovr) in all_overrides.iter().enumerate() {
+            assert!(
+                ovr.starts_with("diff --git"),
+                "hunk {i} override should start with file header"
+            );
+            assert!(
+                ovr.contains("@@"),
+                "hunk {i} override should contain hunk marker"
+            );
+        }
+        // Overrides should be distinct (different hunks).
+        let unique: std::collections::HashSet<&str> =
+            all_overrides.iter().map(|s| s.as_str()).collect();
+        assert_eq!(unique.len(), 3, "each hunk override should be distinct");
+        Ok(())
+    }
+
+    #[test]
+    fn binary_file_override_is_none() -> Result<()> {
+        let content = "diff --git a/image.png b/image.png\n\
+                        new file mode 100644\n\
+                        index 0000000..abc1234\n\
+                        Binary files /dev/null and b/image.png differ\n";
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(content.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let file_ref = FileDiffRef {
+            path: "image.png".to_string(),
+            diff_file: tmp.path().to_string_lossy().to_string(),
+            byte_len: content.len(),
+        };
+
+        // Capacity low enough to trigger split attempt.
+        let plan = pack_file_diffs("abc123", &[file_ref], 10)?;
+        assert_eq!(plan.chunks.len(), 1);
+        // Binary file has no hunks → fallback to whole-file item → None override.
+        assert_eq!(plan.chunks[0].diff_overrides, vec![None]);
+        Ok(())
     }
 }
