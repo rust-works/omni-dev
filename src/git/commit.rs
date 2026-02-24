@@ -678,6 +678,67 @@ impl CommitInfoForAI {
         })
     }
 
+    /// Creates a partial view of a commit containing only the specified file diffs.
+    ///
+    /// Reads diff content from each matching [`FileDiffRef::diff_file`] and
+    /// concatenates it into `diff_content`. Preserves all commit metadata
+    /// (hash, author, date, original_message, `diff_summary`) so the AI has
+    /// full context alongside the partial diff.
+    ///
+    /// Duplicate paths (which arise when a large file is hunk-split and
+    /// multiple hunks land in the same chunk) are deduplicated so each
+    /// file's content is loaded only once.
+    pub(crate) fn from_commit_info_partial(
+        commit_info: CommitInfo,
+        file_paths: &[String],
+    ) -> Result<Self> {
+        // Deduplicate requested paths (hunk-split files may repeat).
+        let unique_paths: Vec<&String> = {
+            let mut seen = std::collections::HashSet::new();
+            file_paths
+                .iter()
+                .filter(|p| seen.insert(p.as_str()))
+                .collect()
+        };
+
+        // Filter file_diffs to only the requested paths and load content.
+        let matching_refs: Vec<FileDiffRef> = commit_info
+            .analysis
+            .file_diffs
+            .iter()
+            .filter(|r| unique_paths.contains(&&r.path))
+            .cloned()
+            .collect();
+
+        let mut diff_parts = Vec::with_capacity(matching_refs.len());
+        for file_ref in &matching_refs {
+            let content = fs::read_to_string(&file_ref.diff_file)
+                .with_context(|| format!("Failed to read per-file diff: {}", file_ref.diff_file))?;
+            diff_parts.push(content);
+        }
+        let diff_content = diff_parts.join("\n");
+
+        let partial_analysis = CommitAnalysisForAI {
+            base: CommitAnalysis {
+                file_diffs: matching_refs,
+                ..commit_info.analysis
+            },
+            diff_content,
+        };
+
+        Ok(Self {
+            base: CommitInfo {
+                hash: commit_info.hash,
+                author: commit_info.author,
+                date: commit_info.date,
+                original_message: commit_info.original_message,
+                in_main_branches: commit_info.in_main_branches,
+                analysis: partial_analysis,
+            },
+            pre_validated_checks: Vec::new(),
+        })
+    }
+
     /// Runs deterministic pre-validation checks on the commit message.
     /// Passing checks are recorded in pre_validated_checks so the LLM
     /// can skip re-checking them. Failing checks are not recorded.
@@ -1242,5 +1303,127 @@ diff_file: "/tmp/test.diff"
         assert!(yaml.contains("file_diffs"));
         assert!(yaml.contains("src/main.rs"));
         assert!(yaml.contains("byte_len: 42"));
+    }
+
+    // ── from_commit_info_partial ────────────────────────────────────
+
+    /// Helper: creates a `CommitInfo` with N file diffs backed by temp files.
+    fn make_commit_with_file_diffs(
+        dir: &tempfile::TempDir,
+        files: &[(&str, &str)], // (path, diff_content)
+    ) -> CommitInfo {
+        let file_diffs: Vec<FileDiffRef> = files
+            .iter()
+            .enumerate()
+            .map(|(i, (path, content))| {
+                let diff_path = dir.path().join(format!("{i:04}.diff"));
+                fs::write(&diff_path, content).unwrap();
+                FileDiffRef {
+                    path: (*path).to_string(),
+                    diff_file: diff_path.to_string_lossy().to_string(),
+                    byte_len: content.len(),
+                }
+            })
+            .collect();
+
+        CommitInfo {
+            hash: "abc123def456abc123def456abc123def456abc1".to_string(),
+            author: "Test Author".to_string(),
+            date: DateTime::parse_from_rfc3339("2025-01-01T00:00:00+00:00").unwrap(),
+            original_message: "feat(cli): original message".to_string(),
+            in_main_branches: vec!["main".to_string()],
+            analysis: CommitAnalysis {
+                detected_type: "feat".to_string(),
+                detected_scope: "cli".to_string(),
+                proposed_message: "feat(cli): proposed".to_string(),
+                file_changes: make_file_changes(
+                    &files.iter().map(|(p, _)| ("M", *p)).collect::<Vec<_>>(),
+                ),
+                diff_summary: " src/main.rs | 10 ++++\n src/lib.rs | 5 ++\n".to_string(),
+                diff_file: dir.path().join("full.diff").to_string_lossy().to_string(),
+                file_diffs,
+            },
+        }
+    }
+
+    #[test]
+    fn from_commit_info_partial_loads_subset() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let commit = make_commit_with_file_diffs(
+            &dir,
+            &[
+                ("src/main.rs", "diff --git a/src/main.rs\n+main\n"),
+                ("src/lib.rs", "diff --git a/src/lib.rs\n+lib\n"),
+                ("src/utils.rs", "diff --git a/src/utils.rs\n+utils\n"),
+            ],
+        );
+
+        let paths = vec!["src/main.rs".to_string(), "src/utils.rs".to_string()];
+        let partial = CommitInfoForAI::from_commit_info_partial(commit, &paths)?;
+
+        // Only requested files in diff_content
+        assert!(partial.base.analysis.diff_content.contains("+main"));
+        assert!(partial.base.analysis.diff_content.contains("+utils"));
+        assert!(!partial.base.analysis.diff_content.contains("+lib"));
+
+        // file_diffs filtered to requested paths
+        let ref_paths: Vec<&str> = partial
+            .base
+            .analysis
+            .base
+            .file_diffs
+            .iter()
+            .map(|r| r.path.as_str())
+            .collect();
+        assert_eq!(ref_paths, &["src/main.rs", "src/utils.rs"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn from_commit_info_partial_deduplicates_paths() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let commit = make_commit_with_file_diffs(
+            &dir,
+            &[("src/main.rs", "diff --git a/src/main.rs\n+main\n")],
+        );
+
+        // Duplicate path (simulates hunk-split scenario)
+        let paths = vec!["src/main.rs".to_string(), "src/main.rs".to_string()];
+        let partial = CommitInfoForAI::from_commit_info_partial(commit, &paths)?;
+
+        // Content loaded only once (no duplicate)
+        assert_eq!(
+            partial.base.analysis.diff_content.matches("+main").count(),
+            1
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn from_commit_info_partial_preserves_metadata() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let commit = make_commit_with_file_diffs(
+            &dir,
+            &[("src/main.rs", "diff --git a/src/main.rs\n+main\n")],
+        );
+
+        let original_hash = commit.hash.clone();
+        let original_author = commit.author.clone();
+        let original_date = commit.date;
+        let original_message = commit.original_message.clone();
+        let original_summary = commit.analysis.diff_summary.clone();
+
+        let paths = vec!["src/main.rs".to_string()];
+        let partial = CommitInfoForAI::from_commit_info_partial(commit, &paths)?;
+
+        assert_eq!(partial.base.hash, original_hash);
+        assert_eq!(partial.base.author, original_author);
+        assert_eq!(partial.base.date, original_date);
+        assert_eq!(partial.base.original_message, original_message);
+        assert_eq!(partial.base.analysis.base.diff_summary, original_summary);
+
+        Ok(())
     }
 }
