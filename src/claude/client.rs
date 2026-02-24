@@ -2647,4 +2647,548 @@ mod tests {
         assert!(pr.title.contains("modules"));
         assert_eq!(handle.remaining(), 0, "expected all responses consumed");
     }
+
+    // ── prompt-recording split dispatch tests ────────────────────
+
+    /// Like [`make_small_context_client_tracked`] but also returns a
+    /// [`PromptRecordHandle`] for inspecting which prompts were sent.
+    fn make_small_context_client_with_prompts(
+        responses: Vec<Result<String>>,
+    ) -> (
+        ClaudeClient,
+        crate::claude::test_utils::ResponseQueueHandle,
+        crate::claude::test_utils::PromptRecordHandle,
+    ) {
+        let mock = crate::claude::test_utils::ConfigurableMockAiClient::new(responses)
+            .with_context_length(25_000);
+        let response_handle = mock.response_handle();
+        let prompt_handle = mock.prompt_handle();
+        (
+            ClaudeClient::new(Box::new(mock)),
+            response_handle,
+            prompt_handle,
+        )
+    }
+
+    /// Creates a default-context mock client that also records prompts.
+    fn make_configurable_client_with_prompts(
+        responses: Vec<Result<String>>,
+    ) -> (
+        ClaudeClient,
+        crate::claude::test_utils::ResponseQueueHandle,
+        crate::claude::test_utils::PromptRecordHandle,
+    ) {
+        let mock = crate::claude::test_utils::ConfigurableMockAiClient::new(responses);
+        let response_handle = mock.response_handle();
+        let prompt_handle = mock.prompt_handle();
+        (
+            ClaudeClient::new(Box::new(mock)),
+            response_handle,
+            prompt_handle,
+        )
+    }
+
+    /// Creates a repo view with one commit containing a single large file
+    /// whose diff exceeds the token budget. Because the per-file diff is
+    /// loaded as a whole (hunk-level granularity from the packer is lost
+    /// at the dispatch layer), the split dispatch path will fail with a
+    /// budget error. This helper exists to test that the error propagates
+    /// cleanly rather than silently degrading.
+    fn make_single_oversized_file_repo_view(
+        dir: &tempfile::TempDir,
+    ) -> crate::data::RepositoryView {
+        use crate::data::{AiInfo, FieldExplanation, WorkingDirectoryInfo};
+        use crate::git::commit::{FileChange, FileChanges, FileDiffRef};
+        use crate::git::{CommitAnalysis, CommitInfo};
+
+        let hash = "c".repeat(40);
+
+        // A single file diff large enough (~80K bytes ≈ 25K tokens) to
+        // exceed the 25K context window budget even for a single chunk.
+        let diff_content = format!(
+            "diff --git a/src/big.rs b/src/big.rs\n{}\n",
+            "x".repeat(80_000)
+        );
+
+        let flat_diff_path = dir.path().join("full.diff");
+        std::fs::write(&flat_diff_path, &diff_content).unwrap();
+
+        let per_file_path = dir.path().join("0000.diff");
+        std::fs::write(&per_file_path, &diff_content).unwrap();
+
+        crate::data::RepositoryView {
+            versions: None,
+            explanation: FieldExplanation::default(),
+            working_directory: WorkingDirectoryInfo {
+                clean: true,
+                untracked_changes: Vec::new(),
+            },
+            remotes: Vec::new(),
+            ai: AiInfo {
+                scratch: String::new(),
+            },
+            branch_info: None,
+            pr_template: None,
+            pr_template_location: None,
+            branch_prs: None,
+            commits: vec![CommitInfo {
+                hash,
+                author: "Test <test@test.com>".to_string(),
+                date: chrono::Utc::now().fixed_offset(),
+                original_message: "feat(big): add large module".to_string(),
+                in_main_branches: Vec::new(),
+                analysis: CommitAnalysis {
+                    detected_type: "feat".to_string(),
+                    detected_scope: "big".to_string(),
+                    proposed_message: "feat(big): add large module".to_string(),
+                    file_changes: FileChanges {
+                        total_files: 1,
+                        files_added: 1,
+                        files_deleted: 0,
+                        file_list: vec![FileChange {
+                            status: "A".to_string(),
+                            file: "src/big.rs".to_string(),
+                        }],
+                    },
+                    diff_summary: " src/big.rs | 80 ++++\n".to_string(),
+                    diff_file: flat_diff_path.to_string_lossy().to_string(),
+                    file_diffs: vec![FileDiffRef {
+                        path: "src/big.rs".to_string(),
+                        diff_file: per_file_path.to_string_lossy().to_string(),
+                        byte_len: diff_content.len(),
+                    }],
+                },
+            }],
+        }
+    }
+
+    /// A small single-file commit whose diff fits within the token budget.
+    ///
+    /// Exercises the non-split path: `generate_amendments_with_options` →
+    /// `try_full_diff_budget` succeeds → single AI request → amendment
+    /// returned directly. Verifies exactly one request is made and the
+    /// user prompt contains the actual diff content.
+    #[tokio::test]
+    async fn amendment_single_file_under_budget_no_split() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_test_repo_view(&dir);
+        let hash = format!("{:0>40}", 0);
+
+        let (client, response_handle, prompt_handle) =
+            make_configurable_client_with_prompts(vec![Ok(valid_amendment_yaml(
+                &hash,
+                "feat(test): improved message",
+            ))]);
+
+        let result = client
+            .generate_amendments_with_options(&repo_view, false)
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().amendments.len(), 1);
+        assert_eq!(response_handle.remaining(), 0);
+
+        let prompts = prompt_handle.prompts();
+        assert_eq!(
+            prompts.len(),
+            1,
+            "expected exactly one AI request, no split"
+        );
+
+        let (_, user_prompt) = &prompts[0];
+        assert!(
+            user_prompt.contains("added line"),
+            "user prompt should contain the diff content"
+        );
+    }
+
+    /// A two-file commit that exceeds the token budget when combined.
+    ///
+    /// Exercises the file-level split path: `generate_amendments_with_options`
+    /// → `try_full_diff_budget` fails → `generate_amendment_for_commit` →
+    /// `try_full_diff_budget` fails again → `generate_amendment_split` →
+    /// `pack_file_diffs` creates 2 chunks (one file each) → 2 AI requests
+    /// → `merge_amendment_chunks` reduce pass → 1 merged amendment.
+    ///
+    /// Verifies that each chunk's user prompt contains only its file's diff
+    /// content, and the merge prompt contains both partial amendment messages.
+    #[tokio::test]
+    async fn amendment_two_chunks_prompt_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_large_diff_repo_view(&dir);
+        let hash = "a".repeat(40);
+
+        let (client, response_handle, prompt_handle) =
+            make_small_context_client_with_prompts(vec![
+                Ok(valid_amendment_yaml(&hash, "feat(a): add a.rs")),
+                Ok(valid_amendment_yaml(&hash, "feat(b): add b.rs")),
+                Ok(valid_amendment_yaml(&hash, "feat(test): add a.rs and b.rs")),
+            ]);
+
+        let result = client
+            .generate_amendments_with_options(&repo_view, false)
+            .await;
+
+        assert!(result.is_ok(), "split dispatch failed: {:?}", result.err());
+        let amendments = result.unwrap();
+        assert_eq!(amendments.amendments.len(), 1);
+        assert!(amendments.amendments[0]
+            .message
+            .contains("add a.rs and b.rs"));
+        assert_eq!(response_handle.remaining(), 0);
+
+        let prompts = prompt_handle.prompts();
+        assert_eq!(prompts.len(), 3, "expected 2 chunks + 1 merge = 3 requests");
+
+        // Chunk 1 should contain file-a diff content (repeated 'a' chars)
+        let (_, chunk1_user) = &prompts[0];
+        assert!(
+            chunk1_user.contains("aaa"),
+            "chunk 1 prompt should contain file-a diff content"
+        );
+
+        // Chunk 2 should contain file-b diff content (repeated 'b' chars)
+        let (_, chunk2_user) = &prompts[1];
+        assert!(
+            chunk2_user.contains("bbb"),
+            "chunk 2 prompt should contain file-b diff content"
+        );
+
+        // Merge pass: system prompt is the synthesis prompt
+        let (merge_sys, merge_user) = &prompts[2];
+        assert!(
+            merge_sys.contains("synthesiz"),
+            "merge system prompt should contain synthesis instructions"
+        );
+        // Merge user prompt should contain both partial messages
+        assert!(
+            merge_user.contains("feat(a): add a.rs") && merge_user.contains("feat(b): add b.rs"),
+            "merge user prompt should contain both partial amendment messages"
+        );
+    }
+
+    /// A single file whose diff exceeds the budget even after split dispatch.
+    ///
+    /// Exercises the budget-error path: `generate_amendment_for_commit` →
+    /// budget exceeded → `generate_amendment_split` → `pack_file_diffs`
+    /// plans hunk-level chunks → but `from_commit_info_partial` loads the
+    /// full per-file diff (deduplicates the repeated path) →
+    /// `build_prompt_fitting_budget` fails for the chunk → error propagates.
+    ///
+    /// Verifies the error is surfaced cleanly (not silently degraded to
+    /// stat-only or file-list-only) and at most one AI request is attempted.
+    #[tokio::test]
+    async fn amendment_single_oversized_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_single_oversized_file_repo_view(&dir);
+        let hash = "c".repeat(40);
+
+        // The file is too large for the budget. Split dispatch will
+        // attempt to chunk it, but partial views load the full per-file
+        // diff, so the budget check still fails. The error should
+        // propagate cleanly (not silently degrade to stat-only).
+        let (client, _, prompt_handle) = make_small_context_client_with_prompts(vec![Ok(
+            valid_amendment_yaml(&hash, "feat(big): add large module"),
+        )]);
+
+        let result = client
+            .generate_amendments_with_options(&repo_view, false)
+            .await;
+
+        assert!(result.is_err(), "expected budget error for oversized file");
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            err_msg.contains("too large") || err_msg.contains("Prompt too large"),
+            "error should mention prompt size, got: {err_msg}"
+        );
+
+        // The budget failure may occur during prompt assembly (before
+        // the AI request is sent) or the first chunk may be attempted.
+        // Either way, no more than 1 request should have been made.
+        assert!(
+            prompt_handle.request_count() <= 1,
+            "expected at most 1 request attempt, got {}",
+            prompt_handle.request_count()
+        );
+    }
+
+    /// A two-chunk split where the second chunk's AI request fails.
+    ///
+    /// Exercises the error-propagation path within `generate_amendment_split`:
+    /// chunk 1 succeeds → chunk 2 returns `Err` → the `?` operator in the
+    /// loop body propagates the error immediately, skipping the merge pass.
+    ///
+    /// Verifies that exactly 2 requests are recorded (no further processing)
+    /// and the overall result is `Err` (no silent degradation).
+    #[tokio::test]
+    async fn amendment_chunk_failure_stops_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_large_diff_repo_view(&dir);
+        let hash = "a".repeat(40);
+
+        // First chunk succeeds, second chunk fails
+        let (client, _, prompt_handle) = make_small_context_client_with_prompts(vec![
+            Ok(valid_amendment_yaml(&hash, "feat(a): add a.rs")),
+            Err(anyhow::anyhow!("rate limit exceeded")),
+        ]);
+
+        let result = client
+            .generate_amendments_with_options(&repo_view, false)
+            .await;
+
+        assert!(result.is_err());
+
+        // Exactly 2 requests: chunk 1 (success) + chunk 2 (failure)
+        let prompts = prompt_handle.prompts();
+        assert_eq!(
+            prompts.len(),
+            2,
+            "should stop after the failing chunk, got {} requests",
+            prompts.len()
+        );
+
+        // The first request should reference one of the files
+        let (_, first_user) = &prompts[0];
+        assert!(
+            first_user.contains("src/a.rs") || first_user.contains("src/b.rs"),
+            "first chunk prompt should reference a file"
+        );
+    }
+
+    /// Two-chunk amendment split dispatch, focused on the reduce pass inputs.
+    ///
+    /// Exercises `merge_amendment_chunks` which calls
+    /// `generate_chunk_merge_user_prompt` to assemble the merge prompt from:
+    /// the commit hash, original message, diff_summary, and the partial
+    /// amendment messages returned by each chunk.
+    ///
+    /// Verifies that the merge (3rd) request's user prompt contains all of:
+    /// both partial messages, the original commit message, the diff_summary
+    /// file paths, and the commit hash.
+    #[tokio::test]
+    async fn amendment_reduce_pass_prompt_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_large_diff_repo_view(&dir);
+        let hash = "a".repeat(40);
+
+        let (client, _, prompt_handle) = make_small_context_client_with_prompts(vec![
+            Ok(valid_amendment_yaml(
+                &hash,
+                "feat(a): add module a implementation",
+            )),
+            Ok(valid_amendment_yaml(
+                &hash,
+                "feat(b): add module b implementation",
+            )),
+            Ok(valid_amendment_yaml(
+                &hash,
+                "feat(test): add modules a and b",
+            )),
+        ]);
+
+        let result = client
+            .generate_amendments_with_options(&repo_view, false)
+            .await;
+
+        assert!(result.is_ok());
+
+        let prompts = prompt_handle.prompts();
+        assert_eq!(prompts.len(), 3);
+
+        // The merge pass is the last (3rd) request
+        let (merge_system, merge_user) = &prompts[2];
+
+        // System prompt should be the amendment chunk merge prompt
+        assert!(
+            merge_system.contains("synthesiz"),
+            "merge system prompt should contain synthesis instructions"
+        );
+
+        // User prompt should contain the partial messages from chunks
+        assert!(
+            merge_user.contains("feat(a): add module a implementation"),
+            "merge user prompt should contain chunk 1's partial message"
+        );
+        assert!(
+            merge_user.contains("feat(b): add module b implementation"),
+            "merge user prompt should contain chunk 2's partial message"
+        );
+
+        // User prompt should contain the original commit message
+        assert!(
+            merge_user.contains("feat(test): large commit"),
+            "merge user prompt should contain the original commit message"
+        );
+
+        // User prompt should contain the diff_summary referencing both files
+        assert!(
+            merge_user.contains("src/a.rs") && merge_user.contains("src/b.rs"),
+            "merge user prompt should contain the diff_summary"
+        );
+
+        // User prompt should reference the commit hash
+        assert!(
+            merge_user.contains(&hash),
+            "merge user prompt should reference the commit hash"
+        );
+    }
+
+    /// Two-chunk check split dispatch with issue deduplication and merge.
+    ///
+    /// Exercises `check_commit_split` which:
+    /// 1. Dispatches 2 chunk requests (one per file)
+    /// 2. Collects issues from both chunks into a `HashSet` keyed by
+    ///    `(rule, severity, section)` — duplicates are dropped
+    /// 3. Detects that both chunks have suggestions → calls
+    ///    `merge_check_chunks` for the AI reduce pass
+    ///
+    /// Chunk 1 reports: `error:subject-too-long:Subject Line` +
+    ///                   `warning:body-required:Content`
+    /// Chunk 2 reports: `error:subject-too-long:Subject Line` (duplicate) +
+    ///                   `info:scope-suggestion:Style` (new)
+    ///
+    /// Verifies: 3 unique issues after dedup, suggestion from merge pass,
+    /// and the merge prompt contains both partial suggestions + diff_summary.
+    #[tokio::test]
+    async fn check_split_dedup_and_merge_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_large_diff_repo_view(&dir);
+        let hash = "a".repeat(40);
+
+        // Chunk 1: error (subject-too-long) + warning (body-required) + suggestion
+        let chunk1_yaml = format!(
+            concat!(
+                "checks:\n",
+                "  - commit: \"{hash}\"\n",
+                "    passes: false\n",
+                "    issues:\n",
+                "      - severity: error\n",
+                "        section: \"Subject Line\"\n",
+                "        rule: \"subject-too-long\"\n",
+                "        explanation: \"Subject exceeds 72 characters\"\n",
+                "      - severity: warning\n",
+                "        section: \"Content\"\n",
+                "        rule: \"body-required\"\n",
+                "        explanation: \"Large change needs body\"\n",
+                "    suggestion:\n",
+                "      message: \"feat(a): shorter subject for a\"\n",
+                "      explanation: \"Shortened subject for file a\"\n",
+                "    summary: \"Adds module a\"\n",
+            ),
+            hash = hash,
+        );
+
+        // Chunk 2: same error (different explanation) + new info issue + suggestion
+        let chunk2_yaml = format!(
+            concat!(
+                "checks:\n",
+                "  - commit: \"{hash}\"\n",
+                "    passes: false\n",
+                "    issues:\n",
+                "      - severity: error\n",
+                "        section: \"Subject Line\"\n",
+                "        rule: \"subject-too-long\"\n",
+                "        explanation: \"Subject line is way too long\"\n",
+                "      - severity: info\n",
+                "        section: \"Style\"\n",
+                "        rule: \"scope-suggestion\"\n",
+                "        explanation: \"Consider more specific scope\"\n",
+                "    suggestion:\n",
+                "      message: \"feat(b): shorter subject for b\"\n",
+                "      explanation: \"Shortened subject for file b\"\n",
+                "    summary: \"Adds module b\"\n",
+            ),
+            hash = hash,
+        );
+
+        // Merge pass (called because suggestions exist)
+        let merge_yaml = format!(
+            concat!(
+                "checks:\n",
+                "  - commit: \"{hash}\"\n",
+                "    passes: false\n",
+                "    issues: []\n",
+                "    suggestion:\n",
+                "      message: \"feat(test): add modules a and b\"\n",
+                "      explanation: \"Combined suggestion\"\n",
+                "    summary: \"Adds modules a and b\"\n",
+            ),
+            hash = hash,
+        );
+
+        let (client, response_handle, prompt_handle) =
+            make_small_context_client_with_prompts(vec![
+                Ok(chunk1_yaml),
+                Ok(chunk2_yaml),
+                Ok(merge_yaml),
+            ]);
+
+        let result = client
+            .check_commits_with_scopes(&repo_view, None, &[], true)
+            .await;
+
+        assert!(result.is_ok(), "split dispatch failed: {:?}", result.err());
+        let report = result.unwrap();
+        assert_eq!(report.commits.len(), 1);
+        assert!(!report.commits[0].passes);
+        assert_eq!(response_handle.remaining(), 0);
+
+        // Dedup: 3 unique (rule, severity, section) tuples
+        //  - subject-too-long / error / Subject Line   (appears in both → deduped)
+        //  - body-required    / warning / Content
+        //  - scope-suggestion / info / Style
+        assert_eq!(
+            report.commits[0].issues.len(),
+            3,
+            "expected 3 unique issues after dedup, got {:?}",
+            report.commits[0]
+                .issues
+                .iter()
+                .map(|i| &i.rule)
+                .collect::<Vec<_>>()
+        );
+
+        // Suggestion should come from the merge pass
+        assert!(report.commits[0].suggestion.is_some());
+        assert!(
+            report.commits[0]
+                .suggestion
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("add modules a and b"),
+            "suggestion should come from the merge pass"
+        );
+
+        // Prompt content assertions
+        let prompts = prompt_handle.prompts();
+        assert_eq!(prompts.len(), 3, "expected 2 chunks + 1 merge");
+
+        // Chunk prompts should collectively cover both files
+        let (_, chunk1_user) = &prompts[0];
+        let (_, chunk2_user) = &prompts[1];
+        let combined_chunk_prompts = format!("{chunk1_user}{chunk2_user}");
+        assert!(
+            combined_chunk_prompts.contains("src/a.rs")
+                && combined_chunk_prompts.contains("src/b.rs"),
+            "chunk prompts should collectively cover both files"
+        );
+
+        // Merge pass prompt should contain partial suggestions
+        let (merge_sys, merge_user) = &prompts[2];
+        assert!(
+            merge_sys.contains("synthesiz") || merge_sys.contains("reviewer"),
+            "merge system prompt should be the check chunk merge prompt"
+        );
+        assert!(
+            merge_user.contains("feat(a): shorter subject for a")
+                && merge_user.contains("feat(b): shorter subject for b"),
+            "merge user prompt should contain both partial suggestions"
+        );
+        // Merge prompt should contain the diff_summary
+        assert!(
+            merge_user.contains("src/a.rs") && merge_user.contains("src/b.rs"),
+            "merge user prompt should contain the diff_summary"
+        );
+    }
 }
