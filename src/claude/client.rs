@@ -161,16 +161,19 @@ impl ClaudeClient {
 
         let mut chunk_amendments = Vec::with_capacity(total_chunks);
         for (i, chunk) in plan.chunks.iter().enumerate() {
-            let mut partial =
-                CommitInfoForAI::from_commit_info_partial(commit.clone(), &chunk.file_paths)
-                    .with_context(|| {
-                        format!(
-                            "Failed to build partial view for chunk {}/{} of commit {}",
-                            i + 1,
-                            total_chunks,
-                            &commit.hash[..8]
-                        )
-                    })?;
+            let mut partial = CommitInfoForAI::from_commit_info_partial_with_overrides(
+                commit.clone(),
+                &chunk.file_paths,
+                &chunk.diff_overrides,
+            )
+            .with_context(|| {
+                format!(
+                    "Failed to build partial view for chunk {}/{} of commit {}",
+                    i + 1,
+                    total_chunks,
+                    &commit.hash[..8]
+                )
+            })?;
 
             if fresh {
                 partial.base.original_message =
@@ -355,16 +358,19 @@ impl ClaudeClient {
 
         let mut chunk_results = Vec::with_capacity(total_chunks);
         for (i, chunk) in plan.chunks.iter().enumerate() {
-            let mut partial =
-                CommitInfoForAI::from_commit_info_partial(commit.clone(), &chunk.file_paths)
-                    .with_context(|| {
-                        format!(
-                            "Failed to build partial view for chunk {}/{} of commit {}",
-                            i + 1,
-                            total_chunks,
-                            &commit.hash[..8]
-                        )
-                    })?;
+            let mut partial = CommitInfoForAI::from_commit_info_partial_with_overrides(
+                commit.clone(),
+                &chunk.file_paths,
+                &chunk.diff_overrides,
+            )
+            .with_context(|| {
+                format!(
+                    "Failed to build partial view for chunk {}/{} of commit {}",
+                    i + 1,
+                    total_chunks,
+                    &commit.hash[..8]
+                )
+            })?;
 
             partial.run_pre_validation_checks(valid_scopes);
 
@@ -740,16 +746,19 @@ impl ClaudeClient {
 
         let mut chunk_contents = Vec::with_capacity(total_chunks);
         for (i, chunk) in plan.chunks.iter().enumerate() {
-            let partial =
-                CommitInfoForAI::from_commit_info_partial(commit.clone(), &chunk.file_paths)
-                    .with_context(|| {
-                        format!(
-                            "Failed to build partial view for chunk {}/{} of commit {}",
-                            i + 1,
-                            total_chunks,
-                            &commit.hash[..8]
-                        )
-                    })?;
+            let partial = CommitInfoForAI::from_commit_info_partial_with_overrides(
+                commit.clone(),
+                &chunk.file_paths,
+                &chunk.diff_overrides,
+            )
+            .with_context(|| {
+                format!(
+                    "Failed to build partial view for chunk {}/{} of commit {}",
+                    i + 1,
+                    total_chunks,
+                    &commit.hash[..8]
+                )
+            })?;
 
             let partial_view = repo_view_for_ai.single_commit_view_for_ai(&partial);
 
