@@ -1,10 +1,12 @@
 //! File-based context analysis and architectural understanding.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::data::context::{
     ArchitecturalLayer, ChangeImpact, FileContext, FilePurpose, ProjectSignificance,
 };
+use crate::git::CommitInfo;
 
 /// File context analyzer.
 pub struct FileAnalyzer;
@@ -34,10 +36,26 @@ impl FileAnalyzer {
             .collect()
     }
 
+    /// Analyzes file changes across a range of commits, deduplicating by path.
+    ///
+    /// When a file appears in multiple commits, the status from the last
+    /// (most recent) commit wins. This provides the most accurate signal
+    /// for significance analysis.
+    pub fn analyze_commits(commits: &[CommitInfo]) -> Vec<FileContext> {
+        let mut file_map: HashMap<PathBuf, String> = HashMap::new();
+
+        for commit in commits {
+            for fc in &commit.analysis.file_changes.file_list {
+                file_map.insert(PathBuf::from(&fc.file), fc.status.clone());
+            }
+        }
+
+        let files: Vec<(PathBuf, String)> = file_map.into_iter().collect();
+        Self::analyze_file_set(&files)
+    }
+
     /// Determines the primary architectural impact of a set of file changes.
     pub fn primary_architectural_impact(contexts: &[FileContext]) -> ArchitecturalLayer {
-        use std::collections::HashMap;
-
         let mut layer_counts = HashMap::new();
         for context in contexts {
             *layer_counts
@@ -636,6 +654,82 @@ mod tests {
             "M",
         )];
         assert!(!FileAnalyzer::is_architectural_change(&contexts));
+    }
+
+    // ── FileAnalyzer::analyze_commits ─────────────────────────────
+
+    mod analyze_commits_tests {
+        use super::*;
+        use crate::git::commit::{CommitAnalysis, FileChange, FileChanges};
+
+        fn make_commit(files: Vec<(&str, &str)>) -> CommitInfo {
+            CommitInfo {
+                hash: "a".repeat(40),
+                author: "Test <test@test.com>".to_string(),
+                date: chrono::Utc::now().fixed_offset(),
+                original_message: "test commit".to_string(),
+                in_main_branches: Vec::new(),
+                analysis: CommitAnalysis {
+                    detected_type: String::new(),
+                    detected_scope: String::new(),
+                    proposed_message: String::new(),
+                    file_changes: FileChanges {
+                        total_files: files.len(),
+                        files_added: files.iter().filter(|(s, _)| *s == "A").count(),
+                        files_deleted: files.iter().filter(|(s, _)| *s == "D").count(),
+                        file_list: files
+                            .into_iter()
+                            .map(|(status, file)| FileChange {
+                                status: status.to_string(),
+                                file: file.to_string(),
+                            })
+                            .collect(),
+                    },
+                    diff_summary: String::new(),
+                    diff_file: String::new(),
+                    file_diffs: Vec::new(),
+                },
+            }
+        }
+
+        #[test]
+        fn empty_commits() {
+            let result = FileAnalyzer::analyze_commits(&[]);
+            assert!(result.is_empty());
+        }
+
+        #[test]
+        fn single_commit() {
+            let commit = make_commit(vec![("M", "src/main.rs"), ("A", "src/new.rs")]);
+            let result = FileAnalyzer::analyze_commits(&[commit]);
+            assert_eq!(result.len(), 2);
+        }
+
+        #[test]
+        fn deduplicates_across_commits() {
+            let commits = vec![
+                make_commit(vec![("A", "src/feature.rs"), ("M", "src/lib.rs")]),
+                make_commit(vec![("M", "src/feature.rs"), ("M", "src/main.rs")]),
+            ];
+            let result = FileAnalyzer::analyze_commits(&commits);
+            // 3 unique files: src/feature.rs, src/lib.rs, src/main.rs
+            assert_eq!(result.len(), 3);
+        }
+
+        #[test]
+        fn last_status_wins() {
+            let commits = vec![
+                make_commit(vec![("A", "src/feature.rs")]),
+                make_commit(vec![("M", "src/feature.rs")]),
+            ];
+            let result = FileAnalyzer::analyze_commits(&commits);
+            assert_eq!(result.len(), 1);
+            // Added then Modified — last status (M) wins → Modification impact
+            assert!(matches!(
+                result[0].change_impact,
+                ChangeImpact::Modification
+            ));
+        }
     }
 
     // ── property tests ────────────────────────────────────────────
