@@ -3,29 +3,14 @@
 use anyhow::{Context, Result};
 use tracing::debug;
 
-use crate::claude::token_budget::{self, TokenBudget};
+use crate::claude::token_budget::TokenBudget;
 use crate::claude::{ai::bedrock::BedrockAiClient, ai::claude::ClaudeAiClient};
 use crate::claude::{ai::AiClient, error::ClaudeError, prompts};
 use crate::data::{
     amendments::{Amendment, AmendmentFile},
     context::CommitContext,
-    DiffDetail, RepositoryView, RepositoryViewForAI,
+    RepositoryView, RepositoryViewForAI,
 };
-
-/// Multiplier for YAML re-serialization overhead when calculating excess chars.
-///
-/// Accounts for indentation changes, literal block markers, and other
-/// formatting differences when YAML is re-serialized after diff truncation.
-const YAML_OVERHEAD_FACTOR: f64 = 1.10;
-
-/// Result of fitting a prompt within the model's token budget.
-struct PromptWithBudget {
-    /// The user prompt (serialized from a possibly-reduced view).
-    user_prompt: String,
-    /// The level of diff detail that was used.
-    #[allow(dead_code)] // Retained for future diagnostics; set by all budget-fitting levels
-    diff_detail: DiffDetail,
-}
 
 /// Returned when the full diff does not fit the token budget.
 ///
@@ -73,109 +58,22 @@ impl ClaudeClient {
         Ok(())
     }
 
-    /// Builds a user prompt that fits within the model's token budget,
-    /// progressively reducing diff detail if necessary.
+    /// Builds a user prompt and validates it against the model's token budget.
     ///
-    /// Tries levels in order: Full → Truncated → StatOnly → FileListOnly.
-    /// Logs a warning at each reduction level so the user knows the AI
-    /// received less context.
+    /// Serializes the repository view to YAML, constructs the user prompt, and
+    /// checks that it fits within the available input tokens. Returns an error
+    /// if the prompt exceeds the budget.
     fn build_prompt_fitting_budget(
         &self,
-        ai_view: RepositoryViewForAI,
+        ai_view: &RepositoryViewForAI,
         system_prompt: &str,
-        build_user_prompt: impl Fn(&str) -> String,
-    ) -> Result<PromptWithBudget> {
+        build_user_prompt: &(impl Fn(&str) -> String + ?Sized),
+    ) -> Result<String> {
         let metadata = self.ai_client.get_metadata();
         let budget = TokenBudget::from_metadata(&metadata);
 
-        // Level 1: Full diff
-        let yaml = crate::data::to_yaml(&ai_view)
-            .context("Failed to serialize repository view to YAML")?;
-        let user_prompt = build_user_prompt(&yaml);
-
-        if let Ok(estimate) = budget.validate_prompt(system_prompt, &user_prompt) {
-            debug!(
-                model = %metadata.model,
-                estimated_tokens = estimate.estimated_tokens,
-                available_tokens = estimate.available_tokens,
-                utilization_pct = format!("{:.1}%", estimate.utilization_pct),
-                diff_detail = %DiffDetail::Full,
-                "Token budget check passed"
-            );
-            return Ok(PromptWithBudget {
-                user_prompt,
-                diff_detail: DiffDetail::Full,
-            });
-        }
-
-        // Level 2: Truncated diff — calculate excess and trim
-        let system_tokens = token_budget::estimate_tokens(system_prompt);
-        let user_tokens = token_budget::estimate_tokens(&user_prompt);
-        let excess_tokens =
-            (system_tokens + user_tokens).saturating_sub(budget.available_input_tokens());
-        let excess_chars = (token_budget::tokens_to_chars(excess_tokens) as f64
-            * YAML_OVERHEAD_FACTOR)
-            .ceil() as usize;
-
-        let mut truncated_view = ai_view.clone();
-        truncated_view.truncate_diffs(excess_chars);
-
-        let yaml = crate::data::to_yaml(&truncated_view)
-            .context("Failed to serialize truncated view to YAML")?;
-        let user_prompt = build_user_prompt(&yaml);
-
-        if let Ok(estimate) = budget.validate_prompt(system_prompt, &user_prompt) {
-            debug!(
-                model = %metadata.model,
-                estimated_tokens = estimate.estimated_tokens,
-                available_tokens = estimate.available_tokens,
-                utilization_pct = format!("{:.1}%", estimate.utilization_pct),
-                diff_detail = %DiffDetail::Truncated,
-                "Token budget check passed after diff truncation"
-            );
-            tracing::warn!(
-                "Diff content truncated to fit model context window ({})",
-                metadata.model
-            );
-            return Ok(PromptWithBudget {
-                user_prompt,
-                diff_detail: DiffDetail::Truncated,
-            });
-        }
-
-        // Level 3: Stat-only — replace diff content with stat summary
-        let mut stat_view = ai_view.clone();
-        stat_view.replace_diffs_with_stat();
-
-        let yaml = crate::data::to_yaml(&stat_view)
-            .context("Failed to serialize stat-only view to YAML")?;
-        let user_prompt = build_user_prompt(&yaml);
-
-        if let Ok(estimate) = budget.validate_prompt(system_prompt, &user_prompt) {
-            debug!(
-                model = %metadata.model,
-                estimated_tokens = estimate.estimated_tokens,
-                available_tokens = estimate.available_tokens,
-                utilization_pct = format!("{:.1}%", estimate.utilization_pct),
-                diff_detail = %DiffDetail::StatOnly,
-                "Token budget check passed with stat-only diff"
-            );
-            tracing::warn!(
-                "Full diff replaced with stat summary to fit model context window ({})",
-                metadata.model
-            );
-            return Ok(PromptWithBudget {
-                user_prompt,
-                diff_detail: DiffDetail::StatOnly,
-            });
-        }
-
-        // Level 4: File-list-only — remove all diff content
-        let mut minimal_view = ai_view;
-        minimal_view.remove_diffs();
-
-        let yaml = crate::data::to_yaml(&minimal_view)
-            .context("Failed to serialize minimal view to YAML")?;
+        let yaml =
+            crate::data::to_yaml(ai_view).context("Failed to serialize repository view to YAML")?;
         let user_prompt = build_user_prompt(&yaml);
 
         let estimate = budget.validate_prompt(system_prompt, &user_prompt)?;
@@ -184,22 +82,15 @@ impl ClaudeClient {
             estimated_tokens = estimate.estimated_tokens,
             available_tokens = estimate.available_tokens,
             utilization_pct = format!("{:.1}%", estimate.utilization_pct),
-            diff_detail = %DiffDetail::FileListOnly,
-            "Token budget check passed with file-list-only"
+            "Token budget check passed"
         );
-        tracing::warn!(
-            "All diff content removed to fit model context window — only file list available ({})",
-            metadata.model
-        );
-        Ok(PromptWithBudget {
-            user_prompt,
-            diff_detail: DiffDetail::FileListOnly,
-        })
+
+        Ok(user_prompt)
     }
 
     /// Tests whether the full diff fits the token budget.
     ///
-    /// Returns `Ok(Ok(PromptWithBudget))` when the full diff fits,
+    /// Returns `Ok(Ok(user_prompt))` when the full diff fits,
     /// `Ok(Err(BudgetExceeded))` when it does not, or a top-level error
     /// on serialization failure.
     fn try_full_diff_budget(
@@ -207,7 +98,7 @@ impl ClaudeClient {
         ai_view: &RepositoryViewForAI,
         system_prompt: &str,
         build_user_prompt: &impl Fn(&str) -> String,
-    ) -> Result<std::result::Result<PromptWithBudget, BudgetExceeded>> {
+    ) -> Result<std::result::Result<String, BudgetExceeded>> {
         let metadata = self.ai_client.get_metadata();
         let budget = TokenBudget::from_metadata(&metadata);
 
@@ -221,13 +112,9 @@ impl ClaudeClient {
                 estimated_tokens = estimate.estimated_tokens,
                 available_tokens = estimate.available_tokens,
                 utilization_pct = format!("{:.1}%", estimate.utilization_pct),
-                diff_detail = %DiffDetail::Full,
                 "Token budget check passed"
             );
-            return Ok(Ok(PromptWithBudget {
-                user_prompt,
-                diff_detail: DiffDetail::Full,
-            }));
+            return Ok(Ok(user_prompt));
         }
 
         Ok(Err(BudgetExceeded {
@@ -292,12 +179,12 @@ impl ClaudeClient {
 
             let partial_view = repo_view_for_ai.single_commit_view_for_ai(&partial);
 
-            let fitted =
-                self.build_prompt_fitting_budget(partial_view, system_prompt, build_user_prompt)?;
+            let user_prompt =
+                self.build_prompt_fitting_budget(&partial_view, system_prompt, build_user_prompt)?;
 
             let content = self
                 .ai_client
-                .send_request(system_prompt, &fitted.user_prompt)
+                .send_request(system_prompt, &user_prompt)
                 .await
                 .with_context(|| {
                     format!(
@@ -431,12 +318,12 @@ impl ClaudeClient {
                 .context("Failed to enhance repository view with diff content")?
                 .single_commit_view_for_ai(&partial);
 
-            let fitted =
-                self.build_prompt_fitting_budget(partial_view, system_prompt, build_user_prompt)?;
+            let user_prompt =
+                self.build_prompt_fitting_budget(&partial_view, system_prompt, &build_user_prompt)?;
 
             let content = self
                 .ai_client
-                .send_request(system_prompt, &fitted.user_prompt)
+                .send_request(system_prompt, &user_prompt)
                 .await
                 .with_context(|| {
                     format!(
@@ -617,10 +504,10 @@ impl ClaudeClient {
         // Single-commit views: try split dispatch when full diff exceeds budget
         if repo_view.commits.len() == 1 && !repo_view.commits[0].analysis.file_diffs.is_empty() {
             match self.try_full_diff_budget(&ai_repo_view, system_prompt, &build_user_prompt)? {
-                Ok(fitted) => {
+                Ok(user_prompt) => {
                     let content = self
                         .ai_client
-                        .send_request(system_prompt, &fitted.user_prompt)
+                        .send_request(system_prompt, &user_prompt)
                         .await?;
                     return self.parse_amendment_response(&content);
                 }
@@ -642,13 +529,13 @@ impl ClaudeClient {
             }
         }
 
-        // Multi-commit or no file_diffs: use progressive diff reduction
-        let fitted =
-            self.build_prompt_fitting_budget(ai_repo_view, system_prompt, build_user_prompt)?;
+        // Multi-commit or no file_diffs: validate budget and send
+        let user_prompt =
+            self.build_prompt_fitting_budget(&ai_repo_view, system_prompt, &build_user_prompt)?;
 
         let content = self
             .ai_client
-            .send_request(system_prompt, &fitted.user_prompt)
+            .send_request(system_prompt, &user_prompt)
             .await?;
 
         self.parse_amendment_response(&content)
@@ -706,10 +593,10 @@ impl ClaudeClient {
         // Single-commit views: try split dispatch when full diff exceeds budget
         if repo_view.commits.len() == 1 && !repo_view.commits[0].analysis.file_diffs.is_empty() {
             match self.try_full_diff_budget(&ai_repo_view, &system_prompt, &build_user_prompt)? {
-                Ok(fitted) => {
+                Ok(user_prompt) => {
                     let content = self
                         .ai_client
-                        .send_request(&system_prompt, &fitted.user_prompt)
+                        .send_request(&system_prompt, &user_prompt)
                         .await?;
                     return self.parse_amendment_response(&content);
                 }
@@ -731,13 +618,13 @@ impl ClaudeClient {
             }
         }
 
-        // Multi-commit or no file_diffs: use progressive diff reduction
-        let fitted =
-            self.build_prompt_fitting_budget(ai_repo_view, &system_prompt, build_user_prompt)?;
+        // Multi-commit or no file_diffs: validate budget and send
+        let user_prompt =
+            self.build_prompt_fitting_budget(&ai_repo_view, &system_prompt, &build_user_prompt)?;
 
         let content = self
             .ai_client
-            .send_request(&system_prompt, &fitted.user_prompt)
+            .send_request(&system_prompt, &user_prompt)
             .await?;
 
         self.parse_amendment_response(&content)
@@ -787,17 +674,19 @@ impl ClaudeClient {
         let ai_repo_view = RepositoryViewForAI::from_repository_view(repo_view.clone())
             .context("Failed to enhance repository view with diff content")?;
 
-        // Build prompt with progressive diff reduction if needed
-        let fitted = self.build_prompt_fitting_budget(
-            ai_repo_view,
+        // Build prompt and validate token budget
+        let build_user_prompt =
+            |yaml: &str| prompts::generate_pr_description_prompt(yaml, pr_template);
+        let user_prompt = self.build_prompt_fitting_budget(
+            &ai_repo_view,
             prompts::PR_GENERATION_SYSTEM_PROMPT,
-            |yaml| prompts::generate_pr_description_prompt(yaml, pr_template),
+            &build_user_prompt,
         )?;
 
         // Send request using AI client
         let content = self
             .ai_client
-            .send_request(prompts::PR_GENERATION_SYSTEM_PROMPT, &fitted.user_prompt)
+            .send_request(prompts::PR_GENERATION_SYSTEM_PROMPT, &user_prompt)
             .await?;
 
         // The AI response should be treated as YAML directly
@@ -827,15 +716,17 @@ impl ClaudeClient {
         let system_prompt =
             prompts::generate_pr_system_prompt_with_context_for_provider(context, prompt_style);
 
-        // Build prompt with progressive diff reduction if needed
-        let fitted = self.build_prompt_fitting_budget(ai_repo_view, &system_prompt, |yaml| {
+        // Build prompt and validate token budget
+        let build_user_prompt = |yaml: &str| {
             prompts::generate_pr_description_prompt_with_context(yaml, pr_template, context)
-        })?;
+        };
+        let user_prompt =
+            self.build_prompt_fitting_budget(&ai_repo_view, &system_prompt, &build_user_prompt)?;
 
         // Send request using AI client
         let content = self
             .ai_client
-            .send_request(&system_prompt, &fitted.user_prompt)
+            .send_request(&system_prompt, &user_prompt)
             .await?;
 
         // The AI response should be treated as YAML directly
@@ -923,10 +814,10 @@ impl ClaudeClient {
             }
 
             match self.try_full_diff_budget(&ai_repo_view, &system_prompt, &build_user_prompt)? {
-                Ok(fitted) => {
+                Ok(user_prompt) => {
                     let content = self
                         .ai_client
-                        .send_request(&system_prompt, &fitted.user_prompt)
+                        .send_request(&system_prompt, &user_prompt)
                         .await?;
                     return self.parse_check_response(&content, repo_view);
                 }
@@ -945,7 +836,7 @@ impl ClaudeClient {
             }
         }
 
-        // Multi-commit or no file_diffs: use progressive diff reduction
+        // Multi-commit or no file_diffs: validate budget and send
         let mut ai_repo_view = RepositoryViewForAI::from_repository_view(repo_view.clone())
             .context("Failed to enhance repository view with diff content")?;
 
@@ -954,9 +845,9 @@ impl ClaudeClient {
             commit.run_pre_validation_checks(valid_scopes);
         }
 
-        // Build prompt with progressive diff reduction if needed
-        let fitted =
-            self.build_prompt_fitting_budget(ai_repo_view, &system_prompt, build_user_prompt)?;
+        // Build prompt and validate token budget
+        let user_prompt =
+            self.build_prompt_fitting_budget(&ai_repo_view, &system_prompt, &build_user_prompt)?;
 
         let mut last_error = None;
 
@@ -964,7 +855,7 @@ impl ClaudeClient {
             // Send request using AI client
             match self
                 .ai_client
-                .send_request(&system_prompt, &fitted.user_prompt)
+                .send_request(&system_prompt, &user_prompt)
                 .await
             {
                 Ok(content) => match self.parse_check_response(&content, repo_view) {
@@ -1638,7 +1529,7 @@ mod tests {
     fn make_small_context_client(responses: Vec<Result<String>>) -> ClaudeClient {
         ClaudeClient::new(Box::new(
             crate::claude::test_utils::ConfigurableMockAiClient::new(responses)
-                .with_context_length(12_000),
+                .with_context_length(25_000),
         ))
     }
 
@@ -1652,13 +1543,13 @@ mod tests {
         let hash = "a".repeat(40);
 
         // Write a full (flat) diff file (large enough to bust the budget)
-        let full_diff = "x".repeat(15_000);
+        let full_diff = "x".repeat(80_000);
         let flat_diff_path = dir.path().join("full.diff");
         std::fs::write(&flat_diff_path, &full_diff).unwrap();
 
-        // Write two large per-file diff files (~8K chars each ≈ 2500 tokens)
-        let diff_a = format!("diff --git a/src/a.rs b/src/a.rs\n{}\n", "a".repeat(8_000));
-        let diff_b = format!("diff --git a/src/b.rs b/src/b.rs\n{}\n", "b".repeat(8_000));
+        // Write two large per-file diff files (~30K chars each ≈ 9400 tokens)
+        let diff_a = format!("diff --git a/src/a.rs b/src/a.rs\n{}\n", "a".repeat(30_000));
+        let diff_b = format!("diff --git a/src/b.rs b/src/b.rs\n{}\n", "b".repeat(30_000));
 
         let path_a = dir.path().join("0000.diff");
         let path_b = dir.path().join("0001.diff");
@@ -2005,5 +1896,225 @@ mod tests {
             !report.commits[0].passes,
             "should fail when any chunk fails"
         );
+    }
+
+    // ── multi-commit and PR generation paths ──────────────────────
+
+    /// Creates a repo view with two small commits (fits budget without split dispatch).
+    fn make_multi_commit_repo_view(dir: &tempfile::TempDir) -> crate::data::RepositoryView {
+        use crate::data::{AiInfo, FieldExplanation, WorkingDirectoryInfo};
+        use crate::git::commit::FileChanges;
+        use crate::git::{CommitAnalysis, CommitInfo};
+
+        let diff_a = dir.path().join("0.diff");
+        let diff_b = dir.path().join("1.diff");
+        std::fs::write(&diff_a, "+line a\n").unwrap();
+        std::fs::write(&diff_b, "+line b\n").unwrap();
+
+        let hash_a = "a".repeat(40);
+        let hash_b = "b".repeat(40);
+
+        crate::data::RepositoryView {
+            versions: None,
+            explanation: FieldExplanation::default(),
+            working_directory: WorkingDirectoryInfo {
+                clean: true,
+                untracked_changes: Vec::new(),
+            },
+            remotes: Vec::new(),
+            ai: AiInfo {
+                scratch: String::new(),
+            },
+            branch_info: None,
+            pr_template: None,
+            pr_template_location: None,
+            branch_prs: None,
+            commits: vec![
+                CommitInfo {
+                    hash: hash_a,
+                    author: "Test <test@test.com>".to_string(),
+                    date: chrono::Utc::now().fixed_offset(),
+                    original_message: "feat(a): add a".to_string(),
+                    in_main_branches: Vec::new(),
+                    analysis: CommitAnalysis {
+                        detected_type: "feat".to_string(),
+                        detected_scope: "a".to_string(),
+                        proposed_message: "feat(a): add a".to_string(),
+                        file_changes: FileChanges {
+                            total_files: 1,
+                            files_added: 1,
+                            files_deleted: 0,
+                            file_list: Vec::new(),
+                        },
+                        diff_summary: "a.rs | 1 +".to_string(),
+                        diff_file: diff_a.to_string_lossy().to_string(),
+                        file_diffs: Vec::new(),
+                    },
+                },
+                CommitInfo {
+                    hash: hash_b,
+                    author: "Test <test@test.com>".to_string(),
+                    date: chrono::Utc::now().fixed_offset(),
+                    original_message: "feat(b): add b".to_string(),
+                    in_main_branches: Vec::new(),
+                    analysis: CommitAnalysis {
+                        detected_type: "feat".to_string(),
+                        detected_scope: "b".to_string(),
+                        proposed_message: "feat(b): add b".to_string(),
+                        file_changes: FileChanges {
+                            total_files: 1,
+                            files_added: 1,
+                            files_deleted: 0,
+                            file_list: Vec::new(),
+                        },
+                        diff_summary: "b.rs | 1 +".to_string(),
+                        diff_file: diff_b.to_string_lossy().to_string(),
+                        file_diffs: Vec::new(),
+                    },
+                },
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn generate_amendments_multi_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_multi_commit_repo_view(&dir);
+        let hash_a = "a".repeat(40);
+        let hash_b = "b".repeat(40);
+
+        let response = format!(
+            concat!(
+                "amendments:\n",
+                "  - commit: \"{hash_a}\"\n",
+                "    message: \"feat(a): improved a\"\n",
+                "  - commit: \"{hash_b}\"\n",
+                "    message: \"feat(b): improved b\"\n",
+            ),
+            hash_a = hash_a,
+            hash_b = hash_b,
+        );
+        let client = make_configurable_client(vec![Ok(response)]);
+
+        let result = client
+            .generate_amendments_with_options(&repo_view, false)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "multi-commit amendment failed: {:?}",
+            result.err()
+        );
+        let amendments = result.unwrap();
+        assert_eq!(amendments.amendments.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn generate_contextual_amendments_multi_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_multi_commit_repo_view(&dir);
+        let hash_a = "a".repeat(40);
+        let hash_b = "b".repeat(40);
+
+        let response = format!(
+            concat!(
+                "amendments:\n",
+                "  - commit: \"{hash_a}\"\n",
+                "    message: \"feat(a): improved a\"\n",
+                "  - commit: \"{hash_b}\"\n",
+                "    message: \"feat(b): improved b\"\n",
+            ),
+            hash_a = hash_a,
+            hash_b = hash_b,
+        );
+        let client = make_configurable_client(vec![Ok(response)]);
+        let context = crate::data::context::CommitContext::default();
+
+        let result = client
+            .generate_contextual_amendments_with_options(&repo_view, &context, false)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "multi-commit contextual amendment failed: {:?}",
+            result.err()
+        );
+        let amendments = result.unwrap();
+        assert_eq!(amendments.amendments.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn generate_pr_content_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_test_repo_view(&dir);
+
+        let response = "title: \"feat: add something\"\ndescription: \"Adds a new feature.\"\n";
+        let client = make_configurable_client(vec![Ok(response.to_string())]);
+
+        let result = client.generate_pr_content(&repo_view, "").await;
+
+        assert!(result.is_ok(), "PR generation failed: {:?}", result.err());
+        let pr = result.unwrap();
+        assert_eq!(pr.title, "feat: add something");
+        assert_eq!(pr.description, "Adds a new feature.");
+    }
+
+    #[tokio::test]
+    async fn generate_pr_content_with_context_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_test_repo_view(&dir);
+        let context = crate::data::context::CommitContext::default();
+
+        let response = "title: \"feat: add something\"\ndescription: \"Adds a new feature.\"\n";
+        let client = make_configurable_client(vec![Ok(response.to_string())]);
+
+        let result = client
+            .generate_pr_content_with_context(&repo_view, "", &context)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "PR generation with context failed: {:?}",
+            result.err()
+        );
+        let pr = result.unwrap();
+        assert_eq!(pr.title, "feat: add something");
+    }
+
+    #[tokio::test]
+    async fn check_commits_multi_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_multi_commit_repo_view(&dir);
+        let hash_a = "a".repeat(40);
+        let hash_b = "b".repeat(40);
+
+        let response = format!(
+            concat!(
+                "checks:\n",
+                "  - commit: \"{hash_a}\"\n",
+                "    passes: true\n",
+                "    issues: []\n",
+                "  - commit: \"{hash_b}\"\n",
+                "    passes: true\n",
+                "    issues: []\n",
+            ),
+            hash_a = hash_a,
+            hash_b = hash_b,
+        );
+        let client = make_configurable_client(vec![Ok(response)]);
+
+        let result = client
+            .check_commits_with_scopes(&repo_view, None, &[], false)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "multi-commit check failed: {:?}",
+            result.err()
+        );
+        let report = result.unwrap();
+        assert_eq!(report.commits.len(), 2);
+        assert!(report.commits[0].passes);
+        assert!(report.commits[1].passes);
     }
 }
