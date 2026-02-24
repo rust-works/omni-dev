@@ -7,7 +7,7 @@ pub mod remote;
 pub mod repository;
 
 pub use amendment::AmendmentHandler;
-pub use commit::{CommitAnalysis, CommitAnalysisForAI, CommitInfo, CommitInfoForAI};
+pub use commit::{CommitAnalysis, CommitAnalysisForAI, CommitInfo, CommitInfoForAI, FileDiffRef};
 pub use diff_split::{split_by_file, split_file_by_hunk, FileDiff, HunkDiff};
 pub use remote::RemoteInfo;
 pub use repository::GitRepository;

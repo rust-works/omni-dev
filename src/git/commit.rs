@@ -11,6 +11,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::data::context::ScopeDefinition;
+use crate::git::diff_split::split_by_file;
 
 /// Matches conventional commit scope patterns including breaking-change syntax.
 #[allow(clippy::unwrap_used)] // Compile-time constant regex pattern
@@ -49,6 +50,24 @@ pub struct CommitAnalysis {
     pub diff_summary: String,
     /// Path to diff file showing line-by-line changes.
     pub diff_file: String,
+    /// Per-file diff references for individual file changes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_diffs: Vec<FileDiffRef>,
+}
+
+/// Reference to a per-file diff stored on disk.
+///
+/// Tracks the repository-relative file path, the absolute path to the
+/// diff file on disk, and the byte length of that diff. Gives consumers
+/// per-file size information without loading diff content into memory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileDiffRef {
+    /// Repository-relative path of the changed file.
+    pub path: String,
+    /// Absolute path to the per-file diff file on disk.
+    pub diff_file: String,
+    /// Byte length of the per-file diff content.
+    pub byte_len: usize,
 }
 
 /// Enhanced commit analysis for AI processing with full diff content.
@@ -153,7 +172,7 @@ impl CommitAnalysis {
         let diff_summary = Self::get_diff_summary(repo, commit)?;
 
         // Write diff to file and get path
-        let diff_file = Self::write_diff_to_file(repo, commit)?;
+        let (diff_file, file_diffs) = Self::write_diff_to_file(repo, commit)?;
 
         Ok(Self {
             detected_type,
@@ -162,6 +181,7 @@ impl CommitAnalysis {
             file_changes,
             diff_summary,
             diff_file,
+            file_diffs,
         })
     }
 
@@ -548,8 +568,11 @@ impl CommitAnalysis {
         Ok(summary)
     }
 
-    /// Writes full diff content to a file and returns the path.
-    fn write_diff_to_file(repo: &Repository, commit: &Commit) -> Result<String> {
+    /// Writes full diff content to a file and returns the path and per-file refs.
+    fn write_diff_to_file(
+        repo: &Repository,
+        commit: &Commit,
+    ) -> Result<(String, Vec<FileDiffRef>)> {
         // Get AI scratch directory
         let ai_scratch_path = crate::utils::ai_scratch::get_ai_scratch_dir()
             .context("Failed to determine AI scratch directory")?;
@@ -606,11 +629,34 @@ impl CommitAnalysis {
             diff_content.push('\n');
         }
 
-        // Write diff content to file
-        fs::write(&diff_path, diff_content).context("Failed to write diff file")?;
+        // Write flat diff content to file
+        fs::write(&diff_path, &diff_content).context("Failed to write diff file")?;
 
-        // Return the path as a string
-        Ok(diff_path.to_string_lossy().to_string())
+        // Split into per-file diffs and write each to disk
+        let per_file_diffs = split_by_file(&diff_content);
+        let mut file_diffs = Vec::with_capacity(per_file_diffs.len());
+
+        if !per_file_diffs.is_empty() {
+            let per_file_dir = diffs_dir.join(&commit_hash);
+            fs::create_dir_all(&per_file_dir)
+                .context("Failed to create per-file diffs directory")?;
+
+            for (index, file_diff) in per_file_diffs.iter().enumerate() {
+                let per_file_name = format!("{index:04}.diff");
+                let per_file_path = per_file_dir.join(&per_file_name);
+                fs::write(&per_file_path, &file_diff.content).with_context(|| {
+                    format!("Failed to write per-file diff: {}", per_file_path.display())
+                })?;
+
+                file_diffs.push(FileDiffRef {
+                    path: file_diff.path.clone(),
+                    diff_file: per_file_path.to_string_lossy().to_string(),
+                    byte_len: file_diff.byte_len,
+                });
+            }
+        }
+
+        Ok((diff_path.to_string_lossy().to_string(), file_diffs))
     }
 }
 
@@ -884,6 +930,7 @@ mod tests {
             file_changes: make_file_changes(&[("M", "src/cli/commands.rs")]),
             diff_summary: String::new(),
             diff_file: String::new(),
+            file_diffs: Vec::new(),
         };
         analysis.refine_scope(&[]);
         assert_eq!(analysis.detected_scope, "original");
@@ -902,6 +949,7 @@ mod tests {
             file_changes: make_file_changes(&[("M", "src/cli/commands.rs")]),
             diff_summary: String::new(),
             diff_file: String::new(),
+            file_diffs: Vec::new(),
         };
         analysis.refine_scope(&scope_defs);
         assert_eq!(analysis.detected_scope, "cli");
@@ -917,6 +965,7 @@ mod tests {
             file_changes: make_file_changes(&[("M", "README.md")]),
             diff_summary: String::new(),
             diff_file: String::new(),
+            file_diffs: Vec::new(),
         };
         analysis.refine_scope(&scope_defs);
         // No match → keeps original
@@ -939,6 +988,7 @@ mod tests {
             ]),
             diff_summary: String::new(),
             diff_file: String::new(),
+            file_diffs: Vec::new(),
         };
         analysis.refine_scope(&scope_defs);
         // Both have specificity 2 and both match → joined
@@ -967,6 +1017,7 @@ mod tests {
                         file_changes: make_file_changes(&[]),
                         diff_summary: String::new(),
                         diff_file: String::new(),
+                        file_diffs: Vec::new(),
                     },
                     diff_content: String::new(),
                 },
@@ -1100,6 +1151,7 @@ mod tests {
             file_changes: make_file_changes(&[]),
             diff_summary: "file.rs | 2 +-".to_string(),
             diff_file: diff_path.to_string_lossy().to_string(),
+            file_diffs: Vec::new(),
         };
 
         let ai = CommitAnalysisForAI::from_commit_analysis(analysis.clone()).unwrap();
@@ -1127,6 +1179,7 @@ mod tests {
                 file_changes: make_file_changes(&[("M", "src/cli.rs")]),
                 diff_summary: "cli.rs | 1 +".to_string(),
                 diff_file: diff_path.to_string_lossy().to_string(),
+                file_diffs: Vec::new(),
             },
         };
 
@@ -1135,5 +1188,59 @@ mod tests {
         assert_eq!(ai.base.hash, "a".repeat(40));
         assert_eq!(ai.base.original_message, "feat(cli): add flag");
         assert!(ai.pre_validated_checks.is_empty());
+    }
+
+    #[test]
+    fn file_diffs_default_empty_on_deserialize() {
+        let yaml = r#"
+detected_type: feat
+detected_scope: cli
+proposed_message: "feat(cli): test"
+file_changes:
+  total_files: 0
+  files_added: 0
+  files_deleted: 0
+  file_list: []
+diff_summary: ""
+diff_file: "/tmp/test.diff"
+"#;
+        let analysis: CommitAnalysis = serde_yaml::from_str(yaml).unwrap();
+        assert!(analysis.file_diffs.is_empty());
+    }
+
+    #[test]
+    fn file_diffs_omitted_when_empty_on_serialize() {
+        let analysis = CommitAnalysis {
+            detected_type: "feat".to_string(),
+            detected_scope: "cli".to_string(),
+            proposed_message: "feat(cli): test".to_string(),
+            file_changes: make_file_changes(&[]),
+            diff_summary: String::new(),
+            diff_file: String::new(),
+            file_diffs: Vec::new(),
+        };
+        let yaml = serde_yaml::to_string(&analysis).unwrap();
+        assert!(!yaml.contains("file_diffs"));
+    }
+
+    #[test]
+    fn file_diffs_included_when_populated() {
+        let analysis = CommitAnalysis {
+            detected_type: "feat".to_string(),
+            detected_scope: "cli".to_string(),
+            proposed_message: "feat(cli): test".to_string(),
+            file_changes: make_file_changes(&[]),
+            diff_summary: String::new(),
+            diff_file: String::new(),
+            file_diffs: vec![FileDiffRef {
+                path: "src/main.rs".to_string(),
+                diff_file: "/tmp/diffs/abc/0000.diff".to_string(),
+                byte_len: 42,
+            }],
+        };
+        let yaml = serde_yaml::to_string(&analysis).unwrap();
+        assert!(yaml.contains("file_diffs"));
+        assert!(yaml.contains("src/main.rs"));
+        assert!(yaml.contains("byte_len: 42"));
     }
 }
