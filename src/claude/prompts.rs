@@ -1012,6 +1012,76 @@ pub(crate) fn generate_check_chunk_merge_user_prompt(
     prompt
 }
 
+/// System prompt for merging per-commit PR content into a unified PR description.
+///
+/// When a PR's combined diff is too large for a single AI request, each commit
+/// is processed individually to produce a partial PR title and description.
+/// This prompt drives a reduce pass that synthesizes per-commit results into
+/// one cohesive PR title and description.
+pub(crate) const PR_CONTENT_MERGE_SYSTEM_PROMPT: &str = r#"You are a software engineer synthesizing a pull request description from partial descriptions that were generated from individual commits.
+
+Because the PR's combined diff was too large for a single request, each commit was processed individually and produced a partial PR title and description. You now see all partial results together with the PR template.
+
+Your task:
+1. **Synthesize** a single unified PR title that covers the overall change set
+2. **Combine** the per-commit descriptions into a coherent PR description that follows the template structure
+3. **Preserve details** from each partial description — do not lose important information
+4. **Avoid redundancy** — merge overlapping content rather than repeating it
+5. **Follow the PR template** structure if one is provided
+
+CRITICAL RESPONSE FORMAT: Respond with ONLY valid YAML content. Do not include explanatory text, markdown wrappers, or code blocks.
+
+Your response must follow this exact YAML structure:
+
+title: "Concise PR title covering the overall change"
+description: |
+  Full PR description in markdown format.
+
+IMPORTANT:
+- The title should be concise (50-80 characters) and cover the overall change
+- The description should synthesize all per-commit descriptions into a coherent narrative
+- Your response must be valid YAML only"#;
+
+/// Generates the user prompt for a PR content merge reduce pass.
+///
+/// Lists each per-commit PR content with its index, plus the PR template
+/// for structural guidance.
+pub(crate) fn generate_pr_content_merge_user_prompt(
+    per_commit_contents: &[crate::cli::git::PrContent],
+    pr_template: &str,
+) -> String {
+    let mut prompt = String::from(
+        "Synthesize the following per-commit PR descriptions into a single unified PR.\n\n",
+    );
+
+    if !pr_template.is_empty() {
+        prompt.push_str(&format!(
+            "PR template:\n{}\n\n",
+            indent_message(pr_template, "  "),
+        ));
+    }
+
+    prompt.push_str(&format!(
+        "Per-commit descriptions ({} commits):\n\n",
+        per_commit_contents.len()
+    ));
+
+    for (i, content) in per_commit_contents.iter().enumerate() {
+        prompt.push_str(&format!(
+            "Commit {}:\n  Title: {}\n  Description: |\n{}\n\n",
+            i + 1,
+            content.title,
+            indent_message(&content.description, "    "),
+        ));
+    }
+
+    prompt.push_str(
+        "Synthesize these into a single PR with one title and one description. Return exactly one PR entry.",
+    );
+
+    prompt
+}
+
 /// Generates the user prompt for an amendment coherence pass.
 pub fn generate_amendment_coherence_user_prompt(
     items: &[(crate::data::amendments::Amendment, String)],
@@ -1511,6 +1581,48 @@ mod tests {
             &summaries,
         );
         assert!(prompt.contains("(none)"));
+    }
+
+    // ── PR content merge prompts ────────────────────────────────
+
+    #[test]
+    fn pr_content_merge_system_prompt_not_empty() {
+        assert!(PR_CONTENT_MERGE_SYSTEM_PROMPT.len() > 100);
+        assert!(PR_CONTENT_MERGE_SYSTEM_PROMPT.contains("title:"));
+        assert!(PR_CONTENT_MERGE_SYSTEM_PROMPT.contains("description:"));
+    }
+
+    #[test]
+    fn pr_content_merge_user_prompt_includes_all_commits() {
+        let contents = vec![
+            crate::cli::git::PrContent {
+                title: "feat(a): add module a".to_string(),
+                description: "Adds the a module with core logic.".to_string(),
+            },
+            crate::cli::git::PrContent {
+                title: "feat(b): add module b".to_string(),
+                description: "Adds the b module with helpers.".to_string(),
+            },
+        ];
+        let prompt = generate_pr_content_merge_user_prompt(&contents, "## Summary\n");
+        assert!(prompt.contains("Commit 1:"));
+        assert!(prompt.contains("Commit 2:"));
+        assert!(prompt.contains("add module a"));
+        assert!(prompt.contains("add module b"));
+        assert!(prompt.contains("2 commits"));
+        assert!(prompt.contains("## Summary"));
+    }
+
+    #[test]
+    fn pr_content_merge_user_prompt_empty_template() {
+        let contents = vec![crate::cli::git::PrContent {
+            title: "fix: patch".to_string(),
+            description: "Patch description.".to_string(),
+        }];
+        let prompt = generate_pr_content_merge_user_prompt(&contents, "");
+        assert!(!prompt.contains("PR template:"));
+        assert!(prompt.contains("1 commits"));
+        assert!(prompt.contains("fix: patch"));
     }
 
     #[test]

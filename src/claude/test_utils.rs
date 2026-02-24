@@ -49,6 +49,29 @@ impl ConfigurableMockAiClient {
         self.metadata.max_context_length = max_context_length;
         self
     }
+
+    /// Returns a handle that can be used to inspect the response queue
+    /// after the mock client has been moved into a [`ClaudeClient`].
+    pub(crate) fn response_handle(&self) -> ResponseQueueHandle {
+        ResponseQueueHandle {
+            responses: self.responses.clone(),
+        }
+    }
+}
+
+/// Shared handle to a mock client's response queue.
+///
+/// Holds an `Arc` reference to the same queue used by the mock client,
+/// allowing tests to inspect how many responses remain after execution.
+pub(crate) struct ResponseQueueHandle {
+    responses: Arc<Mutex<VecDeque<Result<String>>>>,
+}
+
+impl ResponseQueueHandle {
+    /// Returns the number of unconsumed responses remaining in the queue.
+    pub(crate) fn remaining(&self) -> usize {
+        self.responses.lock().unwrap().len()
+    }
 }
 
 impl AiClient for ConfigurableMockAiClient {
