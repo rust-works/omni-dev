@@ -756,7 +756,9 @@ impl TwiddleCommand {
         &self,
         repo_view: &crate::data::RepositoryView,
     ) -> Result<crate::data::context::CommitContext> {
-        use crate::claude::context::{BranchAnalyzer, ProjectDiscovery, WorkPatternAnalyzer};
+        use crate::claude::context::{
+            BranchAnalyzer, FileAnalyzer, ProjectDiscovery, WorkPatternAnalyzer,
+        };
         use crate::data::context::CommitContext;
 
         let mut context = CommitContext::new();
@@ -802,6 +804,11 @@ impl TwiddleCommand {
             context.range = WorkPatternAnalyzer::analyze_commit_range(&repo_view.commits);
         }
 
+        // 3.5. Analyze file-level context
+        if !repo_view.commits.is_empty() {
+            context.files = FileAnalyzer::analyze_commits(&repo_view.commits);
+        }
+
         // 4. Apply user-provided context overrides
         if let Some(ref work_ctx) = self.work_context {
             context.user_provided = Some(work_ctx.clone());
@@ -839,6 +846,11 @@ impl TwiddleCommand {
 
         // Work pattern
         if let Some(label) = format_work_pattern(&context.range.work_pattern) {
+            println!("   {label}");
+        }
+
+        // File analysis
+        if let Some(label) = super::formatting::format_file_analysis(&context.files) {
             println!("   {label}");
         }
 
