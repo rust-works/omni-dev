@@ -163,6 +163,7 @@ mod tests {
                 },
                 diff_summary: "test.rs | 10 ++++".to_string(),
                 diff_file: tmp.path().to_string_lossy().to_string(),
+                file_diffs: Vec::new(),
             },
         };
         (commit, tmp)
