@@ -55,7 +55,7 @@ pub struct CommitSuggestion {
 }
 
 /// Severity level for issues.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IssueSeverity {
     /// Errors block CI (exit code 1).
@@ -506,6 +506,62 @@ mod tests {
     }
 
     // ── property tests ────────────────────────────────────────────
+
+    // ── IssueSeverity Hash ────────────────────────────────────────
+
+    #[test]
+    fn severity_hash_consistent_with_eq() {
+        use std::collections::HashSet;
+
+        let mut set = HashSet::new();
+        set.insert(IssueSeverity::Error);
+        set.insert(IssueSeverity::Warning);
+        set.insert(IssueSeverity::Info);
+        assert_eq!(set.len(), 3);
+
+        // Duplicate insert should not increase size
+        set.insert(IssueSeverity::Error);
+        assert_eq!(set.len(), 3);
+    }
+
+    #[test]
+    fn issue_dedup_by_rule_severity_section() {
+        use std::collections::HashSet;
+
+        let issues = vec![
+            CommitIssue {
+                severity: IssueSeverity::Error,
+                section: "Format".to_string(),
+                rule: "subject-line".to_string(),
+                explanation: "too long".to_string(),
+            },
+            CommitIssue {
+                severity: IssueSeverity::Error,
+                section: "Format".to_string(),
+                rule: "subject-line".to_string(),
+                explanation: "different wording".to_string(),
+            },
+            CommitIssue {
+                severity: IssueSeverity::Warning,
+                section: "Content".to_string(),
+                rule: "body-required".to_string(),
+                explanation: "missing body".to_string(),
+            },
+        ];
+
+        let mut seen = HashSet::new();
+        let mut deduped = Vec::new();
+        for issue in &issues {
+            let key = (issue.rule.clone(), issue.severity, issue.section.clone());
+            if seen.insert(key) {
+                deduped.push(issue.clone());
+            }
+        }
+
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].rule, "subject-line");
+        assert_eq!(deduped[1].rule, "body-required");
+    }
 
     mod prop {
         use super::*;

@@ -918,6 +918,100 @@ pub(crate) fn generate_chunk_merge_user_prompt(
     prompt
 }
 
+/// System prompt for merging partial chunk check results into a single check result.
+///
+/// When a commit's diff is too large for one AI request, it is split into
+/// file-level chunks and each chunk produces partial check results. This
+/// prompt drives a reduce pass that synthesizes per-chunk suggestions and
+/// summaries into one cohesive result. Issues are merged deterministically
+/// (union + dedup) outside this prompt.
+pub(crate) const CHECK_CHUNK_MERGE_SYSTEM_PROMPT: &str = r#"You are an expert commit message reviewer synthesizing check results that were generated from different subsets of the same commit's file diffs.
+
+Because the commit's diff was too large for a single request, it was split into N chunks and each chunk produced a partial suggestion for improving the commit message. You now see all partial suggestions together with the commit's original message and full `diff --stat` summary.
+
+Your task:
+1. **Synthesize** a single cohesive commit message suggestion that incorporates insights from ALL partial suggestions
+2. **Choose type and scope** that best represent the overall change — if partial suggestions disagree, pick the one that covers the broadest set of changes
+3. **Preserve accuracy feedback** from each partial suggestion — do not lose important corrections about what changed
+4. **Write a brief summary** of what the commit changes (one sentence, factual)
+
+CRITICAL RESPONSE FORMAT: Respond with ONLY valid YAML content. Do not include explanatory text, markdown wrappers, or code blocks.
+
+Your response must follow this exact YAML structure:
+
+checks:
+  - commit: "full-40-character-sha1-hash"
+    passes: false
+    issues: []
+    suggestion:
+      message: |
+        type(scope): subject line
+
+        Body paragraph synthesized from all chunks.
+      explanation: |
+        Combined improvements from all partial reviews.
+    summary: "One sentence describing what this commit changes"
+
+IMPORTANT:
+- Return exactly ONE check entry for this commit
+- Preserve the commit hash exactly as given
+- The `issues` array must be empty — issues are merged separately
+- The `passes` field must match the value provided below
+- Use YAML literal block scalar (|) for multi-line messages
+- Your response must start with "checks:" and be valid YAML only"#;
+
+/// Generates the user prompt for a check chunk-merge reduce pass.
+///
+/// Lists each partial suggestion with its index, plus the original message,
+/// full `diff --stat` summary, and the deterministically-merged pass status
+/// for context.
+pub(crate) fn generate_check_chunk_merge_user_prompt(
+    commit_hash: &str,
+    original_message: &str,
+    diff_summary: &str,
+    passes: bool,
+    chunk_suggestions: &[&crate::data::check::CommitSuggestion],
+    chunk_summaries: &[Option<&str>],
+) -> String {
+    let mut prompt = format!(
+        "Merge the following partial check suggestions for commit {commit_hash} into a single cohesive result.\n\n"
+    );
+
+    prompt.push_str(&format!(
+        "Original message:\n{}\n\n",
+        indent_message(original_message, "  "),
+    ));
+
+    prompt.push_str(&format!(
+        "Full diff --stat summary:\n{}\n\n",
+        indent_message(diff_summary, "  "),
+    ));
+
+    prompt.push_str(&format!("Overall passes: {passes}\n\n"));
+
+    prompt.push_str(&format!(
+        "Partial suggestions ({} chunks):\n\n",
+        chunk_suggestions.len()
+    ));
+
+    for (i, suggestion) in chunk_suggestions.iter().enumerate() {
+        let summary_text = chunk_summaries.get(i).and_then(|s| *s).unwrap_or("(none)");
+        prompt.push_str(&format!(
+            "Chunk {}:\n  Suggested message: |\n{}\n  Explanation: |\n{}\n  Summary: {}\n\n",
+            i + 1,
+            indent_message(&suggestion.message, "    "),
+            indent_message(&suggestion.explanation, "    "),
+            summary_text,
+        ));
+    }
+
+    prompt.push_str(
+        "Synthesize these into a single check entry with one suggestion and one summary. Return exactly one check entry.",
+    );
+
+    prompt
+}
+
 /// Generates the user prompt for an amendment coherence pass.
 pub fn generate_amendment_coherence_user_prompt(
     items: &[(crate::data::amendments::Amendment, String)],
@@ -1331,6 +1425,92 @@ mod tests {
         assert!(prompt.contains("src/main.rs | 10"));
         assert!(prompt.contains("src/lib.rs"));
         assert!(prompt.contains("original"));
+    }
+
+    #[test]
+    fn check_chunk_merge_system_prompt_not_empty() {
+        assert!(CHECK_CHUNK_MERGE_SYSTEM_PROMPT.len() > 100);
+        assert!(CHECK_CHUNK_MERGE_SYSTEM_PROMPT.contains("checks:"));
+    }
+
+    // ── check chunk merge user prompt ───────────────────────────
+
+    #[test]
+    fn check_chunk_merge_user_prompt_includes_all_chunks() {
+        use crate::data::check::CommitSuggestion;
+
+        let suggestions = vec![
+            CommitSuggestion {
+                message: "feat(cli): add flag".to_string(),
+                explanation: "improved clarity".to_string(),
+            },
+            CommitSuggestion {
+                message: "feat(cli): add option".to_string(),
+                explanation: "better scope".to_string(),
+            },
+        ];
+        let suggestion_refs: Vec<&CommitSuggestion> = suggestions.iter().collect();
+        let summaries = vec![Some("Added flag"), Some("Added option")];
+        let prompt = generate_check_chunk_merge_user_prompt(
+            &"a".repeat(40),
+            "original message",
+            " src/main.rs | 10 ++++",
+            false,
+            &suggestion_refs,
+            &summaries,
+        );
+        assert!(prompt.contains("Chunk 1:"));
+        assert!(prompt.contains("Chunk 2:"));
+        assert!(prompt.contains("add flag"));
+        assert!(prompt.contains("add option"));
+        assert!(prompt.contains("2 chunks"));
+        assert!(prompt.contains("passes: false"));
+    }
+
+    #[test]
+    fn check_chunk_merge_user_prompt_includes_context() {
+        use crate::data::check::CommitSuggestion;
+
+        let suggestions = vec![CommitSuggestion {
+            message: "fix: correct typo".to_string(),
+            explanation: "typo in subject".to_string(),
+        }];
+        let suggestion_refs: Vec<&CommitSuggestion> = suggestions.iter().collect();
+        let summaries = vec![Some("Fixed typo")];
+        let prompt = generate_check_chunk_merge_user_prompt(
+            &"b".repeat(40),
+            "original",
+            " src/main.rs | 5 ++\n src/lib.rs  | 3 ++",
+            true,
+            &suggestion_refs,
+            &summaries,
+        );
+        assert!(prompt.contains("src/main.rs | 5"));
+        assert!(prompt.contains("src/lib.rs"));
+        assert!(prompt.contains("original"));
+        assert!(prompt.contains("passes: true"));
+        assert!(prompt.contains("Fixed typo"));
+    }
+
+    #[test]
+    fn check_chunk_merge_user_prompt_handles_missing_summaries() {
+        use crate::data::check::CommitSuggestion;
+
+        let suggestions = vec![CommitSuggestion {
+            message: "feat: change".to_string(),
+            explanation: "reason".to_string(),
+        }];
+        let suggestion_refs: Vec<&CommitSuggestion> = suggestions.iter().collect();
+        let summaries: Vec<Option<&str>> = vec![None];
+        let prompt = generate_check_chunk_merge_user_prompt(
+            &"c".repeat(40),
+            "msg",
+            " a.rs | 1 +",
+            false,
+            &suggestion_refs,
+            &summaries,
+        );
+        assert!(prompt.contains("(none)"));
     }
 
     #[test]
