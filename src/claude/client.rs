@@ -370,6 +370,202 @@ impl ClaudeClient {
             .context("Merge pass returned no amendments")
     }
 
+    /// Checks a single commit whose diff exceeds the token budget by
+    /// splitting it into file-level chunks.
+    ///
+    /// Uses [`pack_file_diffs`](crate::claude::diff_pack::pack_file_diffs) to
+    /// create chunks, sends one check request per chunk, then merges results
+    /// deterministically (issue union + dedup). Runs an AI reduce pass only
+    /// when at least one chunk returns a suggestion.
+    async fn check_commit_split(
+        &self,
+        commit: &crate::git::CommitInfo,
+        repo_view: &RepositoryView,
+        system_prompt: &str,
+        valid_scopes: &[crate::data::context::ScopeDefinition],
+        include_suggestions: bool,
+        available_input_tokens: usize,
+    ) -> Result<crate::data::check::CheckReport> {
+        use crate::claude::diff_pack::pack_file_diffs;
+        use crate::data::check::{CommitCheckResult, CommitIssue, IssueSeverity};
+        use crate::git::commit::CommitInfoForAI;
+
+        let plan = pack_file_diffs(
+            &commit.hash,
+            &commit.analysis.file_diffs,
+            available_input_tokens,
+        )
+        .with_context(|| {
+            format!(
+                "Failed to plan diff chunks for commit {}",
+                &commit.hash[..8]
+            )
+        })?;
+
+        let total_chunks = plan.chunks.len();
+        debug!(
+            commit = %&commit.hash[..8],
+            chunks = total_chunks,
+            "Check split dispatch: processing commit in chunks"
+        );
+
+        let build_user_prompt =
+            |yaml: &str| prompts::generate_check_user_prompt(yaml, include_suggestions);
+
+        let mut chunk_results = Vec::with_capacity(total_chunks);
+        for (i, chunk) in plan.chunks.iter().enumerate() {
+            let mut partial =
+                CommitInfoForAI::from_commit_info_partial(commit.clone(), &chunk.file_paths)
+                    .with_context(|| {
+                        format!(
+                            "Failed to build partial view for chunk {}/{} of commit {}",
+                            i + 1,
+                            total_chunks,
+                            &commit.hash[..8]
+                        )
+                    })?;
+
+            partial.run_pre_validation_checks(valid_scopes);
+
+            let partial_view = RepositoryViewForAI::from_repository_view(repo_view.clone())
+                .context("Failed to enhance repository view with diff content")?
+                .single_commit_view_for_ai(&partial);
+
+            let fitted =
+                self.build_prompt_fitting_budget(partial_view, system_prompt, build_user_prompt)?;
+
+            let content = self
+                .ai_client
+                .send_request(system_prompt, &fitted.user_prompt)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Check chunk {}/{} failed for commit {}",
+                        i + 1,
+                        total_chunks,
+                        &commit.hash[..8]
+                    )
+                })?;
+
+            let report = self
+                .parse_check_response(&content, repo_view)
+                .with_context(|| {
+                    format!(
+                        "Failed to parse check chunk {}/{} response for commit {}",
+                        i + 1,
+                        total_chunks,
+                        &commit.hash[..8]
+                    )
+                })?;
+
+            if let Some(result) = report.commits.into_iter().next() {
+                chunk_results.push(result);
+            }
+        }
+
+        // Deterministic merge: union issues, dedup by (rule, severity, section)
+        let mut seen = std::collections::HashSet::new();
+        let mut merged_issues: Vec<CommitIssue> = Vec::new();
+        for result in &chunk_results {
+            for issue in &result.issues {
+                let key: (String, IssueSeverity, String) =
+                    (issue.rule.clone(), issue.severity, issue.section.clone());
+                if seen.insert(key) {
+                    merged_issues.push(issue.clone());
+                }
+            }
+        }
+
+        let passes = chunk_results.iter().all(|r| r.passes);
+
+        // AI reduce pass for suggestion/summary only when needed
+        let has_suggestions = chunk_results.iter().any(|r| r.suggestion.is_some());
+
+        let (merged_suggestion, merged_summary) = if has_suggestions {
+            self.merge_check_chunks(
+                &commit.hash,
+                &commit.original_message,
+                &commit.analysis.diff_summary,
+                passes,
+                &chunk_results,
+                repo_view,
+            )
+            .await?
+        } else {
+            // Take first non-None summary
+            let summary = chunk_results.iter().find_map(|r| r.summary.clone());
+            (None, summary)
+        };
+
+        let original_message = commit
+            .original_message
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string();
+
+        let merged_result = CommitCheckResult {
+            hash: commit.hash.clone(),
+            message: original_message,
+            issues: merged_issues,
+            suggestion: merged_suggestion,
+            passes,
+            summary: merged_summary,
+        };
+
+        Ok(crate::data::check::CheckReport::new(vec![merged_result]))
+    }
+
+    /// Runs an AI reduce pass to synthesize a single suggestion and summary
+    /// from partial chunk check results for the same commit.
+    ///
+    /// Only called when at least one chunk returned a suggestion.
+    async fn merge_check_chunks(
+        &self,
+        commit_hash: &str,
+        original_message: &str,
+        diff_summary: &str,
+        passes: bool,
+        chunk_results: &[crate::data::check::CommitCheckResult],
+        repo_view: &RepositoryView,
+    ) -> Result<(Option<crate::data::check::CommitSuggestion>, Option<String>)> {
+        let suggestions: Vec<&crate::data::check::CommitSuggestion> = chunk_results
+            .iter()
+            .filter_map(|r| r.suggestion.as_ref())
+            .collect();
+
+        let summaries: Vec<Option<&str>> =
+            chunk_results.iter().map(|r| r.summary.as_deref()).collect();
+
+        let system_prompt = prompts::CHECK_CHUNK_MERGE_SYSTEM_PROMPT;
+        let user_prompt = prompts::generate_check_chunk_merge_user_prompt(
+            commit_hash,
+            original_message,
+            diff_summary,
+            passes,
+            &suggestions,
+            &summaries,
+        );
+
+        self.validate_prompt_budget(system_prompt, &user_prompt)?;
+
+        let content = self
+            .ai_client
+            .send_request(system_prompt, &user_prompt)
+            .await
+            .context("Merge pass failed for check chunk suggestions")?;
+
+        let report = self
+            .parse_check_response(&content, repo_view)
+            .context("Failed to parse check merge pass response")?;
+
+        let result = report.commits.into_iter().next();
+        Ok(match result {
+            Some(r) => (r.suggestion, r.summary),
+            None => (None, None),
+        })
+    }
+
     /// Sends a raw prompt to the AI client and returns the text response.
     pub async fn send_message(&self, system_prompt: &str, user_prompt: &str) -> Result<String> {
         self.validate_prompt_budget(system_prompt, user_prompt)?;
@@ -697,6 +893,12 @@ impl ClaudeClient {
     }
 
     /// Checks commit messages with retry logic for parse failures.
+    ///
+    /// For single-commit views whose full diff exceeds the token budget,
+    /// splits the diff into file-level chunks and dispatches multiple AI
+    /// requests, then merges results. Multi-commit views fall back to
+    /// progressive diff reduction (the caller retries individually on
+    /// failure).
     async fn check_commits_with_retry(
         &self,
         repo_view: &RepositoryView,
@@ -705,7 +907,45 @@ impl ClaudeClient {
         include_suggestions: bool,
         max_retries: u32,
     ) -> Result<crate::data::check::CheckReport> {
-        // Convert to AI-enhanced view with diff content
+        // Generate system prompt with scopes
+        let system_prompt =
+            prompts::generate_check_system_prompt_with_scopes(guidelines, valid_scopes);
+
+        let build_user_prompt =
+            |yaml: &str| prompts::generate_check_user_prompt(yaml, include_suggestions);
+
+        // Single-commit views: try split dispatch when full diff exceeds budget
+        if repo_view.commits.len() == 1 && !repo_view.commits[0].analysis.file_diffs.is_empty() {
+            let mut ai_repo_view = RepositoryViewForAI::from_repository_view(repo_view.clone())
+                .context("Failed to enhance repository view with diff content")?;
+            for commit in &mut ai_repo_view.commits {
+                commit.run_pre_validation_checks(valid_scopes);
+            }
+
+            match self.try_full_diff_budget(&ai_repo_view, &system_prompt, &build_user_prompt)? {
+                Ok(fitted) => {
+                    let content = self
+                        .ai_client
+                        .send_request(&system_prompt, &fitted.user_prompt)
+                        .await?;
+                    return self.parse_check_response(&content, repo_view);
+                }
+                Err(exceeded) => {
+                    return self
+                        .check_commit_split(
+                            &repo_view.commits[0],
+                            repo_view,
+                            &system_prompt,
+                            valid_scopes,
+                            include_suggestions,
+                            exceeded.available_input_tokens,
+                        )
+                        .await;
+                }
+            }
+        }
+
+        // Multi-commit or no file_diffs: use progressive diff reduction
         let mut ai_repo_view = RepositoryViewForAI::from_repository_view(repo_view.clone())
             .context("Failed to enhance repository view with diff content")?;
 
@@ -714,14 +954,9 @@ impl ClaudeClient {
             commit.run_pre_validation_checks(valid_scopes);
         }
 
-        // Generate system prompt with scopes
-        let system_prompt =
-            prompts::generate_check_system_prompt_with_scopes(guidelines, valid_scopes);
-
         // Build prompt with progressive diff reduction if needed
-        let fitted = self.build_prompt_fitting_budget(ai_repo_view, &system_prompt, |yaml| {
-            prompts::generate_check_user_prompt(yaml, include_suggestions)
-        })?;
+        let fitted =
+            self.build_prompt_fitting_budget(ai_repo_view, &system_prompt, build_user_prompt)?;
 
         let mut last_error = None;
 
@@ -1556,5 +1791,219 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap().amendments.len(), 1);
+    }
+
+    // ── check split dispatch tests ──────────────────────────────
+
+    fn valid_check_yaml_for(hash: &str, passes: bool) -> String {
+        format!(
+            "checks:\n  - commit: \"{hash}\"\n    passes: {passes}\n    issues: []\n    summary: \"test summary\"\n"
+        )
+    }
+
+    fn valid_check_yaml_with_issues(hash: &str) -> String {
+        format!(
+            concat!(
+                "checks:\n",
+                "  - commit: \"{hash}\"\n",
+                "    passes: false\n",
+                "    issues:\n",
+                "      - severity: error\n",
+                "        section: \"Subject Line\"\n",
+                "        rule: \"subject-too-long\"\n",
+                "        explanation: \"Subject exceeds 72 characters\"\n",
+                "    suggestion:\n",
+                "      message: \"feat(test): shorter subject\"\n",
+                "      explanation: \"Shortened subject line\"\n",
+                "    summary: \"Large commit with issues\"\n",
+            ),
+            hash = hash,
+        )
+    }
+
+    fn valid_check_yaml_chunk_no_suggestion(hash: &str) -> String {
+        format!(
+            concat!(
+                "checks:\n",
+                "  - commit: \"{hash}\"\n",
+                "    passes: true\n",
+                "    issues: []\n",
+                "    summary: \"chunk summary\"\n",
+            ),
+            hash = hash,
+        )
+    }
+
+    #[tokio::test]
+    async fn check_commits_split_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_large_diff_repo_view(&dir);
+        let hash = "a".repeat(40);
+
+        // Responses: chunk 1 (issues + suggestion) + chunk 2 (issues + suggestion) + merge pass
+        let client = make_small_context_client(vec![
+            Ok(valid_check_yaml_with_issues(&hash)),
+            Ok(valid_check_yaml_with_issues(&hash)),
+            Ok(valid_check_yaml_with_issues(&hash)), // merge pass response
+        ]);
+
+        let result = client
+            .check_commits_with_scopes(&repo_view, None, &[], true)
+            .await;
+
+        assert!(result.is_ok(), "split dispatch failed: {:?}", result.err());
+        let report = result.unwrap();
+        assert_eq!(report.commits.len(), 1);
+        assert!(!report.commits[0].passes);
+        // Dedup: both chunks report the same (rule, severity, section), so only 1 unique issue
+        assert_eq!(report.commits[0].issues.len(), 1);
+        assert_eq!(report.commits[0].issues[0].rule, "subject-too-long");
+    }
+
+    #[tokio::test]
+    async fn check_commits_split_dispatch_no_merge_when_no_suggestions() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_large_diff_repo_view(&dir);
+        let hash = "a".repeat(40);
+
+        // Responses: chunk 1 + chunk 2, both passing with no suggestions
+        // No merge pass needed — only 2 responses
+        let client = make_small_context_client(vec![
+            Ok(valid_check_yaml_chunk_no_suggestion(&hash)),
+            Ok(valid_check_yaml_chunk_no_suggestion(&hash)),
+        ]);
+
+        let result = client
+            .check_commits_with_scopes(&repo_view, None, &[], false)
+            .await;
+
+        assert!(result.is_ok(), "split dispatch failed: {:?}", result.err());
+        let report = result.unwrap();
+        assert_eq!(report.commits.len(), 1);
+        assert!(report.commits[0].passes);
+        assert!(report.commits[0].issues.is_empty());
+        assert!(report.commits[0].suggestion.is_none());
+        // First non-None summary from chunks
+        assert_eq!(report.commits[0].summary.as_deref(), Some("chunk summary"));
+    }
+
+    #[tokio::test]
+    async fn check_commits_split_chunk_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_large_diff_repo_view(&dir);
+        let hash = "a".repeat(40);
+
+        // First chunk succeeds, second chunk fails
+        let client = make_small_context_client(vec![
+            Ok(valid_check_yaml_for(&hash, true)),
+            Err(anyhow::anyhow!("rate limit exceeded")),
+        ]);
+
+        let result = client
+            .check_commits_with_scopes(&repo_view, None, &[], false)
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn check_commits_no_split_when_fits() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_test_repo_view(&dir); // Small diff, no file_diffs
+        let hash = format!("{:0>40}", 0);
+
+        // Only one response needed — no split dispatch
+        let client = make_configurable_client(vec![Ok(valid_check_yaml_for(&hash, true))]);
+
+        let result = client
+            .check_commits_with_scopes(&repo_view, None, &[], false)
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().commits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn check_commits_split_dedup_across_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_large_diff_repo_view(&dir);
+        let hash = "a".repeat(40);
+
+        // Chunk 1: two issues (error + warning)
+        let chunk1 = format!(
+            concat!(
+                "checks:\n",
+                "  - commit: \"{hash}\"\n",
+                "    passes: false\n",
+                "    issues:\n",
+                "      - severity: error\n",
+                "        section: \"Subject Line\"\n",
+                "        rule: \"subject-too-long\"\n",
+                "        explanation: \"Subject exceeds 72 characters\"\n",
+                "      - severity: warning\n",
+                "        section: \"Content\"\n",
+                "        rule: \"body-required\"\n",
+                "        explanation: \"Large change needs body\"\n",
+            ),
+            hash = hash,
+        );
+
+        // Chunk 2: same error (different wording) + new info issue
+        let chunk2 = format!(
+            concat!(
+                "checks:\n",
+                "  - commit: \"{hash}\"\n",
+                "    passes: false\n",
+                "    issues:\n",
+                "      - severity: error\n",
+                "        section: \"Subject Line\"\n",
+                "        rule: \"subject-too-long\"\n",
+                "        explanation: \"Subject line is too long\"\n",
+                "      - severity: info\n",
+                "        section: \"Style\"\n",
+                "        rule: \"scope-suggestion\"\n",
+                "        explanation: \"Consider more specific scope\"\n",
+            ),
+            hash = hash,
+        );
+
+        // No suggestions → no merge pass needed
+        let client = make_small_context_client(vec![Ok(chunk1), Ok(chunk2)]);
+
+        let result = client
+            .check_commits_with_scopes(&repo_view, None, &[], false)
+            .await;
+
+        assert!(result.is_ok(), "split dispatch failed: {:?}", result.err());
+        let report = result.unwrap();
+        assert_eq!(report.commits.len(), 1);
+        assert!(!report.commits[0].passes);
+        // 3 unique issues: subject-too-long, body-required, scope-suggestion
+        // (subject-too-long appears in both chunks but deduped)
+        assert_eq!(report.commits[0].issues.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn check_commits_split_passes_only_when_all_chunks_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_large_diff_repo_view(&dir);
+        let hash = "a".repeat(40);
+
+        // Chunk 1 passes, chunk 2 fails
+        let client = make_small_context_client(vec![
+            Ok(valid_check_yaml_for(&hash, true)),
+            Ok(valid_check_yaml_for(&hash, false)),
+        ]);
+
+        let result = client
+            .check_commits_with_scopes(&repo_view, None, &[], false)
+            .await;
+
+        assert!(result.is_ok(), "split dispatch failed: {:?}", result.err());
+        let report = result.unwrap();
+        assert!(
+            !report.commits[0].passes,
+            "should fail when any chunk fails"
+        );
     }
 }
