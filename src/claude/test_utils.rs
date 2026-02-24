@@ -14,6 +14,12 @@ use crate::claude::ai::{AiClient, AiClientMetadata};
 /// Responses are returned in FIFO order. When the queue is exhausted,
 /// subsequent calls return `Err("no more mock responses")`.
 ///
+/// Every call to [`send_request`](AiClient::send_request) records the
+/// `(system_prompt, user_prompt)` pair so tests can inspect which prompts
+/// were dispatched. Use [`prompt_handle`](Self::prompt_handle) to obtain
+/// a shared handle for reading the recorded prompts after the client has
+/// been moved into a [`ClaudeClient`](super::client::ClaudeClient).
+///
 /// # Example
 ///
 /// ```rust
@@ -25,6 +31,7 @@ use crate::claude::ai::{AiClient, AiClientMetadata};
 pub(crate) struct ConfigurableMockAiClient {
     responses: Arc<Mutex<VecDeque<Result<String>>>>,
     metadata: AiClientMetadata,
+    recorded_prompts: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl ConfigurableMockAiClient {
@@ -39,6 +46,7 @@ impl ConfigurableMockAiClient {
                 max_response_length: 8_192,
                 active_beta: None,
             },
+            recorded_prompts: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -55,6 +63,14 @@ impl ConfigurableMockAiClient {
     pub(crate) fn response_handle(&self) -> ResponseQueueHandle {
         ResponseQueueHandle {
             responses: self.responses.clone(),
+        }
+    }
+
+    /// Returns a handle for inspecting which prompts were sent to the
+    /// mock client after it has been moved into a [`ClaudeClient`].
+    pub(crate) fn prompt_handle(&self) -> PromptRecordHandle {
+        PromptRecordHandle {
+            recorded_prompts: self.recorded_prompts.clone(),
         }
     }
 }
@@ -74,14 +90,39 @@ impl ResponseQueueHandle {
     }
 }
 
+/// Shared handle to a mock client's recorded prompts.
+///
+/// Holds an `Arc` reference to the same prompt log used by the mock
+/// client, allowing tests to inspect which prompts were sent after the
+/// client has been moved into a [`ClaudeClient`](super::client::ClaudeClient).
+pub(crate) struct PromptRecordHandle {
+    recorded_prompts: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl PromptRecordHandle {
+    /// Returns all recorded `(system_prompt, user_prompt)` pairs.
+    pub(crate) fn prompts(&self) -> Vec<(String, String)> {
+        self.recorded_prompts.lock().unwrap().clone()
+    }
+
+    /// Returns the number of AI requests that were made.
+    pub(crate) fn request_count(&self) -> usize {
+        self.recorded_prompts.lock().unwrap().len()
+    }
+}
+
 impl AiClient for ConfigurableMockAiClient {
     fn send_request<'a>(
         &'a self,
-        _system_prompt: &'a str,
-        _user_prompt: &'a str,
+        system_prompt: &'a str,
+        user_prompt: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
         let responses = self.responses.clone();
+        let recorded = self.recorded_prompts.clone();
+        let sys = system_prompt.to_string();
+        let usr = user_prompt.to_string();
         Box::pin(async move {
+            recorded.lock().unwrap().push((sys, usr));
             responses
                 .lock()
                 .unwrap()
