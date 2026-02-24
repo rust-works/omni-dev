@@ -479,12 +479,12 @@ async fn cli_execute_dispatches_git_branch_info() {
 
 #[tokio::test]
 async fn cli_execute_dispatches_ai_chat() {
-    use omni_dev::cli::ai::{AiCommand, AiSubcommand, ChatCommand};
+    use omni_dev::cli::ai::{AiCommand, AiSubcommands, ChatCommand};
     use omni_dev::cli::{Cli, Commands};
 
     let cli = Cli {
         command: Commands::Ai(AiCommand {
-            command: AiSubcommand::Chat(ChatCommand { model: None }),
+            command: AiSubcommands::Chat(ChatCommand { model: None }),
         }),
     };
     // Without API credentials this returns Err at the preflight check;
