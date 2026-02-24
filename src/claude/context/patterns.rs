@@ -393,6 +393,7 @@ mod tests {
                 },
                 diff_summary: String::new(),
                 diff_file: String::new(),
+                file_diffs: Vec::new(),
             },
         }
     }
