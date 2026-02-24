@@ -4,6 +4,7 @@ pub mod ai;
 pub(crate) mod batch;
 pub mod client;
 pub mod context;
+pub(crate) mod diff_pack;
 pub mod error;
 pub mod model_config;
 pub mod prompts;
