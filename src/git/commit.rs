@@ -680,47 +680,77 @@ impl CommitInfoForAI {
 
     /// Creates a partial view of a commit containing only the specified file diffs.
     ///
-    /// Reads diff content from each matching [`FileDiffRef::diff_file`] and
-    /// concatenates it into `diff_content`. Preserves all commit metadata
-    /// (hash, author, date, original_message, `diff_summary`) so the AI has
-    /// full context alongside the partial diff.
-    ///
-    /// Duplicate paths (which arise when a large file is hunk-split and
-    /// multiple hunks land in the same chunk) are deduplicated so each
-    /// file's content is loaded only once.
+    /// Convenience wrapper around [`Self::from_commit_info_partial_with_overrides`]
+    /// with all-`None` overrides (every file loaded from disk).
+    #[cfg(test)]
     pub(crate) fn from_commit_info_partial(
         commit_info: CommitInfo,
         file_paths: &[String],
     ) -> Result<Self> {
-        // Deduplicate requested paths (hunk-split files may repeat).
-        let unique_paths: Vec<&String> = {
-            let mut seen = std::collections::HashSet::new();
-            file_paths
-                .iter()
-                .filter(|p| seen.insert(p.as_str()))
-                .collect()
-        };
+        let overrides: Vec<Option<String>> = vec![None; file_paths.len()];
+        Self::from_commit_info_partial_with_overrides(commit_info, file_paths, &overrides)
+    }
 
-        // Filter file_diffs to only the requested paths and load content.
-        let matching_refs: Vec<FileDiffRef> = commit_info
-            .analysis
-            .file_diffs
-            .iter()
-            .filter(|r| unique_paths.contains(&&r.path))
-            .cloned()
-            .collect();
+    /// Creates a partial view using pre-sliced diff content where available.
+    ///
+    /// `file_paths` and `diff_overrides` must be parallel slices. When
+    /// `diff_overrides[i]` is `Some(content)`, that content is used directly
+    /// instead of reading the full per-file diff from disk. This enables
+    /// per-hunk partial views where each chunk receives only its assigned
+    /// hunk slices rather than the entire file.
+    ///
+    /// Entries with `None` overrides fall back to loading from disk via
+    /// [`FileDiffRef::diff_file`], deduplicated by path.
+    pub(crate) fn from_commit_info_partial_with_overrides(
+        commit_info: CommitInfo,
+        file_paths: &[String],
+        diff_overrides: &[Option<String>],
+    ) -> Result<Self> {
+        let mut diff_parts = Vec::new();
+        let mut included_refs = Vec::new();
+        let mut loaded_disk_paths: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
-        let mut diff_parts = Vec::with_capacity(matching_refs.len());
-        for file_ref in &matching_refs {
-            let content = fs::read_to_string(&file_ref.diff_file)
-                .with_context(|| format!("Failed to read per-file diff: {}", file_ref.diff_file))?;
-            diff_parts.push(content);
+        for (path, override_content) in file_paths.iter().zip(diff_overrides.iter()) {
+            if let Some(content) = override_content {
+                // Pre-sliced hunk content — use directly.
+                diff_parts.push(content.clone());
+                // Include the FileDiffRef for metadata (deduplicated).
+                if let Some(file_ref) = commit_info
+                    .analysis
+                    .file_diffs
+                    .iter()
+                    .find(|r| r.path == *path)
+                {
+                    if !included_refs.iter().any(|r: &FileDiffRef| r.path == *path) {
+                        included_refs.push(file_ref.clone());
+                    }
+                }
+            } else {
+                // Whole-file item — load from disk (deduplicated).
+                if loaded_disk_paths.insert(path.clone()) {
+                    if let Some(file_ref) = commit_info
+                        .analysis
+                        .file_diffs
+                        .iter()
+                        .find(|r| r.path == *path)
+                    {
+                        let content =
+                            fs::read_to_string(&file_ref.diff_file).with_context(|| {
+                                format!("Failed to read per-file diff: {}", file_ref.diff_file)
+                            })?;
+                        diff_parts.push(content);
+                        included_refs.push(file_ref.clone());
+                    }
+                }
+            }
         }
+
         let diff_content = diff_parts.join("\n");
 
         let partial_analysis = CommitAnalysisForAI {
             base: CommitAnalysis {
-                file_diffs: matching_refs,
+                file_diffs: included_refs,
                 ..commit_info.analysis
             },
             diff_content,
@@ -1423,6 +1453,130 @@ diff_file: "/tmp/test.diff"
         assert_eq!(partial.base.date, original_date);
         assert_eq!(partial.base.original_message, original_message);
         assert_eq!(partial.base.analysis.base.diff_summary, original_summary);
+
+        Ok(())
+    }
+
+    // ── from_commit_info_partial_with_overrides ─────────────────────
+
+    #[test]
+    fn with_overrides_uses_override_content() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let commit = make_commit_with_file_diffs(
+            &dir,
+            &[(
+                "src/big.rs",
+                "diff --git a/src/big.rs\n+full-file-content\n",
+            )],
+        );
+
+        let paths = vec!["src/big.rs".to_string(), "src/big.rs".to_string()];
+        let overrides = vec![
+            Some("diff --git a/src/big.rs\n@@ -1,3 +1,4 @@\n+hunk1\n".to_string()),
+            Some("diff --git a/src/big.rs\n@@ -10,3 +10,4 @@\n+hunk2\n".to_string()),
+        ];
+        let partial =
+            CommitInfoForAI::from_commit_info_partial_with_overrides(commit, &paths, &overrides)?;
+
+        // Should contain hunk content, NOT full file content.
+        assert!(partial.base.analysis.diff_content.contains("+hunk1"));
+        assert!(partial.base.analysis.diff_content.contains("+hunk2"));
+        assert!(
+            !partial
+                .base
+                .analysis
+                .diff_content
+                .contains("+full-file-content"),
+            "should not contain full file content"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn with_overrides_mixed_override_and_disk() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let commit = make_commit_with_file_diffs(
+            &dir,
+            &[
+                ("src/big.rs", "diff --git a/src/big.rs\n+big-full\n"),
+                ("src/small.rs", "diff --git a/src/small.rs\n+small-disk\n"),
+            ],
+        );
+
+        let paths = vec!["src/big.rs".to_string(), "src/small.rs".to_string()];
+        let overrides = vec![
+            Some("diff --git a/src/big.rs\n@@ -1,3 +1,4 @@\n+big-hunk\n".to_string()),
+            None, // load from disk
+        ];
+        let partial =
+            CommitInfoForAI::from_commit_info_partial_with_overrides(commit, &paths, &overrides)?;
+
+        // big.rs: override content
+        assert!(partial.base.analysis.diff_content.contains("+big-hunk"));
+        assert!(!partial.base.analysis.diff_content.contains("+big-full"));
+        // small.rs: loaded from disk
+        assert!(partial.base.analysis.diff_content.contains("+small-disk"));
+
+        // Both files should appear in file_diffs metadata.
+        let ref_paths: Vec<&str> = partial
+            .base
+            .analysis
+            .base
+            .file_diffs
+            .iter()
+            .map(|r| r.path.as_str())
+            .collect();
+        assert!(ref_paths.contains(&"src/big.rs"));
+        assert!(ref_paths.contains(&"src/small.rs"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn with_overrides_deduplicates_disk_reads() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let commit = make_commit_with_file_diffs(
+            &dir,
+            &[("src/main.rs", "diff --git a/src/main.rs\n+main\n")],
+        );
+
+        // Two None entries for same path (simulates duplicate whole-file items).
+        let paths = vec!["src/main.rs".to_string(), "src/main.rs".to_string()];
+        let overrides = vec![None, None];
+        let partial =
+            CommitInfoForAI::from_commit_info_partial_with_overrides(commit, &paths, &overrides)?;
+
+        // Content loaded only once despite two None entries.
+        assert_eq!(
+            partial.base.analysis.diff_content.matches("+main").count(),
+            1
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn with_overrides_preserves_metadata() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let commit = make_commit_with_file_diffs(
+            &dir,
+            &[("src/main.rs", "diff --git a/src/main.rs\n+main\n")],
+        );
+
+        let original_hash = commit.hash.clone();
+        let original_author = commit.author.clone();
+        let original_message = commit.original_message.clone();
+
+        let paths = vec!["src/main.rs".to_string()];
+        let overrides = vec![Some("+override-content\n".to_string())];
+        let partial =
+            CommitInfoForAI::from_commit_info_partial_with_overrides(commit, &paths, &overrides)?;
+
+        assert_eq!(partial.base.hash, original_hash);
+        assert_eq!(partial.base.author, original_author);
+        assert_eq!(partial.base.original_message, original_message);
+        assert!(partial.pre_validated_checks.is_empty());
 
         Ok(())
     }
