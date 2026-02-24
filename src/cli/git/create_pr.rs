@@ -117,7 +117,7 @@ impl CreatePrCommand {
 
         // 6. Show context analysis (quick collection for display only)
         let context = {
-            use crate::claude::context::{BranchAnalyzer, WorkPatternAnalyzer};
+            use crate::claude::context::{BranchAnalyzer, FileAnalyzer, WorkPatternAnalyzer};
             use crate::data::context::CommitContext;
             let mut context = CommitContext::new();
             context.project = project_context;
@@ -129,6 +129,7 @@ impl CreatePrCommand {
 
             if !repo_view.commits.is_empty() {
                 context.range = WorkPatternAnalyzer::analyze_commit_range(&repo_view.commits);
+                context.files = FileAnalyzer::analyze_commits(&repo_view.commits);
             }
             context
         };
@@ -507,7 +508,9 @@ impl CreatePrCommand {
         &self,
         repo_view: &crate::data::RepositoryView,
     ) -> Result<crate::data::context::CommitContext> {
-        use crate::claude::context::{BranchAnalyzer, ProjectDiscovery, WorkPatternAnalyzer};
+        use crate::claude::context::{
+            BranchAnalyzer, FileAnalyzer, ProjectDiscovery, WorkPatternAnalyzer,
+        };
         use crate::data::context::{CommitContext, ProjectContext};
         use crate::git::GitRepository;
 
@@ -538,6 +541,11 @@ impl CreatePrCommand {
         // 3. Analyze commit range patterns
         if !repo_view.commits.is_empty() {
             context.range = WorkPatternAnalyzer::analyze_commit_range(&repo_view.commits);
+        }
+
+        // 3.5. Analyze file-level context
+        if !repo_view.commits.is_empty() {
+            context.files = FileAnalyzer::analyze_commits(&repo_view.commits);
         }
 
         Ok(context)
@@ -632,6 +640,11 @@ impl CreatePrCommand {
             WorkPattern::Documentation => println!("   📖 Pattern: Documentation updates"),
             WorkPattern::Configuration => println!("   ⚙️  Pattern: Configuration changes"),
             WorkPattern::Unknown => {}
+        }
+
+        // File analysis
+        if let Some(label) = super::formatting::format_file_analysis(&context.files) {
+            println!("   {label}");
         }
 
         // Verbosity level
