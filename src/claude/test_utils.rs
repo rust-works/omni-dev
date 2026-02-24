@@ -41,6 +41,14 @@ impl ConfigurableMockAiClient {
             },
         }
     }
+
+    /// Returns a new mock client with a custom context window size.
+    ///
+    /// Useful for testing split-dispatch behaviour with a small budget.
+    pub(crate) fn with_context_length(mut self, max_context_length: usize) -> Self {
+        self.metadata.max_context_length = max_context_length;
+        self
+    }
 }
 
 impl AiClient for ConfigurableMockAiClient {

@@ -612,6 +612,35 @@ impl RepositoryViewForAI {
             commit.base.analysis.base.diff_summary = String::new();
         }
     }
+
+    /// Creates a minimal AI view containing a single commit for split dispatch.
+    ///
+    /// Analogous to [`RepositoryView::single_commit_view`] but operates on
+    /// the AI-enhanced type. Strips metadata not relevant to per-commit
+    /// analysis to reduce prompt size.
+    #[must_use]
+    pub(crate) fn single_commit_view_for_ai(&self, commit: &CommitInfoForAI) -> Self {
+        Self {
+            versions: None,
+            explanation: FieldExplanation {
+                text: String::new(),
+                fields: Vec::new(),
+            },
+            working_directory: WorkingDirectoryInfo {
+                clean: true,
+                untracked_changes: Vec::new(),
+            },
+            remotes: Vec::new(),
+            ai: AiInfo {
+                scratch: String::new(),
+            },
+            branch_info: self.branch_info.clone(),
+            pr_template: None,
+            pr_template_location: None,
+            branch_prs: None,
+            commits: vec![commit.clone()],
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1029,6 +1058,66 @@ mod tests {
 
         assert!(multi.commits.is_empty());
         assert!(multi.versions.is_none());
+    }
+
+    // ── single_commit_view_for_ai ──────────────────────────────────
+
+    #[test]
+    fn single_commit_view_for_ai_strips_metadata() {
+        use crate::git::commit::CommitInfoForAI;
+
+        let commit_info = make_commit_info("aaa");
+        let ai_commit = CommitInfoForAI {
+            base: crate::git::CommitInfo {
+                hash: commit_info.hash,
+                author: commit_info.author,
+                date: commit_info.date,
+                original_message: commit_info.original_message,
+                in_main_branches: commit_info.in_main_branches,
+                analysis: crate::git::commit::CommitAnalysisForAI {
+                    base: commit_info.analysis,
+                    diff_content: "diff content".to_string(),
+                },
+            },
+            pre_validated_checks: Vec::new(),
+        };
+
+        let ai_view = RepositoryViewForAI {
+            versions: Some(VersionInfo {
+                omni_dev: "1.0.0".to_string(),
+            }),
+            explanation: FieldExplanation::default(),
+            working_directory: WorkingDirectoryInfo {
+                clean: true,
+                untracked_changes: Vec::new(),
+            },
+            remotes: vec![RemoteInfo {
+                name: "origin".to_string(),
+                uri: "https://example.com".to_string(),
+                main_branch: "main".to_string(),
+            }],
+            ai: AiInfo {
+                scratch: String::new(),
+            },
+            branch_info: Some(BranchInfo {
+                branch: "feature/test".to_string(),
+            }),
+            pr_template: Some("template".to_string()),
+            pr_template_location: Some(".github/PULL_REQUEST_TEMPLATE.md".to_string()),
+            branch_prs: None,
+            commits: vec![ai_commit.clone()],
+        };
+
+        let single = ai_view.single_commit_view_for_ai(&ai_commit);
+
+        assert!(single.versions.is_none());
+        assert!(single.pr_template.is_none());
+        assert!(single.remotes.is_empty());
+        assert_eq!(single.commits.len(), 1);
+        assert_eq!(single.commits[0].base.hash, "aaa");
+        // branch_info IS preserved (for scope context)
+        assert!(single.branch_info.is_some());
+        assert_eq!(single.branch_info.unwrap().branch, "feature/test");
     }
 
     // ── FieldExplanation::default ────────────────────────────────────
