@@ -7,9 +7,6 @@
 //! hunk that still exceeds capacity gets its own chunk; the dispatch layer
 //! is responsible for treating that as a hard error.
 
-// Building block for the dispatch layer (#192); no callers yet.
-#![allow(dead_code)]
-
 use std::fs;
 
 use anyhow::{Context, Result};
@@ -43,6 +40,7 @@ pub(crate) struct DiffChunk {
 #[derive(Debug)]
 pub(crate) struct CommitDiffPlan {
     /// SHA-1 hash of the commit these chunks belong to.
+    #[allow(dead_code)] // Structural metadata; useful in Debug output
     pub commit_hash: String,
     /// Ordered list of chunks, each fitting within the token budget.
     pub chunks: Vec<DiffChunk>,

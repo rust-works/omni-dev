@@ -841,6 +841,83 @@ IMPORTANT:
 - Set `passes: true` only if there are no error or warning level issues
 - Your response must start with "checks:" and be valid YAML only"#;
 
+/// System prompt for merging partial chunk amendments into a single commit message.
+///
+/// When a commit's diff is too large for one AI request, it is split into
+/// file-level chunks and each chunk produces a partial amendment. This prompt
+/// drives a reduce pass that synthesizes those partial amendments into one
+/// cohesive message.
+pub(crate) const AMENDMENT_CHUNK_MERGE_SYSTEM_PROMPT: &str = r#"You are an expert software engineer synthesizing commit message proposals that were generated from different subsets of the same commit's file diffs.
+
+Because the commit's diff was too large for a single request, it was split into N chunks and each chunk produced a partial proposed message. You now see all partial messages together with the commit's full `diff --stat` summary and the original commit message.
+
+Your task:
+1. **Synthesize** a single cohesive conventional commit message that accurately describes ALL changes in the commit
+2. **Choose type and scope** that best represent the overall change — if partial messages disagree, pick the one that covers the broadest set of changes
+3. **Preserve details** from each partial message — do not lose important information about what changed
+4. **Write a body** when the combined scope warrants it — summarize the key changes from all chunks
+5. **Use conventional commit format**: `type(scope): subject` with optional body after a blank line
+
+CRITICAL RESPONSE FORMAT: Respond with ONLY valid YAML content. Do not include explanatory text, markdown wrappers, or code blocks.
+
+Your response must follow this exact YAML structure:
+
+amendments:
+  - commit: "full-40-character-sha1-hash"
+    message: |
+      type(scope): subject line
+
+      Body paragraph synthesized from all chunks.
+
+IMPORTANT:
+- Return exactly ONE amendment for this commit
+- Preserve the commit hash exactly as given
+- Use YAML literal block scalar (|) for multi-line messages
+- Your response must start with "amendments:" and be valid YAML only"#;
+
+/// Generates the user prompt for a chunk-merge reduce pass.
+///
+/// Lists each partial amendment with its index and covered files, plus the
+/// original message and full `diff --stat` summary for context.
+pub(crate) fn generate_chunk_merge_user_prompt(
+    commit_hash: &str,
+    original_message: &str,
+    diff_summary: &str,
+    chunk_amendments: &[crate::data::amendments::Amendment],
+) -> String {
+    let mut prompt = format!(
+        "Merge the following partial amendments for commit {commit_hash} into a single cohesive message.\n\n"
+    );
+
+    prompt.push_str(&format!(
+        "Original message:\n{}\n\n",
+        indent_message(original_message, "  "),
+    ));
+
+    prompt.push_str(&format!(
+        "Full diff --stat summary:\n{}\n\n",
+        indent_message(diff_summary, "  "),
+    ));
+
+    prompt.push_str(&format!(
+        "Partial amendments ({} chunks):\n\n",
+        chunk_amendments.len()
+    ));
+
+    for (i, amendment) in chunk_amendments.iter().enumerate() {
+        prompt.push_str(&format!(
+            "Chunk {}:\n  Proposed message: |\n{}\n\n",
+            i + 1,
+            indent_message(&amendment.message, "    "),
+        ));
+    }
+
+    prompt
+        .push_str("Synthesize these into a single amendment. Return exactly one amendment entry.");
+
+    prompt
+}
+
 /// Generates the user prompt for an amendment coherence pass.
 pub fn generate_amendment_coherence_user_prompt(
     items: &[(crate::data::amendments::Amendment, String)],
@@ -1212,6 +1289,48 @@ mod tests {
     #[test]
     fn check_coherence_system_prompt_not_empty() {
         assert!(CHECK_COHERENCE_SYSTEM_PROMPT.len() > 100);
+    }
+
+    #[test]
+    fn chunk_merge_system_prompt_not_empty() {
+        assert!(AMENDMENT_CHUNK_MERGE_SYSTEM_PROMPT.len() > 100);
+        assert!(AMENDMENT_CHUNK_MERGE_SYSTEM_PROMPT.contains("amendments:"));
+    }
+
+    // ── chunk merge user prompt ──────────────────────────────────
+
+    #[test]
+    fn chunk_merge_user_prompt_includes_all_chunks() {
+        use crate::data::amendments::Amendment;
+
+        let chunks = vec![
+            Amendment::new("a".repeat(40), "feat(cli): add flag".to_string()),
+            Amendment::new("a".repeat(40), "feat(cli): add option".to_string()),
+        ];
+        let prompt = generate_chunk_merge_user_prompt(
+            &"a".repeat(40),
+            "original message",
+            " src/main.rs | 10 ++++",
+            &chunks,
+        );
+        assert!(prompt.contains("Chunk 1:"));
+        assert!(prompt.contains("Chunk 2:"));
+        assert!(prompt.contains("add flag"));
+        assert!(prompt.contains("add option"));
+        assert!(prompt.contains("2 chunks"));
+    }
+
+    #[test]
+    fn chunk_merge_user_prompt_includes_diff_summary() {
+        use crate::data::amendments::Amendment;
+
+        let chunks = vec![Amendment::new("a".repeat(40), "feat: change".to_string())];
+        let summary = " src/main.rs | 10 ++++\n src/lib.rs  |  5 ++";
+        let prompt =
+            generate_chunk_merge_user_prompt(&"a".repeat(40), "original", summary, &chunks);
+        assert!(prompt.contains("src/main.rs | 10"));
+        assert!(prompt.contains("src/lib.rs"));
+        assert!(prompt.contains("original"));
     }
 
     #[test]
