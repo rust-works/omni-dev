@@ -4,6 +4,7 @@
 //! `create_pr` command modules to eliminate duplication and enable unit testing.
 
 use crate::data::check::{CommitIssue, IssueSeverity};
+use crate::data::context::{FileContext, ProjectSignificance};
 
 /// Truncates a commit hash to [`SHORT_HASH_LEN`](crate::git::SHORT_HASH_LEN) characters.
 pub(crate) fn truncate_hash(hash: &str) -> &str {
@@ -51,6 +52,29 @@ pub(crate) fn resolve_short_hash<'a>(short: &str, candidates: &'a [String]) -> O
             None
         }
     })
+}
+
+/// Formats a file analysis summary with file count and critical file count.
+///
+/// Returns `None` when the file list is empty.
+pub(crate) fn format_file_analysis(files: &[FileContext]) -> Option<String> {
+    if files.is_empty() {
+        return None;
+    }
+
+    let critical_count = files
+        .iter()
+        .filter(|f| matches!(f.project_significance, ProjectSignificance::Critical))
+        .count();
+
+    if critical_count > 0 {
+        Some(format!(
+            "\u{1f4c2} Files: {} analyzed ({critical_count} critical)",
+            files.len()
+        ))
+    } else {
+        Some(format!("\u{1f4c2} Files: {} analyzed", files.len()))
+    }
 }
 
 /// Splits an editor command string into the executable and its arguments.
@@ -194,5 +218,58 @@ mod tests {
         let (cmd, args) = parse_editor_command("code --wait --new-window");
         assert_eq!(cmd, "code");
         assert_eq!(args, vec!["--wait", "--new-window"]);
+    }
+
+    // --- format_file_analysis ---
+
+    use crate::data::context::{ArchitecturalLayer, ChangeImpact, FilePurpose};
+    use std::path::PathBuf;
+
+    fn make_file_context(path: &str, significance: ProjectSignificance) -> FileContext {
+        FileContext {
+            path: PathBuf::from(path),
+            file_purpose: FilePurpose::CoreLogic,
+            architectural_layer: ArchitecturalLayer::Business,
+            change_impact: ChangeImpact::Modification,
+            project_significance: significance,
+        }
+    }
+
+    #[test]
+    fn file_analysis_empty() {
+        assert!(format_file_analysis(&[]).is_none());
+    }
+
+    #[test]
+    fn file_analysis_no_critical() {
+        let files = vec![
+            make_file_context("src/foo.rs", ProjectSignificance::Routine),
+            make_file_context("src/bar.rs", ProjectSignificance::Important),
+        ];
+        let label = format_file_analysis(&files).unwrap();
+        assert!(label.contains("2 analyzed"));
+        assert!(!label.contains("critical"));
+    }
+
+    #[test]
+    fn file_analysis_with_critical() {
+        let files = vec![
+            make_file_context("src/main.rs", ProjectSignificance::Critical),
+            make_file_context("src/foo.rs", ProjectSignificance::Routine),
+            make_file_context("src/lib.rs", ProjectSignificance::Critical),
+        ];
+        let label = format_file_analysis(&files).unwrap();
+        assert!(label.contains("3 analyzed"));
+        assert!(label.contains("2 critical"));
+    }
+
+    #[test]
+    fn file_analysis_single_file() {
+        let files = vec![make_file_context(
+            "src/foo.rs",
+            ProjectSignificance::Routine,
+        )];
+        let label = format_file_analysis(&files).unwrap();
+        assert!(label.contains("1 analyzed"));
     }
 }
