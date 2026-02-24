@@ -1112,6 +1112,7 @@ mod tests {
                 },
                 diff_summary: String::new(),
                 diff_file: tmp.path().to_string_lossy().to_string(),
+                file_diffs: Vec::new(),
             },
         };
         (commit, tmp)

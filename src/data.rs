@@ -176,7 +176,11 @@ impl RepositoryView {
                 | "commits[].analysis.file_changes.files_deleted"
                 | "commits[].analysis.file_changes.file_list"
                 | "commits[].analysis.diff_summary"
-                | "commits[].analysis.diff_file" => !self.commits.is_empty(),
+                | "commits[].analysis.diff_file"
+                | "commits[].analysis.file_diffs"
+                | "commits[].analysis.file_diffs[].path"
+                | "commits[].analysis.file_diffs[].diff_file"
+                | "commits[].analysis.file_diffs[].byte_len" => !self.commits.is_empty(),
                 "versions.omni_dev" => self.versions.is_some(),
                 "branch_info.branch" => self.branch_info.is_some(),
                 "pr_template" => self.pr_template.is_some(),
@@ -382,6 +386,33 @@ impl Default for FieldExplanation {
                     text: "Path to file containing full diff content showing line-by-line changes with added, removed, and context lines.\n\
                            AI assistants should read this file to understand the specific changes made in the commit.".to_string(),
                     command: Some("git show <commit>".to_string()),
+                    present: false,
+                },
+                FieldDocumentation {
+                    name: "commits[].analysis.file_diffs".to_string(),
+                    text: "Array of per-file diff references, each containing the file path, \
+                           absolute path to the diff file on disk, and byte length of the diff content.\n\
+                           AI assistants can use these to analyze individual file changes without loading the full diff."
+                        .to_string(),
+                    command: None,
+                    present: false,
+                },
+                FieldDocumentation {
+                    name: "commits[].analysis.file_diffs[].path".to_string(),
+                    text: "Repository-relative path of the changed file.".to_string(),
+                    command: None,
+                    present: false,
+                },
+                FieldDocumentation {
+                    name: "commits[].analysis.file_diffs[].diff_file".to_string(),
+                    text: "Absolute path to the per-file diff file on disk.".to_string(),
+                    command: None,
+                    present: false,
+                },
+                FieldDocumentation {
+                    name: "commits[].analysis.file_diffs[].byte_len".to_string(),
+                    text: "Byte length of the per-file diff content.".to_string(),
+                    command: None,
                     present: false,
                 },
                 FieldDocumentation {
@@ -612,6 +643,7 @@ mod tests {
                         },
                         diff_summary: diff_summary.to_string(),
                         diff_file: "/tmp/test.diff".to_string(),
+                        file_diffs: Vec::new(),
                     },
                     diff_content: diff_content.to_string(),
                 },
@@ -944,6 +976,7 @@ mod tests {
                 },
                 diff_summary: String::new(),
                 diff_file: String::new(),
+                file_diffs: Vec::new(),
             },
         }
     }
@@ -1064,6 +1097,7 @@ mod tests {
                         },
                         diff_summary: "file.rs | 1 +".to_string(),
                         diff_file: diff_path.to_string_lossy().to_string(),
+                        file_diffs: Vec::new(),
                     },
                 }
             })

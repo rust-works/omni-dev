@@ -1062,6 +1062,7 @@ mod tests {
                     },
                     diff_summary: "file.rs | 1 +".to_string(),
                     diff_file: diff_path.to_string_lossy().to_string(),
+                    file_diffs: Vec::new(),
                 },
             }],
         }
