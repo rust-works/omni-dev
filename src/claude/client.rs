@@ -97,7 +97,7 @@ impl ClaudeClient {
         &self,
         ai_view: &RepositoryViewForAI,
         system_prompt: &str,
-        build_user_prompt: &impl Fn(&str) -> String,
+        build_user_prompt: &(impl Fn(&str) -> String + ?Sized),
     ) -> Result<std::result::Result<String, BudgetExceeded>> {
         let metadata = self.ai_client.get_metadata();
         let budget = TokenBudget::from_metadata(&metadata);
@@ -255,6 +255,60 @@ impl ClaudeClient {
             .into_iter()
             .next()
             .context("Merge pass returned no amendments")
+    }
+
+    /// Generates an amendment for a single commit, using split dispatch
+    /// if the full diff exceeds the token budget.
+    ///
+    /// Tries the full diff first. If it exceeds the budget and the commit
+    /// has file-level diffs, falls back to
+    /// [`generate_amendment_split`](Self::generate_amendment_split).
+    async fn generate_amendment_for_commit(
+        &self,
+        commit: &crate::git::CommitInfo,
+        repo_view_for_ai: &RepositoryViewForAI,
+        system_prompt: &str,
+        build_user_prompt: &(dyn Fn(&str) -> String + Sync),
+        fresh: bool,
+    ) -> Result<Amendment> {
+        let mut ai_commit = crate::git::commit::CommitInfoForAI::from_commit_info(commit.clone())?;
+        if fresh {
+            ai_commit.base.original_message =
+                "(Original message hidden - generate fresh message from diff)".to_string();
+        }
+        let single_view = repo_view_for_ai.single_commit_view_for_ai(&ai_commit);
+
+        match self.try_full_diff_budget(&single_view, system_prompt, build_user_prompt)? {
+            Ok(user_prompt) => {
+                let content = self
+                    .ai_client
+                    .send_request(system_prompt, &user_prompt)
+                    .await?;
+                let amendment_file = self.parse_amendment_response(&content)?;
+                amendment_file
+                    .amendments
+                    .into_iter()
+                    .next()
+                    .context("AI returned no amendments for commit")
+            }
+            Err(exceeded) => {
+                if commit.analysis.file_diffs.is_empty() {
+                    anyhow::bail!(
+                        "Token budget exceeded for commit {} but no file-level diffs available for split dispatch",
+                        &commit.hash[..8]
+                    );
+                }
+                self.generate_amendment_split(
+                    commit,
+                    repo_view_for_ai,
+                    system_prompt,
+                    build_user_prompt,
+                    exceeded.available_input_tokens,
+                    fresh,
+                )
+                .await
+            }
+        }
     }
 
     /// Checks a single commit whose diff exceeds the token budget by
@@ -501,44 +555,32 @@ impl ClaudeClient {
         let system_prompt = prompts::SYSTEM_PROMPT;
         let build_user_prompt = |yaml: &str| prompts::generate_user_prompt(yaml);
 
-        // Single-commit views: try split dispatch when full diff exceeds budget
-        if repo_view.commits.len() == 1 && !repo_view.commits[0].analysis.file_diffs.is_empty() {
-            match self.try_full_diff_budget(&ai_repo_view, system_prompt, &build_user_prompt)? {
-                Ok(user_prompt) => {
-                    let content = self
-                        .ai_client
-                        .send_request(system_prompt, &user_prompt)
-                        .await?;
-                    return self.parse_amendment_response(&content);
-                }
-                Err(exceeded) => {
+        // Try full view first; fall back to per-commit split dispatch
+        match self.try_full_diff_budget(&ai_repo_view, system_prompt, &build_user_prompt)? {
+            Ok(user_prompt) => {
+                let content = self
+                    .ai_client
+                    .send_request(system_prompt, &user_prompt)
+                    .await?;
+                self.parse_amendment_response(&content)
+            }
+            Err(_exceeded) => {
+                let mut amendments = Vec::new();
+                for commit in &repo_view.commits {
                     let amendment = self
-                        .generate_amendment_split(
-                            &repo_view.commits[0],
+                        .generate_amendment_for_commit(
+                            commit,
                             &ai_repo_view,
                             system_prompt,
                             &build_user_prompt,
-                            exceeded.available_input_tokens,
                             fresh,
                         )
                         .await?;
-                    return Ok(AmendmentFile {
-                        amendments: vec![amendment],
-                    });
+                    amendments.push(amendment);
                 }
+                Ok(AmendmentFile { amendments })
             }
         }
-
-        // Multi-commit or no file_diffs: validate budget and send
-        let user_prompt =
-            self.build_prompt_fitting_budget(&ai_repo_view, system_prompt, &build_user_prompt)?;
-
-        let content = self
-            .ai_client
-            .send_request(system_prompt, &user_prompt)
-            .await?;
-
-        self.parse_amendment_response(&content)
     }
 
     /// Generates contextual commit message amendments with enhanced intelligence.
@@ -590,44 +632,32 @@ impl ClaudeClient {
         let build_user_prompt =
             |yaml: &str| prompts::generate_contextual_user_prompt(yaml, context);
 
-        // Single-commit views: try split dispatch when full diff exceeds budget
-        if repo_view.commits.len() == 1 && !repo_view.commits[0].analysis.file_diffs.is_empty() {
-            match self.try_full_diff_budget(&ai_repo_view, &system_prompt, &build_user_prompt)? {
-                Ok(user_prompt) => {
-                    let content = self
-                        .ai_client
-                        .send_request(&system_prompt, &user_prompt)
-                        .await?;
-                    return self.parse_amendment_response(&content);
-                }
-                Err(exceeded) => {
+        // Try full view first; fall back to per-commit split dispatch
+        match self.try_full_diff_budget(&ai_repo_view, &system_prompt, &build_user_prompt)? {
+            Ok(user_prompt) => {
+                let content = self
+                    .ai_client
+                    .send_request(&system_prompt, &user_prompt)
+                    .await?;
+                self.parse_amendment_response(&content)
+            }
+            Err(_exceeded) => {
+                let mut amendments = Vec::new();
+                for commit in &repo_view.commits {
                     let amendment = self
-                        .generate_amendment_split(
-                            &repo_view.commits[0],
+                        .generate_amendment_for_commit(
+                            commit,
                             &ai_repo_view,
                             &system_prompt,
                             &build_user_prompt,
-                            exceeded.available_input_tokens,
                             fresh,
                         )
                         .await?;
-                    return Ok(AmendmentFile {
-                        amendments: vec![amendment],
-                    });
+                    amendments.push(amendment);
                 }
+                Ok(AmendmentFile { amendments })
             }
         }
-
-        // Multi-commit or no file_diffs: validate budget and send
-        let user_prompt =
-            self.build_prompt_fitting_budget(&ai_repo_view, &system_prompt, &build_user_prompt)?;
-
-        let content = self
-            .ai_client
-            .send_request(&system_prompt, &user_prompt)
-            .await?;
-
-        self.parse_amendment_response(&content)
     }
 
     /// Parses Claude's YAML response into an AmendmentFile.
@@ -664,6 +694,160 @@ impl ClaudeClient {
         Ok(amendment_file)
     }
 
+    /// Parses an AI response as PR content YAML.
+    fn parse_pr_response(&self, content: &str) -> Result<crate::cli::git::PrContent> {
+        let yaml_content = content.trim();
+        crate::data::from_yaml(yaml_content)
+            .context("Failed to parse AI response as YAML. AI may have returned malformed output.")
+    }
+
+    /// Generates PR content for a single commit whose diff exceeds the token
+    /// budget by splitting it into file-level chunks.
+    ///
+    /// Analogous to [`generate_amendment_split`](Self::generate_amendment_split)
+    /// but produces [`PrContent`](crate::cli::git::PrContent) instead of an
+    /// amendment.
+    async fn generate_pr_content_split(
+        &self,
+        commit: &crate::git::CommitInfo,
+        repo_view_for_ai: &RepositoryViewForAI,
+        system_prompt: &str,
+        build_user_prompt: &(dyn Fn(&str) -> String + Sync),
+        available_input_tokens: usize,
+        pr_template: &str,
+    ) -> Result<crate::cli::git::PrContent> {
+        use crate::claude::diff_pack::pack_file_diffs;
+        use crate::git::commit::CommitInfoForAI;
+
+        let plan = pack_file_diffs(
+            &commit.hash,
+            &commit.analysis.file_diffs,
+            available_input_tokens,
+        )
+        .with_context(|| {
+            format!(
+                "Failed to plan diff chunks for commit {}",
+                &commit.hash[..8]
+            )
+        })?;
+
+        let total_chunks = plan.chunks.len();
+        debug!(
+            commit = %&commit.hash[..8],
+            chunks = total_chunks,
+            "PR split dispatch: processing commit in chunks"
+        );
+
+        let mut chunk_contents = Vec::with_capacity(total_chunks);
+        for (i, chunk) in plan.chunks.iter().enumerate() {
+            let partial =
+                CommitInfoForAI::from_commit_info_partial(commit.clone(), &chunk.file_paths)
+                    .with_context(|| {
+                        format!(
+                            "Failed to build partial view for chunk {}/{} of commit {}",
+                            i + 1,
+                            total_chunks,
+                            &commit.hash[..8]
+                        )
+                    })?;
+
+            let partial_view = repo_view_for_ai.single_commit_view_for_ai(&partial);
+
+            let user_prompt =
+                self.build_prompt_fitting_budget(&partial_view, system_prompt, build_user_prompt)?;
+
+            let content = self
+                .ai_client
+                .send_request(system_prompt, &user_prompt)
+                .await
+                .with_context(|| {
+                    format!(
+                        "PR chunk {}/{} failed for commit {}",
+                        i + 1,
+                        total_chunks,
+                        &commit.hash[..8]
+                    )
+                })?;
+
+            let pr_content = self.parse_pr_response(&content).with_context(|| {
+                format!(
+                    "Failed to parse PR chunk {}/{} response for commit {}",
+                    i + 1,
+                    total_chunks,
+                    &commit.hash[..8]
+                )
+            })?;
+
+            chunk_contents.push(pr_content);
+        }
+
+        self.merge_pr_content_chunks(&chunk_contents, pr_template)
+            .await
+    }
+
+    /// Runs an AI reduce pass to synthesize a single PR content from partial
+    /// per-commit or per-chunk PR contents.
+    async fn merge_pr_content_chunks(
+        &self,
+        partial_contents: &[crate::cli::git::PrContent],
+        pr_template: &str,
+    ) -> Result<crate::cli::git::PrContent> {
+        let system_prompt = prompts::PR_CONTENT_MERGE_SYSTEM_PROMPT;
+        let user_prompt =
+            prompts::generate_pr_content_merge_user_prompt(partial_contents, pr_template);
+
+        self.validate_prompt_budget(system_prompt, &user_prompt)?;
+
+        let content = self
+            .ai_client
+            .send_request(system_prompt, &user_prompt)
+            .await
+            .context("Merge pass failed for PR content chunks")?;
+
+        self.parse_pr_response(&content)
+            .context("Failed to parse PR content merge pass response")
+    }
+
+    /// Generates PR content for a single commit, using split dispatch if needed.
+    async fn generate_pr_content_for_commit(
+        &self,
+        commit: &crate::git::CommitInfo,
+        repo_view_for_ai: &RepositoryViewForAI,
+        system_prompt: &str,
+        build_user_prompt: &(dyn Fn(&str) -> String + Sync),
+        pr_template: &str,
+    ) -> Result<crate::cli::git::PrContent> {
+        let ai_commit = crate::git::commit::CommitInfoForAI::from_commit_info(commit.clone())?;
+        let single_view = repo_view_for_ai.single_commit_view_for_ai(&ai_commit);
+
+        match self.try_full_diff_budget(&single_view, system_prompt, build_user_prompt)? {
+            Ok(user_prompt) => {
+                let content = self
+                    .ai_client
+                    .send_request(system_prompt, &user_prompt)
+                    .await?;
+                self.parse_pr_response(&content)
+            }
+            Err(exceeded) => {
+                if commit.analysis.file_diffs.is_empty() {
+                    anyhow::bail!(
+                        "Token budget exceeded for commit {} but no file-level diffs available for split dispatch",
+                        &commit.hash[..8]
+                    );
+                }
+                self.generate_pr_content_split(
+                    commit,
+                    repo_view_for_ai,
+                    system_prompt,
+                    build_user_prompt,
+                    exceeded.available_input_tokens,
+                    pr_template,
+                )
+                .await
+            }
+        }
+    }
+
     /// Generates AI-powered PR content (title + description) from repository view and template.
     pub async fn generate_pr_content(
         &self,
@@ -674,30 +858,46 @@ impl ClaudeClient {
         let ai_repo_view = RepositoryViewForAI::from_repository_view(repo_view.clone())
             .context("Failed to enhance repository view with diff content")?;
 
-        // Build prompt and validate token budget
         let build_user_prompt =
             |yaml: &str| prompts::generate_pr_description_prompt(yaml, pr_template);
-        let user_prompt = self.build_prompt_fitting_budget(
+
+        // Try full view first; fall back to per-commit split dispatch
+        match self.try_full_diff_budget(
             &ai_repo_view,
             prompts::PR_GENERATION_SYSTEM_PROMPT,
             &build_user_prompt,
-        )?;
-
-        // Send request using AI client
-        let content = self
-            .ai_client
-            .send_request(prompts::PR_GENERATION_SYSTEM_PROMPT, &user_prompt)
-            .await?;
-
-        // The AI response should be treated as YAML directly
-        let yaml_content = content.trim();
-
-        // Parse the YAML response using our hybrid YAML parser
-        let pr_content: crate::cli::git::PrContent = crate::data::from_yaml(yaml_content).context(
-            "Failed to parse AI response as YAML. AI may have returned malformed output.",
-        )?;
-
-        Ok(pr_content)
+        )? {
+            Ok(user_prompt) => {
+                let content = self
+                    .ai_client
+                    .send_request(prompts::PR_GENERATION_SYSTEM_PROMPT, &user_prompt)
+                    .await?;
+                self.parse_pr_response(&content)
+            }
+            Err(_exceeded) => {
+                let mut per_commit_contents = Vec::new();
+                for commit in &repo_view.commits {
+                    let pr = self
+                        .generate_pr_content_for_commit(
+                            commit,
+                            &ai_repo_view,
+                            prompts::PR_GENERATION_SYSTEM_PROMPT,
+                            &build_user_prompt,
+                            pr_template,
+                        )
+                        .await?;
+                    per_commit_contents.push(pr);
+                }
+                if per_commit_contents.len() == 1 {
+                    return per_commit_contents
+                        .into_iter()
+                        .next()
+                        .context("Per-commit PR contents unexpectedly empty");
+                }
+                self.merge_pr_content_chunks(&per_commit_contents, pr_template)
+                    .await
+            }
+        }
     }
 
     /// Generates AI-powered PR content with project context (title + description).
@@ -716,42 +916,58 @@ impl ClaudeClient {
         let system_prompt =
             prompts::generate_pr_system_prompt_with_context_for_provider(context, prompt_style);
 
-        // Build prompt and validate token budget
         let build_user_prompt = |yaml: &str| {
             prompts::generate_pr_description_prompt_with_context(yaml, pr_template, context)
         };
-        let user_prompt =
-            self.build_prompt_fitting_budget(&ai_repo_view, &system_prompt, &build_user_prompt)?;
 
-        // Send request using AI client
-        let content = self
-            .ai_client
-            .send_request(&system_prompt, &user_prompt)
-            .await?;
+        // Try full view first; fall back to per-commit split dispatch
+        match self.try_full_diff_budget(&ai_repo_view, &system_prompt, &build_user_prompt)? {
+            Ok(user_prompt) => {
+                let content = self
+                    .ai_client
+                    .send_request(&system_prompt, &user_prompt)
+                    .await?;
 
-        // The AI response should be treated as YAML directly
-        let yaml_content = content.trim();
+                debug!(
+                    content_length = content.len(),
+                    "Received AI response for PR content"
+                );
 
-        debug!(
-            content_length = content.len(),
-            yaml_content_length = yaml_content.len(),
-            yaml_content = %yaml_content,
-            "Extracted YAML content from AI response"
-        );
+                let pr_content = self.parse_pr_response(&content)?;
 
-        // Parse the YAML response using our hybrid YAML parser
-        let pr_content: crate::cli::git::PrContent = crate::data::from_yaml(yaml_content).context(
-            "Failed to parse AI response as YAML. AI may have returned malformed output.",
-        )?;
+                debug!(
+                    parsed_title = %pr_content.title,
+                    parsed_description_length = pr_content.description.len(),
+                    parsed_description_preview = %pr_content.description.lines().take(3).collect::<Vec<_>>().join("\\n"),
+                    "Successfully parsed PR content from YAML"
+                );
 
-        debug!(
-            parsed_title = %pr_content.title,
-            parsed_description_length = pr_content.description.len(),
-            parsed_description_preview = %pr_content.description.lines().take(3).collect::<Vec<_>>().join("\\n"),
-            "Successfully parsed PR content from YAML"
-        );
-
-        Ok(pr_content)
+                Ok(pr_content)
+            }
+            Err(_exceeded) => {
+                let mut per_commit_contents = Vec::new();
+                for commit in &repo_view.commits {
+                    let pr = self
+                        .generate_pr_content_for_commit(
+                            commit,
+                            &ai_repo_view,
+                            &system_prompt,
+                            &build_user_prompt,
+                            pr_template,
+                        )
+                        .await?;
+                    per_commit_contents.push(pr);
+                }
+                if per_commit_contents.len() == 1 {
+                    return per_commit_contents
+                        .into_iter()
+                        .next()
+                        .context("Per-commit PR contents unexpectedly empty");
+                }
+                self.merge_pr_content_chunks(&per_commit_contents, pr_template)
+                    .await
+            }
+        }
     }
 
     /// Checks commit messages against guidelines and returns a report.
@@ -805,86 +1021,99 @@ impl ClaudeClient {
         let build_user_prompt =
             |yaml: &str| prompts::generate_check_user_prompt(yaml, include_suggestions);
 
-        // Single-commit views: try split dispatch when full diff exceeds budget
-        if repo_view.commits.len() == 1 && !repo_view.commits[0].analysis.file_diffs.is_empty() {
-            let mut ai_repo_view = RepositoryViewForAI::from_repository_view(repo_view.clone())
-                .context("Failed to enhance repository view with diff content")?;
-            for commit in &mut ai_repo_view.commits {
-                commit.run_pre_validation_checks(valid_scopes);
-            }
-
-            match self.try_full_diff_budget(&ai_repo_view, &system_prompt, &build_user_prompt)? {
-                Ok(user_prompt) => {
-                    let content = self
-                        .ai_client
-                        .send_request(&system_prompt, &user_prompt)
-                        .await?;
-                    return self.parse_check_response(&content, repo_view);
-                }
-                Err(exceeded) => {
-                    return self
-                        .check_commit_split(
-                            &repo_view.commits[0],
-                            repo_view,
-                            &system_prompt,
-                            valid_scopes,
-                            include_suggestions,
-                            exceeded.available_input_tokens,
-                        )
-                        .await;
-                }
-            }
-        }
-
-        // Multi-commit or no file_diffs: validate budget and send
         let mut ai_repo_view = RepositoryViewForAI::from_repository_view(repo_view.clone())
             .context("Failed to enhance repository view with diff content")?;
-
-        // Run deterministic pre-validation checks before sending to AI
         for commit in &mut ai_repo_view.commits {
             commit.run_pre_validation_checks(valid_scopes);
         }
 
-        // Build prompt and validate token budget
-        let user_prompt =
-            self.build_prompt_fitting_budget(&ai_repo_view, &system_prompt, &build_user_prompt)?;
-
-        let mut last_error = None;
-
-        for attempt in 0..=max_retries {
-            // Send request using AI client
-            match self
-                .ai_client
-                .send_request(&system_prompt, &user_prompt)
-                .await
-            {
-                Ok(content) => match self.parse_check_response(&content, repo_view) {
-                    Ok(report) => return Ok(report),
-                    Err(e) => {
-                        if attempt < max_retries {
-                            eprintln!(
-                                "warning: failed to parse AI response (attempt {}), retrying...",
-                                attempt + 1
-                            );
-                            debug!(error = %e, attempt = attempt + 1, "Check response parse failed, retrying");
+        // Try full view first; fall back to per-commit split dispatch
+        match self.try_full_diff_budget(&ai_repo_view, &system_prompt, &build_user_prompt)? {
+            Ok(user_prompt) => {
+                // Full view fits: send with retry loop
+                let mut last_error = None;
+                for attempt in 0..=max_retries {
+                    match self
+                        .ai_client
+                        .send_request(&system_prompt, &user_prompt)
+                        .await
+                    {
+                        Ok(content) => match self.parse_check_response(&content, repo_view) {
+                            Ok(report) => return Ok(report),
+                            Err(e) => {
+                                if attempt < max_retries {
+                                    eprintln!(
+                                        "warning: failed to parse AI response (attempt {}), retrying...",
+                                        attempt + 1
+                                    );
+                                    debug!(error = %e, attempt = attempt + 1, "Check response parse failed, retrying");
+                                }
+                                last_error = Some(e);
+                            }
+                        },
+                        Err(e) => {
+                            if attempt < max_retries {
+                                eprintln!(
+                                    "warning: AI request failed (attempt {}), retrying...",
+                                    attempt + 1
+                                );
+                                debug!(error = %e, attempt = attempt + 1, "AI request failed, retrying");
+                            }
+                            last_error = Some(e);
                         }
-                        last_error = Some(e);
                     }
-                },
-                Err(e) => {
-                    if attempt < max_retries {
-                        eprintln!(
-                            "warning: AI request failed (attempt {}), retrying...",
-                            attempt + 1
-                        );
-                        debug!(error = %e, attempt = attempt + 1, "AI request failed, retrying");
-                    }
-                    last_error = Some(e);
                 }
+                Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Check failed after retries")))
+            }
+            Err(_exceeded) => {
+                // Per-commit split dispatch
+                let mut all_results = Vec::new();
+                for commit in &repo_view.commits {
+                    let single_view = repo_view.single_commit_view(commit);
+                    let mut single_ai_view =
+                        RepositoryViewForAI::from_repository_view(single_view.clone())
+                            .context("Failed to enhance single-commit view with diff content")?;
+                    for c in &mut single_ai_view.commits {
+                        c.run_pre_validation_checks(valid_scopes);
+                    }
+
+                    match self.try_full_diff_budget(
+                        &single_ai_view,
+                        &system_prompt,
+                        &build_user_prompt,
+                    )? {
+                        Ok(user_prompt) => {
+                            let content = self
+                                .ai_client
+                                .send_request(&system_prompt, &user_prompt)
+                                .await?;
+                            let report = self.parse_check_response(&content, &single_view)?;
+                            all_results.extend(report.commits);
+                        }
+                        Err(exceeded) => {
+                            if commit.analysis.file_diffs.is_empty() {
+                                anyhow::bail!(
+                                    "Token budget exceeded for commit {} but no file-level diffs available for split dispatch",
+                                    &commit.hash[..8]
+                                );
+                            }
+                            let report = self
+                                .check_commit_split(
+                                    commit,
+                                    &single_view,
+                                    &system_prompt,
+                                    valid_scopes,
+                                    include_suggestions,
+                                    exceeded.available_input_tokens,
+                                )
+                                .await?;
+                            all_results.extend(report.commits);
+                        }
+                    }
+                }
+                Ok(crate::data::check::CheckReport::new(all_results))
             }
         }
-
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Check failed after retries")))
     }
 
     /// Parses the check response from AI.
@@ -1527,10 +1756,20 @@ mod tests {
     /// The window is large enough that a single-file chunk fits, but too
     /// small for both files together (including system prompt overhead).
     fn make_small_context_client(responses: Vec<Result<String>>) -> ClaudeClient {
-        ClaudeClient::new(Box::new(
-            crate::claude::test_utils::ConfigurableMockAiClient::new(responses)
-                .with_context_length(25_000),
-        ))
+        let mock = crate::claude::test_utils::ConfigurableMockAiClient::new(responses)
+            .with_context_length(25_000);
+        ClaudeClient::new(Box::new(mock))
+    }
+
+    /// Like [`make_small_context_client`] but also returns a handle to inspect
+    /// how many mock responses remain unconsumed after the test runs.
+    fn make_small_context_client_tracked(
+        responses: Vec<Result<String>>,
+    ) -> (ClaudeClient, crate::claude::test_utils::ResponseQueueHandle) {
+        let mock = crate::claude::test_utils::ConfigurableMockAiClient::new(responses)
+            .with_context_length(25_000);
+        let handle = mock.response_handle();
+        (ClaudeClient::new(Box::new(mock)), handle)
     }
 
     /// Creates a repo view with per-file diffs large enough to exceed the
@@ -2116,5 +2355,296 @@ mod tests {
         assert_eq!(report.commits.len(), 2);
         assert!(report.commits[0].passes);
         assert!(report.commits[1].passes);
+    }
+
+    // ── Multi-commit split dispatch helpers ──────────────────────────
+
+    /// Creates a repo view with two large-diff commits whose combined view
+    /// exceeds the constrained 25KB context window.
+    fn make_large_multi_commit_repo_view(dir: &tempfile::TempDir) -> crate::data::RepositoryView {
+        use crate::data::{AiInfo, FieldExplanation, WorkingDirectoryInfo};
+        use crate::git::commit::{FileChange, FileChanges, FileDiffRef};
+        use crate::git::{CommitAnalysis, CommitInfo};
+
+        let hash_a = "a".repeat(40);
+        let hash_b = "b".repeat(40);
+
+        // Write flat diff files large enough to bust the 25KB budget when combined
+        let diff_content_a = "x".repeat(40_000);
+        let diff_content_b = "y".repeat(40_000);
+        let flat_a = dir.path().join("flat_a.diff");
+        let flat_b = dir.path().join("flat_b.diff");
+        std::fs::write(&flat_a, &diff_content_a).unwrap();
+        std::fs::write(&flat_b, &diff_content_b).unwrap();
+
+        // Write per-file diff files for split dispatch
+        let file_diff_a = format!("diff --git a/src/a.rs b/src/a.rs\n{}\n", "a".repeat(30_000));
+        let file_diff_b = format!("diff --git a/src/b.rs b/src/b.rs\n{}\n", "b".repeat(30_000));
+        let per_file_a = dir.path().join("pf_a.diff");
+        let per_file_b = dir.path().join("pf_b.diff");
+        std::fs::write(&per_file_a, &file_diff_a).unwrap();
+        std::fs::write(&per_file_b, &file_diff_b).unwrap();
+
+        crate::data::RepositoryView {
+            versions: None,
+            explanation: FieldExplanation::default(),
+            working_directory: WorkingDirectoryInfo {
+                clean: true,
+                untracked_changes: Vec::new(),
+            },
+            remotes: Vec::new(),
+            ai: AiInfo {
+                scratch: String::new(),
+            },
+            branch_info: None,
+            pr_template: None,
+            pr_template_location: None,
+            branch_prs: None,
+            commits: vec![
+                CommitInfo {
+                    hash: hash_a,
+                    author: "Test <test@test.com>".to_string(),
+                    date: chrono::Utc::now().fixed_offset(),
+                    original_message: "feat(a): add module a".to_string(),
+                    in_main_branches: Vec::new(),
+                    analysis: CommitAnalysis {
+                        detected_type: "feat".to_string(),
+                        detected_scope: "a".to_string(),
+                        proposed_message: "feat(a): add module a".to_string(),
+                        file_changes: FileChanges {
+                            total_files: 1,
+                            files_added: 1,
+                            files_deleted: 0,
+                            file_list: vec![FileChange {
+                                status: "A".to_string(),
+                                file: "src/a.rs".to_string(),
+                            }],
+                        },
+                        diff_summary: " src/a.rs | 100 ++++\n".to_string(),
+                        diff_file: flat_a.to_string_lossy().to_string(),
+                        file_diffs: vec![FileDiffRef {
+                            path: "src/a.rs".to_string(),
+                            diff_file: per_file_a.to_string_lossy().to_string(),
+                            byte_len: file_diff_a.len(),
+                        }],
+                    },
+                },
+                CommitInfo {
+                    hash: hash_b,
+                    author: "Test <test@test.com>".to_string(),
+                    date: chrono::Utc::now().fixed_offset(),
+                    original_message: "feat(b): add module b".to_string(),
+                    in_main_branches: Vec::new(),
+                    analysis: CommitAnalysis {
+                        detected_type: "feat".to_string(),
+                        detected_scope: "b".to_string(),
+                        proposed_message: "feat(b): add module b".to_string(),
+                        file_changes: FileChanges {
+                            total_files: 1,
+                            files_added: 1,
+                            files_deleted: 0,
+                            file_list: vec![FileChange {
+                                status: "A".to_string(),
+                                file: "src/b.rs".to_string(),
+                            }],
+                        },
+                        diff_summary: " src/b.rs | 100 ++++\n".to_string(),
+                        diff_file: flat_b.to_string_lossy().to_string(),
+                        file_diffs: vec![FileDiffRef {
+                            path: "src/b.rs".to_string(),
+                            diff_file: per_file_b.to_string_lossy().to_string(),
+                            byte_len: file_diff_b.len(),
+                        }],
+                    },
+                },
+            ],
+        }
+    }
+
+    fn valid_pr_yaml(title: &str, description: &str) -> String {
+        format!("title: \"{title}\"\ndescription: \"{description}\"\n")
+    }
+
+    // ── Multi-commit amendment split dispatch tests ──────────────────
+
+    #[tokio::test]
+    async fn generate_amendments_multi_commit_split_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_large_multi_commit_repo_view(&dir);
+        let hash_a = "a".repeat(40);
+        let hash_b = "b".repeat(40);
+
+        // Full view exceeds budget → per-commit fallback
+        // Each commit fits individually (1 file each) → 1 response per commit
+        let (client, handle) = make_small_context_client_tracked(vec![
+            Ok(valid_amendment_yaml(&hash_a, "feat(a): improved a")),
+            Ok(valid_amendment_yaml(&hash_b, "feat(b): improved b")),
+        ]);
+
+        let result = client
+            .generate_amendments_with_options(&repo_view, false)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "multi-commit split dispatch failed: {:?}",
+            result.err()
+        );
+        let amendments = result.unwrap();
+        assert_eq!(amendments.amendments.len(), 2);
+        assert_eq!(amendments.amendments[0].commit, hash_a);
+        assert_eq!(amendments.amendments[1].commit, hash_b);
+        assert!(amendments.amendments[0].message.contains("improved a"));
+        assert!(amendments.amendments[1].message.contains("improved b"));
+        assert_eq!(handle.remaining(), 0, "expected all responses consumed");
+    }
+
+    #[tokio::test]
+    async fn generate_contextual_amendments_multi_commit_split_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_large_multi_commit_repo_view(&dir);
+        let hash_a = "a".repeat(40);
+        let hash_b = "b".repeat(40);
+        let context = crate::data::context::CommitContext::default();
+
+        let (client, handle) = make_small_context_client_tracked(vec![
+            Ok(valid_amendment_yaml(&hash_a, "feat(a): improved a")),
+            Ok(valid_amendment_yaml(&hash_b, "feat(b): improved b")),
+        ]);
+
+        let result = client
+            .generate_contextual_amendments_with_options(&repo_view, &context, false)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "multi-commit contextual split dispatch failed: {:?}",
+            result.err()
+        );
+        let amendments = result.unwrap();
+        assert_eq!(amendments.amendments.len(), 2);
+        assert_eq!(amendments.amendments[0].commit, hash_a);
+        assert_eq!(amendments.amendments[1].commit, hash_b);
+        assert_eq!(handle.remaining(), 0, "expected all responses consumed");
+    }
+
+    // ── Multi-commit check split dispatch tests ──────────────────────
+
+    #[tokio::test]
+    async fn check_commits_multi_commit_split_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_large_multi_commit_repo_view(&dir);
+        let hash_a = "a".repeat(40);
+        let hash_b = "b".repeat(40);
+
+        // Full view exceeds budget → per-commit fallback
+        let (client, handle) = make_small_context_client_tracked(vec![
+            Ok(valid_check_yaml_for(&hash_a, true)),
+            Ok(valid_check_yaml_for(&hash_b, true)),
+        ]);
+
+        let result = client
+            .check_commits_with_scopes(&repo_view, None, &[], false)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "multi-commit check split dispatch failed: {:?}",
+            result.err()
+        );
+        let report = result.unwrap();
+        assert_eq!(report.commits.len(), 2);
+        assert!(report.commits[0].passes);
+        assert!(report.commits[1].passes);
+        assert_eq!(handle.remaining(), 0, "expected all responses consumed");
+    }
+
+    // ── PR split dispatch tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn generate_pr_content_split_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_large_diff_repo_view(&dir);
+
+        // Single large commit: full view exceeds budget → per-commit fallback
+        // 1 commit with 2 file chunks → chunk 1 + chunk 2 + chunk merge pass
+        // Single per-commit result → returned directly (no extra merge)
+        let (client, handle) = make_small_context_client_tracked(vec![
+            Ok(valid_pr_yaml("feat(a): add a.rs", "Adds a.rs module")),
+            Ok(valid_pr_yaml("feat(b): add b.rs", "Adds b.rs module")),
+            Ok(valid_pr_yaml(
+                "feat(test): add modules",
+                "Adds a.rs and b.rs",
+            )),
+        ]);
+
+        let result = client.generate_pr_content(&repo_view, "").await;
+
+        assert!(
+            result.is_ok(),
+            "PR split dispatch failed: {:?}",
+            result.err()
+        );
+        let pr = result.unwrap();
+        assert!(pr.title.contains("add modules"));
+        assert_eq!(handle.remaining(), 0, "expected all responses consumed");
+    }
+
+    #[tokio::test]
+    async fn generate_pr_content_multi_commit_split_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_large_multi_commit_repo_view(&dir);
+
+        // Full view exceeds budget → per-commit fallback
+        // Each commit fits individually → 1 response per commit, then merge pass
+        let (client, handle) = make_small_context_client_tracked(vec![
+            Ok(valid_pr_yaml("feat(a): add module a", "Adds module a")),
+            Ok(valid_pr_yaml("feat(b): add module b", "Adds module b")),
+            Ok(valid_pr_yaml(
+                "feat: add modules a and b",
+                "Adds both modules",
+            )),
+        ]);
+
+        let result = client.generate_pr_content(&repo_view, "").await;
+
+        assert!(
+            result.is_ok(),
+            "PR multi-commit split dispatch failed: {:?}",
+            result.err()
+        );
+        let pr = result.unwrap();
+        assert!(pr.title.contains("modules"));
+        assert_eq!(handle.remaining(), 0, "expected all responses consumed");
+    }
+
+    #[tokio::test]
+    async fn generate_pr_content_with_context_split_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_large_multi_commit_repo_view(&dir);
+        let context = crate::data::context::CommitContext::default();
+
+        // Full view exceeds budget → per-commit fallback → merge pass
+        let (client, handle) = make_small_context_client_tracked(vec![
+            Ok(valid_pr_yaml("feat(a): add module a", "Adds module a")),
+            Ok(valid_pr_yaml("feat(b): add module b", "Adds module b")),
+            Ok(valid_pr_yaml(
+                "feat: add modules a and b",
+                "Adds both modules",
+            )),
+        ]);
+
+        let result = client
+            .generate_pr_content_with_context(&repo_view, "", &context)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "PR with context split dispatch failed: {:?}",
+            result.err()
+        );
+        let pr = result.unwrap();
+        assert!(pr.title.contains("modules"));
+        assert_eq!(handle.remaining(), 0, "expected all responses consumed");
     }
 }
