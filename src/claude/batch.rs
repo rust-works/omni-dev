@@ -20,13 +20,29 @@ const BATCH_CAPACITY_FACTOR: f64 = 0.90;
 ///
 /// Accounts for hash (40 chars), author (~50 chars), date (~30 chars),
 /// analysis fields (~200 chars), and YAML formatting overhead.
-const PER_COMMIT_METADATA_OVERHEAD_TOKENS: usize = 120;
+///
+/// Used by both batch planning and split dispatch to ensure consistent
+/// capacity calculations.
+pub(crate) const PER_COMMIT_METADATA_OVERHEAD_TOKENS: usize = 120;
 
 /// Estimated token overhead for the `RepositoryViewForAI` YAML envelope.
 ///
 /// Accounts for versions, explanation, working_directory, remotes, ai,
 /// and branch_info fields in the serialized YAML.
-const VIEW_ENVELOPE_OVERHEAD_TOKENS: usize = 150;
+///
+/// Used by both batch planning and split dispatch to ensure consistent
+/// capacity calculations.
+pub(crate) const VIEW_ENVELOPE_OVERHEAD_TOKENS: usize = 150;
+
+/// Estimated token overhead for the user prompt template text.
+///
+/// Accounts for instruction text, analysis steps, guidelines references,
+/// and other static content in `generate_user_prompt` and
+/// `generate_contextual_user_prompt`.
+///
+/// Used by split dispatch to ensure chunk capacity accounts for the
+/// full prompt size.
+pub(crate) const USER_PROMPT_TEMPLATE_OVERHEAD_TOKENS: usize = 1000;
 
 /// A group of commits to send in one AI request.
 #[derive(Debug)]
