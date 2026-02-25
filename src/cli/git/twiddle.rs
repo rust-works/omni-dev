@@ -79,6 +79,10 @@ pub struct TwiddleCommand {
     /// Runs commit message validation after applying amendments.
     #[arg(long)]
     pub check: bool,
+
+    /// Only shows errors/warnings, suppresses info-level output.
+    #[arg(long)]
+    pub quiet: bool,
 }
 
 impl TwiddleCommand {
@@ -459,7 +463,7 @@ impl TwiddleCommand {
         }
 
         // Offer interactive retry for commits that failed
-        if !failed_indices.is_empty() {
+        if !failed_indices.is_empty() && !self.quiet {
             use std::io::IsTerminal;
             self.run_interactive_retry_generate_amendments(
                 &mut failed_indices,
@@ -472,6 +476,11 @@ impl TwiddleCommand {
                 &mut std::io::BufReader::new(std::io::stdin()),
             )
             .await?;
+        } else if !failed_indices.is_empty() {
+            eprintln!(
+                "warning: {} commit(s) failed to process",
+                failed_indices.len()
+            );
         }
 
         if !failed_indices.is_empty() {
@@ -1400,7 +1409,7 @@ impl TwiddleCommand {
         }
 
         // Offer interactive retry for commits that failed
-        if !failed_indices.is_empty() {
+        if !failed_indices.is_empty() && !self.quiet {
             use std::io::IsTerminal;
             if std::io::stdin().is_terminal() {
                 self.run_interactive_retry_twiddle_check(
@@ -1419,6 +1428,11 @@ impl TwiddleCommand {
                     failed_indices.len()
                 );
             }
+        } else if !failed_indices.is_empty() {
+            eprintln!(
+                "warning: {} commit(s) failed to check",
+                failed_indices.len()
+            );
         }
 
         if !failed_indices.is_empty() {
@@ -1909,6 +1923,7 @@ mod tests {
             fresh: false,
             refine: false,
             check: false,
+            quiet: false,
         }
     }
 
