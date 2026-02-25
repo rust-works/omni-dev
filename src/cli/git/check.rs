@@ -54,6 +54,10 @@ pub struct CheckCommand {
     #[arg(long, default_value = "4")]
     pub concurrency: usize,
 
+    /// Deprecated: use --concurrency instead.
+    #[arg(long, hide = true)]
+    pub batch_size: Option<usize>,
+
     /// Disables the cross-commit coherence pass.
     #[arg(long)]
     pub no_coherence: bool,
@@ -69,7 +73,12 @@ pub struct CheckCommand {
 
 impl CheckCommand {
     /// Executes the check command, validating commit messages against guidelines.
-    pub async fn execute(self) -> Result<()> {
+    pub async fn execute(mut self) -> Result<()> {
+        // Resolve deprecated --batch-size into --concurrency
+        if let Some(bs) = self.batch_size {
+            eprintln!("warning: --batch-size is deprecated; use --concurrency instead");
+            self.concurrency = bs;
+        }
         use crate::data::check::OutputFormat;
 
         // Parse output format
@@ -1082,6 +1091,7 @@ mod tests {
             verbose: false,
             show_passing: false,
             concurrency: 4,
+            batch_size: None,
             no_coherence: true,
             no_suggestions: false,
             twiddle: false,

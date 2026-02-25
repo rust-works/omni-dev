@@ -54,6 +54,10 @@ pub struct TwiddleCommand {
     #[arg(long, default_value = "4")]
     pub concurrency: usize,
 
+    /// Deprecated: use --concurrency instead.
+    #[arg(long, hide = true)]
+    pub batch_size: Option<usize>,
+
     /// Disables the cross-commit coherence pass.
     #[arg(long)]
     pub no_coherence: bool,
@@ -85,7 +89,13 @@ impl TwiddleCommand {
     }
 
     /// Executes the twiddle command with contextual intelligence.
-    pub async fn execute(self) -> Result<()> {
+    pub async fn execute(mut self) -> Result<()> {
+        // Resolve deprecated --batch-size into --concurrency
+        if let Some(bs) = self.batch_size {
+            eprintln!("warning: --batch-size is deprecated; use --concurrency instead");
+            self.concurrency = bs;
+        }
+
         // If --no-ai flag is set, skip AI processing and output YAML directly
         if self.no_ai {
             return self.execute_no_ai().await;
@@ -1893,6 +1903,7 @@ mod tests {
             branch_context: None,
             no_context: true,
             concurrency: 4,
+            batch_size: None,
             no_coherence: true,
             no_ai: false,
             fresh: false,
