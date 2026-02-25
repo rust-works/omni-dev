@@ -41,3 +41,5 @@ by Michael Nygard.
 | [ADR-0015](adr-0015.md)  | ✅ Accepted | 2026-02-23 | Dual Error Handling Strategy — `thiserror` for Domain Errors, `anyhow` for Propagation |
 | [ADR-0016](adr-0016.md)  | ✅ Accepted | 2026-02-24 | Clap Derive Macros with Hierarchical Subcommand Structure                              |
 | [ADR-0017](adr-0017.md)  | ✅ Accepted | 2026-02-25 | Per-File Diff Splitting for Token Budget Fitting                                       |
+| [ADR-0018](adr-0018.md)  | 🟡 Proposed | 2026-02-25 | Automatic Context Detection for Adaptive AI Prompts                                    |
+| [ADR-0019](adr-0019.md)  | 🟡 Proposed | 2026-02-25 | Ecosystem-Aware Scope Auto-Detection                                                   |
