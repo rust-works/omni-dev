@@ -435,15 +435,15 @@ impl TwiddleCommand {
         let mut successes: Vec<(crate::data::amendments::Amendment, String)> = Vec::new();
         let mut failed_indices: Vec<usize> = Vec::new();
 
-        for result in results {
+        for (result, batch) in results.into_iter().zip(&batch_plan.batches) {
             match result {
                 Ok((items, failed)) => {
                     successes.extend(items);
                     failed_indices.extend(failed);
                 }
                 Err(e) => {
-                    // Semaphore errors: can't identify which commits were affected
                     eprintln!("warning: batch processing error: {e}");
+                    failed_indices.extend(&batch.commit_indices);
                 }
             }
         }
@@ -1376,15 +1376,15 @@ impl TwiddleCommand {
         let mut successes: Vec<(CommitCheckResult, String)> = Vec::new();
         let mut failed_indices: Vec<usize> = Vec::new();
 
-        for result in results {
+        for (result, batch) in results.into_iter().zip(&batch_plan.batches) {
             match result {
                 Ok((items, failed)) => {
                     successes.extend(items);
                     failed_indices.extend(failed);
                 }
                 Err(e) => {
-                    // Semaphore errors: can't identify which commits were affected
                     eprintln!("warning: batch processing error: {e}");
+                    failed_indices.extend(&batch.commit_indices);
                 }
             }
         }
