@@ -381,6 +381,8 @@ Options:
           Uses existing commit messages as a starting point for AI refinement instead of generating fresh messages from scratch
       --check
           Runs commit message validation after applying amendments
+      --quiet
+          Only shows errors/warnings, suppresses info-level output
   -h, --help
           Print help
 
