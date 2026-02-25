@@ -14,12 +14,12 @@ use crossterm::{
 pub struct AiCommand {
     /// The AI subcommand to execute.
     #[command(subcommand)]
-    pub command: AiSubcommand,
+    pub command: AiSubcommands,
 }
 
 /// AI subcommands.
 #[derive(Subcommand)]
-pub enum AiSubcommand {
+pub enum AiSubcommands {
     /// Interactive AI chat session.
     Chat(ChatCommand),
 }
@@ -28,7 +28,7 @@ impl AiCommand {
     /// Executes the AI command.
     pub async fn execute(self) -> Result<()> {
         match self.command {
-            AiSubcommand::Chat(cmd) => cmd.execute().await,
+            AiSubcommands::Chat(cmd) => cmd.execute().await,
         }
     }
 }
