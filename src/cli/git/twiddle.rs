@@ -663,12 +663,10 @@ impl TwiddleCommand {
             print!("❓ [A]pply amendments, [S]how file, [E]dit file, or [Q]uit? [A/s/e/q] ");
             io::stdout().flush()?;
 
-            let mut input = String::new();
-            let bytes = reader.read_line(&mut input)?;
-            if bytes == 0 {
+            let Some(input) = super::read_interactive_line(reader)? else {
                 eprintln!("warning: stdin closed, cancelling amendments");
                 return Ok(false);
-            }
+            };
 
             match input.trim().to_lowercase().as_str() {
                 "a" | "apply" | "" => return Ok(true),
@@ -1494,12 +1492,10 @@ impl TwiddleCommand {
         loop {
             print!("\n❓ [R]etry failed commits, or [S]kip? [R/s] ");
             std::io::stdout().flush()?;
-            let mut input = String::new();
-            let bytes = reader.read_line(&mut input)?;
-            if bytes == 0 {
+            let Some(input) = super::read_interactive_line(reader)? else {
                 eprintln!("warning: stdin closed, skipping failed commit(s)");
                 break;
-            }
+            };
             match input.trim().to_lowercase().as_str() {
                 "r" | "retry" | "" => {
                     let mut still_failed = Vec::new();
@@ -1589,12 +1585,10 @@ impl TwiddleCommand {
         loop {
             print!("\n❓ [R]etry failed commits, or [S]kip? [R/s] ");
             std::io::stdout().flush()?;
-            let mut input = String::new();
-            let bytes = reader.read_line(&mut input)?;
-            if bytes == 0 {
+            let Some(input) = super::read_interactive_line(reader)? else {
                 eprintln!("warning: stdin closed, skipping failed commit(s)");
                 break;
-            }
+            };
             match input.trim().to_lowercase().as_str() {
                 "r" | "retry" | "" => {
                     let mut still_failed = Vec::new();
