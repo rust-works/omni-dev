@@ -18,6 +18,23 @@ pub use view::ViewCommand;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+/// Reads one line of interactive input from `reader`.
+///
+/// Returns `Some(line)` on success, or `None` when the reader reaches EOF
+/// (i.e., `read_line` returns 0 bytes). Callers handle the `None` case
+/// with context-specific warnings and control flow.
+pub(super) fn read_interactive_line(
+    reader: &mut (dyn std::io::BufRead + Send),
+) -> std::io::Result<Option<String>> {
+    let mut input = String::new();
+    let bytes = reader.read_line(&mut input)?;
+    if bytes == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(input))
+    }
+}
+
 /// Parses a `--beta-header key:value` string into a `(key, value)` tuple.
 pub(crate) fn parse_beta_header(s: &str) -> Result<(String, String)> {
     let (k, v) = s
@@ -303,5 +320,26 @@ mod tests {
     fn cli_parses_ai_chat_with_model() {
         let cli = Cli::try_parse_from(["omni-dev", "ai", "chat", "--model", "claude-sonnet-4"]);
         assert!(cli.is_ok(), "Failed to parse: {:?}", cli.err());
+    }
+
+    #[test]
+    fn read_interactive_line_returns_input() {
+        let mut reader = std::io::Cursor::new(b"hello\n" as &[u8]);
+        let result = read_interactive_line(&mut reader).unwrap();
+        assert_eq!(result, Some("hello\n".to_string()));
+    }
+
+    #[test]
+    fn read_interactive_line_eof_returns_none() {
+        let mut reader = std::io::Cursor::new(b"" as &[u8]);
+        let result = read_interactive_line(&mut reader).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn read_interactive_line_empty_line() {
+        let mut reader = std::io::Cursor::new(b"\n" as &[u8]);
+        let result = read_interactive_line(&mut reader).unwrap();
+        assert_eq!(result, Some("\n".to_string()));
     }
 }
