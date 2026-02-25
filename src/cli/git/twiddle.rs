@@ -401,6 +401,10 @@ impl TwiddleCommand {
                                     }
                                     Err(e) => {
                                         eprintln!("warning: failed to process commit: {e}");
+                                        // Print the full error chain for debugging using anyhow's chain()
+                                        for (i, cause) in e.chain().skip(1).enumerate() {
+                                            eprintln!("  caused by [{i}]: {cause}");
+                                        }
                                         failed_indices.push(idx);
                                         println!(
                                             "   ❌ {done}/{total_commits} commits processed (failed)"
@@ -414,6 +418,10 @@ impl TwiddleCommand {
                             // Single-commit batch failed; record the index so the user can retry
                             let idx = batch_indices[0];
                             eprintln!("warning: failed to process commit: {e}");
+                            // Print the full error chain for debugging using anyhow's chain()
+                            for (i, cause) in e.chain().skip(1).enumerate() {
+                                eprintln!("  caused by [{i}]: {cause}");
+                            }
                             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                             println!(
                                 "   ❌ {done}/{total_commits} commits processed (failed)"
