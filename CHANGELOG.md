@@ -7,6 +7,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-02-26
+
+### Added
+- **Split Dispatch for Large Diffs**: Intelligent per-file diff splitting when commits exceed token budgets
+  - Per-file and per-hunk unified diff parser for granular diff handling
+  - Per-file diff storage with `FileDiffRef` struct tracking byte lengths
+  - Greedy file-packing algorithm for token-budget-constrained splitting
+  - Split dispatch across amendment, check, and multi-commit operations
+  - Per-hunk diff override support for partial commit views
+  - Placeholder substitution for oversized diffs instead of hard failures
+- **File-Level Context Analysis**: Hook-based file analyzer adds semantic context to commit pipelines
+- **Walk-Up Config Directory Discovery**: Config resolution walks up the directory tree to find `.omni-dev/` directories
+- **XDG Base Directory Compliance**: Config resolution follows XDG standards for fallback locations
+- **`OMNI_DEV_CONFIG_DIR` Environment Variable**: Explicit config directory override for all commands
+- **Config Source Tracking**: Diagnostic output shows where each config file was loaded from
+- **`--quiet` Flag**: Suppress interactive retry prompts in twiddle
+- **`--context-dir` Option**: Explicit context directory for create-pr command
+- **`--refine` Flag**: Opt-in to refine mode (fresh mode is now the default for twiddle)
+- **Amendment Parse Retry Logic**: Automatic retry on amendment parse and AI request failures
+- **Claude Sonnet 4.6 Model**: Added to model registry and set as default
+- **Preflight Checks Expanded**: Applied consistently to amend, view, and info commands
+- **Configurable Mock AI Client**: Shared test utility for integration testing
+
+### Changed
+- **Fresh Mode Default**: Twiddle now generates messages from scratch by default; use `--refine` to amend existing messages
+- **Default AI Model**: Claude Sonnet 4.6 replaces previous default
+- **Registry Default Model**: Uses model registry default instead of hardcoded model strings
+
+### Removed
+- **`--batch-size` Flag**: Removed deprecated flag from check and twiddle commands (use `--concurrency` instead)
+- **Progressive Diff Reduction**: Removed fallback strategy in favor of split dispatch
+- **Dead Utils Module**: Removed unused `utils/general` module and its re-exports
+
+### Fixed
+- **Batch Processing Failure Tracking**: Track failed commit indices when batch processing errors occur
+- **Progress Counter**: Increment only on success path to avoid inflated counts
+- **Split Dispatch Overhead**: Correctly subtract prompt overhead from chunk capacity
+- **Token Estimation**: Use conservative estimation for code diffs
+- **Error Chain Display**: Print full error chain for failed commits in twiddle
+- **Tracing Output**: Write tracing output to stderr instead of stdout
+- **Stdin EOF Loop**: Prevent infinite loop on EOF in interactive prompts
+- **Provider String Matching**: Use exact string matching in prompt_style selection
+- **Field Presence Tracking**: Add missing `branch_prs[].base` field
+- **Batch-Size Deprecation**: Proper deprecation warning for `--batch-size` flag
+
+### Security
+- **Dependency Advisories**: Update `bytes` and `git2` to resolve security advisories
+- **CI Hardening**: Add security audit, dependency policy, and secret scanning workflows
+
+### Refactored
+- **Generic Repository View**: Make `RepositoryView` and `CommitInfo` generic over inner types
+- **Single Async Runtime**: Migrate command execution to single tokio runtime
+- **Consolidated Config Resolution**: Unified config resolution into discovery module
+- **Panic-Free Operations**: Replace panicking operations with proper error handling across all modules
+- **Pure Logic Extraction**: Extract and test pure logic from twiddle, create-pr, and check commands
+- **Interactive Retry Extraction**: Extract interactive retry loop and `read_interactive_line` helper into testable methods
+- **Shared Formatting Utilities**: Extract formatting module for reuse across commands
+- **AI Client Helpers**: Extract shared helpers for AI client implementations
+- **Deduplicated Models Embed**: Shared constant for `models.yaml` embedding
+
+### Testing
+- **Property-Based Tests**: Added proptest-based tests across 7 modules
+- **Comprehensive Unit Tests**: Added tests for 6+ previously untested modules
+- **Split Dispatch Integration Tests**: Integration tests with prompt recording
+- **Test Directory Isolation**: Relocated temp directories to project-local `tmp/` folder
+- **Parallel Test Safety**: Fix process-wide CWD mutation causing parallel test failures
+
+### Documentation
+- **Architecture Decision Records**: Added ADRs 0004–0019 covering embedded templates, hierarchical config resolution, two-view data model, preflight validation, deterministic pre-validation, token-budget batch planning, multi-layer retry, model registry, severity levels, self-describing YAML, provider-specific prompts, dual error handling, hierarchical CLI, per-file diff splitting, context detection, and ecosystem scope auto-detection
+- **Architecture Documentation**: Comprehensive architecture docs for the codebase
+- **Style Guide**: Broadened scope, added STYLE-0022 (ADR format) and STYLE-0023 (commit validation)
+- **Config Resolution Docs**: Four-tier config resolution with walk-up discovery and XDG support
+
+### CI/CD
+- **Code Coverage Enforcement**: Enforce minimum coverage threshold and fail on codecov errors
+- **GitHub Actions Updates**: Bump actions/checkout to v6, codecov-action to v5, cachix/install-nix-action to v31, cachix/cachix-action to v16
+- **Clippy Pedantic Lints**: Enable pedantic and nursery lint groups
+
+### Dependencies
+- `crossterm` 0.28 → 0.29
+- `dirs` 5.0 → 6.0
+- `ssh2-config` 0.6 → 0.7
+- `thiserror` 1.x → 2.x
+- `reqwest` 0.12 → 0.13
+- Rust minor-patch group with 13 updates
+
 ## [0.17.0] - 2026-02-13
 
 ### Added
@@ -567,7 +653,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation and community files (README, CONTRIBUTING, CODE_OF_CONDUCT)
 - BSD 3-Clause license
 
-[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/rust-works/omni-dev/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/rust-works/omni-dev/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/rust-works/omni-dev/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/rust-works/omni-dev/compare/v0.14.0...v0.15.0
