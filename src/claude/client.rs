@@ -21,6 +21,9 @@ struct BudgetExceeded {
     available_input_tokens: usize,
 }
 
+/// Maximum retries for amendment parse/request failures (matches check retry count).
+const AMENDMENT_PARSE_MAX_RETRIES: u32 = 2;
+
 /// Claude client for commit message improvement.
 pub struct ClaudeClient {
     /// AI client implementation.
@@ -354,11 +357,9 @@ impl ClaudeClient {
 
         match self.try_full_diff_budget(&single_view, system_prompt, build_user_prompt)? {
             Ok(user_prompt) => {
-                let content = self
-                    .ai_client
-                    .send_request(system_prompt, &user_prompt)
+                let amendment_file = self
+                    .send_and_parse_amendment_with_retry(system_prompt, &user_prompt)
                     .await?;
-                let amendment_file = self.parse_amendment_response(&content)?;
                 amendment_file
                     .amendments
                     .into_iter()
@@ -666,11 +667,8 @@ impl ClaudeClient {
         // Try full view first; fall back to per-commit split dispatch
         match self.try_full_diff_budget(&ai_repo_view, system_prompt, &build_user_prompt)? {
             Ok(user_prompt) => {
-                let content = self
-                    .ai_client
-                    .send_request(system_prompt, &user_prompt)
-                    .await?;
-                self.parse_amendment_response(&content)
+                self.send_and_parse_amendment_with_retry(system_prompt, &user_prompt)
+                    .await
             }
             Err(_exceeded) => {
                 let mut amendments = Vec::new();
@@ -743,11 +741,8 @@ impl ClaudeClient {
         // Try full view first; fall back to per-commit split dispatch
         match self.try_full_diff_budget(&ai_repo_view, &system_prompt, &build_user_prompt)? {
             Ok(user_prompt) => {
-                let content = self
-                    .ai_client
-                    .send_request(&system_prompt, &user_prompt)
-                    .await?;
-                self.parse_amendment_response(&content)
+                self.send_and_parse_amendment_with_retry(&system_prompt, &user_prompt)
+                    .await
             }
             Err(_exceeded) => {
                 let mut amendments = Vec::new();
@@ -800,6 +795,54 @@ impl ClaudeClient {
             .map_err(|e| ClaudeError::AmendmentParsingFailed(format!("Validation error: {e}")))?;
 
         Ok(amendment_file)
+    }
+
+    /// Sends a prompt to the AI and parses the response as an [`AmendmentFile`],
+    /// retrying on parse or request failures.
+    ///
+    /// Mirrors the retry pattern in [`check_commits_with_retry`](Self::check_commits_with_retry):
+    /// up to [`AMENDMENT_PARSE_MAX_RETRIES`] additional attempts after the first
+    /// failure. Logs a warning via `eprintln!` and a `debug!` trace on each retry.
+    /// Returns the last error if all attempts are exhausted.
+    async fn send_and_parse_amendment_with_retry(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+    ) -> Result<AmendmentFile> {
+        let mut last_error = None;
+        for attempt in 0..=AMENDMENT_PARSE_MAX_RETRIES {
+            match self
+                .ai_client
+                .send_request(system_prompt, user_prompt)
+                .await
+            {
+                Ok(content) => match self.parse_amendment_response(&content) {
+                    Ok(amendment_file) => return Ok(amendment_file),
+                    Err(e) => {
+                        if attempt < AMENDMENT_PARSE_MAX_RETRIES {
+                            eprintln!(
+                                "warning: failed to parse amendment response (attempt {}), retrying...",
+                                attempt + 1
+                            );
+                            debug!(error = %e, attempt = attempt + 1, "Amendment response parse failed, retrying");
+                        }
+                        last_error = Some(e);
+                    }
+                },
+                Err(e) => {
+                    if attempt < AMENDMENT_PARSE_MAX_RETRIES {
+                        eprintln!(
+                            "warning: AI request failed (attempt {}), retrying...",
+                            attempt + 1
+                        );
+                        debug!(error = %e, attempt = attempt + 1, "AI request failed, retrying");
+                    }
+                    last_error = Some(e);
+                }
+            }
+        }
+        Err(last_error
+            .unwrap_or_else(|| anyhow::anyhow!("Amendment generation failed after retries")))
     }
 
     /// Parses an AI response as PR content YAML.
@@ -3336,5 +3379,128 @@ mod tests {
             merge_user.contains("src/a.rs") && merge_user.contains("src/b.rs"),
             "merge user prompt should contain the diff_summary"
         );
+    }
+
+    // ── Amendment retry tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn amendment_retry_parse_failure_then_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_test_repo_view(&dir);
+        let hash = format!("{:0>40}", 0);
+
+        let (client, response_handle, prompt_handle) = make_configurable_client_with_prompts(vec![
+            Ok("not valid yaml {{[".to_string()),
+            Ok(valid_amendment_yaml(&hash, "feat(test): improved")),
+        ]);
+
+        let result = client
+            .generate_amendments_with_options(&repo_view, false)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "should succeed after retry: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap().amendments.len(), 1);
+        assert_eq!(response_handle.remaining(), 0, "both responses consumed");
+        assert_eq!(prompt_handle.request_count(), 2, "exactly 2 AI requests");
+    }
+
+    #[tokio::test]
+    async fn amendment_retry_request_failure_then_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_test_repo_view(&dir);
+        let hash = format!("{:0>40}", 0);
+
+        let (client, response_handle, prompt_handle) = make_configurable_client_with_prompts(vec![
+            Err(anyhow::anyhow!("rate limit")),
+            Ok(valid_amendment_yaml(&hash, "feat(test): improved")),
+        ]);
+
+        let result = client
+            .generate_amendments_with_options(&repo_view, false)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "should succeed after retry: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap().amendments.len(), 1);
+        assert_eq!(response_handle.remaining(), 0);
+        assert_eq!(prompt_handle.request_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn amendment_retry_all_attempts_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_test_repo_view(&dir);
+
+        let (client, response_handle, prompt_handle) = make_configurable_client_with_prompts(vec![
+            Ok("bad yaml 1".to_string()),
+            Ok("bad yaml 2".to_string()),
+            Ok("bad yaml 3".to_string()),
+        ]);
+
+        let result = client
+            .generate_amendments_with_options(&repo_view, false)
+            .await;
+
+        assert!(result.is_err(), "should fail after all retries exhausted");
+        assert_eq!(response_handle.remaining(), 0, "all 3 responses consumed");
+        assert_eq!(
+            prompt_handle.request_count(),
+            3,
+            "exactly 3 AI requests (1 + 2 retries)"
+        );
+    }
+
+    #[tokio::test]
+    async fn amendment_retry_success_first_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_test_repo_view(&dir);
+        let hash = format!("{:0>40}", 0);
+
+        let (client, response_handle, prompt_handle) =
+            make_configurable_client_with_prompts(vec![Ok(valid_amendment_yaml(
+                &hash,
+                "feat(test): works first time",
+            ))]);
+
+        let result = client
+            .generate_amendments_with_options(&repo_view, false)
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(response_handle.remaining(), 0);
+        assert_eq!(prompt_handle.request_count(), 1, "only 1 request, no retry");
+    }
+
+    #[tokio::test]
+    async fn amendment_retry_mixed_request_and_parse_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_test_repo_view(&dir);
+        let hash = format!("{:0>40}", 0);
+
+        let (client, response_handle, prompt_handle) = make_configurable_client_with_prompts(vec![
+            Err(anyhow::anyhow!("network error")),
+            Ok("invalid yaml {{".to_string()),
+            Ok(valid_amendment_yaml(&hash, "feat(test): third time")),
+        ]);
+
+        let result = client
+            .generate_amendments_with_options(&repo_view, false)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "should succeed on third attempt: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap().amendments.len(), 1);
+        assert_eq!(response_handle.remaining(), 0);
+        assert_eq!(prompt_handle.request_count(), 3, "all 3 attempts used");
     }
 }
