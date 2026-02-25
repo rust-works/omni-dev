@@ -390,13 +390,13 @@ impl TwiddleCommand {
                                         .generate_amendments_with_options(&single_view, fresh)
                                         .await
                                 };
-                                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                                 match single_result {
                                     Ok(af) => {
                                         if let Some(a) = af.amendments.into_iter().next() {
                                             let summary = a.summary.clone().unwrap_or_default();
                                             items.push((a, summary));
                                         }
+                                        let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                                         println!("   ✅ {done}/{total_commits} commits processed");
                                     }
                                     Err(e) => {
@@ -406,9 +406,7 @@ impl TwiddleCommand {
                                             eprintln!("  caused by [{i}]: {cause}");
                                         }
                                         failed_indices.push(idx);
-                                        println!(
-                                            "   ❌ {done}/{total_commits} commits processed (failed)"
-                                        );
+                                        println!("   ❌ commit processing failed");
                                     }
                                 }
                             }
@@ -423,9 +421,7 @@ impl TwiddleCommand {
                                 eprintln!("  caused by [{i}]: {cause}");
                             }
                             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                            println!(
-                                "   ❌ {done}/{total_commits} commits processed (failed)"
-                            );
+                            println!("   ❌ {done}/{total_commits} commits processed (failed)");
                             Ok((vec![], vec![idx]))
                         }
                     }
@@ -1344,21 +1340,19 @@ impl TwiddleCommand {
                                         true,
                                     )
                                     .await;
-                                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                                 match single_result {
                                     Ok(report) => {
                                         if let Some(r) = report.commits.into_iter().next() {
                                             let summary = r.summary.clone().unwrap_or_default();
                                             items.push((r, summary));
                                         }
+                                        let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                                         println!("   ✅ {done}/{total_commits} commits checked");
                                     }
                                     Err(e) => {
                                         eprintln!("warning: failed to check commit: {e}");
                                         failed_indices.push(idx);
-                                        println!(
-                                            "   ❌ {done}/{total_commits} commits checked (failed)"
-                                        );
+                                        println!("   ❌ commit check failed");
                                     }
                                 }
                             }
