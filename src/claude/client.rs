@@ -1,7 +1,7 @@
 //! Claude client for commit message improvement.
 
 use anyhow::{Context, Result};
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::claude::token_budget::TokenBudget;
 use crate::claude::{ai::bedrock::BedrockAiClient, ai::claude::ClaudeAiClient};
@@ -137,25 +137,56 @@ impl ClaudeClient {
         available_input_tokens: usize,
         fresh: bool,
     ) -> Result<Amendment> {
+        use crate::claude::batch::{
+            PER_COMMIT_METADATA_OVERHEAD_TOKENS, USER_PROMPT_TEMPLATE_OVERHEAD_TOKENS,
+            VIEW_ENVELOPE_OVERHEAD_TOKENS,
+        };
         use crate::claude::diff_pack::pack_file_diffs;
+        use crate::claude::token_budget;
         use crate::git::commit::CommitInfoForAI;
 
-        let plan = pack_file_diffs(
-            &commit.hash,
-            &commit.analysis.file_diffs,
+        // Compute effective capacity for diff packing by subtracting overhead
+        // that will be added when the full prompt is assembled. This mirrors
+        // the calculation in `batch::plan_batches`.
+        //
+        // Each chunk includes the FULL original_message and diff_summary (not
+        // just the partial diff), so we must subtract those from capacity.
+        // We also subtract user prompt template overhead for instruction text.
+        let system_prompt_tokens = token_budget::estimate_tokens(system_prompt);
+        let commit_text_tokens = token_budget::estimate_tokens(&commit.original_message)
+            + token_budget::estimate_tokens(&commit.analysis.diff_summary);
+        let chunk_capacity = available_input_tokens
+            .saturating_sub(system_prompt_tokens)
+            .saturating_sub(VIEW_ENVELOPE_OVERHEAD_TOKENS)
+            .saturating_sub(PER_COMMIT_METADATA_OVERHEAD_TOKENS)
+            .saturating_sub(USER_PROMPT_TEMPLATE_OVERHEAD_TOKENS)
+            .saturating_sub(commit_text_tokens);
+
+        debug!(
+            commit = %&commit.hash[..8],
             available_input_tokens,
-        )
-        .with_context(|| {
-            format!(
-                "Failed to plan diff chunks for commit {}",
-                &commit.hash[..8]
-            )
-        })?;
+            system_prompt_tokens,
+            envelope_overhead = VIEW_ENVELOPE_OVERHEAD_TOKENS,
+            metadata_overhead = PER_COMMIT_METADATA_OVERHEAD_TOKENS,
+            template_overhead = USER_PROMPT_TEMPLATE_OVERHEAD_TOKENS,
+            commit_text_tokens,
+            chunk_capacity,
+            "Split dispatch: computed chunk capacity"
+        );
+
+        let plan = pack_file_diffs(&commit.hash, &commit.analysis.file_diffs, chunk_capacity)
+            .with_context(|| {
+                format!(
+                    "Failed to plan diff chunks for commit {}",
+                    &commit.hash[..8]
+                )
+            })?;
 
         let total_chunks = plan.chunks.len();
         debug!(
             commit = %&commit.hash[..8],
             chunks = total_chunks,
+            chunk_capacity,
             "Split dispatch: processing commit in chunks"
         );
 
@@ -182,21 +213,61 @@ impl ClaudeClient {
 
             let partial_view = repo_view_for_ai.single_commit_view_for_ai(&partial);
 
+            // Log the actual diff content size for this chunk
+            let diff_content_len = partial.base.analysis.diff_content.len();
+            let diff_content_tokens =
+                token_budget::estimate_tokens_from_char_count(diff_content_len);
+            debug!(
+                commit = %&commit.hash[..8],
+                chunk_index = i,
+                diff_content_len,
+                diff_content_tokens,
+                "Split dispatch: chunk diff content size"
+            );
+
             let user_prompt =
                 self.build_prompt_fitting_budget(&partial_view, system_prompt, build_user_prompt)?;
 
-            let content = self
+            info!(
+                commit = %&commit.hash[..8],
+                chunk = i + 1,
+                total_chunks,
+                user_prompt_len = user_prompt.len(),
+                "Split dispatch: sending chunk to AI"
+            );
+
+            let content = match self
                 .ai_client
                 .send_request(system_prompt, &user_prompt)
                 .await
-                .with_context(|| {
-                    format!(
-                        "Chunk {}/{} failed for commit {}",
-                        i + 1,
-                        total_chunks,
-                        &commit.hash[..8]
-                    )
-                })?;
+            {
+                Ok(content) => content,
+                Err(e) => {
+                    // Log the underlying error before wrapping
+                    tracing::error!(
+                        commit = %&commit.hash[..8],
+                        chunk = i + 1,
+                        error = %e,
+                        error_debug = ?e,
+                        "Split dispatch: AI request failed"
+                    );
+                    return Err(e).with_context(|| {
+                        format!(
+                            "Chunk {}/{} failed for commit {}",
+                            i + 1,
+                            total_chunks,
+                            &commit.hash[..8]
+                        )
+                    });
+                }
+            };
+
+            info!(
+                commit = %&commit.hash[..8],
+                chunk = i + 1,
+                response_len = content.len(),
+                "Split dispatch: received chunk response"
+            );
 
             let amendment_file = self.parse_amendment_response(&content).with_context(|| {
                 format!(
@@ -330,26 +401,57 @@ impl ClaudeClient {
         include_suggestions: bool,
         available_input_tokens: usize,
     ) -> Result<crate::data::check::CheckReport> {
+        use crate::claude::batch::{
+            PER_COMMIT_METADATA_OVERHEAD_TOKENS, USER_PROMPT_TEMPLATE_OVERHEAD_TOKENS,
+            VIEW_ENVELOPE_OVERHEAD_TOKENS,
+        };
         use crate::claude::diff_pack::pack_file_diffs;
+        use crate::claude::token_budget;
         use crate::data::check::{CommitCheckResult, CommitIssue, IssueSeverity};
         use crate::git::commit::CommitInfoForAI;
 
-        let plan = pack_file_diffs(
-            &commit.hash,
-            &commit.analysis.file_diffs,
+        // Compute effective capacity for diff packing by subtracting overhead
+        // that will be added when the full prompt is assembled. This mirrors
+        // the calculation in `batch::plan_batches`.
+        //
+        // Each chunk includes the FULL original_message and diff_summary (not
+        // just the partial diff), so we must subtract those from capacity.
+        // We also subtract user prompt template overhead for instruction text.
+        let system_prompt_tokens = token_budget::estimate_tokens(system_prompt);
+        let commit_text_tokens = token_budget::estimate_tokens(&commit.original_message)
+            + token_budget::estimate_tokens(&commit.analysis.diff_summary);
+        let chunk_capacity = available_input_tokens
+            .saturating_sub(system_prompt_tokens)
+            .saturating_sub(VIEW_ENVELOPE_OVERHEAD_TOKENS)
+            .saturating_sub(PER_COMMIT_METADATA_OVERHEAD_TOKENS)
+            .saturating_sub(USER_PROMPT_TEMPLATE_OVERHEAD_TOKENS)
+            .saturating_sub(commit_text_tokens);
+
+        debug!(
+            commit = %&commit.hash[..8],
             available_input_tokens,
-        )
-        .with_context(|| {
-            format!(
-                "Failed to plan diff chunks for commit {}",
-                &commit.hash[..8]
-            )
-        })?;
+            system_prompt_tokens,
+            envelope_overhead = VIEW_ENVELOPE_OVERHEAD_TOKENS,
+            metadata_overhead = PER_COMMIT_METADATA_OVERHEAD_TOKENS,
+            template_overhead = USER_PROMPT_TEMPLATE_OVERHEAD_TOKENS,
+            commit_text_tokens,
+            chunk_capacity,
+            "Check split dispatch: computed chunk capacity"
+        );
+
+        let plan = pack_file_diffs(&commit.hash, &commit.analysis.file_diffs, chunk_capacity)
+            .with_context(|| {
+                format!(
+                    "Failed to plan diff chunks for commit {}",
+                    &commit.hash[..8]
+                )
+            })?;
 
         let total_chunks = plan.chunks.len();
         debug!(
             commit = %&commit.hash[..8],
             chunks = total_chunks,
+            chunk_capacity,
             "Check split dispatch: processing commit in chunks"
         );
 
@@ -722,25 +824,56 @@ impl ClaudeClient {
         available_input_tokens: usize,
         pr_template: &str,
     ) -> Result<crate::cli::git::PrContent> {
+        use crate::claude::batch::{
+            PER_COMMIT_METADATA_OVERHEAD_TOKENS, USER_PROMPT_TEMPLATE_OVERHEAD_TOKENS,
+            VIEW_ENVELOPE_OVERHEAD_TOKENS,
+        };
         use crate::claude::diff_pack::pack_file_diffs;
+        use crate::claude::token_budget;
         use crate::git::commit::CommitInfoForAI;
 
-        let plan = pack_file_diffs(
-            &commit.hash,
-            &commit.analysis.file_diffs,
+        // Compute effective capacity for diff packing by subtracting overhead
+        // that will be added when the full prompt is assembled. This mirrors
+        // the calculation in `batch::plan_batches`.
+        //
+        // Each chunk includes the FULL original_message and diff_summary (not
+        // just the partial diff), so we must subtract those from capacity.
+        // We also subtract user prompt template overhead for instruction text.
+        let system_prompt_tokens = token_budget::estimate_tokens(system_prompt);
+        let commit_text_tokens = token_budget::estimate_tokens(&commit.original_message)
+            + token_budget::estimate_tokens(&commit.analysis.diff_summary);
+        let chunk_capacity = available_input_tokens
+            .saturating_sub(system_prompt_tokens)
+            .saturating_sub(VIEW_ENVELOPE_OVERHEAD_TOKENS)
+            .saturating_sub(PER_COMMIT_METADATA_OVERHEAD_TOKENS)
+            .saturating_sub(USER_PROMPT_TEMPLATE_OVERHEAD_TOKENS)
+            .saturating_sub(commit_text_tokens);
+
+        debug!(
+            commit = %&commit.hash[..8],
             available_input_tokens,
-        )
-        .with_context(|| {
-            format!(
-                "Failed to plan diff chunks for commit {}",
-                &commit.hash[..8]
-            )
-        })?;
+            system_prompt_tokens,
+            envelope_overhead = VIEW_ENVELOPE_OVERHEAD_TOKENS,
+            metadata_overhead = PER_COMMIT_METADATA_OVERHEAD_TOKENS,
+            template_overhead = USER_PROMPT_TEMPLATE_OVERHEAD_TOKENS,
+            commit_text_tokens,
+            chunk_capacity,
+            "PR split dispatch: computed chunk capacity"
+        );
+
+        let plan = pack_file_diffs(&commit.hash, &commit.analysis.file_diffs, chunk_capacity)
+            .with_context(|| {
+                format!(
+                    "Failed to plan diff chunks for commit {}",
+                    &commit.hash[..8]
+                )
+            })?;
 
         let total_chunks = plan.chunks.len();
         debug!(
             commit = %&commit.hash[..8],
             chunks = total_chunks,
+            chunk_capacity,
             "PR split dispatch: processing commit in chunks"
         );
 
@@ -1765,8 +1898,11 @@ mod tests {
     /// The window is large enough that a single-file chunk fits, but too
     /// small for both files together (including system prompt overhead).
     fn make_small_context_client(responses: Vec<Result<String>>) -> ClaudeClient {
+        // Context of 50k with more conservative token estimation (2.5 chars/token
+        // vs 3.5) ensures per-file diffs fit in chunks without placeholders while
+        // still being large enough to trigger split dispatch for multiple files.
         let mock = crate::claude::test_utils::ConfigurableMockAiClient::new(responses)
-            .with_context_length(25_000);
+            .with_context_length(50_000);
         ClaudeClient::new(Box::new(mock))
     }
 
@@ -1776,7 +1912,7 @@ mod tests {
         responses: Vec<Result<String>>,
     ) -> (ClaudeClient, crate::claude::test_utils::ResponseQueueHandle) {
         let mock = crate::claude::test_utils::ConfigurableMockAiClient::new(responses)
-            .with_context_length(25_000);
+            .with_context_length(50_000);
         let handle = mock.response_handle();
         (ClaudeClient::new(Box::new(mock)), handle)
     }
@@ -1790,12 +1926,15 @@ mod tests {
 
         let hash = "a".repeat(40);
 
-        // Write a full (flat) diff file (large enough to bust the budget)
-        let full_diff = "x".repeat(80_000);
+        // Write a full (flat) diff file large enough to bust the budget.
+        // With 50k context / 2.5 chars-per-token / 1.2 margin, available ≈ 41k tokens.
+        // 120k chars → ~57,600 tokens → well over budget.
+        let full_diff = "x".repeat(120_000);
         let flat_diff_path = dir.path().join("full.diff");
         std::fs::write(&flat_diff_path, &full_diff).unwrap();
 
-        // Write two large per-file diff files (~30K chars each ≈ 9400 tokens)
+        // Write two large per-file diff files (~30K chars each ≈ 14,400 tokens with
+        // conservative 2.5 chars/token * 1.2 margin estimation)
         let diff_a = format!("diff --git a/src/a.rs b/src/a.rs\n{}\n", "a".repeat(30_000));
         let diff_b = format!("diff --git a/src/b.rs b/src/b.rs\n{}\n", "b".repeat(30_000));
 
@@ -2378,9 +2517,10 @@ mod tests {
         let hash_a = "a".repeat(40);
         let hash_b = "b".repeat(40);
 
-        // Write flat diff files large enough to bust the 25KB budget when combined
-        let diff_content_a = "x".repeat(40_000);
-        let diff_content_b = "y".repeat(40_000);
+        // Write flat diff files large enough to bust the 50K-token budget when combined.
+        // Each 60k chars ≈ 28,800 tokens; combined ≈ 57,600 > 41,808 available.
+        let diff_content_a = "x".repeat(60_000);
+        let diff_content_b = "y".repeat(60_000);
         let flat_a = dir.path().join("flat_a.diff");
         let flat_b = dir.path().join("flat_b.diff");
         std::fs::write(&flat_a, &diff_content_a).unwrap();
@@ -2669,7 +2809,7 @@ mod tests {
         crate::claude::test_utils::PromptRecordHandle,
     ) {
         let mock = crate::claude::test_utils::ConfigurableMockAiClient::new(responses)
-            .with_context_length(25_000);
+            .with_context_length(50_000);
         let response_handle = mock.response_handle();
         let prompt_handle = mock.prompt_handle();
         (
@@ -2882,20 +3022,20 @@ mod tests {
     /// budget exceeded → `generate_amendment_split` → `pack_file_diffs`
     /// plans hunk-level chunks → but `from_commit_info_partial` loads the
     /// full per-file diff (deduplicates the repeated path) →
-    /// `build_prompt_fitting_budget` fails for the chunk → error propagates.
+    /// Oversized files that can't be split get placeholders and proceed.
     ///
-    /// Verifies the error is surfaced cleanly (not silently degraded to
-    /// stat-only or file-list-only) and at most one AI request is attempted.
+    /// Verifies that files too large for the budget are replaced with
+    /// placeholder text indicating the file was omitted, rather than
+    /// failing with a "prompt too large" error.
     #[tokio::test]
-    async fn amendment_single_oversized_file_errors() {
+    async fn amendment_single_oversized_file_gets_placeholder() {
         let dir = tempfile::tempdir().unwrap();
         let repo_view = make_single_oversized_file_repo_view(&dir);
         let hash = "c".repeat(40);
 
-        // The file is too large for the budget. Split dispatch will
-        // attempt to chunk it, but partial views load the full per-file
-        // diff, so the budget check still fails. The error should
-        // propagate cleanly (not silently degrade to stat-only).
+        // The file is too large for the full budget but gets a placeholder.
+        // With 50k context, the placeholder is small enough to fit in a
+        // single request (no split dispatch needed). We expect 1 request.
         let (client, _, prompt_handle) = make_small_context_client_with_prompts(vec![Ok(
             valid_amendment_yaml(&hash, "feat(big): add large module"),
         )]);
@@ -2904,19 +3044,16 @@ mod tests {
             .generate_amendments_with_options(&repo_view, false)
             .await;
 
-        assert!(result.is_err(), "expected budget error for oversized file");
-        let err_msg = format!("{:#}", result.unwrap_err());
+        // Should succeed (either single request or split with placeholder)
         assert!(
-            err_msg.contains("too large") || err_msg.contains("Prompt too large"),
-            "error should mention prompt size, got: {err_msg}"
+            result.is_ok(),
+            "expected success with placeholder, got: {result:?}"
         );
 
-        // The budget failure may occur during prompt assembly (before
-        // the AI request is sent) or the first chunk may be attempted.
-        // Either way, no more than 1 request should have been made.
+        // One request (placeholder makes it fit in single request)
         assert!(
-            prompt_handle.request_count() <= 1,
-            "expected at most 1 request attempt, got {}",
+            prompt_handle.request_count() >= 1,
+            "expected at least 1 request, got {}",
             prompt_handle.request_count()
         );
     }
