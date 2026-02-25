@@ -11,15 +11,17 @@ use crate::claude::error::ClaudeError;
 
 /// Approximate characters per token for heuristic estimation.
 ///
-/// Claude tokenizers average roughly 3.5 characters per token for English
-/// text with code mixed in.
-const CHARS_PER_TOKEN: f64 = 3.5;
+/// Uses a conservative estimate of 2.5 characters per token. While English
+/// prose averages ~3.5 chars/token, code diffs have many short tokens
+/// (operators, brackets, whitespace, special characters) that tokenize
+/// less efficiently—observed ratios as low as 2.0 chars/token for diffs.
+const CHARS_PER_TOKEN: f64 = 2.5;
 
 /// Safety margin multiplier applied to token estimates.
 ///
-/// Adds 10% overhead to account for tokenizer variance (special tokens,
-/// whitespace handling, non-ASCII characters).
-const SAFETY_MARGIN: f64 = 1.10;
+/// Adds 20% overhead to account for tokenizer variance (special tokens,
+/// whitespace handling, non-ASCII characters, YAML serialization overhead).
+const SAFETY_MARGIN: f64 = 1.20;
 
 /// Estimates the token count for a text string using a character-based heuristic.
 ///
@@ -132,25 +134,24 @@ mod tests {
 
     #[test]
     fn estimate_tokens_short_text() {
-        // "hello" = 5 bytes -> 5/3.5 * 1.10 = 1.571... -> ceil = 2
+        // "hello" = 5 bytes -> 5/2.5 * 1.20 = 2.4 -> ceil = 3
         let tokens = estimate_tokens("hello");
-        assert_eq!(tokens, 2);
+        assert_eq!(tokens, 3);
     }
 
     #[test]
     fn estimate_tokens_scales_linearly() {
-        // 700 bytes -> 700/3.5 = 200.0, * 1.10 = 220.0 -> ceil = 220
-        // (f64 precision: 200.0 * 1.1 may be 220.00...001, ceil still 221 — accept either)
-        let text = "a".repeat(700);
+        // 500 bytes -> 500/2.5 = 200.0, * 1.20 = 240.0 -> ceil = 240
+        let text = "a".repeat(500);
         let tokens = estimate_tokens(&text);
-        assert!(tokens == 220 || tokens == 221, "got {tokens}");
+        assert_eq!(tokens, 240);
     }
 
     #[test]
     fn estimate_tokens_includes_safety_margin() {
-        // 3500 bytes -> 3500/3.5 = 1000, * 1.10 = 1100
-        let text = "x".repeat(3500);
-        assert_eq!(estimate_tokens(&text), 1100);
+        // 2500 bytes -> 2500/2.5 = 1000, * 1.20 = 1200
+        let text = "x".repeat(2500);
+        assert_eq!(estimate_tokens(&text), 1200);
     }
 
     fn make_metadata(context: usize, response: usize) -> AiClientMetadata {
@@ -178,8 +179,9 @@ mod tests {
         let metadata = make_metadata(1000, 500);
         let budget = TokenBudget::from_metadata(&metadata);
         // available = 500 tokens
-        // 2000 bytes -> 2000/3.5 * 1.10 ≈ 629 tokens -> exceeds 500
-        let large_text = "x".repeat(2000);
+        // 1000 bytes -> 1000/2.5 * 1.20 = 480 tokens -> within budget
+        // 1100 bytes -> 1100/2.5 * 1.20 = 528 tokens -> exceeds 500
+        let large_text = "x".repeat(1100);
         let result = budget.validate_prompt(&large_text, "user");
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
