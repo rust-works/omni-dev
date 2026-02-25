@@ -10,6 +10,7 @@
 use std::fs;
 
 use anyhow::{Context, Result};
+use tracing::debug;
 
 use crate::claude::token_budget;
 use crate::git::commit::FileDiffRef;
@@ -19,9 +20,14 @@ use crate::git::diff_split::{split_file_by_hunk, FileDiff};
 /// variance and file-header overhead that the byte-count heuristic does
 /// not capture.
 ///
+/// Set to 0.70 (30% headroom) to account for YAML serialization expansion
+/// which can increase content size by 20-30% for diffs containing special
+/// characters, binary markers, or unusual encodings.
+///
 /// Mirrors [`BATCH_CAPACITY_FACTOR`](super::batch) in the commit-level
-/// batching module.
-const CHUNK_CAPACITY_FACTOR: f64 = 0.90;
+/// batching module, though uses more aggressive headroom due to observed
+/// serialization variance in split dispatch scenarios.
+const CHUNK_CAPACITY_FACTOR: f64 = 0.70;
 
 /// A group of file diffs (or hunk slices) that fits within one AI
 /// request's token budget.
@@ -87,6 +93,33 @@ pub(crate) fn pack_file_diffs(
     let items = build_packable_items(file_diffs, effective_capacity)?;
     let chunks = first_fit_decreasing(&items, effective_capacity);
 
+    debug!(
+        commit = %&commit_hash[..8.min(commit_hash.len())],
+        capacity_tokens,
+        effective_capacity,
+        num_items = items.len(),
+        num_chunks = chunks.len(),
+        "pack_file_diffs: packing complete"
+    );
+
+    for (i, chunk) in chunks.iter().enumerate() {
+        let oversized = chunk.estimated_tokens > effective_capacity;
+        debug!(
+            commit = %&commit_hash[..8.min(commit_hash.len())],
+            chunk_index = i,
+            estimated_tokens = chunk.estimated_tokens,
+            effective_capacity,
+            oversized,
+            num_files = chunk.file_paths.len(),
+            files = ?chunk.file_paths,
+            "pack_file_diffs: chunk details"
+        );
+    }
+
+    // Note: Chunks exceeding capacity are allowed - they will fail at prompt
+    // validation time with a clear error. This allows the dispatch layer to
+    // attempt processing and provide detailed diagnostics.
+
     Ok(CommitDiffPlan {
         commit_hash: commit_hash.to_string(),
         chunks,
@@ -94,7 +127,8 @@ pub(crate) fn pack_file_diffs(
 }
 
 /// Converts file diff references into packable items, splitting oversized
-/// files into per-hunk items.
+/// files into per-hunk items or replacing unsplittable oversized files
+/// with placeholders.
 fn build_packable_items(file_diffs: &[FileDiffRef], capacity: usize) -> Result<Vec<PackableItem>> {
     let mut items = Vec::new();
 
@@ -108,7 +142,7 @@ fn build_packable_items(file_diffs: &[FileDiffRef], capacity: usize) -> Result<V
                 diff_override: None,
             });
         } else {
-            let hunk_items = split_oversized_file(file_ref)?;
+            let hunk_items = split_oversized_file(file_ref, capacity)?;
             items.extend(hunk_items);
         }
     }
@@ -119,9 +153,10 @@ fn build_packable_items(file_diffs: &[FileDiffRef], capacity: usize) -> Result<V
 /// Reads a file diff from disk, splits it into hunks, and returns
 /// packable items for each hunk.
 ///
-/// Files with no hunk markers (binary files, mode-only changes) are
-/// returned as a single item.
-fn split_oversized_file(file_ref: &FileDiffRef) -> Result<Vec<PackableItem>> {
+/// Files with no hunk markers (binary files, mode-only changes) that exceed
+/// capacity are replaced with a placeholder summary. Files that can be split
+/// into hunks have each hunk returned as a separate packable item.
+fn split_oversized_file(file_ref: &FileDiffRef, capacity: usize) -> Result<Vec<PackableItem>> {
     let content = fs::read_to_string(&file_ref.diff_file).with_context(|| {
         format!(
             "Failed to read diff file for hunk splitting: {}",
@@ -138,19 +173,73 @@ fn split_oversized_file(file_ref: &FileDiffRef) -> Result<Vec<PackableItem>> {
     let hunks = split_file_by_hunk(&file_diff);
 
     if hunks.is_empty() {
+        // No hunks found - this is likely a binary file or unsplittable content.
+        // If it's still too large, replace with a placeholder.
+        let file_tokens = token_budget::estimate_tokens_from_char_count(file_ref.byte_len);
+        if file_tokens > capacity {
+            debug!(
+                path = %file_ref.path,
+                file_tokens,
+                capacity,
+                byte_len = file_ref.byte_len,
+                "Replacing oversized unsplittable file with placeholder"
+            );
+            let placeholder = format!(
+                "diff --git a/{path} b/{path}\n\
+                 [File content omitted: {bytes} bytes, estimated {tokens} tokens - exceeds capacity]\n\
+                 [This file was too large to include in the analysis]\n",
+                path = file_ref.path,
+                bytes = file_ref.byte_len,
+                tokens = file_tokens
+            );
+            let placeholder_tokens =
+                token_budget::estimate_tokens_from_char_count(placeholder.len());
+            return Ok(vec![PackableItem {
+                path: file_ref.path.clone(),
+                estimated_tokens: placeholder_tokens,
+                diff_override: Some(placeholder),
+            }]);
+        }
         return Ok(vec![PackableItem {
             path: file_ref.path.clone(),
-            estimated_tokens: token_budget::estimate_tokens_from_char_count(file_ref.byte_len),
+            estimated_tokens: file_tokens,
             diff_override: None,
         }]);
     }
 
+    // Check if any individual hunk exceeds capacity - if so, replace it with placeholder
     Ok(hunks
         .iter()
-        .map(|hunk| PackableItem {
-            path: file_ref.path.clone(),
-            estimated_tokens: token_budget::estimate_tokens_from_char_count(hunk.byte_len),
-            diff_override: Some(format!("{}{}", hunk.file_header, hunk.content)),
+        .map(|hunk| {
+            let hunk_tokens = token_budget::estimate_tokens_from_char_count(hunk.byte_len);
+            if hunk_tokens > capacity {
+                debug!(
+                    path = %file_ref.path,
+                    hunk_tokens,
+                    capacity,
+                    byte_len = hunk.byte_len,
+                    "Replacing oversized hunk with placeholder"
+                );
+                let placeholder = format!(
+                    "{header}\
+                     [Hunk content omitted: {bytes} bytes, estimated {tokens} tokens - exceeds capacity]\n",
+                    header = hunk.file_header,
+                    bytes = hunk.byte_len,
+                    tokens = hunk_tokens
+                );
+                let placeholder_tokens = token_budget::estimate_tokens_from_char_count(placeholder.len());
+                PackableItem {
+                    path: file_ref.path.clone(),
+                    estimated_tokens: placeholder_tokens,
+                    diff_override: Some(placeholder),
+                }
+            } else {
+                PackableItem {
+                    path: file_ref.path.clone(),
+                    estimated_tokens: hunk_tokens,
+                    diff_override: Some(format!("{}{}", hunk.file_header, hunk.content)),
+                }
+            }
         })
         .collect())
 }
@@ -296,12 +385,13 @@ mod tests {
 
     #[test]
     fn pack_files_into_multiple_chunks() -> Result<()> {
-        // Each 5000-byte file ≈ 1571 tokens. Capacity 2000 tokens fits ~1 file
-        // after 0.90 headroom (effective 1800).
+        // Each 5000-byte file ≈ 2400 tokens (5000/2.5*1.2). Capacity 3000 tokens
+        // with 0.70 headroom = effective 2100. Each file exceeds this, so gets
+        // split or placeholder. Use larger capacity to ensure multiple chunks.
         let (f1, _t1) = make_file_diff_ref("a.rs", 5000);
         let (f2, _t2) = make_file_diff_ref("b.rs", 5000);
         let (f3, _t3) = make_file_diff_ref("c.rs", 5000);
-        let plan = pack_file_diffs("abc123", &[f1, f2, f3], 2000)?;
+        let plan = pack_file_diffs("abc123", &[f1, f2, f3], 5000)?;
         assert!(
             plan.chunks.len() >= 2,
             "expected multiple chunks, got {}",
@@ -312,11 +402,11 @@ mod tests {
 
     #[test]
     fn pack_oversized_file_splits_into_hunks() -> Result<()> {
-        // 4 hunks of 500 bytes each ≈ 157 tokens per hunk.
-        // Total file ≈ 700 tokens. Capacity 200 tokens → file must be split.
-        // Each hunk (~157 tokens) fits within effective capacity (180).
+        // 4 hunks of 500 bytes each. Each hunk + header ≈ 580 bytes ≈ 278 tokens (580/2.5*1.2).
+        // Total file ≈ 2400 bytes ≈ 1152 tokens. Capacity 600, effective 420.
+        // Each hunk (~278 tokens) fits within effective capacity (420).
         let (f, _tmp) = make_multi_hunk_file_diff_ref("big.rs", 4, 500);
-        let plan = pack_file_diffs("abc123", &[f], 200)?;
+        let plan = pack_file_diffs("abc123", &[f], 600)?;
         assert!(
             plan.chunks.len() >= 2,
             "oversized file should be split into multiple chunks, got {}",
@@ -344,14 +434,28 @@ mod tests {
     }
 
     #[test]
-    fn pack_single_hunk_exceeding_capacity() -> Result<()> {
+    fn pack_single_hunk_exceeding_capacity_gets_placeholder() -> Result<()> {
         // One file with a single massive hunk — cannot be split further.
+        // Now replaced with a small placeholder instead of being oversized.
         let (f, _tmp) = make_file_diff_ref("huge.rs", 10_000);
         let plan = pack_file_diffs("abc123", &[f], 100)?;
         assert_eq!(plan.chunks.len(), 1);
+        // The chunk now contains a placeholder, so tokens are small
         assert!(
-            plan.chunks[0].estimated_tokens > 100,
-            "oversized hunk should exceed capacity"
+            plan.chunks[0].estimated_tokens < 100,
+            "placeholder should have small token count, got {}",
+            plan.chunks[0].estimated_tokens
+        );
+        // Verify it has a diff_override (the placeholder)
+        assert!(
+            plan.chunks[0].diff_overrides[0].is_some(),
+            "oversized file should have placeholder override"
+        );
+        let override_content = plan.chunks[0].diff_overrides[0].as_ref().unwrap();
+        // File has a hunk, so it goes through hunk splitting and gets "Hunk content omitted"
+        assert!(
+            override_content.contains("content omitted"),
+            "placeholder should indicate content was omitted, got: {override_content}"
         );
         Ok(())
     }
@@ -499,9 +603,10 @@ mod tests {
 
     #[test]
     fn split_oversized_preserves_each_hunk_content() -> Result<()> {
-        // 3 hunks, each ~500 bytes. Capacity set so the file must be split.
+        // 3 hunks, each ~500 bytes ≈ 240 tokens (500/2.5*1.2).
+        // Capacity 500, effective 350. Each hunk fits but file total doesn't.
         let (f, _tmp) = make_multi_hunk_file_diff_ref("big.rs", 3, 500);
-        let plan = pack_file_diffs("abc123", &[f], 200)?;
+        let plan = pack_file_diffs("abc123", &[f], 500)?;
 
         // Collect all overrides across chunks.
         let all_overrides: Vec<&String> = plan
@@ -531,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn binary_file_override_is_none() -> Result<()> {
+    fn binary_file_within_capacity_has_no_override() -> Result<()> {
         let content = "diff --git a/image.png b/image.png\n\
                         new file mode 100644\n\
                         index 0000000..abc1234\n\
@@ -547,11 +652,39 @@ mod tests {
             byte_len: content.len(),
         };
 
-        // Capacity low enough to trigger split attempt.
+        // Capacity high enough that binary file fits without placeholder.
+        // 125 bytes ≈ 60 tokens (125/2.5*1.2). Need capacity > 60/0.70 ≈ 86.
+        let plan = pack_file_diffs("abc123", &[file_ref], 200)?;
+        assert_eq!(plan.chunks.len(), 1);
+        // Binary file within capacity has no hunks → whole-file item → None override.
+        assert_eq!(plan.chunks[0].diff_overrides, vec![None]);
+        Ok(())
+    }
+
+    #[test]
+    fn binary_file_exceeding_capacity_gets_placeholder() -> Result<()> {
+        let content = "diff --git a/image.png b/image.png\n\
+                        new file mode 100644\n\
+                        index 0000000..abc1234\n\
+                        Binary files /dev/null and b/image.png differ\n";
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(content.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let file_ref = FileDiffRef {
+            path: "image.png".to_string(),
+            diff_file: tmp.path().to_string_lossy().to_string(),
+            byte_len: content.len(),
+        };
+
+        // Capacity low enough to trigger placeholder.
         let plan = pack_file_diffs("abc123", &[file_ref], 10)?;
         assert_eq!(plan.chunks.len(), 1);
-        // Binary file has no hunks → fallback to whole-file item → None override.
-        assert_eq!(plan.chunks[0].diff_overrides, vec![None]);
+        // Binary file exceeding capacity gets placeholder override.
+        assert!(plan.chunks[0].diff_overrides[0].is_some());
+        let override_content = plan.chunks[0].diff_overrides[0].as_ref().unwrap();
+        assert!(override_content.contains("File content omitted"));
         Ok(())
     }
 }
