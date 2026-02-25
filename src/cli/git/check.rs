@@ -458,24 +458,24 @@ impl CheckCommand {
                                         !self.no_suggestions,
                                     )
                                     .await;
-                                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                                 match single_result {
                                     Ok(report) => {
                                         if let Some(r) = report.commits.into_iter().next() {
                                             let summary = r.summary.clone().unwrap_or_default();
                                             items.push((r, summary));
                                         }
+                                        let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                                         if !self.quiet {
-                                            println!("   ✅ {done}/{total_commits} commits checked");
+                                            println!(
+                                                "   ✅ {done}/{total_commits} commits checked"
+                                            );
                                         }
                                     }
                                     Err(e) => {
                                         eprintln!("warning: failed to check commit: {e}");
                                         failed_indices.push(idx);
                                         if !self.quiet {
-                                            println!(
-                                                "   ❌ {done}/{total_commits} commits checked (failed)"
-                                            );
+                                            println!("   ❌ commit check failed");
                                         }
                                     }
                                 }
@@ -488,9 +488,7 @@ impl CheckCommand {
                             eprintln!("warning: failed to check commit: {e}");
                             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                             if !self.quiet {
-                                println!(
-                                    "   ❌ {done}/{total_commits} commits checked (failed)"
-                                );
+                                println!("   ❌ {done}/{total_commits} commits checked (failed)");
                             }
                             Ok((vec![], vec![idx]))
                         }
