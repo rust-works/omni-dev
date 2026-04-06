@@ -1,37 +1,13 @@
-//! AI commands.
+//! Interactive AI chat command.
 
 use std::io::{self, Write};
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     terminal::{disable_raw_mode, enable_raw_mode},
 };
-
-/// AI operations.
-#[derive(Parser)]
-pub struct AiCommand {
-    /// The AI subcommand to execute.
-    #[command(subcommand)]
-    pub command: AiSubcommands,
-}
-
-/// AI subcommands.
-#[derive(Subcommand)]
-pub enum AiSubcommands {
-    /// Interactive AI chat session.
-    Chat(ChatCommand),
-}
-
-impl AiCommand {
-    /// Executes the AI command.
-    pub async fn execute(self) -> Result<()> {
-        match self.command {
-            AiSubcommands::Chat(cmd) => cmd.execute().await,
-        }
-    }
-}
 
 /// Interactive AI chat session.
 #[derive(Parser)]
