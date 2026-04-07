@@ -323,6 +323,12 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_ai_claude_cli_model_resolve() {
+        let cli = Cli::try_parse_from(["omni-dev", "ai", "claude", "cli", "model", "resolve"]);
+        assert!(cli.is_ok(), "Failed to parse: {:?}", cli.err());
+    }
+
+    #[test]
     fn read_interactive_line_returns_input() {
         let mut reader = std::io::Cursor::new(b"hello\n" as &[u8]);
         let result = read_interactive_line(&mut reader).unwrap();

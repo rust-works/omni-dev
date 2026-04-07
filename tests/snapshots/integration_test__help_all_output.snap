@@ -30,8 +30,9 @@ AI operations
 Usage: ai <COMMAND>
 
 Commands:
-  chat  Interactive AI chat session
-  help  Print this message or the help of the given subcommand(s)
+  chat    Interactive AI chat session
+  claude  Claude Code diagnostics and inspection
+  help    Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
@@ -48,6 +49,66 @@ Usage: chat [OPTIONS]
 Options:
       --model <MODEL>  AI model to use (overrides environment configuration)
   -h, --help           Print help
+
+
+================================================================================
+
+omni-dev ai claude - Claude Code diagnostics and inspection
+
+Claude Code diagnostics and inspection
+
+Usage: claude <COMMAND>
+
+Commands:
+  cli   Claude Code CLI inspection
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev ai claude cli - Claude Code CLI inspection
+
+Claude Code CLI inspection
+
+Usage: cli <COMMAND>
+
+Commands:
+  model  Model selection diagnostics
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev ai claude cli model - Model selection diagnostics
+
+Model selection diagnostics
+
+Usage: model <COMMAND>
+
+Commands:
+  resolve  Show how Claude Code resolves the active model in the current directory
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev ai claude cli model resolve - Show how Claude Code resolves the active model in the current directory
+
+Show how Claude Code resolves the active model in the current directory
+
+Usage: resolve
+
+Options:
+  -h, --help  Print help
 
 
 ================================================================================
