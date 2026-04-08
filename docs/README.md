@@ -29,6 +29,10 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 - **[Help All Command](plan/help-all-command.md)** - Comprehensive help system design
 - **[Config Internals](plan/config-internals.md)** - How configuration resolution works
 
+### Retrospectives
+
+- **[v0.18.0 Retrospective](retrospective-v0.18.0.md)** - ADR-guided code quality and issue-driven development
+
 ### Development & Release
 
 - **[Contributing Guidelines](../CONTRIBUTING.md)** - How to contribute to the project
