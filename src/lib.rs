@@ -18,6 +18,7 @@
 
 #![warn(missing_docs)]
 
+pub mod atlassian;
 pub mod claude;
 pub mod cli;
 pub mod data;

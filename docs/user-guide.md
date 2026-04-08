@@ -8,10 +8,11 @@ intelligence.
 1. [Getting Started](#getting-started)
 2. [Core Concepts](#core-concepts)
 3. [Command Reference](#command-reference)
-4. [Contextual Intelligence](#contextual-intelligence)
-5. [Workflows](#workflows)
-6. [Advanced Usage](#advanced-usage)
-7. [Best Practices](#best-practices)
+4. [JIRA and Confluence Integration (JFM)](#jfm---jira-and-confluence-integration)
+5. [Contextual Intelligence](#contextual-intelligence)
+6. [Workflows](#workflows)
+7. [Advanced Usage](#advanced-usage)
+8. [Best Practices](#best-practices)
 
 ## Getting Started
 
@@ -243,6 +244,187 @@ description: |
   ## Additional Notes
   This implementation follows OAuth2 best practices and includes comprehensive
   error handling for edge cases.
+```
+
+### `jfm` - JIRA and Confluence Integration
+
+Read, edit, and update JIRA issues and Confluence pages as local markdown
+files using JFM (JIRA-Flavored Markdown). JFM converts between markdown
+and Atlassian Document Format (ADF), so you can work with Atlassian
+content in your editor.
+
+See the [JFM Specification](plan/jfm.md) for full technical details.
+
+#### Authentication Setup
+
+Before using JFM, configure your Atlassian Cloud credentials:
+
+```bash
+# Interactive credential setup (prompts for instance URL, email, API token)
+omni-dev jfm auth login
+
+# Verify credentials work (makes API call)
+omni-dev jfm auth status
+```
+
+Credentials are stored in `~/.omni-dev/settings.json`. You need:
+- Your Atlassian Cloud instance URL (e.g., `https://myorg.atlassian.net`)
+- Your email address
+- An API token (generate at https://id.atlassian.com/manage-profile/security/api-tokens)
+
+#### Reading Content
+
+Fetch a JIRA issue or Confluence page as a JFM markdown document:
+
+```bash
+# JIRA issue (auto-detected from key pattern)
+omni-dev jfm read PROJ-123
+omni-dev jfm read PROJ-123 -o issue.md
+
+# Confluence page (auto-detected from numeric ID)
+omni-dev jfm read 12345
+omni-dev jfm read 12345 -o page.md
+
+# Explicit target override
+omni-dev jfm read 12345 --jira        # force JIRA interpretation
+omni-dev jfm read PROJ-123 --confluence  # force Confluence
+
+# Get raw ADF JSON (useful for debugging)
+omni-dev jfm read PROJ-123 --raw
+```
+
+JIRA output:
+
+```markdown
+---
+type: jira
+instance: https://myorg.atlassian.net
+key: PROJ-123
+summary: Implement user authentication
+status: In Progress
+issue_type: Story
+assignee: Alice Smith
+priority: High
+labels:
+  - backend
+  - auth
+---
+
+## Description
+
+This story covers the implementation of OAuth2-based authentication...
+```
+
+Confluence output:
+
+```markdown
+---
+type: confluence
+instance: https://myorg.atlassian.net
+page_id: "12345"
+title: Architecture Overview
+space_key: ENG
+status: current
+version: 7
+---
+
+# Architecture Overview
+
+Page body content here...
+```
+
+#### Writing Changes
+
+Push a JFM markdown file back to JIRA or Confluence:
+
+```bash
+# Update from file (prompts for confirmation)
+omni-dev jfm write PROJ-123 issue.md
+omni-dev jfm write 12345 page.md
+
+# Skip confirmation prompt
+omni-dev jfm write PROJ-123 issue.md --force
+
+# Preview what would be sent without updating
+omni-dev jfm write PROJ-123 issue.md --dry-run
+
+# Read from stdin
+cat issue.md | omni-dev jfm write PROJ-123
+```
+
+The write command updates the content body (converted to ADF) and
+optionally the title if it changed in the frontmatter. For Confluence,
+the page version is automatically incremented.
+
+#### Interactive Editing
+
+Fetch content, edit in your editor, and push changes in one command:
+
+```bash
+omni-dev jfm edit PROJ-123
+omni-dev jfm edit 12345
+omni-dev jfm edit 12345 --confluence
+```
+
+This opens an interactive loop:
+1. Fetches the content and writes it to a temp file
+2. Prompts with: `[A]ccept, [S]how, [E]dit, or [Q]uit?`
+   - **Edit** - Opens the temp file in your editor (`$EDITOR` or `$OMNI_DEV_EDITOR`)
+   - **Show** - Prints the current file content
+   - **Accept** - Pushes changes (only if content changed)
+   - **Quit** - Cancels without updating
+
+#### Offline Format Conversion
+
+Convert between markdown and ADF locally without credentials:
+
+```bash
+# Convert markdown to ADF JSON
+omni-dev jfm convert to-adf issue.md
+
+# Compact JSON output
+omni-dev jfm convert to-adf issue.md --compact
+
+# Convert ADF JSON back to markdown
+omni-dev jfm convert from-adf issue.json
+
+# Pipe for inspection
+cat issue.md | omni-dev jfm convert to-adf | jq .
+```
+
+#### JFM Markdown Syntax
+
+JFM supports standard GitHub-Flavored Markdown plus directives for
+JIRA-specific elements:
+
+**Standard markdown**: headings, bold, italic, code, strikethrough, links,
+images, lists, task lists, tables, code blocks, blockquotes, horizontal rules.
+
+**Inline directives** for JIRA constructs without markdown equivalents:
+
+```markdown
+Status: :status[In Progress]{color=blue}
+Assigned to: :mention[Alice]{id=abc123}
+Due: :date[2026-04-15]
+Emoji: :smile:
+```
+
+**Container directives** for panels and other blocks:
+
+```markdown
+:::panel{type=info}
+This is an info panel with **rich** content inside.
+:::
+
+:::expand{title="Click to expand"}
+Hidden content here.
+:::
+```
+
+**Leaf block directives** for smart links and cards:
+
+```markdown
+::card[https://example.com/page]
 ```
 
 ## Contextual Intelligence
