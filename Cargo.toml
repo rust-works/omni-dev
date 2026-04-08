@@ -35,12 +35,14 @@ dirs = "6.0.0"
 globset = "0.4"
 crossterm = "0.29"
 url = "2.5.8"
+base64 = "0.22"
 futures = "0.3"
 
 [dev-dependencies]
 tempfile = "3.25"
 insta = "1.46"
 proptest = "1"
+wiremock = "0.6"
 
 [lib]
 name = "omni_dev"
