@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 pub mod ai;
+pub mod atlassian;
 pub mod commands;
 pub mod config;
 pub mod git;
@@ -31,6 +32,8 @@ pub enum Commands {
     Commands(commands::CommandsCommand),
     /// Configuration and model information.
     Config(config::ConfigCommand),
+    /// Atlassian: JIRA and Confluence operations.
+    Atlassian(atlassian::AtlassianCommand),
     /// Displays comprehensive help for all commands.
     #[command(name = "help-all")]
     HelpAll(help::HelpCommand),
@@ -43,6 +46,7 @@ impl Cli {
             Commands::Ai(ai_cmd) => ai_cmd.execute().await,
             Commands::Git(git_cmd) => git_cmd.execute().await,
             Commands::Commands(commands_cmd) => commands_cmd.execute(),
+            Commands::Atlassian(cmd) => cmd.execute().await,
             Commands::Config(config_cmd) => config_cmd.execute(),
             Commands::HelpAll(help_cmd) => help_cmd.execute(),
         }

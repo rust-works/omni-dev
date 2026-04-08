@@ -137,6 +137,42 @@ omni-dev git branch create pr --save-only pr-description.yaml
 omni-dev git branch create pr --auto-apply
 ```
 
+### 📝 JIRA Integration (`jfm`)
+
+Read and write JIRA issues as markdown using JFM (JIRA-Flavored Markdown):
+
+```bash
+# Authenticate with Atlassian Cloud
+omni-dev jfm auth login
+
+# Check authentication status
+omni-dev jfm auth status
+
+# Fetch a JIRA issue as markdown
+omni-dev jfm read PROJ-123
+
+# Fetch and save to a file
+omni-dev jfm read PROJ-123 -o issue.md
+
+# Fetch raw ADF JSON instead of markdown
+omni-dev jfm read PROJ-123 --raw
+
+# Push markdown changes back to JIRA
+omni-dev jfm write PROJ-123 issue.md
+
+# Preview changes without writing
+omni-dev jfm write PROJ-123 issue.md --dry-run
+
+# Interactive edit: fetch, edit in $EDITOR, push
+omni-dev jfm edit PROJ-123
+
+# Convert markdown to ADF JSON (offline)
+omni-dev jfm convert to-adf input.md
+
+# Convert ADF JSON to markdown (offline)
+omni-dev jfm convert from-adf input.json
+```
+
 ### ✏️ Manual Amendment
 
 ```bash
@@ -339,6 +375,9 @@ We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.
   - View available models: `omni-dev config models show`
   - Configure via `~/.omni-dev/settings.json` or `ANTHROPIC_MODEL` environment variable
   - Supports standard identifiers and Bedrock-style formats
+- **Atlassian Credentials** (for JFM features): Instance URL, email, and
+  [API token](https://id.atlassian.com/manage-profile/security/api-tokens)
+  - Configure with: `omni-dev jfm auth login`
 - **Git**: Any modern version
 
 ## 🐛 Debugging

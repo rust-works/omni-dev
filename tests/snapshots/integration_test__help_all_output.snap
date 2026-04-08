@@ -9,12 +9,13 @@ A comprehensive development toolkit
 Usage: omni-dev <COMMAND>
 
 Commands:
-  ai        AI operations
-  git       Git-related operations
-  commands  Command template management
-  config    Configuration and model information
-  help-all  Displays comprehensive help for all commands
-  help      Print this message or the help of the given subcommand(s)
+  ai         AI operations
+  git        Git-related operations
+  commands   Command template management
+  config     Configuration and model information
+  atlassian  Atlassian: JIRA and Confluence operations
+  help-all   Displays comprehensive help for all commands
+  help       Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help     Print help
@@ -109,6 +110,252 @@ Usage: resolve
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian - Atlassian: JIRA and Confluence operations
+
+Atlassian: JIRA and Confluence operations
+
+Usage: atlassian <COMMAND>
+
+Commands:
+  jira        JIRA operations (read, write, edit issues)
+  confluence  Confluence operations (read, write, edit pages)
+  convert     Converts between JFM markdown and ADF JSON
+  auth        Manages Atlassian Cloud credentials
+  help        Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian auth - Manages Atlassian Cloud credentials
+
+Manages Atlassian Cloud credentials
+
+Usage: auth <COMMAND>
+
+Commands:
+  login   Configures Atlassian Cloud credentials interactively
+  status  Shows the current authentication status
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian auth login - Configures Atlassian Cloud credentials interactively
+
+Configures Atlassian Cloud credentials interactively
+
+Usage: login
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian auth status - Shows the current authentication status
+
+Shows the current authentication status
+
+Usage: status
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian confluence - Confluence operations (read, write, edit pages)
+
+Confluence operations (read, write, edit pages)
+
+Usage: confluence <COMMAND>
+
+Commands:
+  read   Fetches a Confluence page and outputs it as JFM markdown or ADF JSON
+  write  Pushes content to a Confluence page
+  edit   Interactive fetch-edit-push cycle for a Confluence page
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian confluence edit - Interactive fetch-edit-push cycle for a Confluence page
+
+Interactive fetch-edit-push cycle for a Confluence page
+
+Usage: edit <ID>
+
+Arguments:
+  <ID>  Confluence page ID (e.g., 12345678)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian confluence read - Fetches a Confluence page and outputs it as JFM markdown or ADF JSON
+
+Fetches a Confluence page and outputs it as JFM markdown or ADF JSON
+
+Usage: read [OPTIONS] <ID>
+
+Arguments:
+  <ID>  Confluence page ID (e.g., 12345678)
+
+Options:
+  -o, --output <OUTPUT>  Output file (writes to stdout if omitted)
+      --format <FORMAT>  Output format [default: jfm] [possible values: jfm, adf]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian confluence write - Pushes content to a Confluence page
+
+Pushes content to a Confluence page
+
+Usage: write [OPTIONS] <ID> [FILE]
+
+Arguments:
+  <ID>    Confluence page ID (e.g., 12345678)
+  [FILE]  Input file (reads from stdin if omitted or "-")
+
+Options:
+      --format <FORMAT>  Input format [default: jfm] [possible values: jfm, adf]
+      --force            Skips the confirmation prompt
+      --dry-run          Shows what would change without writing
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian convert - Converts between JFM markdown and ADF JSON
+
+Converts between JFM markdown and ADF JSON
+
+Usage: convert <COMMAND>
+
+Commands:
+  to-adf    Converts JFM markdown to ADF JSON
+  from-adf  Converts ADF JSON to JFM markdown
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian convert from-adf - Converts ADF JSON to JFM markdown
+
+Converts ADF JSON to JFM markdown
+
+Usage: from-adf [FILE]
+
+Arguments:
+  [FILE]  Input file (reads from stdin if omitted or "-")
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian convert to-adf - Converts JFM markdown to ADF JSON
+
+Converts JFM markdown to ADF JSON
+
+Usage: to-adf [OPTIONS] [FILE]
+
+Arguments:
+  [FILE]  Input file (reads from stdin if omitted or "-")
+
+Options:
+      --compact  Outputs compact JSON instead of pretty-printed
+  -h, --help     Print help
+
+
+================================================================================
+
+omni-dev atlassian jira - JIRA operations (read, write, edit issues)
+
+JIRA operations (read, write, edit issues)
+
+Usage: jira <COMMAND>
+
+Commands:
+  read   Fetches a JIRA issue and outputs it as JFM markdown or ADF JSON
+  write  Pushes content to a JIRA issue
+  edit   Interactive fetch-edit-push cycle for a JIRA issue
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian jira edit - Interactive fetch-edit-push cycle for a JIRA issue
+
+Interactive fetch-edit-push cycle for a JIRA issue
+
+Usage: edit <KEY>
+
+Arguments:
+  <KEY>  JIRA issue key (e.g., PROJ-123)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian jira read - Fetches a JIRA issue and outputs it as JFM markdown or ADF JSON
+
+Fetches a JIRA issue and outputs it as JFM markdown or ADF JSON
+
+Usage: read [OPTIONS] <KEY>
+
+Arguments:
+  <KEY>  JIRA issue key (e.g., PROJ-123)
+
+Options:
+  -o, --output <OUTPUT>  Output file (writes to stdout if omitted)
+      --format <FORMAT>  Output format [default: jfm] [possible values: jfm, adf]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian jira write - Pushes content to a JIRA issue
+
+Pushes content to a JIRA issue
+
+Usage: write [OPTIONS] <KEY> [FILE]
+
+Arguments:
+  <KEY>   JIRA issue key (e.g., PROJ-123)
+  [FILE]  Input file (reads from stdin if omitted or "-")
+
+Options:
+      --format <FORMAT>  Input format [default: jfm] [possible values: jfm, adf]
+      --force            Skips the confirmation prompt
+      --dry-run          Shows what would change without writing
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================

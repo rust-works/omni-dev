@@ -1,0 +1,567 @@
+//! Confluence Cloud REST API v2 implementation of [`AtlassianApi`].
+//!
+//! Uses the Confluence REST API v2 to read and write pages.
+//! Pages are fetched with ADF body format and updated with version
+//! number increments for optimistic locking.
+
+use std::future::Future;
+use std::pin::Pin;
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use tracing::debug;
+
+use crate::atlassian::adf::AdfDocument;
+use crate::atlassian::api::{AtlassianApi, ContentItem, ContentMetadata};
+use crate::atlassian::client::AtlassianClient;
+use crate::atlassian::error::AtlassianError;
+
+/// Confluence Cloud REST API v2 backend.
+pub struct ConfluenceApi {
+    client: AtlassianClient,
+}
+
+impl ConfluenceApi {
+    /// Creates a new Confluence API backend.
+    pub fn new(client: AtlassianClient) -> Self {
+        Self { client }
+    }
+}
+
+// ── Internal API response structs ───────────────────────────────────
+
+#[derive(Deserialize)]
+struct ConfluencePageResponse {
+    id: String,
+    title: String,
+    status: String,
+    #[serde(rename = "spaceId")]
+    space_id: String,
+    version: Option<ConfluenceVersion>,
+    body: Option<ConfluenceBody>,
+    #[serde(rename = "parentId")]
+    parent_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceVersion {
+    number: u32,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceBody {
+    atlas_doc_format: Option<ConfluenceAtlasDoc>,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceAtlasDoc {
+    value: String,
+}
+
+// ── Space lookup ────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ConfluenceSpaceResponse {
+    key: String,
+}
+
+// ── Update request ──────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct ConfluenceUpdateRequest {
+    id: String,
+    status: String,
+    title: String,
+    body: ConfluenceUpdateBody,
+    version: ConfluenceUpdateVersion,
+}
+
+#[derive(Serialize)]
+struct ConfluenceUpdateBody {
+    representation: String,
+    value: String,
+}
+
+#[derive(Serialize)]
+struct ConfluenceUpdateVersion {
+    number: u32,
+    message: Option<String>,
+}
+
+impl AtlassianApi for ConfluenceApi {
+    fn get_content<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<ContentItem>> + Send + 'a>> {
+        Box::pin(async move {
+            let url = format!(
+                "{}/wiki/api/v2/pages/{}?body-format=atlas_doc_format",
+                self.client.instance_url(),
+                id
+            );
+
+            let response = self
+                .client
+                .get_json(&url)
+                .await
+                .context("Failed to fetch Confluence page")?;
+
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+            }
+
+            let page: ConfluencePageResponse = response
+                .json()
+                .await
+                .context("Failed to parse Confluence page response")?;
+
+            debug!(
+                page_id = page.id,
+                title = page.title,
+                "Fetched Confluence page"
+            );
+
+            // Confluence returns ADF as a JSON string — parse it to a Value.
+            let body_adf = if let Some(body) = &page.body {
+                if let Some(atlas_doc) = &body.atlas_doc_format {
+                    if tracing::enabled!(tracing::Level::TRACE) {
+                        if let Ok(pretty) =
+                            serde_json::from_str::<serde_json::Value>(&atlas_doc.value)
+                                .and_then(|v| serde_json::to_string_pretty(&v))
+                        {
+                            tracing::trace!("Original ADF from Confluence:\n{pretty}");
+                        }
+                    }
+                    Some(
+                        serde_json::from_str(&atlas_doc.value)
+                            .context("Failed to parse ADF from Confluence body")?,
+                    )
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Resolve space key from space ID.
+            let space_key = self.resolve_space_key(&page.space_id).await?;
+
+            Ok(ContentItem {
+                id: page.id,
+                title: page.title,
+                body_adf,
+                metadata: ContentMetadata::Confluence {
+                    space_key,
+                    status: Some(page.status),
+                    version: page.version.map(|v| v.number),
+                    parent_id: page.parent_id,
+                },
+            })
+        })
+    }
+
+    fn update_content<'a>(
+        &'a self,
+        id: &'a str,
+        body_adf: &'a AdfDocument,
+        title: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            // Fetch current page to get version number and title.
+            let current = self.get_content(id).await?;
+            let current_version = match &current.metadata {
+                ContentMetadata::Confluence { version, .. } => version.unwrap_or(1),
+                ContentMetadata::Jira { .. } => 1,
+            };
+            let current_title = current.title;
+
+            let adf_json =
+                serde_json::to_string(body_adf).context("Failed to serialize ADF document")?;
+
+            debug!(
+                page_id = id,
+                version = current_version + 1,
+                adf_bytes = adf_json.len(),
+                "Updating Confluence page"
+            );
+            if tracing::enabled!(tracing::Level::TRACE) {
+                let pretty = serde_json::to_string_pretty(body_adf)
+                    .unwrap_or_else(|e| format!("<serialization error: {e}>"));
+                tracing::trace!("ADF body for update:\n{pretty}");
+            }
+
+            let update = ConfluenceUpdateRequest {
+                id: id.to_string(),
+                status: "current".to_string(),
+                title: title.unwrap_or(&current_title).to_string(),
+                body: ConfluenceUpdateBody {
+                    representation: "atlas_doc_format".to_string(),
+                    value: adf_json,
+                },
+                version: ConfluenceUpdateVersion {
+                    number: current_version + 1,
+                    message: None,
+                },
+            };
+
+            let url = format!("{}/wiki/api/v2/pages/{}", self.client.instance_url(), id);
+
+            let response = self
+                .client
+                .put_json(&url, &update)
+                .await
+                .context("Failed to update Confluence page")?;
+
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+            }
+
+            Ok(())
+        })
+    }
+
+    fn verify_auth<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+        // Reuse the JIRA /myself endpoint — same Atlassian Cloud instance.
+        Box::pin(async move {
+            let user = self.client.get_myself().await?;
+            Ok(user.display_name)
+        })
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "confluence"
+    }
+}
+
+impl ConfluenceApi {
+    /// Resolves a space ID to a space key via the Confluence API.
+    async fn resolve_space_key(&self, space_id: &str) -> Result<String> {
+        let url = format!(
+            "{}/wiki/api/v2/spaces/{}",
+            self.client.instance_url(),
+            space_id
+        );
+
+        let response = self
+            .client
+            .get_json(&url)
+            .await
+            .context("Failed to fetch Confluence space")?;
+
+        if !response.status().is_success() {
+            // Fall back to using the space ID as key if lookup fails.
+            return Ok(space_id.to_string());
+        }
+
+        let space: ConfluenceSpaceResponse = response
+            .json()
+            .await
+            .context("Failed to parse Confluence space response")?;
+
+        Ok(space.key)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confluence_api_backend_name() {
+        let client =
+            AtlassianClient::new("https://org.atlassian.net", "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        assert_eq!(api.backend_name(), "confluence");
+    }
+
+    #[test]
+    fn confluence_page_response_deserialization() {
+        let json = r#"{
+            "id": "12345",
+            "title": "Test Page",
+            "status": "current",
+            "spaceId": "98765",
+            "version": {"number": 3},
+            "body": {
+                "atlas_doc_format": {
+                    "value": "{\"version\":1,\"type\":\"doc\",\"content\":[]}"
+                }
+            },
+            "parentId": "11111"
+        }"#;
+        let page: ConfluencePageResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(page.id, "12345");
+        assert_eq!(page.title, "Test Page");
+        assert_eq!(page.status, "current");
+        assert_eq!(page.space_id, "98765");
+        assert_eq!(page.version.unwrap().number, 3);
+        assert_eq!(page.parent_id.as_deref(), Some("11111"));
+
+        let body = page.body.unwrap();
+        let atlas_doc = body.atlas_doc_format.unwrap();
+        let adf: serde_json::Value = serde_json::from_str(&atlas_doc.value).unwrap();
+        assert_eq!(adf["version"], 1);
+        assert_eq!(adf["type"], "doc");
+    }
+
+    #[test]
+    fn confluence_page_response_minimal() {
+        let json = r#"{
+            "id": "99",
+            "title": "Minimal",
+            "status": "draft",
+            "spaceId": "1"
+        }"#;
+        let page: ConfluencePageResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(page.id, "99");
+        assert!(page.version.is_none());
+        assert!(page.body.is_none());
+        assert!(page.parent_id.is_none());
+    }
+
+    #[test]
+    fn confluence_update_request_serialization() {
+        let req = ConfluenceUpdateRequest {
+            id: "12345".to_string(),
+            status: "current".to_string(),
+            title: "Updated Title".to_string(),
+            body: ConfluenceUpdateBody {
+                representation: "atlas_doc_format".to_string(),
+                value: r#"{"version":1,"type":"doc","content":[]}"#.to_string(),
+            },
+            version: ConfluenceUpdateVersion {
+                number: 4,
+                message: None,
+            },
+        };
+
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["id"], "12345");
+        assert_eq!(json["status"], "current");
+        assert_eq!(json["title"], "Updated Title");
+        assert_eq!(json["body"]["representation"], "atlas_doc_format");
+        assert_eq!(json["version"]["number"], 4);
+    }
+
+    #[test]
+    fn confluence_update_version_with_message() {
+        let req = ConfluenceUpdateRequest {
+            id: "1".to_string(),
+            status: "current".to_string(),
+            title: "T".to_string(),
+            body: ConfluenceUpdateBody {
+                representation: "atlas_doc_format".to_string(),
+                value: "{}".to_string(),
+            },
+            version: ConfluenceUpdateVersion {
+                number: 2,
+                message: Some("Updated via API".to_string()),
+            },
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["version"]["message"], "Updated via API");
+    }
+
+    #[test]
+    fn confluence_space_response_deserialization() {
+        let json = r#"{"key": "ENG"}"#;
+        let space: ConfluenceSpaceResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(space.key, "ENG");
+    }
+
+    /// Helper to set up a wiremock server with the Confluence page and space endpoints.
+    async fn setup_confluence_mock() -> (wiremock::MockServer, ConfluenceApi) {
+        let server = wiremock::MockServer::start().await;
+
+        let page_json = serde_json::json!({
+            "id": "12345",
+            "title": "Test Page",
+            "status": "current",
+            "spaceId": "98765",
+            "version": {"number": 3},
+            "body": {
+                "atlas_doc_format": {
+                    "value": "{\"version\":1,\"type\":\"doc\",\"content\":[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"Hello\"}]}]}"
+                }
+            },
+            "parentId": "11111"
+        });
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12345"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&page_json))
+            .mount(&server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/98765"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"key": "ENG"})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+
+        (server, api)
+    }
+
+    #[tokio::test]
+    async fn get_content_success() {
+        use crate::atlassian::api::{AtlassianApi, ContentMetadata};
+
+        let (_server, api) = setup_confluence_mock().await;
+        let item = api.get_content("12345").await.unwrap();
+
+        assert_eq!(item.id, "12345");
+        assert_eq!(item.title, "Test Page");
+        assert!(item.body_adf.is_some());
+        match &item.metadata {
+            ContentMetadata::Confluence {
+                space_key,
+                status,
+                version,
+                parent_id,
+            } => {
+                assert_eq!(space_key, "ENG");
+                assert_eq!(status.as_deref(), Some("current"));
+                assert_eq!(*version, Some(3));
+                assert_eq!(parent_id.as_deref(), Some("11111"));
+            }
+            ContentMetadata::Jira { .. } => panic!("Expected Confluence metadata"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_content_api_error() {
+        use crate::atlassian::api::AtlassianApi;
+
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/99999"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = api.get_content("99999").await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn get_content_no_body() {
+        use crate::atlassian::api::AtlassianApi;
+
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/55555"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "55555",
+                    "title": "No Body",
+                    "status": "draft",
+                    "spaceId": "11111"
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/11111"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"key": "DEV"})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let item = api.get_content("55555").await.unwrap();
+        assert!(item.body_adf.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_content_success() {
+        use crate::atlassian::api::AtlassianApi;
+
+        let (server, api) = setup_confluence_mock().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12345"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let adf = AdfDocument::new();
+        let result = api.update_content("12345", &adf, Some("New Title")).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn update_content_api_error() {
+        use crate::atlassian::api::AtlassianApi;
+
+        let (server, api) = setup_confluence_mock().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12345"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        let adf = AdfDocument::new();
+        let err = api.update_content("12345", &adf, None).await.unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn verify_auth_success() {
+        use crate::atlassian::api::AtlassianApi;
+
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/myself"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "displayName": "Alice",
+                    "accountId": "abc123"
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let name = api.verify_auth().await.unwrap();
+        assert_eq!(name, "Alice");
+    }
+
+    #[tokio::test]
+    async fn resolve_space_key_fallback_on_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/unknown"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let key = api.resolve_space_key("unknown").await.unwrap();
+        // Falls back to the space ID when lookup fails
+        assert_eq!(key, "unknown");
+    }
+}
