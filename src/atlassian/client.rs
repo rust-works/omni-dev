@@ -88,6 +88,19 @@ pub struct JiraSearchResult {
     pub total: u32,
 }
 
+/// A JIRA issue comment.
+#[derive(Debug, Clone)]
+pub struct JiraComment {
+    /// Comment ID.
+    pub id: String,
+    /// Author display name.
+    pub author: String,
+    /// Comment body as raw ADF JSON.
+    pub body_adf: Option<serde_json::Value>,
+    /// ISO 8601 creation timestamp.
+    pub created: String,
+}
+
 /// A JIRA workflow transition.
 #[derive(Debug, Clone)]
 pub struct JiraTransition {
@@ -143,6 +156,25 @@ struct JiraTransitionsResponse {
 struct JiraTransitionEntry {
     id: String,
     name: String,
+}
+
+#[derive(Deserialize)]
+struct JiraCommentsResponse {
+    comments: Vec<JiraCommentEntry>,
+}
+
+#[derive(Deserialize)]
+struct JiraCommentEntry {
+    id: String,
+    author: Option<JiraCommentAuthor>,
+    body: Option<serde_json::Value>,
+    created: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct JiraCommentAuthor {
+    #[serde(rename = "displayName")]
+    display_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -687,6 +719,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_comments_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1/comment"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "comments": [
+                        {
+                            "id": "100",
+                            "author": {"displayName": "Alice"},
+                            "body": {"version": 1, "type": "doc", "content": []},
+                            "created": "2026-04-01T10:00:00.000+0000"
+                        },
+                        {
+                            "id": "101",
+                            "author": {"displayName": "Bob"},
+                            "body": null,
+                            "created": "2026-04-02T14:00:00.000+0000"
+                        }
+                    ]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let comments = client.get_comments("PROJ-1").await.unwrap();
+
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].id, "100");
+        assert_eq!(comments[0].author, "Alice");
+        assert!(comments[0].body_adf.is_some());
+        assert!(comments[0].created.contains("2026-04-01"));
+        assert_eq!(comments[1].id, "101");
+        assert_eq!(comments[1].author, "Bob");
+        assert!(comments[1].body_adf.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_comments_empty() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1/comment"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"comments": []})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let comments = client.get_comments("PROJ-1").await.unwrap();
+        assert!(comments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_comments_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/NOPE-1/comment"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.get_comments("NOPE-1").await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn add_comment_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1/comment"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(201).set_body_json(
+                    serde_json::json!({"id": "200", "author": {"displayName": "Me"}}),
+                ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let adf = AdfDocument::new();
+        let result = client.add_comment("PROJ-1", &adf).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn add_comment_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1/comment"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let adf = AdfDocument::new();
+        let err = client.add_comment("PROJ-1", &adf).await.unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
     async fn get_transitions_success() {
         let server = wiremock::MockServer::start().await;
 
@@ -1064,6 +1210,57 @@ impl AtlassianClient {
             id: create_response.id,
             self_url: create_response.self_url,
         })
+    }
+
+    /// Lists comments on a JIRA issue.
+    pub async fn get_comments(&self, key: &str) -> Result<Vec<JiraComment>> {
+        let url = format!(
+            "{}/rest/api/3/issue/{}/comment?orderBy=created",
+            self.instance_url, key
+        );
+
+        let response = self.get_json(&url).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let resp: JiraCommentsResponse = response
+            .json()
+            .await
+            .context("Failed to parse comments response")?;
+
+        Ok(resp
+            .comments
+            .into_iter()
+            .map(|c| JiraComment {
+                id: c.id,
+                author: c.author.and_then(|a| a.display_name).unwrap_or_default(),
+                body_adf: c.body,
+                created: c.created.unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    /// Adds a comment to a JIRA issue.
+    pub async fn add_comment(&self, key: &str, body_adf: &AdfDocument) -> Result<()> {
+        let url = format!("{}/rest/api/3/issue/{}/comment", self.instance_url, key);
+
+        let body = serde_json::json!({
+            "body": body_adf
+        });
+
+        let response = self.post_json(&url, &body).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        Ok(())
     }
 
     /// Lists available transitions for a JIRA issue.
