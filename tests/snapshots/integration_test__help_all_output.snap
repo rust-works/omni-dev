@@ -363,10 +363,58 @@ Commands:
   delete      Deletes a JIRA issue
   project     Lists JIRA projects
   field       Manages JIRA field definitions and options
+  board       Manages JIRA agile boards
   help        Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian jira board - Manages JIRA agile boards
+
+Manages JIRA agile boards
+
+Usage: board <COMMAND>
+
+Commands:
+  list    Lists agile boards
+  issues  Lists issues on a board
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian jira board issues - Lists issues on a board
+
+Lists issues on a board
+
+Usage: issues [OPTIONS] --board-id <BOARD_ID>
+
+Options:
+      --board-id <BOARD_ID>        Board ID
+      --jql <JQL>                  JQL filter for issues
+      --max-results <MAX_RESULTS>  Maximum number of results (default: 50) [default: 50]
+  -h, --help                       Print help
+
+
+================================================================================
+
+omni-dev atlassian jira board list - Lists agile boards
+
+Lists agile boards
+
+Usage: list [OPTIONS]
+
+Options:
+      --project <PROJECT>          Filter by project key
+      --type <TYPE>                Filter by board type (scrum or kanban)
+      --max-results <MAX_RESULTS>  Maximum number of results (default: 50) [default: 50]
+  -h, --help                       Print help
 
 
 ================================================================================

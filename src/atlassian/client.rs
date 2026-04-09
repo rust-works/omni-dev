@@ -167,6 +167,28 @@ pub struct JiraFieldOption {
     pub value: String,
 }
 
+/// A JIRA agile board.
+#[derive(Debug, Clone)]
+pub struct AgileBoard {
+    /// Board ID.
+    pub id: u64,
+    /// Board name.
+    pub name: String,
+    /// Board type (e.g., "scrum", "kanban").
+    pub board_type: String,
+    /// Project key associated with the board, if available.
+    pub project_key: Option<String>,
+}
+
+/// Result from listing agile boards.
+#[derive(Debug, Clone)]
+pub struct AgileBoardList {
+    /// Boards returned.
+    pub boards: Vec<AgileBoard>,
+    /// Total number of boards.
+    pub total: u32,
+}
+
 /// A JIRA workflow transition.
 #[derive(Debug, Clone)]
 pub struct JiraTransition {
@@ -261,6 +283,37 @@ struct ConfluenceContentSearchEntry {
 #[derive(Deserialize)]
 struct ConfluenceExpandable {
     space: Option<String>,
+}
+
+// ── Agile API response structs ─────────────────────────────────────
+
+#[derive(Deserialize)]
+struct AgileBoardListResponse {
+    values: Vec<AgileBoardEntry>,
+    #[serde(default)]
+    total: u32,
+}
+
+#[derive(Deserialize)]
+struct AgileBoardEntry {
+    id: u64,
+    name: String,
+    #[serde(rename = "type")]
+    board_type: String,
+    location: Option<AgileBoardLocation>,
+}
+
+#[derive(Deserialize)]
+struct AgileBoardLocation {
+    #[serde(rename = "projectKey")]
+    project_key: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AgileIssueListResponse {
+    issues: Vec<JiraIssueResponse>,
+    #[serde(default)]
+    total: u32,
 }
 
 #[derive(Deserialize)]
@@ -1176,6 +1229,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_boards_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/board"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({
+                    "values": [
+                        {"id": 1, "name": "PROJ Board", "type": "scrum", "location": {"projectKey": "PROJ"}},
+                        {"id": 2, "name": "Kanban", "type": "kanban"}
+                    ],
+                    "total": 2
+                }),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.get_boards(None, None, 50).await.unwrap();
+
+        assert_eq!(result.total, 2);
+        assert_eq!(result.boards.len(), 2);
+        assert_eq!(result.boards[0].id, 1);
+        assert_eq!(result.boards[0].name, "PROJ Board");
+        assert_eq!(result.boards[0].board_type, "scrum");
+        assert_eq!(result.boards[0].project_key.as_deref(), Some("PROJ"));
+        assert!(result.boards[1].project_key.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_boards_with_filters() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/board"))
+            .and(wiremock::matchers::query_param("projectKeyOrId", "PROJ"))
+            .and(wiremock::matchers::query_param("type", "scrum"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({
+                    "values": [{"id": 1, "name": "PROJ Board", "type": "scrum", "location": {"projectKey": "PROJ"}}],
+                    "total": 1
+                }),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client
+            .get_boards(Some("PROJ"), Some("scrum"), 50)
+            .await
+            .unwrap();
+
+        assert_eq!(result.boards.len(), 1);
+        assert_eq!(result.boards[0].project_key.as_deref(), Some("PROJ"));
+    }
+
+    #[tokio::test]
+    async fn get_boards_empty() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/board"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"values": [], "total": 0})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.get_boards(None, None, 50).await.unwrap();
+        assert!(result.boards.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_boards_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/board"))
+            .respond_with(wiremock::ResponseTemplate::new(401).set_body_string("Unauthorized"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.get_boards(None, None, 50).await.unwrap_err();
+        assert!(err.to_string().contains("401"));
+    }
+
+    #[tokio::test]
+    async fn get_board_issues_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/board/1/issue"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issues": [{
+                        "key": "PROJ-1",
+                        "fields": {
+                            "summary": "Board issue",
+                            "description": null,
+                            "status": {"name": "Open"},
+                            "issuetype": {"name": "Task"},
+                            "assignee": null,
+                            "priority": null,
+                            "labels": []
+                        }
+                    }],
+                    "total": 1
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.get_board_issues(1, None, 50).await.unwrap();
+
+        assert_eq!(result.total, 1);
+        assert_eq!(result.issues[0].key, "PROJ-1");
+        assert_eq!(result.issues[0].summary, "Board issue");
+    }
+
+    #[tokio::test]
+    async fn get_board_issues_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/board/999/issue"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.get_board_issues(999, None, 50).await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
     async fn get_fields_success() {
         let server = wiremock::MockServer::start().await;
 
@@ -1893,6 +2091,107 @@ impl AtlassianClient {
         Ok(ConfluenceSearchResults {
             results,
             total: resp.size,
+        })
+    }
+
+    /// Lists agile boards.
+    pub async fn get_boards(
+        &self,
+        project: Option<&str>,
+        board_type: Option<&str>,
+        max_results: u32,
+    ) -> Result<AgileBoardList> {
+        let mut url = format!(
+            "{}/rest/agile/1.0/board?maxResults={}",
+            self.instance_url, max_results
+        );
+        if let Some(proj) = project {
+            url.push_str(&format!("&projectKeyOrId={proj}"));
+        }
+        if let Some(bt) = board_type {
+            url.push_str(&format!("&type={bt}"));
+        }
+
+        let response = self.get_json(&url).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let resp: AgileBoardListResponse = response
+            .json()
+            .await
+            .context("Failed to parse board list response")?;
+
+        let boards = resp
+            .values
+            .into_iter()
+            .map(|b| AgileBoard {
+                id: b.id,
+                name: b.name,
+                board_type: b.board_type,
+                project_key: b.location.and_then(|l| l.project_key),
+            })
+            .collect();
+
+        Ok(AgileBoardList {
+            boards,
+            total: resp.total,
+        })
+    }
+
+    /// Lists issues on an agile board.
+    pub async fn get_board_issues(
+        &self,
+        board_id: u64,
+        jql: Option<&str>,
+        max_results: u32,
+    ) -> Result<JiraSearchResult> {
+        let base = format!(
+            "{}/rest/agile/1.0/board/{}/issue",
+            self.instance_url, board_id
+        );
+        let mut params: Vec<(&str, String)> = vec![("maxResults", max_results.to_string())];
+        if let Some(jql_str) = jql {
+            params.push(("jql", jql_str.to_string()));
+        }
+        let url =
+            reqwest::Url::parse_with_params(&base, params.iter().map(|(k, v)| (*k, v.as_str())))
+                .context("Failed to build board issues URL")?;
+
+        let response = self.get_json(url.as_str()).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let resp: AgileIssueListResponse = response
+            .json()
+            .await
+            .context("Failed to parse board issues response")?;
+
+        let issues = resp
+            .issues
+            .into_iter()
+            .map(|r| JiraIssue {
+                key: r.key,
+                summary: r.fields.summary.unwrap_or_default(),
+                description_adf: r.fields.description,
+                status: r.fields.status.and_then(|s| s.name),
+                issue_type: r.fields.issuetype.and_then(|t| t.name),
+                assignee: r.fields.assignee.and_then(|a| a.display_name),
+                priority: r.fields.priority.and_then(|p| p.name),
+                labels: r.fields.labels,
+            })
+            .collect();
+
+        Ok(JiraSearchResult {
+            issues,
+            total: resp.total,
         })
     }
 
