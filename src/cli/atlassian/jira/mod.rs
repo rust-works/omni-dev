@@ -2,6 +2,7 @@
 
 pub(crate) mod comment;
 pub(crate) mod create;
+pub(crate) mod delete;
 pub(crate) mod edit;
 pub(crate) mod read;
 pub(crate) mod search;
@@ -36,6 +37,8 @@ pub enum JiraSubcommands {
     Transition(transition::TransitionCommand),
     /// Manages comments on a JIRA issue.
     Comment(comment::CommentCommand),
+    /// Deletes a JIRA issue.
+    Delete(delete::DeleteCommand),
 }
 
 impl JiraCommand {
@@ -49,6 +52,7 @@ impl JiraCommand {
             JiraSubcommands::Create(cmd) => cmd.execute().await,
             JiraSubcommands::Transition(cmd) => cmd.execute().await,
             JiraSubcommands::Comment(cmd) => cmd.execute().await,
+            JiraSubcommands::Delete(cmd) => cmd.execute().await,
         }
     }
 }
@@ -145,5 +149,16 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Comment(_)));
+    }
+
+    #[test]
+    fn jira_subcommands_delete_variant() {
+        let cmd = JiraCommand {
+            command: JiraSubcommands::Delete(delete::DeleteCommand {
+                key: "PROJ-1".to_string(),
+                force: true,
+            }),
+        };
+        assert!(matches!(cmd.command, JiraSubcommands::Delete(_)));
     }
 }
