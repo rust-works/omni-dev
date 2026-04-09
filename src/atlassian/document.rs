@@ -89,7 +89,8 @@ pub struct ConfluenceFrontmatter {
     /// Atlassian instance base URL.
     pub instance: String,
 
-    /// Confluence page ID.
+    /// Confluence page ID. Empty when creating a new page.
+    #[serde(default)]
     pub page_id: String,
 
     /// Page title.

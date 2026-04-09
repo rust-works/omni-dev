@@ -65,6 +65,34 @@ struct ConfluenceSpaceResponse {
     key: String,
 }
 
+#[derive(Deserialize)]
+struct ConfluenceSpacesSearchResponse {
+    results: Vec<ConfluenceSpaceSearchEntry>,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceSpaceSearchEntry {
+    id: String,
+}
+
+// ── Create request ─────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct ConfluenceCreateRequest {
+    #[serde(rename = "spaceId")]
+    space_id: String,
+    title: String,
+    body: ConfluenceUpdateBody,
+    #[serde(rename = "parentId", skip_serializing_if = "Option::is_none")]
+    parent_id: Option<String>,
+    status: String,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceCreateResponse {
+    id: String,
+}
+
 // ── Update request ──────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -238,6 +266,83 @@ impl AtlassianApi for ConfluenceApi {
 }
 
 impl ConfluenceApi {
+    /// Resolves a space key to a space ID via the Confluence API.
+    pub async fn resolve_space_id(&self, space_key: &str) -> Result<String> {
+        let url = format!(
+            "{}/wiki/api/v2/spaces?keys={}",
+            self.client.instance_url(),
+            space_key
+        );
+
+        let response = self
+            .client
+            .get_json(&url)
+            .await
+            .context("Failed to search Confluence spaces")?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let resp: ConfluenceSpacesSearchResponse = response
+            .json()
+            .await
+            .context("Failed to parse Confluence spaces response")?;
+
+        resp.results
+            .first()
+            .map(|s| s.id.clone())
+            .ok_or_else(|| anyhow::anyhow!("Space with key \"{space_key}\" not found"))
+    }
+
+    /// Creates a new Confluence page.
+    pub async fn create_page(
+        &self,
+        space_key: &str,
+        title: &str,
+        body_adf: &AdfDocument,
+        parent_id: Option<&str>,
+    ) -> Result<String> {
+        let space_id = self.resolve_space_id(space_key).await?;
+
+        let adf_json =
+            serde_json::to_string(body_adf).context("Failed to serialize ADF document")?;
+
+        let request = ConfluenceCreateRequest {
+            space_id,
+            title: title.to_string(),
+            body: ConfluenceUpdateBody {
+                representation: "atlas_doc_format".to_string(),
+                value: adf_json,
+            },
+            parent_id: parent_id.map(String::from),
+            status: "current".to_string(),
+        };
+
+        let url = format!("{}/wiki/api/v2/pages", self.client.instance_url());
+
+        let response = self
+            .client
+            .post_json(&url, &request)
+            .await
+            .context("Failed to create Confluence page")?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let resp: ConfluenceCreateResponse = response
+            .json()
+            .await
+            .context("Failed to parse Confluence create response")?;
+
+        Ok(resp.id)
+    }
+
     /// Resolves a space ID to a space key via the Confluence API.
     async fn resolve_space_key(&self, space_id: &str) -> Result<String> {
         let url = format!(
@@ -546,6 +651,155 @@ mod tests {
         let api = ConfluenceApi::new(client);
         let name = api.verify_auth().await.unwrap();
         assert_eq!(name, "Alice");
+    }
+
+    #[tokio::test]
+    async fn resolve_space_id_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": [{"id": "98765"}]})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let id = api.resolve_space_id("ENG").await.unwrap();
+        assert_eq!(id, "98765");
+    }
+
+    #[tokio::test]
+    async fn resolve_space_id_not_found() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = api.resolve_space_id("NOPE").await.unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn resolve_space_id_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = api.resolve_space_id("ENG").await.unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn create_page_success() {
+        let server = wiremock::MockServer::start().await;
+
+        // Space lookup
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": [{"id": "98765"}]})),
+            )
+            .mount(&server)
+            .await;
+
+        // Create page
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "54321"})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let adf = AdfDocument::new();
+        let id = api
+            .create_page("ENG", "New Page", &adf, None)
+            .await
+            .unwrap();
+        assert_eq!(id, "54321");
+    }
+
+    #[tokio::test]
+    async fn create_page_with_parent() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": [{"id": "98765"}]})),
+            )
+            .mount(&server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "54322"})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let adf = AdfDocument::new();
+        let id = api
+            .create_page("ENG", "Child Page", &adf, Some("11111"))
+            .await
+            .unwrap();
+        assert_eq!(id, "54322");
+    }
+
+    #[tokio::test]
+    async fn create_page_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": [{"id": "98765"}]})),
+            )
+            .mount(&server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages"))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("Bad Request"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let adf = AdfDocument::new();
+        let err = api
+            .create_page("ENG", "Fail", &adf, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("400"));
     }
 
     #[tokio::test]
