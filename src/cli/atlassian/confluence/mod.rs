@@ -1,5 +1,6 @@
 //! Confluence CLI subcommands.
 
+pub(crate) mod create;
 pub(crate) mod edit;
 pub(crate) mod read;
 pub(crate) mod search;
@@ -27,6 +28,8 @@ pub enum ConfluenceSubcommands {
     Edit(edit::EditCommand),
     /// Searches Confluence pages using CQL.
     Search(search::SearchCommand),
+    /// Creates a new Confluence page.
+    Create(create::CreateCommand),
 }
 
 impl ConfluenceCommand {
@@ -37,6 +40,7 @@ impl ConfluenceCommand {
             ConfluenceSubcommands::Write(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Edit(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Search(cmd) => cmd.execute().await,
+            ConfluenceSubcommands::Create(cmd) => cmd.execute().await,
         }
     }
 }
@@ -93,5 +97,20 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::Search(_)));
+    }
+
+    #[test]
+    fn confluence_subcommands_create_variant() {
+        let cmd = ConfluenceCommand {
+            command: ConfluenceSubcommands::Create(create::CreateCommand {
+                file: None,
+                format: ContentFormat::Jfm,
+                space: Some("ENG".to_string()),
+                title: Some("Test".to_string()),
+                parent: None,
+                dry_run: false,
+            }),
+        };
+        assert!(matches!(cmd.command, ConfluenceSubcommands::Create(_)));
     }
 }
