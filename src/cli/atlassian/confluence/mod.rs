@@ -2,6 +2,7 @@
 
 pub(crate) mod edit;
 pub(crate) mod read;
+pub(crate) mod search;
 pub(crate) mod write;
 
 use anyhow::Result;
@@ -24,6 +25,8 @@ pub enum ConfluenceSubcommands {
     Write(write::WriteCommand),
     /// Interactive fetch-edit-push cycle for a Confluence page.
     Edit(edit::EditCommand),
+    /// Searches Confluence pages using CQL.
+    Search(search::SearchCommand),
 }
 
 impl ConfluenceCommand {
@@ -33,6 +36,7 @@ impl ConfluenceCommand {
             ConfluenceSubcommands::Read(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Write(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Edit(cmd) => cmd.execute().await,
+            ConfluenceSubcommands::Search(cmd) => cmd.execute().await,
         }
     }
 }
@@ -76,5 +80,18 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::Edit(_)));
+    }
+
+    #[test]
+    fn confluence_subcommands_search_variant() {
+        let cmd = ConfluenceCommand {
+            command: ConfluenceSubcommands::Search(search::SearchCommand {
+                cql: Some("space = ENG".to_string()),
+                space: None,
+                title: None,
+                max_results: 25,
+            }),
+        };
+        assert!(matches!(cmd.command, ConfluenceSubcommands::Search(_)));
     }
 }

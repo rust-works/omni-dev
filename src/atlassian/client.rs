@@ -88,6 +88,26 @@ pub struct JiraSearchResult {
     pub total: u32,
 }
 
+/// A Confluence search result.
+#[derive(Debug, Clone)]
+pub struct ConfluenceSearchResult {
+    /// Page ID.
+    pub id: String,
+    /// Page title.
+    pub title: String,
+    /// Space key (e.g., "ENG").
+    pub space_key: String,
+}
+
+/// Result from a Confluence CQL search.
+#[derive(Debug, Clone)]
+pub struct ConfluenceSearchResults {
+    /// Matching pages.
+    pub results: Vec<ConfluenceSearchResult>,
+    /// Total number of matching results.
+    pub total: u32,
+}
+
 /// A JIRA issue comment.
 #[derive(Debug, Clone)]
 pub struct JiraComment {
@@ -175,6 +195,26 @@ struct JiraCommentEntry {
 struct JiraCommentAuthor {
     #[serde(rename = "displayName")]
     display_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceContentSearchResponse {
+    results: Vec<ConfluenceContentSearchEntry>,
+    #[serde(default)]
+    size: u32,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceContentSearchEntry {
+    id: String,
+    title: String,
+    #[serde(rename = "_expandable")]
+    expandable: Option<ConfluenceExpandable>,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceExpandable {
+    space: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -941,6 +981,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_confluence_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/content/search"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {
+                            "id": "12345",
+                            "title": "Architecture Overview",
+                            "_expandable": {"space": "/wiki/rest/api/space/ENG"}
+                        },
+                        {
+                            "id": "67890",
+                            "title": "Getting Started",
+                            "_expandable": {"space": "/wiki/rest/api/space/DOC"}
+                        }
+                    ],
+                    "size": 2
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.search_confluence("type = page", 25).await.unwrap();
+
+        assert_eq!(result.total, 2);
+        assert_eq!(result.results.len(), 2);
+        assert_eq!(result.results[0].id, "12345");
+        assert_eq!(result.results[0].title, "Architecture Overview");
+        assert_eq!(result.results[0].space_key, "ENG");
+        assert_eq!(result.results[1].space_key, "DOC");
+    }
+
+    #[tokio::test]
+    async fn search_confluence_empty() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/content/search"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": [], "size": 0})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client
+            .search_confluence("title = \"Nonexistent\"", 25)
+            .await
+            .unwrap();
+        assert_eq!(result.total, 0);
+        assert!(result.results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_confluence_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/content/search"))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("Invalid CQL"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .search_confluence("bad cql !!!", 25)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("400"));
+    }
+
+    #[tokio::test]
+    async fn search_confluence_missing_space() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/content/search"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{"id": "111", "title": "No Space"}],
+                    "size": 1
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.search_confluence("type = page", 10).await.unwrap();
+        assert_eq!(result.results[0].space_key, "");
+    }
+
+    #[tokio::test]
     async fn delete_issue_success() {
         let server = wiremock::MockServer::start().await;
 
@@ -1401,6 +1542,59 @@ impl AtlassianClient {
         Ok(JiraSearchResult {
             issues,
             total: search_response.total,
+        })
+    }
+
+    /// Searches Confluence pages using CQL.
+    pub async fn search_confluence(
+        &self,
+        cql: &str,
+        limit: u32,
+    ) -> Result<ConfluenceSearchResults> {
+        let base = format!("{}/wiki/rest/api/content/search", self.instance_url);
+        let url = reqwest::Url::parse_with_params(
+            &base,
+            &[
+                ("cql", cql),
+                ("limit", &limit.to_string()),
+                ("expand", "space"),
+            ],
+        )
+        .context("Failed to build Confluence search URL")?;
+
+        let response = self.get_json(url.as_str()).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let resp: ConfluenceContentSearchResponse = response
+            .json()
+            .await
+            .context("Failed to parse Confluence search response")?;
+
+        let results = resp
+            .results
+            .into_iter()
+            .map(|r| {
+                let space_key = r
+                    .expandable
+                    .and_then(|e| e.space)
+                    .and_then(|s| s.rsplit('/').next().map(String::from))
+                    .unwrap_or_default();
+                ConfluenceSearchResult {
+                    id: r.id,
+                    title: r.title,
+                    space_key,
+                }
+            })
+            .collect();
+
+        Ok(ConfluenceSearchResults {
+            results,
+            total: resp.size,
         })
     }
 
