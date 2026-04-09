@@ -48,12 +48,13 @@ Required. Must be one of:
 
 Required. Use scopes defined in `.omni-dev/scopes.yaml`:
 
+- `atlassian` - Atlassian JIRA/Confluence integration and API client
 - `ci` - CI/CD pipelines and GitHub Actions workflows
 - `claude` - Claude AI client implementation and integration
 - `cli` - Command-line interface and argument parsing
-- `git` - Git operations and repository analysis
 - `data` - Data structures and serialization
 - `docs` - Documentation and planning
+- `git` - Git operations and repository analysis
 - `release` - Release process, versioning, and publishing
 - `scopes` - Commit scope definitions and configuration
 - `workflows` - GitHub Actions workflow files

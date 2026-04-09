@@ -7,6 +7,10 @@ scopes:
     description: "Claude AI client implementation and integration"
     examples: ["claude: add contextual prompting", "claude: fix API error handling"]
     file_patterns: ["src/claude/**", "src/data/context.rs"]
+  - name: "atlassian"
+    description: "Atlassian JIRA/Confluence integration and API client"
+    examples: ["atlassian: add post_json to AtlassianClient", "atlassian: implement jira search"]
+    file_patterns: ["src/atlassian/**", "src/cli/atlassian/**"]
   - name: "cli"
     description: "Command-line interface and argument parsing"
     examples: ["cli: add twiddle contextual options", "cli: improve help text"]
