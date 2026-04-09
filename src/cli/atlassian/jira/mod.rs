@@ -4,6 +4,7 @@ pub(crate) mod create;
 pub(crate) mod edit;
 pub(crate) mod read;
 pub(crate) mod search;
+pub(crate) mod transition;
 pub(crate) mod write;
 
 use anyhow::Result;
@@ -30,6 +31,8 @@ pub enum JiraSubcommands {
     Search(search::SearchCommand),
     /// Creates a new JIRA issue.
     Create(create::CreateCommand),
+    /// Lists or executes workflow transitions on a JIRA issue.
+    Transition(transition::TransitionCommand),
 }
 
 impl JiraCommand {
@@ -41,6 +44,7 @@ impl JiraCommand {
             JiraSubcommands::Edit(cmd) => cmd.execute().await,
             JiraSubcommands::Search(cmd) => cmd.execute().await,
             JiraSubcommands::Create(cmd) => cmd.execute().await,
+            JiraSubcommands::Transition(cmd) => cmd.execute().await,
         }
     }
 }
@@ -113,5 +117,17 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Search(_)));
+    }
+
+    #[test]
+    fn jira_subcommands_transition_variant() {
+        let cmd = JiraCommand {
+            command: JiraSubcommands::Transition(transition::TransitionCommand {
+                key: "PROJ-1".to_string(),
+                transition: Some("Done".to_string()),
+                list: false,
+            }),
+        };
+        assert!(matches!(cmd.command, JiraSubcommands::Transition(_)));
     }
 }

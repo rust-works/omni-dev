@@ -298,12 +298,13 @@ JIRA operations (read, write, edit issues)
 Usage: jira <COMMAND>
 
 Commands:
-  read    Fetches a JIRA issue and outputs it as JFM markdown or ADF JSON
-  write   Pushes content to a JIRA issue
-  edit    Interactive fetch-edit-push cycle for a JIRA issue
-  search  Searches JIRA issues using JQL
-  create  Creates a new JIRA issue
-  help    Print this message or the help of the given subcommand(s)
+  read        Fetches a JIRA issue and outputs it as JFM markdown or ADF JSON
+  write       Pushes content to a JIRA issue
+  edit        Interactive fetch-edit-push cycle for a JIRA issue
+  search      Searches JIRA issues using JQL
+  create      Creates a new JIRA issue
+  transition  Lists or executes workflow transitions on a JIRA issue
+  help        Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
@@ -376,6 +377,23 @@ Options:
       --status <STATUS>            Filter by status name
       --max-results <MAX_RESULTS>  Maximum number of results (default: 50) [default: 50]
   -h, --help                       Print help
+
+
+================================================================================
+
+omni-dev atlassian jira transition - Lists or executes workflow transitions on a JIRA issue
+
+Lists or executes workflow transitions on a JIRA issue
+
+Usage: transition [OPTIONS] <KEY> [TRANSITION]
+
+Arguments:
+  <KEY>         JIRA issue key (e.g., PROJ-123)
+  [TRANSITION]  Transition name or ID to execute. Omit to list available transitions
+
+Options:
+      --list  Lists available transitions (same as omitting the transition argument)
+  -h, --help  Print help
 
 
 ================================================================================
