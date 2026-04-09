@@ -366,6 +366,7 @@ Commands:
   board       Manages JIRA agile boards
   sprint      Manages JIRA agile sprints
   link        Manages JIRA issue links
+  changelog   Shows change history for JIRA issues
   help        Print this message or the help of the given subcommand(s)
 
 Options:
@@ -416,6 +417,20 @@ Options:
       --project <PROJECT>          Filter by project key
       --type <TYPE>                Filter by board type (scrum or kanban)
       --max-results <MAX_RESULTS>  Maximum number of results (default: 50) [default: 50]
+  -h, --help                       Print help
+
+
+================================================================================
+
+omni-dev atlassian jira changelog - Shows change history for JIRA issues
+
+Shows change history for JIRA issues
+
+Usage: changelog [OPTIONS] --keys <KEYS>
+
+Options:
+      --keys <KEYS>                Comma-separated issue keys (e.g., "PROJ-1,PROJ-2")
+      --max-results <MAX_RESULTS>  Maximum number of changelog entries per issue (default: 50) [default: 50]
   -h, --help                       Print help
 
 
