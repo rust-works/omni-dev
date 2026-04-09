@@ -1,5 +1,6 @@
 //! JIRA CLI subcommands.
 
+pub(crate) mod attachment;
 pub(crate) mod board;
 pub(crate) mod changelog;
 pub(crate) mod comment;
@@ -57,6 +58,8 @@ pub enum JiraSubcommands {
     Link(link::LinkCommand),
     /// Shows change history for JIRA issues.
     Changelog(changelog::ChangelogCommand),
+    /// Downloads JIRA issue attachments.
+    Attachment(attachment::AttachmentCommand),
 }
 
 impl JiraCommand {
@@ -77,6 +80,7 @@ impl JiraCommand {
             JiraSubcommands::Sprint(cmd) => cmd.execute().await,
             JiraSubcommands::Link(cmd) => cmd.execute().await,
             JiraSubcommands::Changelog(cmd) => cmd.execute().await,
+            JiraSubcommands::Attachment(cmd) => cmd.execute().await,
         }
     }
 }
@@ -255,5 +259,19 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Changelog(_)));
+    }
+
+    #[test]
+    fn jira_subcommands_attachment_variant() {
+        let cmd = JiraCommand {
+            command: JiraSubcommands::Attachment(attachment::AttachmentCommand {
+                command: attachment::AttachmentSubcommands::Download(attachment::DownloadCommand {
+                    key: "PROJ-1".to_string(),
+                    output_dir: ".".to_string(),
+                    filter: None,
+                }),
+            }),
+        };
+        assert!(matches!(cmd.command, JiraSubcommands::Attachment(_)));
     }
 }
