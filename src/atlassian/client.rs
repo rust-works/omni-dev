@@ -67,6 +67,16 @@ pub struct JiraUser {
     pub account_id: String,
 }
 
+/// Result from a JIRA JQL search.
+#[derive(Debug, Clone)]
+pub struct JiraSearchResult {
+    /// Matching issues.
+    pub issues: Vec<JiraIssue>,
+
+    /// Total number of matching issues (may exceed `issues.len()` if paginated).
+    pub total: u32,
+}
+
 // ── Internal API response structs ───────────────────────────────────
 
 #[derive(Deserialize)]
@@ -96,6 +106,12 @@ struct JiraNameField {
 struct JiraAssigneeField {
     #[serde(rename = "displayName")]
     display_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct JiraSearchResponse {
+    issues: Vec<JiraIssueResponse>,
+    total: u32,
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -472,6 +488,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_issues_success() {
+        let server = wiremock::MockServer::start().await;
+
+        let search_json = serde_json::json!({
+            "issues": [
+                {
+                    "key": "PROJ-1",
+                    "fields": {
+                        "summary": "First issue",
+                        "description": null,
+                        "status": {"name": "Open"},
+                        "issuetype": {"name": "Bug"},
+                        "assignee": {"displayName": "Alice"},
+                        "priority": {"name": "High"},
+                        "labels": []
+                    }
+                },
+                {
+                    "key": "PROJ-2",
+                    "fields": {
+                        "summary": "Second issue",
+                        "description": null,
+                        "status": {"name": "Done"},
+                        "issuetype": {"name": "Task"},
+                        "assignee": null,
+                        "priority": null,
+                        "labels": ["backend"]
+                    }
+                }
+            ],
+            "total": 2
+        });
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/search"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&search_json))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.search_issues("project = PROJ", 50).await.unwrap();
+
+        assert_eq!(result.total, 2);
+        assert_eq!(result.issues.len(), 2);
+        assert_eq!(result.issues[0].key, "PROJ-1");
+        assert_eq!(result.issues[0].summary, "First issue");
+        assert_eq!(result.issues[0].status.as_deref(), Some("Open"));
+        assert_eq!(result.issues[1].key, "PROJ-2");
+        assert!(result.issues[1].assignee.is_none());
+    }
+
+    #[tokio::test]
+    async fn search_issues_empty_results() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/search"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"issues": [], "total": 0})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.search_issues("project = NOPE", 50).await.unwrap();
+
+        assert_eq!(result.total, 0);
+        assert!(result.issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_issues_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/search"))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("Invalid JQL query"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .search_issues("invalid jql !!!", 50)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("400"));
+    }
+
+    #[tokio::test]
     async fn get_myself_success() {
         let server = wiremock::MockServer::start().await;
 
@@ -682,6 +791,53 @@ impl AtlassianClient {
         }
 
         Ok(())
+    }
+
+    /// Searches JIRA issues using JQL.
+    pub async fn search_issues(&self, jql: &str, max_results: u32) -> Result<JiraSearchResult> {
+        let url = format!("{}/rest/api/3/search", self.instance_url);
+
+        let body = serde_json::json!({
+            "jql": jql,
+            "maxResults": max_results,
+            "fields": ["summary", "status", "issuetype", "assignee", "priority"]
+        });
+
+        let response = self
+            .post_json(&url, &body)
+            .await
+            .context("Failed to send search request to JIRA API")?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let search_response: JiraSearchResponse = response
+            .json()
+            .await
+            .context("Failed to parse JIRA search response")?;
+
+        let issues = search_response
+            .issues
+            .into_iter()
+            .map(|r| JiraIssue {
+                key: r.key,
+                summary: r.fields.summary.unwrap_or_default(),
+                description_adf: r.fields.description,
+                status: r.fields.status.and_then(|s| s.name),
+                issue_type: r.fields.issuetype.and_then(|t| t.name),
+                assignee: r.fields.assignee.and_then(|a| a.display_name),
+                priority: r.fields.priority.and_then(|p| p.name),
+                labels: r.fields.labels,
+            })
+            .collect();
+
+        Ok(JiraSearchResult {
+            issues,
+            total: search_response.total,
+        })
     }
 
     /// Verifies authentication by fetching the current user.
