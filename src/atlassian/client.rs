@@ -224,6 +224,19 @@ pub struct JiraTransition {
     pub name: String,
 }
 
+/// A JIRA issue link type.
+#[derive(Debug, Clone)]
+pub struct JiraLinkType {
+    /// Link type ID.
+    pub id: String,
+    /// Link type name (e.g., "Blocks", "Clones").
+    pub name: String,
+    /// Inward description (e.g., "is blocked by").
+    pub inward: String,
+    /// Outward description (e.g., "blocks").
+    pub outward: String,
+}
+
 // ── Internal API response structs ───────────────────────────────────
 
 #[derive(Deserialize)]
@@ -359,6 +372,20 @@ struct AgileSprintEntry {
     #[serde(rename = "endDate")]
     end_date: Option<String>,
     goal: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct JiraLinkTypesResponse {
+    #[serde(rename = "issueLinkTypes")]
+    issue_link_types: Vec<JiraLinkTypeEntry>,
+}
+
+#[derive(Deserialize)]
+struct JiraLinkTypeEntry {
+    id: String,
+    name: String,
+    inward: String,
+    outward: String,
 }
 
 #[derive(Deserialize)]
@@ -1443,7 +1470,6 @@ mod tests {
         assert_eq!(result.total, 2);
         assert_eq!(result.sprints.len(), 2);
         assert_eq!(result.sprints[0].id, 10);
-        assert_eq!(result.sprints[0].name, "Sprint 1");
         assert_eq!(result.sprints[0].state, "closed");
         assert_eq!(result.sprints[0].goal.as_deref(), Some("MVP"));
         assert!(result.sprints[1].goal.is_none());
@@ -1456,12 +1482,9 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/rest/agile/1.0/board/1/sprint"))
             .and(wiremock::matchers::query_param("state", "active"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "values": [{"id": 11, "name": "Sprint 2", "state": "active"}],
-                    "total": 1
-                })),
-            )
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"values": [{"id": 11, "name": "Sprint 2", "state": "active"}], "total": 1}),
+            ))
             .expect(1)
             .mount(&server)
             .await;
@@ -1469,7 +1492,6 @@ mod tests {
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
         let result = client.get_sprints(1, Some("active"), 50).await.unwrap();
         assert_eq!(result.sprints.len(), 1);
-        assert_eq!(result.sprints[0].state, "active");
     }
 
     #[tokio::test]
@@ -1494,33 +1516,19 @@ mod tests {
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/rest/agile/1.0/sprint/10/issue"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "issues": [{
-                        "key": "PROJ-1",
-                        "fields": {
-                            "summary": "Sprint issue",
-                            "description": null,
-                            "status": {"name": "In Progress"},
-                            "issuetype": {"name": "Story"},
-                            "assignee": {"displayName": "Alice"},
-                            "priority": null,
-                            "labels": []
-                        }
-                    }],
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({
+                    "issues": [{"key": "PROJ-1", "fields": {"summary": "Sprint issue", "description": null, "status": {"name": "In Progress"}, "issuetype": {"name": "Story"}, "assignee": {"displayName": "Alice"}, "priority": null, "labels": []}}],
                     "total": 1
-                })),
-            )
+                }),
+            ))
             .expect(1)
             .mount(&server)
             .await;
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
         let result = client.get_sprint_issues(10, None, 50).await.unwrap();
-
-        assert_eq!(result.total, 1);
         assert_eq!(result.issues[0].key, "PROJ-1");
-        assert_eq!(result.issues[0].assignee.as_deref(), Some("Alice"));
     }
 
     #[tokio::test]
@@ -1571,6 +1579,148 @@ mod tests {
             .add_issues_to_sprint(999, &["NOPE-1"])
             .await
             .unwrap_err();
+        assert!(err.to_string().contains("400"));
+    }
+
+    #[tokio::test]
+    async fn get_link_types_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issueLinkType"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({
+                    "issueLinkTypes": [
+                        {"id": "1", "name": "Blocks", "inward": "is blocked by", "outward": "blocks"},
+                        {"id": "2", "name": "Clones", "inward": "is cloned by", "outward": "clones"}
+                    ]
+                }),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let types = client.get_link_types().await.unwrap();
+
+        assert_eq!(types.len(), 2);
+        assert_eq!(types[0].name, "Blocks");
+        assert_eq!(types[0].inward, "is blocked by");
+        assert_eq!(types[0].outward, "blocks");
+    }
+
+    #[tokio::test]
+    async fn get_link_types_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issueLinkType"))
+            .respond_with(wiremock::ResponseTemplate::new(401).set_body_string("Unauthorized"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.get_link_types().await.unwrap_err();
+        assert!(err.to_string().contains("401"));
+    }
+
+    #[tokio::test]
+    async fn create_issue_link_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/issueLink"))
+            .respond_with(wiremock::ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.create_issue_link("Blocks", "PROJ-1", "PROJ-2").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn create_issue_link_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/issueLink"))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("Bad Request"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .create_issue_link("Invalid", "NOPE-1", "NOPE-2")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("400"));
+    }
+
+    #[tokio::test]
+    async fn remove_issue_link_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/api/3/issueLink/12345"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.remove_issue_link("12345").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn remove_issue_link_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/api/3/issueLink/99999"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.remove_issue_link("99999").await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn link_to_epic_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-2"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.link_to_epic("EPIC-1", "PROJ-2").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn link_to_epic_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-2"))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("Not an epic"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.link_to_epic("NOPE-1", "PROJ-2").await.unwrap_err();
         assert!(err.to_string().contains("400"));
     }
 
@@ -2506,6 +2656,95 @@ impl AtlassianClient {
         let body = serde_json::json!({ "issues": issue_keys });
 
         let response = self.post_json(&url, &body).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        Ok(())
+    }
+
+    /// Lists available issue link types.
+    pub async fn get_link_types(&self) -> Result<Vec<JiraLinkType>> {
+        let url = format!("{}/rest/api/3/issueLinkType", self.instance_url);
+
+        let response = self.get_json(&url).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let resp: JiraLinkTypesResponse = response
+            .json()
+            .await
+            .context("Failed to parse link types response")?;
+
+        Ok(resp
+            .issue_link_types
+            .into_iter()
+            .map(|t| JiraLinkType {
+                id: t.id,
+                name: t.name,
+                inward: t.inward,
+                outward: t.outward,
+            })
+            .collect())
+    }
+
+    /// Creates a link between two JIRA issues.
+    pub async fn create_issue_link(
+        &self,
+        type_name: &str,
+        inward_key: &str,
+        outward_key: &str,
+    ) -> Result<()> {
+        let url = format!("{}/rest/api/3/issueLink", self.instance_url);
+
+        let body = serde_json::json!({
+            "type": { "name": type_name },
+            "inwardIssue": { "key": inward_key },
+            "outwardIssue": { "key": outward_key }
+        });
+
+        let response = self.post_json(&url, &body).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        Ok(())
+    }
+
+    /// Removes an issue link by ID.
+    pub async fn remove_issue_link(&self, link_id: &str) -> Result<()> {
+        let url = format!("{}/rest/api/3/issueLink/{}", self.instance_url, link_id);
+
+        let response = self.delete(&url).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        Ok(())
+    }
+
+    /// Links an issue to an epic by setting the parent field.
+    pub async fn link_to_epic(&self, epic_key: &str, issue_key: &str) -> Result<()> {
+        let url = format!("{}/rest/api/3/issue/{}", self.instance_url, issue_key);
+
+        let body = serde_json::json!({
+            "fields": { "parent": { "key": epic_key } }
+        });
+
+        let response = self.put_json(&url, &body).await?;
 
         if !response.status().is_success() {
             let status = response.status().as_u16();

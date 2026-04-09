@@ -365,6 +365,7 @@ Commands:
   field       Manages JIRA field definitions and options
   board       Manages JIRA agile boards
   sprint      Manages JIRA agile sprints
+  link        Manages JIRA issue links
   help        Print this message or the help of the given subcommand(s)
 
 Options:
@@ -560,6 +561,79 @@ Options:
       --field-id <FIELD_ID>      Field ID (e.g., "customfield_10001")
       --context-id <CONTEXT_ID>  Context ID (defaults to "default")
   -h, --help                     Print help
+
+
+================================================================================
+
+omni-dev atlassian jira link - Manages JIRA issue links
+
+Manages JIRA issue links
+
+Usage: link <COMMAND>
+
+Commands:
+  types   Lists available issue link types
+  create  Creates a link between two issues
+  remove  Removes an issue link by ID
+  epic    Links an issue to an epic (sets parent)
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian jira link create - Creates a link between two issues
+
+Creates a link between two issues
+
+Usage: create --type <TYPE> --inward <INWARD> --outward <OUTWARD>
+
+Options:
+      --type <TYPE>        Link type name (e.g., "Blocks", "Clones")
+      --inward <INWARD>    Inward issue key (e.g., the issue that "is blocked by")
+      --outward <OUTWARD>  Outward issue key (e.g., the issue that "blocks")
+  -h, --help               Print help
+
+
+================================================================================
+
+omni-dev atlassian jira link epic - Links an issue to an epic (sets parent)
+
+Links an issue to an epic (sets parent)
+
+Usage: epic --epic <EPIC> --issue <ISSUE>
+
+Options:
+      --epic <EPIC>    Epic issue key
+      --issue <ISSUE>  Issue key to link to the epic
+  -h, --help           Print help
+
+
+================================================================================
+
+omni-dev atlassian jira link remove - Removes an issue link by ID
+
+Removes an issue link by ID
+
+Usage: remove --link-id <LINK_ID>
+
+Options:
+      --link-id <LINK_ID>  Link ID to remove
+  -h, --help               Print help
+
+
+================================================================================
+
+omni-dev atlassian jira link types - Lists available issue link types
+
+Lists available issue link types
+
+Usage: types
+
+Options:
+  -h, --help  Print help
 
 
 ================================================================================
