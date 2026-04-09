@@ -1,5 +1,6 @@
 //! JIRA CLI subcommands.
 
+pub(crate) mod comment;
 pub(crate) mod create;
 pub(crate) mod edit;
 pub(crate) mod read;
@@ -33,6 +34,8 @@ pub enum JiraSubcommands {
     Create(create::CreateCommand),
     /// Lists or executes workflow transitions on a JIRA issue.
     Transition(transition::TransitionCommand),
+    /// Manages comments on a JIRA issue.
+    Comment(comment::CommentCommand),
 }
 
 impl JiraCommand {
@@ -45,6 +48,7 @@ impl JiraCommand {
             JiraSubcommands::Search(cmd) => cmd.execute().await,
             JiraSubcommands::Create(cmd) => cmd.execute().await,
             JiraSubcommands::Transition(cmd) => cmd.execute().await,
+            JiraSubcommands::Comment(cmd) => cmd.execute().await,
         }
     }
 }
@@ -129,5 +133,17 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Transition(_)));
+    }
+
+    #[test]
+    fn jira_subcommands_comment_variant() {
+        let cmd = JiraCommand {
+            command: JiraSubcommands::Comment(comment::CommentCommand {
+                command: comment::CommentSubcommands::List(comment::ListCommand {
+                    key: "PROJ-1".to_string(),
+                }),
+            }),
+        };
+        assert!(matches!(cmd.command, JiraSubcommands::Comment(_)));
     }
 }
