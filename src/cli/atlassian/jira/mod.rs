@@ -1,5 +1,6 @@
 //! JIRA CLI subcommands.
 
+pub(crate) mod board;
 pub(crate) mod comment;
 pub(crate) mod create;
 pub(crate) mod delete;
@@ -45,6 +46,8 @@ pub enum JiraSubcommands {
     Project(project::ProjectCommand),
     /// Manages JIRA field definitions and options.
     Field(field::FieldCommand),
+    /// Manages JIRA agile boards.
+    Board(board::BoardCommand),
 }
 
 impl JiraCommand {
@@ -61,6 +64,7 @@ impl JiraCommand {
             JiraSubcommands::Delete(cmd) => cmd.execute().await,
             JiraSubcommands::Project(cmd) => cmd.execute().await,
             JiraSubcommands::Field(cmd) => cmd.execute().await,
+            JiraSubcommands::Board(cmd) => cmd.execute().await,
         }
     }
 }
@@ -190,5 +194,19 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Field(_)));
+    }
+
+    #[test]
+    fn jira_subcommands_board_variant() {
+        let cmd = JiraCommand {
+            command: JiraSubcommands::Board(board::BoardCommand {
+                command: board::BoardSubcommands::List(board::ListCommand {
+                    project: None,
+                    r#type: None,
+                    max_results: 50,
+                }),
+            }),
+        };
+        assert!(matches!(cmd.command, JiraSubcommands::Board(_)));
     }
 }
