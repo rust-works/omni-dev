@@ -367,10 +367,57 @@ Commands:
   sprint      Manages JIRA agile sprints
   link        Manages JIRA issue links
   changelog   Shows change history for JIRA issues
+  attachment  Downloads JIRA issue attachments
   help        Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian jira attachment - Downloads JIRA issue attachments
+
+Downloads JIRA issue attachments
+
+Usage: attachment <COMMAND>
+
+Commands:
+  download  Downloads all attachments (or filtered by pattern)
+  images    Downloads only image attachments
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian jira attachment download - Downloads all attachments (or filtered by pattern)
+
+Downloads all attachments (or filtered by pattern)
+
+Usage: download [OPTIONS] --key <KEY>
+
+Options:
+      --key <KEY>                JIRA issue key (e.g., PROJ-123)
+      --output-dir <OUTPUT_DIR>  Output directory (defaults to current directory) [default: .]
+      --filter <FILTER>          Filter filenames by substring (case-insensitive)
+  -h, --help                     Print help
+
+
+================================================================================
+
+omni-dev atlassian jira attachment images - Downloads only image attachments
+
+Downloads only image attachments
+
+Usage: images [OPTIONS] --key <KEY>
+
+Options:
+      --key <KEY>                JIRA issue key (e.g., PROJ-123)
+      --output-dir <OUTPUT_DIR>  Output directory (defaults to current directory) [default: .]
+  -h, --help                     Print help
 
 
 ================================================================================
