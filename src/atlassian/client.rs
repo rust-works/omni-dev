@@ -252,6 +252,21 @@ pub struct JiraLinkType {
     pub outward: String,
 }
 
+/// A JIRA issue attachment.
+#[derive(Debug, Clone)]
+pub struct JiraAttachment {
+    /// Attachment ID.
+    pub id: String,
+    /// File name.
+    pub filename: String,
+    /// MIME type (e.g., "image/png", "application/pdf").
+    pub mime_type: String,
+    /// File size in bytes.
+    pub size: u64,
+    /// Download URL.
+    pub content_url: String,
+}
+
 /// A JIRA workflow transition.
 #[derive(Debug, Clone)]
 pub struct JiraTransition {
@@ -410,6 +425,27 @@ struct JiraLinkTypeEntry {
     name: String,
     inward: String,
     outward: String,
+}
+
+#[derive(Deserialize)]
+struct JiraAttachmentIssueResponse {
+    fields: JiraAttachmentFields,
+}
+
+#[derive(Deserialize)]
+struct JiraAttachmentFields {
+    #[serde(default)]
+    attachment: Vec<JiraAttachmentEntry>,
+}
+
+#[derive(Deserialize)]
+struct JiraAttachmentEntry {
+    id: String,
+    filename: String,
+    #[serde(rename = "mimeType")]
+    mime_type: String,
+    size: u64,
+    content: String,
 }
 
 #[derive(Deserialize)]
@@ -1764,6 +1800,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_bytes_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/file.bin"))
+            .and(wiremock::matchers::header("Accept", "*/*"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"binary content"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let data = client
+            .get_bytes(&format!("{}/file.bin", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(&data[..], b"binary content");
+    }
+
+    #[tokio::test]
+    async fn get_bytes_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/missing.bin"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .get_bytes(&format!("{}/missing.bin", server.uri()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn get_attachments_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({
+                    "fields": {
+                        "attachment": [
+                            {"id": "1", "filename": "screenshot.png", "mimeType": "image/png", "size": 12345, "content": "https://org.atlassian.net/attachment/1"},
+                            {"id": "2", "filename": "report.pdf", "mimeType": "application/pdf", "size": 99999, "content": "https://org.atlassian.net/attachment/2"}
+                        ]
+                    }
+                }),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let attachments = client.get_attachments("PROJ-1").await.unwrap();
+
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].filename, "screenshot.png");
+        assert_eq!(attachments[0].mime_type, "image/png");
+        assert_eq!(attachments[0].size, 12345);
+        assert_eq!(attachments[1].filename, "report.pdf");
+    }
+
+    #[tokio::test]
+    async fn get_attachments_empty() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"fields": {"attachment": []}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let attachments = client.get_attachments("PROJ-1").await.unwrap();
+        assert!(attachments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_attachments_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/NOPE-1"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.get_attachments("NOPE-1").await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
     async fn get_changelog_success() {
         let server = wiremock::MockServer::start().await;
 
@@ -2224,6 +2359,30 @@ impl AtlassianClient {
             .send()
             .await
             .context("Failed to send POST request to Atlassian API")
+    }
+
+    /// Sends an authenticated GET request and returns raw bytes.
+    pub async fn get_bytes(&self, url: &str) -> Result<Vec<u8>> {
+        let response = self
+            .client
+            .get(url)
+            .header("Authorization", &self.auth_header)
+            .header("Accept", "*/*")
+            .send()
+            .await
+            .context("Failed to send GET request for binary download")?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let bytes = response
+            .bytes()
+            .await
+            .context("Failed to read response bytes")?;
+        Ok(bytes.to_vec())
     }
 
     /// Sends an authenticated DELETE request and returns the raw response.
@@ -2860,6 +3019,40 @@ impl AtlassianClient {
             return Err(AtlassianError::ApiRequestFailed { status, body }.into());
         }
         Ok(())
+    }
+
+    /// Gets attachment metadata for a JIRA issue.
+    pub async fn get_attachments(&self, key: &str) -> Result<Vec<JiraAttachment>> {
+        let url = format!(
+            "{}/rest/api/3/issue/{}?fields=attachment",
+            self.instance_url, key
+        );
+
+        let response = self.get_json(&url).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let resp: JiraAttachmentIssueResponse = response
+            .json()
+            .await
+            .context("Failed to parse attachment response")?;
+
+        Ok(resp
+            .fields
+            .attachment
+            .into_iter()
+            .map(|a| JiraAttachment {
+                id: a.id,
+                filename: a.filename,
+                mime_type: a.mime_type,
+                size: a.size,
+                content_url: a.content,
+            })
+            .collect())
     }
 
     /// Gets the changelog for a JIRA issue.
