@@ -310,6 +310,7 @@ struct JiraAssigneeField {
 #[derive(Deserialize)]
 struct JiraSearchResponse {
     issues: Vec<JiraIssueResponse>,
+    #[serde(default)]
     total: u32,
 }
 
@@ -935,7 +936,7 @@ mod tests {
         });
 
         wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path("/rest/api/3/search"))
+            .and(wiremock::matchers::path("/rest/api/3/search/jql"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&search_json))
             .expect(1)
             .mount(&server)
@@ -954,11 +955,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_issues_without_total() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/search/jql"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issues": [{
+                        "key": "PROJ-1",
+                        "fields": {
+                            "summary": "Test",
+                            "description": null,
+                            "status": null,
+                            "issuetype": null,
+                            "assignee": null,
+                            "priority": null,
+                            "labels": []
+                        }
+                    }]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.search_issues("project = PROJ", 50).await.unwrap();
+
+        assert_eq!(result.issues.len(), 1);
+        // total falls back to issues count when not in response
+        assert_eq!(result.total, 1);
+    }
+
+    #[tokio::test]
     async fn search_issues_empty_results() {
         let server = wiremock::MockServer::start().await;
 
         wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path("/rest/api/3/search"))
+            .and(wiremock::matchers::path("/rest/api/3/search/jql"))
             .respond_with(
                 wiremock::ResponseTemplate::new(200)
                     .set_body_json(serde_json::json!({"issues": [], "total": 0})),
@@ -979,7 +1014,7 @@ mod tests {
         let server = wiremock::MockServer::start().await;
 
         wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path("/rest/api/3/search"))
+            .and(wiremock::matchers::path("/rest/api/3/search/jql"))
             .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("Invalid JQL query"))
             .expect(1)
             .mount(&server)
@@ -2634,7 +2669,7 @@ impl AtlassianClient {
 
     /// Searches JIRA issues using JQL.
     pub async fn search_issues(&self, jql: &str, max_results: u32) -> Result<JiraSearchResult> {
-        let url = format!("{}/rest/api/3/search", self.instance_url);
+        let url = format!("{}/rest/api/3/search/jql", self.instance_url);
 
         let body = serde_json::json!({
             "jql": jql,
@@ -2658,7 +2693,7 @@ impl AtlassianClient {
             .await
             .context("Failed to parse JIRA search response")?;
 
-        let issues = search_response
+        let issues: Vec<JiraIssue> = search_response
             .issues
             .into_iter()
             .map(|r| JiraIssue {
@@ -2673,10 +2708,13 @@ impl AtlassianClient {
             })
             .collect();
 
-        Ok(JiraSearchResult {
-            issues,
-            total: search_response.total,
-        })
+        let total = if search_response.total > 0 {
+            search_response.total
+        } else {
+            issues.len() as u32
+        };
+
+        Ok(JiraSearchResult { issues, total })
     }
 
     /// Searches Confluence pages using CQL.
