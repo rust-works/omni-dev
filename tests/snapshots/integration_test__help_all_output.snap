@@ -181,10 +181,11 @@ Confluence operations (read, write, edit pages)
 Usage: confluence <COMMAND>
 
 Commands:
-  read   Fetches a Confluence page and outputs it as JFM markdown or ADF JSON
-  write  Pushes content to a Confluence page
-  edit   Interactive fetch-edit-push cycle for a Confluence page
-  help   Print this message or the help of the given subcommand(s)
+  read    Fetches a Confluence page and outputs it as JFM markdown or ADF JSON
+  write   Pushes content to a Confluence page
+  edit    Interactive fetch-edit-push cycle for a Confluence page
+  search  Searches Confluence pages using CQL
+  help    Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
@@ -220,6 +221,22 @@ Options:
   -o, --output <OUTPUT>  Output file (writes to stdout if omitted)
       --format <FORMAT>  Output format [default: jfm] [possible values: jfm, adf]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian confluence search - Searches Confluence pages using CQL
+
+Searches Confluence pages using CQL
+
+Usage: search [OPTIONS]
+
+Options:
+      --cql <CQL>                  Raw CQL query string (e.g., "space = ENG AND title ~ 'architecture'")
+      --space <SPACE>              Filter by space key
+      --title <TITLE>              Filter by title (substring match)
+      --max-results <MAX_RESULTS>  Maximum number of results (default: 25) [default: 25]
+  -h, --help                       Print help
 
 
 ================================================================================
