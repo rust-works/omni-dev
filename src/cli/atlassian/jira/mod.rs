@@ -4,6 +4,7 @@ pub(crate) mod comment;
 pub(crate) mod create;
 pub(crate) mod delete;
 pub(crate) mod edit;
+pub(crate) mod field;
 pub(crate) mod project;
 pub(crate) mod read;
 pub(crate) mod search;
@@ -42,6 +43,8 @@ pub enum JiraSubcommands {
     Delete(delete::DeleteCommand),
     /// Lists JIRA projects.
     Project(project::ProjectCommand),
+    /// Manages JIRA field definitions and options.
+    Field(field::FieldCommand),
 }
 
 impl JiraCommand {
@@ -57,6 +60,7 @@ impl JiraCommand {
             JiraSubcommands::Comment(cmd) => cmd.execute().await,
             JiraSubcommands::Delete(cmd) => cmd.execute().await,
             JiraSubcommands::Project(cmd) => cmd.execute().await,
+            JiraSubcommands::Field(cmd) => cmd.execute().await,
         }
     }
 }
@@ -176,5 +180,15 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Project(_)));
+    }
+
+    #[test]
+    fn jira_subcommands_field_variant() {
+        let cmd = JiraCommand {
+            command: JiraSubcommands::Field(field::FieldCommand {
+                command: field::FieldSubcommands::List(field::ListCommand { search: None }),
+            }),
+        };
+        assert!(matches!(cmd.command, JiraSubcommands::Field(_)));
     }
 }

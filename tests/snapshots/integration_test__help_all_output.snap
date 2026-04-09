@@ -362,6 +362,7 @@ Commands:
   comment     Manages comments on a JIRA issue
   delete      Deletes a JIRA issue
   project     Lists JIRA projects
+  field       Manages JIRA field definitions and options
   help        Print this message or the help of the given subcommand(s)
 
 Options:
@@ -466,6 +467,50 @@ Arguments:
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian jira field - Manages JIRA field definitions and options
+
+Manages JIRA field definitions and options
+
+Usage: field <COMMAND>
+
+Commands:
+  list     Lists all field definitions
+  options  Shows options for a custom field
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian jira field list - Lists all field definitions
+
+Lists all field definitions
+
+Usage: list [OPTIONS]
+
+Options:
+      --search <SEARCH>  Filter fields by name (case-insensitive substring match)
+  -h, --help             Print help
+
+
+================================================================================
+
+omni-dev atlassian jira field options - Shows options for a custom field
+
+Shows options for a custom field
+
+Usage: options [OPTIONS] --field-id <FIELD_ID>
+
+Options:
+      --field-id <FIELD_ID>      Field ID (e.g., "customfield_10001")
+      --context-id <CONTEXT_ID>  Context ID (defaults to "default")
+  -h, --help                     Print help
 
 
 ================================================================================

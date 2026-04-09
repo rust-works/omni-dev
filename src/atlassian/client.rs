@@ -145,6 +145,28 @@ pub struct JiraProjectList {
     pub total: u32,
 }
 
+/// A JIRA field definition.
+#[derive(Debug, Clone)]
+pub struct JiraField {
+    /// Field ID (e.g., "summary", "customfield_10001").
+    pub id: String,
+    /// Human-readable field name.
+    pub name: String,
+    /// Whether this is a custom field.
+    pub custom: bool,
+    /// Schema type (e.g., "string", "array", "option").
+    pub schema_type: Option<String>,
+}
+
+/// An option value for a JIRA custom field.
+#[derive(Debug, Clone)]
+pub struct JiraFieldOption {
+    /// Option ID.
+    pub id: String,
+    /// Option display value.
+    pub value: String,
+}
+
 /// A JIRA workflow transition.
 #[derive(Debug, Clone)]
 pub struct JiraTransition {
@@ -239,6 +261,32 @@ struct ConfluenceContentSearchEntry {
 #[derive(Deserialize)]
 struct ConfluenceExpandable {
     space: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct JiraFieldEntry {
+    id: String,
+    name: String,
+    #[serde(default)]
+    custom: bool,
+    schema: Option<JiraFieldSchema>,
+}
+
+#[derive(Deserialize)]
+struct JiraFieldSchema {
+    #[serde(rename = "type")]
+    schema_type: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct JiraFieldOptionsResponse {
+    values: Vec<JiraFieldOptionEntry>,
+}
+
+#[derive(Deserialize)]
+struct JiraFieldOptionEntry {
+    id: String,
+    value: String,
 }
 
 #[derive(Deserialize)]
@@ -1128,6 +1176,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_fields_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/field"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!([
+                    {"id": "summary", "name": "Summary", "custom": false, "schema": {"type": "string"}},
+                    {"id": "customfield_10001", "name": "Story Points", "custom": true, "schema": {"type": "number"}},
+                    {"id": "labels", "name": "Labels", "custom": false}
+                ]),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let fields = client.get_fields().await.unwrap();
+
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].id, "summary");
+        assert_eq!(fields[0].name, "Summary");
+        assert!(!fields[0].custom);
+        assert_eq!(fields[0].schema_type.as_deref(), Some("string"));
+        assert_eq!(fields[1].id, "customfield_10001");
+        assert!(fields[1].custom);
+        assert!(fields[2].schema_type.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_fields_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/field"))
+            .respond_with(wiremock::ResponseTemplate::new(401).set_body_string("Unauthorized"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.get_fields().await.unwrap_err();
+        assert!(err.to_string().contains("401"));
+    }
+
+    #[tokio::test]
+    async fn get_field_options_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/field/customfield_10001/context/default/option",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"values": [
+                    {"id": "1", "value": "High"},
+                    {"id": "2", "value": "Medium"},
+                    {"id": "3", "value": "Low"}
+                ]}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let options = client
+            .get_field_options("customfield_10001", None)
+            .await
+            .unwrap();
+
+        assert_eq!(options.len(), 3);
+        assert_eq!(options[0].id, "1");
+        assert_eq!(options[0].value, "High");
+    }
+
+    #[tokio::test]
+    async fn get_field_options_with_context() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/field/customfield_10001/context/12345/option",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"values": [{"id": "1", "value": "Option A"}]}),
+                ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let options = client
+            .get_field_options("customfield_10001", Some("12345"))
+            .await
+            .unwrap();
+
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].value, "Option A");
+    }
+
+    #[tokio::test]
+    async fn get_field_options_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/field/nonexistent/context/default/option",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .get_field_options("nonexistent", None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
     async fn get_projects_success() {
         let server = wiremock::MockServer::start().await;
 
@@ -1722,6 +1894,69 @@ impl AtlassianClient {
             results,
             total: resp.size,
         })
+    }
+
+    /// Lists all JIRA field definitions.
+    pub async fn get_fields(&self) -> Result<Vec<JiraField>> {
+        let url = format!("{}/rest/api/3/field", self.instance_url);
+
+        let response = self.get_json(&url).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let entries: Vec<JiraFieldEntry> = response
+            .json()
+            .await
+            .context("Failed to parse field list response")?;
+
+        Ok(entries
+            .into_iter()
+            .map(|f| JiraField {
+                id: f.id,
+                name: f.name,
+                custom: f.custom,
+                schema_type: f.schema.and_then(|s| s.schema_type),
+            })
+            .collect())
+    }
+
+    /// Lists options for a JIRA custom field.
+    pub async fn get_field_options(
+        &self,
+        field_id: &str,
+        context_id: Option<&str>,
+    ) -> Result<Vec<JiraFieldOption>> {
+        let ctx = context_id.unwrap_or("default");
+        let url = format!(
+            "{}/rest/api/3/field/{}/context/{}/option",
+            self.instance_url, field_id, ctx
+        );
+
+        let response = self.get_json(&url).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let resp: JiraFieldOptionsResponse = response
+            .json()
+            .await
+            .context("Failed to parse field options response")?;
+
+        Ok(resp
+            .values
+            .into_iter()
+            .map(|o| JiraFieldOption {
+                id: o.id,
+                value: o.value,
+            })
+            .collect())
     }
 
     /// Lists JIRA projects.
