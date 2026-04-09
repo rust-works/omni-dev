@@ -1,6 +1,7 @@
 //! Confluence CLI subcommands.
 
 pub(crate) mod create;
+pub(crate) mod delete;
 pub(crate) mod edit;
 pub(crate) mod read;
 pub(crate) mod search;
@@ -30,6 +31,8 @@ pub enum ConfluenceSubcommands {
     Search(search::SearchCommand),
     /// Creates a new Confluence page.
     Create(create::CreateCommand),
+    /// Deletes a Confluence page.
+    Delete(delete::DeleteCommand),
 }
 
 impl ConfluenceCommand {
@@ -41,6 +44,7 @@ impl ConfluenceCommand {
             ConfluenceSubcommands::Edit(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Search(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Create(cmd) => cmd.execute().await,
+            ConfluenceSubcommands::Delete(cmd) => cmd.execute().await,
         }
     }
 }
@@ -112,5 +116,16 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::Create(_)));
+    }
+
+    #[test]
+    fn confluence_subcommands_delete_variant() {
+        let cmd = ConfluenceCommand {
+            command: ConfluenceSubcommands::Delete(delete::DeleteCommand {
+                id: "12345".to_string(),
+                force: true,
+            }),
+        };
+        assert!(matches!(cmd.command, ConfluenceSubcommands::Delete(_)));
     }
 }

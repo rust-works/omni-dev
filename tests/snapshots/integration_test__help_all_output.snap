@@ -186,6 +186,7 @@ Commands:
   edit    Interactive fetch-edit-push cycle for a Confluence page
   search  Searches Confluence pages using CQL
   create  Creates a new Confluence page
+  delete  Deletes a Confluence page
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -210,6 +211,22 @@ Options:
       --parent <PARENT>  Parent page ID for nesting under an existing page
       --dry-run          Shows what would be sent without creating
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian confluence delete - Deletes a Confluence page
+
+Deletes a Confluence page
+
+Usage: delete [OPTIONS] <ID>
+
+Arguments:
+  <ID>  Confluence page ID (e.g., 12345678)
+
+Options:
+      --force  Skips the confirmation prompt
+  -h, --help   Print help
 
 
 ================================================================================
