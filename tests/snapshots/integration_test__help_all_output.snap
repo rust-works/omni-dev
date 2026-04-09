@@ -304,7 +304,57 @@ Commands:
   search      Searches JIRA issues using JQL
   create      Creates a new JIRA issue
   transition  Lists or executes workflow transitions on a JIRA issue
+  comment     Manages comments on a JIRA issue
   help        Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian jira comment - Manages comments on a JIRA issue
+
+Manages comments on a JIRA issue
+
+Usage: comment <COMMAND>
+
+Commands:
+  list  Lists comments on a JIRA issue
+  add   Adds a comment to a JIRA issue
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian jira comment add - Adds a comment to a JIRA issue
+
+Adds a comment to a JIRA issue
+
+Usage: add [OPTIONS] <KEY> [FILE]
+
+Arguments:
+  <KEY>   JIRA issue key (e.g., PROJ-123)
+  [FILE]  Input file (reads from stdin if omitted or "-")
+
+Options:
+      --format <FORMAT>  Input format [default: jfm] [possible values: jfm, adf]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian jira comment list - Lists comments on a JIRA issue
+
+Lists comments on a JIRA issue
+
+Usage: list <KEY>
+
+Arguments:
+  <KEY>  JIRA issue key (e.g., PROJ-123)
 
 Options:
   -h, --help  Print help
