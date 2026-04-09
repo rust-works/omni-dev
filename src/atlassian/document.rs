@@ -51,8 +51,13 @@ pub struct JiraFrontmatter {
     /// Atlassian instance base URL.
     pub instance: String,
 
-    /// JIRA issue key (e.g., "PROJ-123").
+    /// JIRA issue key (e.g., "PROJ-123"). Empty when creating a new issue.
+    #[serde(default)]
     pub key: String,
+
+    /// Project key (e.g., "PROJ"). Used when creating issues without an existing key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
 
     /// Issue summary (title).
     pub summary: String,
@@ -164,6 +169,7 @@ pub fn issue_to_jfm_document(issue: &JiraIssue, instance_url: &str) -> Result<Jf
         frontmatter: JfmFrontmatter::Jira(JiraFrontmatter {
             instance: instance_url.to_string(),
             key: issue.key.clone(),
+            project: None,
             summary: issue.summary.clone(),
             status: issue.status.clone(),
             issue_type: issue.issue_type.clone(),
@@ -198,6 +204,7 @@ pub fn content_item_to_document(item: &ContentItem, instance_url: &str) -> Resul
         } => JfmFrontmatter::Jira(JiraFrontmatter {
             instance: instance_url.to_string(),
             key: item.id.clone(),
+            project: None,
             summary: item.title.clone(),
             status: status.clone(),
             issue_type: issue_type.clone(),
@@ -350,6 +357,7 @@ mod tests {
             frontmatter: JfmFrontmatter::Jira(JiraFrontmatter {
                 instance: "https://org.atlassian.net".to_string(),
                 key: "PROJ-123".to_string(),
+                project: None,
                 summary: "Fix the bug".to_string(),
                 status: None,
                 issue_type: None,
@@ -373,6 +381,7 @@ mod tests {
             frontmatter: JfmFrontmatter::Jira(JiraFrontmatter {
                 instance: "https://org.atlassian.net".to_string(),
                 key: "PROJ-789".to_string(),
+                project: None,
                 summary: "Round trip test".to_string(),
                 status: Some("Open".to_string()),
                 issue_type: Some("Bug".to_string()),
@@ -501,6 +510,7 @@ mod tests {
             frontmatter: JfmFrontmatter::Jira(JiraFrontmatter {
                 instance: "https://org.atlassian.net".to_string(),
                 key: "PROJ-1".to_string(),
+                project: None,
                 summary: "Minimal".to_string(),
                 status: None,
                 issue_type: None,

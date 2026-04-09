@@ -302,10 +302,31 @@ Commands:
   write   Pushes content to a JIRA issue
   edit    Interactive fetch-edit-push cycle for a JIRA issue
   search  Searches JIRA issues using JQL
+  create  Creates a new JIRA issue
   help    Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian jira create - Creates a new JIRA issue
+
+Creates a new JIRA issue
+
+Usage: create [OPTIONS] [FILE]
+
+Arguments:
+  [FILE]  Input file containing JFM markdown or ADF JSON (reads from stdin if omitted or "-")
+
+Options:
+      --format <FORMAT>    Input format [default: jfm] [possible values: jfm, adf]
+      --project <PROJECT>  Project key (e.g., "PROJ"). Overrides frontmatter
+      --type <TYPE>        Issue type (e.g., "Task", "Bug", "Story"). Overrides frontmatter
+      --summary <SUMMARY>  Issue summary/title. Overrides frontmatter
+      --dry-run            Shows what would be sent without creating
+  -h, --help               Print help (see more with '--help')
 
 
 ================================================================================
