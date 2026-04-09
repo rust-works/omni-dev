@@ -189,6 +189,32 @@ pub struct AgileBoardList {
     pub total: u32,
 }
 
+/// A JIRA agile sprint.
+#[derive(Debug, Clone)]
+pub struct AgileSprint {
+    /// Sprint ID.
+    pub id: u64,
+    /// Sprint name.
+    pub name: String,
+    /// Sprint state (e.g., "active", "future", "closed").
+    pub state: String,
+    /// Sprint start date (ISO 8601).
+    pub start_date: Option<String>,
+    /// Sprint end date (ISO 8601).
+    pub end_date: Option<String>,
+    /// Sprint goal.
+    pub goal: Option<String>,
+}
+
+/// Result from listing agile sprints.
+#[derive(Debug, Clone)]
+pub struct AgileSprintList {
+    /// Sprints returned.
+    pub sprints: Vec<AgileSprint>,
+    /// Total number of sprints.
+    pub total: u32,
+}
+
 /// A JIRA workflow transition.
 #[derive(Debug, Clone)]
 pub struct JiraTransition {
@@ -314,6 +340,25 @@ struct AgileIssueListResponse {
     issues: Vec<JiraIssueResponse>,
     #[serde(default)]
     total: u32,
+}
+
+#[derive(Deserialize)]
+struct AgileSprintListResponse {
+    values: Vec<AgileSprintEntry>,
+    #[serde(default)]
+    total: u32,
+}
+
+#[derive(Deserialize)]
+struct AgileSprintEntry {
+    id: u64,
+    name: String,
+    state: String,
+    #[serde(rename = "startDate")]
+    start_date: Option<String>,
+    #[serde(rename = "endDate")]
+    end_date: Option<String>,
+    goal: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1374,6 +1419,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_sprints_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/board/1/sprint"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({
+                    "values": [
+                        {"id": 10, "name": "Sprint 1", "state": "closed", "startDate": "2026-03-01", "endDate": "2026-03-14", "goal": "MVP"},
+                        {"id": 11, "name": "Sprint 2", "state": "active", "startDate": "2026-03-15", "endDate": "2026-03-28"}
+                    ],
+                    "total": 2
+                }),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.get_sprints(1, None, 50).await.unwrap();
+
+        assert_eq!(result.total, 2);
+        assert_eq!(result.sprints.len(), 2);
+        assert_eq!(result.sprints[0].id, 10);
+        assert_eq!(result.sprints[0].name, "Sprint 1");
+        assert_eq!(result.sprints[0].state, "closed");
+        assert_eq!(result.sprints[0].goal.as_deref(), Some("MVP"));
+        assert!(result.sprints[1].goal.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_sprints_with_state_filter() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/board/1/sprint"))
+            .and(wiremock::matchers::query_param("state", "active"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "values": [{"id": 11, "name": "Sprint 2", "state": "active"}],
+                    "total": 1
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.get_sprints(1, Some("active"), 50).await.unwrap();
+        assert_eq!(result.sprints.len(), 1);
+        assert_eq!(result.sprints[0].state, "active");
+    }
+
+    #[tokio::test]
+    async fn get_sprints_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/board/999/sprint"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.get_sprints(999, None, 50).await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn get_sprint_issues_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint/10/issue"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issues": [{
+                        "key": "PROJ-1",
+                        "fields": {
+                            "summary": "Sprint issue",
+                            "description": null,
+                            "status": {"name": "In Progress"},
+                            "issuetype": {"name": "Story"},
+                            "assignee": {"displayName": "Alice"},
+                            "priority": null,
+                            "labels": []
+                        }
+                    }],
+                    "total": 1
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.get_sprint_issues(10, None, 50).await.unwrap();
+
+        assert_eq!(result.total, 1);
+        assert_eq!(result.issues[0].key, "PROJ-1");
+        assert_eq!(result.issues[0].assignee.as_deref(), Some("Alice"));
+    }
+
+    #[tokio::test]
+    async fn get_sprint_issues_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint/999/issue"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.get_sprint_issues(999, None, 50).await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn add_issues_to_sprint_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint/10/issue"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.add_issues_to_sprint(10, &["PROJ-1", "PROJ-2"]).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn add_issues_to_sprint_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint/999/issue"))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("Bad Request"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .add_issues_to_sprint(999, &["NOPE-1"])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("400"));
+    }
+
+    #[tokio::test]
     async fn get_fields_success() {
         let server = wiremock::MockServer::start().await;
 
@@ -2193,6 +2394,126 @@ impl AtlassianClient {
             issues,
             total: resp.total,
         })
+    }
+
+    /// Lists sprints for an agile board.
+    pub async fn get_sprints(
+        &self,
+        board_id: u64,
+        state: Option<&str>,
+        max_results: u32,
+    ) -> Result<AgileSprintList> {
+        let mut url = format!(
+            "{}/rest/agile/1.0/board/{}/sprint?maxResults={}",
+            self.instance_url, board_id, max_results
+        );
+        if let Some(s) = state {
+            url.push_str(&format!("&state={s}"));
+        }
+
+        let response = self.get_json(&url).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let resp: AgileSprintListResponse = response
+            .json()
+            .await
+            .context("Failed to parse sprint list response")?;
+
+        let sprints = resp
+            .values
+            .into_iter()
+            .map(|s| AgileSprint {
+                id: s.id,
+                name: s.name,
+                state: s.state,
+                start_date: s.start_date,
+                end_date: s.end_date,
+                goal: s.goal,
+            })
+            .collect();
+
+        Ok(AgileSprintList {
+            sprints,
+            total: resp.total,
+        })
+    }
+
+    /// Lists issues in an agile sprint.
+    pub async fn get_sprint_issues(
+        &self,
+        sprint_id: u64,
+        jql: Option<&str>,
+        max_results: u32,
+    ) -> Result<JiraSearchResult> {
+        let base = format!(
+            "{}/rest/agile/1.0/sprint/{}/issue",
+            self.instance_url, sprint_id
+        );
+        let mut params: Vec<(&str, String)> = vec![("maxResults", max_results.to_string())];
+        if let Some(jql_str) = jql {
+            params.push(("jql", jql_str.to_string()));
+        }
+        let url =
+            reqwest::Url::parse_with_params(&base, params.iter().map(|(k, v)| (*k, v.as_str())))
+                .context("Failed to build sprint issues URL")?;
+
+        let response = self.get_json(url.as_str()).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let resp: AgileIssueListResponse = response
+            .json()
+            .await
+            .context("Failed to parse sprint issues response")?;
+
+        let issues = resp
+            .issues
+            .into_iter()
+            .map(|r| JiraIssue {
+                key: r.key,
+                summary: r.fields.summary.unwrap_or_default(),
+                description_adf: r.fields.description,
+                status: r.fields.status.and_then(|s| s.name),
+                issue_type: r.fields.issuetype.and_then(|t| t.name),
+                assignee: r.fields.assignee.and_then(|a| a.display_name),
+                priority: r.fields.priority.and_then(|p| p.name),
+                labels: r.fields.labels,
+            })
+            .collect();
+
+        Ok(JiraSearchResult {
+            issues,
+            total: resp.total,
+        })
+    }
+
+    /// Adds issues to an agile sprint.
+    pub async fn add_issues_to_sprint(&self, sprint_id: u64, issue_keys: &[&str]) -> Result<()> {
+        let url = format!(
+            "{}/rest/agile/1.0/sprint/{}/issue",
+            self.instance_url, sprint_id
+        );
+
+        let body = serde_json::json!({ "issues": issue_keys });
+
+        let response = self.post_json(&url, &body).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        Ok(())
     }
 
     /// Lists all JIRA field definitions.
