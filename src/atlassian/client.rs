@@ -941,6 +941,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_issue_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-42"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.delete_issue("PROJ-42").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_issue_not_found() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/NOPE-1"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.delete_issue("NOPE-1").await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn delete_issue_forbidden() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.delete_issue("PROJ-1").await.unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
     async fn get_myself_success() {
         let server = wiremock::MockServer::start().await;
 
@@ -1354,6 +1402,21 @@ impl AtlassianClient {
             issues,
             total: search_response.total,
         })
+    }
+
+    /// Deletes a JIRA issue.
+    pub async fn delete_issue(&self, key: &str) -> Result<()> {
+        let url = format!("{}/rest/api/3/issue/{}", self.instance_url, key);
+
+        let response = self.delete(&url).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        Ok(())
     }
 
     /// Verifies authentication by fetching the current user.
