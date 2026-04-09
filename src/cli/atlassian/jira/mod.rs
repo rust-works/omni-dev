@@ -1,6 +1,7 @@
 //! JIRA CLI subcommands.
 
 pub(crate) mod board;
+pub(crate) mod changelog;
 pub(crate) mod comment;
 pub(crate) mod create;
 pub(crate) mod delete;
@@ -54,6 +55,8 @@ pub enum JiraSubcommands {
     Sprint(sprint::SprintCommand),
     /// Manages JIRA issue links.
     Link(link::LinkCommand),
+    /// Shows change history for JIRA issues.
+    Changelog(changelog::ChangelogCommand),
 }
 
 impl JiraCommand {
@@ -73,6 +76,7 @@ impl JiraCommand {
             JiraSubcommands::Board(cmd) => cmd.execute().await,
             JiraSubcommands::Sprint(cmd) => cmd.execute().await,
             JiraSubcommands::Link(cmd) => cmd.execute().await,
+            JiraSubcommands::Changelog(cmd) => cmd.execute().await,
         }
     }
 }
@@ -240,5 +244,16 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Link(_)));
+    }
+
+    #[test]
+    fn jira_subcommands_changelog_variant() {
+        let cmd = JiraCommand {
+            command: JiraSubcommands::Changelog(changelog::ChangelogCommand {
+                keys: "PROJ-1".to_string(),
+                max_results: 50,
+            }),
+        };
+        assert!(matches!(cmd.command, JiraSubcommands::Changelog(_)));
     }
 }
