@@ -271,6 +271,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_json_sends_body_and_auth() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Basic dXNlckB0ZXN0LmNvbTp0b2tlbg==",
+            ))
+            .and(wiremock::matchers::header(
+                "Content-Type",
+                "application/json",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": "1"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let body = serde_json::json!({"name": "test"});
+        let resp = client
+            .post_json(&format!("{}/test", server.uri()), &body)
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 201);
+    }
+
+    #[tokio::test]
+    async fn post_json_error_response() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("Bad Request"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let body = serde_json::json!({});
+        let resp = client
+            .post_json(&format!("{}/test", server.uri()), &body)
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400);
+    }
+
+    #[tokio::test]
+    async fn delete_sends_auth_header() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Basic dXNlckB0ZXN0LmNvbTp0b2tlbg==",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let resp = client
+            .delete(&format!("{}/test", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 204);
+    }
+
+    #[tokio::test]
+    async fn delete_error_response() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let resp = client
+            .delete(&format!("{}/test", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 404);
+    }
+
+    #[tokio::test]
     async fn get_issue_success() {
         let server = wiremock::MockServer::start().await;
 
@@ -487,6 +575,32 @@ impl AtlassianClient {
             .send()
             .await
             .context("Failed to send PUT request to Atlassian API")
+    }
+
+    /// Sends an authenticated POST request with a JSON body and returns the raw response.
+    pub async fn post_json<T: serde::Serialize + Sync + ?Sized>(
+        &self,
+        url: &str,
+        body: &T,
+    ) -> Result<reqwest::Response> {
+        self.client
+            .post(url)
+            .header("Authorization", &self.auth_header)
+            .header("Content-Type", "application/json")
+            .json(body)
+            .send()
+            .await
+            .context("Failed to send POST request to Atlassian API")
+    }
+
+    /// Sends an authenticated DELETE request and returns the raw response.
+    pub async fn delete(&self, url: &str) -> Result<reqwest::Response> {
+        self.client
+            .delete(url)
+            .header("Authorization", &self.auth_header)
+            .send()
+            .await
+            .context("Failed to send DELETE request to Atlassian API")
     }
 
     /// Fetches a JIRA issue by key.
