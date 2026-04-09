@@ -6,6 +6,7 @@ pub(crate) mod create;
 pub(crate) mod delete;
 pub(crate) mod edit;
 pub(crate) mod field;
+pub(crate) mod link;
 pub(crate) mod project;
 pub(crate) mod read;
 pub(crate) mod search;
@@ -51,6 +52,8 @@ pub enum JiraSubcommands {
     Board(board::BoardCommand),
     /// Manages JIRA agile sprints.
     Sprint(sprint::SprintCommand),
+    /// Manages JIRA issue links.
+    Link(link::LinkCommand),
 }
 
 impl JiraCommand {
@@ -69,6 +72,7 @@ impl JiraCommand {
             JiraSubcommands::Field(cmd) => cmd.execute().await,
             JiraSubcommands::Board(cmd) => cmd.execute().await,
             JiraSubcommands::Sprint(cmd) => cmd.execute().await,
+            JiraSubcommands::Link(cmd) => cmd.execute().await,
         }
     }
 }
@@ -226,5 +230,15 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Sprint(_)));
+    }
+
+    #[test]
+    fn jira_subcommands_link_variant() {
+        let cmd = JiraCommand {
+            command: JiraSubcommands::Link(link::LinkCommand {
+                command: link::LinkSubcommands::Types(link::TypesCommand),
+            }),
+        };
+        assert!(matches!(cmd.command, JiraSubcommands::Link(_)));
     }
 }
