@@ -88,6 +88,15 @@ pub struct JiraSearchResult {
     pub total: u32,
 }
 
+/// A JIRA workflow transition.
+#[derive(Debug, Clone)]
+pub struct JiraTransition {
+    /// Transition ID.
+    pub id: String,
+    /// Transition name (e.g., "In Progress", "Done").
+    pub name: String,
+}
+
 // ── Internal API response structs ───────────────────────────────────
 
 #[derive(Deserialize)]
@@ -123,6 +132,17 @@ struct JiraAssigneeField {
 struct JiraSearchResponse {
     issues: Vec<JiraIssueResponse>,
     total: u32,
+}
+
+#[derive(Deserialize)]
+struct JiraTransitionsResponse {
+    transitions: Vec<JiraTransitionEntry>,
+}
+
+#[derive(Deserialize)]
+struct JiraTransitionEntry {
+    id: String,
+    name: String,
 }
 
 #[derive(Deserialize)]
@@ -667,6 +687,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_transitions_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/transitions",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "transitions": [
+                        {"id": "11", "name": "In Progress"},
+                        {"id": "21", "name": "Done"},
+                        {"id": "31", "name": "Won't Do"}
+                    ]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let transitions = client.get_transitions("PROJ-1").await.unwrap();
+
+        assert_eq!(transitions.len(), 3);
+        assert_eq!(transitions[0].id, "11");
+        assert_eq!(transitions[0].name, "In Progress");
+        assert_eq!(transitions[1].id, "21");
+        assert_eq!(transitions[2].name, "Won't Do");
+    }
+
+    #[tokio::test]
+    async fn get_transitions_empty() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/transitions",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"transitions": []})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let transitions = client.get_transitions("PROJ-1").await.unwrap();
+        assert!(transitions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_transitions_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/NOPE-1/transitions",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.get_transitions("NOPE-1").await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn do_transition_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/transitions",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.do_transition("PROJ-1", "21").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn do_transition_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/transitions",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(400).set_body_string("Invalid transition"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.do_transition("PROJ-1", "999").await.unwrap_err();
+        assert!(err.to_string().contains("400"));
+    }
+
+    #[tokio::test]
     async fn get_myself_success() {
         let server = wiremock::MockServer::start().await;
 
@@ -936,6 +1064,52 @@ impl AtlassianClient {
             id: create_response.id,
             self_url: create_response.self_url,
         })
+    }
+
+    /// Lists available transitions for a JIRA issue.
+    pub async fn get_transitions(&self, key: &str) -> Result<Vec<JiraTransition>> {
+        let url = format!("{}/rest/api/3/issue/{}/transitions", self.instance_url, key);
+
+        let response = self.get_json(&url).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let resp: JiraTransitionsResponse = response
+            .json()
+            .await
+            .context("Failed to parse transitions response")?;
+
+        Ok(resp
+            .transitions
+            .into_iter()
+            .map(|t| JiraTransition {
+                id: t.id,
+                name: t.name,
+            })
+            .collect())
+    }
+
+    /// Executes a transition on a JIRA issue.
+    pub async fn do_transition(&self, key: &str, transition_id: &str) -> Result<()> {
+        let url = format!("{}/rest/api/3/issue/{}/transitions", self.instance_url, key);
+
+        let body = serde_json::json!({
+            "transition": { "id": transition_id }
+        });
+
+        let response = self.post_json(&url, &body).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        Ok(())
     }
 
     /// Searches JIRA issues using JQL.
