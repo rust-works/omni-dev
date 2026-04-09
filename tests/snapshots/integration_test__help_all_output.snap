@@ -361,6 +361,7 @@ Commands:
   transition  Lists or executes workflow transitions on a JIRA issue
   comment     Manages comments on a JIRA issue
   delete      Deletes a JIRA issue
+  project     Lists JIRA projects
   help        Print this message or the help of the given subcommand(s)
 
 Options:
@@ -465,6 +466,35 @@ Arguments:
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian jira project - Lists JIRA projects
+
+Lists JIRA projects
+
+Usage: project <COMMAND>
+
+Commands:
+  list  Lists all accessible JIRA projects
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian jira project list - Lists all accessible JIRA projects
+
+Lists all accessible JIRA projects
+
+Usage: list [OPTIONS]
+
+Options:
+      --max-results <MAX_RESULTS>  Maximum number of results (default: 50) [default: 50]
+  -h, --help                       Print help
 
 
 ================================================================================

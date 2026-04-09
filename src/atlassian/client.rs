@@ -121,6 +121,30 @@ pub struct JiraComment {
     pub created: String,
 }
 
+/// A JIRA project.
+#[derive(Debug, Clone)]
+pub struct JiraProject {
+    /// Project ID.
+    pub id: String,
+    /// Project key (e.g., "PROJ").
+    pub key: String,
+    /// Project name.
+    pub name: String,
+    /// Project type key (e.g., "software", "business").
+    pub project_type: Option<String>,
+    /// Project lead display name.
+    pub lead: Option<String>,
+}
+
+/// Result from listing JIRA projects.
+#[derive(Debug, Clone)]
+pub struct JiraProjectList {
+    /// Projects returned.
+    pub projects: Vec<JiraProject>,
+    /// Total number of projects.
+    pub total: u32,
+}
+
 /// A JIRA workflow transition.
 #[derive(Debug, Clone)]
 pub struct JiraTransition {
@@ -215,6 +239,28 @@ struct ConfluenceContentSearchEntry {
 #[derive(Deserialize)]
 struct ConfluenceExpandable {
     space: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct JiraProjectSearchResponse {
+    values: Vec<JiraProjectEntry>,
+    total: u32,
+}
+
+#[derive(Deserialize)]
+struct JiraProjectEntry {
+    id: String,
+    key: String,
+    name: String,
+    #[serde(rename = "projectTypeKey")]
+    project_type_key: Option<String>,
+    lead: Option<JiraProjectLead>,
+}
+
+#[derive(Deserialize)]
+struct JiraProjectLead {
+    #[serde(rename = "displayName")]
+    display_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1082,6 +1128,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_projects_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/project/search"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "values": [
+                        {
+                            "id": "10001",
+                            "key": "PROJ",
+                            "name": "My Project",
+                            "projectTypeKey": "software",
+                            "lead": {"displayName": "Alice"}
+                        },
+                        {
+                            "id": "10002",
+                            "key": "OPS",
+                            "name": "Operations",
+                            "projectTypeKey": "business",
+                            "lead": null
+                        }
+                    ],
+                    "total": 2
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.get_projects(50).await.unwrap();
+
+        assert_eq!(result.total, 2);
+        assert_eq!(result.projects.len(), 2);
+        assert_eq!(result.projects[0].key, "PROJ");
+        assert_eq!(result.projects[0].name, "My Project");
+        assert_eq!(result.projects[0].project_type.as_deref(), Some("software"));
+        assert_eq!(result.projects[0].lead.as_deref(), Some("Alice"));
+        assert_eq!(result.projects[1].key, "OPS");
+        assert!(result.projects[1].lead.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_projects_empty() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/project/search"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"values": [], "total": 0})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.get_projects(50).await.unwrap();
+        assert_eq!(result.total, 0);
+        assert!(result.projects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_projects_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/project/search"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.get_projects(50).await.unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
     async fn delete_issue_success() {
         let server = wiremock::MockServer::start().await;
 
@@ -1595,6 +1721,44 @@ impl AtlassianClient {
         Ok(ConfluenceSearchResults {
             results,
             total: resp.size,
+        })
+    }
+
+    /// Lists JIRA projects.
+    pub async fn get_projects(&self, max_results: u32) -> Result<JiraProjectList> {
+        let url = format!(
+            "{}/rest/api/3/project/search?maxResults={}",
+            self.instance_url, max_results
+        );
+
+        let response = self.get_json(&url).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let resp: JiraProjectSearchResponse = response
+            .json()
+            .await
+            .context("Failed to parse project search response")?;
+
+        let projects = resp
+            .values
+            .into_iter()
+            .map(|p| JiraProject {
+                id: p.id,
+                key: p.key,
+                name: p.name,
+                project_type: p.project_type_key,
+                lead: p.lead.and_then(|l| l.display_name),
+            })
+            .collect();
+
+        Ok(JiraProjectList {
+            projects,
+            total: resp.total,
         })
     }
 
