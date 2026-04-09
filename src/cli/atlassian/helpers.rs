@@ -77,6 +77,28 @@ pub fn print_dry_run(id: &str, adf: &AdfDocument, title: &str) -> Result<()> {
     Ok(())
 }
 
+/// Prints a dry-run summary for issue creation.
+pub fn print_create_dry_run(
+    project: &str,
+    issue_type: &str,
+    summary: &str,
+    adf: &AdfDocument,
+    labels: &[String],
+) -> Result<()> {
+    println!("Dry run — would create issue:");
+    println!("  Project:    {project}");
+    println!("  Type:       {issue_type}");
+    println!("  Summary:    {summary}");
+    if !labels.is_empty() {
+        println!("  Labels:     {}", labels.join(", "));
+    }
+    println!(
+        "\nADF body:\n{}",
+        serde_json::to_string_pretty(adf).context("Failed to serialize ADF")?
+    );
+    Ok(())
+}
+
 /// Confirms and pushes content to the target.
 pub async fn execute_write(
     id: &str,
@@ -659,5 +681,22 @@ mod tests {
         let result = execute_write("PROJ-1", &adf, "", true, &api).await;
         assert!(result.is_ok());
         assert!(api.was_update_called());
+    }
+
+    // ── print_create_dry_run ───────────────────────────────────────
+
+    #[test]
+    fn print_create_dry_run_with_labels() {
+        let adf = AdfDocument::new();
+        let labels = vec!["backend".to_string(), "urgent".to_string()];
+        let result = print_create_dry_run("PROJ", "Bug", "Fix login", &adf, &labels);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn print_create_dry_run_without_labels() {
+        let adf = AdfDocument::new();
+        let result = print_create_dry_run("PROJ", "Task", "Add feature", &adf, &[]);
+        assert!(result.is_ok());
     }
 }

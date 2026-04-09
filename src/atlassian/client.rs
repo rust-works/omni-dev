@@ -67,6 +67,17 @@ pub struct JiraUser {
     pub account_id: String,
 }
 
+/// Result from creating a JIRA issue via the REST API.
+#[derive(Debug, Clone)]
+pub struct JiraCreatedIssue {
+    /// Issue key (e.g., "PROJ-124").
+    pub key: String,
+    /// Issue numeric ID.
+    pub id: String,
+    /// API self URL.
+    pub self_url: String,
+}
+
 /// Result from a JIRA JQL search.
 #[derive(Debug, Clone)]
 pub struct JiraSearchResult {
@@ -112,6 +123,14 @@ struct JiraAssigneeField {
 struct JiraSearchResponse {
     issues: Vec<JiraIssueResponse>,
     total: u32,
+}
+
+#[derive(Deserialize)]
+struct JiraCreateResponse {
+    key: String,
+    id: String,
+    #[serde(rename = "self")]
+    self_url: String,
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -581,6 +600,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_issue_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/issue"))
+            .respond_with(wiremock::ResponseTemplate::new(201).set_body_json(
+                serde_json::json!({"key": "PROJ-124", "id": "10042", "self": "https://org.atlassian.net/rest/api/3/issue/10042"}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client
+            .create_issue("PROJ", "Bug", "Fix login", None, &[])
+            .await
+            .unwrap();
+
+        assert_eq!(result.key, "PROJ-124");
+        assert_eq!(result.id, "10042");
+        assert!(result.self_url.contains("10042"));
+    }
+
+    #[tokio::test]
+    async fn create_issue_with_description_and_labels() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/issue"))
+            .respond_with(wiremock::ResponseTemplate::new(201).set_body_json(
+                serde_json::json!({"key": "PROJ-125", "id": "10043", "self": "https://org.atlassian.net/rest/api/3/issue/10043"}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let adf = AdfDocument::new();
+        let labels = vec!["backend".to_string(), "urgent".to_string()];
+        let result = client
+            .create_issue("PROJ", "Task", "Add feature", Some(&adf), &labels)
+            .await
+            .unwrap();
+
+        assert_eq!(result.key, "PROJ-125");
+    }
+
+    #[tokio::test]
+    async fn create_issue_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/issue"))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("Project not found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .create_issue("NOPE", "Bug", "Test", None, &[])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("400"));
+    }
+
+    #[tokio::test]
     async fn get_myself_success() {
         let server = wiremock::MockServer::start().await;
 
@@ -791,6 +877,65 @@ impl AtlassianClient {
         }
 
         Ok(())
+    }
+
+    /// Creates a new JIRA issue.
+    pub async fn create_issue(
+        &self,
+        project_key: &str,
+        issue_type: &str,
+        summary: &str,
+        description_adf: Option<&AdfDocument>,
+        labels: &[String],
+    ) -> Result<JiraCreatedIssue> {
+        let url = format!("{}/rest/api/3/issue", self.instance_url);
+
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "project".to_string(),
+            serde_json::json!({ "key": project_key }),
+        );
+        fields.insert(
+            "issuetype".to_string(),
+            serde_json::json!({ "name": issue_type }),
+        );
+        fields.insert(
+            "summary".to_string(),
+            serde_json::Value::String(summary.to_string()),
+        );
+        if let Some(adf) = description_adf {
+            fields.insert(
+                "description".to_string(),
+                serde_json::to_value(adf).context("Failed to serialize ADF document")?,
+            );
+        }
+        if !labels.is_empty() {
+            fields.insert("labels".to_string(), serde_json::to_value(labels)?);
+        }
+
+        let body = serde_json::json!({ "fields": fields });
+
+        let response = self
+            .post_json(&url, &body)
+            .await
+            .context("Failed to send create request to JIRA API")?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let create_response: JiraCreateResponse = response
+            .json()
+            .await
+            .context("Failed to parse JIRA create response")?;
+
+        Ok(JiraCreatedIssue {
+            key: create_response.key,
+            id: create_response.id,
+            self_url: create_response.self_url,
+        })
     }
 
     /// Searches JIRA issues using JQL.

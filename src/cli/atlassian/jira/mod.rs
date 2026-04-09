@@ -1,5 +1,6 @@
 //! JIRA CLI subcommands.
 
+pub(crate) mod create;
 pub(crate) mod edit;
 pub(crate) mod read;
 pub(crate) mod search;
@@ -27,6 +28,8 @@ pub enum JiraSubcommands {
     Edit(edit::EditCommand),
     /// Searches JIRA issues using JQL.
     Search(search::SearchCommand),
+    /// Creates a new JIRA issue.
+    Create(create::CreateCommand),
 }
 
 impl JiraCommand {
@@ -37,6 +40,7 @@ impl JiraCommand {
             JiraSubcommands::Write(cmd) => cmd.execute().await,
             JiraSubcommands::Edit(cmd) => cmd.execute().await,
             JiraSubcommands::Search(cmd) => cmd.execute().await,
+            JiraSubcommands::Create(cmd) => cmd.execute().await,
         }
     }
 }
@@ -80,6 +84,21 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Edit(_)));
+    }
+
+    #[test]
+    fn jira_subcommands_create_variant() {
+        let cmd = JiraCommand {
+            command: JiraSubcommands::Create(create::CreateCommand {
+                file: None,
+                format: ContentFormat::Jfm,
+                project: Some("PROJ".to_string()),
+                r#type: None,
+                summary: Some("Test".to_string()),
+                dry_run: false,
+            }),
+        };
+        assert!(matches!(cmd.command, JiraSubcommands::Create(_)));
     }
 
     #[test]
