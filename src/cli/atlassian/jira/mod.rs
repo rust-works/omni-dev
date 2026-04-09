@@ -9,6 +9,7 @@ pub(crate) mod field;
 pub(crate) mod project;
 pub(crate) mod read;
 pub(crate) mod search;
+pub(crate) mod sprint;
 pub(crate) mod transition;
 pub(crate) mod write;
 
@@ -48,6 +49,8 @@ pub enum JiraSubcommands {
     Field(field::FieldCommand),
     /// Manages JIRA agile boards.
     Board(board::BoardCommand),
+    /// Manages JIRA agile sprints.
+    Sprint(sprint::SprintCommand),
 }
 
 impl JiraCommand {
@@ -65,6 +68,7 @@ impl JiraCommand {
             JiraSubcommands::Project(cmd) => cmd.execute().await,
             JiraSubcommands::Field(cmd) => cmd.execute().await,
             JiraSubcommands::Board(cmd) => cmd.execute().await,
+            JiraSubcommands::Sprint(cmd) => cmd.execute().await,
         }
     }
 }
@@ -208,5 +212,19 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Board(_)));
+    }
+
+    #[test]
+    fn jira_subcommands_sprint_variant() {
+        let cmd = JiraCommand {
+            command: JiraSubcommands::Sprint(sprint::SprintCommand {
+                command: sprint::SprintSubcommands::List(sprint::ListCommand {
+                    board_id: 1,
+                    state: None,
+                    max_results: 50,
+                }),
+            }),
+        };
+        assert!(matches!(cmd.command, JiraSubcommands::Sprint(_)));
     }
 }
