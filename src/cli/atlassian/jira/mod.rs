@@ -2,6 +2,7 @@
 
 pub(crate) mod edit;
 pub(crate) mod read;
+pub(crate) mod search;
 pub(crate) mod write;
 
 use anyhow::Result;
@@ -24,6 +25,8 @@ pub enum JiraSubcommands {
     Write(write::WriteCommand),
     /// Interactive fetch-edit-push cycle for a JIRA issue.
     Edit(edit::EditCommand),
+    /// Searches JIRA issues using JQL.
+    Search(search::SearchCommand),
 }
 
 impl JiraCommand {
@@ -33,6 +36,7 @@ impl JiraCommand {
             JiraSubcommands::Read(cmd) => cmd.execute().await,
             JiraSubcommands::Write(cmd) => cmd.execute().await,
             JiraSubcommands::Edit(cmd) => cmd.execute().await,
+            JiraSubcommands::Search(cmd) => cmd.execute().await,
         }
     }
 }
@@ -76,5 +80,19 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Edit(_)));
+    }
+
+    #[test]
+    fn jira_subcommands_search_variant() {
+        let cmd = JiraCommand {
+            command: JiraSubcommands::Search(search::SearchCommand {
+                jql: Some("project = PROJ".to_string()),
+                project: None,
+                assignee: None,
+                status: None,
+                max_results: 50,
+            }),
+        };
+        assert!(matches!(cmd.command, JiraSubcommands::Search(_)));
     }
 }
