@@ -256,6 +256,21 @@ pub struct JiraLinkType {
     pub outward: String,
 }
 
+/// A link on a JIRA issue.
+#[derive(Debug, Clone)]
+pub struct JiraIssueLink {
+    /// Link ID (used for removal).
+    pub id: String,
+    /// Link type name.
+    pub link_type: String,
+    /// Direction: "inward" or "outward".
+    pub direction: String,
+    /// The linked issue key.
+    pub linked_issue_key: String,
+    /// The linked issue summary.
+    pub linked_issue_summary: String,
+}
+
 /// A JIRA issue attachment.
 #[derive(Debug, Clone)]
 pub struct JiraAttachment {
@@ -436,6 +451,44 @@ struct AgileSprintEntry {
     #[serde(rename = "endDate")]
     end_date: Option<String>,
     goal: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct JiraIssueLinksResponse {
+    fields: JiraIssueLinksFields,
+}
+
+#[derive(Deserialize)]
+struct JiraIssueLinksFields {
+    #[serde(default)]
+    issuelinks: Vec<JiraIssueLinkEntry>,
+}
+
+#[derive(Deserialize)]
+struct JiraIssueLinkEntry {
+    id: String,
+    #[serde(rename = "type")]
+    link_type: JiraIssueLinkType,
+    #[serde(rename = "inwardIssue")]
+    inward_issue: Option<JiraIssueLinkIssue>,
+    #[serde(rename = "outwardIssue")]
+    outward_issue: Option<JiraIssueLinkIssue>,
+}
+
+#[derive(Deserialize)]
+struct JiraIssueLinkType {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct JiraIssueLinkIssue {
+    key: String,
+    fields: Option<JiraIssueLinkIssueFields>,
+}
+
+#[derive(Deserialize)]
+struct JiraIssueLinkIssueFields {
+    summary: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1863,6 +1916,83 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("400"));
+    }
+
+    #[tokio::test]
+    async fn get_issue_links_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({
+                    "fields": {
+                        "issuelinks": [
+                            {
+                                "id": "100",
+                                "type": {"name": "Blocks"},
+                                "outwardIssue": {"key": "PROJ-2", "fields": {"summary": "Blocked issue"}}
+                            },
+                            {
+                                "id": "101",
+                                "type": {"name": "Relates"},
+                                "inwardIssue": {"key": "PROJ-3", "fields": {"summary": "Related issue"}}
+                            }
+                        ]
+                    }
+                }),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let links = client.get_issue_links("PROJ-1").await.unwrap();
+
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].id, "100");
+        assert_eq!(links[0].link_type, "Blocks");
+        assert_eq!(links[0].direction, "outward");
+        assert_eq!(links[0].linked_issue_key, "PROJ-2");
+        assert_eq!(links[0].linked_issue_summary, "Blocked issue");
+        assert_eq!(links[1].id, "101");
+        assert_eq!(links[1].direction, "inward");
+        assert_eq!(links[1].linked_issue_key, "PROJ-3");
+    }
+
+    #[tokio::test]
+    async fn get_issue_links_empty() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"fields": {"issuelinks": []}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let links = client.get_issue_links("PROJ-1").await.unwrap();
+        assert!(links.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_issue_links_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/NOPE-1"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.get_issue_links("NOPE-1").await.unwrap_err();
+        assert!(err.to_string().contains("404"));
     }
 
     #[tokio::test]
@@ -3382,6 +3512,54 @@ impl AtlassianClient {
         }
 
         Ok(())
+    }
+
+    /// Lists links on a JIRA issue.
+    pub async fn get_issue_links(&self, key: &str) -> Result<Vec<JiraIssueLink>> {
+        let url = format!(
+            "{}/rest/api/3/issue/{}?fields=issuelinks",
+            self.instance_url, key
+        );
+
+        let response = self.get_json(&url).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let resp: JiraIssueLinksResponse = response
+            .json()
+            .await
+            .context("Failed to parse issue links response")?;
+
+        let mut links = Vec::new();
+        for entry in resp.fields.issuelinks {
+            if let Some(inward) = entry.inward_issue {
+                links.push(JiraIssueLink {
+                    id: entry.id.clone(),
+                    link_type: entry.link_type.name.clone(),
+                    direction: "inward".to_string(),
+                    linked_issue_key: inward.key,
+                    linked_issue_summary: inward.fields.and_then(|f| f.summary).unwrap_or_default(),
+                });
+            }
+            if let Some(outward) = entry.outward_issue {
+                links.push(JiraIssueLink {
+                    id: entry.id,
+                    link_type: entry.link_type.name,
+                    direction: "outward".to_string(),
+                    linked_issue_key: outward.key,
+                    linked_issue_summary: outward
+                        .fields
+                        .and_then(|f| f.summary)
+                        .unwrap_or_default(),
+                });
+            }
+        }
+
+        Ok(links)
     }
 
     /// Lists available issue link types.
