@@ -124,6 +124,7 @@ mod tests {
             command: ConfluenceSubcommands::Delete(delete::DeleteCommand {
                 id: "12345".to_string(),
                 force: true,
+                purge: false,
             }),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::Delete(_)));
