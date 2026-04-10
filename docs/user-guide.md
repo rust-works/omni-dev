@@ -8,7 +8,7 @@ intelligence.
 1. [Getting Started](#getting-started)
 2. [Core Concepts](#core-concepts)
 3. [Command Reference](#command-reference)
-4. [JIRA and Confluence Integration (JFM)](#jfm---jira-and-confluence-integration)
+4. [Atlassian Integration](#atlassian---jira-and-confluence-integration)
 5. [Contextual Intelligence](#contextual-intelligence)
 6. [Workflows](#workflows)
 7. [Advanced Usage](#advanced-usage)
@@ -246,54 +246,61 @@ description: |
   error handling for edge cases.
 ```
 
-### `jfm` - JIRA and Confluence Integration
+### `atlassian` - JIRA and Confluence Integration
 
-Read, edit, and update JIRA issues and Confluence pages as local markdown
-files using JFM (JIRA-Flavored Markdown). JFM converts between markdown
-and Atlassian Document Format (ADF), so you can work with Atlassian
-content in your editor.
+Read, edit, and manage JIRA issues and Confluence pages from the command line.
+Content is represented as JFM (JIRA-Flavored Markdown) with YAML frontmatter,
+enabling round-trip editing between your editor and Atlassian Cloud.
 
-See the [JFM Specification](plan/jfm.md) for full technical details.
+See the [JFM Specification](specs/jfm.md) for full technical details on the
+markdown format.
 
 #### Authentication Setup
 
-Before using JFM, configure your Atlassian Cloud credentials:
+Configure your Atlassian Cloud credentials:
 
 ```bash
 # Interactive credential setup (prompts for instance URL, email, API token)
-omni-dev jfm auth login
+omni-dev atlassian auth login
 
-# Verify credentials work (makes API call)
-omni-dev jfm auth status
+# Verify credentials work
+omni-dev atlassian auth status
 ```
 
-Credentials are stored in `~/.omni-dev/settings.json`. You need:
-- Your Atlassian Cloud instance URL (e.g., `https://myorg.atlassian.net`)
-- Your email address
-- An API token (generate at https://id.atlassian.com/manage-profile/security/api-tokens)
-
-#### Reading Content
-
-Fetch a JIRA issue or Confluence page as a JFM markdown document:
+Credentials are stored in `~/.omni-dev/settings.json`. You can also use
+environment variables:
 
 ```bash
-# JIRA issue (auto-detected from key pattern)
-omni-dev jfm read PROJ-123
-omni-dev jfm read PROJ-123 -o issue.md
-
-# Confluence page (auto-detected from numeric ID)
-omni-dev jfm read 12345
-omni-dev jfm read 12345 -o page.md
-
-# Explicit target override
-omni-dev jfm read 12345 --jira        # force JIRA interpretation
-omni-dev jfm read PROJ-123 --confluence  # force Confluence
-
-# Get raw ADF JSON (useful for debugging)
-omni-dev jfm read PROJ-123 --raw
+export ATLASSIAN_INSTANCE_URL=https://myorg.atlassian.net
+export ATLASSIAN_EMAIL=you@example.com
+export ATLASSIAN_API_TOKEN=your-token
 ```
 
-JIRA output:
+Environment variables take precedence over the settings file.
+
+#### JIRA: Reading and Writing Issues
+
+```bash
+# Read an issue as JFM markdown
+omni-dev atlassian jira read PROJ-123
+omni-dev atlassian jira read PROJ-123 -o issue.md
+omni-dev atlassian jira read PROJ-123 --format adf   # raw ADF JSON
+
+# Write changes back (prompts for confirmation)
+omni-dev atlassian jira write PROJ-123 issue.md
+omni-dev atlassian jira write PROJ-123 issue.md --force
+omni-dev atlassian jira write PROJ-123 issue.md --dry-run
+
+# Interactive edit: fetch -> $EDITOR -> push
+omni-dev atlassian jira edit PROJ-123
+```
+
+The edit command opens an interactive loop:
+1. Fetches the issue and writes JFM to a temp file
+2. Prompts: `[A]ccept, [S]how, [E]dit, or [Q]uit?`
+3. On accept, converts back to ADF and pushes changes
+
+JFM output example:
 
 ```markdown
 ---
@@ -304,18 +311,203 @@ summary: Implement user authentication
 status: In Progress
 issue_type: Story
 assignee: Alice Smith
-priority: High
 labels:
   - backend
-  - auth
 ---
-
-## Description
 
 This story covers the implementation of OAuth2-based authentication...
 ```
 
-Confluence output:
+#### JIRA: Search
+
+Search issues using JQL or convenience flags:
+
+```bash
+# Raw JQL
+omni-dev atlassian jira search --jql "project = PROJ AND status = Open"
+
+# Convenience flags (combined with AND)
+omni-dev atlassian jira search --project PROJ --status "In Progress"
+omni-dev atlassian jira search --assignee alice --limit 100
+
+# Fetch all results (auto-paginates)
+omni-dev atlassian jira search --jql "project = PROJ" --limit 0
+```
+
+Output is a formatted table: `KEY | STATUS | ASSIGNEE | SUMMARY`.
+
+#### JIRA: Create Issues
+
+Create issues from JFM markdown or CLI flags:
+
+```bash
+# From JFM file (project, type, summary from frontmatter)
+omni-dev atlassian jira create issue.md
+
+# From CLI flags
+omni-dev atlassian jira create issue.md --project PROJ --type Bug --summary "Fix login"
+
+# From ADF JSON (all metadata via flags)
+omni-dev atlassian jira create body.json --format adf --project PROJ --summary "Title"
+
+# Preview without creating
+omni-dev atlassian jira create issue.md --dry-run
+```
+
+Prints the created issue key (e.g., `PROJ-124`) to stdout.
+
+#### JIRA: Transitions
+
+List and execute workflow transitions:
+
+```bash
+# List available transitions
+omni-dev atlassian jira transition PROJ-123
+
+# Execute a transition by name (case-insensitive)
+omni-dev atlassian jira transition PROJ-123 "In Progress"
+
+# Execute by ID
+omni-dev atlassian jira transition PROJ-123 21
+```
+
+#### JIRA: Comments
+
+```bash
+# List comments on an issue
+omni-dev atlassian jira comment list PROJ-123
+
+# Add a comment from a file
+omni-dev atlassian jira comment add PROJ-123 comment.md
+
+# Add from stdin
+echo "This is a comment" | omni-dev atlassian jira comment add PROJ-123
+
+# Add ADF JSON comment
+omni-dev atlassian jira comment add PROJ-123 body.json --format adf
+```
+
+#### JIRA: Delete Issues
+
+```bash
+# Delete with confirmation prompt
+omni-dev atlassian jira delete PROJ-123
+
+# Skip confirmation
+omni-dev atlassian jira delete PROJ-123 --force
+```
+
+#### JIRA: Projects
+
+```bash
+# List all accessible projects
+omni-dev atlassian jira project list
+omni-dev atlassian jira project list --limit 100
+```
+
+#### JIRA: Fields
+
+```bash
+# List all field definitions
+omni-dev atlassian jira field list
+
+# Search by name
+omni-dev atlassian jira field list --search "story"
+
+# Show options for a custom field (auto-discovers context)
+omni-dev atlassian jira field options --field-id customfield_10001
+
+# Specify context explicitly
+omni-dev atlassian jira field options --field-id customfield_10001 --context-id 12345
+```
+
+#### JIRA: Agile Boards
+
+```bash
+# List boards
+omni-dev atlassian jira board list
+omni-dev atlassian jira board list --project PROJ --type scrum
+
+# List issues on a board
+omni-dev atlassian jira board issues --board-id 1
+omni-dev atlassian jira board issues --board-id 1 --jql "status = Open"
+```
+
+#### JIRA: Sprints
+
+```bash
+# List sprints for a board
+omni-dev atlassian jira sprint list --board-id 1
+omni-dev atlassian jira sprint list --board-id 1 --state active
+
+# List issues in a sprint
+omni-dev atlassian jira sprint issues --sprint-id 10
+
+# Add issues to a sprint
+omni-dev atlassian jira sprint add --sprint-id 10 --issues PROJ-1,PROJ-2,PROJ-3
+```
+
+#### JIRA: Issue Links
+
+```bash
+# List links on an issue (shows link IDs)
+omni-dev atlassian jira link list PROJ-123
+
+# List available link types
+omni-dev atlassian jira link types
+
+# Create a link
+omni-dev atlassian jira link create --type Blocks --inward PROJ-1 --outward PROJ-2
+
+# Remove a link by ID (get IDs from `link list`)
+omni-dev atlassian jira link remove --link-id 12345
+
+# Link an issue to an epic
+omni-dev atlassian jira link epic --epic EPIC-1 --issue PROJ-2
+```
+
+#### JIRA: Changelog
+
+View change history for one or more issues:
+
+```bash
+omni-dev atlassian jira changelog --keys PROJ-1
+omni-dev atlassian jira changelog --keys PROJ-1,PROJ-2 --limit 100
+```
+
+#### JIRA: Attachments
+
+```bash
+# Download all attachments
+omni-dev atlassian jira attachment download --key PROJ-123
+omni-dev atlassian jira attachment download --key PROJ-123 --output-dir ./files
+
+# Filter by filename
+omni-dev atlassian jira attachment download --key PROJ-123 --filter screenshot
+
+# Download only images (png, jpeg, gif, svg, webp)
+omni-dev atlassian jira attachment images --key PROJ-123
+omni-dev atlassian jira attachment images --key PROJ-123 --output-dir ./images
+```
+
+#### Confluence: Reading and Writing Pages
+
+```bash
+# Read a page as JFM markdown
+omni-dev atlassian confluence read 12345
+omni-dev atlassian confluence read 12345 -o page.md
+omni-dev atlassian confluence read 12345 --format adf
+
+# Write changes back
+omni-dev atlassian confluence write 12345 page.md
+omni-dev atlassian confluence write 12345 page.md --force
+omni-dev atlassian confluence write 12345 page.md --dry-run
+
+# Interactive edit
+omni-dev atlassian confluence edit 12345
+```
+
+Confluence JFM output example:
 
 ```markdown
 ---
@@ -333,63 +525,79 @@ version: 7
 Page body content here...
 ```
 
-#### Writing Changes
+#### Confluence: Search
 
-Push a JFM markdown file back to JIRA or Confluence:
-
-```bash
-# Update from file (prompts for confirmation)
-omni-dev jfm write PROJ-123 issue.md
-omni-dev jfm write 12345 page.md
-
-# Skip confirmation prompt
-omni-dev jfm write PROJ-123 issue.md --force
-
-# Preview what would be sent without updating
-omni-dev jfm write PROJ-123 issue.md --dry-run
-
-# Read from stdin
-cat issue.md | omni-dev jfm write PROJ-123
-```
-
-The write command updates the content body (converted to ADF) and
-optionally the title if it changed in the frontmatter. For Confluence,
-the page version is automatically incremented.
-
-#### Interactive Editing
-
-Fetch content, edit in your editor, and push changes in one command:
+Search pages using CQL or convenience flags:
 
 ```bash
-omni-dev jfm edit PROJ-123
-omni-dev jfm edit 12345
-omni-dev jfm edit 12345 --confluence
+# Raw CQL
+omni-dev atlassian confluence search --cql "space = ENG AND title ~ 'auth'"
+
+# Convenience flags
+omni-dev atlassian confluence search --space ENG
+omni-dev atlassian confluence search --title architecture
+omni-dev atlassian confluence search --space ENG --title auth --limit 100
 ```
 
-This opens an interactive loop:
-1. Fetches the content and writes it to a temp file
-2. Prompts with: `[A]ccept, [S]how, [E]dit, or [Q]uit?`
-   - **Edit** - Opens the temp file in your editor (`$EDITOR` or `$OMNI_DEV_EDITOR`)
-   - **Show** - Prints the current file content
-   - **Accept** - Pushes changes (only if content changed)
-   - **Quit** - Cancels without updating
+#### Confluence: Create Pages
+
+```bash
+# From JFM file
+omni-dev atlassian confluence create page.md
+
+# From CLI flags
+omni-dev atlassian confluence create page.md --space ENG --title "New Page"
+
+# With parent page
+omni-dev atlassian confluence create page.md --space ENG --title "Child" --parent 12345
+
+# Preview
+omni-dev atlassian confluence create page.md --dry-run
+```
+
+#### Confluence: Delete Pages
+
+```bash
+# Delete (moves to trash, prompts for confirmation)
+omni-dev atlassian confluence delete 12345
+
+# Skip confirmation
+omni-dev atlassian confluence delete 12345 --force
+
+# Permanently purge (requires space admin)
+omni-dev atlassian confluence delete 12345 --force --purge
+```
 
 #### Offline Format Conversion
 
-Convert between markdown and ADF locally without credentials:
+Convert between JFM markdown and ADF JSON locally without credentials:
 
 ```bash
-# Convert markdown to ADF JSON
-omni-dev jfm convert to-adf issue.md
+# Markdown to ADF JSON
+omni-dev atlassian convert to-adf issue.md
+omni-dev atlassian convert to-adf issue.md --compact
 
-# Compact JSON output
-omni-dev jfm convert to-adf issue.md --compact
-
-# Convert ADF JSON back to markdown
-omni-dev jfm convert from-adf issue.json
+# ADF JSON to markdown
+omni-dev atlassian convert from-adf issue.json
 
 # Pipe for inspection
-cat issue.md | omni-dev jfm convert to-adf | jq .
+cat issue.md | omni-dev atlassian convert to-adf | jq .
+```
+
+#### Auto-Pagination
+
+All commands that query paginated endpoints auto-paginate transparently.
+Use `--limit` to control how many results are fetched:
+
+```bash
+# Default: up to 50 results
+omni-dev atlassian jira search --project PROJ
+
+# Fetch more
+omni-dev atlassian jira search --project PROJ --limit 200
+
+# Fetch all (no limit)
+omni-dev atlassian jira search --project PROJ --limit 0
 ```
 
 #### JFM Markdown Syntax
