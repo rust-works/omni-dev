@@ -18,6 +18,10 @@ pub struct DeleteCommand {
     /// Skips the confirmation prompt.
     #[arg(long)]
     pub force: bool,
+
+    /// Permanently purges the page instead of moving to trash (requires space admin).
+    #[arg(long)]
+    pub purge: bool,
 }
 
 impl DeleteCommand {
@@ -35,7 +39,7 @@ impl DeleteCommand {
             }
         }
 
-        api.delete_page(&self.id).await?;
+        api.delete_page(&self.id, self.purge).await?;
         println!("Deleted page {} from {}.", self.id, instance_url);
 
         Ok(())
@@ -70,9 +74,11 @@ mod tests {
         let cmd = DeleteCommand {
             id: "12345".to_string(),
             force: false,
+            purge: false,
         };
         assert_eq!(cmd.id, "12345");
         assert!(!cmd.force);
+        assert!(!cmd.purge);
     }
 
     #[test]
@@ -80,8 +86,19 @@ mod tests {
         let cmd = DeleteCommand {
             id: "12345".to_string(),
             force: true,
+            purge: false,
         };
         assert!(cmd.force);
+    }
+
+    #[test]
+    fn delete_command_purge_mode() {
+        let cmd = DeleteCommand {
+            id: "12345".to_string(),
+            force: true,
+            purge: true,
+        };
+        assert!(cmd.purge);
     }
 
     // ── format_delete_prompt ───────────────────────────────────────
