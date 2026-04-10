@@ -137,40 +137,45 @@ omni-dev git branch create pr --save-only pr-description.yaml
 omni-dev git branch create pr --auto-apply
 ```
 
-### 📝 JIRA Integration (`jfm`)
+### 📝 Atlassian Integration
 
-Read and write JIRA issues as markdown using JFM (JIRA-Flavored Markdown):
+Read, write, and manage JIRA issues and Confluence pages from the command line:
 
 ```bash
 # Authenticate with Atlassian Cloud
-omni-dev jfm auth login
+omni-dev atlassian auth login
 
 # Check authentication status
-omni-dev jfm auth status
+omni-dev atlassian auth status
 
 # Fetch a JIRA issue as markdown
-omni-dev jfm read PROJ-123
+omni-dev atlassian jira read PROJ-123
 
-# Fetch and save to a file
-omni-dev jfm read PROJ-123 -o issue.md
-
-# Fetch raw ADF JSON instead of markdown
-omni-dev jfm read PROJ-123 --raw
+# Fetch as raw ADF JSON
+omni-dev atlassian jira read PROJ-123 --format adf
 
 # Push markdown changes back to JIRA
-omni-dev jfm write PROJ-123 issue.md
-
-# Preview changes without writing
-omni-dev jfm write PROJ-123 issue.md --dry-run
+omni-dev atlassian jira write PROJ-123 issue.md
 
 # Interactive edit: fetch, edit in $EDITOR, push
-omni-dev jfm edit PROJ-123
+omni-dev atlassian jira edit PROJ-123
+
+# Search issues with JQL
+omni-dev atlassian jira search --project PROJ --status Open
+
+# Create an issue
+omni-dev atlassian jira create issue.md --project PROJ --summary "Fix bug"
+
+# Transition an issue
+omni-dev atlassian jira transition PROJ-123 "In Progress"
+
+# Confluence: read, search, create pages
+omni-dev atlassian confluence read 12345
+omni-dev atlassian confluence search --space ENG --title auth
+omni-dev atlassian confluence create page.md --space ENG --title "New Page"
 
 # Convert markdown to ADF JSON (offline)
-omni-dev jfm convert to-adf input.md
-
-# Convert ADF JSON to markdown (offline)
-omni-dev jfm convert from-adf input.json
+omni-dev atlassian convert to-adf input.md
 ```
 
 ### ✏️ Manual Amendment
@@ -375,9 +380,9 @@ We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.
   - View available models: `omni-dev config models show`
   - Configure via `~/.omni-dev/settings.json` or `ANTHROPIC_MODEL` environment variable
   - Supports standard identifiers and Bedrock-style formats
-- **Atlassian Credentials** (for JFM features): Instance URL, email, and
+- **Atlassian Credentials** (for JIRA/Confluence features): Instance URL, email, and
   [API token](https://id.atlassian.com/manage-profile/security/api-tokens)
-  - Configure with: `omni-dev jfm auth login`
+  - Configure with: `omni-dev atlassian auth login`
 - **Git**: Any modern version
 
 ## 🐛 Debugging

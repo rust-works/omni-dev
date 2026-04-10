@@ -18,6 +18,8 @@ omni-dev is a powerful Git commit message analysis and amendment toolkit written
 - `src/main.rs` - CLI entry point
 - `src/lib.rs` - Library exports
 - `src/cli/` - Command-line interface implementation
+- `src/cli/atlassian/` - Atlassian JIRA/Confluence CLI commands
+- `src/atlassian/` - Atlassian API client, ADF/JFM conversion, document format
 - `src/data/` - Data structures and YAML output formatting
 - `src/core/` - Core application logic
 - `src/utils/` - Utility functions
