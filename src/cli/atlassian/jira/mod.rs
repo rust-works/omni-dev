@@ -19,7 +19,7 @@ pub(crate) mod write;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-/// JIRA operations.
+/// JIRA issue management, search, agile boards, and more.
 #[derive(Parser)]
 pub struct JiraCommand {
     /// The JIRA subcommand to execute.

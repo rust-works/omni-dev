@@ -21,9 +21,9 @@ pub struct AtlassianCommand {
 /// Atlassian subcommands.
 #[derive(Subcommand)]
 pub enum AtlassianSubcommands {
-    /// JIRA operations (read, write, edit issues).
+    /// JIRA issue management, search, agile boards, and more.
     Jira(jira::JiraCommand),
-    /// Confluence operations (read, write, edit pages).
+    /// Confluence page management, search, and more.
     Confluence(confluence::ConfluenceCommand),
     /// Converts between JFM markdown and ADF JSON.
     Convert(convert::ConvertCommand),

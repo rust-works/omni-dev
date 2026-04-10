@@ -80,11 +80,11 @@ pub struct CreateLinkCommand {
     #[arg(long, value_name = "TYPE")]
     pub r#type: String,
 
-    /// Inward issue key (e.g., the issue that "is blocked by").
+    /// Source issue key (e.g., for "Blocks": the issue doing the blocking).
     #[arg(long)]
     pub inward: String,
 
-    /// Outward issue key (e.g., the issue that "blocks").
+    /// Target issue key (e.g., for "Blocks": the issue being blocked).
     #[arg(long)]
     pub outward: String,
 }

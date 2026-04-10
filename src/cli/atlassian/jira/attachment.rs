@@ -49,7 +49,6 @@ impl AttachmentCommand {
 #[derive(Parser)]
 pub struct DownloadCommand {
     /// JIRA issue key (e.g., PROJ-123).
-    #[arg(long)]
     pub key: String,
 
     /// Output directory (defaults to current directory).
@@ -92,7 +91,6 @@ impl DownloadCommand {
 #[derive(Parser)]
 pub struct ImagesCommand {
     /// JIRA issue key (e.g., PROJ-123).
-    #[arg(long)]
     pub key: String,
 
     /// Output directory (defaults to current directory).
