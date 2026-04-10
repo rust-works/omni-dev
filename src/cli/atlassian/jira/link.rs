@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::atlassian::client::JiraLinkType;
+use crate::atlassian::client::{JiraIssueLink, JiraLinkType};
 use crate::cli::atlassian::helpers::create_client;
 
 /// Manages JIRA issue links.
@@ -17,6 +17,8 @@ pub struct LinkCommand {
 /// Link subcommands.
 #[derive(Subcommand)]
 pub enum LinkSubcommands {
+    /// Lists links on a JIRA issue.
+    List(ListLinksCommand),
     /// Lists available issue link types.
     Types(TypesCommand),
     /// Creates a link between two issues.
@@ -31,11 +33,29 @@ impl LinkCommand {
     /// Executes the link command.
     pub async fn execute(self) -> Result<()> {
         match self.command {
+            LinkSubcommands::List(cmd) => cmd.execute().await,
             LinkSubcommands::Types(cmd) => cmd.execute().await,
             LinkSubcommands::Create(cmd) => cmd.execute().await,
             LinkSubcommands::Remove(cmd) => cmd.execute().await,
             LinkSubcommands::Epic(cmd) => cmd.execute().await,
         }
+    }
+}
+
+/// Lists links on a JIRA issue.
+#[derive(Parser)]
+pub struct ListLinksCommand {
+    /// JIRA issue key (e.g., PROJ-123).
+    pub key: String,
+}
+
+impl ListLinksCommand {
+    /// Fetches and displays issue links.
+    pub async fn execute(self) -> Result<()> {
+        let (client, _instance_url) = create_client()?;
+        let links = client.get_issue_links(&self.key).await?;
+        print_issue_links(&self.key, &links);
+        Ok(())
     }
 }
 
@@ -135,7 +155,53 @@ fn format_link_direction(type_name: &str) -> &str {
     }
 }
 
-/// Prints link types as a formatted table.
+/// Prints issue links as a formatted table.
+fn print_issue_links(key: &str, links: &[JiraIssueLink]) {
+    if links.is_empty() {
+        println!("{key}: no links.");
+        return;
+    }
+
+    let id_width = links.iter().map(|l| l.id.len()).max().unwrap_or(2).max(2);
+    let type_width = links
+        .iter()
+        .map(|l| l.link_type.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let dir_width = 7; // "outward" is the longest
+    let key_width = links
+        .iter()
+        .map(|l| l.linked_issue_key.len())
+        .max()
+        .unwrap_or(3)
+        .max(3);
+
+    println!(
+        "{:<id_width$}  {:<type_width$}  {:<dir_width$}  {:<key_width$}  SUMMARY",
+        "ID", "TYPE", "DIR", "KEY"
+    );
+    let summary_sep = "-".repeat(7);
+    println!(
+        "{:<id_width$}  {:<type_width$}  {:<dir_width$}  {:<key_width$}  {summary_sep}",
+        "-".repeat(id_width),
+        "-".repeat(type_width),
+        "-".repeat(dir_width),
+        "-".repeat(key_width),
+    );
+
+    for link in links {
+        println!(
+            "{:<id_width$}  {:<type_width$}  {:<dir_width$}  {:<key_width$}  {}",
+            link.id,
+            link.link_type,
+            link.direction,
+            link.linked_issue_key,
+            link.linked_issue_summary
+        );
+    }
+}
+
 fn print_link_types(types: &[JiraLinkType]) {
     if types.is_empty() {
         println!("No link types found.");
@@ -224,7 +290,49 @@ mod tests {
         print_link_types(&types);
     }
 
+    // ── print_issue_links ───────────────────────────────────────────
+
+    fn sample_link(
+        id: &str,
+        link_type: &str,
+        direction: &str,
+        key: &str,
+        summary: &str,
+    ) -> JiraIssueLink {
+        JiraIssueLink {
+            id: id.to_string(),
+            link_type: link_type.to_string(),
+            direction: direction.to_string(),
+            linked_issue_key: key.to_string(),
+            linked_issue_summary: summary.to_string(),
+        }
+    }
+
+    #[test]
+    fn print_issue_links_empty() {
+        print_issue_links("PROJ-1", &[]);
+    }
+
+    #[test]
+    fn print_issue_links_with_data() {
+        let links = vec![
+            sample_link("100", "Blocks", "outward", "PROJ-2", "Blocked issue"),
+            sample_link("101", "Relates", "inward", "PROJ-3", "Related issue"),
+        ];
+        print_issue_links("PROJ-1", &links);
+    }
+
     // ── dispatch ───────────────────────────────────────────────────
+
+    #[test]
+    fn link_command_list_variant() {
+        let cmd = LinkCommand {
+            command: LinkSubcommands::List(ListLinksCommand {
+                key: "PROJ-1".to_string(),
+            }),
+        };
+        assert!(matches!(cmd.command, LinkSubcommands::List(_)));
+    }
 
     #[test]
     fn link_command_types_variant() {
