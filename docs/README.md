@@ -13,6 +13,11 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 - **[Configuration Best Practices](configuration-best-practices.md)** - Writing effective scopes and guidelines
 - **[Examples](examples.md)** - Real-world usage examples across different project types
 
+### Atlassian Integration
+
+- **[User Guide - Atlassian](user-guide.md#atlassian---jira-and-confluence-integration)** - JIRA and Confluence commands
+- **[JFM Specification](specs/jfm.md)** - JIRA-Flavored Markdown format and ADF conversion
+
 ### Reference & Support
 
 - **[Troubleshooting](troubleshooting.md)** - Common issues and solutions  
@@ -84,6 +89,7 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 | **Automatic Batching** | [User Guide - Batching](user-guide.md#automatic-batching) | [Troubleshooting - Performance](troubleshooting.md#performance-issues) |
 | **Workflow Integration** | [User Guide - Workflows](user-guide.md#workflows) | [Examples - Enterprise](examples.md#enterprise-monorepo) |
 | **Configuration Quality** | [Best Practices](configuration-best-practices.md) | [Config Internals](plan/config-internals.md) |
+| **Atlassian Integration** | [User Guide - Atlassian](user-guide.md#atlassian---jira-and-confluence-integration) | [JFM Spec](specs/jfm.md) |
 
 ## 🔗 External Resources
 
