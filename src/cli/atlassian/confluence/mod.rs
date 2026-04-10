@@ -10,7 +10,7 @@ pub(crate) mod write;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-/// Confluence operations.
+/// Confluence page management, search, and more.
 #[derive(Parser)]
 pub struct ConfluenceCommand {
     /// The Confluence subcommand to execute.
