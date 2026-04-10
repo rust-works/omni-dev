@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-04-10
+
+### Added
+- **Atlassian Integration**: Comprehensive JIRA and Confluence CLI commands via JFM (JIRA-Flavored Markdown) format
+  - Read and write JIRA and Confluence content as JFM markdown
+  - JIRA issue create, delete, search (JQL), and transition commands
+  - JIRA comment list and add commands
+  - JIRA issue link management and link list commands
+  - JIRA issue attachment download commands
+  - JIRA issue changelog command
+  - JIRA agile board and sprint management commands
+  - JIRA project list and field listing/options commands
+  - Auto-discover field context when fetching JIRA field options
+  - Confluence search (CQL), create, and delete commands with purge flag
+  - `post_json` and `delete` methods on `AtlassianClient`
+- **Auto-Pagination**: Automatic pagination for all Atlassian API methods
+- **Claude CLI Model Resolve**: `claude cli model resolve` command for model resolution diagnostics
+
+### Changed
+- **CLI Help Text**: Improved help text and converted key arguments to positional for Atlassian commands
+
+### Fixed
+- **Confluence Delete Error**: Improved 404 error message for confluence delete command
+- **JIRA Search Endpoint**: Updated search endpoint and handle missing `total` field in response
+
+### Security
+- **CI Hardening**: Pin `cargo-deny-action` version and update vulnerable dependencies
+
+### Testing
+- **Field Context Error Handling**: Added test for `get_field_contexts` 404 error response
+
+### Documentation
+- **Atlassian User Guide**: Comprehensive command reference for all Atlassian CLI commands
+- **JFM Specification**: Moved JFM spec from plan to specs directory with revised content
+- **Atlassian Scope**: Added `atlassian` scope to scope list
+- **v0.18.0 Retrospective**: Added release retrospective document
+
 ## [0.18.0] - 2026-02-26
 
 ### Added
@@ -654,6 +691,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - BSD 3-Clause license
 
 [Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.18.0...HEAD
+[0.19.0]: https://github.com/rust-works/omni-dev/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/rust-works/omni-dev/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/rust-works/omni-dev/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/rust-works/omni-dev/compare/v0.15.0...v0.16.0
