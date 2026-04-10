@@ -25,9 +25,9 @@ pub struct SearchCommand {
     #[arg(long)]
     pub status: Option<String>,
 
-    /// Maximum number of results (default: 50).
+    /// Maximum number of results, 0 for unlimited (default: 50).
     #[arg(long, default_value_t = 50)]
-    pub max_results: u32,
+    pub limit: u32,
 }
 
 impl SearchCommand {
@@ -36,7 +36,7 @@ impl SearchCommand {
         let jql = self.build_jql()?;
         let (client, _instance_url) = create_client()?;
 
-        let result = client.search_issues(&jql, self.max_results).await?;
+        let result = client.search_issues(&jql, self.limit).await?;
         print_search_results(&result);
 
         Ok(())
@@ -166,7 +166,7 @@ mod tests {
             project: None,
             assignee: None,
             status: None,
-            max_results: 50,
+            limit: 50,
         };
         assert_eq!(cmd.build_jql().unwrap(), "project = PROJ ORDER BY created");
     }
@@ -178,7 +178,7 @@ mod tests {
             project: Some("PROJ".to_string()),
             assignee: None,
             status: None,
-            max_results: 50,
+            limit: 50,
         };
         assert_eq!(cmd.build_jql().unwrap(), "project = \"PROJ\"");
     }
@@ -190,7 +190,7 @@ mod tests {
             project: Some("PROJ".to_string()),
             assignee: Some("alice".to_string()),
             status: Some("Open".to_string()),
-            max_results: 25,
+            limit: 25,
         };
         let jql = cmd.build_jql().unwrap();
         assert!(jql.contains("project = \"PROJ\""));
@@ -206,7 +206,7 @@ mod tests {
             project: None,
             assignee: None,
             status: None,
-            max_results: 50,
+            limit: 50,
         };
         assert!(cmd.build_jql().is_err());
     }
@@ -218,7 +218,7 @@ mod tests {
             project: Some("PROJ".to_string()),
             assignee: Some("alice".to_string()),
             status: None,
-            max_results: 50,
+            limit: 50,
         };
         assert_eq!(cmd.build_jql().unwrap(), "assignee = bob");
     }

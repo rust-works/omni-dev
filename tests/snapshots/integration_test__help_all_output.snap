@@ -271,11 +271,11 @@ Searches Confluence pages using CQL
 Usage: search [OPTIONS]
 
 Options:
-      --cql <CQL>                  Raw CQL query string (e.g., "space = ENG AND title ~ 'architecture'")
-      --space <SPACE>              Filter by space key
-      --title <TITLE>              Filter by title (substring match)
-      --max-results <MAX_RESULTS>  Maximum number of results (default: 25) [default: 25]
-  -h, --help                       Print help
+      --cql <CQL>      Raw CQL query string (e.g., "space = ENG AND title ~ 'architecture'")
+      --space <SPACE>  Filter by space key
+      --title <TITLE>  Filter by title (substring match)
+      --limit <LIMIT>  Maximum number of results, 0 for unlimited (default: 25) [default: 25]
+  -h, --help           Print help
 
 
 ================================================================================
@@ -447,10 +447,10 @@ Lists issues on a board
 Usage: issues [OPTIONS] --board-id <BOARD_ID>
 
 Options:
-      --board-id <BOARD_ID>        Board ID
-      --jql <JQL>                  JQL filter for issues
-      --max-results <MAX_RESULTS>  Maximum number of results (default: 50) [default: 50]
-  -h, --help                       Print help
+      --board-id <BOARD_ID>  Board ID
+      --jql <JQL>            JQL filter for issues
+      --limit <LIMIT>        Maximum number of results, 0 for unlimited (default: 50) [default: 50]
+  -h, --help                 Print help
 
 
 ================================================================================
@@ -462,10 +462,10 @@ Lists agile boards
 Usage: list [OPTIONS]
 
 Options:
-      --project <PROJECT>          Filter by project key
-      --type <TYPE>                Filter by board type (scrum or kanban)
-      --max-results <MAX_RESULTS>  Maximum number of results (default: 50) [default: 50]
-  -h, --help                       Print help
+      --project <PROJECT>  Filter by project key
+      --type <TYPE>        Filter by board type (scrum or kanban)
+      --limit <LIMIT>      Maximum number of results, 0 for unlimited (default: 50) [default: 50]
+  -h, --help               Print help
 
 
 ================================================================================
@@ -477,9 +477,9 @@ Shows change history for JIRA issues
 Usage: changelog [OPTIONS] --keys <KEYS>
 
 Options:
-      --keys <KEYS>                Comma-separated issue keys (e.g., "PROJ-1,PROJ-2")
-      --max-results <MAX_RESULTS>  Maximum number of changelog entries per issue (default: 50) [default: 50]
-  -h, --help                       Print help
+      --keys <KEYS>    Comma-separated issue keys (e.g., "PROJ-1,PROJ-2")
+      --limit <LIMIT>  Maximum number of changelog entries per issue (default: 50) [default: 50]
+  -h, --help           Print help
 
 
 ================================================================================
@@ -724,8 +724,8 @@ Lists all accessible JIRA projects
 Usage: list [OPTIONS]
 
 Options:
-      --max-results <MAX_RESULTS>  Maximum number of results (default: 50) [default: 50]
-  -h, --help                       Print help
+      --limit <LIMIT>  Maximum number of results, 0 for unlimited (default: 50) [default: 50]
+  -h, --help           Print help
 
 
 ================================================================================
@@ -754,12 +754,12 @@ Searches JIRA issues using JQL
 Usage: search [OPTIONS]
 
 Options:
-      --jql <JQL>                  Raw JQL query string (e.g., "project = PROJ AND status = Open")
-      --project <PROJECT>          Filter by project key
-      --assignee <ASSIGNEE>        Filter by assignee (display name or email)
-      --status <STATUS>            Filter by status name
-      --max-results <MAX_RESULTS>  Maximum number of results (default: 50) [default: 50]
-  -h, --help                       Print help
+      --jql <JQL>            Raw JQL query string (e.g., "project = PROJ AND status = Open")
+      --project <PROJECT>    Filter by project key
+      --assignee <ASSIGNEE>  Filter by assignee (display name or email)
+      --status <STATUS>      Filter by status name
+      --limit <LIMIT>        Maximum number of results, 0 for unlimited (default: 50) [default: 50]
+  -h, --help                 Print help
 
 
 ================================================================================
@@ -803,10 +803,10 @@ Lists issues in a sprint
 Usage: issues [OPTIONS] --sprint-id <SPRINT_ID>
 
 Options:
-      --sprint-id <SPRINT_ID>      Sprint ID
-      --jql <JQL>                  JQL filter for issues
-      --max-results <MAX_RESULTS>  Maximum number of results (default: 50) [default: 50]
-  -h, --help                       Print help
+      --sprint-id <SPRINT_ID>  Sprint ID
+      --jql <JQL>              JQL filter for issues
+      --limit <LIMIT>          Maximum number of results, 0 for unlimited (default: 50) [default: 50]
+  -h, --help                   Print help
 
 
 ================================================================================
@@ -818,10 +818,10 @@ Lists sprints for a board
 Usage: list [OPTIONS] --board-id <BOARD_ID>
 
 Options:
-      --board-id <BOARD_ID>        Board ID
-      --state <STATE>              Filter by sprint state (active, future, closed)
-      --max-results <MAX_RESULTS>  Maximum number of results (default: 50) [default: 50]
-  -h, --help                       Print help
+      --board-id <BOARD_ID>  Board ID
+      --state <STATE>        Filter by sprint state (active, future, closed)
+      --limit <LIMIT>        Maximum number of results, 0 for unlimited (default: 50) [default: 50]
+  -h, --help                 Print help
 
 
 ================================================================================

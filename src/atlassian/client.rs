@@ -16,6 +16,10 @@ use crate::atlassian::error::AtlassianError;
 /// HTTP request timeout for Atlassian API calls.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Internal page size for auto-pagination. Individual API calls request
+/// this many items per page; the `limit` parameter controls the total.
+const PAGE_SIZE: u32 = 100;
+
 /// HTTP client for Atlassian Cloud REST APIs.
 pub struct AtlassianClient {
     client: Client,
@@ -308,10 +312,13 @@ struct JiraAssigneeField {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct JiraSearchResponse {
     issues: Vec<JiraIssueResponse>,
     #[serde(default)]
     total: u32,
+    #[serde(rename = "nextPageToken", default)]
+    next_page_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -345,10 +352,18 @@ struct JiraCommentAuthor {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct ConfluenceContentSearchResponse {
     results: Vec<ConfluenceContentSearchEntry>,
     #[serde(default)]
     size: u32,
+    #[serde(rename = "_links", default)]
+    links: Option<ConfluenceSearchLinks>,
+}
+
+#[derive(Deserialize, Default)]
+struct ConfluenceSearchLinks {
+    next: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -367,10 +382,13 @@ struct ConfluenceExpandable {
 // ── Agile API response structs ─────────────────────────────────────
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct AgileBoardListResponse {
     values: Vec<AgileBoardEntry>,
     #[serde(default)]
     total: u32,
+    #[serde(rename = "isLast", default)]
+    is_last: bool,
 }
 
 #[derive(Deserialize)]
@@ -389,17 +407,23 @@ struct AgileBoardLocation {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct AgileIssueListResponse {
     issues: Vec<JiraIssueResponse>,
     #[serde(default)]
     total: u32,
+    #[serde(rename = "isLast", default)]
+    is_last: bool,
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct AgileSprintListResponse {
     values: Vec<AgileSprintEntry>,
     #[serde(default)]
     total: u32,
+    #[serde(rename = "isLast", default)]
+    is_last: bool,
 }
 
 #[derive(Deserialize)]
@@ -450,8 +474,13 @@ struct JiraAttachmentEntry {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct JiraChangelogResponse {
     values: Vec<JiraChangelogEntryResponse>,
+    #[serde(default)]
+    total: u32,
+    #[serde(rename = "isLast", default)]
+    is_last: bool,
 }
 
 #[derive(Deserialize)]
@@ -499,9 +528,12 @@ struct JiraFieldOptionEntry {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct JiraProjectSearchResponse {
     values: Vec<JiraProjectEntry>,
     total: u32,
+    #[serde(rename = "isLast", default)]
+    is_last: bool,
 }
 
 #[derive(Deserialize)]
@@ -1430,7 +1462,7 @@ mod tests {
                         {"id": 1, "name": "PROJ Board", "type": "scrum", "location": {"projectKey": "PROJ"}},
                         {"id": 2, "name": "Kanban", "type": "kanban"}
                     ],
-                    "total": 2
+                    "total": 2, "isLast": true
                 }),
             ))
             .expect(1)
@@ -1460,7 +1492,7 @@ mod tests {
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
                 serde_json::json!({
                     "values": [{"id": 1, "name": "PROJ Board", "type": "scrum", "location": {"projectKey": "PROJ"}}],
-                    "total": 1
+                    "total": 1, "isLast": true
                 }),
             ))
             .expect(1)
@@ -1475,6 +1507,110 @@ mod tests {
 
         assert_eq!(result.boards.len(), 1);
         assert_eq!(result.boards[0].project_key.as_deref(), Some("PROJ"));
+    }
+
+    #[tokio::test]
+    async fn search_issues_paginates_with_token() {
+        let server = wiremock::MockServer::start().await;
+
+        // First page returns a nextPageToken
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/search/jql"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({"jql": "project = PROJ"})))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({
+                    "issues": [{"key": "PROJ-1", "fields": {"summary": "First", "description": null, "status": null, "issuetype": null, "assignee": null, "priority": null, "labels": []}}],
+                    "nextPageToken": "token123"
+                }),
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Second page has no nextPageToken (last page)
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/search/jql"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({"nextPageToken": "token123"})))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({
+                    "issues": [{"key": "PROJ-2", "fields": {"summary": "Second", "description": null, "status": null, "issuetype": null, "assignee": null, "priority": null, "labels": []}}]
+                }),
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.search_issues("project = PROJ", 0).await.unwrap();
+
+        assert_eq!(result.issues.len(), 2);
+        assert_eq!(result.issues[0].key, "PROJ-1");
+        assert_eq!(result.issues[1].key, "PROJ-2");
+    }
+
+    #[tokio::test]
+    async fn search_issues_respects_limit() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/search/jql"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({
+                    "issues": [
+                        {"key": "PROJ-1", "fields": {"summary": "A", "description": null, "status": null, "issuetype": null, "assignee": null, "priority": null, "labels": []}},
+                        {"key": "PROJ-2", "fields": {"summary": "B", "description": null, "status": null, "issuetype": null, "assignee": null, "priority": null, "labels": []}}
+                    ],
+                    "nextPageToken": "more"
+                }),
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        // Limit to 2 — should not fetch second page
+        let result = client.search_issues("project = PROJ", 2).await.unwrap();
+        assert_eq!(result.issues.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_boards_paginates_with_offset() {
+        let server = wiremock::MockServer::start().await;
+
+        // First page
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/board"))
+            .and(wiremock::matchers::query_param("startAt", "0"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "values": [{"id": 1, "name": "Board 1", "type": "scrum"}],
+                    "total": 2, "isLast": false
+                })),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Second page
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/board"))
+            .and(wiremock::matchers::query_param("startAt", "1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "values": [{"id": 2, "name": "Board 2", "type": "kanban"}],
+                    "total": 2, "isLast": true
+                })),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.get_boards(None, None, 0).await.unwrap();
+
+        assert_eq!(result.boards.len(), 2);
+        assert_eq!(result.boards[0].name, "Board 1");
+        assert_eq!(result.boards[1].name, "Board 2");
     }
 
     #[tokio::test]
@@ -1532,7 +1668,7 @@ mod tests {
                             "labels": []
                         }
                     }],
-                    "total": 1
+                    "total": 1, "isLast": true
                 })),
             )
             .expect(1)
@@ -1575,7 +1711,7 @@ mod tests {
                         {"id": 10, "name": "Sprint 1", "state": "closed", "startDate": "2026-03-01", "endDate": "2026-03-14", "goal": "MVP"},
                         {"id": 11, "name": "Sprint 2", "state": "active", "startDate": "2026-03-15", "endDate": "2026-03-28"}
                     ],
-                    "total": 2
+                    "total": 2, "isLast": true
                 }),
             ))
             .expect(1)
@@ -1604,7 +1740,7 @@ mod tests {
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "values": [{"id": 11, "name": "Sprint 2", "state": "active"}],
-                    "total": 1
+                    "total": 1, "isLast": true
                 })),
             )
             .expect(1)
@@ -1653,7 +1789,7 @@ mod tests {
                             "labels": []
                         }
                     }],
-                    "total": 1
+                    "total": 1, "isLast": true
                 })),
             )
             .expect(1)
@@ -1959,7 +2095,8 @@ mod tests {
                             "created": "2026-04-02T14:00:00.000+0000",
                             "items": [{"field": "priority", "fromString": "Medium", "toString": "High"}]
                         }
-                    ]
+                    ],
+                    "isLast": true
                 }),
             ))
             .expect(1)
@@ -2170,7 +2307,7 @@ mod tests {
                             "lead": null
                         }
                     ],
-                    "total": 2
+                    "total": 2, "isLast": true
                 })),
             )
             .expect(1)
@@ -2667,307 +2804,420 @@ impl AtlassianClient {
         Ok(())
     }
 
-    /// Searches JIRA issues using JQL.
-    pub async fn search_issues(&self, jql: &str, max_results: u32) -> Result<JiraSearchResult> {
+    /// Searches JIRA issues using JQL with auto-pagination.
+    ///
+    /// `limit` controls total results: 0 means unlimited.
+    pub async fn search_issues(&self, jql: &str, limit: u32) -> Result<JiraSearchResult> {
         let url = format!("{}/rest/api/3/search/jql", self.instance_url);
+        let effective_limit = if limit == 0 { u32::MAX } else { limit };
+        let mut all_issues = Vec::new();
+        let mut next_token: Option<String> = None;
 
-        let body = serde_json::json!({
-            "jql": jql,
-            "maxResults": max_results,
-            "fields": ["summary", "status", "issuetype", "assignee", "priority"]
-        });
+        loop {
+            let remaining = effective_limit.saturating_sub(all_issues.len() as u32);
+            if remaining == 0 {
+                break;
+            }
+            let page_size = remaining.min(PAGE_SIZE);
 
-        let response = self
-            .post_json(&url, &body)
-            .await
-            .context("Failed to send search request to JIRA API")?;
+            let mut body = serde_json::json!({
+                "jql": jql,
+                "maxResults": page_size,
+                "fields": ["summary", "status", "issuetype", "assignee", "priority"]
+            });
+            if let Some(ref token) = next_token {
+                body["nextPageToken"] = serde_json::Value::String(token.clone());
+            }
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+            let response = self
+                .post_json(&url, &body)
+                .await
+                .context("Failed to send search request to JIRA API")?;
+
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+            }
+
+            let page: JiraSearchResponse = response
+                .json()
+                .await
+                .context("Failed to parse JIRA search response")?;
+
+            let page_count = page.issues.len();
+            for r in page.issues {
+                all_issues.push(JiraIssue {
+                    key: r.key,
+                    summary: r.fields.summary.unwrap_or_default(),
+                    description_adf: r.fields.description,
+                    status: r.fields.status.and_then(|s| s.name),
+                    issue_type: r.fields.issuetype.and_then(|t| t.name),
+                    assignee: r.fields.assignee.and_then(|a| a.display_name),
+                    priority: r.fields.priority.and_then(|p| p.name),
+                    labels: r.fields.labels,
+                });
+            }
+
+            match page.next_page_token {
+                Some(token) if page_count > 0 => next_token = Some(token),
+                _ => break,
+            }
         }
 
-        let search_response: JiraSearchResponse = response
-            .json()
-            .await
-            .context("Failed to parse JIRA search response")?;
-
-        let issues: Vec<JiraIssue> = search_response
-            .issues
-            .into_iter()
-            .map(|r| JiraIssue {
-                key: r.key,
-                summary: r.fields.summary.unwrap_or_default(),
-                description_adf: r.fields.description,
-                status: r.fields.status.and_then(|s| s.name),
-                issue_type: r.fields.issuetype.and_then(|t| t.name),
-                assignee: r.fields.assignee.and_then(|a| a.display_name),
-                priority: r.fields.priority.and_then(|p| p.name),
-                labels: r.fields.labels,
-            })
-            .collect();
-
-        let total = if search_response.total > 0 {
-            search_response.total
-        } else {
-            issues.len() as u32
-        };
-
-        Ok(JiraSearchResult { issues, total })
+        let total = all_issues.len() as u32;
+        Ok(JiraSearchResult {
+            issues: all_issues,
+            total,
+        })
     }
 
-    /// Searches Confluence pages using CQL.
+    /// Searches Confluence pages using CQL with auto-pagination.
     pub async fn search_confluence(
         &self,
         cql: &str,
         limit: u32,
     ) -> Result<ConfluenceSearchResults> {
-        let base = format!("{}/wiki/rest/api/content/search", self.instance_url);
-        let url = reqwest::Url::parse_with_params(
-            &base,
-            &[
-                ("cql", cql),
-                ("limit", &limit.to_string()),
-                ("expand", "space"),
-            ],
-        )
-        .context("Failed to build Confluence search URL")?;
+        let effective_limit = if limit == 0 { u32::MAX } else { limit };
+        let mut all_results = Vec::new();
+        let mut start: u32 = 0;
 
-        let response = self.get_json(url.as_str()).await?;
+        loop {
+            let remaining = effective_limit.saturating_sub(all_results.len() as u32);
+            if remaining == 0 {
+                break;
+            }
+            let page_size = remaining.min(PAGE_SIZE);
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
+            let base = format!("{}/wiki/rest/api/content/search", self.instance_url);
+            let url = reqwest::Url::parse_with_params(
+                &base,
+                &[
+                    ("cql", cql),
+                    ("limit", &page_size.to_string()),
+                    ("start", &start.to_string()),
+                    ("expand", "space"),
+                ],
+            )
+            .context("Failed to build Confluence search URL")?;
 
-        let resp: ConfluenceContentSearchResponse = response
-            .json()
-            .await
-            .context("Failed to parse Confluence search response")?;
+            let response = self.get_json(url.as_str()).await?;
 
-        let results = resp
-            .results
-            .into_iter()
-            .map(|r| {
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+            }
+
+            let resp: ConfluenceContentSearchResponse = response
+                .json()
+                .await
+                .context("Failed to parse Confluence search response")?;
+
+            let page_count = resp.results.len() as u32;
+            for r in resp.results {
                 let space_key = r
                     .expandable
                     .and_then(|e| e.space)
                     .and_then(|s| s.rsplit('/').next().map(String::from))
                     .unwrap_or_default();
-                ConfluenceSearchResult {
+                all_results.push(ConfluenceSearchResult {
                     id: r.id,
                     title: r.title,
                     space_key,
-                }
-            })
-            .collect();
+                });
+            }
 
+            let has_next = resp.links.and_then(|l| l.next).is_some();
+            if !has_next || page_count == 0 {
+                break;
+            }
+            start += page_count;
+        }
+
+        let total = all_results.len() as u32;
         Ok(ConfluenceSearchResults {
-            results,
-            total: resp.size,
+            results: all_results,
+            total,
         })
     }
 
-    /// Lists agile boards.
+    /// Lists agile boards with auto-pagination.
     pub async fn get_boards(
         &self,
         project: Option<&str>,
         board_type: Option<&str>,
-        max_results: u32,
+        limit: u32,
     ) -> Result<AgileBoardList> {
-        let mut url = format!(
-            "{}/rest/agile/1.0/board?maxResults={}",
-            self.instance_url, max_results
-        );
-        if let Some(proj) = project {
-            url.push_str(&format!("&projectKeyOrId={proj}"));
+        let effective_limit = if limit == 0 { u32::MAX } else { limit };
+        let mut all_boards = Vec::new();
+        let mut start_at: u32 = 0;
+
+        loop {
+            let remaining = effective_limit.saturating_sub(all_boards.len() as u32);
+            if remaining == 0 {
+                break;
+            }
+            let page_size = remaining.min(PAGE_SIZE);
+
+            let mut url = format!(
+                "{}/rest/agile/1.0/board?maxResults={}&startAt={}",
+                self.instance_url, page_size, start_at
+            );
+            if let Some(proj) = project {
+                url.push_str(&format!("&projectKeyOrId={proj}"));
+            }
+            if let Some(bt) = board_type {
+                url.push_str(&format!("&type={bt}"));
+            }
+
+            let response = self.get_json(&url).await?;
+
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+            }
+
+            let resp: AgileBoardListResponse = response
+                .json()
+                .await
+                .context("Failed to parse board list response")?;
+
+            let page_count = resp.values.len() as u32;
+            for b in resp.values {
+                all_boards.push(AgileBoard {
+                    id: b.id,
+                    name: b.name,
+                    board_type: b.board_type,
+                    project_key: b.location.and_then(|l| l.project_key),
+                });
+            }
+
+            if resp.is_last || page_count == 0 {
+                break;
+            }
+            start_at += page_count;
         }
-        if let Some(bt) = board_type {
-            url.push_str(&format!("&type={bt}"));
-        }
 
-        let response = self.get_json(&url).await?;
-
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-
-        let resp: AgileBoardListResponse = response
-            .json()
-            .await
-            .context("Failed to parse board list response")?;
-
-        let boards = resp
-            .values
-            .into_iter()
-            .map(|b| AgileBoard {
-                id: b.id,
-                name: b.name,
-                board_type: b.board_type,
-                project_key: b.location.and_then(|l| l.project_key),
-            })
-            .collect();
-
+        let total = all_boards.len() as u32;
         Ok(AgileBoardList {
-            boards,
-            total: resp.total,
+            boards: all_boards,
+            total,
         })
     }
 
-    /// Lists issues on an agile board.
+    /// Lists issues on an agile board with auto-pagination.
     pub async fn get_board_issues(
         &self,
         board_id: u64,
         jql: Option<&str>,
-        max_results: u32,
+        limit: u32,
     ) -> Result<JiraSearchResult> {
-        let base = format!(
-            "{}/rest/agile/1.0/board/{}/issue",
-            self.instance_url, board_id
-        );
-        let mut params: Vec<(&str, String)> = vec![("maxResults", max_results.to_string())];
-        if let Some(jql_str) = jql {
-            params.push(("jql", jql_str.to_string()));
+        let effective_limit = if limit == 0 { u32::MAX } else { limit };
+        let mut all_issues = Vec::new();
+        let mut start_at: u32 = 0;
+
+        loop {
+            let remaining = effective_limit.saturating_sub(all_issues.len() as u32);
+            if remaining == 0 {
+                break;
+            }
+            let page_size = remaining.min(PAGE_SIZE);
+
+            let base = format!(
+                "{}/rest/agile/1.0/board/{}/issue",
+                self.instance_url, board_id
+            );
+            let mut params: Vec<(&str, String)> = vec![
+                ("maxResults", page_size.to_string()),
+                ("startAt", start_at.to_string()),
+            ];
+            if let Some(jql_str) = jql {
+                params.push(("jql", jql_str.to_string()));
+            }
+            let url = reqwest::Url::parse_with_params(
+                &base,
+                params.iter().map(|(k, v)| (*k, v.as_str())),
+            )
+            .context("Failed to build board issues URL")?;
+
+            let response = self.get_json(url.as_str()).await?;
+
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+            }
+
+            let resp: AgileIssueListResponse = response
+                .json()
+                .await
+                .context("Failed to parse board issues response")?;
+
+            let page_count = resp.issues.len() as u32;
+            for r in resp.issues {
+                all_issues.push(JiraIssue {
+                    key: r.key,
+                    summary: r.fields.summary.unwrap_or_default(),
+                    description_adf: r.fields.description,
+                    status: r.fields.status.and_then(|s| s.name),
+                    issue_type: r.fields.issuetype.and_then(|t| t.name),
+                    assignee: r.fields.assignee.and_then(|a| a.display_name),
+                    priority: r.fields.priority.and_then(|p| p.name),
+                    labels: r.fields.labels,
+                });
+            }
+
+            if resp.is_last || page_count == 0 {
+                break;
+            }
+            start_at += page_count;
         }
-        let url =
-            reqwest::Url::parse_with_params(&base, params.iter().map(|(k, v)| (*k, v.as_str())))
-                .context("Failed to build board issues URL")?;
 
-        let response = self.get_json(url.as_str()).await?;
-
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-
-        let resp: AgileIssueListResponse = response
-            .json()
-            .await
-            .context("Failed to parse board issues response")?;
-
-        let issues = resp
-            .issues
-            .into_iter()
-            .map(|r| JiraIssue {
-                key: r.key,
-                summary: r.fields.summary.unwrap_or_default(),
-                description_adf: r.fields.description,
-                status: r.fields.status.and_then(|s| s.name),
-                issue_type: r.fields.issuetype.and_then(|t| t.name),
-                assignee: r.fields.assignee.and_then(|a| a.display_name),
-                priority: r.fields.priority.and_then(|p| p.name),
-                labels: r.fields.labels,
-            })
-            .collect();
-
+        let total = all_issues.len() as u32;
         Ok(JiraSearchResult {
-            issues,
-            total: resp.total,
+            issues: all_issues,
+            total,
         })
     }
 
-    /// Lists sprints for an agile board.
+    /// Lists sprints for an agile board with auto-pagination.
     pub async fn get_sprints(
         &self,
         board_id: u64,
         state: Option<&str>,
-        max_results: u32,
+        limit: u32,
     ) -> Result<AgileSprintList> {
-        let mut url = format!(
-            "{}/rest/agile/1.0/board/{}/sprint?maxResults={}",
-            self.instance_url, board_id, max_results
-        );
-        if let Some(s) = state {
-            url.push_str(&format!("&state={s}"));
+        let effective_limit = if limit == 0 { u32::MAX } else { limit };
+        let mut all_sprints = Vec::new();
+        let mut start_at: u32 = 0;
+
+        loop {
+            let remaining = effective_limit.saturating_sub(all_sprints.len() as u32);
+            if remaining == 0 {
+                break;
+            }
+            let page_size = remaining.min(PAGE_SIZE);
+
+            let mut url = format!(
+                "{}/rest/agile/1.0/board/{}/sprint?maxResults={}&startAt={}",
+                self.instance_url, board_id, page_size, start_at
+            );
+            if let Some(s) = state {
+                url.push_str(&format!("&state={s}"));
+            }
+
+            let response = self.get_json(&url).await?;
+
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+            }
+
+            let resp: AgileSprintListResponse = response
+                .json()
+                .await
+                .context("Failed to parse sprint list response")?;
+
+            let page_count = resp.values.len() as u32;
+            for s in resp.values {
+                all_sprints.push(AgileSprint {
+                    id: s.id,
+                    name: s.name,
+                    state: s.state,
+                    start_date: s.start_date,
+                    end_date: s.end_date,
+                    goal: s.goal,
+                });
+            }
+
+            if resp.is_last || page_count == 0 {
+                break;
+            }
+            start_at += page_count;
         }
 
-        let response = self.get_json(&url).await?;
-
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-
-        let resp: AgileSprintListResponse = response
-            .json()
-            .await
-            .context("Failed to parse sprint list response")?;
-
-        let sprints = resp
-            .values
-            .into_iter()
-            .map(|s| AgileSprint {
-                id: s.id,
-                name: s.name,
-                state: s.state,
-                start_date: s.start_date,
-                end_date: s.end_date,
-                goal: s.goal,
-            })
-            .collect();
-
+        let total = all_sprints.len() as u32;
         Ok(AgileSprintList {
-            sprints,
-            total: resp.total,
+            sprints: all_sprints,
+            total,
         })
     }
 
-    /// Lists issues in an agile sprint.
+    /// Lists issues in an agile sprint with auto-pagination.
     pub async fn get_sprint_issues(
         &self,
         sprint_id: u64,
         jql: Option<&str>,
-        max_results: u32,
+        limit: u32,
     ) -> Result<JiraSearchResult> {
-        let base = format!(
-            "{}/rest/agile/1.0/sprint/{}/issue",
-            self.instance_url, sprint_id
-        );
-        let mut params: Vec<(&str, String)> = vec![("maxResults", max_results.to_string())];
-        if let Some(jql_str) = jql {
-            params.push(("jql", jql_str.to_string()));
+        let effective_limit = if limit == 0 { u32::MAX } else { limit };
+        let mut all_issues = Vec::new();
+        let mut start_at: u32 = 0;
+
+        loop {
+            let remaining = effective_limit.saturating_sub(all_issues.len() as u32);
+            if remaining == 0 {
+                break;
+            }
+            let page_size = remaining.min(PAGE_SIZE);
+
+            let base = format!(
+                "{}/rest/agile/1.0/sprint/{}/issue",
+                self.instance_url, sprint_id
+            );
+            let mut params: Vec<(&str, String)> = vec![
+                ("maxResults", page_size.to_string()),
+                ("startAt", start_at.to_string()),
+            ];
+            if let Some(jql_str) = jql {
+                params.push(("jql", jql_str.to_string()));
+            }
+            let url = reqwest::Url::parse_with_params(
+                &base,
+                params.iter().map(|(k, v)| (*k, v.as_str())),
+            )
+            .context("Failed to build sprint issues URL")?;
+
+            let response = self.get_json(url.as_str()).await?;
+
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+            }
+
+            let resp: AgileIssueListResponse = response
+                .json()
+                .await
+                .context("Failed to parse sprint issues response")?;
+
+            let page_count = resp.issues.len() as u32;
+            for r in resp.issues {
+                all_issues.push(JiraIssue {
+                    key: r.key,
+                    summary: r.fields.summary.unwrap_or_default(),
+                    description_adf: r.fields.description,
+                    status: r.fields.status.and_then(|s| s.name),
+                    issue_type: r.fields.issuetype.and_then(|t| t.name),
+                    assignee: r.fields.assignee.and_then(|a| a.display_name),
+                    priority: r.fields.priority.and_then(|p| p.name),
+                    labels: r.fields.labels,
+                });
+            }
+
+            if resp.is_last || page_count == 0 {
+                break;
+            }
+            start_at += page_count;
         }
-        let url =
-            reqwest::Url::parse_with_params(&base, params.iter().map(|(k, v)| (*k, v.as_str())))
-                .context("Failed to build sprint issues URL")?;
 
-        let response = self.get_json(url.as_str()).await?;
-
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-
-        let resp: AgileIssueListResponse = response
-            .json()
-            .await
-            .context("Failed to parse sprint issues response")?;
-
-        let issues = resp
-            .issues
-            .into_iter()
-            .map(|r| JiraIssue {
-                key: r.key,
-                summary: r.fields.summary.unwrap_or_default(),
-                description_adf: r.fields.description,
-                status: r.fields.status.and_then(|s| s.name),
-                issue_type: r.fields.issuetype.and_then(|t| t.name),
-                assignee: r.fields.assignee.and_then(|a| a.display_name),
-                priority: r.fields.priority.and_then(|p| p.name),
-                labels: r.fields.labels,
-            })
-            .collect();
-
+        let total = all_issues.len() as u32;
         Ok(JiraSearchResult {
-            issues,
-            total: resp.total,
+            issues: all_issues,
+            total,
         })
     }
 
@@ -3093,48 +3343,62 @@ impl AtlassianClient {
             .collect())
     }
 
-    /// Gets the changelog for a JIRA issue.
-    pub async fn get_changelog(
-        &self,
-        key: &str,
-        max_results: u32,
-    ) -> Result<Vec<JiraChangelogEntry>> {
-        let url = format!(
-            "{}/rest/api/3/issue/{}/changelog?maxResults={}",
-            self.instance_url, key, max_results
-        );
+    /// Gets the changelog for a JIRA issue with auto-pagination.
+    pub async fn get_changelog(&self, key: &str, limit: u32) -> Result<Vec<JiraChangelogEntry>> {
+        let effective_limit = if limit == 0 { u32::MAX } else { limit };
+        let mut all_entries = Vec::new();
+        let mut start_at: u32 = 0;
 
-        let response = self.get_json(&url).await?;
+        loop {
+            let remaining = effective_limit.saturating_sub(all_entries.len() as u32);
+            if remaining == 0 {
+                break;
+            }
+            let page_size = remaining.min(PAGE_SIZE);
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+            let url = format!(
+                "{}/rest/api/3/issue/{}/changelog?maxResults={}&startAt={}",
+                self.instance_url, key, page_size, start_at
+            );
+
+            let response = self.get_json(&url).await?;
+
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+            }
+
+            let resp: JiraChangelogResponse = response
+                .json()
+                .await
+                .context("Failed to parse changelog response")?;
+
+            let page_count = resp.values.len() as u32;
+            for e in resp.values {
+                all_entries.push(JiraChangelogEntry {
+                    id: e.id,
+                    author: e.author.and_then(|a| a.display_name).unwrap_or_default(),
+                    created: e.created.unwrap_or_default(),
+                    items: e
+                        .items
+                        .into_iter()
+                        .map(|i| JiraChangelogItem {
+                            field: i.field,
+                            from_string: i.from_string,
+                            to_string: i.to_string,
+                        })
+                        .collect(),
+                });
+            }
+
+            if resp.is_last || page_count == 0 {
+                break;
+            }
+            start_at += page_count;
         }
 
-        let resp: JiraChangelogResponse = response
-            .json()
-            .await
-            .context("Failed to parse changelog response")?;
-
-        Ok(resp
-            .values
-            .into_iter()
-            .map(|e| JiraChangelogEntry {
-                id: e.id,
-                author: e.author.and_then(|a| a.display_name).unwrap_or_default(),
-                created: e.created.unwrap_or_default(),
-                items: e
-                    .items
-                    .into_iter()
-                    .map(|i| JiraChangelogItem {
-                        field: i.field,
-                        from_string: i.from_string,
-                        to_string: i.to_string,
-                    })
-                    .collect(),
-            })
-            .collect())
+        Ok(all_entries)
     }
 
     /// Lists all JIRA field definitions.
@@ -3201,40 +3465,57 @@ impl AtlassianClient {
     }
 
     /// Lists JIRA projects.
-    pub async fn get_projects(&self, max_results: u32) -> Result<JiraProjectList> {
-        let url = format!(
-            "{}/rest/api/3/project/search?maxResults={}",
-            self.instance_url, max_results
-        );
+    pub async fn get_projects(&self, limit: u32) -> Result<JiraProjectList> {
+        let effective_limit = if limit == 0 { u32::MAX } else { limit };
+        let mut all_projects = Vec::new();
+        let mut start_at: u32 = 0;
 
-        let response = self.get_json(&url).await?;
+        loop {
+            let remaining = effective_limit.saturating_sub(all_projects.len() as u32);
+            if remaining == 0 {
+                break;
+            }
+            let page_size = remaining.min(PAGE_SIZE);
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+            let url = format!(
+                "{}/rest/api/3/project/search?maxResults={}&startAt={}",
+                self.instance_url, page_size, start_at
+            );
+
+            let response = self.get_json(&url).await?;
+
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+            }
+
+            let resp: JiraProjectSearchResponse = response
+                .json()
+                .await
+                .context("Failed to parse project search response")?;
+
+            let page_count = resp.values.len() as u32;
+            for p in resp.values {
+                all_projects.push(JiraProject {
+                    id: p.id,
+                    key: p.key,
+                    name: p.name,
+                    project_type: p.project_type_key,
+                    lead: p.lead.and_then(|l| l.display_name),
+                });
+            }
+
+            if resp.is_last || page_count == 0 {
+                break;
+            }
+            start_at += page_count;
         }
 
-        let resp: JiraProjectSearchResponse = response
-            .json()
-            .await
-            .context("Failed to parse project search response")?;
-
-        let projects = resp
-            .values
-            .into_iter()
-            .map(|p| JiraProject {
-                id: p.id,
-                key: p.key,
-                name: p.name,
-                project_type: p.project_type_key,
-                lead: p.lead.and_then(|l| l.display_name),
-            })
-            .collect();
-
+        let total = all_projects.len() as u32;
         Ok(JiraProjectList {
-            projects,
-            total: resp.total,
+            projects: all_projects,
+            total,
         })
     }
 

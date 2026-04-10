@@ -149,7 +149,7 @@ mod tests {
                 project: None,
                 assignee: None,
                 status: None,
-                max_results: 50,
+                limit: 50,
             }),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Search(_)));
@@ -194,9 +194,7 @@ mod tests {
     fn jira_subcommands_project_variant() {
         let cmd = JiraCommand {
             command: JiraSubcommands::Project(project::ProjectCommand {
-                command: project::ProjectSubcommands::List(project::ListCommand {
-                    max_results: 50,
-                }),
+                command: project::ProjectSubcommands::List(project::ListCommand { limit: 50 }),
             }),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Project(_)));
@@ -219,7 +217,7 @@ mod tests {
                 command: board::BoardSubcommands::List(board::ListCommand {
                     project: None,
                     r#type: None,
-                    max_results: 50,
+                    limit: 50,
                 }),
             }),
         };
@@ -233,7 +231,7 @@ mod tests {
                 command: sprint::SprintSubcommands::List(sprint::ListCommand {
                     board_id: 1,
                     state: None,
-                    max_results: 50,
+                    limit: 50,
                 }),
             }),
         };
@@ -255,7 +253,7 @@ mod tests {
         let cmd = JiraCommand {
             command: JiraSubcommands::Changelog(changelog::ChangelogCommand {
                 keys: "PROJ-1".to_string(),
-                max_results: 50,
+                limit: 50,
             }),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Changelog(_)));
