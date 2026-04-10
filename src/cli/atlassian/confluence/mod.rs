@@ -97,7 +97,7 @@ mod tests {
                 cql: Some("space = ENG".to_string()),
                 space: None,
                 title: None,
-                max_results: 25,
+                limit: 25,
             }),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::Search(_)));
