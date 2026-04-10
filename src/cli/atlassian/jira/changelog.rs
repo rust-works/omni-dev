@@ -9,8 +9,7 @@ use crate::cli::atlassian::helpers::create_client;
 /// Shows change history for one or more JIRA issues.
 #[derive(Parser)]
 pub struct ChangelogCommand {
-    /// Comma-separated issue keys (e.g., "PROJ-1,PROJ-2").
-    #[arg(long)]
+    /// Issue keys, comma-separated (e.g., PROJ-1 or PROJ-1,PROJ-2).
     pub keys: String,
 
     /// Maximum number of changelog entries per issue (default: 50).
