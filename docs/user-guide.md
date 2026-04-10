@@ -252,7 +252,7 @@ Read, edit, and manage JIRA issues and Confluence pages from the command line.
 Content is represented as JFM (JIRA-Flavored Markdown) with YAML frontmatter,
 enabling round-trip editing between your editor and Atlassian Cloud.
 
-See the [JFM Specification](plan/jfm.md) for full technical details on the
+See the [JFM Specification](specs/jfm.md) for full technical details on the
 markdown format.
 
 #### Authentication Setup
