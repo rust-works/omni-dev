@@ -517,6 +517,16 @@ struct JiraFieldSchema {
 }
 
 #[derive(Deserialize)]
+struct JiraFieldContextsResponse {
+    values: Vec<JiraFieldContextEntry>,
+}
+
+#[derive(Deserialize)]
+struct JiraFieldContextEntry {
+    id: String,
+}
+
+#[derive(Deserialize)]
 struct JiraFieldOptionsResponse {
     values: Vec<JiraFieldOptionEntry>,
 }
@@ -2206,12 +2216,127 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_field_options_success() {
+    async fn get_field_contexts_success() {
         let server = wiremock::MockServer::start().await;
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path(
-                "/rest/api/3/field/customfield_10001/context/default/option",
+                "/rest/api/3/field/customfield_10001/context",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"values": [{"id": "12345"}, {"id": "67890"}]}),
+                ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let contexts = client
+            .get_field_contexts("customfield_10001")
+            .await
+            .unwrap();
+
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(contexts[0], "12345");
+    }
+
+    #[tokio::test]
+    async fn get_field_contexts_empty() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/field/customfield_99999/context",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"values": []})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let contexts = client
+            .get_field_contexts("customfield_99999")
+            .await
+            .unwrap();
+        assert!(contexts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_field_options_auto_discovers_context() {
+        let server = wiremock::MockServer::start().await;
+
+        // Context discovery
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/field/customfield_10001/context",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"values": [{"id": "12345"}]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Options for discovered context
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/field/customfield_10001/context/12345/option",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"values": [{"id": "1", "value": "High"}]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let options = client
+            .get_field_options("customfield_10001", None)
+            .await
+            .unwrap();
+
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].value, "High");
+    }
+
+    #[tokio::test]
+    async fn get_field_options_no_context_errors() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/field/customfield_99999/context",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"values": []})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .get_field_options("customfield_99999", None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("No contexts found"));
+    }
+
+    #[tokio::test]
+    async fn get_field_options_with_explicit_context() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/field/customfield_10001/context/12345/option",
             ))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
                 serde_json::json!({"values": [
@@ -2226,7 +2351,7 @@ mod tests {
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
         let options = client
-            .get_field_options("customfield_10001", None)
+            .get_field_options("customfield_10001", Some("12345"))
             .await
             .unwrap();
 
@@ -2268,7 +2393,7 @@ mod tests {
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path(
-                "/rest/api/3/field/nonexistent/context/default/option",
+                "/rest/api/3/field/nonexistent/context/99999/option",
             ))
             .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
             .expect(1)
@@ -2277,7 +2402,7 @@ mod tests {
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
         let err = client
-            .get_field_options("nonexistent", None)
+            .get_field_options("nonexistent", Some("99999"))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("404"));
@@ -3430,12 +3555,49 @@ impl AtlassianClient {
     }
 
     /// Lists options for a JIRA custom field.
+    /// Lists contexts for a JIRA custom field.
+    pub async fn get_field_contexts(&self, field_id: &str) -> Result<Vec<String>> {
+        let url = format!(
+            "{}/rest/api/3/field/{}/context",
+            self.instance_url, field_id
+        );
+
+        let response = self.get_json(&url).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let resp: JiraFieldContextsResponse = response
+            .json()
+            .await
+            .context("Failed to parse field contexts response")?;
+
+        Ok(resp.values.into_iter().map(|c| c.id).collect())
+    }
+
+    /// Lists options for a JIRA custom field.
+    ///
+    /// When `context_id` is `None`, auto-discovers the first context for the field.
     pub async fn get_field_options(
         &self,
         field_id: &str,
         context_id: Option<&str>,
     ) -> Result<Vec<JiraFieldOption>> {
-        let ctx = context_id.unwrap_or("default");
+        let ctx = if let Some(id) = context_id {
+            id.to_string()
+        } else {
+            let contexts = self.get_field_contexts(field_id).await?;
+            contexts.into_iter().next().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No contexts found for field \"{field_id}\". \
+                     Use --context-id to specify one explicitly."
+                )
+            })?
+        };
+
         let url = format!(
             "{}/rest/api/3/field/{}/context/{}/option",
             self.instance_url, field_id, ctx
