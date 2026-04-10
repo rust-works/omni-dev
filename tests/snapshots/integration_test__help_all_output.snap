@@ -635,6 +635,7 @@ Manages JIRA issue links
 Usage: link <COMMAND>
 
 Commands:
+  list    Lists links on a JIRA issue
   types   Lists available issue link types
   create  Creates a link between two issues
   remove  Removes an issue link by ID
@@ -672,6 +673,21 @@ Options:
       --epic <EPIC>    Epic issue key
       --issue <ISSUE>  Issue key to link to the epic
   -h, --help           Print help
+
+
+================================================================================
+
+omni-dev atlassian jira link list - Lists links on a JIRA issue
+
+Lists links on a JIRA issue
+
+Usage: list <KEY>
+
+Arguments:
+  <KEY>  JIRA issue key (e.g., PROJ-123)
+
+Options:
+  -h, --help  Print help
 
 
 ================================================================================
