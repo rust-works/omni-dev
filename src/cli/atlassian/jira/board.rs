@@ -44,9 +44,9 @@ pub struct ListCommand {
     #[arg(long, value_name = "TYPE")]
     pub r#type: Option<String>,
 
-    /// Maximum number of results (default: 50).
+    /// Maximum number of results, 0 for unlimited (default: 50).
     #[arg(long, default_value_t = 50)]
-    pub max_results: u32,
+    pub limit: u32,
 }
 
 impl ListCommand {
@@ -54,11 +54,7 @@ impl ListCommand {
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
         let result = client
-            .get_boards(
-                self.project.as_deref(),
-                self.r#type.as_deref(),
-                self.max_results,
-            )
+            .get_boards(self.project.as_deref(), self.r#type.as_deref(), self.limit)
             .await?;
         print_boards(&result);
         Ok(())
@@ -76,9 +72,9 @@ pub struct IssuesCommand {
     #[arg(long)]
     pub jql: Option<String>,
 
-    /// Maximum number of results (default: 50).
+    /// Maximum number of results, 0 for unlimited (default: 50).
     #[arg(long, default_value_t = 50)]
-    pub max_results: u32,
+    pub limit: u32,
 }
 
 impl IssuesCommand {
@@ -86,7 +82,7 @@ impl IssuesCommand {
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
         let result = client
-            .get_board_issues(self.board_id, self.jql.as_deref(), self.max_results)
+            .get_board_issues(self.board_id, self.jql.as_deref(), self.limit)
             .await?;
         print_board_issues(&result);
         Ok(())
@@ -315,7 +311,7 @@ mod tests {
             command: BoardSubcommands::List(ListCommand {
                 project: None,
                 r#type: None,
-                max_results: 50,
+                limit: 50,
             }),
         };
         assert!(matches!(cmd.command, BoardSubcommands::List(_)));
@@ -327,7 +323,7 @@ mod tests {
             command: BoardSubcommands::Issues(IssuesCommand {
                 board_id: 1,
                 jql: None,
-                max_results: 50,
+                limit: 50,
             }),
         };
         assert!(matches!(cmd.command, BoardSubcommands::Issues(_)));
@@ -338,7 +334,7 @@ mod tests {
         let cmd = ListCommand {
             project: Some("PROJ".to_string()),
             r#type: Some("scrum".to_string()),
-            max_results: 25,
+            limit: 25,
         };
         assert_eq!(cmd.project.as_deref(), Some("PROJ"));
         assert_eq!(cmd.r#type.as_deref(), Some("scrum"));
@@ -349,7 +345,7 @@ mod tests {
         let cmd = IssuesCommand {
             board_id: 42,
             jql: Some("status = Open".to_string()),
-            max_results: 10,
+            limit: 10,
         };
         assert_eq!(cmd.board_id, 42);
         assert_eq!(cmd.jql.as_deref(), Some("status = Open"));
