@@ -226,6 +226,7 @@ Arguments:
 
 Options:
       --force  Skips the confirmation prompt
+      --purge  Permanently purges the page instead of moving to trash (requires space admin)
   -h, --help   Print help
 
 
