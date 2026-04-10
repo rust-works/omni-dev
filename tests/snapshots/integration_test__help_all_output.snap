@@ -121,8 +121,8 @@ Atlassian: JIRA and Confluence operations
 Usage: atlassian <COMMAND>
 
 Commands:
-  jira        JIRA operations (read, write, edit issues)
-  confluence  Confluence operations (read, write, edit pages)
+  jira        JIRA issue management, search, agile boards, and more
+  confluence  Confluence page management, search, and more
   convert     Converts between JFM markdown and ADF JSON
   auth        Manages Atlassian Cloud credentials
   help        Print this message or the help of the given subcommand(s)
@@ -174,9 +174,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian confluence - Confluence operations (read, write, edit pages)
+omni-dev atlassian confluence - Confluence page management, search, and more
 
-Confluence operations (read, write, edit pages)
+Confluence page management, search, and more
 
 Usage: confluence <COMMAND>
 
@@ -347,9 +347,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira - JIRA operations (read, write, edit issues)
+omni-dev atlassian jira - JIRA issue management, search, agile boards, and more
 
-JIRA operations (read, write, edit issues)
+JIRA issue management, search, agile boards, and more
 
 Usage: jira <COMMAND>
 
@@ -398,10 +398,12 @@ omni-dev atlassian jira attachment download - Downloads all attachments (or filt
 
 Downloads all attachments (or filtered by pattern)
 
-Usage: download [OPTIONS] --key <KEY>
+Usage: download [OPTIONS] <KEY>
+
+Arguments:
+  <KEY>  JIRA issue key (e.g., PROJ-123)
 
 Options:
-      --key <KEY>                JIRA issue key (e.g., PROJ-123)
       --output-dir <OUTPUT_DIR>  Output directory (defaults to current directory) [default: .]
       --filter <FILTER>          Filter filenames by substring (case-insensitive)
   -h, --help                     Print help
@@ -413,10 +415,12 @@ omni-dev atlassian jira attachment images - Downloads only image attachments
 
 Downloads only image attachments
 
-Usage: images [OPTIONS] --key <KEY>
+Usage: images [OPTIONS] <KEY>
+
+Arguments:
+  <KEY>  JIRA issue key (e.g., PROJ-123)
 
 Options:
-      --key <KEY>                JIRA issue key (e.g., PROJ-123)
       --output-dir <OUTPUT_DIR>  Output directory (defaults to current directory) [default: .]
   -h, --help                     Print help
 
@@ -474,10 +478,12 @@ omni-dev atlassian jira changelog - Shows change history for JIRA issues
 
 Shows change history for JIRA issues
 
-Usage: changelog [OPTIONS] --keys <KEYS>
+Usage: changelog [OPTIONS] <KEYS>
+
+Arguments:
+  <KEYS>  Issue keys, comma-separated (e.g., PROJ-1 or PROJ-1,PROJ-2)
 
 Options:
-      --keys <KEYS>    Comma-separated issue keys (e.g., "PROJ-1,PROJ-2")
       --limit <LIMIT>  Maximum number of changelog entries per issue (default: 50) [default: 50]
   -h, --help           Print help
 
@@ -656,8 +662,8 @@ Usage: create --type <TYPE> --inward <INWARD> --outward <OUTWARD>
 
 Options:
       --type <TYPE>        Link type name (e.g., "Blocks", "Clones")
-      --inward <INWARD>    Inward issue key (e.g., the issue that "is blocked by")
-      --outward <OUTWARD>  Outward issue key (e.g., the issue that "blocks")
+      --inward <INWARD>    Source issue key (e.g., for "Blocks": the issue doing the blocking)
+      --outward <OUTWARD>  Target issue key (e.g., for "Blocks": the issue being blocked)
   -h, --help               Print help
 
 
