@@ -344,14 +344,24 @@ impl ConfluenceApi {
     }
 
     /// Deletes a Confluence page.
-    pub async fn delete_page(&self, id: &str) -> Result<()> {
-        let url = format!("{}/wiki/api/v2/pages/{}", self.client.instance_url(), id);
+    pub async fn delete_page(&self, id: &str, purge: bool) -> Result<()> {
+        let mut url = format!("{}/wiki/api/v2/pages/{}", self.client.instance_url(), id);
+        if purge {
+            url.push_str("?purge=true");
+        }
 
         let response = self.client.delete(&url).await?;
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let body = response.text().await.unwrap_or_default();
+            if status == 404 {
+                anyhow::bail!(
+                    "Page {id} not found or insufficient permissions. \
+                     Confluence returns 404 when the API user lacks space-level delete permission. \
+                     Check Space Settings > Permissions."
+                );
+            }
             return Err(AtlassianError::ApiRequestFailed { status, body }.into());
         }
 
@@ -830,12 +840,30 @@ mod tests {
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
         let api = ConfluenceApi::new(client);
-        let result = api.delete_page("12345").await;
+        let result = api.delete_page("12345", false).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
-    async fn delete_page_not_found() {
+    async fn delete_page_with_purge() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12345"))
+            .and(wiremock::matchers::query_param("purge", "true"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let result = api.delete_page("12345", true).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_page_not_found_hints_permissions() {
         let server = wiremock::MockServer::start().await;
 
         wiremock::Mock::given(wiremock::matchers::method("DELETE"))
@@ -847,8 +875,10 @@ mod tests {
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
         let api = ConfluenceApi::new(client);
-        let err = api.delete_page("99999").await.unwrap_err();
-        assert!(err.to_string().contains("404"));
+        let err = api.delete_page("99999", false).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not found or insufficient permissions"));
+        assert!(msg.contains("Space Settings"));
     }
 
     #[tokio::test]
@@ -864,7 +894,7 @@ mod tests {
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
         let api = ConfluenceApi::new(client);
-        let err = api.delete_page("12345").await.unwrap_err();
+        let err = api.delete_page("12345", false).await.unwrap_err();
         assert!(err.to_string().contains("403"));
     }
 
