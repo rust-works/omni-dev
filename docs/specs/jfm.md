@@ -4,42 +4,7 @@
 
 JFM provides bidirectional conversion between Markdown and Atlassian Document
 Format (ADF), enabling JIRA Cloud issues and Confluence Cloud pages to be
-read, edited, and updated as local markdown files. It integrates with the
-JIRA Cloud REST API v3 and Confluence Cloud REST API v2 for fetching and
-pushing content.
-
-## Architecture
-
-```
-┌──────────────┐     ┌───────────────┐     ┌──────────────────┐
-│  CLI Layer   │────▶│  JFM Library  │────▶│  JIRA Cloud API  │
-│  (cli/jfm/)  │     │  (src/jfm/)   │     │  REST API v3     │
-└──────────────┘     └───────┬───────┘     └──────────────────┘
-                             │
-                    ┌────────┼────────┐
-                    │        │        │
-              ┌─────┴──┐ ┌──┴───┐ ┌──┴──────────────────┐
-              │Document│ │ MD ↔ │ │ Confluence Cloud API │
-              │ Parser │ │  ADF │ │   REST API v2        │
-              └────────┘ └──────┘ └─────────────────────┘
-```
-
-### Module Structure
-
-| Module           | File                | Purpose                                      |
-|------------------|---------------------|----------------------------------------------|
-| `adf`            | `adf.rs`            | ADF type definitions and node constructors    |
-| `api`            | `api.rs`            | `AtlassianApi` trait, `ContentItem`, `ContentMetadata` |
-| `attrs`          | `attrs.rs`          | Pandoc-style attribute parsing (`{key=val}`)  |
-| `auth`           | `auth.rs`           | Credential load/save from settings file       |
-| `client`         | `client.rs`         | Shared Atlassian HTTP transport (Basic Auth)  |
-| `confluence_api` | `confluence_api.rs` | Confluence REST API v2 implementation         |
-| `convert`        | `convert.rs`        | Bidirectional Markdown ↔ ADF conversion       |
-| `directive`      | `directive.rs`      | Generic directive parsing (inline/leaf/container) |
-| `document`       | `document.rs`       | JFM document format (frontmatter + body)      |
-| `error`          | `error.rs`          | Error types for the JFM subsystem             |
-| `jira_api`       | `jira_api.rs`       | JIRA REST API v3 implementation               |
-| `target`         | `target.rs`         | Target resolution (auto-detect JIRA/Confluence)|
+read, edited, and updated as local markdown files.
 
 ## JFM Document Format
 
@@ -89,7 +54,8 @@ Page body content here.
 |--------------|----------|------------------------------------------|
 | `type`       | Yes      | Always `"jira"`                          |
 | `instance`   | Yes      | Atlassian Cloud instance URL             |
-| `key`        | Yes      | JIRA issue key (e.g., `PROJ-123`)        |
+| `key`        | No       | JIRA issue key (e.g., `PROJ-123`). Absent when creating a new issue. |
+| `project`    | No       | Project key (e.g., `PROJ`). Used for issue creation when `key` is absent. |
 | `summary`    | Yes      | Issue title/summary                      |
 | `status`     | No       | Issue status (read-only from JIRA)       |
 | `issue_type` | No       | Issue type (Bug, Story, Task, etc.)      |
@@ -103,7 +69,7 @@ Page body content here.
 |--------------|----------|------------------------------------------|
 | `type`       | Yes      | Always `"confluence"`                    |
 | `instance`   | Yes      | Atlassian Cloud instance URL             |
-| `page_id`    | Yes      | Confluence page ID                       |
+| `page_id`    | No       | Confluence page ID. Absent when creating a new page. |
 | `title`      | Yes      | Page title                               |
 | `space_key`  | Yes      | Space key (e.g., `ENG`)                  |
 | `status`     | No       | Page status (`"current"` or `"draft"`)   |
@@ -276,11 +242,9 @@ Attributes follow Pandoc-style `{key=value flag}` syntax:
 - Keys: alphanumeric, hyphens, underscores
 - Values: unquoted (stop at whitespace/`}`) or quoted (single/double)
 - Flags: bare words treated as boolean true
-- Round-trip safe: `parse → render → parse` preserves structure
+- Round-trip safe: `parse -> render -> parse` preserves structure
 
-## Markdown ↔ ADF Conversion
-
-### Markdown to ADF
+## Markdown to ADF Conversion
 
 The converter uses a line-oriented parser that processes blocks in order:
 
@@ -318,119 +282,23 @@ Block-level attributes can follow a block on a separate line:
 
 Supported attributes: `align`, `indent`, `breakout`.
 
-## Atlassian Cloud API Integration
-
-### Authentication
+## Authentication
 
 - **Method**: HTTP Basic Auth (base64-encoded `email:api_token`)
-- **Credential storage**: `~/.omni-dev/settings.json` in the `env` map
+- **Credential sources** (checked in order):
+  1. Environment variables
+  2. `~/.omni-dev/settings.json` `env` map
 - **Required keys**:
   - `ATLASSIAN_INSTANCE_URL`
   - `ATLASSIAN_EMAIL`
   - `ATLASSIAN_API_TOKEN`
 - Same credentials serve both JIRA and Confluence (same Atlassian instance)
 
-### Client Architecture
-
-The `AtlassianClient` struct provides shared HTTP transport (auth headers,
-timeouts). Backend-specific logic is in `JiraApi` and `ConfluenceApi`, both
-implementing the `AtlassianApi` trait. Auto-detection in `target.rs`
-selects the correct backend based on the identifier pattern.
-
-### JIRA API Endpoints
-
-| Operation       | Method | Endpoint                         |
-|-----------------|--------|----------------------------------|
-| Fetch issue     | GET    | `/rest/api/3/issue/{key}`        |
-| Update issue    | PUT    | `/rest/api/3/issue/{key}`        |
-| Verify auth     | GET    | `/rest/api/3/myself`             |
-
-### Confluence API Endpoints
-
-| Operation       | Method | Endpoint                                            |
-|-----------------|--------|-----------------------------------------------------|
-| Fetch page      | GET    | `/wiki/api/v2/pages/{id}?body-format=atlas_doc_format` |
-| Update page     | PUT    | `/wiki/api/v2/pages/{id}`                           |
-| Fetch space     | GET    | `/wiki/api/v2/spaces/{id}`                          |
-
-### Confluence Update Details
-
-- Page updates require an incremented `version.number`
-- Current version is fetched before writing (optimistic locking)
-- ADF is sent as a JSON string in `body.value` with
-  `body.representation = "atlas_doc_format"`
-
-### Configuration
-
-- HTTP timeout: 30 seconds
-- Content-Type: `application/json`
-- Instance URL: HTTPS, trailing slash normalized
-
 ## Error Types
 
 | Error                  | Cause                                        |
 |------------------------|----------------------------------------------|
-| `CredentialsNotFound`  | No credentials in `~/.omni-dev/settings.json`|
-| `ApiRequestFailed`     | HTTP error from JIRA (includes status + body)|
+| `CredentialsNotFound`  | No credentials configured                    |
+| `ApiRequestFailed`     | HTTP error from API (includes status + body) |
 | `InvalidDocument`      | JFM parse error (bad YAML, missing delimiters)|
 | `ConversionError`      | ADF conversion failure                       |
-
-## Target Auto-Detection
-
-The `<ID>` argument is auto-detected based on pattern:
-
-| Pattern                    | Target     | Example      |
-|----------------------------|------------|--------------|
-| `[A-Z][A-Z0-9]+-\d+`      | JIRA       | `PROJ-123`   |
-| `^\d+$`                    | Confluence | `12345`      |
-| Other                      | Error      | `My Page`    |
-
-Explicit flags `--jira` and `--confluence` override auto-detection.
-
-## CLI Commands
-
-| Command                            | Purpose                              |
-|------------------------------------|--------------------------------------|
-| `omni-dev jfm auth login`         | Configure Atlassian credentials      |
-| `omni-dev jfm auth status`        | Verify authentication                |
-| `omni-dev jfm read <ID>`          | Fetch content as JFM markdown        |
-| `omni-dev jfm write <ID> [FILE]`  | Push JFM markdown to JIRA/Confluence |
-| `omni-dev jfm edit <ID>`          | Interactive fetch-edit-push cycle    |
-| `omni-dev jfm convert to-adf`     | Convert markdown to ADF JSON         |
-| `omni-dev jfm convert from-adf`   | Convert ADF JSON to markdown         |
-
-All read/write/edit commands accept `--jira` or `--confluence` flags to
-override auto-detection.
-
-See the [User Guide](../user-guide.md) for detailed command usage and
-examples.
-
-## Data Flow
-
-### Read
-
-```
-resolve_target(ID) → create_api_for_target() → api.get_content()
-→ ContentItem → content_item_to_document() → render() → stdout/file
-```
-
-### Write
-
-```
-file/stdin → JfmDocument::parse() → markdown_to_adf()
-→ resolve_target(ID) → create_api_for_target() → api.update_content()
-```
-
-### Edit
-
-```
-resolve_target(ID) → api.get_content() → JFM doc → temp file
-→ [edit loop: show/edit/accept/quit] → api.update_content() if changed
-```
-
-### Convert (local, no auth)
-
-```
-markdown → markdown_to_adf() → ADF JSON    (to-adf)
-ADF JSON → adf_to_markdown() → markdown    (from-adf)
-```
