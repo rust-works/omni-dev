@@ -21,9 +21,9 @@ pub struct SearchCommand {
     #[arg(long)]
     pub title: Option<String>,
 
-    /// Maximum number of results (default: 25).
+    /// Maximum number of results, 0 for unlimited (default: 25).
     #[arg(long, default_value_t = 25)]
-    pub max_results: u32,
+    pub limit: u32,
 }
 
 impl SearchCommand {
@@ -32,7 +32,7 @@ impl SearchCommand {
         let cql = self.build_cql()?;
         let (client, _instance_url) = create_client()?;
 
-        let result = client.search_confluence(&cql, self.max_results).await?;
+        let result = client.search_confluence(&cql, self.limit).await?;
         print_search_results(&result);
 
         Ok(())
@@ -135,7 +135,7 @@ mod tests {
             cql: Some("space = ENG ORDER BY title".to_string()),
             space: None,
             title: None,
-            max_results: 25,
+            limit: 25,
         };
         assert_eq!(cmd.build_cql().unwrap(), "space = ENG ORDER BY title");
     }
@@ -146,7 +146,7 @@ mod tests {
             cql: None,
             space: Some("ENG".to_string()),
             title: None,
-            max_results: 25,
+            limit: 25,
         };
         let cql = cmd.build_cql().unwrap();
         assert!(cql.contains("type = \"page\""));
@@ -159,7 +159,7 @@ mod tests {
             cql: None,
             space: None,
             title: Some("architecture".to_string()),
-            max_results: 25,
+            limit: 25,
         };
         let cql = cmd.build_cql().unwrap();
         assert!(cql.contains("title ~ \"architecture\""));
@@ -171,7 +171,7 @@ mod tests {
             cql: None,
             space: Some("ENG".to_string()),
             title: Some("auth".to_string()),
-            max_results: 10,
+            limit: 10,
         };
         let cql = cmd.build_cql().unwrap();
         assert!(cql.contains("type = \"page\""));
@@ -186,7 +186,7 @@ mod tests {
             cql: None,
             space: None,
             title: None,
-            max_results: 25,
+            limit: 25,
         };
         assert!(cmd.build_cql().is_err());
     }
@@ -197,7 +197,7 @@ mod tests {
             cql: Some("title = \"override\"".to_string()),
             space: Some("ENG".to_string()),
             title: Some("ignored".to_string()),
-            max_results: 25,
+            limit: 25,
         };
         assert_eq!(cmd.build_cql().unwrap(), "title = \"override\"");
     }
@@ -251,9 +251,9 @@ mod tests {
             cql: None,
             space: None,
             title: None,
-            max_results: 25,
+            limit: 25,
         };
         assert!(cmd.cql.is_none());
-        assert_eq!(cmd.max_results, 25);
+        assert_eq!(cmd.limit, 25);
     }
 }

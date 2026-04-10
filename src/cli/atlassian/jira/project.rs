@@ -33,16 +33,16 @@ impl ProjectCommand {
 /// Lists all accessible JIRA projects.
 #[derive(Parser)]
 pub struct ListCommand {
-    /// Maximum number of results (default: 50).
+    /// Maximum number of results, 0 for unlimited (default: 50).
     #[arg(long, default_value_t = 50)]
-    pub max_results: u32,
+    pub limit: u32,
 }
 
 impl ListCommand {
     /// Fetches and displays projects.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        let result = client.get_projects(self.max_results).await?;
+        let result = client.get_projects(self.limit).await?;
         print_projects(&result);
         Ok(())
     }
@@ -179,14 +179,14 @@ mod tests {
     #[test]
     fn project_command_list_variant() {
         let cmd = ProjectCommand {
-            command: ProjectSubcommands::List(ListCommand { max_results: 50 }),
+            command: ProjectSubcommands::List(ListCommand { limit: 50 }),
         };
         assert!(matches!(cmd.command, ProjectSubcommands::List(_)));
     }
 
     #[test]
     fn list_command_defaults() {
-        let cmd = ListCommand { max_results: 50 };
-        assert_eq!(cmd.max_results, 50);
+        let cmd = ListCommand { limit: 50 };
+        assert_eq!(cmd.limit, 50);
     }
 }

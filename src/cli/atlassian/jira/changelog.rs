@@ -15,7 +15,7 @@ pub struct ChangelogCommand {
 
     /// Maximum number of changelog entries per issue (default: 50).
     #[arg(long, default_value_t = 50)]
-    pub max_results: u32,
+    pub limit: u32,
 }
 
 impl ChangelogCommand {
@@ -32,7 +32,7 @@ impl ChangelogCommand {
             if i > 0 {
                 println!();
             }
-            let entries = client.get_changelog(key, self.max_results).await?;
+            let entries = client.get_changelog(key, self.limit).await?;
             print_changelog(key, &entries);
         }
 
@@ -219,9 +219,9 @@ mod tests {
     fn changelog_command_fields() {
         let cmd = ChangelogCommand {
             keys: "PROJ-1,PROJ-2".to_string(),
-            max_results: 50,
+            limit: 50,
         };
         assert_eq!(cmd.keys, "PROJ-1,PROJ-2");
-        assert_eq!(cmd.max_results, 50);
+        assert_eq!(cmd.limit, 50);
     }
 }

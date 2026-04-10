@@ -47,9 +47,9 @@ pub struct ListCommand {
     #[arg(long)]
     pub state: Option<String>,
 
-    /// Maximum number of results (default: 50).
+    /// Maximum number of results, 0 for unlimited (default: 50).
     #[arg(long, default_value_t = 50)]
-    pub max_results: u32,
+    pub limit: u32,
 }
 
 impl ListCommand {
@@ -57,7 +57,7 @@ impl ListCommand {
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
         let result = client
-            .get_sprints(self.board_id, self.state.as_deref(), self.max_results)
+            .get_sprints(self.board_id, self.state.as_deref(), self.limit)
             .await?;
         print_sprints(&result);
         Ok(())
@@ -75,9 +75,9 @@ pub struct IssuesCommand {
     #[arg(long)]
     pub jql: Option<String>,
 
-    /// Maximum number of results (default: 50).
+    /// Maximum number of results, 0 for unlimited (default: 50).
     #[arg(long, default_value_t = 50)]
-    pub max_results: u32,
+    pub limit: u32,
 }
 
 impl IssuesCommand {
@@ -85,7 +85,7 @@ impl IssuesCommand {
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
         let result = client
-            .get_sprint_issues(self.sprint_id, self.jql.as_deref(), self.max_results)
+            .get_sprint_issues(self.sprint_id, self.jql.as_deref(), self.limit)
             .await?;
         print_sprint_issues(&result);
         Ok(())
@@ -431,7 +431,7 @@ mod tests {
             command: SprintSubcommands::List(ListCommand {
                 board_id: 1,
                 state: None,
-                max_results: 50,
+                limit: 50,
             }),
         };
         assert!(matches!(cmd.command, SprintSubcommands::List(_)));
@@ -443,7 +443,7 @@ mod tests {
             command: SprintSubcommands::Issues(IssuesCommand {
                 sprint_id: 10,
                 jql: None,
-                max_results: 50,
+                limit: 50,
             }),
         };
         assert!(matches!(cmd.command, SprintSubcommands::Issues(_)));
@@ -465,7 +465,7 @@ mod tests {
         let cmd = ListCommand {
             board_id: 1,
             state: Some("active".to_string()),
-            max_results: 25,
+            limit: 25,
         };
         assert_eq!(cmd.state.as_deref(), Some("active"));
     }
