@@ -59,7 +59,7 @@ pub struct OptionsCommand {
     #[arg(long)]
     pub field_id: String,
 
-    /// Context ID (defaults to "default").
+    /// Context ID (auto-discovered if omitted).
     #[arg(long)]
     pub context_id: Option<String>,
 }

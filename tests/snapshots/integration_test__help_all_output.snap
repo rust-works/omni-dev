@@ -622,7 +622,7 @@ Usage: options [OPTIONS] --field-id <FIELD_ID>
 
 Options:
       --field-id <FIELD_ID>      Field ID (e.g., "customfield_10001")
-      --context-id <CONTEXT_ID>  Context ID (defaults to "default")
+      --context-id <CONTEXT_ID>  Context ID (auto-discovered if omitted)
   -h, --help                     Print help
 
 
