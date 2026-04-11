@@ -20,6 +20,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// this many items per page; the `limit` parameter controls the total.
 const PAGE_SIZE: u32 = 100;
 
+/// Maximum number of retries on HTTP 429 (Too Many Requests).
+const MAX_RETRIES: u32 = 3;
+
+/// Default retry delay in seconds when no `Retry-After` header is present.
+const DEFAULT_RETRY_DELAY_SECS: u64 = 2;
+
 /// HTTP client for Atlassian Cloud REST APIs.
 pub struct AtlassianClient {
     client: Client,
@@ -741,6 +747,109 @@ mod tests {
         let response: JiraIssueResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.key, "PROJ-1");
         assert!(response.fields.summary.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_json_retries_on_429() {
+        let server = wiremock::MockServer::start().await;
+
+        // First request returns 429 with Retry-After: 0
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/test"))
+            .respond_with(wiremock::ResponseTemplate::new(429).append_header("Retry-After", "0"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Second request succeeds
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/test"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let resp = client
+            .get_json(&format!("{}/test", server.uri()))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+    }
+
+    #[tokio::test]
+    async fn get_json_returns_429_after_max_retries() {
+        let server = wiremock::MockServer::start().await;
+
+        // All requests return 429
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/test"))
+            .respond_with(wiremock::ResponseTemplate::new(429).append_header("Retry-After", "0"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let resp = client
+            .get_json(&format!("{}/test", server.uri()))
+            .await
+            .unwrap();
+        // After max retries, returns the 429 response to the caller
+        assert_eq!(resp.status().as_u16(), 429);
+    }
+
+    #[tokio::test]
+    async fn post_json_retries_on_429() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/test"))
+            .respond_with(wiremock::ResponseTemplate::new(429).append_header("Retry-After", "0"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/test"))
+            .respond_with(wiremock::ResponseTemplate::new(201))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let body = serde_json::json!({"key": "value"});
+        let resp = client
+            .post_json(&format!("{}/test", server.uri()), &body)
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 201);
+    }
+
+    #[tokio::test]
+    async fn delete_retries_on_429() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/test"))
+            .respond_with(wiremock::ResponseTemplate::new(429).append_header("Retry-After", "0"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/test"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let resp = client
+            .delete(&format!("{}/test", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 204);
     }
 
     #[tokio::test]
@@ -2762,13 +2871,22 @@ impl AtlassianClient {
     /// Shared transport method used by both JIRA and Confluence API
     /// implementations.
     pub async fn get_json(&self, url: &str) -> Result<reqwest::Response> {
-        self.client
-            .get(url)
-            .header("Authorization", &self.auth_header)
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .context("Failed to send GET request to Atlassian API")
+        for attempt in 0..=MAX_RETRIES {
+            let response = self
+                .client
+                .get(url)
+                .header("Authorization", &self.auth_header)
+                .header("Accept", "application/json")
+                .send()
+                .await
+                .context("Failed to send GET request to Atlassian API")?;
+
+            if response.status().as_u16() != 429 || attempt == MAX_RETRIES {
+                return Ok(response);
+            }
+            Self::wait_for_retry(&response, attempt).await;
+        }
+        unreachable!()
     }
 
     /// Sends an authenticated PUT request with a JSON body and returns the raw response.
@@ -2780,14 +2898,23 @@ impl AtlassianClient {
         url: &str,
         body: &T,
     ) -> Result<reqwest::Response> {
-        self.client
-            .put(url)
-            .header("Authorization", &self.auth_header)
-            .header("Content-Type", "application/json")
-            .json(body)
-            .send()
-            .await
-            .context("Failed to send PUT request to Atlassian API")
+        for attempt in 0..=MAX_RETRIES {
+            let response = self
+                .client
+                .put(url)
+                .header("Authorization", &self.auth_header)
+                .header("Content-Type", "application/json")
+                .json(body)
+                .send()
+                .await
+                .context("Failed to send PUT request to Atlassian API")?;
+
+            if response.status().as_u16() != 429 || attempt == MAX_RETRIES {
+                return Ok(response);
+            }
+            Self::wait_for_retry(&response, attempt).await;
+        }
+        unreachable!()
     }
 
     /// Sends an authenticated POST request with a JSON body and returns the raw response.
@@ -2796,26 +2923,28 @@ impl AtlassianClient {
         url: &str,
         body: &T,
     ) -> Result<reqwest::Response> {
-        self.client
-            .post(url)
-            .header("Authorization", &self.auth_header)
-            .header("Content-Type", "application/json")
-            .json(body)
-            .send()
-            .await
-            .context("Failed to send POST request to Atlassian API")
+        for attempt in 0..=MAX_RETRIES {
+            let response = self
+                .client
+                .post(url)
+                .header("Authorization", &self.auth_header)
+                .header("Content-Type", "application/json")
+                .json(body)
+                .send()
+                .await
+                .context("Failed to send POST request to Atlassian API")?;
+
+            if response.status().as_u16() != 429 || attempt == MAX_RETRIES {
+                return Ok(response);
+            }
+            Self::wait_for_retry(&response, attempt).await;
+        }
+        unreachable!()
     }
 
     /// Sends an authenticated GET request and returns raw bytes.
     pub async fn get_bytes(&self, url: &str) -> Result<Vec<u8>> {
-        let response = self
-            .client
-            .get(url)
-            .header("Authorization", &self.auth_header)
-            .header("Accept", "*/*")
-            .send()
-            .await
-            .context("Failed to send GET request for binary download")?;
+        let response = self.get_json_raw_accept(url, "*/*").await?;
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
@@ -2832,12 +2961,58 @@ impl AtlassianClient {
 
     /// Sends an authenticated DELETE request and returns the raw response.
     pub async fn delete(&self, url: &str) -> Result<reqwest::Response> {
-        self.client
-            .delete(url)
-            .header("Authorization", &self.auth_header)
-            .send()
-            .await
-            .context("Failed to send DELETE request to Atlassian API")
+        for attempt in 0..=MAX_RETRIES {
+            let response = self
+                .client
+                .delete(url)
+                .header("Authorization", &self.auth_header)
+                .send()
+                .await
+                .context("Failed to send DELETE request to Atlassian API")?;
+
+            if response.status().as_u16() != 429 || attempt == MAX_RETRIES {
+                return Ok(response);
+            }
+            Self::wait_for_retry(&response, attempt).await;
+        }
+        unreachable!()
+    }
+
+    /// Internal: GET with custom Accept header and 429 retry.
+    async fn get_json_raw_accept(&self, url: &str, accept: &str) -> Result<reqwest::Response> {
+        for attempt in 0..=MAX_RETRIES {
+            let response = self
+                .client
+                .get(url)
+                .header("Authorization", &self.auth_header)
+                .header("Accept", accept)
+                .send()
+                .await
+                .context("Failed to send GET request to Atlassian API")?;
+
+            if response.status().as_u16() != 429 || attempt == MAX_RETRIES {
+                return Ok(response);
+            }
+            Self::wait_for_retry(&response, attempt).await;
+        }
+        unreachable!()
+    }
+
+    /// Waits before retrying a rate-limited request.
+    /// Uses `Retry-After` header if present, otherwise exponential backoff.
+    async fn wait_for_retry(response: &reqwest::Response, attempt: u32) {
+        let delay = response
+            .headers()
+            .get("Retry-After")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or_else(|| DEFAULT_RETRY_DELAY_SECS.pow(attempt + 1));
+
+        eprintln!(
+            "Rate limited (429). Retrying in {delay}s (attempt {})...",
+            attempt + 1
+        );
+        tokio::time::sleep(Duration::from_secs(delay)).await;
     }
 
     /// Fetches a JIRA issue by key.
