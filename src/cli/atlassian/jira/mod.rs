@@ -88,7 +88,7 @@ impl JiraCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::atlassian::format::ContentFormat;
+    use crate::cli::atlassian::format::{ContentFormat, OutputFormat};
 
     #[test]
     fn jira_subcommands_read_variant() {
@@ -150,6 +150,7 @@ mod tests {
                 assignee: None,
                 status: None,
                 limit: 50,
+                output: OutputFormat::Table,
             }),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Search(_)));
@@ -162,6 +163,7 @@ mod tests {
                 key: "PROJ-1".to_string(),
                 transition: Some("Done".to_string()),
                 list: false,
+                output: OutputFormat::Table,
             }),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Transition(_)));
@@ -173,6 +175,7 @@ mod tests {
             command: JiraSubcommands::Comment(comment::CommentCommand {
                 command: comment::CommentSubcommands::List(comment::ListCommand {
                     key: "PROJ-1".to_string(),
+                    output: OutputFormat::Table,
                 }),
             }),
         };
@@ -194,7 +197,10 @@ mod tests {
     fn jira_subcommands_project_variant() {
         let cmd = JiraCommand {
             command: JiraSubcommands::Project(project::ProjectCommand {
-                command: project::ProjectSubcommands::List(project::ListCommand { limit: 50 }),
+                command: project::ProjectSubcommands::List(project::ListCommand {
+                    limit: 50,
+                    output: OutputFormat::Table,
+                }),
             }),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Project(_)));
@@ -204,7 +210,10 @@ mod tests {
     fn jira_subcommands_field_variant() {
         let cmd = JiraCommand {
             command: JiraSubcommands::Field(field::FieldCommand {
-                command: field::FieldSubcommands::List(field::ListCommand { search: None }),
+                command: field::FieldSubcommands::List(field::ListCommand {
+                    search: None,
+                    output: OutputFormat::Table,
+                }),
             }),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Field(_)));
@@ -218,6 +227,7 @@ mod tests {
                     project: None,
                     r#type: None,
                     limit: 50,
+                    output: OutputFormat::Table,
                 }),
             }),
         };
@@ -232,6 +242,7 @@ mod tests {
                     board_id: 1,
                     state: None,
                     limit: 50,
+                    output: OutputFormat::Table,
                 }),
             }),
         };
@@ -242,7 +253,9 @@ mod tests {
     fn jira_subcommands_link_variant() {
         let cmd = JiraCommand {
             command: JiraSubcommands::Link(link::LinkCommand {
-                command: link::LinkSubcommands::Types(link::TypesCommand),
+                command: link::LinkSubcommands::Types(link::TypesCommand {
+                    output: OutputFormat::Table,
+                }),
             }),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Link(_)));
@@ -254,6 +267,7 @@ mod tests {
             command: JiraSubcommands::Changelog(changelog::ChangelogCommand {
                 keys: "PROJ-1".to_string(),
                 limit: 50,
+                output: OutputFormat::Table,
             }),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Changelog(_)));

@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::atlassian::client::{AgileSprintList, JiraSearchResult};
+use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
 /// Manages JIRA agile sprints.
@@ -50,6 +51,10 @@ pub struct ListCommand {
     /// Maximum number of results, 0 for unlimited (default: 50).
     #[arg(long, default_value_t = 50)]
     pub limit: u32,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
 }
 
 impl ListCommand {
@@ -59,6 +64,9 @@ impl ListCommand {
         let result = client
             .get_sprints(self.board_id, self.state.as_deref(), self.limit)
             .await?;
+        if output_as(&result, &self.output)? {
+            return Ok(());
+        }
         print_sprints(&result);
         Ok(())
     }
@@ -78,6 +86,10 @@ pub struct IssuesCommand {
     /// Maximum number of results, 0 for unlimited (default: 50).
     #[arg(long, default_value_t = 50)]
     pub limit: u32,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
 }
 
 impl IssuesCommand {
@@ -87,6 +99,9 @@ impl IssuesCommand {
         let result = client
             .get_sprint_issues(self.sprint_id, self.jql.as_deref(), self.limit)
             .await?;
+        if output_as(&result, &self.output)? {
+            return Ok(());
+        }
         print_sprint_issues(&result);
         Ok(())
     }
@@ -432,6 +447,7 @@ mod tests {
                 board_id: 1,
                 state: None,
                 limit: 50,
+                output: OutputFormat::Table,
             }),
         };
         assert!(matches!(cmd.command, SprintSubcommands::List(_)));
@@ -444,6 +460,7 @@ mod tests {
                 sprint_id: 10,
                 jql: None,
                 limit: 50,
+                output: OutputFormat::Table,
             }),
         };
         assert!(matches!(cmd.command, SprintSubcommands::Issues(_)));
@@ -466,6 +483,7 @@ mod tests {
             board_id: 1,
             state: Some("active".to_string()),
             limit: 25,
+            output: OutputFormat::Table,
         };
         assert_eq!(cmd.state.as_deref(), Some("active"));
     }

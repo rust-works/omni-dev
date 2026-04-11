@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::Parser;
 
 use crate::atlassian::client::JiraSearchResult;
+use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
 /// Searches JIRA issues using JQL.
@@ -28,6 +29,10 @@ pub struct SearchCommand {
     /// Maximum number of results, 0 for unlimited (default: 50).
     #[arg(long, default_value_t = 50)]
     pub limit: u32,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
 }
 
 impl SearchCommand {
@@ -37,6 +42,9 @@ impl SearchCommand {
         let (client, _instance_url) = create_client()?;
 
         let result = client.search_issues(&jql, self.limit).await?;
+        if output_as(&result, &self.output)? {
+            return Ok(());
+        }
         print_search_results(&result);
 
         Ok(())
@@ -167,6 +175,7 @@ mod tests {
             assignee: None,
             status: None,
             limit: 50,
+            output: OutputFormat::Table,
         };
         assert_eq!(cmd.build_jql().unwrap(), "project = PROJ ORDER BY created");
     }
@@ -179,6 +188,7 @@ mod tests {
             assignee: None,
             status: None,
             limit: 50,
+            output: OutputFormat::Table,
         };
         assert_eq!(cmd.build_jql().unwrap(), "project = \"PROJ\"");
     }
@@ -191,6 +201,7 @@ mod tests {
             assignee: Some("alice".to_string()),
             status: Some("Open".to_string()),
             limit: 25,
+            output: OutputFormat::Table,
         };
         let jql = cmd.build_jql().unwrap();
         assert!(jql.contains("project = \"PROJ\""));
@@ -207,6 +218,7 @@ mod tests {
             assignee: None,
             status: None,
             limit: 50,
+            output: OutputFormat::Table,
         };
         assert!(cmd.build_jql().is_err());
     }
@@ -219,6 +231,7 @@ mod tests {
             assignee: Some("alice".to_string()),
             status: None,
             limit: 50,
+            output: OutputFormat::Table,
         };
         assert_eq!(cmd.build_jql().unwrap(), "assignee = bob");
     }

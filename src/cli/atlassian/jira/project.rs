@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::atlassian::client::JiraProjectList;
+use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
 /// Manages JIRA projects.
@@ -36,6 +37,10 @@ pub struct ListCommand {
     /// Maximum number of results, 0 for unlimited (default: 50).
     #[arg(long, default_value_t = 50)]
     pub limit: u32,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
 }
 
 impl ListCommand {
@@ -43,6 +48,9 @@ impl ListCommand {
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
         let result = client.get_projects(self.limit).await?;
+        if output_as(&result, &self.output)? {
+            return Ok(());
+        }
         print_projects(&result);
         Ok(())
     }
@@ -179,14 +187,20 @@ mod tests {
     #[test]
     fn project_command_list_variant() {
         let cmd = ProjectCommand {
-            command: ProjectSubcommands::List(ListCommand { limit: 50 }),
+            command: ProjectSubcommands::List(ListCommand {
+                limit: 50,
+                output: OutputFormat::Table,
+            }),
         };
         assert!(matches!(cmd.command, ProjectSubcommands::List(_)));
     }
 
     #[test]
     fn list_command_defaults() {
-        let cmd = ListCommand { limit: 50 };
+        let cmd = ListCommand {
+            limit: 50,
+            output: OutputFormat::Table,
+        };
         assert_eq!(cmd.limit, 50);
     }
 }

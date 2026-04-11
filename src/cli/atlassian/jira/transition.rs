@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::Parser;
 
 use crate::atlassian::client::JiraTransition;
+use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
 /// Lists or executes workflow transitions on a JIRA issue.
@@ -18,6 +19,10 @@ pub struct TransitionCommand {
     /// Lists available transitions (same as omitting the transition argument).
     #[arg(long)]
     pub list: bool,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
 }
 
 impl TransitionCommand {
@@ -27,6 +32,9 @@ impl TransitionCommand {
         let transitions = client.get_transitions(&self.key).await?;
 
         let Some(target) = self.transition.as_deref().filter(|_| !self.list) else {
+            if output_as(&transitions, &self.output)? {
+                return Ok(());
+            }
             print_transitions(&transitions);
             return Ok(());
         };
@@ -228,6 +236,7 @@ mod tests {
             key: "PROJ-1".to_string(),
             transition: None,
             list: true,
+            output: OutputFormat::Table,
         };
         assert!(cmd.list);
         assert!(cmd.transition.is_none());
@@ -239,6 +248,7 @@ mod tests {
             key: "PROJ-1".to_string(),
             transition: Some("Done".to_string()),
             list: false,
+            output: OutputFormat::Table,
         };
         assert_eq!(cmd.transition.as_deref(), Some("Done"));
     }

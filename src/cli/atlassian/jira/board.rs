@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::atlassian::client::{AgileBoardList, JiraSearchResult};
+use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
 /// Manages JIRA agile boards.
@@ -47,6 +48,10 @@ pub struct ListCommand {
     /// Maximum number of results, 0 for unlimited (default: 50).
     #[arg(long, default_value_t = 50)]
     pub limit: u32,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
 }
 
 impl ListCommand {
@@ -56,6 +61,9 @@ impl ListCommand {
         let result = client
             .get_boards(self.project.as_deref(), self.r#type.as_deref(), self.limit)
             .await?;
+        if output_as(&result, &self.output)? {
+            return Ok(());
+        }
         print_boards(&result);
         Ok(())
     }
@@ -75,6 +83,10 @@ pub struct IssuesCommand {
     /// Maximum number of results, 0 for unlimited (default: 50).
     #[arg(long, default_value_t = 50)]
     pub limit: u32,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
 }
 
 impl IssuesCommand {
@@ -84,6 +96,9 @@ impl IssuesCommand {
         let result = client
             .get_board_issues(self.board_id, self.jql.as_deref(), self.limit)
             .await?;
+        if output_as(&result, &self.output)? {
+            return Ok(());
+        }
         print_board_issues(&result);
         Ok(())
     }
@@ -312,6 +327,7 @@ mod tests {
                 project: None,
                 r#type: None,
                 limit: 50,
+                output: OutputFormat::Table,
             }),
         };
         assert!(matches!(cmd.command, BoardSubcommands::List(_)));
@@ -324,6 +340,7 @@ mod tests {
                 board_id: 1,
                 jql: None,
                 limit: 50,
+                output: OutputFormat::Table,
             }),
         };
         assert!(matches!(cmd.command, BoardSubcommands::Issues(_)));
@@ -335,6 +352,7 @@ mod tests {
             project: Some("PROJ".to_string()),
             r#type: Some("scrum".to_string()),
             limit: 25,
+            output: OutputFormat::Table,
         };
         assert_eq!(cmd.project.as_deref(), Some("PROJ"));
         assert_eq!(cmd.r#type.as_deref(), Some("scrum"));
@@ -346,6 +364,7 @@ mod tests {
             board_id: 42,
             jql: Some("status = Open".to_string()),
             limit: 10,
+            output: OutputFormat::Table,
         };
         assert_eq!(cmd.board_id, 42);
         assert_eq!(cmd.jql.as_deref(), Some("status = Open"));

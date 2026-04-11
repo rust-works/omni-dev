@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::atlassian::client::{JiraIssueLink, JiraLinkType};
+use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
 /// Manages JIRA issue links.
@@ -47,6 +48,10 @@ impl LinkCommand {
 pub struct ListLinksCommand {
     /// JIRA issue key (e.g., PROJ-123).
     pub key: String,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
 }
 
 impl ListLinksCommand {
@@ -54,6 +59,9 @@ impl ListLinksCommand {
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
         let links = client.get_issue_links(&self.key).await?;
+        if output_as(&links, &self.output)? {
+            return Ok(());
+        }
         print_issue_links(&self.key, &links);
         Ok(())
     }
@@ -61,13 +69,20 @@ impl ListLinksCommand {
 
 /// Lists available issue link types.
 #[derive(Parser)]
-pub struct TypesCommand;
+pub struct TypesCommand {
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
 
 impl TypesCommand {
     /// Fetches and displays link types.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
         let types = client.get_link_types().await?;
+        if output_as(&types, &self.output)? {
+            return Ok(());
+        }
         print_link_types(&types);
         Ok(())
     }
@@ -329,6 +344,7 @@ mod tests {
         let cmd = LinkCommand {
             command: LinkSubcommands::List(ListLinksCommand {
                 key: "PROJ-1".to_string(),
+                output: OutputFormat::Table,
             }),
         };
         assert!(matches!(cmd.command, LinkSubcommands::List(_)));
@@ -337,7 +353,9 @@ mod tests {
     #[test]
     fn link_command_types_variant() {
         let cmd = LinkCommand {
-            command: LinkSubcommands::Types(TypesCommand),
+            command: LinkSubcommands::Types(TypesCommand {
+                output: OutputFormat::Table,
+            }),
         };
         assert!(matches!(cmd.command, LinkSubcommands::Types(_)));
     }
