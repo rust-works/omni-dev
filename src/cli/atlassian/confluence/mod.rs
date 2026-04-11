@@ -2,6 +2,7 @@
 
 pub(crate) mod create;
 pub(crate) mod delete;
+pub(crate) mod download;
 pub(crate) mod edit;
 pub(crate) mod read;
 pub(crate) mod search;
@@ -33,6 +34,8 @@ pub enum ConfluenceSubcommands {
     Create(create::CreateCommand),
     /// Deletes a Confluence page.
     Delete(delete::DeleteCommand),
+    /// Recursively downloads a Confluence page tree.
+    Download(download::DownloadCommand),
 }
 
 impl ConfluenceCommand {
@@ -45,6 +48,7 @@ impl ConfluenceCommand {
             ConfluenceSubcommands::Search(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Create(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Delete(cmd) => cmd.execute().await,
+            ConfluenceSubcommands::Download(cmd) => cmd.execute().await,
         }
     }
 }
@@ -129,5 +133,21 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::Delete(_)));
+    }
+
+    #[test]
+    fn confluence_subcommands_download_variant() {
+        let cmd = ConfluenceCommand {
+            command: ConfluenceSubcommands::Download(download::DownloadCommand {
+                id: "12345".to_string(),
+                output_dir: std::path::PathBuf::from("."),
+                format: ContentFormat::Jfm,
+                concurrency: 8,
+                max_depth: 0,
+                resume: false,
+                on_conflict: download::OnConflict::Backup,
+            }),
+        };
+        assert!(matches!(cmd.command, ConfluenceSubcommands::Download(_)));
     }
 }

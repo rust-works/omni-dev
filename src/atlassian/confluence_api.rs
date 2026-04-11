@@ -75,6 +75,35 @@ struct ConfluenceSpaceSearchEntry {
     id: String,
 }
 
+// ── Children response ──────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ConfluenceChildrenResponse {
+    results: Vec<ConfluenceChildEntry>,
+    #[serde(rename = "_links", default)]
+    links: Option<ConfluenceChildrenLinks>,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceChildEntry {
+    id: String,
+    title: String,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceChildrenLinks {
+    next: Option<String>,
+}
+
+/// A child page returned from the children API.
+#[derive(Debug, Clone)]
+pub struct ChildPage {
+    /// Page ID.
+    pub id: String,
+    /// Page title.
+    pub title: String,
+}
+
 // ── Create request ─────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -366,6 +395,55 @@ impl ConfluenceApi {
         }
 
         Ok(())
+    }
+
+    /// Fetches all child pages of a given page, handling pagination.
+    ///
+    /// Uses the v1 content API (`/wiki/rest/api/content/{id}/child/page`)
+    /// which is more widely supported than the v2 children endpoint.
+    pub async fn get_children(&self, page_id: &str) -> Result<Vec<ChildPage>> {
+        let mut all_children = Vec::new();
+        let mut url = format!(
+            "{}/wiki/rest/api/content/{}/child/page?limit=50",
+            self.client.instance_url(),
+            page_id
+        );
+
+        loop {
+            let response = self
+                .client
+                .get_json(&url)
+                .await
+                .context("Failed to fetch child pages")?;
+
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+            }
+
+            let resp: ConfluenceChildrenResponse = response
+                .json()
+                .await
+                .context("Failed to parse children response")?;
+
+            let page_count = resp.results.len();
+            for child in resp.results {
+                all_children.push(ChildPage {
+                    id: child.id,
+                    title: child.title,
+                });
+            }
+
+            match resp.links.and_then(|l| l.next) {
+                Some(next_path) if page_count > 0 => {
+                    url = format!("{}{}", self.client.instance_url(), next_path);
+                }
+                _ => break,
+            }
+        }
+
+        Ok(all_children)
     }
 
     /// Resolves a space ID to a space key via the Confluence API.
@@ -896,6 +974,77 @@ mod tests {
         let api = ConfluenceApi::new(client);
         let err = api.delete_page("12345", false).await.unwrap_err();
         assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn get_children_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/child/page",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {"id": "111", "title": "Child One"},
+                        {"id": "222", "title": "Child Two"}
+                    ]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let children = api.get_children("12345").await.unwrap();
+
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].id, "111");
+        assert_eq!(children[0].title, "Child One");
+        assert_eq!(children[1].id, "222");
+    }
+
+    #[tokio::test]
+    async fn get_children_empty() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/child/page",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": []})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let children = api.get_children("12345").await.unwrap();
+        assert!(children.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_children_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/99999/child/page",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = api.get_children("99999").await.unwrap_err();
+        assert!(err.to_string().contains("404"));
     }
 
     #[tokio::test]
