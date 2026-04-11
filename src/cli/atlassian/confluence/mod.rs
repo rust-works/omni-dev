@@ -52,7 +52,7 @@ impl ConfluenceCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::atlassian::format::ContentFormat;
+    use crate::cli::atlassian::format::{ContentFormat, OutputFormat};
 
     #[test]
     fn confluence_subcommands_read_variant() {
@@ -98,6 +98,7 @@ mod tests {
                 space: None,
                 title: None,
                 limit: 25,
+                output: OutputFormat::Table,
             }),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::Search(_)));
