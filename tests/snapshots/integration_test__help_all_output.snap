@@ -271,11 +271,12 @@ Searches Confluence pages using CQL
 Usage: search [OPTIONS]
 
 Options:
-      --cql <CQL>      Raw CQL query string (e.g., "space = ENG AND title ~ 'architecture'")
-      --space <SPACE>  Filter by space key
-      --title <TITLE>  Filter by title (substring match)
-      --limit <LIMIT>  Maximum number of results, 0 for unlimited (default: 25) [default: 25]
-  -h, --help           Print help
+      --cql <CQL>        Raw CQL query string (e.g., "space = ENG AND title ~ 'architecture'")
+      --space <SPACE>    Filter by space key
+      --title <TITLE>    Filter by title (substring match)
+      --limit <LIMIT>    Maximum number of results, 0 for unlimited (default: 25) [default: 25]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================
@@ -454,7 +455,8 @@ Options:
       --board-id <BOARD_ID>  Board ID
       --jql <JQL>            JQL filter for issues
       --limit <LIMIT>        Maximum number of results, 0 for unlimited (default: 50) [default: 50]
-  -h, --help                 Print help
+  -o, --output <OUTPUT>      Output format [default: table] [possible values: table, json, yaml]
+  -h, --help                 Print help (see more with '--help')
 
 
 ================================================================================
@@ -469,7 +471,8 @@ Options:
       --project <PROJECT>  Filter by project key
       --type <TYPE>        Filter by board type (scrum or kanban)
       --limit <LIMIT>      Maximum number of results, 0 for unlimited (default: 50) [default: 50]
-  -h, --help               Print help
+  -o, --output <OUTPUT>    Output format [default: table] [possible values: table, json, yaml]
+  -h, --help               Print help (see more with '--help')
 
 
 ================================================================================
@@ -484,8 +487,9 @@ Arguments:
   <KEYS>  Issue keys, comma-separated (e.g., PROJ-1 or PROJ-1,PROJ-2)
 
 Options:
-      --limit <LIMIT>  Maximum number of changelog entries per issue (default: 50) [default: 50]
-  -h, --help           Print help
+      --limit <LIMIT>    Maximum number of changelog entries per issue (default: 50) [default: 50]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================
@@ -528,13 +532,14 @@ omni-dev atlassian jira comment list - Lists comments on a JIRA issue
 
 Lists comments on a JIRA issue
 
-Usage: list <KEY>
+Usage: list [OPTIONS] <KEY>
 
 Arguments:
   <KEY>  JIRA issue key (e.g., PROJ-123)
 
 Options:
-  -h, --help  Print help
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================
@@ -615,7 +620,8 @@ Usage: list [OPTIONS]
 
 Options:
       --search <SEARCH>  Filter fields by name (case-insensitive substring match)
-  -h, --help             Print help
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================
@@ -629,7 +635,8 @@ Usage: options [OPTIONS] --field-id <FIELD_ID>
 Options:
       --field-id <FIELD_ID>      Field ID (e.g., "customfield_10001")
       --context-id <CONTEXT_ID>  Context ID (auto-discovered if omitted)
-  -h, --help                     Print help
+  -o, --output <OUTPUT>          Output format [default: table] [possible values: table, json, yaml]
+  -h, --help                     Print help (see more with '--help')
 
 
 ================================================================================
@@ -687,13 +694,14 @@ omni-dev atlassian jira link list - Lists links on a JIRA issue
 
 Lists links on a JIRA issue
 
-Usage: list <KEY>
+Usage: list [OPTIONS] <KEY>
 
 Arguments:
   <KEY>  JIRA issue key (e.g., PROJ-123)
 
 Options:
-  -h, --help  Print help
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================
@@ -715,10 +723,11 @@ omni-dev atlassian jira link types - Lists available issue link types
 
 Lists available issue link types
 
-Usage: types
+Usage: types [OPTIONS]
 
 Options:
-  -h, --help  Print help
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================
@@ -746,8 +755,9 @@ Lists all accessible JIRA projects
 Usage: list [OPTIONS]
 
 Options:
-      --limit <LIMIT>  Maximum number of results, 0 for unlimited (default: 50) [default: 50]
-  -h, --help           Print help
+      --limit <LIMIT>    Maximum number of results, 0 for unlimited (default: 50) [default: 50]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================
@@ -781,7 +791,8 @@ Options:
       --assignee <ASSIGNEE>  Filter by assignee (display name or email)
       --status <STATUS>      Filter by status name
       --limit <LIMIT>        Maximum number of results, 0 for unlimited (default: 50) [default: 50]
-  -h, --help                 Print help
+  -o, --output <OUTPUT>      Output format [default: table] [possible values: table, json, yaml]
+  -h, --help                 Print help (see more with '--help')
 
 
 ================================================================================
@@ -828,7 +839,8 @@ Options:
       --sprint-id <SPRINT_ID>  Sprint ID
       --jql <JQL>              JQL filter for issues
       --limit <LIMIT>          Maximum number of results, 0 for unlimited (default: 50) [default: 50]
-  -h, --help                   Print help
+  -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml]
+  -h, --help                   Print help (see more with '--help')
 
 
 ================================================================================
@@ -843,7 +855,8 @@ Options:
       --board-id <BOARD_ID>  Board ID
       --state <STATE>        Filter by sprint state (active, future, closed)
       --limit <LIMIT>        Maximum number of results, 0 for unlimited (default: 50) [default: 50]
-  -h, --help                 Print help
+  -o, --output <OUTPUT>      Output format [default: table] [possible values: table, json, yaml]
+  -h, --help                 Print help (see more with '--help')
 
 
 ================================================================================
@@ -859,8 +872,9 @@ Arguments:
   [TRANSITION]  Transition name or ID to execute. Omit to list available transitions
 
 Options:
-      --list  Lists available transitions (same as omitting the transition argument)
-  -h, --help  Print help
+      --list             Lists available transitions (same as omitting the transition argument)
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================
