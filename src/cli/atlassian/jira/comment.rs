@@ -7,7 +7,7 @@ use crate::atlassian::adf::AdfDocument;
 use crate::atlassian::client::JiraComment;
 use crate::atlassian::convert::{adf_to_markdown, markdown_to_adf};
 use crate::atlassian::document::JfmDocument;
-use crate::cli::atlassian::format::ContentFormat;
+use crate::cli::atlassian::format::{output_as, ContentFormat, OutputFormat};
 use crate::cli::atlassian::helpers::{create_client, read_input};
 
 /// Manages comments on a JIRA issue.
@@ -42,6 +42,10 @@ impl CommentCommand {
 pub struct ListCommand {
     /// JIRA issue key (e.g., PROJ-123).
     pub key: String,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
 }
 
 impl ListCommand {
@@ -49,6 +53,9 @@ impl ListCommand {
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
         let comments = client.get_comments(&self.key).await?;
+        if output_as(&comments, &self.output)? {
+            return Ok(());
+        }
         print_comments(&comments);
         Ok(())
     }
@@ -342,6 +349,7 @@ mod tests {
         let cmd = CommentCommand {
             command: CommentSubcommands::List(ListCommand {
                 key: "PROJ-1".to_string(),
+                output: OutputFormat::Table,
             }),
         };
         assert!(matches!(cmd.command, CommentSubcommands::List(_)));

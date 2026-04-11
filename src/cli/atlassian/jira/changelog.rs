@@ -3,7 +3,10 @@
 use anyhow::Result;
 use clap::Parser;
 
+use serde::Serialize;
+
 use crate::atlassian::client::{JiraChangelogEntry, JiraChangelogItem};
+use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
 /// Shows change history for one or more JIRA issues.
@@ -15,6 +18,10 @@ pub struct ChangelogCommand {
     /// Maximum number of changelog entries per issue (default: 50).
     #[arg(long, default_value_t = 50)]
     pub limit: u32,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
 }
 
 impl ChangelogCommand {
@@ -27,16 +34,35 @@ impl ChangelogCommand {
 
         let (client, _instance_url) = create_client()?;
 
-        for (i, key) in keys.iter().enumerate() {
+        let mut all_changelogs: Vec<IssueChangelog> = Vec::new();
+        for key in &keys {
+            let entries = client.get_changelog(key, self.limit).await?;
+            all_changelogs.push(IssueChangelog {
+                key: key.clone(),
+                entries,
+            });
+        }
+
+        if output_as(&all_changelogs, &self.output)? {
+            return Ok(());
+        }
+
+        for (i, changelog) in all_changelogs.iter().enumerate() {
             if i > 0 {
                 println!();
             }
-            let entries = client.get_changelog(key, self.limit).await?;
-            print_changelog(key, &entries);
+            print_changelog(&changelog.key, &changelog.entries);
         }
 
         Ok(())
     }
+}
+
+/// Collected changelog for a single issue, used for json/yaml serialization.
+#[derive(Serialize)]
+struct IssueChangelog {
+    key: String,
+    entries: Vec<JiraChangelogEntry>,
 }
 
 /// Parses a comma-separated list of issue keys.
@@ -219,6 +245,7 @@ mod tests {
         let cmd = ChangelogCommand {
             keys: "PROJ-1,PROJ-2".to_string(),
             limit: 50,
+            output: OutputFormat::Table,
         };
         assert_eq!(cmd.keys, "PROJ-1,PROJ-2");
         assert_eq!(cmd.limit, 50);

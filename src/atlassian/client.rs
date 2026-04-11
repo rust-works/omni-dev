@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use base64::Engine;
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::atlassian::adf::AdfDocument;
 use crate::atlassian::error::AtlassianError;
@@ -28,7 +28,7 @@ pub struct AtlassianClient {
 }
 
 /// JIRA issue data returned from the REST API.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct JiraIssue {
     /// Issue key (e.g., "PROJ-123").
     pub key: String,
@@ -72,7 +72,7 @@ pub struct JiraUser {
 }
 
 /// Result from creating a JIRA issue via the REST API.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct JiraCreatedIssue {
     /// Issue key (e.g., "PROJ-124").
     pub key: String,
@@ -83,7 +83,7 @@ pub struct JiraCreatedIssue {
 }
 
 /// Result from a JIRA JQL search.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct JiraSearchResult {
     /// Matching issues.
     pub issues: Vec<JiraIssue>,
@@ -93,7 +93,7 @@ pub struct JiraSearchResult {
 }
 
 /// A Confluence search result.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ConfluenceSearchResult {
     /// Page ID.
     pub id: String,
@@ -104,7 +104,7 @@ pub struct ConfluenceSearchResult {
 }
 
 /// Result from a Confluence CQL search.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ConfluenceSearchResults {
     /// Matching pages.
     pub results: Vec<ConfluenceSearchResult>,
@@ -113,7 +113,7 @@ pub struct ConfluenceSearchResults {
 }
 
 /// A JIRA issue comment.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct JiraComment {
     /// Comment ID.
     pub id: String,
@@ -126,7 +126,7 @@ pub struct JiraComment {
 }
 
 /// A JIRA project.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct JiraProject {
     /// Project ID.
     pub id: String,
@@ -141,7 +141,7 @@ pub struct JiraProject {
 }
 
 /// Result from listing JIRA projects.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct JiraProjectList {
     /// Projects returned.
     pub projects: Vec<JiraProject>,
@@ -150,7 +150,7 @@ pub struct JiraProjectList {
 }
 
 /// A JIRA field definition.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct JiraField {
     /// Field ID (e.g., "summary", "customfield_10001").
     pub id: String,
@@ -163,7 +163,7 @@ pub struct JiraField {
 }
 
 /// An option value for a JIRA custom field.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct JiraFieldOption {
     /// Option ID.
     pub id: String,
@@ -172,7 +172,7 @@ pub struct JiraFieldOption {
 }
 
 /// A JIRA agile board.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AgileBoard {
     /// Board ID.
     pub id: u64,
@@ -185,7 +185,7 @@ pub struct AgileBoard {
 }
 
 /// Result from listing agile boards.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AgileBoardList {
     /// Boards returned.
     pub boards: Vec<AgileBoard>,
@@ -194,7 +194,7 @@ pub struct AgileBoardList {
 }
 
 /// A JIRA agile sprint.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AgileSprint {
     /// Sprint ID.
     pub id: u64,
@@ -211,7 +211,7 @@ pub struct AgileSprint {
 }
 
 /// Result from listing agile sprints.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AgileSprintList {
     /// Sprints returned.
     pub sprints: Vec<AgileSprint>,
@@ -220,7 +220,7 @@ pub struct AgileSprintList {
 }
 
 /// A JIRA issue changelog entry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct JiraChangelogEntry {
     /// Entry ID.
     pub id: String,
@@ -233,7 +233,7 @@ pub struct JiraChangelogEntry {
 }
 
 /// A single field change in a changelog entry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct JiraChangelogItem {
     /// Field name that changed.
     pub field: String,
@@ -244,7 +244,7 @@ pub struct JiraChangelogItem {
 }
 
 /// A JIRA issue link type.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct JiraLinkType {
     /// Link type ID.
     pub id: String,
@@ -257,7 +257,7 @@ pub struct JiraLinkType {
 }
 
 /// A link on a JIRA issue.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct JiraIssueLink {
     /// Link ID (used for removal).
     pub id: String,
@@ -272,7 +272,7 @@ pub struct JiraIssueLink {
 }
 
 /// A JIRA issue attachment.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct JiraAttachment {
     /// Attachment ID.
     pub id: String,
@@ -287,7 +287,7 @@ pub struct JiraAttachment {
 }
 
 /// A JIRA workflow transition.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct JiraTransition {
     /// Transition ID.
     pub id: String,

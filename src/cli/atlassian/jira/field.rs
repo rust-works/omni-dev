@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::atlassian::client::{JiraField, JiraFieldOption};
+use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
 /// Manages JIRA field definitions and options.
@@ -39,6 +40,10 @@ pub struct ListCommand {
     /// Filter fields by name (case-insensitive substring match).
     #[arg(long)]
     pub search: Option<String>,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
 }
 
 impl ListCommand {
@@ -47,6 +52,9 @@ impl ListCommand {
         let (client, _instance_url) = create_client()?;
         let fields = client.get_fields().await?;
         let filtered = filter_fields(&fields, self.search.as_deref());
+        if output_as(&filtered, &self.output)? {
+            return Ok(());
+        }
         print_fields(&filtered);
         Ok(())
     }
@@ -62,6 +70,10 @@ pub struct OptionsCommand {
     /// Context ID (auto-discovered if omitted).
     #[arg(long)]
     pub context_id: Option<String>,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
 }
 
 impl OptionsCommand {
@@ -71,6 +83,9 @@ impl OptionsCommand {
         let options = client
             .get_field_options(&self.field_id, self.context_id.as_deref())
             .await?;
+        if output_as(&options, &self.output)? {
+            return Ok(());
+        }
         print_options(&options);
         Ok(())
     }
@@ -243,7 +258,10 @@ mod tests {
     #[test]
     fn field_command_list_variant() {
         let cmd = FieldCommand {
-            command: FieldSubcommands::List(ListCommand { search: None }),
+            command: FieldSubcommands::List(ListCommand {
+                search: None,
+                output: OutputFormat::Table,
+            }),
         };
         assert!(matches!(cmd.command, FieldSubcommands::List(_)));
     }
@@ -254,6 +272,7 @@ mod tests {
             command: FieldSubcommands::Options(OptionsCommand {
                 field_id: "customfield_10001".to_string(),
                 context_id: None,
+                output: OutputFormat::Table,
             }),
         };
         assert!(matches!(cmd.command, FieldSubcommands::Options(_)));
@@ -263,6 +282,7 @@ mod tests {
     fn list_command_with_search() {
         let cmd = ListCommand {
             search: Some("story".to_string()),
+            output: OutputFormat::Table,
         };
         assert_eq!(cmd.search.as_deref(), Some("story"));
     }
@@ -272,6 +292,7 @@ mod tests {
         let cmd = OptionsCommand {
             field_id: "customfield_10001".to_string(),
             context_id: Some("12345".to_string()),
+            output: OutputFormat::Table,
         };
         assert_eq!(cmd.context_id.as_deref(), Some("12345"));
     }

@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::Parser;
 
 use crate::atlassian::client::ConfluenceSearchResults;
+use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
 /// Searches Confluence pages using CQL.
@@ -24,6 +25,10 @@ pub struct SearchCommand {
     /// Maximum number of results, 0 for unlimited (default: 25).
     #[arg(long, default_value_t = 25)]
     pub limit: u32,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
 }
 
 impl SearchCommand {
@@ -33,6 +38,9 @@ impl SearchCommand {
         let (client, _instance_url) = create_client()?;
 
         let result = client.search_confluence(&cql, self.limit).await?;
+        if output_as(&result, &self.output)? {
+            return Ok(());
+        }
         print_search_results(&result);
 
         Ok(())
@@ -136,6 +144,7 @@ mod tests {
             space: None,
             title: None,
             limit: 25,
+            output: OutputFormat::Table,
         };
         assert_eq!(cmd.build_cql().unwrap(), "space = ENG ORDER BY title");
     }
@@ -147,6 +156,7 @@ mod tests {
             space: Some("ENG".to_string()),
             title: None,
             limit: 25,
+            output: OutputFormat::Table,
         };
         let cql = cmd.build_cql().unwrap();
         assert!(cql.contains("type = \"page\""));
@@ -160,6 +170,7 @@ mod tests {
             space: None,
             title: Some("architecture".to_string()),
             limit: 25,
+            output: OutputFormat::Table,
         };
         let cql = cmd.build_cql().unwrap();
         assert!(cql.contains("title ~ \"architecture\""));
@@ -172,6 +183,7 @@ mod tests {
             space: Some("ENG".to_string()),
             title: Some("auth".to_string()),
             limit: 10,
+            output: OutputFormat::Table,
         };
         let cql = cmd.build_cql().unwrap();
         assert!(cql.contains("type = \"page\""));
@@ -187,6 +199,7 @@ mod tests {
             space: None,
             title: None,
             limit: 25,
+            output: OutputFormat::Table,
         };
         assert!(cmd.build_cql().is_err());
     }
@@ -198,6 +211,7 @@ mod tests {
             space: Some("ENG".to_string()),
             title: Some("ignored".to_string()),
             limit: 25,
+            output: OutputFormat::Table,
         };
         assert_eq!(cmd.build_cql().unwrap(), "title = \"override\"");
     }
@@ -252,6 +266,7 @@ mod tests {
             space: None,
             title: None,
             limit: 25,
+            output: OutputFormat::Table,
         };
         assert!(cmd.cql.is_none());
         assert_eq!(cmd.limit, 25);
