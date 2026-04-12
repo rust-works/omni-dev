@@ -2361,11 +2361,17 @@ fn render_media(node: &AdfNode, parent_attrs: Option<&serde_json::Value>, output
 }
 
 /// Renders inline content (text nodes with marks) from a block node's children.
+/// Trailing spaces (not newlines) are trimmed to ensure round-trip fidelity
+/// in pipe tables, where cell content is trimmed during parsing.
 fn render_inline_content(node: &AdfNode, output: &mut String) {
     if let Some(ref content) = node.content {
         for child in content {
             render_inline_node(child, output);
         }
+    }
+    // Trim trailing spaces (but not newlines — those are from hardBreak).
+    while output.ends_with(' ') {
+        output.pop();
     }
 }
 
@@ -5379,6 +5385,77 @@ mod tests {
     fn cell_contains_hard_break_empty() {
         let para = AdfNode::paragraph(vec![]);
         assert!(!cell_contains_hard_break(&para));
+    }
+
+    // ── Trailing whitespace trimming tests ───────────────────────
+
+    #[test]
+    fn trailing_space_text_node_trimmed_in_roundtrip() {
+        // mention + " " + mention + " " → the trailing " " should not survive round-trip
+        let adf = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![
+                AdfNode::mention("abc", "@Rob"),
+                AdfNode::text(" "),
+                AdfNode::mention("def", "@Alice"),
+                AdfNode::text(" "),
+            ])],
+        };
+        let md = adf_to_markdown(&adf).unwrap();
+        // Trailing space should be stripped
+        assert!(
+            !md.trim_end_matches('\n').ends_with(' '),
+            "Rendered markdown should not have trailing space: {:?}",
+            md
+        );
+        // Round-trip should preserve inter-mention space but not trailing
+        let rt = markdown_to_adf(&md).unwrap();
+        let para = &rt.content[0];
+        let nodes = para.content.as_ref().unwrap();
+        // Should have: mention, text(" "), mention — no trailing text(" ")
+        assert_eq!(nodes.len(), 3, "Expected 3 nodes, got {nodes:?}");
+        assert_eq!(nodes[0].node_type, "mention");
+        assert_eq!(nodes[1].node_type, "text");
+        assert_eq!(nodes[1].text.as_deref(), Some(" "));
+        assert_eq!(nodes[2].node_type, "mention");
+    }
+
+    #[test]
+    fn trailing_space_trimmed_in_pipe_table_cell() {
+        let adf = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::table(vec![AdfNode::table_row(vec![
+                AdfNode::table_cell(vec![AdfNode::paragraph(vec![
+                    AdfNode::mention("abc", "@Rob"),
+                    AdfNode::text(" "),
+                    AdfNode::mention("def", "@Alice"),
+                    AdfNode::text(" "),
+                ])]),
+            ])])],
+        };
+        let md = adf_to_markdown(&adf).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let cell = &rt.content[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap()[0];
+        let para = &cell.content.as_ref().unwrap()[0];
+        let nodes = para.content.as_ref().unwrap();
+        // Inter-mention space preserved, trailing space dropped
+        assert!(
+            nodes.iter().any(|n| n.node_type == "mention"),
+            "Should have mentions"
+        );
+        assert!(
+            nodes
+                .iter()
+                .filter(|n| n.node_type == "text" && n.text.as_deref() == Some(" "))
+                .count()
+                >= 1,
+            "Should have at least one space between mentions"
+        );
     }
 
     // ── Multi-paragraph container tests ──────────────────────────
