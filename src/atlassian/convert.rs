@@ -349,13 +349,19 @@ impl<'a> MarkdownParser<'a> {
         };
         self.advance(); // past opening fence
 
-        // Collect inner lines until the matching close fence
+        // Collect inner lines until the matching close fence, tracking nesting
         let mut inner_lines = Vec::new();
+        let mut depth: usize = 0;
         while !self.at_end() {
             let current = self.current_line();
-            if is_container_close(current, colon_count) {
-                self.advance(); // past closing fence
-                break;
+            if try_parse_container_open(current).is_some() {
+                depth += 1;
+            } else if is_container_close(current, colon_count) {
+                if depth == 0 {
+                    self.advance(); // past closing fence
+                    break;
+                }
+                depth -= 1;
             }
             inner_lines.push(current.to_string());
             self.advance();
@@ -443,6 +449,7 @@ impl<'a> MarkdownParser<'a> {
         let mut current_column_lines: Vec<String> = Vec::new();
         let mut current_width: f64 = 50.0;
         let mut in_column = false;
+        let mut depth: usize = 0;
 
         let lines: Vec<&str> = inner_text.lines().collect();
         let mut i = 0;
@@ -450,7 +457,7 @@ impl<'a> MarkdownParser<'a> {
         while i < lines.len() {
             let line = lines[i];
             if let Some((col_d, _)) = try_parse_container_open(line) {
-                if col_d.name == "column" {
+                if col_d.name == "column" && depth == 0 {
                     // Flush previous column
                     if in_column && !current_column_lines.is_empty() {
                         let col_text = current_column_lines.join("\n");
@@ -468,8 +475,17 @@ impl<'a> MarkdownParser<'a> {
                     i += 1;
                     continue;
                 }
+                if in_column {
+                    depth += 1;
+                }
             }
             if in_column && is_container_close(line, 3) {
+                if depth > 0 {
+                    depth -= 1;
+                    current_column_lines.push(line.to_string());
+                    i += 1;
+                    continue;
+                }
                 // End of column
                 let col_text = current_column_lines.join("\n");
                 let blocks = MarkdownParser::new(&col_text).parse_blocks()?;
@@ -526,16 +542,22 @@ impl<'a> MarkdownParser<'a> {
     fn parse_directive_table_row(&self, lines: &[&str], start: usize) -> Result<(AdfNode, usize)> {
         let mut cells = Vec::new();
         let mut i = start;
+        let mut depth: usize = 0;
 
         while i < lines.len() {
             let line = lines[i];
             if is_container_close(line, 3) {
-                // End of :::tr
+                if depth == 0 {
+                    // End of :::tr
+                    i += 1;
+                    break;
+                }
+                depth -= 1;
                 i += 1;
-                break;
+                continue;
             }
             if let Some((d, _)) = try_parse_container_open(line) {
-                if d.name == "th" || d.name == "td" {
+                if depth == 0 && (d.name == "th" || d.name == "td") {
                     let is_header = d.name == "th";
                     let cell_attrs = d.attrs.clone();
                     i += 1;
@@ -545,6 +567,7 @@ impl<'a> MarkdownParser<'a> {
                     i = next_i;
                     continue;
                 }
+                depth += 1;
             }
             i += 1;
         }
@@ -571,12 +594,18 @@ impl<'a> MarkdownParser<'a> {
     ) -> Result<(AdfNode, usize)> {
         let mut cell_lines = Vec::new();
         let mut i = start;
+        let mut depth: usize = 0;
 
         while i < lines.len() {
             let line = lines[i];
-            if is_container_close(line, 3) {
-                i += 1;
-                break;
+            if try_parse_container_open(line).is_some() {
+                depth += 1;
+            } else if is_container_close(line, 3) {
+                if depth == 0 {
+                    i += 1;
+                    break;
+                }
+                depth -= 1;
             }
             cell_lines.push(line.to_string());
             i += 1;
@@ -4895,6 +4924,90 @@ mod tests {
             text_node.text.as_deref(),
             Some(" leading space text"),
             "leading space should be preserved"
+        );
+    }
+
+    // ── Nested container directive tests ───────────────────────────
+
+    #[test]
+    fn nested_expand_inside_panel() {
+        let md = ":::panel{type=info}\n:::expand{title=\"Details\"}\nHidden content\n:::\nMore panel content\n:::";
+        let adf = markdown_to_adf(md).unwrap();
+
+        // Should produce a panel node
+        assert_eq!(adf.content.len(), 1);
+        assert_eq!(adf.content[0].node_type, "panel");
+
+        // Panel should contain the expand AND "More panel content"
+        let panel_content = adf.content[0].content.as_ref().unwrap();
+        assert!(
+            panel_content.len() >= 2,
+            "Panel should contain expand + paragraph, got {} nodes",
+            panel_content.len()
+        );
+    }
+
+    #[test]
+    fn nested_expand_inside_table_cell() {
+        let md = "::::table\n:::tr\n:::td\n:::expand{title=\"Details\"}\nExpand content\n:::\n:::\n:::\n::::";
+        let adf = markdown_to_adf(md).unwrap();
+
+        // Should produce a table
+        assert_eq!(adf.content.len(), 1);
+        assert_eq!(adf.content[0].node_type, "table");
+
+        // Table -> row -> cell -> should contain an expand node
+        let rows = adf.content[0].content.as_ref().unwrap();
+        assert_eq!(rows.len(), 1);
+        let cells = rows[0].content.as_ref().unwrap();
+        assert_eq!(cells.len(), 1);
+        let cell_content = cells[0].content.as_ref().unwrap();
+        assert!(
+            cell_content.iter().any(|n| n.node_type == "expand"),
+            "Cell should contain an expand node, got: {:?}",
+            cell_content
+                .iter()
+                .map(|n| &n.node_type)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn nested_expand_inside_layout_column() {
+        let md = ":::layout\n:::column{width=100}\n:::expand{title=\"Col Expand\"}\nExpanded\n:::\n:::\n:::";
+        let adf = markdown_to_adf(md).unwrap();
+
+        assert_eq!(adf.content.len(), 1);
+        assert_eq!(adf.content[0].node_type, "layoutSection");
+
+        let columns = adf.content[0].content.as_ref().unwrap();
+        assert_eq!(columns.len(), 1);
+        let col_content = columns[0].content.as_ref().unwrap();
+        assert!(
+            col_content.iter().any(|n| n.node_type == "expand"),
+            "Column should contain an expand node, got: {:?}",
+            col_content.iter().map(|n| &n.node_type).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn nested_panel_inside_panel() {
+        let md = ":::panel{type=info}\n:::panel{type=warning}\nInner warning\n:::\n:::";
+        let adf = markdown_to_adf(md).unwrap();
+
+        // Outer panel should exist
+        assert_eq!(adf.content.len(), 1);
+        assert_eq!(adf.content[0].node_type, "panel");
+
+        // Outer panel should contain an inner panel (not have it truncated)
+        let panel_content = adf.content[0].content.as_ref().unwrap();
+        assert!(
+            panel_content.iter().any(|n| n.node_type == "panel"),
+            "Outer panel should contain an inner panel, got: {:?}",
+            panel_content
+                .iter()
+                .map(|n| &n.node_type)
+                .collect::<Vec<_>>()
         );
     }
 }
