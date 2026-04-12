@@ -2153,9 +2153,7 @@ fn render_directive_table(node: &AdfNode, rows: &[AdfNode], output: &mut String)
                 output.push_str(&format!(":::{directive_name}{{{cell_attr_str}}}\n"));
             }
             if let Some(ref content) = cell.content {
-                for block in content {
-                    render_block_node(block, output);
-                }
+                render_block_children(content, output);
             }
             output.push_str(":::\n");
         }
@@ -5448,6 +5446,168 @@ mod tests {
             "Expand should have 2 paragraphs after round-trip, got {}",
             expand_content.len()
         );
+    }
+
+    #[test]
+    fn consecutive_nested_expands_in_table_cell_roundtrip() {
+        let cell_content = vec![
+            AdfNode {
+                node_type: "nestedExpand".to_string(),
+                attrs: Some(serde_json::json!({"title": "First"})),
+                content: Some(vec![AdfNode::paragraph(vec![AdfNode::text("item 1")])]),
+                text: None,
+                marks: None,
+            },
+            AdfNode {
+                node_type: "nestedExpand".to_string(),
+                attrs: Some(serde_json::json!({"title": "Second"})),
+                content: Some(vec![AdfNode::paragraph(vec![AdfNode::text("item 2")])]),
+                text: None,
+                marks: None,
+            },
+        ];
+        let adf = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::table(vec![AdfNode::table_row(vec![
+                AdfNode::table_cell(cell_content),
+            ])])],
+        };
+
+        let md = adf_to_markdown(&adf).unwrap();
+        assert!(
+            md.contains(":::\n\n:::nested-expand"),
+            "Should have blank line between consecutive nested-expands in cell, got:\n{md}"
+        );
+
+        let rt = markdown_to_adf(&md).unwrap();
+        let cell = &rt.content[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap()[0];
+        let cell_nodes = cell.content.as_ref().unwrap();
+        let expand_count = cell_nodes
+            .iter()
+            .filter(|n| n.node_type == "nestedExpand")
+            .count();
+        assert_eq!(
+            expand_count, 2,
+            "Both nested-expands should survive round-trip, got {expand_count}"
+        );
+    }
+
+    #[test]
+    fn multi_paragraph_in_table_cell_roundtrip() {
+        // Two paragraphs inside a directive table cell should survive round-trip
+        let adf = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::table(vec![AdfNode::table_row(vec![
+                AdfNode::table_cell(vec![
+                    AdfNode::paragraph(vec![AdfNode::text("Para one.")]),
+                    AdfNode::paragraph(vec![AdfNode::text("Para two.")]),
+                ]),
+            ])])],
+        };
+
+        let md = adf_to_markdown(&adf).unwrap();
+        assert!(
+            md.contains("Para one.\n\nPara two."),
+            "Should have blank line between paragraphs in cell, got:\n{md}"
+        );
+
+        let rt = markdown_to_adf(&md).unwrap();
+        let cell = &rt.content[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap()[0];
+        let para_count = cell
+            .content
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|n| n.node_type == "paragraph")
+            .count();
+        assert_eq!(para_count, 2, "Both paragraphs should survive round-trip");
+    }
+
+    #[test]
+    fn panel_inside_table_cell_roundtrip() {
+        // A panel inside a directive table cell
+        let adf = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::table(vec![AdfNode::table_row(vec![
+                AdfNode::table_cell(vec![
+                    AdfNode::paragraph(vec![AdfNode::text("Before panel.")]),
+                    AdfNode {
+                        node_type: "panel".to_string(),
+                        attrs: Some(serde_json::json!({"panelType": "info"})),
+                        content: Some(vec![AdfNode::paragraph(vec![AdfNode::text(
+                            "Panel content",
+                        )])]),
+                        text: None,
+                        marks: None,
+                    },
+                ]),
+            ])])],
+        };
+
+        let md = adf_to_markdown(&adf).unwrap();
+        assert!(
+            md.contains(":::panel"),
+            "Should contain panel directive, got:\n{md}"
+        );
+
+        let rt = markdown_to_adf(&md).unwrap();
+        let cell = &rt.content[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap()[0];
+        let has_panel = cell
+            .content
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|n| n.node_type == "panel");
+        assert!(has_panel, "Panel should survive round-trip in table cell");
+    }
+
+    #[test]
+    fn three_consecutive_expands_in_table_cell() {
+        let make_expand = |title: &str| AdfNode {
+            node_type: "nestedExpand".to_string(),
+            attrs: Some(serde_json::json!({"title": title})),
+            content: Some(vec![AdfNode::paragraph(vec![AdfNode::text("content")])]),
+            text: None,
+            marks: None,
+        };
+        let adf = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::table(vec![AdfNode::table_row(vec![
+                AdfNode::table_cell(vec![
+                    make_expand("First"),
+                    make_expand("Second"),
+                    make_expand("Third"),
+                ]),
+            ])])],
+        };
+
+        let md = adf_to_markdown(&adf).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let cell = &rt.content[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap()[0];
+        let expand_count = cell
+            .content
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|n| n.node_type == "nestedExpand")
+            .count();
+        assert_eq!(expand_count, 3, "All 3 expands should survive round-trip");
     }
 
     // ── Nested container directive tests ───────────────────────────
