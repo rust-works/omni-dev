@@ -1430,7 +1430,19 @@ fn try_dispatch_inline_directive(text: &str, pos: usize) -> Option<(AdfNode, usi
                 .as_ref()
                 .and_then(|a| a.get("color"))
                 .unwrap_or("neutral");
-            AdfNode::status(content, color)
+            let mut node = AdfNode::status(content, color);
+            // Pass through style and localId if present
+            if let Some(ref attrs) = d.attrs {
+                if let Some(ref mut node_attrs) = node.attrs {
+                    if let Some(style) = attrs.get("style") {
+                        node_attrs["style"] = serde_json::Value::String(style.to_string());
+                    }
+                    if let Some(local_id) = attrs.get("localId") {
+                        node_attrs["localId"] = serde_json::Value::String(local_id.to_string());
+                    }
+                }
+            }
+            node
         }
         "date" => {
             // Convert ISO 8601 date to epoch milliseconds for ADF
@@ -2382,7 +2394,16 @@ fn render_inline_node(node: &AdfNode, output: &mut String) {
                     .get("color")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("neutral");
-                output.push_str(&format!(":status[{text}]{{color={color}}}"));
+                let mut attr_parts = vec![format!("color={color}")];
+                if let Some(style) = attrs.get("style").and_then(serde_json::Value::as_str) {
+                    attr_parts.push(format!("style={style}"));
+                }
+                if let Some(local_id) = attrs.get("localId").and_then(serde_json::Value::as_str) {
+                    if local_id != "00000000-0000-0000-0000-000000000000" {
+                        attr_parts.push(format!("localId={local_id}"));
+                    }
+                }
+                output.push_str(&format!(":status[{text}]{{{}}}", attr_parts.join(" ")));
             }
         }
         "date" => {
@@ -4023,6 +4044,59 @@ mod tests {
         let doc = markdown_to_adf(md).unwrap();
         let result = adf_to_markdown(&doc).unwrap();
         assert!(result.contains(":status[In Progress]{color=blue}"));
+    }
+
+    #[test]
+    fn status_with_style_and_localid_roundtrips() {
+        let adf = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![{
+                let mut node = AdfNode::status("open", "green");
+                node.attrs.as_mut().unwrap()["style"] =
+                    serde_json::Value::String("bold".to_string());
+                node.attrs.as_mut().unwrap()["localId"] =
+                    serde_json::Value::String("d2205ca5-84b9-4950-a730-bfe550fc146b".to_string());
+                node
+            }])],
+        };
+
+        let md = adf_to_markdown(&adf).unwrap();
+        assert!(
+            md.contains("style=bold"),
+            "Markdown should contain style attr: {md}"
+        );
+        assert!(
+            md.contains("localId=d2205ca5"),
+            "Markdown should contain localId attr: {md}"
+        );
+
+        let rt = markdown_to_adf(&md).unwrap();
+        let status = &rt.content[0].content.as_ref().unwrap()[0];
+        let attrs = status.attrs.as_ref().unwrap();
+        assert_eq!(attrs["text"], "open");
+        assert_eq!(attrs["color"], "green");
+        assert_eq!(attrs["style"], "bold");
+        assert_eq!(
+            attrs["localId"], "d2205ca5-84b9-4950-a730-bfe550fc146b",
+            "localId should be preserved, got: {}",
+            attrs["localId"]
+        );
+    }
+
+    #[test]
+    fn status_without_style_still_works() {
+        let md = ":status[Done]{color=green}\n";
+        let doc = markdown_to_adf(md).unwrap();
+        let status = &doc.content[0].content.as_ref().unwrap()[0];
+        let attrs = status.attrs.as_ref().unwrap();
+        assert_eq!(attrs["text"], "Done");
+        assert_eq!(attrs["color"], "green");
+        // No style attr — should not be present
+        assert!(
+            attrs.get("style").is_none() || attrs["style"].is_null(),
+            "style should not be set when not provided"
+        );
     }
 
     #[test]
