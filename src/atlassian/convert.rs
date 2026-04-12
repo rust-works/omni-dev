@@ -1612,6 +1612,16 @@ pub fn adf_to_markdown(doc: &AdfDocument) -> Result<String> {
     Ok(output)
 }
 
+/// Renders a sequence of block nodes with blank-line separators between them.
+fn render_block_children(children: &[AdfNode], output: &mut String) {
+    for (i, child) in children.iter().enumerate() {
+        if i > 0 {
+            output.push('\n');
+        }
+        render_block_node(child, output);
+    }
+}
+
 /// Renders a block-level ADF node to markdown.
 fn render_block_node(node: &AdfNode, output: &mut String) {
     match node.node_type.as_str() {
@@ -1803,9 +1813,7 @@ fn render_block_node(node: &AdfNode, output: &mut String) {
             }
             output.push_str(&format!(":::panel{{{}}}\n", attr_parts.join(" ")));
             if let Some(ref content) = node.content {
-                for child in content {
-                    render_block_node(child, output);
-                }
+                render_block_children(content, output);
             }
             output.push_str(":::\n");
         }
@@ -1826,9 +1834,7 @@ fn render_block_node(node: &AdfNode, output: &mut String) {
                 output.push_str(&format!(":::{directive_name}\n"));
             }
             if let Some(ref content) = node.content {
-                for child in content {
-                    render_block_node(child, output);
-                }
+                render_block_children(content, output);
             }
             output.push_str(":::\n");
         }
@@ -1845,9 +1851,7 @@ fn render_block_node(node: &AdfNode, output: &mut String) {
                             .unwrap_or(50.0);
                         output.push_str(&format!(":::column{{width={width}}}\n"));
                         if let Some(ref col_content) = child.content {
-                            for block in col_content {
-                                render_block_node(block, output);
-                            }
+                            render_block_children(col_content, output);
                         }
                         output.push_str(":::\n");
                     }
@@ -1877,9 +1881,7 @@ fn render_block_node(node: &AdfNode, output: &mut String) {
                     .unwrap_or("");
                 output.push_str(&format!(":::extension{{type={ext_type} key={ext_key}}}\n"));
                 if let Some(ref content) = node.content {
-                    for child in content {
-                        render_block_node(child, output);
-                    }
+                    render_block_children(content, output);
                 }
                 output.push_str(":::\n");
             }
@@ -5037,6 +5039,73 @@ mod tests {
     fn cell_contains_hard_break_empty() {
         let para = AdfNode::paragraph(vec![]);
         assert!(!cell_contains_hard_break(&para));
+    }
+
+    // ── Multi-paragraph container tests ──────────────────────────
+
+    #[test]
+    fn multi_paragraph_panel_roundtrips() {
+        let adf = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode {
+                node_type: "panel".to_string(),
+                attrs: Some(serde_json::json!({"panelType": "info"})),
+                content: Some(vec![
+                    AdfNode::paragraph(vec![AdfNode::text("First paragraph.")]),
+                    AdfNode::paragraph(vec![AdfNode::text("Second paragraph.")]),
+                ]),
+                text: None,
+                marks: None,
+            }],
+        };
+
+        let md = adf_to_markdown(&adf).unwrap();
+        // Should have blank line between paragraphs inside the panel
+        assert!(
+            md.contains("First paragraph.\n\nSecond paragraph."),
+            "Panel should have blank line between paragraphs, got:\n{md}"
+        );
+
+        // Round-trip should preserve two separate paragraphs
+        let roundtripped = markdown_to_adf(&md).unwrap();
+        assert_eq!(roundtripped.content.len(), 1);
+        assert_eq!(roundtripped.content[0].node_type, "panel");
+        let panel_content = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            panel_content.len(),
+            2,
+            "Panel should have 2 paragraphs after round-trip, got {}",
+            panel_content.len()
+        );
+    }
+
+    #[test]
+    fn multi_paragraph_expand_roundtrips() {
+        let adf = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode {
+                node_type: "expand".to_string(),
+                attrs: Some(serde_json::json!({"title": "Details"})),
+                content: Some(vec![
+                    AdfNode::paragraph(vec![AdfNode::text("Para one.")]),
+                    AdfNode::paragraph(vec![AdfNode::text("Para two.")]),
+                ]),
+                text: None,
+                marks: None,
+            }],
+        };
+
+        let md = adf_to_markdown(&adf).unwrap();
+        let roundtripped = markdown_to_adf(&md).unwrap();
+        let expand_content = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            expand_content.len(),
+            2,
+            "Expand should have 2 paragraphs after round-trip, got {}",
+            expand_content.len()
+        );
     }
 
     // ── Nested container directive tests ───────────────────────────
