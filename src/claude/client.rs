@@ -3078,10 +3078,12 @@ mod tests {
 
         // The file is too large for the full budget but gets a placeholder.
         // With 50k context, the placeholder is small enough to fit in a
-        // single request (no split dispatch needed). We expect 1 request.
-        let (client, _, prompt_handle) = make_small_context_client_with_prompts(vec![Ok(
-            valid_amendment_yaml(&hash, "feat(big): add large module"),
-        )]);
+        // single request. Provide a second response in case the system prompt
+        // is large enough to trigger split dispatch.
+        let (client, _, prompt_handle) = make_small_context_client_with_prompts(vec![
+            Ok(valid_amendment_yaml(&hash, "feat(big): add large module")),
+            Ok(valid_amendment_yaml(&hash, "feat(big): add large module")),
+        ]);
 
         let result = client
             .generate_amendments_with_options(&repo_view, false)

@@ -52,6 +52,25 @@ Analysis Priority:
 3. Third: Apply the exact format specification provided in the user prompt
 4. Last: Are there any important implications or impacts to highlight?
 
+TYPE SELECTION RULES (must match the commit checker's expectations):
+1. Select the type from the NATURE of the change, not its description:
+   - `docs` = ONLY when documentation files (.md, .txt, etc.) are the primary changes
+   - `refactor` = code structure changed without behavior change (renaming, moving arguments, reorganizing)
+   - `feat` = new user-facing functionality added
+   - `fix` = bug or defect fixed
+   - `test` = only test code changed
+   - `ci` = only CI/CD pipeline files changed
+   - `style` = only formatting/whitespace changed
+   - `chore` = maintenance tasks, dependency updates
+   - `build` = build system changes
+   - `perf` = performance improvements
+2. File-type constraints:
+   - If only source code files (.rs, .py, .js, etc.) changed, NEVER use `docs`
+   - If only test files changed, prefer `test`
+   - If only CI files (.github/, etc.) changed, prefer `ci`
+   - Changing doc comments or help text in source code is `refactor` or `fix`, not `docs`
+3. Before finalizing, verify: would the commit checker accept this type given the files that changed?
+
 CRITICAL OUTPUT REQUIREMENT: You MUST include ALL commits in your response, regardless of whether they need changes or not. If a commit message is already perfect, include it unchanged. Never skip commits from the amendments array.
 
 CRITICAL RESPONSE FORMAT: You MUST respond with ONLY valid YAML content. Do not include any explanatory text, markdown wrappers, or code blocks. Your entire response must be parseable YAML starting immediately with "amendments:" and containing nothing else.
