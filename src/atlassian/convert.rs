@@ -1998,9 +1998,22 @@ fn table_qualifies_for_pipe_syntax(rows: &[AdfNode]) -> bool {
             if content.len() != 1 || content[0].node_type != "paragraph" {
                 return false;
             }
+            // hardBreak inside a cell produces a newline that breaks pipe
+            // table syntax — fall back to directive form
+            if cell_contains_hard_break(&content[0]) {
+                return false;
+            }
         }
     }
     true
+}
+
+/// Returns true if a paragraph node contains any `hardBreak` inline nodes.
+fn cell_contains_hard_break(paragraph: &AdfNode) -> bool {
+    paragraph
+        .content
+        .as_ref()
+        .is_some_and(|nodes| nodes.iter().any(|n| n.node_type == "hardBreak"))
 }
 
 /// Renders a table as GFM pipe syntax.
@@ -4925,6 +4938,105 @@ mod tests {
             Some(" leading space text"),
             "leading space should be preserved"
         );
+    }
+
+    // ── Nested container directive tests ───────────────────────────
+
+    // ── hardBreak in table cell tests ────────────────────────────
+
+    #[test]
+    fn hardbreak_in_cell_uses_directive_table() {
+        // A table cell with a hardBreak should NOT use pipe syntax
+        // because the newline would break the row
+        let adf = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::table(vec![AdfNode::table_row(vec![
+                AdfNode::table_cell(vec![AdfNode::paragraph(vec![
+                    AdfNode::text("before"),
+                    AdfNode::hard_break(),
+                    AdfNode::text("after"),
+                ])]),
+            ])])],
+        };
+        let md = adf_to_markdown(&adf).unwrap();
+        // Should render as directive table, not pipe table
+        assert!(
+            md.contains(":::td") || md.contains("::::table"),
+            "Table with hardBreak should use directive form, got:\n{md}"
+        );
+        assert!(
+            !md.contains("| before"),
+            "Should NOT use pipe syntax with hardBreak"
+        );
+    }
+
+    #[test]
+    fn hardbreak_in_cell_roundtrips() {
+        // Verify the directive table form preserves the hardBreak on round-trip
+        let adf = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::table(vec![AdfNode::table_row(vec![
+                AdfNode::table_cell(vec![AdfNode::paragraph(vec![
+                    AdfNode::text("line one"),
+                    AdfNode::hard_break(),
+                    AdfNode::text("line two"),
+                ])]),
+            ])])],
+        };
+        let md = adf_to_markdown(&adf).unwrap();
+        let roundtripped = markdown_to_adf(&md).unwrap();
+
+        // Should still have one table with one row with one cell
+        assert_eq!(roundtripped.content.len(), 1);
+        assert_eq!(roundtripped.content[0].node_type, "table");
+        let rows = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "Should have exactly 1 row, got {}",
+            rows.len()
+        );
+    }
+
+    #[test]
+    fn table_without_hardbreak_uses_pipe_syntax() {
+        // A simple table without hardBreak should still use pipe syntax
+        let adf = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::table(vec![AdfNode::table_row(vec![
+                AdfNode::table_cell(vec![AdfNode::paragraph(vec![AdfNode::text("simple cell")])]),
+            ])])],
+        };
+        let md = adf_to_markdown(&adf).unwrap();
+        assert!(
+            md.contains("| simple cell |"),
+            "Simple table should use pipe syntax, got:\n{md}"
+        );
+    }
+
+    #[test]
+    fn cell_contains_hard_break_true() {
+        let para = AdfNode::paragraph(vec![
+            AdfNode::text("a"),
+            AdfNode::hard_break(),
+            AdfNode::text("b"),
+        ]);
+        assert!(cell_contains_hard_break(&para));
+    }
+
+    #[test]
+    fn cell_contains_hard_break_false() {
+        let para = AdfNode::paragraph(vec![AdfNode::text("no break here")]);
+        assert!(!cell_contains_hard_break(&para));
+    }
+
+    #[test]
+    fn cell_contains_hard_break_empty() {
+        let para = AdfNode::paragraph(vec![]);
+        assert!(!cell_contains_hard_break(&para));
     }
 
     // ── Nested container directive tests ───────────────────────────
