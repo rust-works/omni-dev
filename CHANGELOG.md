@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-04-12
+
+### Added
+- **Confluence Download**: Recursive page tree download with concurrent workers
+  - BFS tree traversal via Confluence children API
+  - Bounded parallel downloads with configurable concurrency (`--concurrency`)
+  - Directory tree mirroring with `{id}-{slug}/index.{md,json}` structure
+  - Manifest-based resume (`--resume`) with ID-aware page tracking
+  - Per-page `meta.json` with untruncated titles and parent IDs
+  - Backup-before-clobber with `--on-conflict backup|skip|overwrite`
+  - Append-mode `download.log` recording all actions per run
+  - Configurable max depth (`--max-depth`)
+- **Structured Output**: `--output json|yaml|table` flag on all list/table commands
+  - Added `Serialize` derives to all public Atlassian data types
+  - `OutputFormat` enum with `output_as()` helper
+- **HTTP 429 Rate Limiting**: Automatic retry with `Retry-After` header support
+  - All transport methods (`get_json`, `post_json`, `put_json`, `delete`, `get_bytes`) retry on 429
+  - Exponential backoff fallback when no `Retry-After` header is present
+  - Configurable max retries (default: 3)
+
+### Fixed
+- **Nested Container Directives**: Container directives (`:::expand`, `:::panel`) inside table cells, layout columns, and other containers are now correctly parsed with depth tracking
+- **hardBreak in Table Cells**: Tables containing `hardBreak` nodes now fall back to directive form instead of pipe tables, preventing row corruption on round-trip
+- **Multi-Paragraph Containers**: Panels, expands, layout columns, and extensions with multiple paragraphs now render with blank-line separators, preserving paragraph boundaries on round-trip
+- **Commit Message Generator**: Added type selection rules to align generator with checker expectations — prevents incorrect type selection (e.g., `docs` for source code changes)
+
 ## [0.19.0] - 2026-04-10
 
 ### Added
@@ -690,7 +716,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation and community files (README, CONTRIBUTING, CODE_OF_CONDUCT)
 - BSD 3-Clause license
 
-[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/rust-works/omni-dev/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/rust-works/omni-dev/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/rust-works/omni-dev/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/rust-works/omni-dev/compare/v0.16.0...v0.17.0
