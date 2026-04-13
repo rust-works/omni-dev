@@ -87,6 +87,7 @@ mod tests {
             command: AtlassianSubcommands::Convert(convert::ConvertCommand {
                 command: convert::ConvertSubcommands::FromAdf(convert::FromAdfCommand {
                     file: None,
+                    strip_local_ids: false,
                 }),
             }),
         };
