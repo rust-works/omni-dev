@@ -1442,9 +1442,13 @@ fn try_parse_bracketed_span(text: &str, i: usize) -> Option<(usize, Vec<AdfNode>
     let result: Vec<AdfNode> = inner
         .into_iter()
         .map(|mut node| {
-            for mark in &marks {
-                add_mark(&mut node, mark.clone());
+            // Prepend bracket marks before inner marks to preserve original
+            // ADF mark ordering (e.g., [underline, strong] not [strong, underline]).
+            let mut combined = marks.clone();
+            if let Some(ref existing) = node.marks {
+                combined.extend(existing.iter().cloned());
             }
+            node.marks = Some(combined);
             node
         })
         .collect();
@@ -4100,6 +4104,30 @@ mod tests {
         let doc = markdown_to_adf(md).unwrap();
         let result = adf_to_markdown(&doc).unwrap();
         assert!(result.contains("[underlined text]{underline}"));
+    }
+
+    #[test]
+    fn mark_ordering_underline_strong_preserved() {
+        // Issue #383: mark ordering was non-deterministic
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"bold and underlined","marks":[{"type":"underline"},{"type":"strong"}]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(
+            mark_types,
+            vec!["underline", "strong"],
+            "mark order should be preserved, got: {mark_types:?}"
+        );
     }
 
     #[test]
