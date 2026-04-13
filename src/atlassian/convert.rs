@@ -606,6 +606,22 @@ impl<'a> MarkdownParser<'a> {
                     i = next_i;
                     continue;
                 }
+                if d.name == "caption" {
+                    i += 1;
+                    let mut caption_lines = Vec::new();
+                    while i < lines.len() {
+                        if is_container_close(lines[i], 3) {
+                            i += 1;
+                            break;
+                        }
+                        caption_lines.push(lines[i]);
+                        i += 1;
+                    }
+                    let caption_text = caption_lines.join("\n");
+                    let inline_nodes = parse_inline(&caption_text);
+                    rows.push(AdfNode::caption(inline_nodes));
+                    continue;
+                }
             }
             i += 1;
         }
@@ -2289,6 +2305,10 @@ fn render_table(node: &AdfNode, output: &mut String, opts: &RenderOptions) {
 ///   always treat the first row as headers, so `tableCell`-only first rows
 ///   must use directive form to preserve the cell type)
 fn table_qualifies_for_pipe_syntax(rows: &[AdfNode]) -> bool {
+    // Tables with caption nodes must use directive form
+    if rows.iter().any(|n| n.node_type == "caption") {
+        return false;
+    }
     let mut first_row_has_header = false;
     for (row_idx, row) in rows.iter().enumerate() {
         let Some(ref cells) = row.content else {
@@ -2404,6 +2424,17 @@ fn render_directive_table(
     }
 
     for row in rows {
+        if row.node_type == "caption" {
+            output.push_str(":::caption\n");
+            if let Some(ref content) = row.content {
+                for child in content {
+                    render_inline_node(child, output, opts);
+                }
+                output.push('\n');
+            }
+            output.push_str(":::\n");
+            continue;
+        }
         let Some(ref cells) = row.content else {
             continue;
         };
@@ -7448,6 +7479,122 @@ C
                 "heading"
             ],
             "Content after tables was dropped: got {types:?}"
+        );
+    }
+
+    // ── Table caption tests (issue #382) ────────────────────────────
+
+    #[test]
+    fn adf_table_caption_to_markdown() {
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::table(vec![
+                AdfNode::table_row(vec![AdfNode::table_cell(vec![AdfNode::paragraph(vec![
+                    AdfNode::text("cell"),
+                ])])]),
+                AdfNode::caption(vec![AdfNode::text("Table caption")]),
+            ])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("::::table"),
+            "table with caption must use directive form"
+        );
+        assert!(
+            md.contains(":::caption"),
+            "caption directive missing, got: {md}"
+        );
+        assert!(
+            md.contains("Table caption"),
+            "caption text missing, got: {md}"
+        );
+    }
+
+    #[test]
+    fn directive_table_caption_parses() {
+        let md = "::::table\n:::tr\n:::td\ncell\n:::\n:::\n:::caption\nTable caption\n:::\n::::\n";
+        let doc = markdown_to_adf(md).unwrap();
+        let table = &doc.content[0];
+        assert_eq!(table.node_type, "table");
+        let children = table.content.as_ref().unwrap();
+        assert_eq!(children.len(), 2, "expected row + caption");
+        assert_eq!(children[0].node_type, "tableRow");
+        assert_eq!(children[1].node_type, "caption");
+        let caption_content = children[1].content.as_ref().unwrap();
+        assert_eq!(caption_content[0].text.as_deref(), Some("Table caption"));
+    }
+
+    #[test]
+    fn table_caption_round_trip_from_adf_json() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"table","attrs":{"isNumberColumnEnabled":false,"layout":"default"},"content":[
+          {"type":"tableRow","content":[{"type":"tableCell","attrs":{},"content":[{"type":"paragraph","content":[{"type":"text","text":"cell"}]}]}]},
+          {"type":"caption","content":[{"type":"text","text":"Table caption"}]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("Table caption"), "caption text lost in ADF→JFM");
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let children = round_tripped.content[0].content.as_ref().unwrap();
+        let caption = children.iter().find(|n| n.node_type == "caption");
+        assert!(caption.is_some(), "caption lost on round-trip");
+        let caption_text = caption.unwrap().content.as_ref().unwrap();
+        assert_eq!(caption_text[0].text.as_deref(), Some("Table caption"));
+    }
+
+    #[test]
+    fn table_caption_with_inline_marks_round_trips() {
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::table(vec![
+                AdfNode::table_row(vec![AdfNode::table_cell(vec![AdfNode::paragraph(vec![
+                    AdfNode::text("data"),
+                ])])]),
+                AdfNode::caption(vec![
+                    AdfNode::text("Caption with "),
+                    AdfNode::text_with_marks("bold", vec![AdfMark::strong()]),
+                ]),
+            ])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("**bold**"), "bold mark missing in caption");
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let caption = round_tripped.content[0]
+            .content
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|n| n.node_type == "caption")
+            .expect("caption node missing after round-trip");
+        let inlines = caption.content.as_ref().unwrap();
+        let bold_node = inlines.iter().find(|n| {
+            n.marks
+                .as_ref()
+                .is_some_and(|m| m.iter().any(|mk| mk.mark_type == "strong"))
+        });
+        assert!(bold_node.is_some(), "bold mark lost in caption round-trip");
+    }
+
+    #[test]
+    fn pipe_table_not_used_when_caption_present() {
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::table(vec![
+                AdfNode::table_row(vec![AdfNode::table_header(vec![AdfNode::paragraph(vec![
+                    AdfNode::text("H"),
+                ])])]),
+                AdfNode::table_row(vec![AdfNode::table_cell(vec![AdfNode::paragraph(vec![
+                    AdfNode::text("D"),
+                ])])]),
+                AdfNode::caption(vec![AdfNode::text("cap")]),
+            ])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("::::table"),
+            "pipe syntax should not be used when caption is present"
         );
     }
 }
