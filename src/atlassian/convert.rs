@@ -2847,7 +2847,23 @@ fn render_marked_text(text: &str, marks: &[AdfMark], output: &mut String) {
                 attr_parts.push(kind.to_string());
             }
         }
-        output.push_str(&format!(":span[{inner}]{{{}}}", attr_parts.join(" ")));
+        let span = format!(":span[{inner}]{{{}}}", attr_parts.join(" "));
+        // If there's also a link mark, wrap the span in a link
+        if let Some(link_mark) = has_link {
+            let href = link_mark
+                .attrs
+                .as_ref()
+                .and_then(|a| a.get("href"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            output.push('[');
+            output.push_str(&span);
+            output.push_str("](");
+            output.push_str(href);
+            output.push(')');
+        } else {
+            output.push_str(&span);
+        }
     } else if has_underline || !annotations.is_empty() {
         let mut attr_parts = Vec::new();
         if has_underline {
@@ -5040,6 +5056,127 @@ mod tests {
         let doc = markdown_to_adf(md).unwrap();
         let result = adf_to_markdown(&doc).unwrap();
         assert!(result.contains(":span[red text]{color=#ff5630}"));
+    }
+
+    #[test]
+    fn text_color_and_link_marks_both_preserved() {
+        // Issue #405: text with both textColor and link marks loses link on round-trip
+        let adf_json = r##"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"red link","marks":[
+            {"type":"link","attrs":{"href":"https://example.com"}},
+            {"type":"textColor","attrs":{"color":"#ff0000"}}
+          ]}
+        ]}]}"##;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains(":span[red link]{color=#ff0000}"),
+            "JFM should contain span with color, got: {md}"
+        );
+        assert!(
+            md.contains("](https://example.com)"),
+            "JFM should contain link href, got: {md}"
+        );
+        // Full round-trip: both marks survive
+        let rt = markdown_to_adf(&md).unwrap();
+        let text_node = &rt.content[0].content.as_ref().unwrap()[0];
+        let marks = text_node.marks.as_ref().expect("should have marks");
+        assert!(
+            marks.iter().any(|m| m.mark_type == "textColor"),
+            "should have textColor mark, got: {:?}",
+            marks.iter().map(|m| &m.mark_type).collect::<Vec<_>>()
+        );
+        assert!(
+            marks.iter().any(|m| m.mark_type == "link"),
+            "should have link mark, got: {:?}",
+            marks.iter().map(|m| &m.mark_type).collect::<Vec<_>>()
+        );
+        // Verify attribute values survive
+        let link_mark = marks.iter().find(|m| m.mark_type == "link").unwrap();
+        assert_eq!(
+            link_mark.attrs.as_ref().unwrap()["href"],
+            "https://example.com"
+        );
+        let color_mark = marks.iter().find(|m| m.mark_type == "textColor").unwrap();
+        assert_eq!(color_mark.attrs.as_ref().unwrap()["color"], "#ff0000");
+    }
+
+    #[test]
+    fn bg_color_and_link_marks_both_preserved() {
+        let adf_json = r##"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"highlighted link","marks":[
+            {"type":"link","attrs":{"href":"https://example.com"}},
+            {"type":"backgroundColor","attrs":{"color":"#ffff00"}}
+          ]}
+        ]}]}"##;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("bg=#ffff00"), "should have bg color: {md}");
+        assert!(
+            md.contains("](https://example.com)"),
+            "should have link: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let text_node = &rt.content[0].content.as_ref().unwrap()[0];
+        let marks = text_node.marks.as_ref().expect("should have marks");
+        assert!(marks.iter().any(|m| m.mark_type == "backgroundColor"));
+        assert!(marks.iter().any(|m| m.mark_type == "link"));
+    }
+
+    #[test]
+    fn text_color_link_and_strong_rendering() {
+        // Verify textColor + link + strong renders all three formatting elements
+        let adf_json = r##"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"bold red link","marks":[
+            {"type":"strong"},
+            {"type":"link","attrs":{"href":"https://example.com"}},
+            {"type":"textColor","attrs":{"color":"#ff0000"}}
+          ]}
+        ]}]}"##;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("**bold red link**"), "should have bold: {md}");
+        assert!(md.contains("color=#ff0000"), "should have color: {md}");
+        assert!(
+            md.contains("](https://example.com)"),
+            "should have link: {md}"
+        );
+    }
+
+    #[test]
+    fn subsup_and_link_marks_both_preserved() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"note","marks":[
+            {"type":"link","attrs":{"href":"https://example.com"}},
+            {"type":"subsup","attrs":{"type":"sup"}}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("sup"), "should have sup: {md}");
+        assert!(
+            md.contains("](https://example.com)"),
+            "should have link: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let text_node = &rt.content[0].content.as_ref().unwrap()[0];
+        let marks = text_node.marks.as_ref().expect("should have marks");
+        assert!(marks.iter().any(|m| m.mark_type == "subsup"));
+        assert!(marks.iter().any(|m| m.mark_type == "link"));
+    }
+
+    #[test]
+    fn text_color_without_link_unchanged() {
+        // Regression guard: textColor without link should still work
+        let adf_json = r##"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"just red","marks":[
+            {"type":"textColor","attrs":{"color":"#ff0000"}}
+          ]}
+        ]}]}"##;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains(":span[just red]{color=#ff0000}"), "md: {md}");
+        assert!(!md.contains("](http"), "should NOT have link syntax: {md}");
     }
 
     #[test]
