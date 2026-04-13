@@ -759,7 +759,13 @@ impl<'a> MarkdownParser<'a> {
                 }
                 node
             }
-            "paragraph" => AdfNode::paragraph(vec![]),
+            "paragraph" => {
+                if let Some(ref text) = d.content {
+                    AdfNode::paragraph(parse_inline(text))
+                } else {
+                    AdfNode::paragraph(vec![])
+                }
+            }
             _ => return None,
         };
 
@@ -1858,8 +1864,17 @@ fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) 
             if is_empty {
                 output.push_str("::paragraph\n");
             } else {
-                render_inline_content(node, output, opts);
-                output.push('\n');
+                // Render to a buffer first to check if content is whitespace-only
+                let mut buf = String::new();
+                render_inline_content(node, &mut buf, opts);
+                if buf.trim().is_empty() && !buf.is_empty() {
+                    // Whitespace-only content (e.g. NBSP) would be lost as a plain
+                    // line — use the ::paragraph[content] directive form instead
+                    output.push_str(&format!("::paragraph[{buf}]\n"));
+                } else {
+                    output.push_str(&buf);
+                    output.push('\n');
+                }
             }
         }
         "heading" => {
@@ -6405,6 +6420,102 @@ mod tests {
             "middle paragraph should be empty"
         );
         assert_eq!(adf_out.content[2].node_type, "paragraph");
+    }
+
+    #[test]
+    fn nbsp_paragraph_roundtrip() {
+        // Issue #411: paragraph with only NBSP should survive round-trip
+        let adf_json = "{\"version\":1,\"type\":\"doc\",\"content\":[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"\\u00a0\"}]}]}";
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("::paragraph["),
+            "NBSP paragraph should use directive form: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        assert_eq!(rt.content.len(), 1, "should have 1 block");
+        assert_eq!(rt.content[0].node_type, "paragraph");
+        let text = rt.content[0].content.as_ref().unwrap()[0]
+            .text
+            .as_deref()
+            .unwrap_or("");
+        assert_eq!(text, "\u{00a0}", "NBSP should survive round-trip");
+    }
+
+    #[test]
+    fn nbsp_in_nested_expand_roundtrip() {
+        // Issue #411 real-world case: NBSP paragraph inside nestedExpand
+        let adf_json = "{\"version\":1,\"type\":\"doc\",\"content\":[{\"type\":\"nestedExpand\",\"attrs\":{\"title\":\"Section\"},\"content\":[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"\\u00a0\"}]}]}]}";
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let ne = &rt.content[0];
+        assert_eq!(ne.node_type, "nestedExpand");
+        let inner = ne.content.as_ref().unwrap();
+        assert_eq!(inner.len(), 1, "should have 1 inner block");
+        assert_eq!(inner[0].node_type, "paragraph");
+        let content = inner[0].content.as_ref().unwrap();
+        assert!(!content.is_empty(), "paragraph should not be empty");
+        let text = content[0].text.as_deref().unwrap_or("");
+        assert_eq!(text, "\u{00a0}", "NBSP should survive in nestedExpand");
+    }
+
+    #[test]
+    fn nbsp_followed_by_content() {
+        // NBSP paragraph followed by regular content should not interfere
+        let adf_json = "{\"version\":1,\"type\":\"doc\",\"content\":[{\"type\":\"nestedExpand\",\"attrs\":{\"title\":\"S\"},\"content\":[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"\\u00a0\"}]}]},{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"after\"}]}]}";
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        assert!(rt.content.len() >= 2, "should have at least 2 blocks");
+        // The second block should be a paragraph with "after"
+        let after_para = rt.content.iter().find(|n| {
+            n.node_type == "paragraph"
+                && n.content
+                    .as_ref()
+                    .and_then(|c| c.first())
+                    .and_then(|n| n.text.as_deref())
+                    .map_or(false, |t| t.contains("after"))
+        });
+        assert!(after_para.is_some(), "should have paragraph with 'after'");
+    }
+
+    #[test]
+    fn nbsp_paragraph_with_marks_survives() {
+        // NBSP with bold marks renders as `** **` which contains non-whitespace
+        // chars and thus doesn't need the directive form — it round-trips naturally
+        let adf_json = "{\"version\":1,\"type\":\"doc\",\"content\":[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"\\u00a0\",\"marks\":[{\"type\":\"strong\"}]}]}]}";
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("**"), "should have bold markers: {md}");
+        let rt = markdown_to_adf(&md).unwrap();
+        let content = rt.content[0].content.as_ref().unwrap();
+        assert!(!content.is_empty(), "should preserve content");
+    }
+
+    #[test]
+    fn regular_paragraph_unchanged() {
+        // Regression guard: normal paragraphs should NOT use directive form
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"hello"}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            !md.contains("::paragraph"),
+            "regular paragraphs should not use directive form: {md}"
+        );
+        assert!(md.contains("hello"));
+    }
+
+    #[test]
+    fn paragraph_directive_with_content_parsed() {
+        // ::paragraph[content] should parse to a paragraph with inline nodes
+        let md = "::paragraph[\u{00a0}]\n";
+        let doc = markdown_to_adf(md).unwrap();
+        assert_eq!(doc.content.len(), 1);
+        assert_eq!(doc.content[0].node_type, "paragraph");
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert!(!content.is_empty(), "should have inline content");
+        assert_eq!(content[0].text.as_deref().unwrap(), "\u{00a0}");
     }
 
     #[test]
