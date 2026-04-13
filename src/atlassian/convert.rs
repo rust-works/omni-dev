@@ -1253,11 +1253,7 @@ fn extract_cell_attrs(cell_text: &str) -> (String, Option<serde_json::Value>) {
     if let Some((end_pos, attrs)) = parse_attrs(trimmed, 0) {
         let remaining = trimmed[end_pos..].trim_start().to_string();
         let adf_attrs = build_cell_attrs(&attrs);
-        if adf_attrs == serde_json::json!({}) {
-            (cell_text.to_string(), None)
-        } else {
-            (remaining, Some(adf_attrs))
-        }
+        (remaining, Some(adf_attrs))
     } else {
         (cell_text.to_string(), None)
     }
@@ -2587,7 +2583,7 @@ fn render_directive_table(
                     cell_attr_str.push_str(&lid_parts.join(" "));
                 }
             }
-            if cell_attr_str.is_empty() {
+            if cell_attr_str.is_empty() && cell.attrs.is_none() {
                 output.push_str(&format!(":::{directive_name}\n"));
             } else {
                 output.push_str(&format!(":::{directive_name}{{{cell_attr_str}}}\n"));
@@ -2652,8 +2648,13 @@ fn build_cell_attrs_string(cell: &AdfNode) -> String {
 
 /// Renders `{attrs}` prefix for a pipe table cell (background, colspan, etc.).
 fn render_cell_attrs_prefix(cell: &AdfNode, output: &mut String) {
+    let Some(ref _attrs) = cell.attrs else {
+        return;
+    };
     let attr_str = build_cell_attrs_string(cell);
-    if !attr_str.is_empty() {
+    if attr_str.is_empty() {
+        output.push_str("{} ");
+    } else {
         output.push_str(&format!("{{{attr_str}}} "));
     }
 }
@@ -8256,6 +8257,88 @@ C
                 .is_some_and(|m| m.iter().any(|mk| mk.mark_type == "strong"))
         });
         assert!(bold_node.is_some(), "bold mark lost in caption round-trip");
+    }
+
+    #[test]
+    #[test]
+    fn tablecell_empty_attrs_preserved_on_roundtrip() {
+        // Issue #385: tableCell with empty attrs:{} dropped on round-trip
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"table","content":[{"type":"tableRow","content":[{"type":"tableCell","attrs":{},"content":[{"type":"paragraph","content":[{"type":"text","text":"hello"}]}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let rows = round_tripped.content[0].content.as_ref().unwrap();
+        let cell = &rows[0].content.as_ref().unwrap()[0];
+        assert!(
+            cell.attrs.is_some(),
+            "tableCell attrs should be preserved, got None"
+        );
+        assert_eq!(
+            cell.attrs.as_ref().unwrap(),
+            &serde_json::json!({}),
+            "tableCell attrs should be an empty object"
+        );
+    }
+
+    #[test]
+    fn tablecell_empty_attrs_serialized_in_json() {
+        // Issue #385: ensure the serialized JSON includes "attrs":{}
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"table","content":[{"type":"tableRow","content":[{"type":"tableCell","attrs":{},"content":[{"type":"paragraph","content":[{"type":"text","text":"hello"}]}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let json = serde_json::to_string(&round_tripped).unwrap();
+        assert!(
+            json.contains(r#""attrs":{}"#),
+            "serialized JSON should contain \"attrs\":{{}}, got: {json}"
+        );
+    }
+
+    #[test]
+    fn tablecell_empty_attrs_renders_braces_in_markdown() {
+        // Issue #385: tableCell with empty attrs should render {} prefix in pipe tables
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"table","content":[{"type":"tableRow","content":[{"type":"tableHeader","content":[{"type":"paragraph","content":[{"type":"text","text":"H"}]}]},{"type":"tableHeader","content":[{"type":"paragraph","content":[{"type":"text","text":"H2"}]}]}]},{"type":"tableRow","content":[{"type":"tableCell","attrs":{},"content":[{"type":"paragraph","content":[{"type":"text","text":"hello"}]}]},{"type":"tableCell","content":[{"type":"paragraph","content":[{"type":"text","text":"world"}]}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        // Cell with attrs:{} should have {} prefix, cell without attrs should not
+        assert!(
+            md.contains("{} hello"),
+            "cell with empty attrs should render '{{}} hello', got: {md}"
+        );
+        assert!(
+            !md.contains("{} world"),
+            "cell without attrs should not render '{{}}', got: {md}"
+        );
+    }
+
+    #[test]
+    fn tablecell_no_attrs_unchanged_on_roundtrip() {
+        // Ensure tableCell without attrs stays without attrs
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"table","content":[{"type":"tableRow","content":[{"type":"tableCell","content":[{"type":"paragraph","content":[{"type":"text","text":"hello"}]}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let rows = round_tripped.content[0].content.as_ref().unwrap();
+        let cell = &rows[0].content.as_ref().unwrap()[0];
+        assert!(
+            cell.attrs.is_none(),
+            "tableCell without attrs should stay None, got: {:?}",
+            cell.attrs
+        );
+    }
+
+    #[test]
+    fn tablecell_nonempty_attrs_preserved_on_roundtrip() {
+        // Ensure tableCell with non-empty attrs still works
+        let adf_json = r##"{"version":1,"type":"doc","content":[{"type":"table","content":[{"type":"tableRow","content":[{"type":"tableHeader","content":[{"type":"paragraph","content":[{"type":"text","text":"H"}]}]}]},{"type":"tableRow","content":[{"type":"tableCell","attrs":{"background":"#DEEBFF","colspan":2},"content":[{"type":"paragraph","content":[{"type":"text","text":"highlighted"}]}]}]}]}]}"##;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let rows = round_tripped.content[0].content.as_ref().unwrap();
+        let cell = &rows[1].content.as_ref().unwrap()[0];
+        let attrs = cell.attrs.as_ref().unwrap();
+        assert_eq!(attrs["background"], "#DEEBFF");
+        assert_eq!(attrs["colspan"], 2);
     }
 
     #[test]
