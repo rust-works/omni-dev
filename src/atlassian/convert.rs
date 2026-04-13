@@ -1613,8 +1613,12 @@ fn try_parse_emoji_shortcode(text: &str, i: usize) -> Option<(usize, &str)> {
 /// trailing `{id="..." text="..."}` attributes to preserve round-trip fidelity.
 fn parse_emoji_with_attrs(text: &str, shortcode_end: usize, short_name: &str) -> (usize, AdfNode) {
     if let Some((attr_end, attrs)) = parse_attrs(text, shortcode_end) {
-        let colon_name = format!(":{short_name}:");
-        let mut emoji_attrs = serde_json::json!({"shortName": colon_name});
+        // Use the explicit shortName attr if provided (preserves original form),
+        // otherwise fall back to colon-wrapped name.
+        let resolved_name = attrs
+            .get("shortName")
+            .map_or_else(|| format!(":{short_name}:"), str::to_string);
+        let mut emoji_attrs = serde_json::json!({"shortName": resolved_name});
         if let Some(id) = attrs.get("id") {
             emoji_attrs["id"] = serde_json::Value::String(id.to_string());
         }
@@ -2441,23 +2445,25 @@ fn render_inline_node(node: &AdfNode, output: &mut String) {
                     output.push_str(name);
                     output.push(':');
 
-                    // Preserve id and text attrs for round-trip fidelity.
+                    // Preserve id, text, and shortName attrs for round-trip fidelity.
                     let id = attrs.get("id").and_then(serde_json::Value::as_str);
                     let text = attrs.get("text").and_then(serde_json::Value::as_str);
-                    if id.is_some() || text.is_some() {
-                        let mut parts = Vec::new();
-                        if let Some(id) = id {
-                            let escaped = id.replace('\\', "\\\\").replace('"', "\\\"");
-                            parts.push(format!("id=\"{escaped}\""));
-                        }
-                        if let Some(text) = text {
-                            let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
-                            parts.push(format!("text=\"{escaped}\""));
-                        }
-                        output.push('{');
-                        output.push_str(&parts.join(" "));
-                        output.push('}');
+                    // Always emit attrs so shortName is preserved exactly.
+                    let mut parts = Vec::new();
+                    // Emit the original shortName so to-adf can restore it exactly.
+                    let escaped_sn = short_name.replace('\\', "\\\\").replace('"', "\\\"");
+                    parts.push(format!("shortName=\"{escaped_sn}\""));
+                    if let Some(id) = id {
+                        let escaped = id.replace('\\', "\\\\").replace('"', "\\\"");
+                        parts.push(format!("id=\"{escaped}\""));
                     }
+                    if let Some(text) = text {
+                        let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+                        parts.push(format!("text=\"{escaped}\""));
+                    }
+                    output.push('{');
+                    output.push_str(&parts.join(" "));
+                    output.push('}');
                 }
             }
         }
@@ -3543,6 +3549,24 @@ mod tests {
         );
         assert_eq!(attrs["id"], "atlassian-cross_mark");
         assert_eq!(attrs["text"], "❌");
+    }
+
+    #[test]
+    fn emoji_shortname_without_colons_preserved() {
+        // Issue #379: shortName without colons should not gain colons
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"emoji","attrs":{"shortName":"white_check_mark","id":"2705","text":"✅"}}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let emoji = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let attrs = emoji.attrs.as_ref().unwrap();
+        assert_eq!(
+            attrs["shortName"], "white_check_mark",
+            "shortName without colons should stay without colons, got: {}",
+            attrs["shortName"]
+        );
     }
 
     #[test]
