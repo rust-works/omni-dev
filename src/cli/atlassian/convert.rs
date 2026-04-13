@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::atlassian::adf::AdfDocument;
-use crate::atlassian::convert::{adf_to_markdown, markdown_to_adf};
+use crate::atlassian::convert::markdown_to_adf;
 
 /// Converts between JFM markdown and ADF JSON.
 #[derive(Parser)]
@@ -71,15 +71,25 @@ impl ToAdfCommand {
 pub struct FromAdfCommand {
     /// Input file (reads from stdin if omitted or "-").
     pub file: Option<String>,
+
+    /// Omit localId attributes from output for readability.
+    #[arg(long)]
+    pub strip_local_ids: bool,
 }
 
 impl FromAdfCommand {
     /// Reads ADF JSON and outputs JFM markdown.
     pub fn execute(self) -> Result<()> {
+        use crate::atlassian::convert::{adf_to_markdown_with_options, RenderOptions};
+
         let input = read_input(self.file.as_deref())?;
         let doc: AdfDocument =
             serde_json::from_str(&input).context("Failed to parse ADF JSON input")?;
-        let markdown = adf_to_markdown(&doc)?;
+
+        let opts = RenderOptions {
+            strip_local_ids: self.strip_local_ids,
+        };
+        let markdown = adf_to_markdown_with_options(&doc, &opts)?;
 
         print!("{markdown}");
         Ok(())
@@ -158,6 +168,7 @@ mod tests {
 
         let cmd = FromAdfCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
+            strip_local_ids: false,
         };
         assert!(cmd.execute().is_ok());
     }
@@ -170,6 +181,7 @@ mod tests {
 
         let cmd = FromAdfCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
+            strip_local_ids: false,
         };
         assert!(cmd.execute().is_err());
     }
@@ -199,6 +211,7 @@ mod tests {
         let cmd = ConvertCommand {
             command: ConvertSubcommands::FromAdf(FromAdfCommand {
                 file: Some(file_path.to_str().unwrap().to_string()),
+                strip_local_ids: false,
             }),
         };
         assert!(cmd.execute().is_ok());

@@ -241,14 +241,20 @@ impl<'a> MarkdownParser<'a> {
             // Detect task list items: - [ ] or - [x]
             if let Some((state, text)) = try_parse_task_marker(after_marker) {
                 is_task_list = true;
-                let inline_nodes = parse_inline(text);
-                items.push(AdfNode::task_item(
-                    state,
-                    vec![AdfNode::paragraph(inline_nodes)],
-                ));
+                let (item_text, local_id) = extract_trailing_local_id(text);
+                let inline_nodes = parse_inline(item_text);
+                let mut task = AdfNode::task_item(state, vec![AdfNode::paragraph(inline_nodes)]);
+                // Override the placeholder localId if one was parsed
+                if let Some(id) = local_id {
+                    if let Some(ref mut attrs) = task.attrs {
+                        attrs["localId"] = serde_json::Value::String(id);
+                    }
+                }
+                items.push(task);
                 self.advance();
             } else {
                 let item_text = &trimmed[2..];
+                let (item_text, local_id) = extract_trailing_local_id(item_text);
                 let inline_nodes = parse_inline(item_text);
                 self.advance();
                 // Collect indented sub-list lines (2-space prefix + list marker)
@@ -266,13 +272,16 @@ impl<'a> MarkdownParser<'a> {
                     break;
                 }
                 if sub_lines.is_empty() {
-                    items.push(AdfNode::list_item(vec![AdfNode::paragraph(inline_nodes)]));
+                    items.push(list_item_with_local_id(
+                        vec![AdfNode::paragraph(inline_nodes)],
+                        local_id,
+                    ));
                 } else {
                     let sub_text = sub_lines.join("\n");
                     let mut nested = MarkdownParser::new(&sub_text).parse_blocks()?;
                     let mut item_content = vec![AdfNode::paragraph(inline_nodes)];
                     item_content.append(&mut nested);
-                    items.push(AdfNode::list_item(item_content));
+                    items.push(list_item_with_local_id(item_content, local_id));
                 }
             }
         }
@@ -294,7 +303,9 @@ impl<'a> MarkdownParser<'a> {
             let trimmed = line.trim_start();
 
             if let Some((_, rest)) = parse_ordered_list_marker(trimmed) {
-                let inline_nodes = parse_inline(rest.trim_start());
+                let rest_trimmed = rest.trim_start();
+                let (item_text, local_id) = extract_trailing_local_id(rest_trimmed);
+                let inline_nodes = parse_inline(item_text);
                 self.advance();
                 // Collect indented sub-list lines (2-space prefix + list marker)
                 let mut sub_lines: Vec<String> = Vec::new();
@@ -315,13 +326,16 @@ impl<'a> MarkdownParser<'a> {
                     break;
                 }
                 if sub_lines.is_empty() {
-                    items.push(AdfNode::list_item(vec![AdfNode::paragraph(inline_nodes)]));
+                    items.push(list_item_with_local_id(
+                        vec![AdfNode::paragraph(inline_nodes)],
+                        local_id,
+                    ));
                 } else {
                     let sub_text = sub_lines.join("\n");
                     let mut nested = MarkdownParser::new(&sub_text).parse_blocks()?;
                     let mut item_content = vec![AdfNode::paragraph(inline_nodes)];
                     item_content.append(&mut nested);
-                    items.push(AdfNode::list_item(item_content));
+                    items.push(list_item_with_local_id(item_content, local_id));
                 }
             } else {
                 break;
@@ -360,9 +374,19 @@ impl<'a> MarkdownParser<'a> {
             marks.push(AdfMark::breakout(mode));
         }
 
-        if !marks.is_empty() {
-            let existing = node.marks.get_or_insert_with(Vec::new);
-            existing.extend(marks);
+        // Parse localId from block attrs
+        let local_id = attrs.get("localId").map(str::to_string);
+
+        let has_attrs = !marks.is_empty() || local_id.is_some();
+        if has_attrs {
+            if !marks.is_empty() {
+                let existing = node.marks.get_or_insert_with(Vec::new);
+                existing.extend(marks);
+            }
+            if let Some(id) = local_id {
+                let node_attrs = node.attrs.get_or_insert_with(|| serde_json::json!({}));
+                node_attrs["localId"] = serde_json::Value::String(id);
+            }
             self.advance(); // consume the attrs line
         }
     }
@@ -564,8 +588,16 @@ impl<'a> MarkdownParser<'a> {
             let line = lines[i];
             if let Some((d, _)) = try_parse_container_open(line) {
                 if d.name == "tr" {
+                    let tr_attrs = d.attrs.clone();
                     i += 1;
-                    let (row, next_i) = self.parse_directive_table_row(&lines, i)?;
+                    let (mut row, next_i) = self.parse_directive_table_row(&lines, i)?;
+                    // Pass through localId from :::tr{localId=...}
+                    if let Some(ref attrs) = tr_attrs {
+                        if let Some(local_id) = attrs.get("localId") {
+                            let row_attrs = row.attrs.get_or_insert_with(|| serde_json::json!({}));
+                            row_attrs["localId"] = serde_json::Value::String(local_id.to_string());
+                        }
+                    }
                     rows.push(row);
                     i = next_i;
                     continue;
@@ -997,6 +1029,9 @@ fn build_cell_attrs(attrs: &crate::atlassian::attrs::Attrs) -> serde_json::Value
             adf["colwidth"] = serde_json::Value::Array(widths);
         }
     }
+    if let Some(local_id) = attrs.get("localId") {
+        adf["localId"] = serde_json::Value::String(local_id.to_string());
+    }
     adf
 }
 
@@ -1046,6 +1081,7 @@ fn is_block_attrs_line(line: &str) -> bool {
         attrs.get("align").is_some()
             || attrs.get("indent").is_some()
             || attrs.get("breakout").is_some()
+            || attrs.get("localId").is_some()
     } else {
         false
     }
@@ -1512,7 +1548,11 @@ fn try_dispatch_inline_directive(text: &str, pos: usize) -> Option<(AdfNode, usi
     let content = d.content.as_deref().unwrap_or("");
 
     let node = match d.name.as_str() {
-        "card" => AdfNode::inline_card(content),
+        "card" => {
+            let mut node = AdfNode::inline_card(content);
+            pass_through_local_id(&d.attrs, &mut node);
+            node
+        }
         "status" => {
             let color = d
                 .attrs
@@ -1534,9 +1574,10 @@ fn try_dispatch_inline_directive(text: &str, pos: usize) -> Option<(AdfNode, usi
             node
         }
         "date" => {
-            // Convert ISO 8601 date to epoch milliseconds for ADF
             let timestamp = iso_date_to_epoch_ms(content);
-            AdfNode::date(&timestamp)
+            let mut node = AdfNode::date(&timestamp);
+            pass_through_local_id(&d.attrs, &mut node);
+            node
         }
         "mention" => {
             let id = d.attrs.as_ref().and_then(|a| a.get("id")).unwrap_or("");
@@ -1555,6 +1596,7 @@ fn try_dispatch_inline_directive(text: &str, pos: usize) -> Option<(AdfNode, usi
                     }
                 }
             }
+            pass_through_local_id(&d.attrs, &mut node);
             node
         }
         "span" => {
@@ -1645,6 +1687,9 @@ fn parse_emoji_with_attrs(text: &str, shortcode_end: usize, short_name: &str) ->
         if let Some(t) = attrs.get("text") {
             emoji_attrs["text"] = serde_json::Value::String(t.to_string());
         }
+        if let Some(lid) = attrs.get("localId") {
+            emoji_attrs["localId"] = serde_json::Value::String(lid.to_string());
+        }
         (
             attr_end,
             AdfNode {
@@ -1704,39 +1749,112 @@ fn try_parse_link(text: &str, i: usize) -> Option<(usize, &str, &str)> {
 
 // ── ADF → Markdown ──────────────────────────────────────────────────
 
+/// Options for ADF-to-markdown rendering.
+#[derive(Debug, Clone, Default)]
+pub struct RenderOptions {
+    /// When true, omit `localId` attributes from directive output.
+    pub strip_local_ids: bool,
+}
+
 /// Converts an ADF document to a markdown string.
 pub fn adf_to_markdown(doc: &AdfDocument) -> Result<String> {
+    adf_to_markdown_with_options(doc, &RenderOptions::default())
+}
+
+/// Converts an ADF document to a markdown string with options.
+pub fn adf_to_markdown_with_options(doc: &AdfDocument, opts: &RenderOptions) -> Result<String> {
     let mut output = String::new();
 
     for (i, node) in doc.content.iter().enumerate() {
         if i > 0 {
             output.push('\n');
         }
-        render_block_node(node, &mut output);
+        render_block_node(node, &mut output, opts);
     }
 
     Ok(output)
 }
 
+/// Pushes a `localId=<value>` entry to an attribute parts vec,
+/// unless `opts.strip_local_ids` is set or the value is a placeholder.
+/// Copies `localId` from parsed directive attrs to an ADF node's attrs if present.
+fn pass_through_local_id(dir_attrs: &Option<crate::atlassian::attrs::Attrs>, node: &mut AdfNode) {
+    if let Some(ref attrs) = dir_attrs {
+        if let Some(local_id) = attrs.get("localId") {
+            if let Some(ref mut node_attrs) = node.attrs {
+                node_attrs["localId"] = serde_json::Value::String(local_id.to_string());
+            } else {
+                node.attrs = Some(serde_json::json!({"localId": local_id}));
+            }
+        }
+    }
+}
+
+// listItem localId is emitted as trailing inline attrs on the item line
+// (e.g., `- item text {localId=...}`) and parsed back by extracting
+// trailing attrs from the list item text. This avoids the block-attrs
+// promotion issue where {localId=...} on a separate line would be
+// applied to the parent list node.
+
+/// Extracts trailing `{localId=...}` from list item text.
+/// Returns the text without the trailing attrs and the localId if found.
+fn extract_trailing_local_id(text: &str) -> (&str, Option<String>) {
+    let trimmed = text.trim_end();
+    if !trimmed.ends_with('}') {
+        return (text, None);
+    }
+    // Find the opening brace
+    if let Some(brace_pos) = trimmed.rfind('{') {
+        let attr_str = &trimmed[brace_pos..];
+        if let Some((_, attrs)) = parse_attrs(attr_str, 0) {
+            if let Some(local_id) = attrs.get("localId") {
+                let before = trimmed[..brace_pos].trim_end();
+                return (before, Some(local_id.to_string()));
+            }
+        }
+    }
+    (text, None)
+}
+
+/// Creates a `listItem` node, optionally with a `localId` attribute.
+fn list_item_with_local_id(content: Vec<AdfNode>, local_id: Option<String>) -> AdfNode {
+    let mut item = AdfNode::list_item(content);
+    if let Some(id) = local_id {
+        item.attrs = Some(serde_json::json!({"localId": id}));
+    }
+    item
+}
+
+fn maybe_push_local_id(attrs: &serde_json::Value, parts: &mut Vec<String>, opts: &RenderOptions) {
+    if opts.strip_local_ids {
+        return;
+    }
+    if let Some(local_id) = attrs.get("localId").and_then(serde_json::Value::as_str) {
+        if local_id != "00000000-0000-0000-0000-000000000000" {
+            parts.push(format!("localId={local_id}"));
+        }
+    }
+}
+
 /// Renders a sequence of block nodes with blank-line separators between them.
-fn render_block_children(children: &[AdfNode], output: &mut String) {
+fn render_block_children(children: &[AdfNode], output: &mut String, opts: &RenderOptions) {
     for (i, child) in children.iter().enumerate() {
         if i > 0 {
             output.push('\n');
         }
-        render_block_node(child, output);
+        render_block_node(child, output, opts);
     }
 }
 
 /// Renders a block-level ADF node to markdown.
-fn render_block_node(node: &AdfNode, output: &mut String) {
+fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) {
     match node.node_type.as_str() {
         "paragraph" => {
             let is_empty = node.content.as_ref().map_or(true, Vec::is_empty);
             if is_empty {
                 output.push_str("::paragraph\n");
             } else {
-                render_inline_content(node, output);
+                render_inline_content(node, output, opts);
                 output.push('\n');
             }
         }
@@ -1751,7 +1869,7 @@ fn render_block_node(node: &AdfNode, output: &mut String) {
                 output.push('#');
             }
             output.push(' ');
-            render_inline_content(node, output);
+            render_inline_content(node, output, opts);
             output.push('\n');
         }
         "codeBlock" => {
@@ -1777,7 +1895,7 @@ fn render_block_node(node: &AdfNode, output: &mut String) {
             if let Some(ref content) = node.content {
                 for child in content {
                     let mut inner = String::new();
-                    render_block_node(child, &mut inner);
+                    render_block_node(child, &mut inner, opts);
                     for line in inner.lines() {
                         output.push_str("> ");
                         output.push_str(line);
@@ -1790,7 +1908,7 @@ fn render_block_node(node: &AdfNode, output: &mut String) {
             if let Some(ref items) = node.content {
                 for item in items {
                     output.push_str("- ");
-                    render_list_item_content(item, output);
+                    render_list_item_content(item, output, opts);
                 }
             }
         }
@@ -1805,7 +1923,7 @@ fn render_block_node(node: &AdfNode, output: &mut String) {
                 for (i, item) in items.iter().enumerate() {
                     let num = start + i as u64;
                     output.push_str(&format!("{num}. "));
-                    render_list_item_content(item, output);
+                    render_list_item_content(item, output, opts);
                 }
             }
         }
@@ -1823,7 +1941,7 @@ fn render_block_node(node: &AdfNode, output: &mut String) {
                     } else {
                         output.push_str("- [ ] ");
                     }
-                    render_list_item_content(item, output);
+                    render_list_item_content(item, output, opts);
                 }
             }
         }
@@ -1831,13 +1949,13 @@ fn render_block_node(node: &AdfNode, output: &mut String) {
             output.push_str("---\n");
         }
         "table" => {
-            render_table(node, output);
+            render_table(node, output, opts);
         }
         "mediaSingle" => {
             if let Some(ref content) = node.content {
                 for child in content {
                     if child.node_type == "media" {
-                        render_media(child, node.attrs.as_ref(), output);
+                        render_media(child, node.attrs.as_ref(), output, opts);
                     }
                 }
             }
@@ -1901,9 +2019,7 @@ fn render_block_node(node: &AdfNode, output: &mut String) {
                         attr_parts.push(format!("params='{json_str}'"));
                     }
                 }
-                if let Some(local_id) = attrs.get("localId").and_then(serde_json::Value::as_str) {
-                    attr_parts.push(format!("localId={local_id}"));
-                }
+                maybe_push_local_id(attrs, &mut attr_parts, opts);
                 output.push_str(&format!("::extension{{{}}}\n", attr_parts.join(" ")));
             }
         }
@@ -1925,7 +2041,7 @@ fn render_block_node(node: &AdfNode, output: &mut String) {
             }
             output.push_str(&format!(":::panel{{{}}}\n", attr_parts.join(" ")));
             if let Some(ref content) = node.content {
-                render_block_children(content, output);
+                render_block_children(content, output, opts);
             }
             output.push_str(":::\n");
         }
@@ -1946,7 +2062,7 @@ fn render_block_node(node: &AdfNode, output: &mut String) {
                 output.push_str(&format!(":::{directive_name}\n"));
             }
             if let Some(ref content) = node.content {
-                render_block_children(content, output);
+                render_block_children(content, output, opts);
             }
             output.push_str(":::\n");
         }
@@ -1963,7 +2079,7 @@ fn render_block_node(node: &AdfNode, output: &mut String) {
                             .unwrap_or(50.0);
                         output.push_str(&format!(":::column{{width={width}}}\n"));
                         if let Some(ref col_content) = child.content {
-                            render_block_children(col_content, output);
+                            render_block_children(col_content, output, opts);
                         }
                         output.push_str(":::\n");
                     }
@@ -1976,7 +2092,7 @@ fn render_block_node(node: &AdfNode, output: &mut String) {
             if let Some(ref content) = node.content {
                 for item in content {
                     output.push_str("- <> ");
-                    render_list_item_content(item, output);
+                    render_list_item_content(item, output, opts);
                 }
             }
             output.push_str(":::\n");
@@ -1995,12 +2111,10 @@ fn render_block_node(node: &AdfNode, output: &mut String) {
                 if let Some(layout) = attrs.get("layout").and_then(serde_json::Value::as_str) {
                     attr_parts.push(format!("layout={layout}"));
                 }
-                if let Some(local_id) = attrs.get("localId").and_then(serde_json::Value::as_str) {
-                    attr_parts.push(format!("localId={local_id}"));
-                }
+                maybe_push_local_id(attrs, &mut attr_parts, opts);
                 output.push_str(&format!(":::extension{{{}}}\n", attr_parts.join(" ")));
                 if let Some(ref content) = node.content {
-                    render_block_children(content, output);
+                    render_block_children(content, output, opts);
                 }
                 output.push_str(":::\n");
             }
@@ -2015,9 +2129,9 @@ fn render_block_node(node: &AdfNode, output: &mut String) {
         }
     }
 
-    // Emit block-level attribute marks (align, indent, breakout)
+    // Emit block-level attribute marks (align, indent, breakout) and localId
+    let mut parts = Vec::new();
     if let Some(ref marks) = node.marks {
-        let mut parts = Vec::new();
         for mark in marks {
             match mark.mark_type.as_str() {
                 "alignment" => {
@@ -2053,15 +2167,18 @@ fn render_block_node(node: &AdfNode, output: &mut String) {
                 _ => {}
             }
         }
-        if !parts.is_empty() {
-            output.push_str(&format!("{{{}}}\n", parts.join(" ")));
-        }
+    }
+    if let Some(ref attrs) = node.attrs {
+        maybe_push_local_id(attrs, &mut parts, opts);
+    }
+    if !parts.is_empty() {
+        output.push_str(&format!("{{{}}}\n", parts.join(" ")));
     }
 }
 
 /// Renders the content of a list item (unwraps the paragraph layer).
 /// Nested block children (e.g. sub-lists) are indented with two spaces.
-fn render_list_item_content(item: &AdfNode, output: &mut String) {
+fn render_list_item_content(item: &AdfNode, output: &mut String, opts: &RenderOptions) {
     let Some(ref content) = item.content else {
         return;
     };
@@ -2070,14 +2187,16 @@ fn render_list_item_content(item: &AdfNode, output: &mut String) {
         return;
     };
     if first.node_type == "paragraph" {
-        render_inline_content(first, output);
+        render_inline_content(first, output, opts);
+        // Emit listItem localId as trailing inline attrs on the first line
+        emit_list_item_local_id(item, output, opts);
         output.push('\n');
     } else {
-        render_block_node(first, output);
+        render_block_node(first, output, opts);
     }
     for child in iter {
         let mut nested = String::new();
-        render_block_node(child, &mut nested);
+        render_block_node(child, &mut nested, opts);
         for line in nested.lines() {
             output.push_str("  ");
             output.push_str(line);
@@ -2086,16 +2205,30 @@ fn render_list_item_content(item: &AdfNode, output: &mut String) {
     }
 }
 
+/// Emits trailing `{localId=...}` on a list item line if the item has a localId.
+fn emit_list_item_local_id(item: &AdfNode, output: &mut String, opts: &RenderOptions) {
+    if opts.strip_local_ids {
+        return;
+    }
+    if let Some(ref attrs) = item.attrs {
+        if let Some(local_id) = attrs.get("localId").and_then(serde_json::Value::as_str) {
+            if local_id != "00000000-0000-0000-0000-000000000000" {
+                output.push_str(&format!(" {{localId={local_id}}}"));
+            }
+        }
+    }
+}
+
 /// Renders a table node, choosing between pipe table and directive table form.
-fn render_table(node: &AdfNode, output: &mut String) {
+fn render_table(node: &AdfNode, output: &mut String, opts: &RenderOptions) {
     let Some(ref rows) = node.content else {
         return;
     };
 
     if table_qualifies_for_pipe_syntax(rows) {
-        render_pipe_table(node, rows, output);
+        render_pipe_table(node, rows, output, opts);
     } else {
-        render_directive_table(node, rows, output);
+        render_directive_table(node, rows, output, opts);
     }
 }
 
@@ -2147,7 +2280,7 @@ fn cell_contains_hard_break(paragraph: &AdfNode) -> bool {
 }
 
 /// Renders a table as GFM pipe syntax.
-fn render_pipe_table(node: &AdfNode, rows: &[AdfNode], output: &mut String) {
+fn render_pipe_table(node: &AdfNode, rows: &[AdfNode], output: &mut String, opts: &RenderOptions) {
     for (row_idx, row) in rows.iter().enumerate() {
         let Some(ref cells) = row.content else {
             continue;
@@ -2157,7 +2290,7 @@ fn render_pipe_table(node: &AdfNode, rows: &[AdfNode], output: &mut String) {
         for cell in cells {
             output.push(' ');
             render_cell_attrs_prefix(cell, output);
-            render_inline_content_from_first_paragraph(cell, output);
+            render_inline_content_from_first_paragraph(cell, output, opts);
             output.push_str(" |");
         }
         output.push('\n');
@@ -2178,11 +2311,16 @@ fn render_pipe_table(node: &AdfNode, rows: &[AdfNode], output: &mut String) {
     }
 
     // Emit table-level attrs if present
-    render_table_level_attrs(node, output);
+    render_table_level_attrs(node, output, opts);
 }
 
 /// Renders a table as `::::table` directive syntax (block-content cells).
-fn render_directive_table(node: &AdfNode, rows: &[AdfNode], output: &mut String) {
+fn render_directive_table(
+    node: &AdfNode,
+    rows: &[AdfNode],
+    output: &mut String,
+    opts: &RenderOptions,
+) {
     // Opening fence with attrs
     let mut attr_parts = Vec::new();
     if let Some(ref attrs) = node.attrs {
@@ -2207,9 +2345,7 @@ fn render_directive_table(node: &AdfNode, rows: &[AdfNode], output: &mut String)
             };
             attr_parts.push(format!("width={tw_str}"));
         }
-        if let Some(local_id) = attrs.get("localId").and_then(serde_json::Value::as_str) {
-            attr_parts.push(format!("localId={local_id}"));
-        }
+        maybe_push_local_id(attrs, &mut attr_parts, opts);
     }
     if attr_parts.is_empty() {
         output.push_str("::::table\n");
@@ -2221,21 +2357,41 @@ fn render_directive_table(node: &AdfNode, rows: &[AdfNode], output: &mut String)
         let Some(ref cells) = row.content else {
             continue;
         };
-        output.push_str(":::tr\n");
+        // Emit :::tr with optional localId
+        let mut tr_attrs = Vec::new();
+        if let Some(ref attrs) = row.attrs {
+            maybe_push_local_id(attrs, &mut tr_attrs, opts);
+        }
+        if tr_attrs.is_empty() {
+            output.push_str(":::tr\n");
+        } else {
+            output.push_str(&format!(":::tr{{{}}}\n", tr_attrs.join(" ")));
+        }
         for cell in cells {
             let directive_name = if cell.node_type == "tableHeader" {
                 "th"
             } else {
                 "td"
             };
-            let cell_attr_str = build_cell_attrs_string(cell);
+            let mut cell_attr_str = build_cell_attrs_string(cell);
+            // Append localId to cell attrs if present
+            if let Some(ref attrs) = cell.attrs {
+                let mut lid_parts = Vec::new();
+                maybe_push_local_id(attrs, &mut lid_parts, opts);
+                if !lid_parts.is_empty() {
+                    if !cell_attr_str.is_empty() {
+                        cell_attr_str.push(' ');
+                    }
+                    cell_attr_str.push_str(&lid_parts.join(" "));
+                }
+            }
             if cell_attr_str.is_empty() {
                 output.push_str(&format!(":::{directive_name}\n"));
             } else {
                 output.push_str(&format!(":::{directive_name}{{{cell_attr_str}}}\n"));
             }
             if let Some(ref content) = cell.content {
-                render_block_children(content, output);
+                render_block_children(content, output, opts);
             }
             output.push_str(":::\n");
         }
@@ -2318,7 +2474,7 @@ fn get_cell_paragraph_alignment(cell: &AdfNode) -> Option<&str> {
 }
 
 /// Emits table-level attributes if present.
-fn render_table_level_attrs(node: &AdfNode, output: &mut String) {
+fn render_table_level_attrs(node: &AdfNode, output: &mut String, opts: &RenderOptions) {
     if let Some(ref attrs) = node.attrs {
         let mut parts = Vec::new();
         if let Some(layout) = attrs.get("layout").and_then(serde_json::Value::as_str) {
@@ -2342,9 +2498,7 @@ fn render_table_level_attrs(node: &AdfNode, output: &mut String) {
             };
             parts.push(format!("width={tw_str}"));
         }
-        if let Some(local_id) = attrs.get("localId").and_then(serde_json::Value::as_str) {
-            parts.push(format!("localId={local_id}"));
-        }
+        maybe_push_local_id(attrs, &mut parts, opts);
         if !parts.is_empty() {
             output.push_str(&format!("{{{}}}\n", parts.join(" ")));
         }
@@ -2352,18 +2506,27 @@ fn render_table_level_attrs(node: &AdfNode, output: &mut String) {
 }
 
 /// Renders inline content from the first paragraph child of a table cell.
-fn render_inline_content_from_first_paragraph(cell: &AdfNode, output: &mut String) {
+fn render_inline_content_from_first_paragraph(
+    cell: &AdfNode,
+    output: &mut String,
+    opts: &RenderOptions,
+) {
     if let Some(ref content) = cell.content {
         if let Some(first) = content.first() {
             if first.node_type == "paragraph" {
-                render_inline_content(first, output);
+                render_inline_content(first, output, opts);
             }
         }
     }
 }
 
 /// Renders a media node as a markdown image, with optional parent (mediaSingle) attrs.
-fn render_media(node: &AdfNode, parent_attrs: Option<&serde_json::Value>, output: &mut String) {
+fn render_media(
+    node: &AdfNode,
+    parent_attrs: Option<&serde_json::Value>,
+    output: &mut String,
+    _opts: &RenderOptions,
+) {
     if let Some(ref attrs) = node.attrs {
         let media_type = attrs
             .get("type")
@@ -2446,16 +2609,16 @@ fn render_media(node: &AdfNode, parent_attrs: Option<&serde_json::Value>, output
 }
 
 /// Renders inline content (text nodes with marks) from a block node's children.
-fn render_inline_content(node: &AdfNode, output: &mut String) {
+fn render_inline_content(node: &AdfNode, output: &mut String, opts: &RenderOptions) {
     if let Some(ref content) = node.content {
         for child in content {
-            render_inline_node(child, output);
+            render_inline_node(child, output, opts);
         }
     }
 }
 
 /// Renders a single inline ADF node to markdown.
-fn render_inline_node(node: &AdfNode, output: &mut String) {
+fn render_inline_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) {
     match node.node_type.as_str() {
         "text" => {
             let text = node.text.as_deref().unwrap_or("");
@@ -2466,15 +2629,19 @@ fn render_inline_node(node: &AdfNode, output: &mut String) {
             output.push_str("  \n");
         }
         "inlineCard" => {
-            if let Some(url) = node
-                .attrs
-                .as_ref()
-                .and_then(|a| a.get("url"))
-                .and_then(serde_json::Value::as_str)
-            {
-                output.push_str(":card[");
-                output.push_str(url);
-                output.push(']');
+            if let Some(ref attrs) = node.attrs {
+                if let Some(url) = attrs.get("url").and_then(serde_json::Value::as_str) {
+                    output.push_str(":card[");
+                    output.push_str(url);
+                    output.push(']');
+                    let mut attr_parts = Vec::new();
+                    maybe_push_local_id(attrs, &mut attr_parts, opts);
+                    if !attr_parts.is_empty() {
+                        output.push('{');
+                        output.push_str(&attr_parts.join(" "));
+                        output.push('}');
+                    }
+                }
             }
         }
         "emoji" => {
@@ -2487,22 +2654,18 @@ fn render_inline_node(node: &AdfNode, output: &mut String) {
                     output.push_str(name);
                     output.push(':');
 
-                    // Preserve id, text, and shortName attrs for round-trip fidelity.
-                    let id = attrs.get("id").and_then(serde_json::Value::as_str);
-                    let text = attrs.get("text").and_then(serde_json::Value::as_str);
-                    // Always emit attrs so shortName is preserved exactly.
                     let mut parts = Vec::new();
-                    // Emit the original shortName so to-adf can restore it exactly.
                     let escaped_sn = short_name.replace('\\', "\\\\").replace('"', "\\\"");
                     parts.push(format!("shortName=\"{escaped_sn}\""));
-                    if let Some(id) = id {
+                    if let Some(id) = attrs.get("id").and_then(serde_json::Value::as_str) {
                         let escaped = id.replace('\\', "\\\\").replace('"', "\\\"");
                         parts.push(format!("id=\"{escaped}\""));
                     }
-                    if let Some(text) = text {
+                    if let Some(text) = attrs.get("text").and_then(serde_json::Value::as_str) {
                         let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
                         parts.push(format!("text=\"{escaped}\""));
                     }
+                    maybe_push_local_id(attrs, &mut parts, opts);
                     output.push('{');
                     output.push_str(&parts.join(" "));
                     output.push('}');
@@ -2523,24 +2686,23 @@ fn render_inline_node(node: &AdfNode, output: &mut String) {
                 if let Some(style) = attrs.get("style").and_then(serde_json::Value::as_str) {
                     attr_parts.push(format!("style={style}"));
                 }
-                if let Some(local_id) = attrs.get("localId").and_then(serde_json::Value::as_str) {
-                    if local_id != "00000000-0000-0000-0000-000000000000" {
-                        attr_parts.push(format!("localId={local_id}"));
-                    }
-                }
+                maybe_push_local_id(attrs, &mut attr_parts, opts);
                 output.push_str(&format!(":status[{text}]{{{}}}", attr_parts.join(" ")));
             }
         }
         "date" => {
-            if let Some(timestamp) = node
-                .attrs
-                .as_ref()
-                .and_then(|a| a.get("timestamp"))
-                .and_then(serde_json::Value::as_str)
-            {
-                // Convert epoch ms to ISO 8601 date for display
-                let display = epoch_ms_to_iso_date(timestamp);
-                output.push_str(&format!(":date[{display}]"));
+            if let Some(ref attrs) = node.attrs {
+                if let Some(timestamp) = attrs.get("timestamp").and_then(serde_json::Value::as_str)
+                {
+                    let display = epoch_ms_to_iso_date(timestamp);
+                    let mut attr_parts = Vec::new();
+                    maybe_push_local_id(attrs, &mut attr_parts, opts);
+                    if attr_parts.is_empty() {
+                        output.push_str(&format!(":date[{display}]"));
+                    } else {
+                        output.push_str(&format!(":date[{display}]{{{}}}", attr_parts.join(" ")));
+                    }
+                }
             }
         }
         "mention" => {
@@ -2560,6 +2722,7 @@ fn render_inline_node(node: &AdfNode, output: &mut String) {
                 if let Some(al) = attrs.get("accessLevel").and_then(serde_json::Value::as_str) {
                     attr_parts.push(format!("accessLevel={al}"));
                 }
+                maybe_push_local_id(attrs, &mut attr_parts, opts);
                 output.push_str(&format!(":mention[{text}]{{{}}}", attr_parts.join(" ")));
             }
         }
@@ -4476,6 +4639,275 @@ mod tests {
     }
 
     #[test]
+    fn strip_local_ids_removes_localid_from_status() {
+        let adf = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![{
+                let mut node = AdfNode::status("open", "green");
+                node.attrs.as_mut().unwrap()["localId"] =
+                    serde_json::Value::String("real-uuid-here".to_string());
+                node
+            }])],
+        };
+        let opts = RenderOptions {
+            strip_local_ids: true,
+        };
+        let md = adf_to_markdown_with_options(&adf, &opts).unwrap();
+        assert!(
+            !md.contains("localId"),
+            "localId should be stripped, got: {md}"
+        );
+        assert!(md.contains("color=green"), "color should be preserved");
+    }
+
+    #[test]
+    fn strip_local_ids_removes_localid_from_table() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"table","attrs":{"layout":"default","localId":"table-uuid"},"content":[{"type":"tableRow","content":[{"type":"tableCell","content":[{"type":"paragraph","content":[{"type":"text","text":"cell"}]}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let opts = RenderOptions {
+            strip_local_ids: true,
+        };
+        let md = adf_to_markdown_with_options(&doc, &opts).unwrap();
+        assert!(
+            !md.contains("localId"),
+            "localId should be stripped from table, got: {md}"
+        );
+        assert!(md.contains("layout=default"), "layout should be preserved");
+    }
+
+    #[test]
+    fn default_options_preserve_localid() {
+        let adf = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![{
+                let mut node = AdfNode::status("open", "green");
+                node.attrs.as_mut().unwrap()["localId"] =
+                    serde_json::Value::String("real-uuid-here".to_string());
+                node
+            }])],
+        };
+        let md = adf_to_markdown(&adf).unwrap();
+        assert!(
+            md.contains("localId=real-uuid-here"),
+            "Default should preserve localId, got: {md}"
+        );
+    }
+
+    #[test]
+    fn mention_localid_roundtrip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"mention","attrs":{"id":"user123","text":"@Alice","localId":"m-001"}}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("localId=m-001"),
+            "mention should have localId in md: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let mention = &rt.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(mention.attrs.as_ref().unwrap()["localId"], "m-001");
+    }
+
+    #[test]
+    fn date_localid_roundtrip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"date","attrs":{"timestamp":"1700000000000","localId":"d-001"}}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("localId=d-001"),
+            "date should have localId in md: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let date = &rt.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(date.attrs.as_ref().unwrap()["localId"], "d-001");
+    }
+
+    #[test]
+    fn emoji_localid_roundtrip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"emoji","attrs":{"shortName":":smile:","localId":"e-001"}}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("localId=e-001"),
+            "emoji should have localId in md: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let emoji = &rt.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(emoji.attrs.as_ref().unwrap()["localId"], "e-001");
+    }
+
+    #[test]
+    fn inline_card_localid_roundtrip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"inlineCard","attrs":{"url":"https://example.com","localId":"c-001"}}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("localId=c-001"),
+            "inlineCard should have localId in md: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let card = &rt.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(card.attrs.as_ref().unwrap()["localId"], "c-001");
+    }
+
+    #[test]
+    fn strip_local_ids_removes_from_mention() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"mention","attrs":{"id":"user123","text":"@Alice","localId":"m-001"}}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let opts = RenderOptions {
+            strip_local_ids: true,
+        };
+        let md = adf_to_markdown_with_options(&doc, &opts).unwrap();
+        assert!(
+            !md.contains("localId"),
+            "localId should be stripped from mention: {md}"
+        );
+        assert!(md.contains("id=user123"), "other attrs should be preserved");
+    }
+
+    #[test]
+    fn strip_local_ids_removes_from_date() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"date","attrs":{"timestamp":"1700000000000","localId":"d-001"}}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let opts = RenderOptions {
+            strip_local_ids: true,
+        };
+        let md = adf_to_markdown_with_options(&doc, &opts).unwrap();
+        assert!(
+            !md.contains("localId"),
+            "localId should be stripped from date: {md}"
+        );
+    }
+
+    #[test]
+    fn strip_local_ids_removes_from_block_attrs() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","attrs":{"localId":"p-001"},"content":[{"type":"text","text":"hello"}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let opts = RenderOptions {
+            strip_local_ids: true,
+        };
+        let md = adf_to_markdown_with_options(&doc, &opts).unwrap();
+        assert!(
+            !md.contains("localId"),
+            "localId should be stripped from block attrs: {md}"
+        );
+    }
+
+    #[test]
+    fn table_cell_localid_roundtrip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"table","attrs":{},"content":[{"type":"tableRow","content":[{"type":"tableCell","attrs":{"localId":"tc-001"},"content":[{"type":"paragraph","content":[{"type":"text","text":"cell"}]}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("localId=tc-001"),
+            "tableCell should have localId in md: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let cell = &rt.content[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap()[0];
+        assert_eq!(
+            cell.attrs.as_ref().unwrap()["localId"],
+            "tc-001",
+            "tableCell localId should round-trip"
+        );
+    }
+
+    #[test]
+    fn table_row_localid_roundtrip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"table","attrs":{},"content":[{"type":"tableRow","attrs":{"localId":"tr-001"},"content":[{"type":"tableCell","content":[{"type":"paragraph","content":[{"type":"text","text":"cell"}]}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("localId=tr-001"),
+            "tableRow should have localId in md: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let row = &rt.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(
+            row.attrs.as_ref().unwrap()["localId"],
+            "tr-001",
+            "tableRow localId should round-trip"
+        );
+    }
+
+    #[test]
+    fn list_item_localid_roundtrip() {
+        // listItem localId is emitted as trailing inline attrs and parsed back
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[{"type":"listItem","attrs":{"localId":"li-001"},"content":[{"type":"paragraph","content":[{"type":"text","text":"item"}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("localId=li-001"),
+            "listItem should have localId in md: {md}"
+        );
+        // Verify localId is on the listItem, NOT promoted to bulletList
+        let rt = markdown_to_adf(&md).unwrap();
+        let list = &rt.content[0];
+        assert!(
+            list.attrs.is_none() || list.attrs.as_ref().unwrap().get("localId").is_none(),
+            "bulletList should NOT have localId: {:?}",
+            list.attrs
+        );
+        let item = &list.content.as_ref().unwrap()[0];
+        assert_eq!(
+            item.attrs.as_ref().unwrap()["localId"],
+            "li-001",
+            "listItem should have localId=li-001"
+        );
+    }
+
+    #[test]
+    fn list_item_localid_not_promoted_to_parent() {
+        // Verify localId stays on listItem and doesn't leak to parent list
+        let md = "- item {localId=li-002}\n";
+        let doc = markdown_to_adf(md).unwrap();
+        let list = &doc.content[0];
+        assert!(
+            list.attrs.is_none(),
+            "bulletList should have no attrs: {:?}",
+            list.attrs
+        );
+        let item = &list.content.as_ref().unwrap()[0];
+        assert_eq!(item.attrs.as_ref().unwrap()["localId"], "li-002");
+    }
+
+    #[test]
+    fn ordered_list_item_localid_roundtrip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"orderedList","attrs":{"order":1},"content":[{"type":"listItem","attrs":{"localId":"oli-001"},"content":[{"type":"paragraph","content":[{"type":"text","text":"first"}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("localId=oli-001"), "md: {md}");
+        let rt = markdown_to_adf(&md).unwrap();
+        let item = &rt.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(item.attrs.as_ref().unwrap()["localId"], "oli-001");
+    }
+
+    #[test]
+    fn task_item_localid_roundtrip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"taskList","attrs":{"localId":"tl-001"},"content":[{"type":"taskItem","attrs":{"localId":"ti-001","state":"TODO"},"content":[{"type":"paragraph","content":[{"type":"text","text":"task"}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("localId=ti-001"), "md: {md}");
+        let rt = markdown_to_adf(&md).unwrap();
+        let item = &rt.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(item.attrs.as_ref().unwrap()["localId"], "ti-001");
+    }
+
+    #[test]
+    fn list_item_localid_stripped() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[{"type":"listItem","attrs":{"localId":"li-001"},"content":[{"type":"paragraph","content":[{"type":"text","text":"item"}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let opts = RenderOptions {
+            strip_local_ids: true,
+        };
+        let md = adf_to_markdown_with_options(&doc, &opts).unwrap();
+        assert!(!md.contains("localId"), "localId should be stripped: {md}");
+    }
+
+    #[test]
     fn date_directive() {
         let doc = markdown_to_adf("Due by :date[2026-04-15].").unwrap();
         let content = doc.content[0].content.as_ref().unwrap();
@@ -5234,6 +5666,53 @@ mod tests {
             attrs["localId"], "7afd4550-e66c-4b12-875f-a91c6c7b62c7",
             "localId should be preserved"
         );
+    }
+
+    #[test]
+    fn paragraph_localid_preserved_in_roundtrip() {
+        // Issue #399: localId on paragraph nodes was dropped
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"paragraph","attrs":{"localId":"abc-123"},"content":[{"type":"text","text":"hello"}]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("localId=abc-123"),
+            "JFM should contain localId, got: {md}"
+        );
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let attrs = round_tripped.content[0].attrs.as_ref().unwrap();
+        assert_eq!(attrs["localId"], "abc-123", "localId should be preserved");
+    }
+
+    #[test]
+    fn heading_localid_preserved_in_roundtrip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"heading","attrs":{"level":2,"localId":"h-456"},"content":[{"type":"text","text":"Title"}]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let attrs = round_tripped.content[0].attrs.as_ref().unwrap();
+        assert_eq!(attrs["localId"], "h-456");
+    }
+
+    #[test]
+    fn localid_with_alignment_preserved() {
+        // localId and alignment marks should coexist in the same {attrs} block
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"paragraph","attrs":{"localId":"p-789"},"marks":[{"type":"alignment","attrs":{"align":"center"}}],
+           "content":[{"type":"text","text":"centered"}]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("localId=p-789"), "should have localId: {md}");
+        assert!(md.contains("align=center"), "should have align: {md}");
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let attrs = round_tripped.content[0].attrs.as_ref().unwrap();
+        assert_eq!(attrs["localId"], "p-789");
+        let marks = round_tripped.content[0].marks.as_ref().unwrap();
+        assert!(marks.iter().any(|m| m.mark_type == "alignment"));
     }
 
     #[test]
