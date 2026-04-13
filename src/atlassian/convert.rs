@@ -2662,7 +2662,23 @@ fn render_marked_text(text: &str, marks: &[AdfMark], output: &mut String) {
                 }
             }
         }
-        output.push_str(&format!("[{inner}]{{{}}}", attr_parts.join(" ")));
+        let bracketed = format!("[{inner}]{{{}}}", attr_parts.join(" "));
+        // If there's also a link mark, wrap the bracketed span in a link
+        if let Some(link_mark) = has_link {
+            let href = link_mark
+                .attrs
+                .as_ref()
+                .and_then(|a| a.get("href"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            output.push('[');
+            output.push_str(&bracketed);
+            output.push_str("](");
+            output.push_str(href);
+            output.push(')');
+        } else {
+            output.push_str(&bracketed);
+        }
     } else if let Some(link_mark) = has_link {
         let href = link_mark
             .attrs
@@ -4243,6 +4259,94 @@ mod tests {
         assert!(
             marks.iter().any(|m| m.mark_type == "annotation"),
             "should have annotation mark"
+        );
+    }
+
+    #[test]
+    fn annotation_and_link_marks_both_preserved() {
+        // Issue #390: text with both annotation and link marks loses link on round-trip
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"HANGUL-8","marks":[
+            {"type":"annotation","attrs":{"annotationType":"inlineComment","id":"5ca7425e-34cd-48d3-b4eb-9873ac8b20e0"}},
+            {"type":"link","attrs":{"href":"https://zendesk.atlassian.net/browse/HANGUL-8"}}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        // Should contain both annotation attrs and link syntax
+        assert!(
+            md.contains("annotation-id="),
+            "JFM should contain annotation-id, got: {md}"
+        );
+        assert!(
+            md.contains("](https://"),
+            "JFM should contain link href, got: {md}"
+        );
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let text_node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let marks = text_node.marks.as_ref().expect("should have marks");
+        assert!(
+            marks.iter().any(|m| m.mark_type == "annotation"),
+            "should have annotation mark, got: {:?}",
+            marks.iter().map(|m| &m.mark_type).collect::<Vec<_>>()
+        );
+        assert!(
+            marks.iter().any(|m| m.mark_type == "link"),
+            "should have link mark, got: {:?}",
+            marks.iter().map(|m| &m.mark_type).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn underline_and_link_marks_both_preserved() {
+        // Underline + link should also coexist
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text_with_marks(
+                "click here",
+                vec![AdfMark::underline(), AdfMark::link("https://example.com")],
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("underline"), "should have underline attr: {md}");
+        assert!(
+            md.contains("](https://example.com)"),
+            "should have link: {md}"
+        );
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let text_node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let marks = text_node.marks.as_ref().expect("should have marks");
+        assert!(marks.iter().any(|m| m.mark_type == "underline"));
+        assert!(marks.iter().any(|m| m.mark_type == "link"));
+    }
+
+    #[test]
+    fn annotation_link_and_bold_all_preserved() {
+        // All three marks should coexist
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"important","marks":[
+            {"type":"annotation","attrs":{"annotationType":"inlineComment","id":"abc"}},
+            {"type":"link","attrs":{"href":"https://example.com"}},
+            {"type":"strong"}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let text_node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let marks = text_node.marks.as_ref().expect("should have marks");
+        assert!(
+            marks.iter().any(|m| m.mark_type == "annotation"),
+            "should have annotation"
+        );
+        assert!(
+            marks.iter().any(|m| m.mark_type == "link"),
+            "should have link"
+        );
+        assert!(
+            marks.iter().any(|m| m.mark_type == "strong"),
+            "should have strong"
         );
     }
 
