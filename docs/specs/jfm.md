@@ -154,6 +154,7 @@ ADF v1.
 | `underline`   | Bracketed span: `[text]{underline}`         |
 | `textColor`   | Bracketed span: `[text]{color=#hex}`        |
 | `subsup`      | Mark for subscript/superscript              |
+| `annotation`  | Bracketed span: `[text]{annotation-id=... annotation-type=...}` |
 
 ### Unsupported Node Handling
 
@@ -263,7 +264,7 @@ Inline content within paragraphs is parsed for:
 - Bold, italic, code, strikethrough
 - Links and bare URLs
 - Inline directives (status, date, mention, emoji)
-- Bracketed spans with attributes (`[text]{color=red}`)
+- Bracketed spans with attributes (`[text]{color=red}`, `[text]{annotation-id=...}`)
 
 ### ADF to Markdown
 
@@ -281,6 +282,32 @@ Block-level attributes can follow a block on a separate line:
 ```
 
 Supported attributes: `align`, `indent`, `breakout`.
+
+### Inline Attribute Marks
+
+Bracketed spans `[text]{attrs}` represent inline marks that have no native
+markdown syntax. Multiple attributes can be combined in a single span.
+
+#### Underline
+
+```markdown
+[underlined text]{underline}
+```
+
+#### Annotation (Inline Comments)
+
+Confluence inline comments attach an `annotation` mark to highlighted text.
+The mark links the text span to a comment thread stored in Confluence's
+comment system. JFM preserves these marks for round-trip fidelity:
+
+```markdown
+[highlighted text]{annotation-id="abc123" annotation-type=inlineComment}
+```
+
+- `annotation-id`: the annotation identifier (required)
+- `annotation-type`: the annotation type, typically `inlineComment` (required)
+- Annotations can coexist with other marks (bold, italic, etc.):
+  `[**bold comment**]{annotation-id="abc123" annotation-type=inlineComment}`
 
 ## Authentication
 
