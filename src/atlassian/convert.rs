@@ -248,7 +248,7 @@ impl<'a> MarkdownParser<'a> {
                 ));
                 self.advance();
             } else {
-                let item_text = trimmed[2..].trim_end();
+                let item_text = &trimmed[2..];
                 let inline_nodes = parse_inline(item_text);
                 self.advance();
                 // Collect indented sub-list lines (2-space prefix + list marker)
@@ -294,7 +294,7 @@ impl<'a> MarkdownParser<'a> {
             let trimmed = line.trim_start();
 
             if let Some((_, rest)) = parse_ordered_list_marker(trimmed) {
-                let inline_nodes = parse_inline(rest.trim());
+                let inline_nodes = parse_inline(rest.trim_start());
                 self.advance();
                 // Collect indented sub-list lines (2-space prefix + list marker)
                 let mut sub_lines: Vec<String> = Vec::new();
@@ -5096,6 +5096,86 @@ mod tests {
         let round_tripped = markdown_to_adf(&md).unwrap();
         let attrs = round_tripped.content[0].attrs.as_ref().unwrap();
         assert_eq!(attrs["isNumberColumnEnabled"], true);
+    }
+
+    #[test]
+    fn trailing_space_in_bullet_list_item_preserved() {
+        // Issue #394: trailing space text node in list item dropped
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[
+          {"type":"listItem","content":[{"type":"paragraph","content":[
+            {"type":"text","text":"Before link "},
+            {"type":"text","text":"link text","marks":[{"type":"link","attrs":{"href":"https://example.com"}}]},
+            {"type":"text","text":" "}
+          ]}]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let list = &round_tripped.content[0];
+        let item = &list.content.as_ref().unwrap()[0];
+        let para = &item.content.as_ref().unwrap()[0];
+        let inlines = para.content.as_ref().unwrap();
+        let last = inlines.last().unwrap();
+        assert_eq!(
+            last.text.as_deref(),
+            Some(" "),
+            "trailing space text node should be preserved, got nodes: {:?}",
+            inlines
+                .iter()
+                .map(|n| (&n.node_type, &n.text))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn trailing_space_after_mention_in_bullet_list_preserved() {
+        // Mention + trailing space in list item
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[
+          {"type":"listItem","content":[{"type":"paragraph","content":[
+            {"type":"mention","attrs":{"id":"abc","text":"@Alice"}},
+            {"type":"text","text":" "}
+          ]}]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let para = &round_tripped.content[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap()[0];
+        let inlines = para.content.as_ref().unwrap();
+        assert!(
+            inlines.len() >= 2,
+            "should have mention + trailing space, got {} nodes",
+            inlines.len()
+        );
+        assert_eq!(inlines.last().unwrap().text.as_deref(), Some(" "));
+    }
+
+    #[test]
+    fn trailing_space_in_ordered_list_item_preserved() {
+        // Same issue in ordered list context
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"orderedList","attrs":{"order":1},"content":[
+          {"type":"listItem","content":[{"type":"paragraph","content":[
+            {"type":"text","text":"item "},
+            {"type":"text","text":"link","marks":[{"type":"link","attrs":{"href":"https://example.com"}}]},
+            {"type":"text","text":" "}
+          ]}]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let para = &round_tripped.content[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap()[0];
+        let inlines = para.content.as_ref().unwrap();
+        let last = inlines.last().unwrap();
+        assert_eq!(
+            last.text.as_deref(),
+            Some(" "),
+            "trailing space should be preserved in ordered list item"
+        );
     }
 
     #[test]
