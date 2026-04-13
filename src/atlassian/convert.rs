@@ -356,11 +356,10 @@ impl<'a> MarkdownParser<'a> {
             let current = self.current_line();
             if try_parse_container_open(current).is_some() {
                 depth += 1;
-            } else if is_container_close(current, colon_count) {
-                if depth == 0 {
-                    self.advance(); // past closing fence
-                    break;
-                }
+            } else if depth == 0 && is_container_close(current, colon_count) {
+                self.advance(); // past closing fence
+                break;
+            } else if depth > 0 && is_container_close(current, 3) {
                 depth -= 1;
             }
             inner_lines.push(current.to_string());
@@ -5263,6 +5262,125 @@ mod tests {
                 .iter()
                 .map(|n| &n.node_type)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn content_after_directive_table_is_preserved() {
+        // Issue #361: content after a ::::table block was silently dropped
+        let md = "\
+## Before table
+
+::::table{layout=default}
+:::tr
+:::th{}
+Cell
+:::
+:::
+::::
+
+## After table
+
+Paragraph after.";
+        let adf = markdown_to_adf(md).unwrap();
+        let types: Vec<&str> = adf.content.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec!["heading", "table", "heading", "paragraph"],
+            "Content after table was dropped: got {types:?}"
+        );
+    }
+
+    #[test]
+    fn paragraph_after_directive_table_is_preserved() {
+        // Issue #361: minimal reproducer — paragraph after table
+        let md = "\
+::::table{layout=default}
+:::tr
+:::th{}
+Header
+:::
+:::
+::::
+
+Just a paragraph.";
+        let adf = markdown_to_adf(md).unwrap();
+        let types: Vec<&str> = adf.content.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec!["table", "paragraph"],
+            "Paragraph after table was dropped: got {types:?}"
+        );
+    }
+
+    #[test]
+    fn extension_after_directive_table_is_preserved() {
+        // Issue #361: extension after table
+        let md = "\
+::::table{layout=default}
+:::tr
+:::th{}
+Header
+:::
+:::
+::::
+
+::extension{type=com.atlassian.confluence.macro.core key=toc}";
+        let adf = markdown_to_adf(md).unwrap();
+        let types: Vec<&str> = adf.content.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec!["table", "extension"],
+            "Extension after table was dropped: got {types:?}"
+        );
+    }
+
+    #[test]
+    fn multiple_blocks_after_directive_table() {
+        // Issue #361: multiple blocks after table, including another table
+        let md = "\
+## Heading 1
+
+::::table{layout=default}
+:::tr
+:::td{}
+A
+:::
+:::td{}
+B
+:::
+:::
+::::
+
+## Heading 2
+
+Some text.
+
+---
+
+::::table{layout=default}
+:::tr
+:::th{}
+C
+:::
+:::
+::::
+
+## Heading 3";
+        let adf = markdown_to_adf(md).unwrap();
+        let types: Vec<&str> = adf.content.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec![
+                "heading",
+                "table",
+                "heading",
+                "paragraph",
+                "rule",
+                "table",
+                "heading"
+            ],
+            "Content after tables was dropped: got {types:?}"
         );
     }
 }
