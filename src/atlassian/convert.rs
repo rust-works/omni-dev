@@ -241,7 +241,7 @@ impl<'a> MarkdownParser<'a> {
             // Detect task list items: - [ ] or - [x]
             if let Some((state, text)) = try_parse_task_marker(after_marker) {
                 is_task_list = true;
-                let (item_text, local_id) = extract_trailing_local_id(text);
+                let (item_text, local_id, _para_local_id) = extract_trailing_local_id(text);
                 let inline_nodes = parse_inline(item_text);
                 let mut task = AdfNode::task_item(state, vec![AdfNode::paragraph(inline_nodes)]);
                 // Override the placeholder localId if one was parsed
@@ -254,7 +254,7 @@ impl<'a> MarkdownParser<'a> {
                 self.advance();
             } else {
                 let item_text = &trimmed[2..];
-                let (item_text, local_id) = extract_trailing_local_id(item_text);
+                let (item_text, local_id, para_local_id) = extract_trailing_local_id(item_text);
                 let inline_nodes = parse_inline(item_text);
                 self.advance();
                 // Collect indented sub-list lines (2-space prefix + list marker)
@@ -275,13 +275,18 @@ impl<'a> MarkdownParser<'a> {
                     items.push(list_item_with_local_id(
                         vec![AdfNode::paragraph(inline_nodes)],
                         local_id,
+                        para_local_id,
                     ));
                 } else {
                     let sub_text = sub_lines.join("\n");
                     let mut nested = MarkdownParser::new(&sub_text).parse_blocks()?;
                     let mut item_content = vec![AdfNode::paragraph(inline_nodes)];
                     item_content.append(&mut nested);
-                    items.push(list_item_with_local_id(item_content, local_id));
+                    items.push(list_item_with_local_id(
+                        item_content,
+                        local_id,
+                        para_local_id,
+                    ));
                 }
             }
         }
@@ -304,7 +309,7 @@ impl<'a> MarkdownParser<'a> {
 
             if let Some((_, rest)) = parse_ordered_list_marker(trimmed) {
                 let rest_trimmed = rest.trim_start();
-                let (item_text, local_id) = extract_trailing_local_id(rest_trimmed);
+                let (item_text, local_id, para_local_id) = extract_trailing_local_id(rest_trimmed);
                 let inline_nodes = parse_inline(item_text);
                 self.advance();
                 // Collect indented sub-list lines (2-space prefix + list marker)
@@ -329,13 +334,18 @@ impl<'a> MarkdownParser<'a> {
                     items.push(list_item_with_local_id(
                         vec![AdfNode::paragraph(inline_nodes)],
                         local_id,
+                        para_local_id,
                     ));
                 } else {
                     let sub_text = sub_lines.join("\n");
                     let mut nested = MarkdownParser::new(&sub_text).parse_blocks()?;
                     let mut item_content = vec![AdfNode::paragraph(inline_nodes)];
                     item_content.append(&mut nested);
-                    items.push(list_item_with_local_id(item_content, local_id));
+                    items.push(list_item_with_local_id(
+                        item_content,
+                        local_id,
+                        para_local_id,
+                    ));
                 }
             } else {
                 break;
@@ -776,11 +786,13 @@ impl<'a> MarkdownParser<'a> {
                 node
             }
             "paragraph" => {
-                if let Some(ref text) = d.content {
+                let mut node = if let Some(ref text) = d.content {
                     AdfNode::paragraph(parse_inline(text))
                 } else {
                     AdfNode::paragraph(vec![])
-                }
+                };
+                pass_through_local_id(&d.attrs, &mut node);
+                node
             }
             _ => return None,
         };
@@ -1882,28 +1894,44 @@ fn pass_through_local_id(dir_attrs: &Option<crate::atlassian::attrs::Attrs>, nod
 // promotion issue where {localId=...} on a separate line would be
 // applied to the parent list node.
 
-/// Extracts trailing `{localId=...}` from list item text.
-/// Returns the text without the trailing attrs and the localId if found.
-fn extract_trailing_local_id(text: &str) -> (&str, Option<String>) {
+/// Extracts trailing `{localId=... paraLocalId=...}` from list item text.
+/// Returns the text without the trailing attrs, the listItem localId, and
+/// the paragraph localId if found.
+fn extract_trailing_local_id(text: &str) -> (&str, Option<String>, Option<String>) {
     let trimmed = text.trim_end();
     if !trimmed.ends_with('}') {
-        return (text, None);
+        return (text, None, None);
     }
     // Find the opening brace
     if let Some(brace_pos) = trimmed.rfind('{') {
         let attr_str = &trimmed[brace_pos..];
         if let Some((_, attrs)) = parse_attrs(attr_str, 0) {
-            if let Some(local_id) = attrs.get("localId") {
+            let local_id = attrs.get("localId").map(str::to_string);
+            let para_local_id = attrs.get("paraLocalId").map(str::to_string);
+            if local_id.is_some() || para_local_id.is_some() {
                 let before = trimmed[..brace_pos].trim_end();
-                return (before, Some(local_id.to_string()));
+                return (before, local_id, para_local_id);
             }
         }
     }
-    (text, None)
+    (text, None, None)
 }
 
-/// Creates a `listItem` node, optionally with a `localId` attribute.
-fn list_item_with_local_id(content: Vec<AdfNode>, local_id: Option<String>) -> AdfNode {
+/// Creates a `listItem` node, optionally with a `localId` attribute
+/// and a `paraLocalId` on its first paragraph child.
+fn list_item_with_local_id(
+    mut content: Vec<AdfNode>,
+    local_id: Option<String>,
+    para_local_id: Option<String>,
+) -> AdfNode {
+    if let Some(id) = &para_local_id {
+        if let Some(first) = content.first_mut() {
+            if first.node_type == "paragraph" {
+                let node_attrs = first.attrs.get_or_insert_with(|| serde_json::json!({}));
+                node_attrs["localId"] = serde_json::Value::String(id.clone());
+            }
+        }
+    }
     let mut item = AdfNode::list_item(content);
     if let Some(id) = local_id {
         item.attrs = Some(serde_json::json!({"localId": id}));
@@ -1937,16 +1965,28 @@ fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) 
     match node.node_type.as_str() {
         "paragraph" => {
             let is_empty = node.content.as_ref().map_or(true, Vec::is_empty);
+            // Build directive attr string for localId when using ::paragraph form
+            let dir_attrs = {
+                let mut parts = Vec::new();
+                if let Some(ref attrs) = node.attrs {
+                    maybe_push_local_id(attrs, &mut parts, opts);
+                }
+                if parts.is_empty() {
+                    String::new()
+                } else {
+                    format!("{{{}}}", parts.join(" "))
+                }
+            };
             if is_empty {
-                output.push_str("::paragraph\n");
+                output.push_str(&format!("::paragraph{dir_attrs}\n"));
             } else {
                 // Render to a buffer first to check if content is whitespace-only
                 let mut buf = String::new();
                 render_inline_content(node, &mut buf, opts);
                 if buf.trim().is_empty() && !buf.is_empty() {
                     // Whitespace-only content (e.g. NBSP) would be lost as a plain
-                    // line — use the ::paragraph[content] directive form instead
-                    output.push_str(&format!("::paragraph[{buf}]\n"));
+                    // line — use the ::paragraph[content]{attrs} directive form
+                    output.push_str(&format!("::paragraph[{buf}]{dir_attrs}\n"));
                 } else {
                     output.push_str(&buf);
                     output.push('\n');
@@ -2273,8 +2313,20 @@ fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) 
             }
         }
     }
-    // Skip localId for node types that already include it in their directive attrs
-    if !matches!(node.node_type.as_str(), "expand" | "nestedExpand") {
+    // Skip localId for node types that already include it in their directive attrs.
+    // For paragraphs, localId is included in the ::paragraph directive when the
+    // paragraph uses directive form (empty or whitespace-only content).
+    let para_used_directive = node.node_type == "paragraph" && {
+        let is_empty = node.content.as_ref().map_or(true, Vec::is_empty);
+        if is_empty {
+            true
+        } else {
+            let mut buf = String::new();
+            render_inline_content(node, &mut buf, opts);
+            buf.trim().is_empty() && !buf.is_empty()
+        }
+    };
+    if !matches!(node.node_type.as_str(), "expand" | "nestedExpand") && !para_used_directive {
         if let Some(ref attrs) = node.attrs {
             maybe_push_local_id(attrs, &mut parts, opts);
         }
@@ -2296,8 +2348,8 @@ fn render_list_item_content(item: &AdfNode, output: &mut String, opts: &RenderOp
     };
     if first.node_type == "paragraph" {
         render_inline_content(first, output, opts);
-        // Emit listItem localId as trailing inline attrs on the first line
-        emit_list_item_local_id(item, output, opts);
+        // Emit paragraph + listItem localIds as trailing inline attrs on the first line
+        emit_list_item_local_ids(item, first, output, opts);
         output.push('\n');
     } else {
         render_block_node(first, output, opts);
@@ -2313,17 +2365,30 @@ fn render_list_item_content(item: &AdfNode, output: &mut String, opts: &RenderOp
     }
 }
 
-/// Emits trailing `{localId=...}` on a list item line if the item has a localId.
-fn emit_list_item_local_id(item: &AdfNode, output: &mut String, opts: &RenderOptions) {
+/// Emits trailing `{localId=... paraLocalId=...}` on a list item line
+/// for both the listItem and its first (unwrapped) paragraph.
+fn emit_list_item_local_ids(
+    item: &AdfNode,
+    paragraph: &AdfNode,
+    output: &mut String,
+    opts: &RenderOptions,
+) {
     if opts.strip_local_ids {
         return;
     }
+    let mut parts = Vec::new();
     if let Some(ref attrs) = item.attrs {
+        maybe_push_local_id(attrs, &mut parts, opts);
+    }
+    if let Some(ref attrs) = paragraph.attrs {
         if let Some(local_id) = attrs.get("localId").and_then(serde_json::Value::as_str) {
             if local_id != "00000000-0000-0000-0000-000000000000" {
-                output.push_str(&format!(" {{localId={local_id}}}"));
+                parts.push(format!("paraLocalId={local_id}"));
             }
         }
+    }
+    if !parts.is_empty() {
+        output.push_str(&format!(" {{{}}}", parts.join(" ")));
     }
 }
 
@@ -2374,6 +2439,16 @@ fn table_qualifies_for_pipe_syntax(rows: &[AdfNode]) -> bool {
             // hardBreak inside a cell produces a newline that breaks pipe
             // table syntax — fall back to directive form
             if cell_contains_hard_break(&content[0]) {
+                return false;
+            }
+            // Paragraph-level localId would be lost in pipe form (the paragraph
+            // is unwrapped into the cell text) — fall back to directive form
+            if content[0]
+                .attrs
+                .as_ref()
+                .and_then(|a| a.get("localId"))
+                .is_some()
+            {
                 return false;
             }
         }
@@ -5378,6 +5453,168 @@ mod tests {
         };
         let md = adf_to_markdown_with_options(&doc, &opts).unwrap();
         assert!(!md.contains("localId"), "localId should be stripped: {md}");
+    }
+
+    #[test]
+    fn paragraph_localid_in_list_item_roundtrip() {
+        // Issue #417: paragraph.attrs.localId dropped in listItem context
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","attrs":{"localId":"list-001"},"content":[{"type":"listItem","attrs":{"localId":"item-001"},"content":[{"type":"paragraph","attrs":{"localId":"para-001"},"content":[{"type":"text","text":"item text"}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("paraLocalId=para-001"),
+            "paragraph localId should be in md: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let item = &rt.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(
+            item.attrs.as_ref().unwrap()["localId"],
+            "item-001",
+            "listItem localId should survive"
+        );
+        let para = &item.content.as_ref().unwrap()[0];
+        assert_eq!(
+            para.attrs.as_ref().unwrap()["localId"],
+            "para-001",
+            "paragraph localId should survive round-trip"
+        );
+    }
+
+    #[test]
+    fn paragraph_localid_in_ordered_list_item_roundtrip() {
+        // Issue #417: paragraph localId in ordered list
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"orderedList","attrs":{"order":1},"content":[{"type":"listItem","attrs":{"localId":"oli-001"},"content":[{"type":"paragraph","attrs":{"localId":"op-001"},"content":[{"type":"text","text":"first"}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("paraLocalId=op-001"), "md: {md}");
+        let rt = markdown_to_adf(&md).unwrap();
+        let item = &rt.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(item.attrs.as_ref().unwrap()["localId"], "oli-001");
+        let para = &item.content.as_ref().unwrap()[0];
+        assert_eq!(para.attrs.as_ref().unwrap()["localId"], "op-001");
+    }
+
+    #[test]
+    fn paragraph_localid_only_in_list_item() {
+        // paragraph has localId but listItem does not
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[{"type":"listItem","content":[{"type":"paragraph","attrs":{"localId":"para-only"},"content":[{"type":"text","text":"text"}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("paraLocalId=para-only"),
+            "paragraph localId should be emitted: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let item = &rt.content[0].content.as_ref().unwrap()[0];
+        assert!(item.attrs.is_none(), "listItem should have no attrs");
+        let para = &item.content.as_ref().unwrap()[0];
+        assert_eq!(para.attrs.as_ref().unwrap()["localId"], "para-only");
+    }
+
+    #[test]
+    fn paragraph_localid_in_table_header_roundtrip() {
+        // Issue #417: paragraph.attrs.localId dropped in tableHeader context
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"table","attrs":{"isNumberColumnEnabled":false,"layout":"default"},"content":[{"type":"tableRow","content":[{"type":"tableHeader","attrs":{},"content":[{"type":"paragraph","attrs":{"localId":"aaaa-aaaa"},"content":[{"type":"text","text":"hello"}]}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        // Should use directive form (not pipe table) to preserve paragraph localId
+        assert!(
+            md.contains("localId=aaaa-aaaa"),
+            "paragraph localId should be in md: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let cell = &rt.content[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap()[0];
+        let para = &cell.content.as_ref().unwrap()[0];
+        assert_eq!(
+            para.attrs.as_ref().unwrap()["localId"],
+            "aaaa-aaaa",
+            "paragraph localId should survive round-trip in tableHeader"
+        );
+    }
+
+    #[test]
+    fn paragraph_localid_in_table_cell_roundtrip() {
+        // Issue #417: paragraph localId in tableCell forces directive table
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"table","attrs":{"isNumberColumnEnabled":false,"layout":"default"},"content":[{"type":"tableRow","content":[{"type":"tableHeader","attrs":{},"content":[{"type":"paragraph","content":[{"type":"text","text":"header"}]}]}]},{"type":"tableRow","content":[{"type":"tableCell","attrs":{},"content":[{"type":"paragraph","attrs":{"localId":"cell-para"},"content":[{"type":"text","text":"data"}]}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("localId=cell-para"),
+            "paragraph localId should be in md: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        // Data row -> cell -> paragraph
+        let cell = &rt.content[0].content.as_ref().unwrap()[1]
+            .content
+            .as_ref()
+            .unwrap()[0];
+        let para = &cell.content.as_ref().unwrap()[0];
+        assert_eq!(
+            para.attrs.as_ref().unwrap()["localId"],
+            "cell-para",
+            "paragraph localId should survive round-trip in tableCell"
+        );
+    }
+
+    #[test]
+    fn nbsp_paragraph_with_localid_roundtrip() {
+        // Issue #417: nbsp paragraph localId emitted as text instead of attrs
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","attrs":{"localId":"nbsp-para"},"content":[{"type":"text","text":"\u00a0"}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("::paragraph["),
+            "nbsp should use directive form: {md}"
+        );
+        assert!(
+            md.contains("localId=nbsp-para"),
+            "localId should be in directive: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let para = &rt.content[0];
+        assert_eq!(
+            para.attrs.as_ref().unwrap()["localId"],
+            "nbsp-para",
+            "localId should survive round-trip"
+        );
+        let text = para.content.as_ref().unwrap()[0].text.as_ref().unwrap();
+        assert_eq!(text, "\u{00a0}", "nbsp should survive");
+    }
+
+    #[test]
+    fn empty_paragraph_with_localid_roundtrip() {
+        // Empty paragraph directive with localId
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","attrs":{"localId":"empty-para"}}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("::paragraph{localId=empty-para}"),
+            "empty paragraph should include localId in directive: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        assert_eq!(
+            rt.content[0].attrs.as_ref().unwrap()["localId"],
+            "empty-para"
+        );
+    }
+
+    #[test]
+    fn paragraph_localid_stripped_from_list_item() {
+        // strip_local_ids should also strip paraLocalId
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[{"type":"listItem","attrs":{"localId":"li-001"},"content":[{"type":"paragraph","attrs":{"localId":"p-001"},"content":[{"type":"text","text":"item"}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let opts = RenderOptions {
+            strip_local_ids: true,
+        };
+        let md = adf_to_markdown_with_options(&doc, &opts).unwrap();
+        assert!(!md.contains("localId"), "localId should be stripped: {md}");
+        assert!(
+            !md.contains("paraLocalId"),
+            "paraLocalId should be stripped: {md}"
+        );
     }
 
     #[test]
