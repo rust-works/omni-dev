@@ -1273,6 +1273,21 @@ fn parse_inline(text: &str) -> Vec<AdfNode> {
                 }
                 chars.next();
             }
+            ' ' if text[i..].starts_with("  \n") => {
+                // Trailing-space line break → hardBreak node.
+                // Flush preceding text (without the trailing spaces).
+                flush_plain(text, plain_start, i, &mut nodes);
+                nodes.push(AdfNode::hard_break());
+                // Skip past all spaces and the newline
+                while chars.peek().is_some_and(|&(_, c)| c == ' ') {
+                    chars.next();
+                }
+                // Skip the newline
+                if chars.peek().is_some_and(|&(_, c)| c == '\n') {
+                    chars.next();
+                }
+                plain_start = chars.peek().map_or(text.len(), |&(idx, _)| idx);
+            }
             '!' if text[i..].starts_with("![") => {
                 // Inline image — skip the ! and let [ handle it next iteration
                 // (Images at block level are handled by try_image; inline images
@@ -5298,6 +5313,28 @@ mod tests {
             "Should have exactly 1 row, got {}",
             rows.len()
         );
+    }
+
+    #[test]
+    fn hardbreak_in_paragraph_roundtrips() {
+        // Issue #373: hardBreak absorbed into preceding text node
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"line one"},
+          {"type":"hardBreak"},
+          {"type":"text","text":"line two"}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let inlines = round_tripped.content[0].content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec!["text", "hardBreak", "text"],
+            "hardBreak should be preserved, got: {types:?}"
+        );
+        assert_eq!(inlines[0].text.as_deref(), Some("line one"));
+        assert_eq!(inlines[2].text.as_deref(), Some("line two"));
     }
 
     #[test]
