@@ -465,7 +465,17 @@ impl<'a> MarkdownParser<'a> {
                 let ext_type = d.attrs.as_ref().and_then(|a| a.get("type")).unwrap_or("");
                 let ext_key = d.attrs.as_ref().and_then(|a| a.get("key")).unwrap_or("");
                 let inner_blocks = MarkdownParser::new(&inner_text).parse_blocks()?;
-                AdfNode::bodied_extension(ext_type, ext_key, inner_blocks)
+                let mut node = AdfNode::bodied_extension(ext_type, ext_key, inner_blocks);
+                if let (Some(ref dir_attrs), Some(ref mut node_attrs)) = (&d.attrs, &mut node.attrs)
+                {
+                    if let Some(layout) = dir_attrs.get("layout") {
+                        node_attrs["layout"] = serde_json::Value::String(layout.to_string());
+                    }
+                    if let Some(local_id) = dir_attrs.get("localId") {
+                        node_attrs["localId"] = serde_json::Value::String(local_id.to_string());
+                    }
+                }
+                node
             }
             _ => return Ok(None),
         };
@@ -701,7 +711,17 @@ impl<'a> MarkdownParser<'a> {
                     .as_ref()
                     .and_then(|a| a.get("params"))
                     .and_then(|p| serde_json::from_str(p).ok());
-                AdfNode::extension(ext_type, ext_key, params)
+                let mut node = AdfNode::extension(ext_type, ext_key, params);
+                if let (Some(ref dir_attrs), Some(ref mut node_attrs)) = (&d.attrs, &mut node.attrs)
+                {
+                    if let Some(layout) = dir_attrs.get("layout") {
+                        node_attrs["layout"] = serde_json::Value::String(layout.to_string());
+                    }
+                    if let Some(local_id) = dir_attrs.get("localId") {
+                        node_attrs["localId"] = serde_json::Value::String(local_id.to_string());
+                    }
+                }
+                node
             }
             "paragraph" => AdfNode::paragraph(vec![]),
             _ => return None,
@@ -1873,10 +1893,16 @@ fn render_block_node(node: &AdfNode, output: &mut String) {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("");
                 let mut attr_parts = vec![format!("type={ext_type}"), format!("key={ext_key}")];
+                if let Some(layout) = attrs.get("layout").and_then(serde_json::Value::as_str) {
+                    attr_parts.push(format!("layout={layout}"));
+                }
                 if let Some(params) = attrs.get("parameters") {
                     if let Ok(json_str) = serde_json::to_string(params) {
                         attr_parts.push(format!("params='{json_str}'"));
                     }
+                }
+                if let Some(local_id) = attrs.get("localId").and_then(serde_json::Value::as_str) {
+                    attr_parts.push(format!("localId={local_id}"));
                 }
                 output.push_str(&format!("::extension{{{}}}\n", attr_parts.join(" ")));
             }
@@ -1965,7 +1991,14 @@ fn render_block_node(node: &AdfNode, output: &mut String) {
                     .get("extensionKey")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("");
-                output.push_str(&format!(":::extension{{type={ext_type} key={ext_key}}}\n"));
+                let mut attr_parts = vec![format!("type={ext_type}"), format!("key={ext_key}")];
+                if let Some(layout) = attrs.get("layout").and_then(serde_json::Value::as_str) {
+                    attr_parts.push(format!("layout={layout}"));
+                }
+                if let Some(local_id) = attrs.get("localId").and_then(serde_json::Value::as_str) {
+                    attr_parts.push(format!("localId={local_id}"));
+                }
+                output.push_str(&format!(":::extension{{{}}}\n", attr_parts.join(" ")));
                 if let Some(ref content) = node.content {
                     render_block_children(content, output);
                 }
@@ -5002,6 +5035,56 @@ mod tests {
         let doc = markdown_to_adf(&format!("{md}\n")).unwrap();
         let attrs = doc.content[0].attrs.as_ref().unwrap();
         assert_eq!(attrs["parameters"]["jql"], "project=PROJ");
+    }
+
+    #[test]
+    fn leaf_extension_layout_preserved_in_roundtrip() {
+        // Issue #381: layout attr on extension nodes was dropped
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"extension","attrs":{"extensionType":"com.atlassian.confluence.macro.core","extensionKey":"toc","layout":"default","parameters":{}}}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("layout=default"),
+            "JFM should contain layout=default, got: {md}"
+        );
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let attrs = round_tripped.content[0].attrs.as_ref().unwrap();
+        assert_eq!(attrs["layout"], "default", "layout should be preserved");
+        assert_eq!(attrs["extensionKey"], "toc");
+    }
+
+    #[test]
+    fn bodied_extension_layout_preserved_in_roundtrip() {
+        // Bodied extension with layout
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"bodiedExtension","attrs":{"extensionType":"com.atlassian.macro","extensionKey":"expand","layout":"wide"},
+           "content":[{"type":"paragraph","content":[{"type":"text","text":"inner"}]}]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("layout=wide"),
+            "JFM should contain layout=wide, got: {md}"
+        );
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let attrs = round_tripped.content[0].attrs.as_ref().unwrap();
+        assert_eq!(attrs["layout"], "wide", "layout should be preserved");
+    }
+
+    #[test]
+    fn leaf_extension_localid_preserved_in_roundtrip() {
+        // Extension with both layout and localId
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"extension","attrs":{"extensionType":"com.atlassian.macro","extensionKey":"toc","layout":"default","localId":"abc-123"}}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let attrs = round_tripped.content[0].attrs.as_ref().unwrap();
+        assert_eq!(attrs["layout"], "default");
+        assert_eq!(attrs["localId"], "abc-123");
     }
 
     // ── Mention with userType test ─────────────────────────────────
