@@ -295,8 +295,34 @@ impl<'a> MarkdownParser<'a> {
 
             if let Some((_, rest)) = parse_ordered_list_marker(trimmed) {
                 let inline_nodes = parse_inline(rest.trim());
-                items.push(AdfNode::list_item(vec![AdfNode::paragraph(inline_nodes)]));
                 self.advance();
+                // Collect indented sub-list lines (2-space prefix + list marker)
+                let mut sub_lines: Vec<String> = Vec::new();
+                while !self.at_end() {
+                    let next = self.current_line();
+                    if let Some(stripped) = next.strip_prefix("  ") {
+                        let st = stripped.trim_start();
+                        if st.starts_with("- ")
+                            || st.starts_with("* ")
+                            || st.starts_with("+ ")
+                            || parse_ordered_list_marker(st).is_some()
+                        {
+                            sub_lines.push(stripped.to_string());
+                            self.advance();
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                if sub_lines.is_empty() {
+                    items.push(AdfNode::list_item(vec![AdfNode::paragraph(inline_nodes)]));
+                } else {
+                    let sub_text = sub_lines.join("\n");
+                    let mut nested = MarkdownParser::new(&sub_text).parse_blocks()?;
+                    let mut item_content = vec![AdfNode::paragraph(inline_nodes)];
+                    item_content.append(&mut nested);
+                    items.push(AdfNode::list_item(item_content));
+                }
             } else {
                 break;
             }
@@ -305,8 +331,7 @@ impl<'a> MarkdownParser<'a> {
         if items.is_empty() {
             Ok(None)
         } else {
-            let start_attr = if start == 1 { None } else { Some(start) };
-            Ok(Some(AdfNode::ordered_list(items, start_attr)))
+            Ok(Some(AdfNode::ordered_list(items, Some(start))))
         }
     }
 
@@ -3051,12 +3076,12 @@ mod tests {
     }
 
     #[test]
-    fn ordered_list_start_at_one_no_attrs() {
+    fn ordered_list_start_at_one_has_order_attr() {
         let md = "1. First\n2. Second";
         let doc = markdown_to_adf(md).unwrap();
         let node = &doc.content[0];
         assert_eq!(node.node_type, "orderedList");
-        assert!(node.attrs.is_none());
+        assert_eq!(node.attrs.as_ref().unwrap()["order"], 1);
     }
 
     #[test]
@@ -5168,6 +5193,107 @@ mod tests {
             md2.contains("  - child"),
             "expected indented child in round-tripped markdown, got: {md2}"
         );
+    }
+
+    #[test]
+    fn nested_ordered_list_roundtrip() {
+        // Issue #389: nested orderedList inside listItem flattened
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"orderedList","attrs":{"order":1},"content":[
+          {"type":"listItem","content":[
+            {"type":"paragraph","content":[{"type":"text","text":"Top level"}]},
+            {"type":"orderedList","attrs":{"order":1},"content":[
+              {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"Nested 1"}]}]},
+              {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"Nested 2"}]}]}
+            ]}
+          ]},
+          {"type":"listItem","content":[
+            {"type":"paragraph","content":[{"type":"text","text":"Second top"}]}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+
+        // Outer list should have 2 items
+        let outer = &round_tripped.content[0];
+        assert_eq!(outer.node_type, "orderedList");
+        assert_eq!(outer.attrs.as_ref().unwrap()["order"], 1);
+        let outer_items = outer.content.as_ref().unwrap();
+        assert_eq!(
+            outer_items.len(),
+            2,
+            "outer list should have 2 items, got {}",
+            outer_items.len()
+        );
+
+        // First item should have paragraph + nested orderedList
+        let first_item = &outer_items[0];
+        let first_content = first_item.content.as_ref().unwrap();
+        assert_eq!(
+            first_content.len(),
+            2,
+            "first listItem should have paragraph + nested list, got {}",
+            first_content.len()
+        );
+        assert_eq!(first_content[0].node_type, "paragraph");
+        assert_eq!(first_content[1].node_type, "orderedList");
+        let nested_items = first_content[1].content.as_ref().unwrap();
+        assert_eq!(nested_items.len(), 2, "nested list should have 2 items");
+    }
+
+    #[test]
+    fn nested_ordered_list_markdown_parsing() {
+        // Direct markdown parsing of nested ordered list
+        let md = "1. Top level\n  1. Nested 1\n  2. Nested 2\n2. Second top\n";
+        let doc = markdown_to_adf(md).unwrap();
+        let outer = &doc.content[0];
+        assert_eq!(outer.node_type, "orderedList");
+        let outer_items = outer.content.as_ref().unwrap();
+        assert_eq!(outer_items.len(), 2, "should have 2 top-level items");
+
+        let first_content = outer_items[0].content.as_ref().unwrap();
+        assert_eq!(
+            first_content.len(),
+            2,
+            "first item should have paragraph + nested list"
+        );
+        assert_eq!(first_content[1].node_type, "orderedList");
+    }
+
+    #[test]
+    fn bullet_list_nested_inside_ordered_list() {
+        // Mixed nesting: bullet list nested inside ordered list
+        let md = "1. Ordered item\n  - Bullet child 1\n  - Bullet child 2\n2. Second ordered\n";
+        let doc = markdown_to_adf(md).unwrap();
+        let outer = &doc.content[0];
+        assert_eq!(outer.node_type, "orderedList");
+        let outer_items = outer.content.as_ref().unwrap();
+        assert_eq!(outer_items.len(), 2);
+
+        let first_content = outer_items[0].content.as_ref().unwrap();
+        assert_eq!(
+            first_content.len(),
+            2,
+            "first item should have paragraph + nested list"
+        );
+        assert_eq!(first_content[1].node_type, "bulletList");
+        let sub_items = first_content[1].content.as_ref().unwrap();
+        assert_eq!(sub_items.len(), 2, "nested bullet list should have 2 items");
+    }
+
+    #[test]
+    fn ordered_list_order_attr_always_preserved() {
+        // order=1 should be preserved, not elided
+        let md = "1. A\n2. B\n";
+        let doc = markdown_to_adf(md).unwrap();
+        let attrs = doc.content[0].attrs.as_ref().unwrap();
+        assert_eq!(attrs["order"], 1, "order=1 should be explicitly present");
+
+        // Round-trip should preserve it
+        let md2 = adf_to_markdown(&doc).unwrap();
+        let doc2 = markdown_to_adf(&md2).unwrap();
+        let attrs2 = doc2.content[0].attrs.as_ref().unwrap();
+        assert_eq!(attrs2["order"], 1);
     }
 
     // ── File media round-trip tests ─────────────────────────────────────
