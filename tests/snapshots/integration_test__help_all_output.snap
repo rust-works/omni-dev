@@ -343,13 +343,14 @@ omni-dev atlassian convert from-adf - Converts ADF JSON to JFM markdown
 
 Converts ADF JSON to JFM markdown
 
-Usage: from-adf [FILE]
+Usage: from-adf [OPTIONS] [FILE]
 
 Arguments:
   [FILE]  Input file (reads from stdin if omitted or "-")
 
 Options:
-  -h, --help  Print help
+      --strip-local-ids  Omit localId attributes from output for readability
+  -h, --help             Print help
 
 
 ================================================================================
