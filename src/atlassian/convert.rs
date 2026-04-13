@@ -1287,7 +1287,7 @@ fn parse_inline(text: &str) -> Vec<AdfNode> {
                     };
                     let inner = parse_inline(content);
                     for mut node in inner {
-                        add_mark(&mut node, mark.clone());
+                        prepend_mark(&mut node, mark.clone());
                         nodes.push(node);
                     }
                     // Advance past the consumed characters
@@ -1304,7 +1304,7 @@ fn parse_inline(text: &str) -> Vec<AdfNode> {
                     flush_plain(text, plain_start, i, &mut nodes);
                     let inner = parse_inline(content);
                     for mut node in inner {
-                        add_mark(&mut node, AdfMark::strike());
+                        prepend_mark(&mut node, AdfMark::strike());
                         nodes.push(node);
                     }
                     while chars.peek().is_some_and(|&(idx, _)| idx < end) {
@@ -1340,7 +1340,7 @@ fn parse_inline(text: &str) -> Vec<AdfNode> {
                     } else {
                         let inner = parse_inline(link_text);
                         for mut node in inner {
-                            add_mark(&mut node, AdfMark::link(href));
+                            prepend_mark(&mut node, AdfMark::link(href));
                             nodes.push(node);
                         }
                     }
@@ -1466,9 +1466,19 @@ fn flush_plain(text: &str, start: usize, end: usize, nodes: &mut Vec<AdfNode>) {
 }
 
 /// Adds a mark to a node (creates marks vec if needed).
+#[cfg(test)]
 fn add_mark(node: &mut AdfNode, mark: AdfMark) {
     if let Some(ref mut marks) = node.marks {
         marks.push(mark);
+    } else {
+        node.marks = Some(vec![mark]);
+    }
+}
+
+/// Prepends a mark before existing marks to preserve outside-in ordering.
+fn prepend_mark(node: &mut AdfNode, mark: AdfMark) {
+    if let Some(ref mut marks) = node.marks {
+        marks.insert(0, mark);
     } else {
         node.marks = Some(vec![mark]);
     }
@@ -1543,7 +1553,24 @@ fn try_parse_bracketed_span(text: &str, i: usize) -> Option<(usize, Vec<AdfNode>
         return None;
     }
 
-    let bracket_close = rest.find(']')?;
+    // Find the matching ] by counting bracket depth (supports nested brackets
+    // such as [[text](url)]{underline} for underline-before-link ordering).
+    let mut depth: usize = 0;
+    let mut bracket_close = None;
+    for (j, ch) in rest.char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    bracket_close = Some(j);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let bracket_close = bracket_close?;
     // Make sure this isn't a link: next char after ] must be { not (
     let after_bracket = &rest[bracket_close + 1..];
     if !after_bracket.starts_with('{') {
@@ -1662,7 +1689,22 @@ fn try_dispatch_inline_directive(text: &str, pos: usize) -> Option<(AdfNode, usi
             if marks.is_empty() {
                 AdfNode::text(content)
             } else {
-                AdfNode::text_with_marks(content, marks)
+                // Parse inner content to handle nested syntax (e.g., links).
+                // Prepend span marks before inner marks to preserve ordering.
+                let inner = parse_inline(content);
+                let mut nodes: Vec<AdfNode> = inner
+                    .into_iter()
+                    .map(|mut node| {
+                        let mut combined = marks.clone();
+                        if let Some(ref existing) = node.marks {
+                            combined.extend(existing.iter().cloned());
+                        }
+                        node.marks = Some(combined);
+                        node
+                    })
+                    .collect();
+                // Return the first marked node (typical case is a single node).
+                nodes.remove(0)
             }
         }
         "extension" => {
@@ -2830,9 +2872,14 @@ fn render_inline_node(node: &AdfNode, output: &mut String, opts: &RenderOptions)
 }
 
 /// Renders text with ADF marks applied as markdown syntax.
+///
+/// Mark ordering is preserved by checking the position of the `link` mark
+/// relative to formatting marks. Formatting marks that appear before `link`
+/// in the marks array are rendered as outer wrappers (e.g., `**[text](url)**`),
+/// while those after `link` are rendered inside the link (e.g., `[**text**](url)`).
 fn render_marked_text(text: &str, marks: &[AdfMark], output: &mut String) {
-    // Determine wrapping order: link is outermost, then bold/italic, then code
-    let has_link = marks.iter().find(|m| m.mark_type == "link");
+    let link_pos = marks.iter().position(|m| m.mark_type == "link");
+    let has_link = link_pos.map(|lp| &marks[lp]);
     let has_strong = marks.iter().any(|m| m.mark_type == "strong");
     let has_em = marks.iter().any(|m| m.mark_type == "em");
     let has_code = marks.iter().any(|m| m.mark_type == "code");
@@ -2862,24 +2909,42 @@ fn render_marked_text(text: &str, marks: &[AdfMark], output: &mut String) {
         return;
     }
 
+    // Helper: check if a formatting mark appears before the link mark.
+    let is_before_link = |mark_type: &str| -> bool {
+        if let Some(lp) = link_pos {
+            marks[..lp].iter().any(|m| m.mark_type == mark_type)
+        } else {
+            false
+        }
+    };
+
+    // Partition formatting marks into outer (before link) and inner (after link / no link).
+    let outer_strike = has_strike && is_before_link("strike");
+    let outer_strong = has_strong && is_before_link("strong");
+    let outer_em = has_em && is_before_link("em");
+    let inner_strike = has_strike && !outer_strike;
+    let inner_strong = has_strong && !outer_strong;
+    let inner_em = has_em && !outer_em;
+
+    // Build the innermost formatted text.
     let mut inner = String::new();
-    if has_strike {
+    if inner_strike {
         inner.push_str("~~");
     }
-    if has_strong {
+    if inner_strong {
         inner.push_str("**");
     }
-    if has_em {
+    if inner_em {
         inner.push('*');
     }
     inner.push_str(text);
-    if has_em {
+    if inner_em {
         inner.push('*');
     }
-    if has_strong {
+    if inner_strong {
         inner.push_str("**");
     }
-    if has_strike {
+    if inner_strike {
         inner.push_str("~~");
     }
 
@@ -2895,6 +2960,8 @@ fn render_marked_text(text: &str, marks: &[AdfMark], output: &mut String) {
 
     let needs_span = text_color.is_some() || bg_color.is_some() || subsup.is_some();
 
+    // Build the core content (with span/bracketed/link wrapping).
+    let mut core = String::new();
     if needs_span {
         // Wrap in :span[text]{attrs} syntax
         let mut attr_parts = Vec::new();
@@ -2929,21 +2996,25 @@ fn render_marked_text(text: &str, marks: &[AdfMark], output: &mut String) {
             }
         }
         let span = format!(":span[{inner}]{{{}}}", attr_parts.join(" "));
-        // If there's also a link mark, wrap the span in a link
         if let Some(link_mark) = has_link {
-            let href = link_mark
-                .attrs
-                .as_ref()
-                .and_then(|a| a.get("href"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            output.push('[');
-            output.push_str(&span);
-            output.push_str("](");
-            output.push_str(href);
-            output.push(')');
+            let href = link_href(link_mark);
+            if is_before_link("textColor")
+                || is_before_link("backgroundColor")
+                || is_before_link("subsup")
+            {
+                // Span wraps the link: :span[[text](url)]{attrs}
+                let link_part = format!("[{inner}]({href})");
+                core = format!(":span[{link_part}]{{{}}}", attr_parts.join(" "));
+            } else {
+                // Link wraps the span: [:span[text]{attrs}](url)
+                core.push('[');
+                core.push_str(&span);
+                core.push_str("](");
+                core.push_str(href);
+                core.push(')');
+            }
         } else {
-            output.push_str(&span);
+            core.push_str(&span);
         }
     } else if has_underline || !annotations.is_empty() {
         let mut attr_parts = Vec::new();
@@ -2965,37 +3036,66 @@ fn render_marked_text(text: &str, marks: &[AdfMark], output: &mut String) {
             }
         }
         let bracketed = format!("[{inner}]{{{}}}", attr_parts.join(" "));
-        // If there's also a link mark, wrap the bracketed span in a link
         if let Some(link_mark) = has_link {
-            let href = link_mark
-                .attrs
-                .as_ref()
-                .and_then(|a| a.get("href"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            output.push('[');
-            output.push_str(&bracketed);
-            output.push_str("](");
-            output.push_str(href);
-            output.push(')');
+            let href = link_href(link_mark);
+            if is_before_link("underline")
+                || link_pos
+                    .is_some_and(|lp| marks[..lp].iter().any(|m| m.mark_type == "annotation"))
+            {
+                // Bracketed span wraps the link: [[text](url)]{underline}
+                let link_part = format!("[{inner}]({href})");
+                core = format!("[{link_part}]{{{}}}", attr_parts.join(" "));
+            } else {
+                // Link wraps the bracketed span: [[text]{underline}](url)
+                core.push('[');
+                core.push_str(&bracketed);
+                core.push_str("](");
+                core.push_str(href);
+                core.push(')');
+            }
         } else {
-            output.push_str(&bracketed);
+            core.push_str(&bracketed);
         }
     } else if let Some(link_mark) = has_link {
-        let href = link_mark
-            .attrs
-            .as_ref()
-            .and_then(|a| a.get("href"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        output.push('[');
-        output.push_str(&inner);
-        output.push_str("](");
-        output.push_str(href);
-        output.push(')');
+        let href = link_href(link_mark);
+        core.push('[');
+        core.push_str(&inner);
+        core.push_str("](");
+        core.push_str(href);
+        core.push(')');
     } else {
-        output.push_str(&inner);
+        core.push_str(&inner);
     }
+
+    // Apply outer formatting wrappers (marks that appeared before link).
+    if outer_strike {
+        output.push_str("~~");
+    }
+    if outer_strong {
+        output.push_str("**");
+    }
+    if outer_em {
+        output.push('*');
+    }
+    output.push_str(&core);
+    if outer_em {
+        output.push('*');
+    }
+    if outer_strong {
+        output.push_str("**");
+    }
+    if outer_strike {
+        output.push_str("~~");
+    }
+}
+
+/// Extracts the href from a link mark.
+fn link_href(mark: &AdfMark) -> &str {
+    mark.attrs
+        .as_ref()
+        .and_then(|a| a.get("href"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
 }
 
 #[cfg(test)]
@@ -3709,7 +3809,7 @@ mod tests {
             )])],
         };
         let md = adf_to_markdown(&doc).unwrap();
-        assert_eq!(md.trim(), "[**bold link**](https://example.com)");
+        assert_eq!(md.trim(), "**[bold link](https://example.com)**");
     }
 
     #[test]
@@ -4508,6 +4608,282 @@ mod tests {
     }
 
     #[test]
+    fn mark_ordering_link_strong_preserved() {
+        // Issue #403: link+strong mark order was swapped on round-trip
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"bold link","marks":[
+            {"type":"link","attrs":{"href":"https://example.com"}},
+            {"type":"strong"}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(
+            mark_types,
+            vec!["link", "strong"],
+            "mark order should be preserved, got: {mark_types:?}"
+        );
+    }
+
+    #[test]
+    fn mark_ordering_link_textcolor_preserved() {
+        // Issue #403 comment: link+textColor mark order was swapped on round-trip
+        let adf_json = r##"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"red link","marks":[
+            {"type":"link","attrs":{"href":"https://example.com"}},
+            {"type":"textColor","attrs":{"color":"#ff0000"}}
+          ]}
+        ]}]}"##;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(
+            mark_types,
+            vec!["link", "textColor"],
+            "mark order should be preserved, got: {mark_types:?}"
+        );
+    }
+
+    #[test]
+    fn mark_ordering_link_em_preserved() {
+        // Issue #403: link+em mark order should be preserved
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"italic link","marks":[
+            {"type":"link","attrs":{"href":"https://example.com"}},
+            {"type":"em"}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(
+            mark_types,
+            vec!["link", "em"],
+            "mark order should be preserved, got: {mark_types:?}"
+        );
+    }
+
+    #[test]
+    fn mark_ordering_link_strike_preserved() {
+        // Issue #403: link+strike mark order should be preserved
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"struck link","marks":[
+            {"type":"link","attrs":{"href":"https://example.com"}},
+            {"type":"strike"}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(
+            mark_types,
+            vec!["link", "strike"],
+            "mark order should be preserved, got: {mark_types:?}"
+        );
+    }
+
+    #[test]
+    fn mark_ordering_strong_link_preserved() {
+        // Issue #403: [strong, link] order must also be preserved (reverse direction)
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"bold link","marks":[
+            {"type":"strong"},
+            {"type":"link","attrs":{"href":"https://example.com"}}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(
+            mark_types,
+            vec!["strong", "link"],
+            "mark order should be preserved, got: {mark_types:?}"
+        );
+    }
+
+    #[test]
+    fn mark_ordering_em_link_preserved() {
+        // Issue #403: [em, link] order must also be preserved
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"italic link","marks":[
+            {"type":"em"},
+            {"type":"link","attrs":{"href":"https://example.com"}}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(
+            mark_types,
+            vec!["em", "link"],
+            "mark order should be preserved, got: {mark_types:?}"
+        );
+    }
+
+    #[test]
+    fn mark_ordering_strike_link_preserved() {
+        // Issue #403: [strike, link] order must also be preserved
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"struck link","marks":[
+            {"type":"strike"},
+            {"type":"link","attrs":{"href":"https://example.com"}}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(
+            mark_types,
+            vec!["strike", "link"],
+            "mark order should be preserved, got: {mark_types:?}"
+        );
+    }
+
+    #[test]
+    fn mark_ordering_underline_link_preserved() {
+        // Issue #403: [underline, link] order must be preserved
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"click here","marks":[
+            {"type":"underline"},
+            {"type":"link","attrs":{"href":"https://example.com"}}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(
+            mark_types,
+            vec!["underline", "link"],
+            "mark order should be preserved, got: {mark_types:?}"
+        );
+    }
+
+    #[test]
+    fn mark_ordering_textcolor_link_preserved() {
+        // Issue #403: [textColor, link] order must be preserved
+        let adf_json = r##"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"red link","marks":[
+            {"type":"textColor","attrs":{"color":"#ff0000"}},
+            {"type":"link","attrs":{"href":"https://example.com"}}
+          ]}
+        ]}]}"##;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(
+            mark_types,
+            vec!["textColor", "link"],
+            "mark order should be preserved, got: {mark_types:?}"
+        );
+    }
+
+    #[test]
+    fn mark_ordering_link_underline_preserved() {
+        // Issue #403: [link, underline] order must be preserved (link wraps bracketed span)
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"click here","marks":[
+            {"type":"link","attrs":{"href":"https://example.com"}},
+            {"type":"underline"}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        // Link should wrap the underline bracketed span: [[click here]{underline}](url)
+        assert!(
+            md.contains("](https://example.com)"),
+            "should have link: {md}"
+        );
+        assert!(md.contains("underline"), "should have underline: {md}");
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(
+            mark_types,
+            vec!["link", "underline"],
+            "mark order should be preserved, got: {mark_types:?}"
+        );
+    }
+
+    #[test]
     fn annotation_mark_round_trip() {
         // Issue #364: annotation marks were silently dropped
         let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
@@ -5216,7 +5592,10 @@ mod tests {
         ]}]}"##;
         let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
         let md = adf_to_markdown(&doc).unwrap();
-        assert!(md.contains("**bold red link**"), "should have bold: {md}");
+        assert!(
+            md.starts_with("**") && md.trim().ends_with("**"),
+            "should have bold wrapping: {md}"
+        );
         assert!(md.contains("color=#ff0000"), "should have color: {md}");
         assert!(
             md.contains("](https://example.com)"),
