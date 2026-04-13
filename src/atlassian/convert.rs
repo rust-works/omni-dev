@@ -442,12 +442,16 @@ impl<'a> MarkdownParser<'a> {
             "expand" => {
                 let title = d.attrs.as_ref().and_then(|a| a.get("title"));
                 let inner_blocks = MarkdownParser::new(&inner_text).parse_blocks()?;
-                AdfNode::expand(title, inner_blocks)
+                let mut node = AdfNode::expand(title, inner_blocks);
+                pass_through_local_id(&d.attrs, &mut node);
+                node
             }
             "nested-expand" => {
                 let title = d.attrs.as_ref().and_then(|a| a.get("title"));
                 let inner_blocks = MarkdownParser::new(&inner_text).parse_blocks()?;
-                AdfNode::nested_expand(title, inner_blocks)
+                let mut node = AdfNode::nested_expand(title, inner_blocks);
+                pass_through_local_id(&d.attrs, &mut node);
+                node
             }
             "layout" => {
                 // Parse inner content looking for :::column sub-containers
@@ -2051,15 +2055,25 @@ fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) 
             } else {
                 "expand"
             };
-            let title = node
+            let mut attr_parts = Vec::new();
+            if let Some(t) = node
                 .attrs
                 .as_ref()
                 .and_then(|a| a.get("title"))
-                .and_then(serde_json::Value::as_str);
-            if let Some(t) = title {
-                output.push_str(&format!(":::{directive_name}{{title=\"{t}\"}}\n"));
-            } else {
+                .and_then(serde_json::Value::as_str)
+            {
+                attr_parts.push(format!("title=\"{t}\""));
+            }
+            if let Some(ref attrs) = node.attrs {
+                maybe_push_local_id(attrs, &mut attr_parts, opts);
+            }
+            if attr_parts.is_empty() {
                 output.push_str(&format!(":::{directive_name}\n"));
+            } else {
+                output.push_str(&format!(
+                    ":::{directive_name}{{{}}}\n",
+                    attr_parts.join(" ")
+                ));
             }
             if let Some(ref content) = node.content {
                 render_block_children(content, output, opts);
@@ -2168,8 +2182,11 @@ fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) 
             }
         }
     }
-    if let Some(ref attrs) = node.attrs {
-        maybe_push_local_id(attrs, &mut parts, opts);
+    // Skip localId for node types that already include it in their directive attrs
+    if !matches!(node.node_type.as_str(), "expand" | "nestedExpand") {
+        if let Some(ref attrs) = node.attrs {
+            maybe_push_local_id(attrs, &mut parts, opts);
+        }
     }
     if !parts.is_empty() {
         output.push_str(&format!("{{{}}}\n", parts.join(" ")));
@@ -6901,6 +6918,148 @@ mod tests {
             col_content.iter().any(|n| n.node_type == "expand"),
             "Column should contain an expand node, got: {:?}",
             col_content.iter().map(|n| &n.node_type).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn expand_localid_in_directive_attrs() {
+        // Issue #412: localId should be in directive attrs, not trailing text
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"expand","attrs":{"localId":"exp-001","title":"Details"},"content":[
+            {"type":"paragraph","content":[{"type":"text","text":"body"}]}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("localId=exp-001"),
+            "should contain localId: {md}"
+        );
+        assert!(
+            md.contains(":::expand{"),
+            "should have expand directive with attrs: {md}"
+        );
+        assert!(
+            !md.contains(":::\n{localId="),
+            "localId should NOT be trailing: {md}"
+        );
+    }
+
+    #[test]
+    fn expand_localid_roundtrip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"expand","attrs":{"localId":"exp-001","title":"Details"},"content":[
+            {"type":"paragraph","content":[{"type":"text","text":"body"}]}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let expand = &rt.content[0];
+        assert_eq!(expand.node_type, "expand");
+        assert_eq!(
+            expand.attrs.as_ref().unwrap()["localId"],
+            "exp-001",
+            "expand localId should survive round-trip"
+        );
+        assert_eq!(
+            expand.attrs.as_ref().unwrap()["title"],
+            "Details",
+            "expand title should survive round-trip"
+        );
+    }
+
+    #[test]
+    fn nested_expand_localid_roundtrip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"nestedExpand","attrs":{"localId":"ne-001","title":"S"},"content":[
+            {"type":"paragraph","content":[{"type":"text","text":"content"}]}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains(":::nested-expand{"),
+            "should have directive: {md}"
+        );
+        assert!(md.contains("localId=ne-001"), "should have localId: {md}");
+        let rt = markdown_to_adf(&md).unwrap();
+        let ne = &rt.content[0];
+        assert_eq!(ne.node_type, "nestedExpand");
+        assert_eq!(ne.attrs.as_ref().unwrap()["localId"], "ne-001");
+    }
+
+    #[test]
+    fn nested_expand_localid_followed_by_content() {
+        // Issue #412 reproducer: localId must not leak into following paragraph
+        let adf_json = "{\
+            \"version\":1,\"type\":\"doc\",\"content\":[\
+              {\"type\":\"nestedExpand\",\"attrs\":{\"localId\":\"exp-001\",\"title\":\"S\"},\"content\":[\
+                {\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"\\u00a0\"}]}\
+              ]},\
+              {\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"after\"}]}\
+            ]}";
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        // nestedExpand should have localId
+        let ne = &rt.content[0];
+        assert_eq!(ne.node_type, "nestedExpand");
+        assert_eq!(
+            ne.attrs.as_ref().unwrap()["localId"],
+            "exp-001",
+            "nestedExpand should preserve localId"
+        );
+        // Following paragraph should contain "after", not "{localId=...}"
+        let para = &rt.content[1];
+        assert_eq!(para.node_type, "paragraph");
+        let text = para.content.as_ref().unwrap()[0]
+            .text
+            .as_deref()
+            .unwrap_or("");
+        assert!(
+            !text.contains("localId"),
+            "following paragraph should not contain localId: {text}"
+        );
+        assert!(
+            text.contains("after"),
+            "following paragraph should contain 'after': {text}"
+        );
+    }
+
+    #[test]
+    fn expand_localid_without_title() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"expand","attrs":{"localId":"exp-002"},"content":[
+            {"type":"paragraph","content":[{"type":"text","text":"no title"}]}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains(":::expand{localId=exp-002}"),
+            "should have localId without title: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        assert_eq!(rt.content[0].attrs.as_ref().unwrap()["localId"], "exp-002");
+    }
+
+    #[test]
+    fn expand_localid_stripped() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"expand","attrs":{"localId":"exp-001","title":"X"},"content":[
+            {"type":"paragraph","content":[{"type":"text","text":"body"}]}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let opts = RenderOptions {
+            strip_local_ids: true,
+        };
+        let md = adf_to_markdown_with_options(&doc, &opts).unwrap();
+        assert!(!md.contains("localId"), "localId should be stripped: {md}");
+        assert!(
+            md.contains(":::expand{title=\"X\"}"),
+            "title should remain: {md}"
         );
     }
 
