@@ -243,7 +243,7 @@ impl<'a> MarkdownParser<'a> {
                 is_task_list = true;
                 let (item_text, local_id, _para_local_id) = extract_trailing_local_id(text);
                 let inline_nodes = parse_inline(item_text);
-                let mut task = AdfNode::task_item(state, vec![AdfNode::paragraph(inline_nodes)]);
+                let mut task = AdfNode::task_item(state, inline_nodes);
                 // Override the placeholder localId if one was parsed
                 if let Some(id) = local_id {
                     if let Some(ref mut attrs) = task.attrs {
@@ -2338,23 +2338,46 @@ fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) 
 
 /// Renders the content of a list item (unwraps the paragraph layer).
 /// Nested block children (e.g. sub-lists) are indented with two spaces.
+///
+/// Some ADF producers (e.g. Confluence) emit `taskItem` content without a
+/// paragraph wrapper — the inline nodes sit directly inside the item.  We
+/// detect this by checking whether the first child is an inline node type
+/// and, if so, render *all* leading inline children on the first line.
 fn render_list_item_content(item: &AdfNode, output: &mut String, opts: &RenderOptions) {
     let Some(ref content) = item.content else {
         return;
     };
-    let mut iter = content.iter();
-    let Some(first) = iter.next() else {
+    if content.is_empty() {
         return;
-    };
+    }
+    let first = &content[0];
+    let rest_start;
     if first.node_type == "paragraph" {
         render_inline_content(first, output, opts);
         // Emit paragraph + listItem localIds as trailing inline attrs on the first line
         emit_list_item_local_ids(item, first, output, opts);
         output.push('\n');
+        rest_start = 1;
+    } else if is_inline_node_type(&first.node_type) {
+        // Inline nodes without a paragraph wrapper — render them directly.
+        rest_start = content
+            .iter()
+            .position(|c| !is_inline_node_type(&c.node_type))
+            .unwrap_or(content.len());
+        for child in &content[..rest_start] {
+            render_inline_node(child, output, opts);
+        }
+        // No paragraph wrapper — pass a bare node so paraLocalId is omitted.
+        let bare = AdfNode::text("");
+        emit_list_item_local_ids(item, &bare, output, opts);
+        output.push('\n');
+        // Any remaining children are block nodes — fall through to the
+        // indented-block loop below.
     } else {
         render_block_node(first, output, opts);
+        rest_start = 1;
     }
-    for child in iter {
+    for child in &content[rest_start..] {
         let mut nested = String::new();
         render_block_node(child, &mut nested, opts);
         for line in nested.lines() {
@@ -2363,6 +2386,22 @@ fn render_list_item_content(item: &AdfNode, output: &mut String, opts: &RenderOp
             output.push('\n');
         }
     }
+}
+
+/// Returns `true` if the given ADF node type is an inline node.
+fn is_inline_node_type(node_type: &str) -> bool {
+    matches!(
+        node_type,
+        "text"
+            | "hardBreak"
+            | "inlineCard"
+            | "emoji"
+            | "mention"
+            | "status"
+            | "date"
+            | "placeholder"
+            | "mediaInline"
+    )
 }
 
 /// Emits trailing `{localId=... paraLocalId=...}` on a list item line
@@ -3303,6 +3342,232 @@ mod tests {
         let result = adf_to_markdown(&doc).unwrap();
         assert!(result.contains("- [ ] Todo item"));
         assert!(result.contains("- [x] Done item"));
+    }
+
+    /// Issue #408: taskItem content with inline nodes directly (no paragraph wrapper).
+    #[test]
+    fn adf_task_item_unwrapped_inline_content() {
+        // Real Confluence ADF: taskItem contains text nodes directly, no paragraph.
+        let json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "taskList",
+                "attrs": {"localId": "list-001"},
+                "content": [{
+                    "type": "taskItem",
+                    "attrs": {"localId": "task-001", "state": "TODO"},
+                    "content": [{"type": "text", "text": "Do something"}]
+                }]
+            }]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("- [ ] Do something"), "got: {md}");
+        assert!(!md.contains("adf-unsupported"), "got: {md}");
+    }
+
+    /// Issue #408: multiple taskItems with unwrapped inline content.
+    #[test]
+    fn adf_task_list_multiple_unwrapped_items() {
+        let json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "taskList",
+                "attrs": {"localId": "list-001"},
+                "content": [
+                    {
+                        "type": "taskItem",
+                        "attrs": {"localId": "task-001", "state": "TODO"},
+                        "content": [{"type": "text", "text": "First task"}]
+                    },
+                    {
+                        "type": "taskItem",
+                        "attrs": {"localId": "task-002", "state": "DONE"},
+                        "content": [{"type": "text", "text": "Second task"}]
+                    }
+                ]
+            }]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("- [ ] First task"), "got: {md}");
+        assert!(md.contains("- [x] Second task"), "got: {md}");
+        assert!(!md.contains("adf-unsupported"), "got: {md}");
+    }
+
+    /// Issue #408: unwrapped inline content with marks (bold text).
+    #[test]
+    fn adf_task_item_unwrapped_inline_with_marks() {
+        let json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "taskList",
+                "attrs": {"localId": "list-001"},
+                "content": [{
+                    "type": "taskItem",
+                    "attrs": {"localId": "task-001", "state": "TODO"},
+                    "content": [
+                        {"type": "text", "text": "Buy "},
+                        {"type": "text", "text": "groceries", "marks": [{"type": "strong"}]},
+                        {"type": "text", "text": " today"}
+                    ]
+                }]
+            }]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("- [ ] Buy **groceries** today"), "got: {md}");
+    }
+
+    /// Issue #408: taskItem localId is preserved for unwrapped inline content.
+    #[test]
+    fn adf_task_item_unwrapped_preserves_local_id() {
+        let json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "taskList",
+                "attrs": {"localId": "list-001"},
+                "content": [{
+                    "type": "taskItem",
+                    "attrs": {"localId": "task-001", "state": "TODO"},
+                    "content": [{"type": "text", "text": "Do something"}]
+                }]
+            }]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("{localId=task-001}"), "got: {md}");
+        assert!(md.contains("{localId=list-001}"), "got: {md}");
+    }
+
+    /// Issue #408: round-trip from Confluence ADF with unwrapped taskItem content.
+    #[test]
+    fn round_trip_task_list_unwrapped_inline() {
+        let json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "taskList",
+                "attrs": {"localId": "list-001"},
+                "content": [
+                    {
+                        "type": "taskItem",
+                        "attrs": {"localId": "task-001", "state": "TODO"},
+                        "content": [{"type": "text", "text": "Do something"}]
+                    },
+                    {
+                        "type": "taskItem",
+                        "attrs": {"localId": "task-002", "state": "DONE"},
+                        "content": [{"type": "text", "text": "Already done"}]
+                    }
+                ]
+            }]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+
+        // Round-trip: markdown back to ADF
+        let doc2 = markdown_to_adf(&md).unwrap();
+        assert_eq!(doc2.content[0].node_type, "taskList");
+
+        let items = doc2.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].attrs.as_ref().unwrap()["state"], "TODO");
+        assert_eq!(items[1].attrs.as_ref().unwrap()["state"], "DONE");
+
+        // localIds preserved
+        assert_eq!(items[0].attrs.as_ref().unwrap()["localId"], "task-001");
+        assert_eq!(items[1].attrs.as_ref().unwrap()["localId"], "task-002");
+        assert_eq!(
+            doc2.content[0].attrs.as_ref().unwrap()["localId"],
+            "list-001"
+        );
+    }
+
+    /// Issue #408: taskItem with inline content followed by a nested block (sub-list).
+    #[test]
+    fn adf_task_item_unwrapped_inline_then_block() {
+        let json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "taskList",
+                "attrs": {"localId": "list-001"},
+                "content": [{
+                    "type": "taskItem",
+                    "attrs": {"localId": "task-001", "state": "TODO"},
+                    "content": [
+                        {"type": "text", "text": "Parent task"},
+                        {
+                            "type": "bulletList",
+                            "content": [{
+                                "type": "listItem",
+                                "content": [{
+                                    "type": "paragraph",
+                                    "content": [{"type": "text", "text": "sub-item"}]
+                                }]
+                            }]
+                        }
+                    ]
+                }]
+            }]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("- [ ] Parent task"), "got: {md}");
+        assert!(md.contains("  - sub-item"), "got: {md}");
+        assert!(!md.contains("adf-unsupported"), "got: {md}");
+    }
+
+    /// Issue #408: taskItem with empty content array renders without panic.
+    #[test]
+    fn adf_task_item_empty_content() {
+        let json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "taskList",
+                "attrs": {"localId": "list-001"},
+                "content": [{
+                    "type": "taskItem",
+                    "attrs": {"localId": "task-001", "state": "TODO"},
+                    "content": []
+                }]
+            }]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("- [ ] "), "got: {md}");
+        assert!(!md.contains("adf-unsupported"), "got: {md}");
+    }
+
+    /// Covers the else branch in render_list_item_content where the first
+    /// child of a list item is a block node (not paragraph, not inline).
+    #[test]
+    fn adf_list_item_leading_block_node() {
+        let json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "bulletList",
+                "content": [{
+                    "type": "listItem",
+                    "content": [{
+                        "type": "codeBlock",
+                        "attrs": {"language": "rust"},
+                        "content": [{"type": "text", "text": "let x = 1;"}]
+                    }]
+                }]
+            }]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("```rust"), "got: {md}");
+        assert!(md.contains("let x = 1;"), "got: {md}");
     }
 
     #[test]
