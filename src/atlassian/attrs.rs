@@ -121,8 +121,8 @@ fn parse_inner(inner: &str) -> Option<Attrs> {
         rest = rest[key_end..].trim_start();
 
         if rest.starts_with('=') {
-            // Key-value pair
-            rest = rest[1..].trim_start();
+            // Key-value pair (no trim after '=' so empty values like key= are detected)
+            rest = &rest[1..];
             let (value, remaining) = parse_value(rest)?;
             attrs.map.insert(key.to_string(), value);
             rest = remaining.trim_start();
@@ -146,9 +146,6 @@ fn parse_value(text: &str) -> Option<(String, &str)> {
         let end = text
             .find(|c: char| c.is_whitespace() || c == '}')
             .unwrap_or(text.len());
-        if end == 0 {
-            return None;
-        }
         Some((text[..end].to_string(), &text[end..]))
     }
 }
@@ -273,6 +270,30 @@ mod tests {
         let (_, attrs) = parse_attrs("{title=\"Click to expand\"}", 0).unwrap();
         let rendered = attrs.render();
         assert_eq!(rendered, "{title=\"Click to expand\"}");
+    }
+
+    #[test]
+    fn empty_value() {
+        // Issue #363: accessLevel= (empty value) should parse as empty string
+        let (end, attrs) = parse_attrs("{id=abc accessLevel=}", 0).unwrap();
+        assert_eq!(end, 21);
+        assert_eq!(attrs.get("id"), Some("abc"));
+        assert_eq!(attrs.get("accessLevel"), Some(""));
+    }
+
+    #[test]
+    fn empty_value_mid_attrs() {
+        let (_, attrs) = parse_attrs("{a= b=value}", 0).unwrap();
+        assert_eq!(attrs.get("a"), Some(""));
+        assert_eq!(attrs.get("b"), Some("value"));
+    }
+
+    #[test]
+    fn empty_value_render_round_trip() {
+        let (_, original) = parse_attrs("{id=abc accessLevel=}", 0).unwrap();
+        let rendered = original.render();
+        let (_, reparsed) = parse_attrs(&rendered, 0).unwrap();
+        assert_eq!(original, reparsed);
     }
 
     #[test]
