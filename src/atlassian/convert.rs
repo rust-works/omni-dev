@@ -803,7 +803,7 @@ impl<'a> MarkdownParser<'a> {
             .iter()
             .enumerate()
             .map(|(col_idx, cell)| {
-                let (cell_text, cell_attrs) = extract_cell_attrs(cell.trim());
+                let (cell_text, cell_attrs) = extract_cell_attrs(cell);
                 let mut para = AdfNode::paragraph(parse_inline(&cell_text));
                 apply_column_alignment(&mut para, alignments.get(col_idx).copied().flatten());
                 if let Some(attrs) = cell_attrs {
@@ -833,7 +833,7 @@ impl<'a> MarkdownParser<'a> {
                 .iter()
                 .enumerate()
                 .map(|(col_idx, cell)| {
-                    let (cell_text, cell_attrs) = extract_cell_attrs(cell.trim());
+                    let (cell_text, cell_attrs) = extract_cell_attrs(cell);
                     let mut para = AdfNode::paragraph(parse_inline(&cell_text));
                     apply_column_alignment(&mut para, alignments.get(col_idx).copied().flatten());
                     if let Some(attrs) = cell_attrs {
@@ -1073,7 +1073,16 @@ fn parse_table_row(line: &str) -> Vec<String> {
     let trimmed = trimmed.strip_prefix('|').unwrap_or(trimmed);
     let trimmed = trimmed.strip_suffix('|').unwrap_or(trimmed);
 
-    trimmed.split('|').map(|s| s.trim().to_string()).collect()
+    trimmed
+        .split('|')
+        .map(|s| {
+            // Strip exactly one leading and one trailing space (pipe table padding).
+            // Preserve any additional whitespace as significant content.
+            let s = s.strip_prefix(' ').unwrap_or(s);
+            let s = s.strip_suffix(' ').unwrap_or(s);
+            s.to_string()
+        })
+        .collect()
 }
 
 /// Parses column alignments from a GFM table separator row.
@@ -1108,12 +1117,12 @@ fn apply_column_alignment(para: &mut AdfNode, alignment: Option<&str>) {
 /// Extracts `{attrs}` prefix from a pipe table cell text.
 /// Returns `(remaining_text, Option<adf_attrs_json>)`.
 fn extract_cell_attrs(cell_text: &str) -> (String, Option<serde_json::Value>) {
-    let trimmed = cell_text.trim();
+    let trimmed = cell_text.trim_start();
     if !trimmed.starts_with('{') {
         return (cell_text.to_string(), None);
     }
     if let Some((end_pos, attrs)) = parse_attrs(trimmed, 0) {
-        let remaining = trimmed[end_pos..].trim().to_string();
+        let remaining = trimmed[end_pos..].trim_start().to_string();
         let adf_attrs = build_cell_attrs(&attrs);
         if adf_attrs == serde_json::json!({}) {
             (cell_text.to_string(), None)
@@ -4640,6 +4649,33 @@ mod tests {
         let cell = &rows[1].content.as_ref().unwrap()[0];
         let attrs = cell.attrs.as_ref().unwrap();
         assert_eq!(attrs["colspan"], 2);
+    }
+
+    #[test]
+    fn trailing_space_after_mention_in_table_cell_preserved() {
+        // Issue #372: trailing space after mention in table cell was dropped
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"table","attrs":{"isNumberColumnEnabled":false,"layout":"default"},"content":[{"type":"tableRow","content":[{"type":"tableCell","attrs":{},"content":[{"type":"paragraph","content":[
+          {"type":"mention","attrs":{"id":"aaa","text":"@Rob"}},
+          {"type":"text","text":" "}
+        ]}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let cell = &round_tripped.content[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap()[0];
+        let para = &cell.content.as_ref().unwrap()[0];
+        let inlines = para.content.as_ref().unwrap();
+        assert!(
+            inlines.len() >= 2,
+            "expected mention + text(' ') nodes, got {} nodes: {:?}",
+            inlines.len(),
+            inlines.iter().map(|n| &n.node_type).collect::<Vec<_>>()
+        );
+        assert_eq!(inlines[0].node_type, "mention");
+        assert_eq!(inlines[1].node_type, "text");
+        assert_eq!(inlines[1].text.as_deref(), Some(" "));
     }
 
     // ── Column alignment tests ─────────────────────────────────────
