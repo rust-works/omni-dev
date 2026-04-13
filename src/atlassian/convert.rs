@@ -1219,10 +1219,13 @@ fn parse_inline(text: &str) -> Vec<AdfNode> {
             '[' => {
                 if let Some((end, link_text, href)) = try_parse_link(text, i) {
                     flush_plain(text, plain_start, i, &mut nodes);
-                    // When text == href, emit an inlineCard (smart link) so that
-                    // JIRA renders it as a resolved card rather than a plain link.
                     if link_text == href {
-                        nodes.push(AdfNode::inline_card(href));
+                        // Bare URL link [url](url): emit as text with link mark,
+                        // not via parse_inline which would produce an inlineCard.
+                        nodes.push(AdfNode::text_with_marks(
+                            link_text,
+                            vec![AdfMark::link(href)],
+                        ));
                     } else {
                         let inner = parse_inline(link_text);
                         for mut node in inner {
@@ -3572,12 +3575,16 @@ mod tests {
     }
 
     #[test]
-    fn self_link_still_becomes_inline_card() {
-        // [url](url) — text equals url, still produces inlineCard (Tier 1 bare URL)
+    fn self_link_becomes_link_mark_not_inline_card() {
+        // Issue #378: [url](url) should produce a link mark, not inlineCard.
+        // inlineCard is only for :card[url] directives and bare URLs.
         let doc = markdown_to_adf("[https://example.com](https://example.com)").unwrap();
         let node = &doc.content[0].content.as_ref().unwrap()[0];
-        assert_eq!(node.node_type, "inlineCard");
-        assert_eq!(node.attrs.as_ref().unwrap()["url"], "https://example.com");
+        assert_eq!(node.node_type, "text");
+        assert_eq!(node.text.as_deref(), Some("https://example.com"));
+        let mark = &node.marks.as_ref().unwrap()[0];
+        assert_eq!(mark.mark_type, "link");
+        assert_eq!(mark.attrs.as_ref().unwrap()["href"], "https://example.com");
     }
 
     #[test]
