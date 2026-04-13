@@ -418,6 +418,8 @@ impl<'a> MarkdownParser<'a> {
                     }
                     if attrs.has_flag("numbered") {
                         table_attrs["isNumberColumnEnabled"] = serde_json::json!(true);
+                    } else if attrs.get("numbered") == Some("false") {
+                        table_attrs["isNumberColumnEnabled"] = serde_json::json!(false);
                     }
                     if let Some(tw) = attrs.get("width") {
                         if let Ok(w) = tw.parse::<f64>() {
@@ -867,6 +869,8 @@ impl<'a> MarkdownParser<'a> {
                     }
                     if attrs.has_flag("numbered") {
                         table_attrs["isNumberColumnEnabled"] = serde_json::json!(true);
+                    } else if attrs.get("numbered") == Some("false") {
+                        table_attrs["isNumberColumnEnabled"] = serde_json::json!(false);
                     }
                     if let Some(tw) = attrs.get("width") {
                         if let Ok(w) = tw.parse::<f64>() {
@@ -2114,12 +2118,15 @@ fn render_directive_table(node: &AdfNode, rows: &[AdfNode], output: &mut String)
         if let Some(layout) = attrs.get("layout").and_then(serde_json::Value::as_str) {
             attr_parts.push(format!("layout={layout}"));
         }
-        if attrs
+        if let Some(numbered) = attrs
             .get("isNumberColumnEnabled")
             .and_then(serde_json::Value::as_bool)
-            == Some(true)
         {
-            attr_parts.push("numbered".to_string());
+            if numbered {
+                attr_parts.push("numbered".to_string());
+            } else {
+                attr_parts.push("numbered=false".to_string());
+            }
         }
         if let Some(tw) = attrs.get("width").and_then(serde_json::Value::as_f64) {
             let tw_str = if tw.fract() == 0.0 {
@@ -2246,12 +2253,15 @@ fn render_table_level_attrs(node: &AdfNode, output: &mut String) {
         if let Some(layout) = attrs.get("layout").and_then(serde_json::Value::as_str) {
             parts.push(format!("layout={layout}"));
         }
-        if attrs
+        if let Some(numbered) = attrs
             .get("isNumberColumnEnabled")
             .and_then(serde_json::Value::as_bool)
-            == Some(true)
         {
-            parts.push("numbered".to_string());
+            if numbered {
+                parts.push("numbered".to_string());
+            } else {
+                parts.push("numbered=false".to_string());
+            }
         }
         if let Some(tw) = attrs.get("width").and_then(serde_json::Value::as_f64) {
             let tw_str = if tw.fract() == 0.0 {
@@ -4979,6 +4989,88 @@ mod tests {
             attrs["localId"], "7afd4550-e66c-4b12-875f-a91c6c7b62c7",
             "localId should be preserved"
         );
+    }
+
+    #[test]
+    fn table_layout_default_preserved_in_roundtrip() {
+        // Issue #380: layout='default' was elided
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"table","attrs":{"isNumberColumnEnabled":false,"layout":"default"},"content":[{"type":"tableRow","content":[{"type":"tableCell","attrs":{},"content":[{"type":"paragraph","content":[{"type":"text","text":"cell"}]}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let attrs = round_tripped.content[0].attrs.as_ref().unwrap();
+        assert_eq!(
+            attrs["layout"], "default",
+            "layout='default' should be preserved"
+        );
+    }
+
+    #[test]
+    fn table_is_number_column_enabled_false_preserved() {
+        // Issue #380: isNumberColumnEnabled=false was elided
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"table","attrs":{"isNumberColumnEnabled":false,"layout":"default"},"content":[{"type":"tableRow","content":[{"type":"tableCell","attrs":{},"content":[{"type":"paragraph","content":[{"type":"text","text":"cell"}]}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let attrs = round_tripped.content[0].attrs.as_ref().unwrap();
+        assert_eq!(
+            attrs["isNumberColumnEnabled"], false,
+            "isNumberColumnEnabled=false should be preserved"
+        );
+    }
+
+    #[test]
+    fn table_is_number_column_enabled_true_preserved() {
+        // Regression check: isNumberColumnEnabled=true should still work
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"table","attrs":{"isNumberColumnEnabled":true,"layout":"default"},"content":[{"type":"tableRow","content":[{"type":"tableCell","attrs":{},"content":[{"type":"paragraph","content":[{"type":"text","text":"cell"}]}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let attrs = round_tripped.content[0].attrs.as_ref().unwrap();
+        assert_eq!(
+            attrs["isNumberColumnEnabled"], true,
+            "isNumberColumnEnabled=true should be preserved"
+        );
+    }
+
+    #[test]
+    fn directive_table_is_number_column_enabled_false_preserved() {
+        // Covers render_directive_table + directive table parsing for numbered=false.
+        // Multi-paragraph cell forces directive table form.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"table","attrs":{"isNumberColumnEnabled":false,"layout":"default"},"content":[{"type":"tableRow","content":[{"type":"tableCell","attrs":{},"content":[
+          {"type":"paragraph","content":[{"type":"text","text":"line one"}]},
+          {"type":"paragraph","content":[{"type":"text","text":"line two"}]}
+        ]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("::::table"), "should use directive table form");
+        assert!(
+            md.contains("numbered=false"),
+            "should contain numbered=false, got: {md}"
+        );
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let attrs = round_tripped.content[0].attrs.as_ref().unwrap();
+        assert_eq!(attrs["isNumberColumnEnabled"], false);
+        assert_eq!(attrs["layout"], "default");
+    }
+
+    #[test]
+    fn directive_table_is_number_column_enabled_true_preserved() {
+        // Covers render_directive_table + directive table parsing for numbered (true).
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"table","attrs":{"isNumberColumnEnabled":true,"layout":"default"},"content":[{"type":"tableRow","content":[{"type":"tableCell","attrs":{},"content":[
+          {"type":"paragraph","content":[{"type":"text","text":"line one"}]},
+          {"type":"paragraph","content":[{"type":"text","text":"line two"}]}
+        ]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("::::table"), "should use directive table form");
+        assert!(
+            md.contains("numbered}") || md.contains("numbered "),
+            "should contain numbered flag, got: {md}"
+        );
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let attrs = round_tripped.content[0].attrs.as_ref().unwrap();
+        assert_eq!(attrs["isNumberColumnEnabled"], true);
     }
 
     #[test]
