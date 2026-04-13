@@ -50,7 +50,24 @@ pub fn try_parse_inline_directive(text: &str, pos: usize) -> Option<ParsedDirect
     if !after_name.starts_with('[') {
         return None;
     }
-    let bracket_close = after_name.find(']')?;
+    // Find matching ] by counting bracket depth (supports nested brackets
+    // such as :span[[text](url)]{attrs} for span-before-link ordering).
+    let mut depth: usize = 0;
+    let mut bracket_close = None;
+    for (j, ch) in after_name.char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    bracket_close = Some(j);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let bracket_close = bracket_close?;
     let content = &after_name[1..bracket_close];
     let mut cursor = pos + name_end + bracket_close + 1;
 
