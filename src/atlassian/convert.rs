@@ -1657,7 +1657,11 @@ fn try_dispatch_inline_directive(text: &str, pos: usize) -> Option<(AdfNode, usi
             node
         }
         "date" => {
-            let timestamp = iso_date_to_epoch_ms(content);
+            let timestamp = d
+                .attrs
+                .as_ref()
+                .and_then(|a| a.get("timestamp"))
+                .map_or_else(|| iso_date_to_epoch_ms(content), ToString::to_string);
             let mut node = AdfNode::date(&timestamp);
             pass_through_local_id(&d.attrs, &mut node);
             node
@@ -2893,13 +2897,9 @@ fn render_inline_node(node: &AdfNode, output: &mut String, opts: &RenderOptions)
                 if let Some(timestamp) = attrs.get("timestamp").and_then(serde_json::Value::as_str)
                 {
                     let display = epoch_ms_to_iso_date(timestamp);
-                    let mut attr_parts = Vec::new();
+                    let mut attr_parts = vec![format!("timestamp={timestamp}")];
                     maybe_push_local_id(attrs, &mut attr_parts, opts);
-                    if attr_parts.is_empty() {
-                        output.push_str(&format!(":date[{display}]"));
-                    } else {
-                        output.push_str(&format!(":date[{display}]{{{}}}", attr_parts.join(" ")));
-                    }
+                    output.push_str(&format!(":date[{display}]{{{}}}", attr_parts.join(" ")));
                 }
             }
         }
@@ -5631,14 +5631,14 @@ mod tests {
 
     #[test]
     fn adf_date_to_markdown() {
-        // ADF dates use epoch ms; renderer converts back to ISO
+        // ADF dates use epoch ms; renderer converts back to ISO with timestamp attr
         let doc = AdfDocument {
             version: 1,
             doc_type: "doc".to_string(),
             content: vec![AdfNode::paragraph(vec![AdfNode::date("1776211200000")])],
         };
         let md = adf_to_markdown(&doc).unwrap();
-        assert!(md.contains(":date[2026-04-15]"));
+        assert!(md.contains(":date[2026-04-15]{timestamp=1776211200000}"));
     }
 
     #[test]
@@ -5650,7 +5650,7 @@ mod tests {
             content: vec![AdfNode::paragraph(vec![AdfNode::date("2026-04-15")])],
         };
         let md = adf_to_markdown(&doc).unwrap();
-        assert!(md.contains(":date[2026-04-15]"));
+        assert!(md.contains(":date[2026-04-15]{timestamp=2026-04-15}"));
     }
 
     #[test]
@@ -5662,6 +5662,27 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_date_non_midnight_timestamp() {
+        // Issue #409: non-midnight timestamps must survive round-trip
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"date","attrs":{"timestamp":"1700000000000"}}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        // JFM should include the original timestamp
+        assert!(
+            md.contains("timestamp=1700000000000"),
+            "JFM should preserve original timestamp: {md}"
+        );
+        // Round-trip back to ADF
+        let doc2 = markdown_to_adf(&md).unwrap();
+        let content = doc2.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            content[0].attrs.as_ref().unwrap()["timestamp"],
+            "1700000000000",
+            "Round-trip must preserve original non-midnight timestamp"
+        );
+    }
+
+    #[test]
     fn date_epoch_ms_passthrough() {
         // If JFM date is already epoch ms, pass through
         let doc = markdown_to_adf("Due by :date[1776211200000].").unwrap();
@@ -5670,6 +5691,51 @@ mod tests {
             content[1].attrs.as_ref().unwrap()["timestamp"],
             "1776211200000"
         );
+    }
+
+    #[test]
+    fn date_timestamp_attr_preferred_over_content() {
+        // When timestamp attr is present, it takes priority over the display date
+        let md = ":date[2023-11-14]{timestamp=1700000000000}\n";
+        let doc = markdown_to_adf(md).unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            content[0].attrs.as_ref().unwrap()["timestamp"],
+            "1700000000000",
+            "timestamp attr should be used directly"
+        );
+    }
+
+    #[test]
+    fn date_without_timestamp_attr_backward_compat() {
+        // Legacy JFM without timestamp attr still works via iso_date_to_epoch_ms
+        let md = ":date[2026-04-15]\n";
+        let doc = markdown_to_adf(md).unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            content[0].attrs.as_ref().unwrap()["timestamp"],
+            "1776211200000",
+            "Should fall back to computing timestamp from date string"
+        );
+    }
+
+    #[test]
+    fn date_with_local_id_and_timestamp() {
+        // Both localId and timestamp should round-trip
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"date","attrs":{"timestamp":"1700000000000","localId":"d-001"}}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("timestamp=1700000000000"),
+            "Should contain timestamp: {md}"
+        );
+        assert!(md.contains("localId=d-001"), "Should contain localId: {md}");
+        // Round-trip
+        let doc2 = markdown_to_adf(&md).unwrap();
+        let content = doc2.content[0].content.as_ref().unwrap();
+        let attrs = content[0].attrs.as_ref().unwrap();
+        assert_eq!(attrs["timestamp"], "1700000000000");
+        assert_eq!(attrs["localId"], "d-001");
     }
 
     #[test]
