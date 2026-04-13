@@ -935,7 +935,7 @@ fn build_cell_attrs(attrs: &crate::atlassian::attrs::Attrs) -> serde_json::Value
     if let Some(colwidth) = attrs.get("colwidth") {
         let widths: Vec<serde_json::Value> = colwidth
             .split(',')
-            .filter_map(|s| s.trim().parse::<u32>().ok())
+            .filter_map(|s| s.trim().parse::<f64>().ok())
             .map(|n| serde_json::json!(n))
             .collect();
         if !widths.is_empty() {
@@ -2143,14 +2143,10 @@ fn build_cell_attrs_string(cell: &AdfNode) -> String {
     };
     let mut parts = Vec::new();
     if let Some(colspan) = attrs.get("colspan").and_then(serde_json::Value::as_u64) {
-        if colspan > 1 {
-            parts.push(format!("colspan={colspan}"));
-        }
+        parts.push(format!("colspan={colspan}"));
     }
     if let Some(rowspan) = attrs.get("rowspan").and_then(serde_json::Value::as_u64) {
-        if rowspan > 1 {
-            parts.push(format!("rowspan={rowspan}"));
-        }
+        parts.push(format!("rowspan={rowspan}"));
     }
     if let Some(bg) = attrs.get("background").and_then(serde_json::Value::as_str) {
         if needs_attr_quoting(bg) {
@@ -2165,8 +2161,9 @@ fn build_cell_attrs_string(cell: &AdfNode) -> String {
             .iter()
             .filter_map(serde_json::Value::as_f64)
             .map(|n| {
+                // Always format as float to preserve Confluence's representation
                 if n.fract() == 0.0 {
-                    (n as u64).to_string()
+                    format!("{n:.1}")
                 } else {
                     n.to_string()
                 }
@@ -4772,7 +4769,10 @@ mod tests {
             .as_ref()
             .unwrap()[0];
         let colwidth = cell.attrs.as_ref().unwrap()["colwidth"].as_array().unwrap();
-        assert_eq!(colwidth, &[serde_json::json!(100), serde_json::json!(200)]);
+        assert_eq!(
+            colwidth,
+            &[serde_json::json!(100.0), serde_json::json!(200.0)]
+        );
     }
 
     #[test]
@@ -4804,12 +4804,12 @@ mod tests {
         let doc: crate::atlassian::adf::AdfDocument = serde_json::from_value(adf_doc).unwrap();
         let md = adf_to_markdown(&doc).unwrap();
         assert!(
-            md.contains("colwidth=157"),
-            "expected colwidth=157 in markdown, got: {md}"
+            md.contains("colwidth=157.0"),
+            "expected colwidth=157.0 in markdown, got: {md}"
         );
         assert!(
-            md.contains("colwidth=863"),
-            "expected colwidth=863 in markdown, got: {md}"
+            md.contains("colwidth=863.0"),
+            "expected colwidth=863.0 in markdown, got: {md}"
         );
         // Round-trip back to ADF
         let doc2 = markdown_to_adf(&md).unwrap();
@@ -4820,14 +4820,49 @@ mod tests {
             header1.attrs.as_ref().unwrap()["colwidth"]
                 .as_array()
                 .unwrap(),
-            &[serde_json::json!(157)]
+            &[serde_json::json!(157.0)]
         );
         assert_eq!(
             header2.attrs.as_ref().unwrap()["colwidth"]
                 .as_array()
                 .unwrap(),
-            &[serde_json::json!(863)]
+            &[serde_json::json!(863.0)]
         );
+    }
+
+    #[test]
+    fn colwidth_float_preserved_in_roundtrip() {
+        // Issue #369: colwidth 254.0 was coerced to integer 254
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"table","attrs":{"isNumberColumnEnabled":false,"layout":"default"},"content":[{"type":"tableRow","content":[{"type":"tableHeader","attrs":{"colwidth":[254.0,416.0]},"content":[{"type":"paragraph","content":[]}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let cell = &round_tripped.content[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap()[0];
+        let colwidth = cell.attrs.as_ref().unwrap()["colwidth"].as_array().unwrap();
+        assert_eq!(
+            colwidth,
+            &[serde_json::json!(254.0), serde_json::json!(416.0)],
+            "colwidth should preserve float values"
+        );
+    }
+
+    #[test]
+    fn default_rowspan_colspan_preserved_in_roundtrip() {
+        // Issue #369: rowspan=1 and colspan=1 were elided
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"table","attrs":{"isNumberColumnEnabled":false,"layout":"default"},"content":[{"type":"tableRow","content":[{"type":"tableCell","attrs":{"rowspan":1,"colspan":1},"content":[{"type":"paragraph","content":[{"type":"text","text":"cell"}]}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let cell = &round_tripped.content[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap()[0];
+        let attrs = cell.attrs.as_ref().unwrap();
+        assert_eq!(attrs["rowspan"], 1, "rowspan=1 should be preserved");
+        assert_eq!(attrs["colspan"], 1, "colspan=1 should be preserved");
     }
 
     // ── Nested list tests ──────────────────────────────────────────────
