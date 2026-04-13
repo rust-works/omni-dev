@@ -424,6 +424,9 @@ impl<'a> MarkdownParser<'a> {
                             table_attrs["width"] = serde_json::json!(w);
                         }
                     }
+                    if let Some(local_id) = attrs.get("localId") {
+                        table_attrs["localId"] = serde_json::Value::String(local_id.to_string());
+                    }
                 }
                 if table_attrs == serde_json::json!({}) {
                     AdfNode::table(rows)
@@ -869,6 +872,9 @@ impl<'a> MarkdownParser<'a> {
                         if let Ok(w) = tw.parse::<f64>() {
                             table_attrs["width"] = serde_json::json!(w);
                         }
+                    }
+                    if let Some(local_id) = attrs.get("localId") {
+                        table_attrs["localId"] = serde_json::Value::String(local_id.to_string());
                     }
                     if table_attrs != serde_json::json!({}) {
                         table.attrs = Some(table_attrs);
@@ -2101,6 +2107,9 @@ fn render_directive_table(node: &AdfNode, rows: &[AdfNode], output: &mut String)
             };
             attr_parts.push(format!("width={tw_str}"));
         }
+        if let Some(local_id) = attrs.get("localId").and_then(serde_json::Value::as_str) {
+            attr_parts.push(format!("localId={local_id}"));
+        }
     }
     if attr_parts.is_empty() {
         output.push_str("::::table\n");
@@ -2231,6 +2240,9 @@ fn render_table_level_attrs(node: &AdfNode, output: &mut String) {
                 tw.to_string()
             };
             parts.push(format!("width={tw_str}"));
+        }
+        if let Some(local_id) = attrs.get("localId").and_then(serde_json::Value::as_str) {
+            parts.push(format!("localId={local_id}"));
         }
         if !parts.is_empty() {
             output.push_str(&format!("{{{}}}\n", parts.join(" ")));
@@ -4902,6 +4914,24 @@ mod tests {
     }
 
     // ── Nested list tests ──────────────────────────────────────────────
+
+    #[test]
+    fn table_localid_preserved_in_roundtrip() {
+        // Issue #374: localId on table nodes was dropped
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"table","attrs":{"isNumberColumnEnabled":false,"layout":"default","localId":"7afd4550-e66c-4b12-875f-a91c6c7b62c7"},"content":[{"type":"tableRow","content":[{"type":"tableCell","attrs":{},"content":[{"type":"paragraph","content":[{"type":"text","text":"cell"}]}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("localId="),
+            "JFM should contain localId, got: {md}"
+        );
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let attrs = round_tripped.content[0].attrs.as_ref().unwrap();
+        assert_eq!(
+            attrs["localId"], "7afd4550-e66c-4b12-875f-a91c6c7b62c7",
+            "localId should be preserved"
+        );
+    }
 
     #[test]
     fn nested_bullet_list_roundtrip() {
