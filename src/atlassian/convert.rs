@@ -2102,7 +2102,11 @@ fn render_table(node: &AdfNode, output: &mut String) {
 /// Checks whether all cells qualify for GFM pipe table syntax:
 /// - Every cell has exactly one paragraph child with only inline nodes
 /// - All `tableHeader` nodes appear exclusively in the first row
+/// - The first row must contain at least one `tableHeader` (pipe tables
+///   always treat the first row as headers, so `tableCell`-only first rows
+///   must use directive form to preserve the cell type)
 fn table_qualifies_for_pipe_syntax(rows: &[AdfNode]) -> bool {
+    let mut first_row_has_header = false;
     for (row_idx, row) in rows.iter().enumerate() {
         let Some(ref cells) = row.content else {
             continue;
@@ -2111,6 +2115,9 @@ fn table_qualifies_for_pipe_syntax(rows: &[AdfNode]) -> bool {
             // Header cells outside first row → must use directive form
             if row_idx > 0 && cell.node_type == "tableHeader" {
                 return false;
+            }
+            if row_idx == 0 && cell.node_type == "tableHeader" {
+                first_row_has_header = true;
             }
             // Check cell has exactly one paragraph with only inline content
             let Some(ref content) = cell.content else {
@@ -2126,7 +2133,9 @@ fn table_qualifies_for_pipe_syntax(rows: &[AdfNode]) -> bool {
             }
         }
     }
-    true
+    // First row must have at least one tableHeader for pipe syntax;
+    // otherwise the round-trip would convert tableCell → tableHeader.
+    first_row_has_header
 }
 
 /// Returns true if a paragraph node contains any `hardBreak` inline nodes.
@@ -5880,8 +5889,27 @@ mod tests {
     }
 
     #[test]
-    fn table_without_hardbreak_uses_pipe_syntax() {
-        // A simple table without hardBreak should still use pipe syntax
+    #[test]
+    fn table_with_header_row_uses_pipe_syntax() {
+        // A table with tableHeader in the first row should use pipe syntax
+        let adf = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::table(vec![AdfNode::table_row(vec![
+                AdfNode::table_header(vec![AdfNode::paragraph(vec![AdfNode::text("header cell")])]),
+            ])])],
+        };
+        let md = adf_to_markdown(&adf).unwrap();
+        assert!(
+            md.contains("| header cell |"),
+            "Table with header row should use pipe syntax, got:\n{md}"
+        );
+    }
+
+    #[test]
+    fn table_without_header_row_uses_directive_syntax() {
+        // Issue #392: tableCell-only first row must use directive syntax
+        // to avoid converting tableCell → tableHeader on round-trip
         let adf = AdfDocument {
             version: 1,
             doc_type: "doc".to_string(),
@@ -5891,9 +5919,59 @@ mod tests {
         };
         let md = adf_to_markdown(&adf).unwrap();
         assert!(
-            md.contains("| simple cell |"),
-            "Simple table should use pipe syntax, got:\n{md}"
+            md.contains("::::table"),
+            "Table without header row should use directive syntax, got:\n{md}"
         );
+    }
+
+    #[test]
+    fn tablecell_first_row_preserved_on_roundtrip() {
+        // Issue #392: tableCell in first row round-trips as tableHeader
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"table","attrs":{},"content":[
+          {"type":"tableRow","content":[
+            {"type":"tableCell","attrs":{},"content":[{"type":"paragraph","content":[{"type":"text","text":"row1 cell"}]}]}
+          ]},
+          {"type":"tableRow","content":[
+            {"type":"tableCell","attrs":{},"content":[{"type":"paragraph","content":[{"type":"text","text":"row2 cell"}]}]}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let rows = round_tripped.content[0].content.as_ref().unwrap();
+        let row0_cell = &rows[0].content.as_ref().unwrap()[0];
+        assert_eq!(
+            row0_cell.node_type, "tableCell",
+            "first row cell should remain tableCell, got: {}",
+            row0_cell.node_type
+        );
+        let row1_cell = &rows[1].content.as_ref().unwrap()[0];
+        assert_eq!(row1_cell.node_type, "tableCell");
+    }
+
+    #[test]
+    fn mixed_header_and_cell_first_row_uses_pipe() {
+        // A first row with at least one tableHeader qualifies for pipe syntax
+        let adf = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::table(vec![
+                AdfNode::table_row(vec![
+                    AdfNode::table_header(vec![AdfNode::paragraph(vec![AdfNode::text("H1")])]),
+                    AdfNode::table_header(vec![AdfNode::paragraph(vec![AdfNode::text("H2")])]),
+                ]),
+                AdfNode::table_row(vec![
+                    AdfNode::table_cell(vec![AdfNode::paragraph(vec![AdfNode::text("C1")])]),
+                    AdfNode::table_cell(vec![AdfNode::paragraph(vec![AdfNode::text("C2")])]),
+                ]),
+            ])],
+        };
+        let md = adf_to_markdown(&adf).unwrap();
+        assert!(
+            md.contains("| H1 |"),
+            "Table with header first row should use pipe syntax, got:\n{md}"
+        );
+        assert!(!md.contains("::::table"), "should not use directive syntax");
     }
 
     #[test]
