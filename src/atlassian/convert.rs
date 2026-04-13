@@ -4207,6 +4207,24 @@ mod tests {
     }
 
     #[test]
+    fn mention_with_empty_access_level_round_trips() {
+        // Issue #363: accessLevel="" produces accessLevel= which failed to parse
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"mention","attrs":{"id":"61921b41c15977006af2b1d1","text":"@Javier Inchausti","accessLevel":""}}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let mention = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(
+            mention.node_type, "mention",
+            "mention with empty accessLevel was not parsed as mention, got: {}",
+            mention.node_type
+        );
+    }
+
+    #[test]
     fn span_with_color() {
         let doc = markdown_to_adf("This is :span[red text]{color=#ff5630}.").unwrap();
         let content = doc.content[0].content.as_ref().unwrap();
