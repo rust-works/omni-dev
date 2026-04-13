@@ -289,6 +289,18 @@ impl AdfNode {
         }
     }
 
+    /// Creates a caption node (used inside tables).
+    #[must_use]
+    pub fn caption(content: Vec<Self>) -> Self {
+        Self {
+            node_type: "caption".to_string(),
+            attrs: None,
+            content: Some(content),
+            text: None,
+            marks: None,
+        }
+    }
+
     /// Creates an inline card node for a smart link (URL as both text and href).
     #[must_use]
     pub fn inline_card(url: &str) -> Self {
