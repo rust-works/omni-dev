@@ -1404,6 +1404,24 @@ fn parse_inline(text: &str) -> Vec<AdfNode> {
                 }
                 chars.next();
             }
+            '\\' if text[i..].starts_with("\\\n") => {
+                // Backslash line break → hardBreak node.
+                flush_plain(text, plain_start, i, &mut nodes);
+                nodes.push(AdfNode::hard_break());
+                chars.next(); // consume the '\'
+                              // Skip the newline
+                if chars.peek().is_some_and(|&(_, c)| c == '\n') {
+                    chars.next();
+                }
+                plain_start = chars.peek().map_or(text.len(), |&(idx, _)| idx);
+            }
+            '\\' if i + 1 == text.len() => {
+                // Trailing backslash at end of paragraph text → hardBreak node.
+                flush_plain(text, plain_start, i, &mut nodes);
+                nodes.push(AdfNode::hard_break());
+                chars.next(); // consume the '\'
+                plain_start = text.len();
+            }
             _ => {
                 chars.next();
             }
@@ -2658,7 +2676,7 @@ fn render_inline_node(node: &AdfNode, output: &mut String, opts: &RenderOptions)
             render_marked_text(text, marks, output);
         }
         "hardBreak" => {
-            output.push_str("  \n");
+            output.push_str("\\\n");
         }
         "inlineCard" => {
             if let Some(ref attrs) = node.attrs {
@@ -3689,7 +3707,7 @@ mod tests {
             ])],
         };
         let md = adf_to_markdown(&doc).unwrap();
-        assert!(md.contains("Line 1  \nLine 2"));
+        assert!(md.contains("Line 1\\\nLine 2"));
     }
 
     #[test]
@@ -6630,6 +6648,125 @@ mod tests {
         );
         assert_eq!(inlines[0].text.as_deref(), Some("line one"));
         assert_eq!(inlines[2].text.as_deref(), Some("line two"));
+    }
+
+    #[test]
+    fn consecutive_hardbreaks_in_paragraph_roundtrip() {
+        // Issue #410: consecutive hardBreak nodes collapsed on round-trip
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"before"},
+          {"type":"hardBreak"},
+          {"type":"hardBreak"},
+          {"type":"text","text":"after"}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        assert_eq!(
+            round_tripped.content.len(),
+            1,
+            "Should remain a single paragraph, got {} blocks",
+            round_tripped.content.len()
+        );
+        let inlines = round_tripped.content[0].content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec!["text", "hardBreak", "hardBreak", "text"],
+            "Both hardBreaks should be preserved, got: {types:?}"
+        );
+        assert_eq!(inlines[0].text.as_deref(), Some("before"));
+        assert_eq!(inlines[3].text.as_deref(), Some("after"));
+    }
+
+    #[test]
+    fn hardbreak_only_paragraph_roundtrips() {
+        // Issue #410: paragraph whose only content is a hardBreak is dropped
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"paragraph","content":[{"type":"hardBreak"}]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        assert_eq!(
+            round_tripped.content.len(),
+            1,
+            "Paragraph should not be dropped, got {} blocks",
+            round_tripped.content.len()
+        );
+        let inlines = round_tripped.content[0].content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec!["hardBreak"],
+            "hardBreak-only paragraph should preserve its content, got: {types:?}"
+        );
+    }
+
+    #[test]
+    fn issue_410_full_reproducer_roundtrips() {
+        // Full reproducer from issue #410: consecutive hardBreaks + hardBreak-only paragraph
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"paragraph","content":[
+            {"type":"text","text":"before"},
+            {"type":"hardBreak"},
+            {"type":"hardBreak"},
+            {"type":"text","text":"after"}
+          ]},
+          {"type":"paragraph","content":[
+            {"type":"hardBreak"}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        assert_eq!(
+            round_tripped.content.len(),
+            2,
+            "Should have exactly 2 paragraphs, got {}",
+            round_tripped.content.len()
+        );
+        // First paragraph: text, hardBreak, hardBreak, text
+        let p1 = round_tripped.content[0].content.as_ref().unwrap();
+        let types1: Vec<&str> = p1.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types1, vec!["text", "hardBreak", "hardBreak", "text"]);
+        // Second paragraph: hardBreak only
+        let p2 = round_tripped.content[1].content.as_ref().unwrap();
+        let types2: Vec<&str> = p2.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types2, vec!["hardBreak"]);
+    }
+
+    #[test]
+    fn trailing_space_hardbreak_still_parsed() {
+        // Backward compatibility: trailing-space hardBreak (old JFM format) still parses
+        let md = "line one  \nline two\n";
+        let doc = markdown_to_adf(md).unwrap();
+        let inlines = doc.content[0].content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec!["text", "hardBreak", "text"],
+            "Trailing-space hardBreak should still parse, got: {types:?}"
+        );
+    }
+
+    #[test]
+    fn trailing_hardbreak_at_end_of_paragraph_roundtrips() {
+        // A paragraph ending with a hardBreak (no text after it)
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"text"},
+          {"type":"hardBreak"}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let inlines = round_tripped.content[0].content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec!["text", "hardBreak"],
+            "Trailing hardBreak should be preserved, got: {types:?}"
+        );
     }
 
     #[test]
