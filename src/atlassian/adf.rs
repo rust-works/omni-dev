@@ -440,10 +440,18 @@ impl AdfNode {
 
     /// Creates an embed card node.
     #[must_use]
-    pub fn embed_card(url: &str, layout: Option<&str>, width: Option<u32>) -> Self {
+    pub fn embed_card(
+        url: &str,
+        layout: Option<&str>,
+        original_height: Option<f64>,
+        width: Option<f64>,
+    ) -> Self {
         let mut attrs = serde_json::json!({"url": url});
         if let Some(l) = layout {
             attrs["layout"] = serde_json::Value::String(l.to_string());
+        }
+        if let Some(h) = original_height {
+            attrs["originalHeight"] = serde_json::json!(h);
         }
         if let Some(w) = width {
             attrs["width"] = serde_json::json!(w);
@@ -1059,19 +1067,26 @@ mod tests {
 
     #[test]
     fn embed_card_with_all_options() {
-        let card = AdfNode::embed_card("https://example.com", Some("wide"), Some(800));
+        let card = AdfNode::embed_card(
+            "https://example.com",
+            Some("wide"),
+            Some(732.0),
+            Some(100.0),
+        );
         let attrs = card.attrs.as_ref().unwrap();
         assert_eq!(attrs["url"], "https://example.com");
         assert_eq!(attrs["layout"], "wide");
-        assert_eq!(attrs["width"], 800);
+        assert_eq!(attrs["originalHeight"], 732.0);
+        assert_eq!(attrs["width"], 100.0);
     }
 
     #[test]
     fn embed_card_minimal() {
-        let card = AdfNode::embed_card("https://example.com", None, None);
+        let card = AdfNode::embed_card("https://example.com", None, None, None);
         let attrs = card.attrs.as_ref().unwrap();
         assert_eq!(attrs["url"], "https://example.com");
         assert!(attrs.get("layout").is_none());
+        assert!(attrs.get("originalHeight").is_none());
         assert!(attrs.get("width").is_none());
     }
 
