@@ -1543,7 +1543,8 @@ fn try_parse_emoji_shortcode(text: &str, i: usize) -> Option<(usize, &str)> {
 /// trailing `{id="..." text="..."}` attributes to preserve round-trip fidelity.
 fn parse_emoji_with_attrs(text: &str, shortcode_end: usize, short_name: &str) -> (usize, AdfNode) {
     if let Some((attr_end, attrs)) = parse_attrs(text, shortcode_end) {
-        let mut emoji_attrs = serde_json::json!({"shortName": short_name});
+        let colon_name = format!(":{short_name}:");
+        let mut emoji_attrs = serde_json::json!({"shortName": colon_name});
         if let Some(id) = attrs.get("id") {
             emoji_attrs["id"] = serde_json::Value::String(id.to_string());
         }
@@ -1561,7 +1562,7 @@ fn parse_emoji_with_attrs(text: &str, shortcode_end: usize, short_name: &str) ->
             },
         )
     } else {
-        (shortcode_end, AdfNode::emoji(short_name))
+        (shortcode_end, AdfNode::emoji(&format!(":{short_name}:")))
     }
 }
 
@@ -3341,7 +3342,7 @@ mod tests {
         let content = doc.content[0].content.as_ref().unwrap();
         assert_eq!(content[0].text.as_deref(), Some("Hello "));
         assert_eq!(content[1].node_type, "emoji");
-        assert_eq!(content[1].attrs.as_ref().unwrap()["shortName"], "wave");
+        assert_eq!(content[1].attrs.as_ref().unwrap()["shortName"], ":wave:");
         assert_eq!(content[2].text.as_deref(), Some(" world"));
     }
 
@@ -3408,7 +3409,7 @@ mod tests {
         let round_tripped = markdown_to_adf(&md).unwrap();
         let emoji = &round_tripped.content[0].content.as_ref().unwrap()[0];
         let attrs = emoji.attrs.as_ref().unwrap();
-        assert_eq!(attrs["shortName"], "check_mark");
+        assert_eq!(attrs["shortName"], ":check_mark:");
         assert_eq!(attrs["id"], "2705");
         assert_eq!(attrs["text"], "✅");
     }
@@ -3418,9 +3419,31 @@ mod tests {
         let md = "Hello :wave: world\n";
         let doc = markdown_to_adf(md).unwrap();
         let emoji = &doc.content[0].content.as_ref().unwrap()[1];
-        assert_eq!(emoji.attrs.as_ref().unwrap()["shortName"], "wave");
+        assert_eq!(emoji.attrs.as_ref().unwrap()["shortName"], ":wave:");
         // No id or text attrs when not provided
         assert!(emoji.attrs.as_ref().unwrap().get("id").is_none());
+    }
+
+    #[test]
+    fn emoji_shortname_preserves_colons_round_trip() {
+        // Issue #362: emoji shortName colons stripped during round-trip
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"emoji","attrs":{"shortName":":cross_mark:","id":"atlassian-cross_mark","text":"❌"}}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+
+        // ADF → markdown → ADF round-trip
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let emoji = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let attrs = emoji.attrs.as_ref().unwrap();
+        assert_eq!(
+            attrs["shortName"], ":cross_mark:",
+            "shortName should preserve colons, got: {}",
+            attrs["shortName"]
+        );
+        assert_eq!(attrs["id"], "atlassian-cross_mark");
+        assert_eq!(attrs["text"], "❌");
     }
 
     #[test]
