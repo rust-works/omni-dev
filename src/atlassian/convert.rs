@@ -758,12 +758,17 @@ impl<'a> MarkdownParser<'a> {
             "embed" => {
                 let url = d.content.as_deref().unwrap_or("");
                 let layout = d.attrs.as_ref().and_then(|a| a.get("layout"));
+                let original_height = d
+                    .attrs
+                    .as_ref()
+                    .and_then(|a| a.get("originalHeight"))
+                    .and_then(|v| v.parse::<f64>().ok());
                 let width = d
                     .attrs
                     .as_ref()
                     .and_then(|a| a.get("width"))
-                    .and_then(|w| w.parse::<u32>().ok());
-                AdfNode::embed_card(url, layout, width)
+                    .and_then(|w| w.parse::<f64>().ok());
+                AdfNode::embed_card(url, layout, original_height, width)
             }
             "extension" => {
                 let ext_type = d.attrs.as_ref().and_then(|a| a.get("type")).unwrap_or("");
@@ -1960,6 +1965,16 @@ fn render_block_children(children: &[AdfNode], output: &mut String, opts: &Rende
     }
 }
 
+/// Formats a float as an integer string when it has no fractional part,
+/// otherwise as a regular float string.
+fn fmt_f64_attr(v: f64) -> String {
+    if v.fract() == 0.0 {
+        format!("{}", v as i64)
+    } else {
+        v.to_string()
+    }
+}
+
 /// Renders a block-level ADF node to markdown.
 fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) {
     match node.node_type.as_str() {
@@ -2126,8 +2141,14 @@ fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) 
                 if let Some(layout) = attrs.get("layout").and_then(serde_json::Value::as_str) {
                     attr_parts.push(format!("layout={layout}"));
                 }
-                if let Some(width) = attrs.get("width").and_then(serde_json::Value::as_u64) {
-                    attr_parts.push(format!("width={width}"));
+                if let Some(h) = attrs
+                    .get("originalHeight")
+                    .and_then(serde_json::Value::as_f64)
+                {
+                    attr_parts.push(format!("originalHeight={}", fmt_f64_attr(h)));
+                }
+                if let Some(w) = attrs.get("width").and_then(serde_json::Value::as_f64) {
+                    attr_parts.push(format!("width={}", fmt_f64_attr(w)));
                 }
                 if !attr_parts.is_empty() {
                     output.push_str(&format!("{{{}}}", attr_parts.join(" ")));
@@ -4687,11 +4708,24 @@ mod tests {
         let doc =
             markdown_to_adf("::embed[https://figma.com/file/abc]{layout=wide width=80}").unwrap();
         assert_eq!(doc.content[0].node_type, "embedCard");
-        assert_eq!(
-            doc.content[0].attrs.as_ref().unwrap()["url"],
-            "https://figma.com/file/abc"
-        );
-        assert_eq!(doc.content[0].attrs.as_ref().unwrap()["layout"], "wide");
+        let attrs = doc.content[0].attrs.as_ref().unwrap();
+        assert_eq!(attrs["url"], "https://figma.com/file/abc");
+        assert_eq!(attrs["layout"], "wide");
+        assert_eq!(attrs["width"], 80.0);
+    }
+
+    #[test]
+    fn leaf_embed_card_with_original_height() {
+        let doc = markdown_to_adf(
+            "::embed[https://example.com]{layout=center originalHeight=732 width=100}",
+        )
+        .unwrap();
+        assert_eq!(doc.content[0].node_type, "embedCard");
+        let attrs = doc.content[0].attrs.as_ref().unwrap();
+        assert_eq!(attrs["url"], "https://example.com");
+        assert_eq!(attrs["layout"], "center");
+        assert_eq!(attrs["originalHeight"], 732.0);
+        assert_eq!(attrs["width"], 100.0);
     }
 
     #[test]
@@ -4702,11 +4736,113 @@ mod tests {
             content: vec![AdfNode::embed_card(
                 "https://figma.com/file/abc",
                 Some("wide"),
-                Some(80),
+                None,
+                Some(80.0),
             )],
         };
         let md = adf_to_markdown(&doc).unwrap();
         assert!(md.contains("::embed[https://figma.com/file/abc]{layout=wide width=80}"));
+    }
+
+    #[test]
+    fn adf_embed_card_original_height_to_markdown() {
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::embed_card(
+                "https://example.com",
+                Some("center"),
+                Some(732.0),
+                Some(100.0),
+            )],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("::embed[https://example.com]{layout=center originalHeight=732 width=100}"),
+            "expected originalHeight and width in md: {md}"
+        );
+    }
+
+    #[test]
+    fn embed_card_roundtrip_with_all_attrs() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{
+            "type":"embedCard",
+            "attrs":{"layout":"center","originalHeight":732.0,"url":"https://example.com","width":100.0}
+        }]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("originalHeight=732"),
+            "originalHeight missing from md: {md}"
+        );
+        assert!(md.contains("width=100"), "width missing from md: {md}");
+        let rt = markdown_to_adf(&md).unwrap();
+        let attrs = rt.content[0].attrs.as_ref().unwrap();
+        assert_eq!(attrs["originalHeight"], 732.0);
+        assert_eq!(attrs["width"], 100.0);
+        assert_eq!(attrs["layout"], "center");
+        assert_eq!(attrs["url"], "https://example.com");
+    }
+
+    #[test]
+    fn embed_card_fractional_dimensions() {
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::embed_card(
+                "https://example.com",
+                Some("center"),
+                Some(732.5),
+                Some(99.9),
+            )],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("originalHeight=732.5"),
+            "fractional originalHeight missing: {md}"
+        );
+        assert!(md.contains("width=99.9"), "fractional width missing: {md}");
+        let rt = markdown_to_adf(&md).unwrap();
+        let attrs = rt.content[0].attrs.as_ref().unwrap();
+        assert_eq!(attrs["originalHeight"], 732.5);
+        assert_eq!(attrs["width"], 99.9);
+    }
+
+    #[test]
+    fn embed_card_integer_width_in_json() {
+        // JSON integer (not float) should also be extracted via as_f64()
+        let adf_json = r#"{"version":1,"type":"doc","content":[{
+            "type":"embedCard",
+            "attrs":{"url":"https://example.com","width":100}
+        }]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("width=100"),
+            "integer width missing from md: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        assert_eq!(rt.content[0].attrs.as_ref().unwrap()["width"], 100.0);
+    }
+
+    #[test]
+    fn embed_card_only_original_height() {
+        // originalHeight without width
+        let adf_json = r#"{"version":1,"type":"doc","content":[{
+            "type":"embedCard",
+            "attrs":{"url":"https://example.com","originalHeight":500.0}
+        }]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("originalHeight=500"),
+            "originalHeight missing: {md}"
+        );
+        assert!(!md.contains("width="), "width should not appear: {md}");
+        let rt = markdown_to_adf(&md).unwrap();
+        let attrs = rt.content[0].attrs.as_ref().unwrap();
+        assert_eq!(attrs["originalHeight"], 500.0);
+        assert!(attrs.get("width").is_none());
     }
 
     #[test]
