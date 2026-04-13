@@ -674,6 +674,15 @@ impl AdfMark {
         }
     }
 
+    /// Creates an annotation mark (inline comment highlight).
+    #[must_use]
+    pub fn annotation(id: &str, annotation_type: &str) -> Self {
+        Self {
+            mark_type: "annotation".to_string(),
+            attrs: Some(serde_json::json!({"id": id, "annotationType": annotation_type})),
+        }
+    }
+
     /// Creates a text color mark.
     #[must_use]
     pub fn text_color(color: &str) -> Self {

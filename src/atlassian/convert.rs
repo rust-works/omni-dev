@@ -1396,6 +1396,10 @@ fn try_parse_bracketed_span(text: &str, i: usize) -> Option<(usize, Vec<AdfNode>
     if attrs.has_flag("underline") {
         marks.push(AdfMark::underline());
     }
+    if let Some(ann_id) = attrs.get("annotation-id") {
+        let ann_type = attrs.get("annotation-type").unwrap_or("inlineComment");
+        marks.push(AdfMark::annotation(ann_id, ann_type));
+    }
 
     if marks.is_empty() {
         return None; // no recognized marks
@@ -2519,6 +2523,10 @@ fn render_marked_text(text: &str, marks: &[AdfMark], output: &mut String) {
     let bg_color = marks.iter().find(|m| m.mark_type == "backgroundColor");
     let subsup = marks.iter().find(|m| m.mark_type == "subsup");
     let has_underline = marks.iter().any(|m| m.mark_type == "underline");
+    let annotations: Vec<&AdfMark> = marks
+        .iter()
+        .filter(|m| m.mark_type == "annotation")
+        .collect();
 
     let needs_span = text_color.is_some() || bg_color.is_some() || subsup.is_some();
 
@@ -2556,8 +2564,26 @@ fn render_marked_text(text: &str, marks: &[AdfMark], output: &mut String) {
             }
         }
         output.push_str(&format!(":span[{inner}]{{{}}}", attr_parts.join(" ")));
-    } else if has_underline {
-        output.push_str(&format!("[{inner}]{{underline}}"));
+    } else if has_underline || !annotations.is_empty() {
+        let mut attr_parts = Vec::new();
+        if has_underline {
+            attr_parts.push("underline".to_string());
+        }
+        for ann in &annotations {
+            if let Some(ref attrs) = ann.attrs {
+                if let Some(id) = attrs.get("id").and_then(serde_json::Value::as_str) {
+                    let escaped = id.replace('\\', "\\\\").replace('"', "\\\"");
+                    attr_parts.push(format!("annotation-id=\"{escaped}\""));
+                }
+                if let Some(at) = attrs
+                    .get("annotationType")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    attr_parts.push(format!("annotation-type={at}"));
+                }
+            }
+        }
+        output.push_str(&format!("[{inner}]{{{}}}", attr_parts.join(" ")));
     } else if let Some(link_mark) = has_link {
         let href = link_mark
             .attrs
@@ -4036,6 +4062,63 @@ mod tests {
         let doc = markdown_to_adf(md).unwrap();
         let result = adf_to_markdown(&doc).unwrap();
         assert!(result.contains("[underlined text]{underline}"));
+    }
+
+    #[test]
+    fn annotation_mark_round_trip() {
+        // Issue #364: annotation marks were silently dropped
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"highlighted text","marks":[
+            {"type":"annotation","attrs":{"id":"abc123","annotationType":"inlineComment"}}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("annotation-id="),
+            "JFM should contain annotation-id, got: {md}"
+        );
+
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let text_node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(text_node.text.as_deref(), Some("highlighted text"));
+        let marks = text_node.marks.as_ref().expect("should have marks");
+        let ann = marks
+            .iter()
+            .find(|m| m.mark_type == "annotation")
+            .expect("should have annotation mark");
+        let attrs = ann.attrs.as_ref().unwrap();
+        assert_eq!(attrs["id"], "abc123");
+        assert_eq!(attrs["annotationType"], "inlineComment");
+    }
+
+    #[test]
+    fn annotation_mark_with_bold() {
+        // Annotation + bold should both survive round-trip
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text_with_marks(
+                "bold comment",
+                vec![
+                    AdfMark::strong(),
+                    AdfMark::annotation("def456", "inlineComment"),
+                ],
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let text_node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let marks = text_node.marks.as_ref().expect("should have marks");
+        assert!(
+            marks.iter().any(|m| m.mark_type == "strong"),
+            "should have strong mark"
+        );
+        assert!(
+            marks.iter().any(|m| m.mark_type == "annotation"),
+            "should have annotation mark"
+        );
     }
 
     // ── Inline directive tests (Tier 4) ───────────────────────────────
