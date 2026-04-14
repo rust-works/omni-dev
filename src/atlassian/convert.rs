@@ -1632,6 +1632,18 @@ fn parse_inline(text: &str) -> Vec<AdfNode> {
                 }
                 chars.next();
             }
+            '\\' if text.as_bytes().get(i + 1) == Some(&b'n')
+                && text.as_bytes().get(i + 2) != Some(&b'\n') =>
+            {
+                // Issue #454: `\n` (backslash + letter n) encodes a literal
+                // newline inside a text node. Emit the newline as a separate
+                // text node so merge_adjacent_text can reassemble it.
+                flush_plain(text, plain_start, i, &mut nodes);
+                nodes.push(AdfNode::text("\n"));
+                chars.next(); // consume the '\'
+                chars.next(); // consume the 'n'
+                plain_start = chars.peek().map_or(text.len(), |&(idx, _)| idx);
+            }
             '\\' if i + 1 < text.len()
                 && !text[i..].starts_with("\\\n")
                 && text.as_bytes()[i + 1] != b'\\' =>
@@ -3373,7 +3385,16 @@ fn render_inline_node(node: &AdfNode, output: &mut String, opts: &RenderOptions)
         "text" => {
             let text = node.text.as_deref().unwrap_or("");
             let marks = node.marks.as_deref().unwrap_or(&[]);
-            render_marked_text(text, marks, output);
+            // Issue #454: A literal newline inside a text node is escaped
+            // as the two-character sequence `\n` so it survives round-trip
+            // as a single text node instead of splitting into paragraphs or
+            // being converted to hardBreak nodes.
+            if text.contains('\n') {
+                let escaped = text.replace('\n', "\\n");
+                render_marked_text(&escaped, marks, output);
+            } else {
+                render_marked_text(text, marks, output);
+            }
         }
         "hardBreak" => {
             output.push_str("\\\n");
@@ -12511,5 +12532,169 @@ C
         assert_eq!(text, "some text");
         assert_eq!(lid.as_deref(), Some("abc-123"));
         assert!(plid.is_none());
+    }
+
+    // --- Issue #454: literal newline in text node inside listItem paragraph ---
+
+    #[test]
+    fn newline_in_text_node_roundtrips_in_bullet_list() {
+        // A text node containing a literal \n inside a bullet list item
+        // must round-trip as a single text node with the embedded newline
+        // preserved, not split into multiple paragraphs or hardBreak nodes.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"Run these commands:"},{"type":"hardBreak"},{"type":"text","text":"first command\nsecond command"}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        // Should still be a single bulletList with one listItem
+        assert_eq!(rt.content.len(), 1);
+        let list = &rt.content[0];
+        assert_eq!(list.node_type, "bulletList");
+        let items = list.content.as_ref().unwrap();
+        assert_eq!(items.len(), 1);
+
+        // The listItem should have exactly one paragraph child
+        let item_content = items[0].content.as_ref().unwrap();
+        assert_eq!(
+            item_content.len(),
+            1,
+            "listItem should have exactly one paragraph"
+        );
+        assert_eq!(item_content[0].node_type, "paragraph");
+
+        // The embedded newline must survive as a single text node
+        let inlines = item_content[0].content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec!["text", "hardBreak", "text"],
+            "embedded newline should stay in a single text node, not produce extra hardBreaks"
+        );
+        assert_eq!(
+            inlines[2].text.as_deref(),
+            Some("first command\nsecond command")
+        );
+    }
+
+    #[test]
+    fn newline_in_text_node_roundtrips_in_ordered_list() {
+        // Same as above but in an ordered list.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"orderedList","attrs":{"order":1},"content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"first\nsecond"}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let list = &rt.content[0];
+        assert_eq!(list.node_type, "orderedList");
+        let items = list.content.as_ref().unwrap();
+        assert_eq!(items.len(), 1);
+
+        let item_content = items[0].content.as_ref().unwrap();
+        assert_eq!(item_content.len(), 1);
+        assert_eq!(item_content[0].node_type, "paragraph");
+
+        let inlines = item_content[0].content.as_ref().unwrap();
+        assert_eq!(inlines.len(), 1);
+        assert_eq!(inlines[0].node_type, "text");
+        assert_eq!(inlines[0].text.as_deref(), Some("first\nsecond"));
+    }
+
+    #[test]
+    fn newline_in_text_node_roundtrips_in_paragraph() {
+        // A text node with \n in a top-level paragraph should render as
+        // escaped \n and round-trip back to a single text node.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"hello\nworld"}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("hello\\nworld"),
+            "newline in text node should render as escaped \\n: {md:?}"
+        );
+
+        let rt = markdown_to_adf(&md).unwrap();
+        let inlines = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(inlines.len(), 1);
+        assert_eq!(inlines[0].text.as_deref(), Some("hello\nworld"));
+    }
+
+    #[test]
+    fn multiple_newlines_in_text_node_roundtrip() {
+        // Multiple \n characters should each round-trip within the same text node.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"a\nb\nc"}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let item_content = rt.content[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap();
+        assert_eq!(item_content.len(), 1);
+
+        let inlines = item_content[0].content.as_ref().unwrap();
+        assert_eq!(inlines.len(), 1);
+        assert_eq!(inlines[0].text.as_deref(), Some("a\nb\nc"));
+    }
+
+    #[test]
+    fn newline_in_marked_text_node_roundtrips() {
+        // A bold text node with \n should round-trip preserving both
+        // the marks and the embedded newline.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"bold\ntext","marks":[{"type":"strong"}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("**bold\\ntext**"),
+            "bold text with embedded newline should stay in one marked run: {md:?}"
+        );
+
+        let rt = markdown_to_adf(&md).unwrap();
+        let inlines = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(inlines.len(), 1);
+        assert_eq!(inlines[0].text.as_deref(), Some("bold\ntext"));
+        assert!(inlines[0]
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|m| m.mark_type == "strong"));
+    }
+
+    #[test]
+    fn trailing_newline_in_text_node_roundtrips() {
+        // A text node ending with \n should round-trip preserving the
+        // trailing newline.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"trailing\n"}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("trailing\\n"),
+            "trailing newline should be escaped: {md:?}"
+        );
+
+        let rt = markdown_to_adf(&md).unwrap();
+        let inlines = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(inlines.len(), 1);
+        assert_eq!(inlines[0].text.as_deref(), Some("trailing\n"));
+    }
+
+    #[test]
+    fn hardbreak_and_embedded_newline_are_distinct() {
+        // A hardBreak node and an embedded \n in a text node must not be
+        // conflated — each must round-trip to its original form.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"before"},{"type":"hardBreak"},{"type":"text","text":"mid\ndle"},{"type":"hardBreak"},{"type":"text","text":"after"}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let inlines = rt.content[0].content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec!["text", "hardBreak", "text", "hardBreak", "text"]
+        );
+        assert_eq!(inlines[0].text.as_deref(), Some("before"));
+        assert_eq!(inlines[2].text.as_deref(), Some("mid\ndle"));
+        assert_eq!(inlines[4].text.as_deref(), Some("after"));
     }
 }
