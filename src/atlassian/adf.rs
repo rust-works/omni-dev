@@ -361,7 +361,11 @@ impl AdfNode {
                 "localId": uuid_placeholder(),
                 "state": state,
             })),
-            content: Some(content),
+            content: if content.is_empty() {
+                None
+            } else {
+                Some(content)
+            },
             text: None,
             marks: None,
         }
@@ -632,11 +636,13 @@ impl AdfNode {
     }
 }
 
-/// Generates a placeholder UUID for nodes that require a `localId`.
-/// Real UUIDs should be generated at conversion time; this provides a
-/// deterministic fallback for testing.
+/// Returns the default placeholder for nodes that require a `localId`.
+/// Empty string is used because Confluence itself emits `localId: ""`
+/// for auto-generated nodes; both `""` and the nil UUID
+/// `"00000000-0000-0000-0000-000000000000"` are treated as
+/// non-significant by the rendering layer.
 fn uuid_placeholder() -> String {
-    "00000000-0000-0000-0000-000000000000".to_string()
+    String::new()
 }
 
 /// An inline mark applied to a text node.
