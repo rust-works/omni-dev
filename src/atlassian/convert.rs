@@ -748,18 +748,28 @@ impl<'a> MarkdownParser<'a> {
         let cell_text = cell_lines.join("\n");
         let blocks = MarkdownParser::new(&cell_text).parse_blocks()?;
 
-        let adf_attrs = cell_attrs.map(|a| build_cell_attrs(&a));
+        let adf_attrs = cell_attrs.as_ref().map(build_cell_attrs);
+        let cell_marks = cell_attrs
+            .as_ref()
+            .map(build_cell_marks)
+            .unwrap_or_default();
 
-        let cell = if is_header {
-            if let Some(attrs) = adf_attrs {
-                AdfNode::table_header_with_attrs(blocks, attrs)
+        let cell = if cell_marks.is_empty() {
+            if is_header {
+                if let Some(attrs) = adf_attrs {
+                    AdfNode::table_header_with_attrs(blocks, attrs)
+                } else {
+                    AdfNode::table_header(blocks)
+                }
+            } else if let Some(attrs) = adf_attrs {
+                AdfNode::table_cell_with_attrs(blocks, attrs)
             } else {
-                AdfNode::table_header(blocks)
+                AdfNode::table_cell(blocks)
             }
-        } else if let Some(attrs) = adf_attrs {
-            AdfNode::table_cell_with_attrs(blocks, attrs)
+        } else if is_header {
+            AdfNode::table_header_with_attrs_and_marks(blocks, adf_attrs, cell_marks)
         } else {
-            AdfNode::table_cell(blocks)
+            AdfNode::table_cell_with_attrs_and_marks(blocks, adf_attrs, cell_marks)
         };
 
         Ok((cell, i))
@@ -1037,6 +1047,19 @@ fn build_cell_attrs(attrs: &crate::atlassian::attrs::Attrs) -> serde_json::Value
         adf["localId"] = serde_json::Value::String(local_id.to_string());
     }
     adf
+}
+
+/// Extracts cell-level marks (e.g., border) from directive attributes.
+fn build_cell_marks(attrs: &crate::atlassian::attrs::Attrs) -> Vec<AdfMark> {
+    let mut marks = Vec::new();
+    let border_color = attrs.get("border-color");
+    let border_size = attrs.get("border-size");
+    if border_color.is_some() || border_size.is_some() {
+        let color = border_color.unwrap_or("#000000");
+        let size = border_size.and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
+        marks.push(AdfMark::border(color, size));
+    }
+    marks
 }
 
 /// Converts an ISO 8601 date string (e.g., "2026-04-15") to epoch milliseconds string.
@@ -2929,6 +2952,11 @@ fn table_qualifies_for_pipe_syntax(rows: &[AdfNode]) -> bool {
             if cell_contains_hard_break(&content[0]) {
                 return false;
             }
+            // Cell-level marks (e.g., border) cannot be represented in pipe
+            // form — fall back to directive form
+            if cell.marks.as_ref().is_some_and(|m| !m.is_empty()) {
+                return false;
+            }
             // Paragraph-level localId would be lost in pipe form (the paragraph
             // is unwrapped into the cell text) — fall back to directive form
             if content[0]
@@ -3071,7 +3099,33 @@ fn render_directive_table(
                     cell_attr_str.push_str(&lid_parts.join(" "));
                 }
             }
-            if cell_attr_str.is_empty() && cell.attrs.is_none() {
+            // Append border mark attrs if present
+            if let Some(ref marks) = cell.marks {
+                for mark in marks {
+                    if mark.mark_type == "border" {
+                        if let Some(ref attrs) = mark.attrs {
+                            if let Some(color) =
+                                attrs.get("color").and_then(serde_json::Value::as_str)
+                            {
+                                if !cell_attr_str.is_empty() {
+                                    cell_attr_str.push(' ');
+                                }
+                                cell_attr_str.push_str(&format!("border-color={color}"));
+                            }
+                            if let Some(size) =
+                                attrs.get("size").and_then(serde_json::Value::as_u64)
+                            {
+                                if !cell_attr_str.is_empty() {
+                                    cell_attr_str.push(' ');
+                                }
+                                cell_attr_str.push_str(&format!("border-size={size}"));
+                            }
+                        }
+                    }
+                }
+            }
+            let has_marks = cell.marks.as_ref().is_some_and(|m| !m.is_empty());
+            if cell_attr_str.is_empty() && cell.attrs.is_none() && !has_marks {
                 output.push_str(&format!(":::{directive_name}\n"));
             } else {
                 output.push_str(&format!(":::{directive_name}{{{cell_attr_str}}}\n"));
@@ -6964,6 +7018,118 @@ mod tests {
             "tc-001",
             "tableCell localId should round-trip"
         );
+    }
+
+    #[test]
+    fn table_cell_border_mark_roundtrip() {
+        let adf_json = r##"{"version":1,"type":"doc","content":[{"type":"table","content":[{"type":"tableRow","content":[{"type":"tableCell","attrs":{},"marks":[{"type":"border","attrs":{"color":"#ff000033","size":2}}],"content":[{"type":"paragraph","content":[{"type":"text","text":"cell with border"}]}]}]}]}]}"##;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("border-color=#ff000033"),
+            "tableCell should have border-color in md: {md}"
+        );
+        assert!(
+            md.contains("border-size=2"),
+            "tableCell should have border-size in md: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let cell = &rt.content[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap()[0];
+        let marks = cell.marks.as_ref().expect("tableCell should have marks");
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].mark_type, "border");
+        let attrs = marks[0].attrs.as_ref().unwrap();
+        assert_eq!(attrs["color"], "#ff000033");
+        assert_eq!(attrs["size"], 2);
+    }
+
+    #[test]
+    fn table_header_border_mark_roundtrip() {
+        let adf_json = r##"{"version":1,"type":"doc","content":[{"type":"table","content":[{"type":"tableRow","content":[{"type":"tableHeader","attrs":{},"marks":[{"type":"border","attrs":{"color":"#0000ff","size":3}}],"content":[{"type":"paragraph","content":[{"type":"text","text":"header"}]}]}]}]}]}"##;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("border-color=#0000ff"), "md: {md}");
+        assert!(md.contains("border-size=3"), "md: {md}");
+        let rt = markdown_to_adf(&md).unwrap();
+        let cell = &rt.content[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap()[0];
+        assert_eq!(cell.node_type, "tableHeader");
+        let marks = cell.marks.as_ref().expect("tableHeader should have marks");
+        assert_eq!(marks[0].mark_type, "border");
+        assert_eq!(marks[0].attrs.as_ref().unwrap()["color"], "#0000ff");
+        assert_eq!(marks[0].attrs.as_ref().unwrap()["size"], 3);
+    }
+
+    #[test]
+    fn table_cell_border_mark_with_attrs_roundtrip() {
+        let adf_json = r##"{"version":1,"type":"doc","content":[{"type":"table","content":[{"type":"tableRow","content":[{"type":"tableCell","attrs":{"background":"#e6fcff","colspan":2},"marks":[{"type":"border","attrs":{"color":"#ff000033","size":1}}],"content":[{"type":"paragraph","content":[{"type":"text","text":"styled"}]}]}]}]}]}"##;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("bg=#e6fcff"), "md: {md}");
+        assert!(md.contains("colspan=2"), "md: {md}");
+        assert!(md.contains("border-color=#ff000033"), "md: {md}");
+        let rt = markdown_to_adf(&md).unwrap();
+        let cell = &rt.content[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap()[0];
+        assert_eq!(cell.attrs.as_ref().unwrap()["background"], "#e6fcff");
+        assert_eq!(cell.attrs.as_ref().unwrap()["colspan"], 2);
+        let marks = cell.marks.as_ref().expect("should have marks");
+        assert_eq!(marks[0].attrs.as_ref().unwrap()["color"], "#ff000033");
+    }
+
+    #[test]
+    fn table_cell_no_border_mark_unchanged() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"table","content":[{"type":"tableRow","content":[{"type":"tableCell","content":[{"type":"paragraph","content":[{"type":"text","text":"plain"}]}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            !md.contains("border-color"),
+            "no border attrs expected: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let cell = &rt.content[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap()[0];
+        assert!(cell.marks.is_none(), "no marks expected on plain cell");
+    }
+
+    #[test]
+    fn table_cell_border_size_only_defaults_color() {
+        // border-size without border-color should still produce a border mark
+        // with the default color
+        let md = "::::table\n:::tr\n:::td{border-size=3}\ncell\n:::\n:::\n::::\n";
+        let doc = markdown_to_adf(md).unwrap();
+        let cell = &doc.content[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap()[0];
+        let marks = cell.marks.as_ref().expect("should have border mark");
+        assert_eq!(marks[0].mark_type, "border");
+        assert_eq!(marks[0].attrs.as_ref().unwrap()["color"], "#000000");
+        assert_eq!(marks[0].attrs.as_ref().unwrap()["size"], 3);
+    }
+
+    #[test]
+    fn table_cell_border_color_only_defaults_size() {
+        // border-color without border-size should default size to 1
+        let md = "::::table\n:::tr\n:::td{border-color=#ff0000}\ncell\n:::\n:::\n::::\n";
+        let doc = markdown_to_adf(md).unwrap();
+        let cell = &doc.content[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap()[0];
+        let marks = cell.marks.as_ref().expect("should have border mark");
+        assert_eq!(marks[0].mark_type, "border");
+        assert_eq!(marks[0].attrs.as_ref().unwrap()["color"], "#ff0000");
+        assert_eq!(marks[0].attrs.as_ref().unwrap()["size"], 1);
     }
 
     #[test]
