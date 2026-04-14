@@ -60,6 +60,26 @@ impl<'a> MarkdownParser<'a> {
         self.pos += 1;
     }
 
+    /// Collects indented continuation lines produced by hardBreaks (issue #402).
+    ///
+    /// When `full_text` ends with a hardBreak marker (trailing backslash or
+    /// two trailing spaces), the next 2-space-indented line is appended as a
+    /// continuation of the same paragraph.  The joined text is later fed to
+    /// `parse_inline`, which converts the `\\\n` or `  \n` sequences back
+    /// into `hardBreak` nodes.
+    fn collect_hardbreak_continuations(&mut self, full_text: &mut String) {
+        while has_trailing_hard_break(full_text) && !self.at_end() {
+            let next = self.current_line();
+            if let Some(stripped) = next.strip_prefix("  ") {
+                full_text.push('\n');
+                full_text.push_str(stripped);
+                self.advance();
+                continue;
+            }
+            break;
+        }
+    }
+
     fn parse_blocks(&mut self) -> Result<Vec<AdfNode>> {
         let mut blocks = Vec::new();
 
@@ -253,21 +273,22 @@ impl<'a> MarkdownParser<'a> {
                 items.push(task);
                 self.advance();
             } else {
-                let item_text = &trimmed[2..];
-                let (item_text, local_id, para_local_id) = extract_trailing_local_id(item_text);
-                let inline_nodes = parse_inline(item_text);
+                let first_line = &trimmed[2..];
                 self.advance();
-                // Collect indented sub-list lines (2-space prefix + list marker)
+                let mut full_text = first_line.to_string();
+                self.collect_hardbreak_continuations(&mut full_text);
+                let (item_text, local_id, para_local_id) = extract_trailing_local_id(&full_text);
+                let inline_nodes = parse_inline(item_text);
+                // Collect indented sub-content lines (2-space prefix).
+                // This captures both nested lists and continuation
+                // paragraphs that belong to the same list item.
                 let mut sub_lines: Vec<String> = Vec::new();
                 while !self.at_end() {
                     let next = self.current_line();
                     if let Some(stripped) = next.strip_prefix("  ") {
-                        let st = stripped.trim_start();
-                        if st.starts_with("- ") || st.starts_with("* ") || st.starts_with("+ ") {
-                            sub_lines.push(stripped.to_string());
-                            self.advance();
-                            continue;
-                        }
+                        sub_lines.push(stripped.to_string());
+                        self.advance();
+                        continue;
                     }
                     break;
                 }
@@ -308,25 +329,20 @@ impl<'a> MarkdownParser<'a> {
             let trimmed = line.trim_start();
 
             if let Some((_, rest)) = parse_ordered_list_marker(trimmed) {
-                let rest_trimmed = rest.trim_start();
-                let (item_text, local_id, para_local_id) = extract_trailing_local_id(rest_trimmed);
-                let inline_nodes = parse_inline(item_text);
+                let first_line = rest.trim_start();
                 self.advance();
-                // Collect indented sub-list lines (2-space prefix + list marker)
+                let mut full_text = first_line.to_string();
+                self.collect_hardbreak_continuations(&mut full_text);
+                let (item_text, local_id, para_local_id) = extract_trailing_local_id(&full_text);
+                let inline_nodes = parse_inline(item_text);
+                // Collect indented sub-content lines (2-space prefix).
                 let mut sub_lines: Vec<String> = Vec::new();
                 while !self.at_end() {
                     let next = self.current_line();
                     if let Some(stripped) = next.strip_prefix("  ") {
-                        let st = stripped.trim_start();
-                        if st.starts_with("- ")
-                            || st.starts_with("* ")
-                            || st.starts_with("+ ")
-                            || parse_ordered_list_marker(st).is_some()
-                        {
-                            sub_lines.push(stripped.to_string());
-                            self.advance();
-                            continue;
-                        }
+                        sub_lines.push(stripped.to_string());
+                        self.advance();
+                        continue;
                     }
                     break;
                 }
@@ -1174,6 +1190,12 @@ fn parse_ordered_list_marker(line: &str) -> Option<(u32, &str)> {
     Some((num, after_marker))
 }
 
+/// Returns true if a line ends with a hardBreak marker
+/// (trailing backslash or two trailing spaces).
+fn has_trailing_hard_break(line: &str) -> bool {
+    line.ends_with('\\') || line.ends_with("  ")
+}
+
 /// Checks if a line starts a list item.
 fn is_list_start(line: &str) -> bool {
     let trimmed = line.trim_start();
@@ -1181,6 +1203,30 @@ fn is_list_start(line: &str) -> bool {
         || trimmed.starts_with("* ")
         || trimmed.starts_with("+ ")
         || parse_ordered_list_marker(trimmed).is_some()
+}
+
+/// Escapes a leading list-marker pattern on a line so it is not
+/// re-parsed as a new list item.  `"2. text"` → `"2\. text"`,
+/// `"- text"` → `"\- text"`.
+fn escape_list_marker(line: &str) -> String {
+    if let Some(dot_pos) = line.find(". ") {
+        if parse_ordered_list_marker(line).is_some() {
+            let mut s = String::with_capacity(line.len() + 1);
+            s.push_str(&line[..dot_pos]);
+            s.push('\\');
+            s.push_str(&line[dot_pos..]);
+            return s;
+        }
+    }
+    for prefix in &["- ", "* ", "+ "] {
+        if line.starts_with(prefix) {
+            let mut s = String::with_capacity(line.len() + 1);
+            s.push('\\');
+            s.push_str(line);
+            return s;
+        }
+    }
+    line.to_string()
 }
 
 /// Checks if a line is a horizontal rule.
@@ -1433,6 +1479,18 @@ fn parse_inline(text: &str) -> Vec<AdfNode> {
                 }
                 chars.next();
             }
+            '\\' if i + 1 < text.len()
+                && !text[i..].starts_with("\\\n")
+                && text.as_bytes()[i + 1] != b'\\' =>
+            {
+                // Backslash escape: skip the backslash and treat the next
+                // character as literal text (e.g. `2\. text` → `2. text`).
+                flush_plain(text, plain_start, i, &mut nodes);
+                chars.next(); // consume the backslash
+                plain_start = chars.peek().map_or(text.len(), |&(idx, _)| idx);
+                // The escaped character remains in `chars` and will be
+                // consumed normally on the next iteration.
+            }
             '\\' if text[i..].starts_with("\\\n") => {
                 // Backslash line break → hardBreak node.
                 flush_plain(text, plain_start, i, &mut nodes);
@@ -1465,7 +1523,31 @@ fn parse_inline(text: &str) -> Vec<AdfNode> {
         }
     }
 
+    // Merge adjacent unmarked text nodes that can arise from backslash
+    // escape handling (e.g. `"2"` + `". text"` → `"2. text"`).
+    merge_adjacent_text(&mut nodes);
+
     nodes
+}
+
+/// Merges consecutive unmarked text nodes in-place.
+fn merge_adjacent_text(nodes: &mut Vec<AdfNode>) {
+    let mut i = 0;
+    while i + 1 < nodes.len() {
+        if nodes[i].node_type == "text"
+            && nodes[i + 1].node_type == "text"
+            && nodes[i].marks.is_none()
+            && nodes[i + 1].marks.is_none()
+        {
+            let next_text = nodes[i + 1].text.clone().unwrap_or_default();
+            if let Some(ref mut t) = nodes[i].text {
+                t.push_str(&next_text);
+            }
+            nodes.remove(i + 1);
+        } else {
+            i += 1;
+        }
+    }
 }
 
 /// Flushes accumulated plain text as a text node.
@@ -2003,7 +2085,15 @@ fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) 
                     // line — use the ::paragraph[content]{attrs} directive form
                     output.push_str(&format!("::paragraph[{buf}]{dir_attrs}\n"));
                 } else {
-                    output.push_str(&buf);
+                    // Escape a leading list-marker pattern so paragraph
+                    // text is not re-parsed as a list item (issue #402).
+                    let first = buf.lines().next().unwrap_or("");
+                    if is_list_start(first) {
+                        output.push_str(&escape_list_marker(first));
+                        output.push_str(&buf[first.len()..]);
+                    } else {
+                        output.push_str(&buf);
+                    }
                     output.push('\n');
                 }
             }
@@ -2374,7 +2464,23 @@ fn render_list_item_content(item: &AdfNode, output: &mut String, opts: &RenderOp
     let first = &content[0];
     let rest_start;
     if first.node_type == "paragraph" {
-        render_inline_content(first, output, opts);
+        let mut buf = String::new();
+        render_inline_content(first, &mut buf, opts);
+        // Indent continuation lines produced by hardBreaks so they stay
+        // within the list item when re-parsed (issue #402).
+        let mut is_first_line = true;
+        for line in buf.split('\n') {
+            if is_first_line {
+                output.push_str(line);
+                is_first_line = false;
+            } else {
+                output.push('\n');
+                if !line.is_empty() {
+                    output.push_str("  ");
+                }
+                output.push_str(line);
+            }
+        }
         // Emit paragraph + listItem localIds as trailing inline attrs on the first line
         emit_list_item_local_ids(item, first, output, opts);
         output.push('\n');
@@ -8761,6 +8867,476 @@ C
         assert!(
             md.contains("::::table"),
             "pipe syntax should not be used when caption is present"
+        );
+    }
+
+    // ── Issue #402: ordered-list-like text in list item hardBreak ──
+
+    #[test]
+    fn hardbreak_with_ordered_marker_in_bullet_item_roundtrips() {
+        // Issue #402: text starting with "2. " after a hardBreak inside a
+        // bullet list item must not be re-parsed as a new ordered list.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[
+          {"type":"listItem","content":[{"type":"paragraph","content":[
+            {"type":"text","text":"1. First item"},
+            {"type":"hardBreak"},
+            {"type":"text","text":"2. Honouring existing commitments"}
+          ]}]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+
+        // The continuation line must be indented so it stays within the list item.
+        assert!(
+            md.contains("  2. Honouring"),
+            "Continuation line should be indented, got:\n{md}"
+        );
+
+        // Round-trip back to ADF
+        let rt = markdown_to_adf(&md).unwrap();
+        let list = &rt.content[0];
+        assert_eq!(list.node_type, "bulletList");
+        let items = list.content.as_ref().unwrap();
+        assert_eq!(
+            items.len(),
+            1,
+            "Should be one list item, got {}",
+            items.len()
+        );
+
+        let para = &items[0].content.as_ref().unwrap()[0];
+        let inlines = para.content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec!["text", "hardBreak", "text"],
+            "Expected text+hardBreak+text, got {types:?}"
+        );
+        assert_eq!(
+            inlines[2].text.as_deref().unwrap(),
+            "2. Honouring existing commitments"
+        );
+    }
+
+    #[test]
+    fn hardbreak_with_ordered_marker_in_ordered_item_roundtrips() {
+        // Same as above but inside an ordered list.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"orderedList","attrs":{"order":1},"content":[
+          {"type":"listItem","content":[{"type":"paragraph","content":[
+            {"type":"text","text":"Introduction  "},
+            {"type":"hardBreak"},
+            {"type":"text","text":"3. Third point"}
+          ]}]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let list = &rt.content[0];
+        assert_eq!(list.node_type, "orderedList");
+        let items = list.content.as_ref().unwrap();
+        assert_eq!(items.len(), 1);
+
+        let para = &items[0].content.as_ref().unwrap()[0];
+        let inlines = para.content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types, vec!["text", "hardBreak", "text"]);
+        assert_eq!(inlines[2].text.as_deref().unwrap(), "3. Third point");
+    }
+
+    #[test]
+    fn hardbreak_with_bullet_marker_in_bullet_item_roundtrips() {
+        // Text starting with "- " after a hardBreak must not become a nested bullet list.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[
+          {"type":"listItem","content":[{"type":"paragraph","content":[
+            {"type":"text","text":"Header  "},
+            {"type":"hardBreak"},
+            {"type":"text","text":"- not a sub-item"}
+          ]}]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let list = &rt.content[0];
+        assert_eq!(list.node_type, "bulletList");
+        let items = list.content.as_ref().unwrap();
+        assert_eq!(
+            items.len(),
+            1,
+            "Should be one list item, not {}",
+            items.len()
+        );
+
+        let para = &items[0].content.as_ref().unwrap()[0];
+        let inlines = para.content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types, vec!["text", "hardBreak", "text"]);
+        assert_eq!(inlines[2].text.as_deref().unwrap(), "- not a sub-item");
+    }
+
+    #[test]
+    fn hardbreak_continuation_followed_by_sub_list() {
+        // A hardBreak continuation line followed by a real sub-list.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[
+          {"type":"listItem","content":[
+            {"type":"paragraph","content":[
+              {"type":"text","text":"Main item  "},
+              {"type":"hardBreak"},
+              {"type":"text","text":"continued here"}
+            ]},
+            {"type":"bulletList","content":[
+              {"type":"listItem","content":[{"type":"paragraph","content":[
+                {"type":"text","text":"sub-item"}
+              ]}]}
+            ]}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let list = &rt.content[0];
+        let items = list.content.as_ref().unwrap();
+        assert_eq!(items.len(), 1);
+
+        let item_content = items[0].content.as_ref().unwrap();
+        assert_eq!(item_content.len(), 2, "Expected paragraph + nested list");
+        assert_eq!(item_content[0].node_type, "paragraph");
+        assert_eq!(item_content[1].node_type, "bulletList");
+
+        // Check the paragraph has hardBreak
+        let inlines = item_content[0].content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types, vec!["text", "hardBreak", "text"]);
+    }
+
+    #[test]
+    fn multiple_hardbreaks_with_numbered_text_roundtrip() {
+        // Multiple hardBreaks where each continuation resembles an ordered list.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[
+          {"type":"listItem","content":[{"type":"paragraph","content":[
+            {"type":"text","text":"Preamble  "},
+            {"type":"hardBreak"},
+            {"type":"text","text":"1. Alpha  "},
+            {"type":"hardBreak"},
+            {"type":"text","text":"2. Bravo"}
+          ]}]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let items = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 1);
+
+        let inlines = items[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec!["text", "hardBreak", "text", "hardBreak", "text"]
+        );
+    }
+
+    #[test]
+    fn trailing_hardbreak_in_bullet_item_roundtrips() {
+        // A hardBreak as the last inline node with no text after it.
+        // Exercises the `break` path in the continuation loop and the
+        // empty-line rendering branch.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[
+          {"type":"listItem","content":[{"type":"paragraph","content":[
+            {"type":"text","text":"ends with break"},
+            {"type":"hardBreak"}
+          ]}]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let list = &rt.content[0];
+        assert_eq!(list.node_type, "bulletList");
+        let inlines = list.content.as_ref().unwrap()[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types, vec!["text", "hardBreak"]);
+    }
+
+    #[test]
+    fn trailing_hardbreak_in_ordered_item_roundtrips() {
+        // Same as above but in an ordered list, covering the ordered-list
+        // continuation `break` path.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"orderedList","attrs":{"order":1},"content":[
+          {"type":"listItem","content":[{"type":"paragraph","content":[
+            {"type":"text","text":"ends with break"},
+            {"type":"hardBreak"}
+          ]}]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let list = &rt.content[0];
+        assert_eq!(list.node_type, "orderedList");
+        let inlines = list.content.as_ref().unwrap()[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types, vec!["text", "hardBreak"]);
+    }
+
+    #[test]
+    fn trailing_space_hardbreak_continuation_in_bullet_item() {
+        // Exercises the `ends_with("  ")` path in `has_trailing_hard_break`
+        // by parsing hand-written markdown that uses trailing-space style
+        // hardBreaks instead of backslash style.
+        let md = "- first line  \n  2. continued\n";
+        let doc = markdown_to_adf(md).unwrap();
+
+        let list = &doc.content[0];
+        assert_eq!(list.node_type, "bulletList");
+        let items = list.content.as_ref().unwrap();
+        assert_eq!(
+            items.len(),
+            1,
+            "Should be one list item, got {}",
+            items.len()
+        );
+
+        let para = &items[0].content.as_ref().unwrap()[0];
+        let inlines = para.content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types, vec!["text", "hardBreak", "text"]);
+        assert_eq!(inlines[2].text.as_deref().unwrap(), "2. continued");
+    }
+
+    #[test]
+    fn trailing_space_hardbreak_continuation_in_ordered_item() {
+        // Same as above but for ordered list, exercising the trailing-space
+        // path in the ordered-list continuation loop.
+        let md = "1. first line  \n  - continued\n";
+        let doc = markdown_to_adf(md).unwrap();
+
+        let list = &doc.content[0];
+        assert_eq!(list.node_type, "orderedList");
+        let items = list.content.as_ref().unwrap();
+        assert_eq!(
+            items.len(),
+            1,
+            "Should be one list item, got {}",
+            items.len()
+        );
+
+        let para = &items[0].content.as_ref().unwrap()[0];
+        let inlines = para.content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types, vec!["text", "hardBreak", "text"]);
+        assert_eq!(inlines[2].text.as_deref().unwrap(), "- continued");
+    }
+
+    #[test]
+    fn multi_paragraph_list_item_with_ordered_marker_roundtrips() {
+        // Issue #402 comment: a listItem with a second paragraph starting
+        // with "2. " must not become a separate orderedList.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[
+          {"type":"listItem","content":[
+            {"type":"paragraph","content":[{"type":"text","text":"some preamble"}]},
+            {"type":"paragraph","content":[{"type":"text","text":"2. Honouring existing commitments"}]}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        assert_eq!(rt.content.len(), 1, "Should be one top-level block");
+        let list = &rt.content[0];
+        assert_eq!(list.node_type, "bulletList");
+        let items = list.content.as_ref().unwrap();
+        assert_eq!(items.len(), 1);
+        let item_content = items[0].content.as_ref().unwrap();
+        assert_eq!(
+            item_content.len(),
+            2,
+            "Expected 2 paragraphs inside the list item, got {}",
+            item_content.len()
+        );
+        assert_eq!(item_content[0].node_type, "paragraph");
+        assert_eq!(item_content[1].node_type, "paragraph");
+        let text = item_content[1].content.as_ref().unwrap()[0]
+            .text
+            .as_deref()
+            .unwrap();
+        assert_eq!(text, "2. Honouring existing commitments");
+    }
+
+    #[test]
+    fn multi_paragraph_list_item_with_bullet_marker_roundtrips() {
+        // Paragraph starting with "- " inside a list item.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[
+          {"type":"listItem","content":[
+            {"type":"paragraph","content":[{"type":"text","text":"preamble"}]},
+            {"type":"paragraph","content":[{"type":"text","text":"- not a sub-item"}]}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let items = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 1);
+        let item_content = items[0].content.as_ref().unwrap();
+        assert_eq!(item_content.len(), 2);
+        assert_eq!(item_content[1].node_type, "paragraph");
+        let text = item_content[1].content.as_ref().unwrap()[0]
+            .text
+            .as_deref()
+            .unwrap();
+        assert_eq!(text, "- not a sub-item");
+    }
+
+    #[test]
+    fn backslash_escape_in_inline_text() {
+        // Verify that `\. ` is unescaped to `. ` in inline parsing.
+        let nodes = parse_inline(r"2\. text");
+        assert_eq!(nodes.len(), 1, "Should be one text node");
+        assert_eq!(nodes[0].text.as_deref().unwrap(), "2. text");
+    }
+
+    #[test]
+    fn escape_list_marker_ordered() {
+        assert_eq!(escape_list_marker("2. text"), r"2\. text");
+        assert_eq!(escape_list_marker("10. tenth"), r"10\. tenth");
+    }
+
+    #[test]
+    fn escape_list_marker_bullet() {
+        assert_eq!(escape_list_marker("- text"), r"\- text");
+        assert_eq!(escape_list_marker("* text"), r"\* text");
+        assert_eq!(escape_list_marker("+ text"), r"\+ text");
+    }
+
+    #[test]
+    fn escape_list_marker_plain() {
+        assert_eq!(escape_list_marker("plain text"), "plain text");
+        assert_eq!(escape_list_marker("no. marker"), "no. marker");
+    }
+
+    #[test]
+    fn merge_adjacent_text_nodes() {
+        let mut nodes = vec![AdfNode::text("a"), AdfNode::text("b"), AdfNode::text("c")];
+        merge_adjacent_text(&mut nodes);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].text.as_deref().unwrap(), "abc");
+    }
+
+    #[test]
+    fn ordered_marker_paragraph_in_table_cell_roundtrips() {
+        // Issue #402: paragraph with "2. " text inside a tableCell must
+        // not be re-parsed as an ordered list.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{
+          "type":"table","attrs":{"isNumberColumnEnabled":false,"layout":"default"},
+          "content":[{"type":"tableRow","content":[{
+            "type":"tableCell","attrs":{"colspan":1,"rowspan":1},
+            "content":[{"type":"paragraph","content":[
+              {"type":"text","text":"2. Honouring existing commitments"}
+            ]}]
+          }]}]
+        }]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let table = &rt.content[0];
+        let cell = &table.content.as_ref().unwrap()[0].content.as_ref().unwrap()[0];
+        let para = &cell.content.as_ref().unwrap()[0];
+        assert_eq!(para.node_type, "paragraph");
+        let text = para.content.as_ref().unwrap()[0].text.as_deref().unwrap();
+        assert_eq!(text, "2. Honouring existing commitments");
+    }
+
+    #[test]
+    fn bullet_marker_paragraph_standalone_roundtrips() {
+        // A top-level paragraph starting with "- " must round-trip as
+        // a paragraph, not a bullet list.
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"paragraph","content":[
+            {"type":"text","text":"- not a list item"}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains(r"\- not a list item"),
+            "Should escape the leading dash, got:\n{md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        assert_eq!(rt.content[0].node_type, "paragraph");
+        let text = rt.content[0].content.as_ref().unwrap()[0]
+            .text
+            .as_deref()
+            .unwrap();
+        assert_eq!(text, "- not a list item");
+    }
+
+    #[test]
+    fn merge_adjacent_text_skips_non_text_nodes() {
+        // Exercises the `else { i += 1 }` branch when adjacent nodes
+        // are not both plain text.
+        let mut nodes = vec![
+            AdfNode::text("a"),
+            AdfNode::hard_break(),
+            AdfNode::text("b"),
+        ];
+        merge_adjacent_text(&mut nodes);
+        assert_eq!(nodes.len(), 3);
+    }
+
+    #[test]
+    fn star_bullet_paragraph_roundtrips() {
+        // Paragraph starting with "* " must round-trip without becoming
+        // a bullet list.
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"paragraph","content":[
+            {"type":"text","text":"* starred"}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        assert_eq!(rt.content[0].node_type, "paragraph");
+        assert_eq!(
+            rt.content[0].content.as_ref().unwrap()[0]
+                .text
+                .as_deref()
+                .unwrap(),
+            "* starred"
+        );
+    }
+
+    #[test]
+    fn plus_bullet_paragraph_roundtrips() {
+        // Paragraph starting with "+ " must round-trip without becoming
+        // a bullet list.
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"paragraph","content":[
+            {"type":"text","text":"+ plus"}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        assert_eq!(rt.content[0].node_type, "paragraph");
+        assert_eq!(
+            rt.content[0].content.as_ref().unwrap()[0]
+                .text
+                .as_deref()
+                .unwrap(),
+            "+ plus"
         );
     }
 }
