@@ -863,6 +863,10 @@ impl<'a> MarkdownParser<'a> {
                         if let Some(alt_text) = alt_opt {
                             media_attrs["alt"] = serde_json::Value::String(alt_text.to_string());
                         }
+                        if let Some(local_id) = attrs.get("localId") {
+                            media_attrs["localId"] =
+                                serde_json::Value::String(local_id.to_string());
+                        }
                         let mut ms_attrs = serde_json::json!({"layout": "center"});
                         if let Some(layout) = attrs.get("layout") {
                             ms_attrs["layout"] = serde_json::Value::String(layout.to_string());
@@ -909,6 +913,16 @@ impl<'a> MarkdownParser<'a> {
                         }
                         if let Some(mode) = attrs.get("mode") {
                             node_attrs["mode"] = serde_json::Value::String(mode.to_string());
+                        }
+                    }
+                    if let Some(local_id) = attrs.get("localId") {
+                        if let Some(ref mut content) = node.content {
+                            if let Some(media) = content.first_mut() {
+                                if let Some(ref mut media_attrs) = media.attrs {
+                                    media_attrs["localId"] =
+                                        serde_json::Value::String(local_id.to_string());
+                                }
+                            }
                         }
                     }
                     return Some(node);
@@ -2940,7 +2954,7 @@ fn render_media(
     node: &AdfNode,
     parent_attrs: Option<&serde_json::Value>,
     output: &mut String,
-    _opts: &RenderOptions,
+    opts: &RenderOptions,
 ) {
     if let Some(ref attrs) = node.attrs {
         let media_type = attrs
@@ -2968,6 +2982,7 @@ fn render_media(
             if let Some(width) = attrs.get("width").and_then(serde_json::Value::as_u64) {
                 parts.push(format!("width={width}"));
             }
+            maybe_push_local_id(attrs, &mut parts, opts);
             // Encode mediaSingle layout/width/widthType if non-default
             if let Some(p_attrs) = parent_attrs {
                 if let Some(layout) = p_attrs.get("layout").and_then(serde_json::Value::as_str) {
@@ -2994,18 +3009,13 @@ fn render_media(
                 .unwrap_or("");
             output.push_str(&format!("![{alt}]({url})"));
 
-            // Emit {layout=... width=... widthType=...} if parent has non-default attrs
-            if let Some(p_attrs) = parent_attrs {
-                let layout = p_attrs.get("layout").and_then(serde_json::Value::as_str);
-                let width = p_attrs.get("width").and_then(serde_json::Value::as_u64);
-                let width_type = p_attrs.get("widthType").and_then(serde_json::Value::as_str);
-                let mode = p_attrs.get("mode").and_then(serde_json::Value::as_str);
-                let has_non_default = layout.is_some_and(|l| l != "center")
-                    || width.is_some()
-                    || width_type.is_some()
-                    || mode.is_some();
-                if has_non_default {
-                    let mut parts = Vec::new();
+            // Emit {layout=... width=... widthType=... mode=... localId=...} if non-default attrs present
+            {
+                let mut parts = Vec::new();
+                if let Some(p_attrs) = parent_attrs {
+                    let layout = p_attrs.get("layout").and_then(serde_json::Value::as_str);
+                    let width = p_attrs.get("width").and_then(serde_json::Value::as_u64);
+                    let width_type = p_attrs.get("widthType").and_then(serde_json::Value::as_str);
                     if let Some(l) = layout {
                         if l != "center" {
                             parts.push(format!("layout={l}"));
@@ -3020,9 +3030,10 @@ fn render_media(
                     if let Some(mode) = p_attrs.get("mode").and_then(serde_json::Value::as_str) {
                         parts.push(format!("mode={mode}"));
                     }
-                    if !parts.is_empty() {
-                        output.push_str(&format!("{{{}}}", parts.join(" ")));
-                    }
+                }
+                maybe_push_local_id(attrs, &mut parts, opts);
+                if !parts.is_empty() {
+                    output.push_str(&format!("{{{}}}", parts.join(" ")));
                 }
             }
         }
@@ -7901,6 +7912,172 @@ mod tests {
         let ms = &doc2.content[0];
         let ms_attrs = ms.attrs.as_ref().unwrap();
         assert_eq!(ms_attrs["mode"], "default");
+    }
+
+    #[test]
+    fn file_media_hex_localid_roundtrip() {
+        // Issue #432: short hex localId (non-UUID) must survive round-trip
+        let adf_doc = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [{
+                "type": "mediaSingle",
+                "attrs": {"layout": "wide", "width": 1200, "widthType": "pixel"},
+                "content": [{
+                    "type": "media",
+                    "attrs": {
+                        "type": "file",
+                        "id": "eb7a9c3b-314e-4458-8200-4b22b67b122e",
+                        "collection": "contentId-123",
+                        "height": 484,
+                        "width": 915,
+                        "alt": "image.png",
+                        "localId": "0e79f58ac382"
+                    }
+                }]
+            }]
+        });
+        let doc: crate::atlassian::adf::AdfDocument = serde_json::from_value(adf_doc).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("localId=0e79f58ac382"),
+            "expected localId=0e79f58ac382 in markdown, got: {md}"
+        );
+        let doc2 = markdown_to_adf(&md).unwrap();
+        let ms = &doc2.content[0];
+        let media = &ms.content.as_ref().unwrap()[0];
+        let attrs = media.attrs.as_ref().unwrap();
+        assert_eq!(attrs["localId"], "0e79f58ac382");
+    }
+
+    #[test]
+    fn file_media_uuid_localid_roundtrip() {
+        // UUID-format localId must also survive round-trip
+        let adf_doc = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [{
+                "type": "mediaSingle",
+                "attrs": {"layout": "center"},
+                "content": [{
+                    "type": "media",
+                    "attrs": {
+                        "type": "file",
+                        "id": "abc-123",
+                        "collection": "contentId-456",
+                        "height": 100,
+                        "width": 200,
+                        "localId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                    }
+                }]
+            }]
+        });
+        let doc: crate::atlassian::adf::AdfDocument = serde_json::from_value(adf_doc).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("localId=a1b2c3d4-e5f6-7890-abcd-ef1234567890"),
+            "expected UUID localId in markdown, got: {md}"
+        );
+        let doc2 = markdown_to_adf(&md).unwrap();
+        let media = &doc2.content[0].content.as_ref().unwrap()[0];
+        let attrs = media.attrs.as_ref().unwrap();
+        assert_eq!(attrs["localId"], "a1b2c3d4-e5f6-7890-abcd-ef1234567890");
+    }
+
+    #[test]
+    fn file_media_null_uuid_localid_stripped() {
+        // Null UUID localId should be stripped (consistent with other node types)
+        let adf_doc = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [{
+                "type": "mediaSingle",
+                "attrs": {"layout": "center"},
+                "content": [{
+                    "type": "media",
+                    "attrs": {
+                        "type": "file",
+                        "id": "abc-123",
+                        "collection": "contentId-456",
+                        "height": 100,
+                        "width": 200,
+                        "localId": "00000000-0000-0000-0000-000000000000"
+                    }
+                }]
+            }]
+        });
+        let doc: crate::atlassian::adf::AdfDocument = serde_json::from_value(adf_doc).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            !md.contains("localId="),
+            "null UUID localId should be stripped, got: {md}"
+        );
+    }
+
+    #[test]
+    fn file_media_localid_stripped_when_option_set() {
+        // localId should be stripped when strip_local_ids option is enabled
+        let adf_doc = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [{
+                "type": "mediaSingle",
+                "attrs": {"layout": "center"},
+                "content": [{
+                    "type": "media",
+                    "attrs": {
+                        "type": "file",
+                        "id": "abc-123",
+                        "collection": "contentId-456",
+                        "height": 100,
+                        "width": 200,
+                        "localId": "0e79f58ac382"
+                    }
+                }]
+            }]
+        });
+        let doc: crate::atlassian::adf::AdfDocument = serde_json::from_value(adf_doc).unwrap();
+        let opts = RenderOptions {
+            strip_local_ids: true,
+            ..Default::default()
+        };
+        let md = adf_to_markdown_with_options(&doc, &opts).unwrap();
+        assert!(
+            !md.contains("localId="),
+            "localId should be stripped with strip_local_ids, got: {md}"
+        );
+    }
+
+    #[test]
+    fn external_media_localid_roundtrip() {
+        // localId on external media nodes must also survive round-trip
+        let adf_doc = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [{
+                "type": "mediaSingle",
+                "attrs": {"layout": "center"},
+                "content": [{
+                    "type": "media",
+                    "attrs": {
+                        "type": "external",
+                        "url": "https://example.com/image.png",
+                        "alt": "test",
+                        "localId": "deadbeef1234"
+                    }
+                }]
+            }]
+        });
+        let doc: crate::atlassian::adf::AdfDocument = serde_json::from_value(adf_doc).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("localId=deadbeef1234"),
+            "expected localId in markdown for external media, got: {md}"
+        );
+        let doc2 = markdown_to_adf(&md).unwrap();
+        let media = &doc2.content[0].content.as_ref().unwrap()[0];
+        let attrs = media.attrs.as_ref().unwrap();
+        assert_eq!(attrs["localId"], "deadbeef1234");
     }
 
     #[test]
