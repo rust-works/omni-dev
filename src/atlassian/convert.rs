@@ -134,10 +134,12 @@ impl<'a> MarkdownParser<'a> {
             return None;
         }
 
-        let text = trimmed[level + 1..].trim_start();
-        let inline_nodes = parse_inline(text);
-
+        let mut full_text = trimmed[level + 1..].trim_start().to_string();
         self.advance();
+        // Collect indented continuation lines produced by hardBreaks (issue #433).
+        self.collect_hardbreak_continuations(&mut full_text);
+        let inline_nodes = parse_inline(&full_text);
+
         #[allow(clippy::cast_possible_truncation)]
         Some(AdfNode::heading(level as u8, inline_nodes))
     }
@@ -2137,7 +2139,23 @@ fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) 
                 output.push('#');
             }
             output.push(' ');
-            render_inline_content(node, output, opts);
+            let mut buf = String::new();
+            render_inline_content(node, &mut buf, opts);
+            // Indent continuation lines produced by hardBreaks so they stay
+            // within the heading when re-parsed (issue #433).
+            let mut is_first_line = true;
+            for line in buf.split('\n') {
+                if is_first_line {
+                    output.push_str(line);
+                    is_first_line = false;
+                } else {
+                    output.push('\n');
+                    if !line.is_empty() {
+                        output.push_str("  ");
+                    }
+                    output.push_str(line);
+                }
+            }
             output.push('\n');
         }
         "codeBlock" => {
@@ -9785,6 +9803,148 @@ C
             assert_eq!(p[0].text.as_deref(), Some(expected.0));
             assert_eq!(p[2].text.as_deref(), Some(expected.1));
         }
+    }
+
+    #[test]
+    fn issue_433_heading_hardbreak_roundtrips() {
+        // Issue #433: hardBreak inside heading splits into heading + paragraph.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{
+          "type":"heading",
+          "attrs":{"level":1},
+          "content":[
+            {"type":"text","text":"Line one"},
+            {"type":"hardBreak"},
+            {"type":"text","text":"Line two"}
+          ]
+        }]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        assert_eq!(
+            rt.content.len(),
+            1,
+            "Should remain a single heading, got {} blocks",
+            rt.content.len()
+        );
+        assert_eq!(rt.content[0].node_type, "heading");
+        let inlines = rt.content[0].content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec!["text", "hardBreak", "text"],
+            "hardBreak should be preserved, got: {types:?}"
+        );
+        assert_eq!(inlines[0].text.as_deref(), Some("Line one"));
+        assert_eq!(inlines[2].text.as_deref(), Some("Line two"));
+    }
+
+    #[test]
+    fn issue_433_heading_hardbreak_jfm_indentation() {
+        // Verify the JFM output has properly indented continuation lines.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{
+          "type":"heading",
+          "attrs":{"level":2},
+          "content":[
+            {"type":"text","text":"Title"},
+            {"type":"hardBreak"},
+            {"type":"text","text":"Subtitle"}
+          ]
+        }]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("## Title\\\n  Subtitle"),
+            "Continuation should be indented, got:\n{md}"
+        );
+    }
+
+    #[test]
+    fn issue_433_heading_hardbreak_from_jfm() {
+        // Direct JFM → ADF: heading with hardBreak continuation.
+        let md = "# First\\\n  Second\n";
+        let doc = markdown_to_adf(md).unwrap();
+
+        assert_eq!(doc.content.len(), 1);
+        assert_eq!(doc.content[0].node_type, "heading");
+        let inlines = doc.content[0].content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types, vec!["text", "hardBreak", "text"]);
+        assert_eq!(inlines[0].text.as_deref(), Some("First"));
+        assert_eq!(inlines[2].text.as_deref(), Some("Second"));
+    }
+
+    #[test]
+    fn issue_433_heading_consecutive_hardbreaks_roundtrip() {
+        // Consecutive hardBreaks in a heading.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{
+          "type":"heading",
+          "attrs":{"level":3},
+          "content":[
+            {"type":"text","text":"A"},
+            {"type":"hardBreak"},
+            {"type":"hardBreak"},
+            {"type":"text","text":"B"}
+          ]
+        }]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        assert_eq!(rt.content.len(), 1, "Should remain a single heading");
+        assert_eq!(rt.content[0].node_type, "heading");
+        let inlines = rt.content[0].content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types, vec!["text", "hardBreak", "hardBreak", "text"]);
+    }
+
+    #[test]
+    fn issue_433_heading_with_strong_and_hardbreak_roundtrips() {
+        // Heading with strong-marked text + hardBreak + plain text.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{
+          "type":"heading",
+          "attrs":{"level":1},
+          "content":[
+            {"type":"text","text":"Bold title","marks":[{"type":"strong"}]},
+            {"type":"hardBreak"},
+            {"type":"text","text":"plain continuation"}
+          ]
+        }]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        assert_eq!(rt.content.len(), 1);
+        assert_eq!(rt.content[0].node_type, "heading");
+        let inlines = rt.content[0].content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types, vec!["text", "hardBreak", "text"]);
+        assert_eq!(inlines[0].text.as_deref(), Some("Bold title"));
+        assert_eq!(inlines[2].text.as_deref(), Some("plain continuation"));
+    }
+
+    #[test]
+    fn issue_433_heading_with_link_and_hardbreak_roundtrips() {
+        // Real-world pattern: heading with link + hardBreak + text.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{
+          "type":"heading",
+          "attrs":{"level":1},
+          "content":[
+            {"type":"text","text":"Click here","marks":[{"type":"link","attrs":{"href":"https://example.com"}}]},
+            {"type":"hardBreak"},
+            {"type":"text","text":"Subtitle text"}
+          ]
+        }]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        assert_eq!(rt.content.len(), 1);
+        assert_eq!(rt.content[0].node_type, "heading");
+        let inlines = rt.content[0].content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types, vec!["text", "hardBreak", "text"]);
+        assert_eq!(inlines[2].text.as_deref(), Some("Subtitle text"));
     }
 
     #[test]
