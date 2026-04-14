@@ -333,6 +333,42 @@ impl AdfNode {
         }
     }
 
+    /// Creates a table header cell node with attributes and marks.
+    #[must_use]
+    pub fn table_header_with_attrs_and_marks(
+        content: Vec<Self>,
+        attrs: Option<serde_json::Value>,
+        marks: Vec<AdfMark>,
+    ) -> Self {
+        Self {
+            node_type: "tableHeader".to_string(),
+            attrs,
+            content: Some(content),
+            text: None,
+            marks: if marks.is_empty() { None } else { Some(marks) },
+            local_id: None,
+            parameters: None,
+        }
+    }
+
+    /// Creates a table cell node with attributes and marks.
+    #[must_use]
+    pub fn table_cell_with_attrs_and_marks(
+        content: Vec<Self>,
+        attrs: Option<serde_json::Value>,
+        marks: Vec<AdfMark>,
+    ) -> Self {
+        Self {
+            node_type: "tableCell".to_string(),
+            attrs,
+            content: Some(content),
+            text: None,
+            marks: if marks.is_empty() { None } else { Some(marks) },
+            local_id: None,
+            parameters: None,
+        }
+    }
+
     /// Creates a caption node (used inside tables).
     #[must_use]
     pub fn caption(content: Vec<Self>) -> Self {
@@ -868,6 +904,15 @@ impl AdfMark {
             attrs: Some(attrs),
         }
     }
+
+    /// Creates a border mark for table cells/headers.
+    #[must_use]
+    pub fn border(color: &str, size: u32) -> Self {
+        Self {
+            mark_type: "border".to_string(),
+            attrs: Some(serde_json::json!({"color": color, "size": size})),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1385,5 +1430,58 @@ mod tests {
         assert_eq!(mark.mark_type, "breakout");
         assert_eq!(mark.attrs.as_ref().unwrap()["mode"], "wide");
         assert_eq!(mark.attrs.as_ref().unwrap()["width"], 1200);
+    }
+
+    #[test]
+    fn border_mark() {
+        let mark = AdfMark::border("#ff000033", 2);
+        assert_eq!(mark.mark_type, "border");
+        let attrs = mark.attrs.as_ref().unwrap();
+        assert_eq!(attrs["color"], "#ff000033");
+        assert_eq!(attrs["size"], 2);
+    }
+
+    #[test]
+    fn table_cell_with_attrs_and_marks_builder() {
+        let cell = AdfNode::table_cell_with_attrs_and_marks(
+            vec![AdfNode::paragraph(vec![])],
+            Some(serde_json::json!({"background": "#e6fcff"})),
+            vec![AdfMark::border("#ff0000", 1)],
+        );
+        assert_eq!(cell.node_type, "tableCell");
+        assert!(cell.marks.is_some());
+        assert_eq!(cell.marks.as_ref().unwrap()[0].mark_type, "border");
+    }
+
+    #[test]
+    fn table_header_with_attrs_and_marks_builder() {
+        let cell = AdfNode::table_header_with_attrs_and_marks(
+            vec![AdfNode::paragraph(vec![])],
+            None,
+            vec![AdfMark::border("#0000ff", 3)],
+        );
+        assert_eq!(cell.node_type, "tableHeader");
+        assert!(cell.marks.is_some());
+        assert_eq!(cell.marks.as_ref().unwrap()[0].mark_type, "border");
+    }
+
+    #[test]
+    fn table_cell_with_empty_marks_has_none() {
+        let cell = AdfNode::table_cell_with_attrs_and_marks(
+            vec![AdfNode::paragraph(vec![])],
+            None,
+            vec![],
+        );
+        assert!(cell.marks.is_none(), "empty marks vec should become None");
+    }
+
+    #[test]
+    fn border_mark_serde_roundtrip() {
+        let mark = AdfMark::border("#ff000033", 2);
+        let json = serde_json::to_string(&mark).unwrap();
+        let deserialized: AdfMark = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.mark_type, "border");
+        assert_eq!(deserialized.attrs.as_ref().unwrap()["color"], "#ff000033");
+        assert_eq!(deserialized.attrs.as_ref().unwrap()["size"], 2);
     }
 }
