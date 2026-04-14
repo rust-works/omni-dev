@@ -36,6 +36,10 @@ pub struct CreatePrCommand {
     /// Path to custom context directory (defaults to .omni-dev/).
     #[arg(long)]
     pub context_dir: Option<std::path::PathBuf>,
+
+    /// Skip pushing the branch to remote before creating the PR.
+    #[arg(long)]
+    pub no_push: bool,
 }
 
 /// PR action choices.
@@ -1024,26 +1028,32 @@ impl CreatePrCommand {
             println!("   🎯 Base: {base}");
         }
 
-        // Check if branch is pushed to remote and push if needed
-        debug!("Opening git repository to check branch status");
-        let git_repo =
-            crate::git::GitRepository::open().context("Failed to open git repository")?;
+        // Push branch to remote unless --no-push was specified
+        let push_action = if self.no_push {
+            determine_push_action(true, false)
+        } else {
+            debug!("Opening git repository to check branch status");
+            let git_repo =
+                crate::git::GitRepository::open().context("Failed to open git repository")?;
 
-        debug!(
-            "Checking if branch '{}' exists on remote 'origin'",
-            branch_name
-        );
-        if !git_repo.branch_exists_on_remote(branch_name, "origin")? {
-            println!("📤 Pushing branch to remote...");
             debug!(
-                "Branch '{}' not found on remote, attempting to push",
+                "Checking if branch '{}' exists on remote 'origin'",
                 branch_name
             );
+            let branch_on_remote = git_repo.branch_exists_on_remote(branch_name, "origin")?;
+            let action = determine_push_action(false, branch_on_remote);
+
+            debug!("Push action for branch '{}': {:?}", branch_name, action);
+            println!("📤 Pushing branch to remote...");
             git_repo
                 .push_branch(branch_name, "origin")
                 .context("Failed to push branch to remote")?;
-        } else {
-            debug!("Branch '{}' already exists on remote 'origin'", branch_name);
+
+            action
+        };
+
+        if push_action == PushAction::Skip {
+            debug!("Skipping push (--no-push flag set)");
         }
 
         // Create PR using gh CLI with explicit head branch
@@ -1246,6 +1256,28 @@ impl CreatePrCommand {
 }
 
 // --- Extracted pure functions ---
+
+/// Describes what push action should be taken before PR creation.
+#[derive(Debug, PartialEq)]
+enum PushAction {
+    /// Skip pushing entirely (user passed `--no-push`).
+    Skip,
+    /// Push to sync with an existing remote branch.
+    SyncExisting,
+    /// Push a new branch to remote.
+    PushNew,
+}
+
+/// Determines what push action to take based on the `--no-push` flag and remote branch state.
+fn determine_push_action(no_push: bool, branch_on_remote: bool) -> PushAction {
+    if no_push {
+        PushAction::Skip
+    } else if branch_on_remote {
+        PushAction::SyncExisting
+    } else {
+        PushAction::PushNew
+    }
+}
 
 /// Parses a boolean-like string value.
 ///
@@ -1460,5 +1492,23 @@ mod tests {
         let (icon, text) = format_draft_status(false);
         assert_eq!(text, "ready for review");
         assert!(!icon.is_empty());
+    }
+
+    // --- determine_push_action ---
+
+    #[test]
+    fn push_action_skip_when_no_push() {
+        assert_eq!(determine_push_action(true, false), PushAction::Skip);
+        assert_eq!(determine_push_action(true, true), PushAction::Skip);
+    }
+
+    #[test]
+    fn push_action_sync_existing_branch() {
+        assert_eq!(determine_push_action(false, true), PushAction::SyncExisting);
+    }
+
+    #[test]
+    fn push_action_push_new_branch() {
+        assert_eq!(determine_push_action(false, false), PushAction::PushNew);
     }
 }
