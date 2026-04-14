@@ -2107,8 +2107,14 @@ fn extract_trailing_local_id(text: &str) -> (&str, Option<String>, Option<String
     if !trimmed.ends_with('}') {
         return (text, None, None);
     }
-    // Find the opening brace
+    // Find the opening brace.  Only match a standalone `{…}` block that is
+    // preceded by whitespace (or is at the start of the string).  A `{` that
+    // immediately follows `]` is part of an inline directive (e.g.
+    // `:mention[text]{id=… localId=…}`) and must NOT be consumed here.
     if let Some(brace_pos) = trimmed.rfind('{') {
+        if brace_pos > 0 && !trimmed.as_bytes()[brace_pos - 1].is_ascii_whitespace() {
+            return (text, None, None);
+        }
         let attr_str = &trimmed[brace_pos..];
         if let Some((_, attrs)) = parse_attrs(attr_str, 0) {
             let local_id = attrs.get("localId").map(str::to_string);
@@ -11047,5 +11053,155 @@ C
         let md = adf_to_markdown(&doc).unwrap();
         // With no attrs, nothing is emitted for the placeholder
         assert!(!md.contains("placeholder"));
+    }
+
+    // Issue #446: mention in table+list loses id and misplaces localId
+    #[test]
+    fn mention_in_table_bullet_list_preserves_id_and_local_id() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"table","content":[{"type":"tableRow","content":[{"type":"tableCell","attrs":{"colspan":1,"colwidth":[200],"rowspan":1},"content":[{"type":"bulletList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"prefix text "},{"type":"mention","attrs":{"id":"aabbccdd11223344aabbccdd","localId":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","text":"@Alice Example"}},{"type":"text","text":" "}]}]}]}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        // Navigate: doc → table → tableRow → tableCell → bulletList → listItem → paragraph
+        let cell = &rt.content[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap()[0];
+        let list = &cell.content.as_ref().unwrap()[0];
+        let list_item = &list.content.as_ref().unwrap()[0];
+
+        // listItem must NOT have a localId attribute
+        assert!(
+            list_item
+                .attrs
+                .as_ref()
+                .and_then(|a| a.get("localId"))
+                .is_none(),
+            "localId should stay on the mention, not the listItem"
+        );
+
+        let para = &list_item.content.as_ref().unwrap()[0];
+        let inlines = para.content.as_ref().unwrap();
+
+        // Should have: text("prefix text "), mention, text(" ")
+        assert_eq!(inlines.len(), 3, "expected 3 inline nodes, got {inlines:?}");
+
+        assert_eq!(inlines[0].node_type, "text");
+        assert_eq!(inlines[0].text.as_deref(), Some("prefix text "));
+
+        assert_eq!(inlines[1].node_type, "mention");
+        let mention_attrs = inlines[1].attrs.as_ref().unwrap();
+        assert_eq!(
+            mention_attrs["id"], "aabbccdd11223344aabbccdd",
+            "mention id must be preserved"
+        );
+        assert_eq!(
+            mention_attrs["localId"], "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "mention localId must be preserved"
+        );
+        assert_eq!(mention_attrs["text"], "@Alice Example");
+
+        assert_eq!(inlines[2].node_type, "text");
+        assert_eq!(inlines[2].text.as_deref(), Some(" "));
+    }
+
+    #[test]
+    fn mention_in_bullet_list_preserves_id_and_local_id() {
+        // Same bug outside of a table context
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"mention","attrs":{"id":"user123","localId":"11111111-2222-3333-4444-555555555555","text":"@Bob"}},{"type":"text","text":" "}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let list_item = &rt.content[0].content.as_ref().unwrap()[0];
+        assert!(
+            list_item
+                .attrs
+                .as_ref()
+                .and_then(|a| a.get("localId"))
+                .is_none(),
+            "localId should stay on the mention, not the listItem"
+        );
+
+        let para = &list_item.content.as_ref().unwrap()[0];
+        let inlines = para.content.as_ref().unwrap();
+        assert_eq!(inlines[0].node_type, "mention");
+        let mention_attrs = inlines[0].attrs.as_ref().unwrap();
+        assert_eq!(mention_attrs["id"], "user123");
+        assert_eq!(
+            mention_attrs["localId"],
+            "11111111-2222-3333-4444-555555555555"
+        );
+    }
+
+    #[test]
+    fn mention_in_ordered_list_preserves_id_and_local_id() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"orderedList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"see "},{"type":"mention","attrs":{"id":"xyz","localId":"aaaa-bbbb","text":"@Carol"}}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let list_item = &rt.content[0].content.as_ref().unwrap()[0];
+        assert!(
+            list_item
+                .attrs
+                .as_ref()
+                .and_then(|a| a.get("localId"))
+                .is_none(),
+            "localId should stay on the mention, not the listItem"
+        );
+
+        let para = &list_item.content.as_ref().unwrap()[0];
+        let inlines = para.content.as_ref().unwrap();
+        assert_eq!(inlines[1].node_type, "mention");
+        let mention_attrs = inlines[1].attrs.as_ref().unwrap();
+        assert_eq!(mention_attrs["id"], "xyz");
+        assert_eq!(mention_attrs["localId"], "aaaa-bbbb");
+    }
+
+    #[test]
+    fn list_item_own_local_id_with_mention_both_preserved() {
+        // When a listItem has its own localId AND contains a mention with localId,
+        // both should be preserved independently.
+        let md = "- hello :mention[@Eve]{id=e1 localId=mention-lid} {localId=item-lid}\n";
+        let doc = markdown_to_adf(md).unwrap();
+        let list_item = &doc.content[0].content.as_ref().unwrap()[0];
+
+        // listItem should have its own localId
+        let item_attrs = list_item.attrs.as_ref().unwrap();
+        assert_eq!(item_attrs["localId"], "item-lid");
+
+        // mention should have its own localId
+        let para = &list_item.content.as_ref().unwrap()[0];
+        let inlines = para.content.as_ref().unwrap();
+        let mention = inlines.iter().find(|n| n.node_type == "mention").unwrap();
+        let mention_attrs = mention.attrs.as_ref().unwrap();
+        assert_eq!(mention_attrs["id"], "e1");
+        assert_eq!(mention_attrs["localId"], "mention-lid");
+    }
+
+    #[test]
+    fn extract_trailing_local_id_ignores_directive_attrs() {
+        // Directly test the helper: a line ending with a directive's {…}
+        // should NOT be treated as a trailing localId.
+        let line = "text :mention[@X]{id=abc localId=uuid}";
+        let (text, lid, plid) = extract_trailing_local_id(line);
+        assert_eq!(text, line, "text should be unchanged");
+        assert!(
+            lid.is_none(),
+            "should not extract localId from directive attrs"
+        );
+        assert!(plid.is_none());
+    }
+
+    #[test]
+    fn extract_trailing_local_id_matches_standalone_block() {
+        // A standalone trailing {localId=…} separated by whitespace should still work.
+        let line = "some text {localId=abc-123}";
+        let (text, lid, plid) = extract_trailing_local_id(line);
+        assert_eq!(text, "some text");
+        assert_eq!(lid.as_deref(), Some("abc-123"));
+        assert!(plid.is_none());
     }
 }
