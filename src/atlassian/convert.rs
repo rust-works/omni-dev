@@ -1157,6 +1157,22 @@ fn escape_emphasis_markers(text: &str) -> String {
     out
 }
 
+/// Escapes backtick characters in text that would otherwise be parsed as
+/// inline code spans (`` `…` ``).
+///
+/// Each backtick is prefixed with a backslash so that the JFM parser treats
+/// it as a literal character rather than an inline-code delimiter.
+fn escape_backticks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch == '`' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Escapes a leading list-marker pattern on a line so it is not
 /// re-parsed as a new list item.  `"2. text"` → `"2\. text"`,
 /// `"- text"` → `"\- text"`.
@@ -3444,7 +3460,7 @@ fn render_marked_text(text: &str, marks: &[AdfMark], output: &mut String) {
     if inner_em {
         inner.push('*');
     }
-    inner.push_str(&escape_emphasis_markers(text));
+    inner.push_str(&escape_backticks(&escape_emphasis_markers(text)));
     if inner_em {
         inner.push('*');
     }
@@ -4572,6 +4588,96 @@ mod tests {
         });
         assert!(strong_node.is_some(), "should have a strong-marked node");
         assert_eq!(strong_node.unwrap().text.as_deref(), Some("call **kwargs"));
+    }
+
+    #[test]
+    fn backtick_code_roundtrip() {
+        // The original reproducer from issue #453
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"Set `max_retries` to 3 in the config"}]}]}"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        let roundtripped = markdown_to_adf(&jfm).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1, "should round-trip as a single text node");
+        assert_eq!(
+            content[0].text.as_deref(),
+            Some("Set `max_retries` to 3 in the config")
+        );
+        assert!(content[0].marks.is_none());
+    }
+
+    #[test]
+    fn multiple_backtick_spans_roundtrip() {
+        // Multiple backtick-delimited spans in a single text node
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"Use `foo` and `bar` together"}]}]}"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        let roundtripped = markdown_to_adf(&jfm).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1, "should round-trip as a single text node");
+        assert_eq!(
+            content[0].text.as_deref(),
+            Some("Use `foo` and `bar` together")
+        );
+        assert!(content[0].marks.is_none());
+    }
+
+    #[test]
+    fn lone_backtick_roundtrip() {
+        // A single backtick that cannot form a code span should round-trip
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"Use a ` character"}]}]}"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        let roundtripped = markdown_to_adf(&jfm).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1, "should round-trip as a single text node");
+        assert_eq!(content[0].text.as_deref(), Some("Use a ` character"));
+        assert!(content[0].marks.is_none());
+    }
+
+    #[test]
+    fn backtick_with_code_mark_roundtrip() {
+        // Text that already has a code mark should preserve both the mark and content
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"max_retries","marks":[{"type":"code"}]}]}]}"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        assert_eq!(jfm.trim(), "`max_retries`");
+        let roundtripped = markdown_to_adf(&jfm).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        let code_node = content.iter().find(|n| {
+            n.marks
+                .as_ref()
+                .is_some_and(|m| m.iter().any(|mk| mk.mark_type == "code"))
+        });
+        assert!(code_node.is_some(), "should have a code-marked node");
+        assert_eq!(code_node.unwrap().text.as_deref(), Some("max_retries"));
+    }
+
+    #[test]
+    fn backtick_with_em_mark_roundtrip() {
+        // Backtick inside em-marked text should preserve both
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"use `cfg`","marks":[{"type":"em"}]}]}]}"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        let roundtripped = markdown_to_adf(&jfm).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        let em_node = content.iter().find(|n| {
+            n.marks
+                .as_ref()
+                .is_some_and(|m| m.iter().any(|mk| mk.mark_type == "em"))
+        });
+        assert!(em_node.is_some(), "should have an em-marked node");
+        assert_eq!(em_node.unwrap().text.as_deref(), Some("use `cfg`"));
+    }
+
+    #[test]
+    fn escape_backticks_unit() {
+        assert_eq!(escape_backticks("hello"), "hello");
+        assert_eq!(escape_backticks("`code`"), r"\`code\`");
+        assert_eq!(escape_backticks("no ticks"), "no ticks");
+        assert_eq!(escape_backticks("a ` b"), r"a \` b");
+        assert_eq!(escape_backticks(""), "");
+        assert_eq!(escape_backticks("`a` and `b`"), r"\`a\` and \`b\`");
     }
 
     #[test]
