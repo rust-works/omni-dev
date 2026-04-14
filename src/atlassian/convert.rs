@@ -9491,6 +9491,324 @@ C
         );
     }
 
+    // ---- Issue #388 tests ----
+
+    #[test]
+    fn issue_388_ordered_list_with_strong_hardbreak_roundtrips() {
+        // Issue #388: orderedList with 2 listItems, each containing
+        // strong-marked text + hardBreak + plain text.
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"orderedList","attrs":{"order":1},"content":[
+            {"type":"listItem","content":[
+              {"type":"paragraph","content":[
+                {"type":"text","text":"Bold heading","marks":[{"type":"strong"}]},
+                {"type":"hardBreak"},
+                {"type":"text","text":"Content after break"}
+              ]}
+            ]},
+            {"type":"listItem","content":[
+              {"type":"paragraph","content":[
+                {"type":"text","text":"Second item","marks":[{"type":"strong"}]},
+                {"type":"hardBreak"},
+                {"type":"text","text":"More content"}
+              ]}
+            ]}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        // Must remain a single orderedList
+        assert_eq!(
+            rt.content.len(),
+            1,
+            "Should be 1 block (orderedList), got {}",
+            rt.content.len()
+        );
+        assert_eq!(rt.content[0].node_type, "orderedList");
+        let items = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            items.len(),
+            2,
+            "Should have 2 listItems, got {}",
+            items.len()
+        );
+
+        // First item: text(strong) + hardBreak + text
+        let p1 = items[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap();
+        let types1: Vec<&str> = p1.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types1, vec!["text", "hardBreak", "text"]);
+        assert_eq!(p1[0].text.as_deref(), Some("Bold heading"));
+        assert_eq!(p1[2].text.as_deref(), Some("Content after break"));
+
+        // Second item: text(strong) + hardBreak + text
+        let p2 = items[1].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap();
+        let types2: Vec<&str> = p2.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types2, vec!["text", "hardBreak", "text"]);
+        assert_eq!(p2[0].text.as_deref(), Some("Second item"));
+        assert_eq!(p2[2].text.as_deref(), Some("More content"));
+    }
+
+    #[test]
+    fn issue_388_bullet_list_with_strong_hardbreak_roundtrips() {
+        // Bullet list variant of issue #388.
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"bulletList","content":[
+            {"type":"listItem","content":[
+              {"type":"paragraph","content":[
+                {"type":"text","text":"First","marks":[{"type":"strong"}]},
+                {"type":"hardBreak"},
+                {"type":"text","text":"details"}
+              ]}
+            ]},
+            {"type":"listItem","content":[
+              {"type":"paragraph","content":[
+                {"type":"text","text":"Second","marks":[{"type":"em"}]},
+                {"type":"hardBreak"},
+                {"type":"text","text":"more details"}
+              ]}
+            ]}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        assert_eq!(rt.content.len(), 1);
+        assert_eq!(rt.content[0].node_type, "bulletList");
+        let items = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 2);
+
+        let p1 = items[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap();
+        assert_eq!(p1[0].text.as_deref(), Some("First"));
+        assert_eq!(p1[2].text.as_deref(), Some("details"));
+
+        let p2 = items[1].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap();
+        assert_eq!(p2[0].text.as_deref(), Some("Second"));
+        assert_eq!(p2[2].text.as_deref(), Some("more details"));
+    }
+
+    #[test]
+    fn issue_388_ordered_list_hardbreak_jfm_indentation() {
+        // Verify the JFM output has properly indented continuation lines.
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"orderedList","attrs":{"order":1},"content":[
+            {"type":"listItem","content":[
+              {"type":"paragraph","content":[
+                {"type":"text","text":"heading","marks":[{"type":"strong"}]},
+                {"type":"hardBreak"},
+                {"type":"text","text":"body"}
+              ]}
+            ]}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("1. **heading**\\\n  body"),
+            "Continuation should be indented, got:\n{md}"
+        );
+    }
+
+    #[test]
+    fn issue_388_ordered_list_hardbreak_from_jfm() {
+        // Direct JFM → ADF: ordered list with hardBreak continuation.
+        let md = "1. **bold**\\\n  continued\n2. **also bold**\\\n  also continued\n";
+        let doc = markdown_to_adf(md).unwrap();
+
+        assert_eq!(doc.content.len(), 1);
+        assert_eq!(doc.content[0].node_type, "orderedList");
+        let items = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 2);
+
+        let p1 = items[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap();
+        let types1: Vec<&str> = p1.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types1, vec!["text", "hardBreak", "text"]);
+        assert_eq!(p1[0].text.as_deref(), Some("bold"));
+        assert_eq!(p1[2].text.as_deref(), Some("continued"));
+
+        let p2 = items[1].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap();
+        let types2: Vec<&str> = p2.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types2, vec!["text", "hardBreak", "text"]);
+    }
+
+    #[test]
+    fn issue_388_bullet_list_hardbreak_from_jfm() {
+        // Direct JFM → ADF: bullet list with hardBreak continuation.
+        let md = "- first\\\n  second\n- third\\\n  fourth\n";
+        let doc = markdown_to_adf(md).unwrap();
+
+        assert_eq!(doc.content.len(), 1);
+        assert_eq!(doc.content[0].node_type, "bulletList");
+        let items = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 2);
+
+        for (i, expected) in [("first", "second"), ("third", "fourth")]
+            .iter()
+            .enumerate()
+        {
+            let p = items[i].content.as_ref().unwrap()[0]
+                .content
+                .as_ref()
+                .unwrap();
+            let types: Vec<&str> = p.iter().map(|n| n.node_type.as_str()).collect();
+            assert_eq!(types, vec!["text", "hardBreak", "text"]);
+            assert_eq!(p[0].text.as_deref(), Some(expected.0));
+            assert_eq!(p[2].text.as_deref(), Some(expected.1));
+        }
+    }
+
+    #[test]
+    fn has_trailing_hard_break_backslash() {
+        assert!(has_trailing_hard_break("text\\"));
+        assert!(has_trailing_hard_break("**bold**\\"));
+    }
+
+    #[test]
+    fn has_trailing_hard_break_trailing_spaces() {
+        assert!(has_trailing_hard_break("text  "));
+        assert!(has_trailing_hard_break("word   "));
+    }
+
+    #[test]
+    fn has_trailing_hard_break_false() {
+        assert!(!has_trailing_hard_break("plain text"));
+        assert!(!has_trailing_hard_break("text "));
+        assert!(!has_trailing_hard_break(""));
+    }
+
+    #[test]
+    fn collect_hardbreak_continuations_collects_indented() {
+        // A line ending with `\` followed by 2-space-indented continuation.
+        // Only one line is collected because the result no longer ends with `\`.
+        let input = "first\\\n  second\n  third\n";
+        let mut parser = MarkdownParser::new(input);
+        parser.advance(); // skip first line
+        let mut text = "first\\".to_string();
+        parser.collect_hardbreak_continuations(&mut text);
+        assert_eq!(text, "first\\\nsecond");
+    }
+
+    #[test]
+    fn collect_hardbreak_continuations_stops_at_non_indented() {
+        let input = "first\\\nnot indented\n";
+        let mut parser = MarkdownParser::new(input);
+        parser.advance();
+        let mut text = "first\\".to_string();
+        parser.collect_hardbreak_continuations(&mut text);
+        // Should NOT collect the non-indented line
+        assert_eq!(text, "first\\");
+    }
+
+    #[test]
+    fn collect_hardbreak_continuations_no_trailing_break() {
+        // If the text doesn't end with a hardBreak marker, nothing is collected.
+        let input = "plain\n  indented\n";
+        let mut parser = MarkdownParser::new(input);
+        parser.advance();
+        let mut text = "plain".to_string();
+        parser.collect_hardbreak_continuations(&mut text);
+        assert_eq!(text, "plain");
+    }
+
+    #[test]
+    fn collect_hardbreak_continuations_chained() {
+        // Multiple continuation lines chained via repeated hardBreaks.
+        let input = "a\\\n  b\\\n  c\\\n  d\n";
+        let mut parser = MarkdownParser::new(input);
+        parser.advance();
+        let mut text = "a\\".to_string();
+        parser.collect_hardbreak_continuations(&mut text);
+        assert_eq!(text, "a\\\nb\\\nc\\\nd");
+    }
+
+    #[test]
+    fn ordered_list_with_sub_content_after_hardbreak() {
+        // Exercises the sub-content collection loop in parse_ordered_list
+        // (lines 339-347) with a hardBreak item that also has a nested list.
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"orderedList","attrs":{"order":1},"content":[
+            {"type":"listItem","content":[
+              {"type":"paragraph","content":[
+                {"type":"text","text":"parent"},
+                {"type":"hardBreak"},
+                {"type":"text","text":"continued"}
+              ]},
+              {"type":"bulletList","content":[
+                {"type":"listItem","content":[
+                  {"type":"paragraph","content":[
+                    {"type":"text","text":"child"}
+                  ]}
+                ]}
+              ]}
+            ]}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        assert_eq!(rt.content.len(), 1);
+        assert_eq!(rt.content[0].node_type, "orderedList");
+        let item_content = rt.content[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap();
+        // Paragraph with hardBreak
+        let p = item_content[0].content.as_ref().unwrap();
+        let types: Vec<&str> = p.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types, vec!["text", "hardBreak", "text"]);
+        assert_eq!(p[0].text.as_deref(), Some("parent"));
+        assert_eq!(p[2].text.as_deref(), Some("continued"));
+        // Nested bullet list
+        assert_eq!(item_content[1].node_type, "bulletList");
+    }
+
+    #[test]
+    fn render_list_item_content_no_content() {
+        // A listItem with content: None should produce no output.
+        let item = AdfNode {
+            node_type: "listItem".to_string(),
+            attrs: None,
+            content: None,
+            text: None,
+            marks: None,
+        };
+        let mut output = String::new();
+        let opts = RenderOptions::default();
+        render_list_item_content(&item, &mut output, &opts);
+        assert_eq!(output, "");
+    }
+
+    #[test]
+    fn render_list_item_content_empty_content() {
+        // A listItem with content: Some(vec![]) should produce no output.
+        let item = AdfNode::list_item(vec![]);
+        let mut output = String::new();
+        let opts = RenderOptions::default();
+        render_list_item_content(&item, &mut output, &opts);
+        assert_eq!(output, "");
+    }
+
     #[test]
     fn plus_bullet_paragraph_roundtrips() {
         // Paragraph starting with "+ " must round-trip without becoming
