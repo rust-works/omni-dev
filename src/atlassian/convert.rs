@@ -1392,7 +1392,17 @@ fn parse_inline(text: &str) -> Vec<AdfNode> {
                     plain_start = end;
                     continue;
                 }
-                chars.next();
+                // For underscores, skip the entire delimiter run so that
+                // individual `_` chars within a `__` or `___` run are not
+                // re-tried as separate emphasis openers (CommonMark treats
+                // consecutive underscores as a single delimiter run).
+                if ch == '_' {
+                    while chars.peek().is_some_and(|&(_, c)| c == '_') {
+                        chars.next();
+                    }
+                } else {
+                    chars.next();
+                }
             }
             '~' => {
                 if let Some((end, content)) = try_parse_strikethrough(text, i) {
@@ -1615,12 +1625,31 @@ fn prepend_mark(node: &mut AdfNode, mark: AdfMark) {
     }
 }
 
+/// Returns `true` when an underscore delimiter run of `len` bytes starting at
+/// byte position `delim_pos` in `text` is flanked by alphanumeric characters on
+/// **both** sides — meaning it sits inside a word and must NOT open or close an
+/// emphasis span per CommonMark.
+fn is_intraword_underscore(text: &str, delim_pos: usize, len: usize) -> bool {
+    let before = text[..delim_pos]
+        .chars()
+        .next_back()
+        .is_some_and(char::is_alphanumeric);
+    let after = text[delim_pos + len..]
+        .chars()
+        .next()
+        .is_some_and(char::is_alphanumeric);
+    before && after
+}
+
 /// Tries to parse ***bold+italic***, **bold**, *italic* (or underscore variants) starting at position `i`.
 /// Returns (end_position, inner_content, is_bold).
 ///
 /// The triple-delimiter case (`***` / `___`) is checked first so that `***text***` is parsed as
 /// bold wrapping italic content, rather than having the `**` branch consume the wrong closing
 /// delimiter and leave stray `*` characters in the text (see issue #401).
+///
+/// For underscore delimiters, intraword positions are rejected per CommonMark: a `_` flanked
+/// by alphanumeric characters on both sides must not open or close emphasis (see issue #438).
 fn try_parse_emphasis(text: &str, i: usize) -> Option<(usize, &str, bool)> {
     let rest = &text[i..];
 
@@ -1628,10 +1657,18 @@ fn try_parse_emphasis(text: &str, i: usize) -> Option<(usize, &str, bool)> {
     // Parse as bold wrapping italic: the inner content will be recursively parsed and pick up
     // the inner * / _ as an em mark.
     if rest.starts_with("***") || rest.starts_with("___") {
+        let is_underscore = rest.starts_with("___");
+        if is_underscore && is_intraword_underscore(text, i, 3) {
+            return None;
+        }
         let triple = &rest[..3];
         let after = &rest[3..];
         if let Some(close) = after.find(triple) {
             if close > 0 {
+                let close_pos = i + 3 + close;
+                if is_underscore && is_intraword_underscore(text, close_pos, 3) {
+                    return None;
+                }
                 // Return a slice that includes the inner italic delimiters from the
                 // original text: for `***text***`, return `*text*`.  The recursive
                 // parse_inline call will then pick up the inner `*…*` as an em mark.
@@ -1644,10 +1681,18 @@ fn try_parse_emphasis(text: &str, i: usize) -> Option<(usize, &str, bool)> {
 
     // Bold: ** or __
     if rest.starts_with("**") || rest.starts_with("__") {
+        let is_underscore = rest.starts_with("__");
+        if is_underscore && is_intraword_underscore(text, i, 2) {
+            return None;
+        }
         let delimiter = &rest[..2];
         let after = &rest[2..];
         let close = after.find(delimiter)?;
         if close == 0 {
+            return None;
+        }
+        let close_pos = i + 2 + close;
+        if is_underscore && is_intraword_underscore(text, close_pos, 2) {
             return None;
         }
         let content = &after[..close];
@@ -1658,9 +1703,17 @@ fn try_parse_emphasis(text: &str, i: usize) -> Option<(usize, &str, bool)> {
     // Italic: * or _
     if rest.starts_with('*') || rest.starts_with('_') {
         let delim_char = rest.as_bytes()[0];
+        let is_underscore = delim_char == b'_';
+        if is_underscore && is_intraword_underscore(text, i, 1) {
+            return None;
+        }
         let after = &rest[1..];
         let close = after.find(delim_char as char)?;
         if close == 0 {
+            return None;
+        }
+        let close_pos = i + 1 + close;
+        if is_underscore && is_intraword_underscore(text, close_pos, 1) {
             return None;
         }
         let content = &after[..close];
@@ -4126,6 +4179,154 @@ mod tests {
         assert_eq!(italic_node.text.as_deref(), Some("italic"));
         let marks = italic_node.marks.as_ref().unwrap();
         assert_eq!(marks[0].mark_type, "em");
+    }
+
+    #[test]
+    fn intraword_underscore_not_emphasis() {
+        // Single intraword underscore pair: do_something_useful
+        let doc = markdown_to_adf("call do_something_useful now").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1, "should be a single text node");
+        assert_eq!(
+            content[0].text.as_deref(),
+            Some("call do_something_useful now")
+        );
+        assert!(content[0].marks.is_none());
+    }
+
+    #[test]
+    fn intraword_underscore_multiple() {
+        // Multiple intraword underscores: a_b_c_d
+        let doc = markdown_to_adf("use a_b_c_d here").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].text.as_deref(), Some("use a_b_c_d here"));
+        assert!(content[0].marks.is_none());
+    }
+
+    #[test]
+    fn intraword_double_underscore_not_bold() {
+        // Intraword double underscores: foo__bar__baz
+        let doc = markdown_to_adf("foo__bar__baz").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].text.as_deref(), Some("foo__bar__baz"));
+        assert!(content[0].marks.is_none());
+    }
+
+    #[test]
+    fn intraword_triple_underscore_not_bold_italic() {
+        // Intraword triple underscores: x___y___z
+        let doc = markdown_to_adf("x___y___z").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].text.as_deref(), Some("x___y___z"));
+        assert!(content[0].marks.is_none());
+    }
+
+    #[test]
+    fn underscore_emphasis_still_works_with_spaces() {
+        // Normal emphasis with spaces around delimiters should still work
+        let doc = markdown_to_adf("some _italic_ here").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[1].text.as_deref(), Some("italic"));
+        let marks = content[1].marks.as_ref().unwrap();
+        assert_eq!(marks[0].mark_type, "em");
+    }
+
+    #[test]
+    fn underscore_bold_still_works_with_spaces() {
+        // Normal bold with spaces around delimiters should still work
+        let doc = markdown_to_adf("some __bold__ here").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[1].text.as_deref(), Some("bold"));
+        let marks = content[1].marks.as_ref().unwrap();
+        assert_eq!(marks[0].mark_type, "strong");
+    }
+
+    #[test]
+    fn intraword_underscore_closing_only() {
+        // Opening _ is valid (preceded by space) but closing _ is intraword: _foo_bar
+        let doc = markdown_to_adf("_foo_bar").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].text.as_deref(), Some("_foo_bar"));
+    }
+
+    #[test]
+    fn intraword_double_underscore_closing_only() {
+        // Opening __ is valid (at start) but closing __ is intraword: __foo__bar
+        let doc = markdown_to_adf("__foo__bar").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].text.as_deref(), Some("__foo__bar"));
+    }
+
+    #[test]
+    fn intraword_triple_underscore_closing_only() {
+        // Opening ___ is valid (at start) but closing ___ is intraword: ___foo___bar
+        let doc = markdown_to_adf("___foo___bar").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].text.as_deref(), Some("___foo___bar"));
+    }
+
+    #[test]
+    fn asterisk_emphasis_unaffected_by_intraword_fix() {
+        // Asterisks should still work for intraword emphasis (CommonMark allows this)
+        let doc = markdown_to_adf("foo*bar*baz").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        // Asterisks CAN be intraword emphasis per CommonMark
+        assert!(content.len() > 1 || content[0].marks.is_some());
+    }
+
+    #[test]
+    fn intraword_underscore_at_start_of_text() {
+        // Underscore at start of text is not intraword (no preceding alphanumeric)
+        let doc = markdown_to_adf("_italic_ word").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(content[0].text.as_deref(), Some("italic"));
+        let marks = content[0].marks.as_ref().unwrap();
+        assert_eq!(marks[0].mark_type, "em");
+    }
+
+    #[test]
+    fn intraword_underscore_at_end_of_text() {
+        // Underscore at end of text is not intraword (no following alphanumeric)
+        let doc = markdown_to_adf("word _italic_").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        let last = content.last().unwrap();
+        assert_eq!(last.text.as_deref(), Some("italic"));
+        let marks = last.marks.as_ref().unwrap();
+        assert_eq!(marks[0].mark_type, "em");
+    }
+
+    #[test]
+    fn intraword_underscore_opening_only() {
+        // Opening underscore is intraword but closing is not: a_b c_d
+        // The first _ is intraword (a_b), so it shouldn't open emphasis
+        let doc = markdown_to_adf("a_b c_d").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].text.as_deref(), Some("a_b c_d"));
+    }
+
+    #[test]
+    fn intraword_underscore_roundtrip() {
+        // The original reproducer from issue #438
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"call the do_something_useful function"}]}]}"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        let roundtripped = markdown_to_adf(&jfm).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1, "should round-trip as a single text node");
+        assert_eq!(
+            content[0].text.as_deref(),
+            Some("call the do_something_useful function")
+        );
+        assert!(content[0].marks.is_none());
     }
 
     #[test]
