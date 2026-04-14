@@ -337,7 +337,7 @@ impl<'a> MarkdownParser<'a> {
             let trimmed = line.trim_start();
 
             if let Some((_, rest)) = parse_ordered_list_marker(trimmed) {
-                let first_line = rest.trim_start();
+                let first_line = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
                 self.advance();
                 let mut full_text = first_line.to_string();
                 self.collect_hardbreak_continuations(&mut full_text);
@@ -2179,7 +2179,8 @@ fn extract_trailing_local_id(text: &str) -> (&str, Option<String>, Option<String
             let local_id = attrs.get("localId").map(str::to_string);
             let para_local_id = attrs.get("paraLocalId").map(str::to_string);
             if local_id.is_some() || para_local_id.is_some() {
-                let before = trimmed[..brace_pos].trim_end();
+                let before =
+                    trimmed[..brace_pos].trim_end_matches(|c: char| c.is_ascii_whitespace());
                 return (before, local_id, para_local_id);
             }
         }
@@ -8828,6 +8829,97 @@ mod tests {
         let content = doc.content[0].content.as_ref().unwrap();
         assert!(!content.is_empty(), "should have inline content");
         assert_eq!(content[0].text.as_deref().unwrap(), "\u{00a0}");
+    }
+
+    #[test]
+    fn nbsp_paragraph_in_list_item_with_nested_list() {
+        // Issue #448: NBSP paragraph content lost inside listItem with nested bulletList
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"\u00a0"}]},{"type":"bulletList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"sub item one"}]}]}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let list = &rt.content[0];
+        assert_eq!(list.node_type, "bulletList");
+        let item = &list.content.as_ref().unwrap()[0];
+        let item_content = item.content.as_ref().unwrap();
+        assert_eq!(
+            item_content.len(),
+            2,
+            "listItem should have paragraph + nested list, got: {item_content:?}"
+        );
+        let para = &item_content[0];
+        assert_eq!(para.node_type, "paragraph");
+        let para_content = para
+            .content
+            .as_ref()
+            .expect("paragraph should have content");
+        assert!(
+            !para_content.is_empty(),
+            "NBSP paragraph content should not be empty"
+        );
+        assert_eq!(
+            para_content[0].text.as_deref().unwrap(),
+            "\u{00a0}",
+            "NBSP should survive round-trip inside listItem"
+        );
+    }
+
+    #[test]
+    fn nbsp_paragraph_in_list_item_with_local_ids() {
+        // Issue #448: NBSP paragraph with localIds inside listItem with nested list
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[{"type":"listItem","attrs":{"localId":"li-001"},"content":[{"type":"paragraph","attrs":{"localId":"p-001"},"content":[{"type":"text","text":"\u00a0"}]},{"type":"bulletList","content":[{"type":"listItem","attrs":{"localId":"li-002"},"content":[{"type":"paragraph","attrs":{"localId":"p-002"},"content":[{"type":"text","text":"sub item"}]}]}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let list = &rt.content[0];
+        let item = &list.content.as_ref().unwrap()[0];
+        // Check listItem localId
+        assert_eq!(
+            item.attrs.as_ref().unwrap()["localId"],
+            "li-001",
+            "listItem localId should survive"
+        );
+        let item_content = item.content.as_ref().unwrap();
+        assert_eq!(item_content.len(), 2);
+        // Check paragraph localId and NBSP content
+        let para = &item_content[0];
+        assert_eq!(
+            para.attrs.as_ref().unwrap()["localId"],
+            "p-001",
+            "paragraph localId should survive"
+        );
+        let text = para.content.as_ref().unwrap()[0].text.as_deref().unwrap();
+        assert_eq!(text, "\u{00a0}", "NBSP should survive with localIds");
+    }
+
+    #[test]
+    fn nbsp_paragraph_in_list_item_without_nested_list() {
+        // NBSP paragraph in a simple listItem (no nested list)
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[{"type":"listItem","attrs":{"localId":"li-001"},"content":[{"type":"paragraph","attrs":{"localId":"p-001"},"content":[{"type":"text","text":"\u00a0"}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let list = &rt.content[0];
+        let item = &list.content.as_ref().unwrap()[0];
+        let para = &item.content.as_ref().unwrap()[0];
+        let text = para.content.as_ref().unwrap()[0].text.as_deref().unwrap();
+        assert_eq!(text, "\u{00a0}", "NBSP should survive in simple list item");
+    }
+
+    #[test]
+    fn nbsp_paragraph_in_ordered_list_item_with_nested_list() {
+        // NBSP paragraph in ordered listItem with nested bulletList
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"orderedList","content":[{"type":"listItem","attrs":{"localId":"li-001"},"content":[{"type":"paragraph","attrs":{"localId":"p-001"},"content":[{"type":"text","text":"\u00a0"}]},{"type":"bulletList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"sub item"}]}]}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let list = &rt.content[0];
+        let item = &list.content.as_ref().unwrap()[0];
+        let item_content = item.content.as_ref().unwrap();
+        assert_eq!(item_content.len(), 2);
+        let para = &item_content[0];
+        let text = para.content.as_ref().unwrap()[0].text.as_deref().unwrap();
+        assert_eq!(text, "\u{00a0}", "NBSP should survive in ordered list item");
     }
 
     #[test]
