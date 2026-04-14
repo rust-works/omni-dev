@@ -2215,7 +2215,7 @@ fn maybe_push_local_id(attrs: &serde_json::Value, parts: &mut Vec<String>, opts:
         return;
     }
     if let Some(local_id) = attrs.get("localId").and_then(serde_json::Value::as_str) {
-        if local_id != "00000000-0000-0000-0000-000000000000" {
+        if !local_id.is_empty() && local_id != "00000000-0000-0000-0000-000000000000" {
             parts.push(format!("localId={local_id}"));
         }
     }
@@ -2664,9 +2664,16 @@ fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) 
 /// and, if so, render *all* leading inline children on the first line.
 fn render_list_item_content(item: &AdfNode, output: &mut String, opts: &RenderOptions) {
     let Some(ref content) = item.content else {
+        // Still emit localId and newline for items with no content (e.g. empty taskItem).
+        let bare = AdfNode::text("");
+        emit_list_item_local_ids(item, &bare, output, opts);
+        output.push('\n');
         return;
     };
     if content.is_empty() {
+        let bare = AdfNode::text("");
+        emit_list_item_local_ids(item, &bare, output, opts);
+        output.push('\n');
         return;
     }
     let first = &content[0];
@@ -2756,7 +2763,7 @@ fn emit_list_item_local_ids(
     }
     if let Some(ref attrs) = paragraph.attrs {
         if let Some(local_id) = attrs.get("localId").and_then(serde_json::Value::as_str) {
-            if local_id != "00000000-0000-0000-0000-000000000000" {
+            if !local_id.is_empty() && local_id != "00000000-0000-0000-0000-000000000000" {
                 parts.push(format!("paraLocalId={local_id}"));
             }
         }
@@ -6709,6 +6716,111 @@ mod tests {
         let rt = markdown_to_adf(&md).unwrap();
         let item = &rt.content[0].content.as_ref().unwrap()[0];
         assert_eq!(item.attrs.as_ref().unwrap()["localId"], "ti-001");
+    }
+
+    /// Issue #447: taskList with empty-string localId and taskItems with
+    /// short numeric localIds must survive a full round-trip.
+    #[test]
+    fn task_list_short_localid_roundtrip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"taskList","attrs":{"localId":""},"content":[{"type":"taskItem","attrs":{"localId":"42","state":"TODO"}},{"type":"taskItem","attrs":{"localId":"99","state":"DONE"},"content":[{"type":"text","text":"done task"}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        // Both taskItem localIds should appear in the markdown
+        assert!(md.contains("localId=42"), "localId=42 missing: {md}");
+        assert!(md.contains("localId=99"), "localId=99 missing: {md}");
+        // Empty-string localId should NOT appear as {localId=}
+        assert!(
+            !md.contains("localId=}"),
+            "empty localId should not be emitted: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let task_list = &rt.content[0];
+        assert_eq!(task_list.node_type, "taskList");
+        // No spurious extra nodes from {localId=}
+        assert_eq!(rt.content.len(), 1, "should be exactly one top-level node");
+        let items = task_list.content.as_ref().unwrap();
+        assert_eq!(items.len(), 2);
+        // First taskItem: localId=42, state=TODO, no content
+        assert_eq!(items[0].attrs.as_ref().unwrap()["localId"], "42");
+        assert_eq!(items[0].attrs.as_ref().unwrap()["state"], "TODO");
+        assert!(
+            items[0].content.is_none(),
+            "empty taskItem should have no content: {:?}",
+            items[0].content
+        );
+        // Second taskItem: localId=99, state=DONE, content with text
+        assert_eq!(items[1].attrs.as_ref().unwrap()["localId"], "99");
+        assert_eq!(items[1].attrs.as_ref().unwrap()["state"], "DONE");
+        let content = items[1].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].text.as_deref(), Some("done task"));
+    }
+
+    /// Issue #447: regression — taskList with empty localId must not inject
+    /// a spurious paragraph.
+    #[test]
+    fn task_list_empty_localid_no_spurious_paragraph() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"taskList","attrs":{"localId":""},"content":[{"type":"taskItem","attrs":{"localId":"tsk-1","state":"DONE"},"content":[{"type":"text","text":"completed item"}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            !md.contains("{localId=}"),
+            "empty localId should not be emitted: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        assert_eq!(
+            rt.content.len(),
+            1,
+            "no spurious paragraph: {:#?}",
+            rt.content
+        );
+        assert_eq!(rt.content[0].node_type, "taskList");
+    }
+
+    /// Issue #447: taskList localId should be stripped when strip_local_ids is set.
+    #[test]
+    fn task_list_localid_stripped() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"taskList","attrs":{"localId":"tl-001"},"content":[{"type":"taskItem","attrs":{"localId":"ti-001","state":"TODO"},"content":[{"type":"paragraph","content":[{"type":"text","text":"task"}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let opts = RenderOptions {
+            strip_local_ids: true,
+        };
+        let md = adf_to_markdown_with_options(&doc, &opts).unwrap();
+        assert!(!md.contains("localId"), "localId should be stripped: {md}");
+    }
+
+    /// Issue #447: taskItem with no content still emits localId.
+    #[test]
+    fn task_item_no_content_emits_localid() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"taskList","attrs":{"localId":"00000000-0000-0000-0000-000000000000"},"content":[{"type":"taskItem","attrs":{"localId":"abc","state":"TODO"}}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("localId=abc"),
+            "localId should be emitted even without content: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let item = &rt.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(item.attrs.as_ref().unwrap()["localId"], "abc");
+        assert!(item.content.is_none(), "should have no content");
+    }
+
+    /// Issue #447: taskList localId roundtrips through block attrs.
+    #[test]
+    fn task_list_localid_roundtrip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"taskList","attrs":{"localId":"tl-xyz"},"content":[{"type":"taskItem","attrs":{"localId":"ti-001","state":"TODO"},"content":[{"type":"paragraph","content":[{"type":"text","text":"task"}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("localId=tl-xyz"),
+            "taskList localId missing: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        assert_eq!(
+            rt.content[0].attrs.as_ref().unwrap()["localId"],
+            "tl-xyz",
+            "taskList localId should survive round-trip"
+        );
     }
 
     #[test]
@@ -10919,7 +11031,7 @@ C
 
     #[test]
     fn render_list_item_content_no_content() {
-        // A listItem with content: None should produce no output.
+        // A listItem with content: None should produce just a newline.
         let item = AdfNode {
             node_type: "listItem".to_string(),
             attrs: None,
@@ -10930,17 +11042,17 @@ C
         let mut output = String::new();
         let opts = RenderOptions::default();
         render_list_item_content(&item, &mut output, &opts);
-        assert_eq!(output, "");
+        assert_eq!(output, "\n");
     }
 
     #[test]
     fn render_list_item_content_empty_content() {
-        // A listItem with content: Some(vec![]) should produce no output.
+        // A listItem with content: Some(vec![]) should produce just a newline.
         let item = AdfNode::list_item(vec![]);
         let mut output = String::new();
         let opts = RenderOptions::default();
         render_list_item_content(&item, &mut output, &opts);
-        assert_eq!(output, "");
+        assert_eq!(output, "\n");
     }
 
     #[test]
