@@ -12,17 +12,35 @@ pub struct Attrs {
     pub map: BTreeMap<String, String>,
     /// Boolean flags without values (e.g., `underline`, `numbered`).
     pub flags: Vec<String>,
+    /// Keys that appear more than once (e.g., multiple `annotation-id` values).
+    pub(crate) multi: BTreeMap<String, Vec<String>>,
 }
 
 impl Attrs {
     /// Returns true if there are no attributes or flags.
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty() && self.flags.is_empty()
+        self.map.is_empty() && self.multi.is_empty() && self.flags.is_empty()
     }
 
-    /// Gets a value by key.
+    /// Gets a single value by key (first occurrence for multi-valued keys).
     pub fn get(&self, key: &str) -> Option<&str> {
-        self.map.get(key).map(String::as_str)
+        self.map.get(key).map(String::as_str).or_else(|| {
+            self.multi
+                .get(key)
+                .and_then(|v| v.first())
+                .map(String::as_str)
+        })
+    }
+
+    /// Returns all values for a key that may appear more than once.
+    pub fn get_all(&self, key: &str) -> Vec<&str> {
+        if let Some(values) = self.multi.get(key) {
+            values.iter().map(String::as_str).collect()
+        } else if let Some(value) = self.map.get(key) {
+            vec![value.as_str()]
+        } else {
+            vec![]
+        }
     }
 
     /// Returns true if the given flag is present.
@@ -34,17 +52,26 @@ impl Attrs {
     pub fn render(&self) -> String {
         let mut parts = Vec::new();
         for (k, v) in &self.map {
-            if v.contains(' ') || v.contains('"') {
-                let escaped = v.replace('"', "\\\"");
-                parts.push(format!("{k}=\"{escaped}\""));
-            } else {
-                parts.push(format!("{k}={v}"));
+            Self::push_kv(&mut parts, k, v);
+        }
+        for (k, values) in &self.multi {
+            for v in values {
+                Self::push_kv(&mut parts, k, v);
             }
         }
         for f in &self.flags {
             parts.push(f.clone());
         }
         format!("{{{}}}", parts.join(" "))
+    }
+
+    fn push_kv(parts: &mut Vec<String>, k: &str, v: &str) {
+        if v.contains(' ') || v.contains('"') {
+            let escaped = v.replace('"', "\\\"");
+            parts.push(format!("{k}=\"{escaped}\""));
+        } else {
+            parts.push(format!("{k}={v}"));
+        }
     }
 }
 
@@ -124,7 +151,19 @@ fn parse_inner(inner: &str) -> Option<Attrs> {
             // Key-value pair (no trim after '=' so empty values like key= are detected)
             rest = &rest[1..];
             let (value, remaining) = parse_value(rest)?;
-            attrs.map.insert(key.to_string(), value);
+            if let Some(existing) = attrs.map.remove(key) {
+                // Key already seen once — promote to multi-valued.
+                attrs
+                    .multi
+                    .entry(key.to_string())
+                    .or_default()
+                    .extend([existing, value]);
+            } else if let Some(values) = attrs.multi.get_mut(key) {
+                // Key already multi-valued — append.
+                values.push(value);
+            } else {
+                attrs.map.insert(key.to_string(), value);
+            }
             rest = remaining.trim_start();
         } else {
             // Boolean flag
@@ -303,5 +342,57 @@ mod tests {
         assert_eq!(end, 11);
         assert_eq!(attrs.get("type"), Some("info"));
         assert_eq!(&text[end..], " and more text");
+    }
+
+    #[test]
+    fn duplicate_keys_parsed_as_multi() {
+        // Issue #439: duplicate keys should all be preserved
+        let input = r#"{annotation-id="id1" annotation-type=inlineComment annotation-id="id2" annotation-type=inlineComment}"#;
+        let (_, attrs) = parse_attrs(input, 0).unwrap();
+        let ids = attrs.get_all("annotation-id");
+        assert_eq!(ids, vec!["id1", "id2"]);
+        let types = attrs.get_all("annotation-type");
+        assert_eq!(types, vec!["inlineComment", "inlineComment"]);
+    }
+
+    #[test]
+    fn duplicate_keys_get_returns_first() {
+        let input = "{k=\"first\" k=\"second\"}";
+        let (_, attrs) = parse_attrs(input, 0).unwrap();
+        assert_eq!(attrs.get("k"), Some("first"));
+        assert_eq!(attrs.get_all("k"), vec!["first", "second"]);
+    }
+
+    #[test]
+    fn three_duplicate_keys() {
+        let input = "{x=a x=b x=c}";
+        let (_, attrs) = parse_attrs(input, 0).unwrap();
+        assert_eq!(attrs.get_all("x"), vec!["a", "b", "c"]);
+        assert_eq!(attrs.get("x"), Some("a"));
+    }
+
+    #[test]
+    fn duplicate_keys_render_round_trip() {
+        let input = r#"{annotation-id="id1" annotation-type=inlineComment annotation-id="id2" annotation-type=inlineComment}"#;
+        let (_, original) = parse_attrs(input, 0).unwrap();
+        let rendered = original.render();
+        let (_, reparsed) = parse_attrs(&rendered, 0).unwrap();
+        assert_eq!(original, reparsed);
+    }
+
+    #[test]
+    fn get_all_single_value() {
+        let (_, attrs) = parse_attrs("{type=info}", 0).unwrap();
+        assert_eq!(attrs.get_all("type"), vec!["info"]);
+        assert!(attrs.get_all("missing").is_empty());
+    }
+
+    #[test]
+    fn mixed_single_and_duplicate_keys() {
+        let input = "{underline a=1 a=2 b=3}";
+        let (_, attrs) = parse_attrs(input, 0).unwrap();
+        assert!(attrs.has_flag("underline"));
+        assert_eq!(attrs.get_all("a"), vec!["1", "2"]);
+        assert_eq!(attrs.get("b"), Some("3"));
     }
 }
