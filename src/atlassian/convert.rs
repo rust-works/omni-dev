@@ -411,7 +411,10 @@ impl<'a> MarkdownParser<'a> {
             }
         }
         if let Some(mode) = attrs.get("breakout") {
-            marks.push(AdfMark::breakout(mode));
+            let width = attrs
+                .get("breakoutWidth")
+                .and_then(|w| w.parse::<u32>().ok());
+            marks.push(AdfMark::breakout(mode, width));
         }
 
         // Parse localId from block attrs
@@ -1070,6 +1073,7 @@ fn is_block_attrs_line(line: &str) -> bool {
         attrs.get("align").is_some()
             || attrs.get("indent").is_some()
             || attrs.get("breakout").is_some()
+            || attrs.get("breakoutWidth").is_some()
             || attrs.get("localId").is_some()
     } else {
         false
@@ -2547,6 +2551,14 @@ fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) 
                         .and_then(serde_json::Value::as_str)
                     {
                         parts.push(format!("breakout={mode}"));
+                    }
+                    if let Some(width) = mark
+                        .attrs
+                        .as_ref()
+                        .and_then(|a| a.get("width"))
+                        .and_then(serde_json::Value::as_u64)
+                    {
+                        parts.push(format!("breakoutWidth={width}"));
                     }
                 }
                 _ => {}
@@ -5343,12 +5355,23 @@ mod tests {
         let marks = doc.content[0].marks.as_ref().unwrap();
         assert_eq!(marks[0].mark_type, "breakout");
         assert_eq!(marks[0].attrs.as_ref().unwrap()["mode"], "wide");
+        assert!(marks[0].attrs.as_ref().unwrap().get("width").is_none());
+    }
+
+    #[test]
+    fn code_block_breakout_with_width() {
+        let md = "```python\ndef f(): pass\n```\n{breakout=wide breakoutWidth=1200}";
+        let doc = markdown_to_adf(md).unwrap();
+        let marks = doc.content[0].marks.as_ref().unwrap();
+        assert_eq!(marks[0].mark_type, "breakout");
+        assert_eq!(marks[0].attrs.as_ref().unwrap()["mode"], "wide");
+        assert_eq!(marks[0].attrs.as_ref().unwrap()["width"], 1200);
     }
 
     #[test]
     fn adf_breakout_to_markdown() {
         let mut node = AdfNode::code_block(Some("python"), "pass");
-        node.marks = Some(vec![AdfMark::breakout("wide")]);
+        node.marks = Some(vec![AdfMark::breakout("wide", None)]);
         let doc = AdfDocument {
             version: 1,
             doc_type: "doc".to_string(),
@@ -5356,6 +5379,40 @@ mod tests {
         };
         let md = adf_to_markdown(&doc).unwrap();
         assert!(md.contains("{breakout=wide}"));
+        assert!(!md.contains("breakoutWidth"));
+    }
+
+    #[test]
+    fn adf_breakout_with_width_to_markdown() {
+        let mut node = AdfNode::code_block(Some("python"), "pass");
+        node.marks = Some(vec![AdfMark::breakout("wide", Some(1200))]);
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![node],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("breakout=wide"));
+        assert!(md.contains("breakoutWidth=1200"));
+    }
+
+    #[test]
+    fn breakout_width_round_trip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{
+            "type":"codeBlock",
+            "attrs":{"language":"text"},
+            "marks":[{"type":"breakout","attrs":{"mode":"wide","width":1200}}],
+            "content":[{"type":"text","text":"some code"}]
+        }]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("breakout=wide"));
+        assert!(md.contains("breakoutWidth=1200"));
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let marks = round_tripped.content[0].marks.as_ref().unwrap();
+        let breakout = marks.iter().find(|m| m.mark_type == "breakout").unwrap();
+        assert_eq!(breakout.attrs.as_ref().unwrap()["mode"], "wide");
+        assert_eq!(breakout.attrs.as_ref().unwrap()["width"], 1200);
     }
 
     // ── Attribute extensions — media & table (Tier 5) ────────────────
