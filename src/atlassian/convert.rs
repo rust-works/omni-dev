@@ -1173,6 +1173,36 @@ fn escape_backticks(text: &str) -> String {
     out
 }
 
+/// Escapes emoji shortcode patterns (`:name:`) in plain text so they are not
+/// parsed as emoji nodes during round-trip.  Only the leading colon is
+/// backslash-escaped, which is enough to prevent the parser from matching the
+/// pattern while the existing backslash-escape handler restores it on re-parse.
+fn escape_emoji_shortcodes(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+
+    for (i, ch) in text.char_indices() {
+        if ch == ':' {
+            // Check if this is a `:name:` pattern where name matches [a-zA-Z0-9_+-]+
+            let after = i + 1;
+            if after < text.len() {
+                let name_end = text[after..]
+                    .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '+' && c != '-')
+                    .map_or(text[after..].len(), |pos| pos);
+                if name_end > 0
+                    && after + name_end < text.len()
+                    && text.as_bytes()[after + name_end] == b':'
+                {
+                    // Found `:name:` pattern — escape the leading colon
+                    result.push('\\');
+                }
+            }
+        }
+        result.push(ch);
+    }
+
+    result
+}
+
 /// Escapes a leading list-marker pattern on a line so it is not
 /// re-parsed as a new list item.  `"2. text"` → `"2\. text"`,
 /// `"- text"` → `"\- text"`.
@@ -1573,12 +1603,13 @@ fn parse_inline(text: &str) -> Vec<AdfNode> {
             {
                 // Backslash escape: skip the backslash and treat the next
                 // character as literal text (e.g. `2\. text` → `2. text`,
-                // `\*word\*` → `*word*` without emphasis).
+                // `\*word\*` → `*word*` without emphasis,
+                // `\:fire:` → `:fire:` without emoji parsing).
                 flush_plain(text, plain_start, i, &mut nodes);
                 chars.next(); // consume the backslash
                               // Set plain_start to the escaped character so it is included
                               // in the next plain-text run, then advance past it so it is
-                              // not re-interpreted as a special character (e.g. `*`, `_`).
+                              // not re-interpreted as a special character (e.g. `*`, `_`, `:`).
                 plain_start = chars.peek().map_or(text.len(), |&(idx, _)| idx);
                 chars.next(); // consume the escaped character
             }
@@ -3460,7 +3491,10 @@ fn render_marked_text(text: &str, marks: &[AdfMark], output: &mut String) {
     if inner_em {
         inner.push('*');
     }
-    inner.push_str(&escape_backticks(&escape_emphasis_markers(text)));
+    let escaped = escape_emphasis_markers(text);
+    let escaped = escape_emoji_shortcodes(&escaped);
+    let escaped = escape_backticks(&escaped);
+    inner.push_str(&escaped);
     if inner_em {
         inner.push('*');
     }
@@ -5101,6 +5135,121 @@ mod tests {
         let content = doc.content[0].content.as_ref().unwrap();
         assert_eq!(content.len(), 1);
         assert_eq!(content[0].node_type, "text");
+    }
+
+    #[test]
+    fn text_with_shortcode_pattern_round_trips_as_text() {
+        // Issue #450: `:fire:` in a text node must not become an emoji node
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"Alert :fire: triggered on pod:pod42"}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let content = round_tripped.content[0].content.as_ref().unwrap();
+
+        assert_eq!(
+            content.len(),
+            1,
+            "should be a single text node, got: {content:?}"
+        );
+        assert_eq!(content[0].node_type, "text");
+        assert_eq!(
+            content[0].text.as_deref().unwrap(),
+            "Alert :fire: triggered on pod:pod42"
+        );
+    }
+
+    #[test]
+    fn double_colon_pattern_round_trips_as_text() {
+        // Issue #450: `::Active::` should not be parsed as emoji `:Active:`
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"Status::Active::Running"}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let content = round_tripped.content[0].content.as_ref().unwrap();
+
+        assert_eq!(
+            content.len(),
+            1,
+            "should be a single text node, got: {content:?}"
+        );
+        assert_eq!(content[0].node_type, "text");
+        assert_eq!(
+            content[0].text.as_deref().unwrap(),
+            "Status::Active::Running"
+        );
+    }
+
+    #[test]
+    fn real_emoji_node_still_round_trips() {
+        // Ensure actual emoji ADF nodes still work after the escaping fix
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"Hello "},
+          {"type":"emoji","attrs":{"shortName":":fire:","id":"1f525","text":"🔥"}},
+          {"type":"text","text":" world"}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let content = round_tripped.content[0].content.as_ref().unwrap();
+
+        // Should have: text("Hello ") + emoji(:fire:) + text(" world")
+        assert_eq!(content.len(), 3, "should have 3 nodes: {content:?}");
+        assert_eq!(content[0].text.as_deref(), Some("Hello "));
+        assert_eq!(content[1].node_type, "emoji");
+        assert_eq!(content[1].attrs.as_ref().unwrap()["shortName"], ":fire:");
+        assert_eq!(content[2].text.as_deref(), Some(" world"));
+    }
+
+    #[test]
+    fn text_shortcode_with_marks_round_trips() {
+        // Bold text containing an emoji-like shortcode should round-trip as bold text
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"Alert :fire: triggered","marks":[{"type":"strong"}]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let content = round_tripped.content[0].content.as_ref().unwrap();
+
+        assert_eq!(
+            content.len(),
+            1,
+            "should be single bold text node: {content:?}"
+        );
+        assert_eq!(content[0].node_type, "text");
+        assert_eq!(
+            content[0].text.as_deref().unwrap(),
+            "Alert :fire: triggered"
+        );
+        assert!(content[0]
+            .marks
+            .as_ref()
+            .is_some_and(|m| m.iter().any(|mk| mk.mark_type == "strong")));
+    }
+
+    #[test]
+    fn mixed_emoji_node_and_text_shortcode_round_trips() {
+        // Real emoji node adjacent to text containing a shortcode-like pattern
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"emoji","attrs":{"shortName":":wave:","id":"1f44b","text":"👋"}},
+          {"type":"text","text":" says :hello: to you"}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let content = round_tripped.content[0].content.as_ref().unwrap();
+
+        // Should be: emoji(:wave:) + text(" says :hello: to you")
+        assert_eq!(content.len(), 2, "should have 2 nodes: {content:?}");
+        assert_eq!(content[0].node_type, "emoji");
+        assert_eq!(content[0].attrs.as_ref().unwrap()["shortName"], ":wave:");
+        assert_eq!(content[1].node_type, "text");
+        assert_eq!(content[1].text.as_deref().unwrap(), " says :hello: to you");
     }
 
     #[test]
@@ -10870,6 +11019,41 @@ C
     fn escape_list_marker_plain() {
         assert_eq!(escape_list_marker("plain text"), "plain text");
         assert_eq!(escape_list_marker("no. marker"), "no. marker");
+    }
+
+    #[test]
+    fn escape_emoji_shortcodes_basic() {
+        assert_eq!(escape_emoji_shortcodes(":fire:"), r"\:fire:");
+        assert_eq!(
+            escape_emoji_shortcodes("hello :wave: world"),
+            r"hello \:wave: world"
+        );
+    }
+
+    #[test]
+    fn escape_emoji_shortcodes_double_colon() {
+        // Only the colon that starts `:Active:` needs escaping
+        assert_eq!(
+            escape_emoji_shortcodes("Status::Active::Running"),
+            r"Status:\:Active::Running"
+        );
+    }
+
+    #[test]
+    fn escape_emoji_shortcodes_no_match() {
+        // Lone colons, numeric-only between colons like 10:30
+        assert_eq!(escape_emoji_shortcodes("Time is 10:30"), "Time is 10:30");
+        assert_eq!(escape_emoji_shortcodes("no colons here"), "no colons here");
+        assert_eq!(escape_emoji_shortcodes("trailing:"), "trailing:");
+        assert_eq!(escape_emoji_shortcodes(":"), ":");
+    }
+
+    #[test]
+    fn escape_emoji_shortcodes_mixed() {
+        assert_eq!(
+            escape_emoji_shortcodes("Alert :fire: on pod:pod42"),
+            r"Alert \:fire: on pod:pod42"
+        );
     }
 
     #[test]
