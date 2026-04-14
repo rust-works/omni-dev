@@ -280,7 +280,6 @@ impl<'a> MarkdownParser<'a> {
                 let mut full_text = first_line.to_string();
                 self.collect_hardbreak_continuations(&mut full_text);
                 let (item_text, local_id, para_local_id) = extract_trailing_local_id(&full_text);
-                let inline_nodes = parse_inline(item_text);
                 // Collect indented sub-content lines (2-space prefix).
                 // This captures both nested lists and continuation
                 // paragraphs that belong to the same list item.
@@ -294,16 +293,23 @@ impl<'a> MarkdownParser<'a> {
                     }
                     break;
                 }
+                // If the first line is a block-level image, parse as mediaSingle
+                // instead of wrapping in a paragraph (issue #430).
+                let first_node = if let Some(media) = try_parse_media_single_from_line(item_text) {
+                    media
+                } else {
+                    AdfNode::paragraph(parse_inline(item_text))
+                };
                 if sub_lines.is_empty() {
                     items.push(list_item_with_local_id(
-                        vec![AdfNode::paragraph(inline_nodes)],
+                        vec![first_node],
                         local_id,
                         para_local_id,
                     ));
                 } else {
                     let sub_text = sub_lines.join("\n");
                     let mut nested = MarkdownParser::new(&sub_text).parse_blocks()?;
-                    let mut item_content = vec![AdfNode::paragraph(inline_nodes)];
+                    let mut item_content = vec![first_node];
                     item_content.append(&mut nested);
                     items.push(list_item_with_local_id(
                         item_content,
@@ -336,7 +342,6 @@ impl<'a> MarkdownParser<'a> {
                 let mut full_text = first_line.to_string();
                 self.collect_hardbreak_continuations(&mut full_text);
                 let (item_text, local_id, para_local_id) = extract_trailing_local_id(&full_text);
-                let inline_nodes = parse_inline(item_text);
                 // Collect indented sub-content lines (2-space prefix).
                 let mut sub_lines: Vec<String> = Vec::new();
                 while !self.at_end() {
@@ -348,16 +353,23 @@ impl<'a> MarkdownParser<'a> {
                     }
                     break;
                 }
+                // If the first line is a block-level image, parse as mediaSingle
+                // instead of wrapping in a paragraph (issue #430).
+                let first_node = if let Some(media) = try_parse_media_single_from_line(item_text) {
+                    media
+                } else {
+                    AdfNode::paragraph(parse_inline(item_text))
+                };
                 if sub_lines.is_empty() {
                     items.push(list_item_with_local_id(
-                        vec![AdfNode::paragraph(inline_nodes)],
+                        vec![first_node],
                         local_id,
                         para_local_id,
                     ));
                 } else {
                     let sub_text = sub_lines.join("\n");
                     let mut nested = MarkdownParser::new(&sub_text).parse_blocks()?;
-                    let mut item_content = vec![AdfNode::paragraph(inline_nodes)];
+                    let mut item_content = vec![first_node];
                     item_content.append(&mut nested);
                     items.push(list_item_with_local_id(
                         item_content,
@@ -826,113 +838,9 @@ impl<'a> MarkdownParser<'a> {
 
     fn try_image(&mut self) -> Option<AdfNode> {
         let line = self.current_line().trim();
-        if !line.starts_with("![") {
-            return None;
-        }
-
-        if let Some((alt, url)) = parse_image_syntax(line) {
-            self.advance();
-            let alt_opt = if alt.is_empty() { None } else { Some(alt) };
-
-            // Check for trailing {attrs} after the image syntax
-            let img_end = line.find(')').unwrap_or(line.len()) + 1;
-            let after_img = line[img_end..].trim_start();
-
-            if after_img.starts_with('{') {
-                if let Some((_, attrs)) = parse_attrs(after_img, 0) {
-                    // Confluence file attachment — reconstruct type:file media node
-                    if attrs.get("type") == Some("file") || attrs.get("id").is_some() {
-                        let mut media_attrs = serde_json::json!({"type": "file"});
-                        if let Some(id) = attrs.get("id") {
-                            media_attrs["id"] = serde_json::Value::String(id.to_string());
-                        }
-                        if let Some(collection) = attrs.get("collection") {
-                            media_attrs["collection"] =
-                                serde_json::Value::String(collection.to_string());
-                        }
-                        if let Some(height) = attrs.get("height") {
-                            if let Ok(h) = height.parse::<u64>() {
-                                media_attrs["height"] = serde_json::json!(h);
-                            }
-                        }
-                        if let Some(width) = attrs.get("width") {
-                            if let Ok(w) = width.parse::<u64>() {
-                                media_attrs["width"] = serde_json::json!(w);
-                            }
-                        }
-                        if let Some(alt_text) = alt_opt {
-                            media_attrs["alt"] = serde_json::Value::String(alt_text.to_string());
-                        }
-                        if let Some(local_id) = attrs.get("localId") {
-                            media_attrs["localId"] =
-                                serde_json::Value::String(local_id.to_string());
-                        }
-                        let mut ms_attrs = serde_json::json!({"layout": "center"});
-                        if let Some(layout) = attrs.get("layout") {
-                            ms_attrs["layout"] = serde_json::Value::String(layout.to_string());
-                        }
-                        if let Some(ms_width) = attrs.get("mediaWidth") {
-                            if let Ok(w) = ms_width.parse::<u64>() {
-                                ms_attrs["width"] = serde_json::json!(w);
-                            }
-                        }
-                        if let Some(wt) = attrs.get("widthType") {
-                            ms_attrs["widthType"] = serde_json::Value::String(wt.to_string());
-                        }
-                        if let Some(mode) = attrs.get("mode") {
-                            ms_attrs["mode"] = serde_json::Value::String(mode.to_string());
-                        }
-                        return Some(AdfNode {
-                            node_type: "mediaSingle".to_string(),
-                            attrs: Some(ms_attrs),
-                            content: Some(vec![AdfNode {
-                                node_type: "media".to_string(),
-                                attrs: Some(media_attrs),
-                                content: None,
-                                text: None,
-                                marks: None,
-                            }]),
-                            text: None,
-                            marks: None,
-                        });
-                    }
-
-                    // External image — apply layout/width/widthType to mediaSingle attrs
-                    let mut node = AdfNode::media_single(url, alt_opt);
-                    if let Some(ref mut node_attrs) = node.attrs {
-                        if let Some(layout) = attrs.get("layout") {
-                            node_attrs["layout"] = serde_json::Value::String(layout.to_string());
-                        }
-                        if let Some(width) = attrs.get("width") {
-                            if let Ok(w) = width.parse::<u64>() {
-                                node_attrs["width"] = serde_json::json!(w);
-                            }
-                        }
-                        if let Some(wt) = attrs.get("widthType") {
-                            node_attrs["widthType"] = serde_json::Value::String(wt.to_string());
-                        }
-                        if let Some(mode) = attrs.get("mode") {
-                            node_attrs["mode"] = serde_json::Value::String(mode.to_string());
-                        }
-                    }
-                    if let Some(local_id) = attrs.get("localId") {
-                        if let Some(ref mut content) = node.content {
-                            if let Some(media) = content.first_mut() {
-                                if let Some(ref mut media_attrs) = media.attrs {
-                                    media_attrs["localId"] =
-                                        serde_json::Value::String(local_id.to_string());
-                                }
-                            }
-                        }
-                    }
-                    return Some(node);
-                }
-            }
-
-            Some(AdfNode::media_single(url, alt_opt))
-        } else {
-            None
-        }
+        let node = try_parse_media_single_from_line(line)?;
+        self.advance();
+        Some(node)
     }
 
     fn try_table(&mut self) -> Result<Option<AdfNode>> {
@@ -1330,6 +1238,112 @@ fn extract_cell_attrs(cell_text: &str) -> (String, Option<serde_json::Value>) {
     } else {
         (cell_text.to_string(), None)
     }
+}
+
+/// Tries to parse a line as a block-level image and return a mediaSingle ADF node.
+/// Used by both `try_image` (top-level blocks) and list item parsing.
+fn try_parse_media_single_from_line(line: &str) -> Option<AdfNode> {
+    let line = line.trim();
+    if !line.starts_with("![") {
+        return None;
+    }
+
+    let (alt, url) = parse_image_syntax(line)?;
+    let alt_opt = if alt.is_empty() { None } else { Some(alt) };
+
+    let img_end = line.find(')').unwrap_or(line.len()) + 1;
+    let after_img = line[img_end..].trim_start();
+
+    if after_img.starts_with('{') {
+        if let Some((_, attrs)) = parse_attrs(after_img, 0) {
+            // Confluence file attachment — reconstruct type:file media node
+            if attrs.get("type") == Some("file") || attrs.get("id").is_some() {
+                let mut media_attrs = serde_json::json!({"type": "file"});
+                if let Some(id) = attrs.get("id") {
+                    media_attrs["id"] = serde_json::Value::String(id.to_string());
+                }
+                if let Some(collection) = attrs.get("collection") {
+                    media_attrs["collection"] = serde_json::Value::String(collection.to_string());
+                }
+                if let Some(height) = attrs.get("height") {
+                    if let Ok(h) = height.parse::<u64>() {
+                        media_attrs["height"] = serde_json::json!(h);
+                    }
+                }
+                if let Some(width) = attrs.get("width") {
+                    if let Ok(w) = width.parse::<u64>() {
+                        media_attrs["width"] = serde_json::json!(w);
+                    }
+                }
+                if let Some(alt_text) = alt_opt {
+                    media_attrs["alt"] = serde_json::Value::String(alt_text.to_string());
+                }
+                if let Some(local_id) = attrs.get("localId") {
+                    media_attrs["localId"] = serde_json::Value::String(local_id.to_string());
+                }
+                let mut ms_attrs = serde_json::json!({"layout": "center"});
+                if let Some(layout) = attrs.get("layout") {
+                    ms_attrs["layout"] = serde_json::Value::String(layout.to_string());
+                }
+                if let Some(ms_width) = attrs.get("mediaWidth") {
+                    if let Ok(w) = ms_width.parse::<u64>() {
+                        ms_attrs["width"] = serde_json::json!(w);
+                    }
+                }
+                if let Some(wt) = attrs.get("widthType") {
+                    ms_attrs["widthType"] = serde_json::Value::String(wt.to_string());
+                }
+                if let Some(mode) = attrs.get("mode") {
+                    ms_attrs["mode"] = serde_json::Value::String(mode.to_string());
+                }
+                return Some(AdfNode {
+                    node_type: "mediaSingle".to_string(),
+                    attrs: Some(ms_attrs),
+                    content: Some(vec![AdfNode {
+                        node_type: "media".to_string(),
+                        attrs: Some(media_attrs),
+                        content: None,
+                        text: None,
+                        marks: None,
+                    }]),
+                    text: None,
+                    marks: None,
+                });
+            }
+
+            // External image — apply layout/width/widthType to mediaSingle attrs
+            let mut node = AdfNode::media_single(url, alt_opt);
+            if let Some(ref mut node_attrs) = node.attrs {
+                if let Some(layout) = attrs.get("layout") {
+                    node_attrs["layout"] = serde_json::Value::String(layout.to_string());
+                }
+                if let Some(width) = attrs.get("width") {
+                    if let Ok(w) = width.parse::<u64>() {
+                        node_attrs["width"] = serde_json::json!(w);
+                    }
+                }
+                if let Some(wt) = attrs.get("widthType") {
+                    node_attrs["widthType"] = serde_json::Value::String(wt.to_string());
+                }
+                if let Some(mode) = attrs.get("mode") {
+                    node_attrs["mode"] = serde_json::Value::String(mode.to_string());
+                }
+            }
+            if let Some(local_id) = attrs.get("localId") {
+                if let Some(ref mut content) = node.content {
+                    if let Some(media) = content.first_mut() {
+                        if let Some(ref mut media_attrs) = media.attrs {
+                            media_attrs["localId"] =
+                                serde_json::Value::String(local_id.to_string());
+                        }
+                    }
+                }
+            }
+            return Some(node);
+        }
+    }
+
+    Some(AdfNode::media_single(url, alt_opt))
 }
 
 /// Parses `![alt](url)` image syntax.
@@ -10276,5 +10290,268 @@ C
                 .unwrap(),
             "+ plus"
         );
+    }
+
+    // ---- Issue #430 tests: mediaSingle inside listItem ----
+
+    #[test]
+    fn issue_430_file_media_in_bullet_list_roundtrip() {
+        // Issue #430: mediaSingle (type:file) as direct child of listItem
+        // in a bulletList must survive round-trip.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[
+          {"type":"listItem","content":[{
+            "type":"mediaSingle",
+            "attrs":{"layout":"center","width":1009,"widthType":"pixel"},
+            "content":[{
+              "type":"media",
+              "attrs":{"collection":"contentId-123","height":576,"id":"00066e8e-554e-4d7e-af59-a0ef2888bdb6","type":"file","width":1009}
+            }]
+          }]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let list = &rt.content[0];
+        assert_eq!(list.node_type, "bulletList");
+        let item = &list.content.as_ref().unwrap()[0];
+        assert_eq!(item.node_type, "listItem");
+        let ms = &item.content.as_ref().unwrap()[0];
+        assert_eq!(ms.node_type, "mediaSingle");
+        let ms_attrs = ms.attrs.as_ref().unwrap();
+        assert_eq!(ms_attrs["layout"], "center");
+        assert_eq!(ms_attrs["width"], 1009);
+        assert_eq!(ms_attrs["widthType"], "pixel");
+        let media = &ms.content.as_ref().unwrap()[0];
+        assert_eq!(media.node_type, "media");
+        let m_attrs = media.attrs.as_ref().unwrap();
+        assert_eq!(m_attrs["type"], "file");
+        assert_eq!(m_attrs["id"], "00066e8e-554e-4d7e-af59-a0ef2888bdb6");
+        assert_eq!(m_attrs["collection"], "contentId-123");
+        assert_eq!(m_attrs["height"], 576);
+        assert_eq!(m_attrs["width"], 1009);
+    }
+
+    #[test]
+    fn issue_430_file_media_in_ordered_list_roundtrip() {
+        // Same as above but inside an orderedList.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"orderedList","attrs":{"order":1},"content":[
+          {"type":"listItem","content":[{
+            "type":"mediaSingle",
+            "attrs":{"layout":"center"},
+            "content":[{
+              "type":"media",
+              "attrs":{"type":"file","id":"abc-123","collection":"contentId-456","height":100,"width":200}
+            }]
+          }]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let list = &rt.content[0];
+        assert_eq!(list.node_type, "orderedList");
+        let item = &list.content.as_ref().unwrap()[0];
+        assert_eq!(item.node_type, "listItem");
+        let ms = &item.content.as_ref().unwrap()[0];
+        assert_eq!(ms.node_type, "mediaSingle");
+        let media = &ms.content.as_ref().unwrap()[0];
+        assert_eq!(media.node_type, "media");
+        let m_attrs = media.attrs.as_ref().unwrap();
+        assert_eq!(m_attrs["type"], "file");
+        assert_eq!(m_attrs["id"], "abc-123");
+        assert_eq!(m_attrs["collection"], "contentId-456");
+    }
+
+    #[test]
+    fn issue_430_external_media_in_bullet_list_roundtrip() {
+        // External image (type:external) inside a bullet list item.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[
+          {"type":"listItem","content":[{
+            "type":"mediaSingle",
+            "attrs":{"layout":"center"},
+            "content":[{
+              "type":"media",
+              "attrs":{"type":"external","url":"https://example.com/img.png","alt":"Photo"}
+            }]
+          }]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let list = &rt.content[0];
+        assert_eq!(list.node_type, "bulletList");
+        let item = &list.content.as_ref().unwrap()[0];
+        let ms = &item.content.as_ref().unwrap()[0];
+        assert_eq!(ms.node_type, "mediaSingle");
+        let media = &ms.content.as_ref().unwrap()[0];
+        assert_eq!(media.node_type, "media");
+        let m_attrs = media.attrs.as_ref().unwrap();
+        assert_eq!(m_attrs["type"], "external");
+        assert_eq!(m_attrs["url"], "https://example.com/img.png");
+    }
+
+    #[test]
+    fn issue_430_media_with_paragraph_siblings_in_list_item() {
+        // listItem containing a paragraph followed by a mediaSingle.
+        // Both children must survive round-trip.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[
+          {"type":"listItem","content":[
+            {"type":"paragraph","content":[{"type":"text","text":"Caption:"}]},
+            {"type":"mediaSingle","attrs":{"layout":"center"},
+             "content":[{"type":"media","attrs":{"type":"file","id":"img-001","collection":"col-1","height":50,"width":100}}]}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let item = &rt.content[0].content.as_ref().unwrap()[0];
+        let children = item.content.as_ref().unwrap();
+        assert_eq!(children.len(), 2, "expected 2 children in listItem");
+        assert_eq!(children[0].node_type, "paragraph");
+        assert_eq!(children[1].node_type, "mediaSingle");
+        let media = &children[1].content.as_ref().unwrap()[0];
+        assert_eq!(media.attrs.as_ref().unwrap()["id"], "img-001");
+    }
+
+    #[test]
+    fn issue_430_multiple_media_in_list_items() {
+        // Multiple list items each containing mediaSingle.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[
+          {"type":"listItem","content":[{
+            "type":"mediaSingle","attrs":{"layout":"center"},
+            "content":[{"type":"media","attrs":{"type":"file","id":"img-a","collection":"c1","height":10,"width":20}}]
+          }]},
+          {"type":"listItem","content":[{
+            "type":"mediaSingle","attrs":{"layout":"center"},
+            "content":[{"type":"media","attrs":{"type":"file","id":"img-b","collection":"c2","height":30,"width":40}}]
+          }]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let items = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 2);
+        for (i, expected_id) in [("img-a", "c1"), ("img-b", "c2")].iter().enumerate() {
+            let ms = &items[i].content.as_ref().unwrap()[0];
+            assert_eq!(ms.node_type, "mediaSingle");
+            let m_attrs = ms.content.as_ref().unwrap()[0].attrs.as_ref().unwrap();
+            assert_eq!(m_attrs["id"], expected_id.0);
+            assert_eq!(m_attrs["collection"], expected_id.1);
+        }
+    }
+
+    #[test]
+    fn issue_430_jfm_to_adf_media_in_bullet_item() {
+        // Parse JFM directly: image syntax on the first line of a bullet item
+        // must produce mediaSingle, not a paragraph with corrupted text.
+        let md = "- ![](){type=file id=test-id collection=col-1 height=100 width=200}\n";
+        let doc = markdown_to_adf(md).unwrap();
+
+        let list = &doc.content[0];
+        assert_eq!(list.node_type, "bulletList");
+        let item = &list.content.as_ref().unwrap()[0];
+        let ms = &item.content.as_ref().unwrap()[0];
+        assert_eq!(
+            ms.node_type, "mediaSingle",
+            "expected mediaSingle, got {}",
+            ms.node_type
+        );
+        let media = &ms.content.as_ref().unwrap()[0];
+        assert_eq!(media.node_type, "media");
+        let m_attrs = media.attrs.as_ref().unwrap();
+        assert_eq!(m_attrs["type"], "file");
+        assert_eq!(m_attrs["id"], "test-id");
+    }
+
+    #[test]
+    fn issue_430_jfm_to_adf_media_in_ordered_item() {
+        // Parse JFM directly: image syntax on the first line of an ordered list item.
+        let md = "1. ![alt text](https://example.com/photo.jpg)\n";
+        let doc = markdown_to_adf(md).unwrap();
+
+        let list = &doc.content[0];
+        assert_eq!(list.node_type, "orderedList");
+        let item = &list.content.as_ref().unwrap()[0];
+        let ms = &item.content.as_ref().unwrap()[0];
+        assert_eq!(
+            ms.node_type, "mediaSingle",
+            "expected mediaSingle, got {}",
+            ms.node_type
+        );
+    }
+
+    #[test]
+    fn issue_430_media_then_paragraph_in_bullet_list_roundtrip() {
+        // listItem with mediaSingle as first child followed by a paragraph.
+        // Exercises the sub_lines non-empty path when first_node is mediaSingle.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[
+          {"type":"listItem","content":[
+            {"type":"mediaSingle","attrs":{"layout":"center"},
+             "content":[{"type":"media","attrs":{"type":"file","id":"img-first","collection":"col-1","height":50,"width":100}}]},
+            {"type":"paragraph","content":[{"type":"text","text":"Caption below"}]}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let item = &rt.content[0].content.as_ref().unwrap()[0];
+        let children = item.content.as_ref().unwrap();
+        assert_eq!(children.len(), 2, "expected 2 children in listItem");
+        assert_eq!(children[0].node_type, "mediaSingle");
+        let media = &children[0].content.as_ref().unwrap()[0];
+        assert_eq!(media.attrs.as_ref().unwrap()["id"], "img-first");
+        assert_eq!(children[1].node_type, "paragraph");
+    }
+
+    #[test]
+    fn issue_430_media_then_paragraph_in_ordered_list_roundtrip() {
+        // Same as above but for ordered lists.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"orderedList","attrs":{"order":1},"content":[
+          {"type":"listItem","content":[
+            {"type":"mediaSingle","attrs":{"layout":"center"},
+             "content":[{"type":"media","attrs":{"type":"file","id":"img-ord","collection":"col-2","height":60,"width":120}}]},
+            {"type":"paragraph","content":[{"type":"text","text":"Description"}]}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let item = &rt.content[0].content.as_ref().unwrap()[0];
+        let children = item.content.as_ref().unwrap();
+        assert_eq!(children.len(), 2, "expected 2 children in listItem");
+        assert_eq!(children[0].node_type, "mediaSingle");
+        assert_eq!(children[1].node_type, "paragraph");
+    }
+
+    #[test]
+    fn issue_430_external_media_with_width_type_roundtrip() {
+        // External image with widthType attr must survive round-trip.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{
+          "type":"mediaSingle",
+          "attrs":{"layout":"wide","width":800,"widthType":"pixel"},
+          "content":[{
+            "type":"media",
+            "attrs":{"type":"external","url":"https://example.com/photo.png","alt":"wide photo"}
+          }]
+        }]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("widthType=pixel"),
+            "expected widthType=pixel in markdown, got: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let ms = &rt.content[0];
+        assert_eq!(ms.node_type, "mediaSingle");
+        let ms_attrs = ms.attrs.as_ref().unwrap();
+        assert_eq!(ms_attrs["widthType"], "pixel");
+        assert_eq!(ms_attrs["width"], 800);
+        assert_eq!(ms_attrs["layout"], "wide");
     }
 }
