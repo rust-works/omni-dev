@@ -1923,6 +1923,7 @@ fn try_dispatch_inline_directive(text: &str, pos: usize) -> Option<(AdfNode, usi
                 nodes.remove(0)
             }
         }
+        "placeholder" => AdfNode::placeholder(content),
         "extension" => {
             let ext_type = d.attrs.as_ref().and_then(|a| a.get("type")).unwrap_or("");
             let ext_key = d.attrs.as_ref().and_then(|a| a.get("key")).unwrap_or("");
@@ -3235,6 +3236,15 @@ fn render_inline_node(node: &AdfNode, output: &mut String, opts: &RenderOptions)
                 }
                 maybe_push_local_id(attrs, &mut attr_parts, opts);
                 output.push_str(&format!(":mention[{text}]{{{}}}", attr_parts.join(" ")));
+            }
+        }
+        "placeholder" => {
+            if let Some(ref attrs) = node.attrs {
+                let text = attrs
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                output.push_str(&format!(":placeholder[{text}]"));
             }
         }
         "inlineExtension" => {
@@ -10949,5 +10959,93 @@ C
         assert_eq!(ms_attrs["widthType"], "pixel");
         assert_eq!(ms_attrs["width"], 800);
         assert_eq!(ms_attrs["layout"], "wide");
+    }
+
+    // ── Placeholder node tests ────────────────────────────────────
+
+    #[test]
+    fn adf_placeholder_to_markdown() {
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::placeholder(
+                "Type something here",
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains(":placeholder[Type something here]"),
+            "expected :placeholder directive, got: {md}"
+        );
+    }
+
+    #[test]
+    fn markdown_placeholder_to_adf() {
+        let doc = markdown_to_adf("Before :placeholder[Enter name] after").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(content[1].node_type, "placeholder");
+        let attrs = content[1].attrs.as_ref().unwrap();
+        assert_eq!(attrs["text"], "Enter name");
+    }
+
+    #[test]
+    fn placeholder_round_trip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"placeholder","attrs":{"text":"Type something here"}}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let content = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].node_type, "placeholder");
+        let attrs = content[0].attrs.as_ref().unwrap();
+        assert_eq!(attrs["text"], "Type something here");
+    }
+
+    #[test]
+    fn placeholder_empty_text() {
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::placeholder("")])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains(":placeholder[]"),
+            "expected empty placeholder directive, got: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let content = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(content[0].node_type, "placeholder");
+        assert_eq!(content[0].attrs.as_ref().unwrap()["text"], "");
+    }
+
+    #[test]
+    fn placeholder_with_surrounding_text() {
+        let md = "Click :placeholder[here] to continue\n";
+        let doc = markdown_to_adf(md).unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(content[0].text.as_deref(), Some("Click "));
+        assert_eq!(content[1].node_type, "placeholder");
+        assert_eq!(content[1].attrs.as_ref().unwrap()["text"], "here");
+        assert_eq!(content[2].text.as_deref(), Some(" to continue"));
+    }
+
+    #[test]
+    fn placeholder_missing_attrs() {
+        // Placeholder node with no attrs should not panic
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode {
+                node_type: "placeholder".to_string(),
+                attrs: None,
+                content: None,
+                text: None,
+                marks: None,
+            }])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        // With no attrs, nothing is emitted for the placeholder
+        assert!(!md.contains("placeholder"));
     }
 }
