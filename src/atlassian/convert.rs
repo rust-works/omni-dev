@@ -1139,6 +1139,24 @@ fn is_list_start(line: &str) -> bool {
         || parse_ordered_list_marker(trimmed).is_some()
 }
 
+/// Escapes asterisk sequences in text that would otherwise be parsed as
+/// CommonMark emphasis (`*…*`) or strong emphasis (`**…**`).
+///
+/// Only sequences that could round-trip as emphasis are escaped: a `*` or
+/// `**` that is followed (at the opening position) or preceded (at the
+/// closing position) by a non-space character.  Lone asterisks that cannot
+/// form a delimiter pair are left untouched.
+fn escape_emphasis_markers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch == '*' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Escapes a leading list-marker pattern on a line so it is not
 /// re-parsed as a new list item.  `"2. text"` → `"2\. text"`,
 /// `"- text"` → `"\- text"`.
@@ -1534,12 +1552,15 @@ fn parse_inline(text: &str) -> Vec<AdfNode> {
                 && text.as_bytes()[i + 1] != b'\\' =>
             {
                 // Backslash escape: skip the backslash and treat the next
-                // character as literal text (e.g. `2\. text` → `2. text`).
+                // character as literal text (e.g. `2\. text` → `2. text`,
+                // `\*word\*` → `*word*` without emphasis).
                 flush_plain(text, plain_start, i, &mut nodes);
                 chars.next(); // consume the backslash
+                              // Set plain_start to the escaped character so it is included
+                              // in the next plain-text run, then advance past it so it is
+                              // not re-interpreted as a special character (e.g. `*`, `_`).
                 plain_start = chars.peek().map_or(text.len(), |&(idx, _)| idx);
-                // The escaped character remains in `chars` and will be
-                // consumed normally on the next iteration.
+                chars.next(); // consume the escaped character
             }
             '\\' if text[i..].starts_with("\\\n") => {
                 // Backslash line break → hardBreak node.
@@ -1645,6 +1666,44 @@ fn is_intraword_underscore(text: &str, delim_pos: usize, len: usize) -> bool {
     before && after
 }
 
+/// Finds the first occurrence of `needle` in `haystack`, skipping over
+/// backslash-escaped characters (e.g. `\*` is not matched when searching
+/// for `*`).
+fn find_unescaped(haystack: &str, needle: &str) -> Option<usize> {
+    let needle_bytes = needle.as_bytes();
+    let hay_bytes = haystack.as_bytes();
+    let mut i = 0;
+    while i < hay_bytes.len() {
+        if hay_bytes[i] == b'\\' {
+            i += 2; // skip escaped character
+            continue;
+        }
+        if hay_bytes[i..].starts_with(needle_bytes) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Finds the first occurrence of a single byte `ch` in `haystack`, skipping
+/// over backslash-escaped characters.
+fn find_unescaped_char(haystack: &str, ch: u8) -> Option<usize> {
+    let hay_bytes = haystack.as_bytes();
+    let mut i = 0;
+    while i < hay_bytes.len() {
+        if hay_bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if hay_bytes[i] == ch {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Tries to parse ***bold+italic***, **bold**, *italic* (or underscore variants) starting at position `i`.
 /// Returns (end_position, inner_content, is_bold).
 ///
@@ -1667,7 +1726,7 @@ fn try_parse_emphasis(text: &str, i: usize) -> Option<(usize, &str, bool)> {
         }
         let triple = &rest[..3];
         let after = &rest[3..];
-        if let Some(close) = after.find(triple) {
+        if let Some(close) = find_unescaped(after, triple) {
             if close > 0 {
                 let close_pos = i + 3 + close;
                 if is_underscore && is_intraword_underscore(text, close_pos, 3) {
@@ -1691,7 +1750,7 @@ fn try_parse_emphasis(text: &str, i: usize) -> Option<(usize, &str, bool)> {
         }
         let delimiter = &rest[..2];
         let after = &rest[2..];
-        let close = after.find(delimiter)?;
+        let close = find_unescaped(after, delimiter)?;
         if close == 0 {
             return None;
         }
@@ -1712,7 +1771,7 @@ fn try_parse_emphasis(text: &str, i: usize) -> Option<(usize, &str, bool)> {
             return None;
         }
         let after = &rest[1..];
-        let close = after.find(delim_char as char)?;
+        let close = find_unescaped_char(after, delim_char)?;
         if close == 0 {
             return None;
         }
@@ -3341,7 +3400,7 @@ fn render_marked_text(text: &str, marks: &[AdfMark], output: &mut String) {
     if inner_em {
         inner.push('*');
     }
-    inner.push_str(text);
+    inner.push_str(&escape_emphasis_markers(text));
     if inner_em {
         inner.push('*');
     }
@@ -4355,6 +4414,116 @@ mod tests {
             Some("call the do_something_useful function")
         );
         assert!(content[0].marks.is_none());
+    }
+
+    #[test]
+    fn asterisk_emphasis_roundtrip() {
+        // The original reproducer from issue #452
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"Status: *confirmed* and active"}]}]}"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        let roundtripped = markdown_to_adf(&jfm).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1, "should round-trip as a single text node");
+        assert_eq!(
+            content[0].text.as_deref(),
+            Some("Status: *confirmed* and active")
+        );
+        assert!(content[0].marks.is_none());
+    }
+
+    #[test]
+    fn double_asterisk_roundtrip() {
+        // **bold** delimiters in plain text should not become strong marks
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"Use **kwargs in Python"}]}]}"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        let roundtripped = markdown_to_adf(&jfm).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1, "should round-trip as a single text node");
+        assert_eq!(content[0].text.as_deref(), Some("Use **kwargs in Python"));
+        assert!(content[0].marks.is_none());
+    }
+
+    #[test]
+    fn asterisk_with_em_mark_roundtrip() {
+        // Text that already has an em mark should preserve both the mark and escaped content
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"a*b","marks":[{"type":"em"}]}]}]}"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        let roundtripped = markdown_to_adf(&jfm).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        // Find the node with em mark
+        let em_node = content.iter().find(|n| {
+            n.marks
+                .as_ref()
+                .is_some_and(|m| m.iter().any(|mk| mk.mark_type == "em"))
+        });
+        assert!(em_node.is_some(), "should have an em-marked node");
+        assert_eq!(em_node.unwrap().text.as_deref(), Some("a*b"));
+    }
+
+    #[test]
+    fn lone_asterisk_roundtrip() {
+        // A single asterisk that cannot form emphasis should round-trip
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"rating: 5 * stars"}]}]}"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        let roundtripped = markdown_to_adf(&jfm).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1, "should round-trip as a single text node");
+        assert_eq!(content[0].text.as_deref(), Some("rating: 5 * stars"));
+    }
+
+    #[test]
+    fn escape_emphasis_markers_unit() {
+        assert_eq!(escape_emphasis_markers("hello"), "hello");
+        assert_eq!(escape_emphasis_markers("*bold*"), r"\*bold\*");
+        assert_eq!(escape_emphasis_markers("**strong**"), r"\*\*strong\*\*");
+        assert_eq!(escape_emphasis_markers("no stars"), "no stars");
+        assert_eq!(escape_emphasis_markers("a * b"), r"a \* b");
+        assert_eq!(escape_emphasis_markers(""), "");
+    }
+
+    #[test]
+    fn find_unescaped_skips_backslash_escaped() {
+        // Escaped `**` should not be found
+        assert_eq!(find_unescaped(r"a\*\*b**", "**"), Some(6));
+        // No unescaped match at all
+        assert_eq!(find_unescaped(r"a\*\*b", "**"), None);
+        // Plain match without any escaping
+        assert_eq!(find_unescaped("a**b", "**"), Some(1));
+        // Empty haystack
+        assert_eq!(find_unescaped("", "**"), None);
+    }
+
+    #[test]
+    fn find_unescaped_char_skips_backslash_escaped() {
+        // Escaped `*` should not be found
+        assert_eq!(find_unescaped_char(r"a\*b*", b'*'), Some(4));
+        // No unescaped match at all
+        assert_eq!(find_unescaped_char(r"\*", b'*'), None);
+        // Plain match
+        assert_eq!(find_unescaped_char("a*b", b'*'), Some(1));
+        // Empty haystack
+        assert_eq!(find_unescaped_char("", b'*'), None);
+    }
+
+    #[test]
+    fn double_asterisk_in_strong_mark_roundtrip() {
+        // Text with ** inside a strong mark should preserve the literal **
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"call **kwargs","marks":[{"type":"strong"}]}]}]}"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        let roundtripped = markdown_to_adf(&jfm).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        let strong_node = content.iter().find(|n| {
+            n.marks
+                .as_ref()
+                .is_some_and(|m| m.iter().any(|mk| mk.mark_type == "strong"))
+        });
+        assert!(strong_node.is_some(), "should have a strong-marked node");
+        assert_eq!(strong_node.unwrap().text.as_deref(), Some("call **kwargs"));
     }
 
     #[test]
