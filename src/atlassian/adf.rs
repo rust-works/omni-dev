@@ -409,6 +409,18 @@ impl AdfNode {
         }
     }
 
+    /// Creates a placeholder node.
+    #[must_use]
+    pub fn placeholder(text: &str) -> Self {
+        Self {
+            node_type: "placeholder".to_string(),
+            attrs: Some(serde_json::json!({"text": text})),
+            content: None,
+            text: None,
+            marks: None,
+        }
+    }
+
     /// Creates a mention node.
     #[must_use]
     pub fn mention(id: &str, display_text: &str) -> Self {
