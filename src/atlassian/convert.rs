@@ -1579,10 +1579,32 @@ fn prepend_mark(node: &mut AdfNode, mark: AdfMark) {
     }
 }
 
-/// Tries to parse **bold** or *italic* or __bold__ or _italic_ starting at position `i`.
+/// Tries to parse ***bold+italic***, **bold**, *italic* (or underscore variants) starting at position `i`.
 /// Returns (end_position, inner_content, is_bold).
+///
+/// The triple-delimiter case (`***` / `___`) is checked first so that `***text***` is parsed as
+/// bold wrapping italic content, rather than having the `**` branch consume the wrong closing
+/// delimiter and leave stray `*` characters in the text (see issue #401).
 fn try_parse_emphasis(text: &str, i: usize) -> Option<(usize, &str, bool)> {
     let rest = &text[i..];
+
+    // Bold+italic: *** or ___
+    // Parse as bold wrapping italic: the inner content will be recursively parsed and pick up
+    // the inner * / _ as an em mark.
+    if rest.starts_with("***") || rest.starts_with("___") {
+        let triple = &rest[..3];
+        let after = &rest[3..];
+        if let Some(close) = after.find(triple) {
+            if close > 0 {
+                // Return a slice that includes the inner italic delimiters from the
+                // original text: for `***text***`, return `*text*`.  The recursive
+                // parse_inline call will then pick up the inner `*…*` as an em mark.
+                let content = &rest[2..=3 + close];
+                let end = i + 3 + close + 3;
+                return Some((end, content, true));
+            }
+        }
+    }
 
     // Bold: ** or __
     if rest.starts_with("**") || rest.starts_with("__") {
@@ -5464,6 +5486,104 @@ mod tests {
             vec!["link", "underline"],
             "mark order should be preserved, got: {mark_types:?}"
         );
+    }
+
+    #[test]
+    fn em_strong_round_trip() {
+        // Issue #401: em mark dropped when combined with strong
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"bold and italic","marks":[{"type":"strong"},{"type":"em"}]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert_eq!(md.trim(), "***bold and italic***");
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(node.text.as_deref(), Some("bold and italic"));
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(
+            mark_types,
+            vec!["strong", "em"],
+            "both strong and em marks should be preserved, got: {mark_types:?}"
+        );
+    }
+
+    #[test]
+    fn em_strong_round_trip_em_first() {
+        // Issue #401: em+strong with em listed first
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"italic and bold","marks":[{"type":"em"},{"type":"strong"}]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(node.text.as_deref(), Some("italic and bold"));
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert!(
+            mark_types.contains(&"strong") && mark_types.contains(&"em"),
+            "both strong and em marks should be present, got: {mark_types:?}"
+        );
+    }
+
+    #[test]
+    fn triple_asterisk_parse_to_adf() {
+        // Issue #401: ***text*** should parse as text with strong+em marks
+        let md = "***bold and italic***\n";
+        let doc = markdown_to_adf(md).unwrap();
+        let node = &doc.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(node.text.as_deref(), Some("bold and italic"));
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert!(
+            mark_types.contains(&"strong") && mark_types.contains(&"em"),
+            "***text*** should produce both strong and em marks, got: {mark_types:?}"
+        );
+    }
+
+    #[test]
+    fn triple_asterisk_with_surrounding_text() {
+        // Issue #401: surrounding text should not be affected
+        let md = "before ***bold italic*** after\n";
+        let doc = markdown_to_adf(md).unwrap();
+        let nodes = doc.content[0].content.as_ref().unwrap();
+        // Should have: "before " (plain), "bold italic" (strong+em), " after" (plain)
+        assert!(
+            nodes.len() >= 3,
+            "expected at least 3 nodes, got {}",
+            nodes.len()
+        );
+        assert_eq!(nodes[0].text.as_deref(), Some("before "));
+        assert_eq!(nodes[1].text.as_deref(), Some("bold italic"));
+        let mark_types: Vec<&str> = nodes[1]
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert!(
+            mark_types.contains(&"strong") && mark_types.contains(&"em"),
+            "middle node should have strong+em, got: {mark_types:?}"
+        );
+        assert_eq!(nodes[2].text.as_deref(), Some(" after"));
     }
 
     #[test]
