@@ -1738,8 +1738,10 @@ fn try_parse_bracketed_span(text: &str, i: usize) -> Option<(usize, Vec<AdfNode>
     if attrs.has_flag("underline") {
         marks.push(AdfMark::underline());
     }
-    if let Some(ann_id) = attrs.get("annotation-id") {
-        let ann_type = attrs.get("annotation-type").unwrap_or("inlineComment");
+    let ann_ids = attrs.get_all("annotation-id");
+    let ann_types = attrs.get_all("annotation-type");
+    for (idx, ann_id) in ann_ids.iter().enumerate() {
+        let ann_type = ann_types.get(idx).copied().unwrap_or("inlineComment");
         marks.push(AdfMark::annotation(ann_id, ann_type));
     }
 
@@ -5785,6 +5787,142 @@ mod tests {
         assert!(
             marks.iter().any(|m| m.mark_type == "strong"),
             "should have strong"
+        );
+    }
+
+    #[test]
+    fn multiple_annotation_marks_round_trip() {
+        // Issue #439: multiple annotation marks on same text node — all but last dropped
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"some annotated text","marks":[
+            {"type":"annotation","attrs":{"id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","annotationType":"inlineComment"}},
+            {"type":"annotation","attrs":{"id":"ffffffff-1111-2222-3333-444444444444","annotationType":"inlineComment"}}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+            "JFM should contain first annotation id, got: {md}"
+        );
+        assert!(
+            md.contains("ffffffff-1111-2222-3333-444444444444"),
+            "JFM should contain second annotation id, got: {md}"
+        );
+
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let text_node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(text_node.text.as_deref(), Some("some annotated text"));
+        let marks = text_node.marks.as_ref().expect("should have marks");
+        let annotations: Vec<_> = marks
+            .iter()
+            .filter(|m| m.mark_type == "annotation")
+            .collect();
+        assert_eq!(
+            annotations.len(),
+            2,
+            "should have 2 annotation marks, got: {annotations:?}"
+        );
+        let ids: Vec<_> = annotations
+            .iter()
+            .map(|a| a.attrs.as_ref().unwrap()["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+        assert!(ids.contains(&"ffffffff-1111-2222-3333-444444444444"));
+    }
+
+    #[test]
+    fn three_annotation_marks_round_trip() {
+        // Verify three overlapping annotations all survive
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text_with_marks(
+                "triple annotated",
+                vec![
+                    AdfMark::annotation("id-1", "inlineComment"),
+                    AdfMark::annotation("id-2", "inlineComment"),
+                    AdfMark::annotation("id-3", "inlineComment"),
+                ],
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let text_node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let marks = text_node.marks.as_ref().expect("should have marks");
+        let annotations: Vec<_> = marks
+            .iter()
+            .filter(|m| m.mark_type == "annotation")
+            .collect();
+        assert_eq!(
+            annotations.len(),
+            3,
+            "should have 3 annotation marks, got: {annotations:?}"
+        );
+    }
+
+    #[test]
+    fn multiple_annotations_with_bold_round_trip() {
+        // Multiple annotations + bold should all survive
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text_with_marks(
+                "bold double annotated",
+                vec![
+                    AdfMark::strong(),
+                    AdfMark::annotation("ann-a", "inlineComment"),
+                    AdfMark::annotation("ann-b", "inlineComment"),
+                ],
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let text_node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let marks = text_node.marks.as_ref().expect("should have marks");
+        assert!(
+            marks.iter().any(|m| m.mark_type == "strong"),
+            "should have strong mark"
+        );
+        let annotations: Vec<_> = marks
+            .iter()
+            .filter(|m| m.mark_type == "annotation")
+            .collect();
+        assert_eq!(
+            annotations.len(),
+            2,
+            "should have 2 annotation marks, got: {annotations:?}"
+        );
+    }
+
+    #[test]
+    fn multiple_annotations_with_link_round_trip() {
+        // Multiple annotations + link should all survive
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"linked text","marks":[
+            {"type":"annotation","attrs":{"id":"ann-x","annotationType":"inlineComment"}},
+            {"type":"annotation","attrs":{"id":"ann-y","annotationType":"inlineComment"}},
+            {"type":"link","attrs":{"href":"https://example.com"}}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let text_node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let marks = text_node.marks.as_ref().expect("should have marks");
+        assert!(
+            marks.iter().any(|m| m.mark_type == "link"),
+            "should have link mark"
+        );
+        let annotations: Vec<_> = marks
+            .iter()
+            .filter(|m| m.mark_type == "annotation")
+            .collect();
+        assert_eq!(
+            annotations.len(),
+            2,
+            "should have 2 annotation marks, got: {annotations:?}"
         );
     }
 
