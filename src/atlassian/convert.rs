@@ -2203,8 +2203,9 @@ fn extract_trailing_local_id(text: &str) -> (&str, Option<String>, Option<String
             let local_id = attrs.get("localId").map(str::to_string);
             let para_local_id = attrs.get("paraLocalId").map(str::to_string);
             if local_id.is_some() || para_local_id.is_some() {
-                let before =
-                    trimmed[..brace_pos].trim_end_matches(|c: char| c.is_ascii_whitespace());
+                let before = trimmed[..brace_pos]
+                    .strip_suffix(' ')
+                    .unwrap_or(&trimmed[..brace_pos]);
                 return (before, local_id, para_local_id);
             }
         }
@@ -6870,6 +6871,56 @@ mod tests {
             "tl-xyz",
             "taskList localId should survive round-trip"
         );
+    }
+
+    #[test]
+    fn trailing_space_preserved_with_hex_localid() {
+        // Issue #449: trailing whitespace stripped from text node
+        // when listItem has a hex-format localId (no hyphens)
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[{"type":"listItem","attrs":{"localId":"aabb112233cc"},"content":[{"type":"paragraph","content":[{"type":"text","text":"trailing space "}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let item = &rt.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(
+            item.attrs.as_ref().unwrap()["localId"],
+            "aabb112233cc",
+            "localId should round-trip"
+        );
+        let para = &item.content.as_ref().unwrap()[0];
+        let inlines = para.content.as_ref().unwrap();
+        let last = inlines.last().unwrap();
+        assert!(
+            last.text.as_deref().unwrap_or("").ends_with(' '),
+            "trailing space should be preserved, got nodes: {:?}",
+            inlines
+                .iter()
+                .map(|n| (&n.node_type, &n.text))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn extract_trailing_local_id_preserves_trailing_space() {
+        // Issue #449: only strip the single separator space before {localId=...}
+        let (before, lid, _) = extract_trailing_local_id("trailing space  {localId=aabb112233cc}");
+        assert_eq!(before, "trailing space ");
+        assert_eq!(lid.as_deref(), Some("aabb112233cc"));
+    }
+
+    #[test]
+    fn extract_trailing_local_id_no_trailing_space() {
+        let (before, lid, _) = extract_trailing_local_id("text {localId=abc123}");
+        assert_eq!(before, "text");
+        assert_eq!(lid.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn extract_trailing_local_id_no_attrs() {
+        let (before, lid, pid) = extract_trailing_local_id("plain text");
+        assert_eq!(before, "plain text");
+        assert!(lid.is_none());
+        assert!(pid.is_none());
     }
 
     #[test]
