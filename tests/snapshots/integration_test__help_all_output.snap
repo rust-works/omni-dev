@@ -1112,6 +1112,7 @@ Options:
       --ready                      Creates PR as ready for review (overrides default)
       --draft                      Creates PR as draft (overrides default)
       --context-dir <CONTEXT_DIR>  Path to custom context directory (defaults to .omni-dev/)
+      --no-push                    Skip pushing the branch to remote before creating the PR
   -h, --help                       Print help
 
 
