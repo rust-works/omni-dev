@@ -750,10 +750,14 @@ impl AdfMark {
 
     /// Creates a breakout mark for block nodes.
     #[must_use]
-    pub fn breakout(mode: &str) -> Self {
+    pub fn breakout(mode: &str, width: Option<u32>) -> Self {
+        let mut attrs = serde_json::json!({"mode": mode});
+        if let Some(w) = width {
+            attrs["width"] = serde_json::json!(w);
+        }
         Self {
             mark_type: "breakout".to_string(),
-            attrs: Some(serde_json::json!({"mode": mode})),
+            attrs: Some(attrs),
         }
     }
 }
@@ -1261,8 +1265,17 @@ mod tests {
 
     #[test]
     fn breakout_mark() {
-        let mark = AdfMark::breakout("wide");
+        let mark = AdfMark::breakout("wide", None);
         assert_eq!(mark.mark_type, "breakout");
         assert_eq!(mark.attrs.as_ref().unwrap()["mode"], "wide");
+        assert!(mark.attrs.as_ref().unwrap().get("width").is_none());
+    }
+
+    #[test]
+    fn breakout_mark_with_width() {
+        let mark = AdfMark::breakout("wide", Some(1200));
+        assert_eq!(mark.mark_type, "breakout");
+        assert_eq!(mark.attrs.as_ref().unwrap()["mode"], "wide");
+        assert_eq!(mark.attrs.as_ref().unwrap()["width"], 1200);
     }
 }
