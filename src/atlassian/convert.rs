@@ -486,14 +486,14 @@ impl<'a> MarkdownParser<'a> {
                 let title = d.attrs.as_ref().and_then(|a| a.get("title"));
                 let inner_blocks = MarkdownParser::new(&inner_text).parse_blocks()?;
                 let mut node = AdfNode::expand(title, inner_blocks);
-                pass_through_local_id(&d.attrs, &mut node);
+                pass_through_expand_params(&d.attrs, &mut node);
                 node
             }
             "nested-expand" => {
                 let title = d.attrs.as_ref().and_then(|a| a.get("title"));
                 let inner_blocks = MarkdownParser::new(&inner_text).parse_blocks()?;
                 let mut node = AdfNode::nested_expand(title, inner_blocks);
-                pass_through_local_id(&d.attrs, &mut node);
+                pass_through_expand_params(&d.attrs, &mut node);
                 node
             }
             "layout" => {
@@ -1327,9 +1327,13 @@ fn try_parse_media_single_from_line(line: &str) -> Option<AdfNode> {
                         content: None,
                         text: None,
                         marks: None,
+                        local_id: None,
+                        parameters: None,
                     }]),
                     text: None,
                     marks: None,
+                    local_id: None,
+                    parameters: None,
                 });
             }
 
@@ -2060,6 +2064,8 @@ fn parse_emoji_with_attrs(text: &str, shortcode_end: usize, short_name: &str) ->
                 content: None,
                 text: None,
                 marks: None,
+                local_id: None,
+                parameters: None,
             },
         )
     } else {
@@ -2147,6 +2153,24 @@ fn pass_through_local_id(dir_attrs: &Option<crate::atlassian::attrs::Attrs>, nod
                 node_attrs["localId"] = serde_json::Value::String(local_id.to_string());
             } else {
                 node.attrs = Some(serde_json::json!({"localId": local_id}));
+            }
+        }
+    }
+}
+
+/// Copies `localId` from directive attrs to the node's top-level `local_id` field,
+/// and parses `params` JSON from directive attrs into the node's `parameters` field.
+fn pass_through_expand_params(
+    dir_attrs: &Option<crate::atlassian::attrs::Attrs>,
+    node: &mut AdfNode,
+) {
+    if let Some(ref attrs) = dir_attrs {
+        if let Some(local_id) = attrs.get("localId") {
+            node.local_id = Some(local_id.to_string());
+        }
+        if let Some(params_str) = attrs.get("params") {
+            if let Ok(params) = serde_json::from_str(params_str) {
+                node.parameters = Some(params);
             }
         }
     }
@@ -2506,8 +2530,19 @@ fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) 
             {
                 attr_parts.push(format!("title=\"{t}\""));
             }
-            if let Some(ref attrs) = node.attrs {
+            // Check top-level localId first, then fall back to attrs.localId
+            if let Some(ref lid) = node.local_id {
+                if !opts.strip_local_ids && lid != "00000000-0000-0000-0000-000000000000" {
+                    attr_parts.push(format!("localId={lid}"));
+                }
+            } else if let Some(ref attrs) = node.attrs {
                 maybe_push_local_id(attrs, &mut attr_parts, opts);
+            }
+            // Emit top-level parameters as params='...'
+            if let Some(ref params) = node.parameters {
+                if let Ok(json_str) = serde_json::to_string(params) {
+                    attr_parts.push(format!("params='{json_str}'"));
+                }
             }
             if attr_parts.is_empty() {
                 output.push_str(&format!(":::{directive_name}\n"));
@@ -4096,6 +4131,8 @@ mod tests {
                 content: None,
                 text: None,
                 marks: None,
+                local_id: None,
+                parameters: None,
             }],
         };
         let md = adf_to_markdown(&doc).unwrap();
@@ -4114,6 +4151,8 @@ mod tests {
                 content: None,
                 text: None,
                 marks: None,
+                local_id: None,
+                parameters: None,
             }],
         };
         let md = adf_to_markdown(&original).unwrap();
@@ -4808,6 +4847,8 @@ mod tests {
                 content: None,
                 text: None,
                 marks: None,
+                local_id: None,
+                parameters: None,
             }])],
         };
         let md = adf_to_markdown(&doc).unwrap();
@@ -4847,6 +4888,8 @@ mod tests {
                 content: None,
                 text: None,
                 marks: None,
+                local_id: None,
+                parameters: None,
             }])],
         };
         let md = adf_to_markdown(&doc).unwrap();
@@ -4876,6 +4919,8 @@ mod tests {
                 content: None,
                 text: None,
                 marks: None,
+                local_id: None,
+                parameters: None,
             }])],
         };
         let md = adf_to_markdown(&doc).unwrap();
@@ -4964,6 +5009,8 @@ mod tests {
                 content: None,
                 text: None,
                 marks: None,
+                local_id: None,
+                parameters: None,
             }])],
         };
         let md = adf_to_markdown(&doc).unwrap();
@@ -5043,6 +5090,8 @@ mod tests {
                 content: None,
                 text: None,
                 marks: None,
+                local_id: None,
+                parameters: None,
             }])],
         };
         let md = adf_to_markdown(&doc).unwrap();
@@ -9391,6 +9440,8 @@ mod tests {
                 ]),
                 text: None,
                 marks: None,
+                local_id: None,
+                parameters: None,
             }],
         };
 
@@ -9428,6 +9479,8 @@ mod tests {
                 ]),
                 text: None,
                 marks: None,
+                local_id: None,
+                parameters: None,
             }],
         };
 
@@ -9451,6 +9504,8 @@ mod tests {
                 content: Some(vec![AdfNode::paragraph(vec![AdfNode::text("item 1")])]),
                 text: None,
                 marks: None,
+                local_id: None,
+                parameters: None,
             },
             AdfNode {
                 node_type: "nestedExpand".to_string(),
@@ -9458,6 +9513,8 @@ mod tests {
                 content: Some(vec![AdfNode::paragraph(vec![AdfNode::text("item 2")])]),
                 text: None,
                 marks: None,
+                local_id: None,
+                parameters: None,
             },
         ];
         let adf = AdfDocument {
@@ -9542,6 +9599,8 @@ mod tests {
                         )])]),
                         text: None,
                         marks: None,
+                        local_id: None,
+                        parameters: None,
                     },
                 ]),
             ])])],
@@ -9575,6 +9634,8 @@ mod tests {
             content: Some(vec![AdfNode::paragraph(vec![AdfNode::text("content")])]),
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         };
         let adf = AdfDocument {
             version: 1,
@@ -9704,8 +9765,8 @@ mod tests {
         let expand = &rt.content[0];
         assert_eq!(expand.node_type, "expand");
         assert_eq!(
-            expand.attrs.as_ref().unwrap()["localId"],
-            "exp-001",
+            expand.local_id.as_deref(),
+            Some("exp-001"),
             "expand localId should survive round-trip"
         );
         assert_eq!(
@@ -9732,7 +9793,7 @@ mod tests {
         let rt = markdown_to_adf(&md).unwrap();
         let ne = &rt.content[0];
         assert_eq!(ne.node_type, "nestedExpand");
-        assert_eq!(ne.attrs.as_ref().unwrap()["localId"], "ne-001");
+        assert_eq!(ne.local_id.as_deref(), Some("ne-001"));
     }
 
     #[test]
@@ -9752,8 +9813,8 @@ mod tests {
         let ne = &rt.content[0];
         assert_eq!(ne.node_type, "nestedExpand");
         assert_eq!(
-            ne.attrs.as_ref().unwrap()["localId"],
-            "exp-001",
+            ne.local_id.as_deref(),
+            Some("exp-001"),
             "nestedExpand should preserve localId"
         );
         // Following paragraph should contain "after", not "{localId=...}"
@@ -9787,7 +9848,7 @@ mod tests {
             "should have localId without title: {md}"
         );
         let rt = markdown_to_adf(&md).unwrap();
-        assert_eq!(rt.content[0].attrs.as_ref().unwrap()["localId"], "exp-002");
+        assert_eq!(rt.content[0].local_id.as_deref(), Some("exp-002"));
     }
 
     #[test]
@@ -9807,6 +9868,157 @@ mod tests {
             md.contains(":::expand{title=\"X\"}"),
             "title should remain: {md}"
         );
+    }
+
+    // ── Issue #444: top-level localId and parameters on expand ──
+
+    #[test]
+    fn expand_top_level_localid_roundtrip() {
+        // localId as a top-level field (not inside attrs) should survive round-trip
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"expand","attrs":{"title":"My Section"},"localId":"abc-123","content":[
+            {"type":"paragraph","content":[{"type":"text","text":"hello"}]}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        assert_eq!(doc.content[0].local_id.as_deref(), Some("abc-123"));
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("localId=abc-123"),
+            "JFM should contain localId: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let expand = &rt.content[0];
+        assert_eq!(expand.node_type, "expand");
+        assert_eq!(expand.local_id.as_deref(), Some("abc-123"));
+        assert_eq!(
+            expand.attrs.as_ref().unwrap()["title"],
+            "My Section",
+            "title should survive round-trip"
+        );
+    }
+
+    #[test]
+    fn expand_parameters_roundtrip() {
+        // parameters (macroMetadata) should survive round-trip
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"expand","attrs":{"title":"Props"},"parameters":{"macroMetadata":{"macroId":{"value":"m-001"},"schemaVersion":{"value":"1"}}},"content":[
+            {"type":"paragraph","content":[{"type":"text","text":"body"}]}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        assert!(doc.content[0].parameters.is_some());
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("params="), "JFM should contain params: {md}");
+        let rt = markdown_to_adf(&md).unwrap();
+        let expand = &rt.content[0];
+        let params = expand
+            .parameters
+            .as_ref()
+            .expect("parameters should survive round-trip");
+        assert_eq!(params["macroMetadata"]["macroId"]["value"], "m-001");
+        assert_eq!(params["macroMetadata"]["schemaVersion"]["value"], "1");
+    }
+
+    #[test]
+    fn expand_localid_and_parameters_roundtrip() {
+        // Issue #444: both localId and parameters on expand should survive round-trip
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"expand","attrs":{"title":"My Section"},"localId":"abc-123","parameters":{"macroMetadata":{"macroId":{"value":"macro-001"},"schemaVersion":{"value":"1"},"title":"Page Properties"}},"content":[{"type":"paragraph","content":[{"type":"text","text":"hello"}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let expand = &rt.content[0];
+        assert_eq!(expand.node_type, "expand");
+        assert_eq!(expand.local_id.as_deref(), Some("abc-123"));
+        assert_eq!(expand.attrs.as_ref().unwrap()["title"], "My Section");
+        let params = expand
+            .parameters
+            .as_ref()
+            .expect("parameters should survive");
+        assert_eq!(params["macroMetadata"]["macroId"]["value"], "macro-001");
+        assert_eq!(params["macroMetadata"]["title"], "Page Properties");
+    }
+
+    #[test]
+    fn nested_expand_top_level_localid_and_parameters_roundtrip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"nestedExpand","attrs":{"title":"Nested"},"localId":"ne-100","parameters":{"macroMetadata":{"macroId":{"value":"nm-001"}}},"content":[
+            {"type":"paragraph","content":[{"type":"text","text":"inner"}]}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains(":::nested-expand{"),
+            "should use nested-expand: {md}"
+        );
+        assert!(md.contains("localId=ne-100"), "should have localId: {md}");
+        assert!(md.contains("params="), "should have params: {md}");
+        let rt = markdown_to_adf(&md).unwrap();
+        let ne = &rt.content[0];
+        assert_eq!(ne.node_type, "nestedExpand");
+        assert_eq!(ne.local_id.as_deref(), Some("ne-100"));
+        assert_eq!(
+            ne.parameters.as_ref().unwrap()["macroMetadata"]["macroId"]["value"],
+            "nm-001"
+        );
+    }
+
+    #[test]
+    fn expand_top_level_localid_stripped() {
+        // strip_local_ids should strip top-level localId too
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"expand","attrs":{"title":"X"},"localId":"exp-strip","content":[
+            {"type":"paragraph","content":[{"type":"text","text":"body"}]}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let opts = RenderOptions {
+            strip_local_ids: true,
+        };
+        let md = adf_to_markdown_with_options(&doc, &opts).unwrap();
+        assert!(!md.contains("localId"), "localId should be stripped: {md}");
+        assert!(
+            md.contains(":::expand{title=\"X\"}"),
+            "title should remain: {md}"
+        );
+    }
+
+    #[test]
+    fn expand_parameters_without_localid() {
+        // parameters without localId should work
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"expand","attrs":{"title":"P"},"parameters":{"macroMetadata":{"macroId":{"value":"solo"}}},"content":[
+            {"type":"paragraph","content":[{"type":"text","text":"data"}]}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(!md.contains("localId"), "no localId: {md}");
+        assert!(md.contains("params="), "has params: {md}");
+        let rt = markdown_to_adf(&md).unwrap();
+        assert!(rt.content[0].local_id.is_none());
+        assert_eq!(
+            rt.content[0].parameters.as_ref().unwrap()["macroMetadata"]["macroId"]["value"],
+            "solo"
+        );
+    }
+
+    #[test]
+    fn expand_localid_without_parameters() {
+        // top-level localId without parameters should work
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"expand","attrs":{"title":"L"},"localId":"lid-only","content":[
+            {"type":"paragraph","content":[{"type":"text","text":"txt"}]}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("localId=lid-only"), "has localId: {md}");
+        assert!(!md.contains("params="), "no params: {md}");
+        let rt = markdown_to_adf(&md).unwrap();
+        assert_eq!(rt.content[0].local_id.as_deref(), Some("lid-only"));
+        assert!(rt.content[0].parameters.is_none());
     }
 
     #[test]
@@ -11038,6 +11250,8 @@ C
             content: None,
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         };
         let mut output = String::new();
         let opts = RenderOptions::default();
@@ -11421,6 +11635,8 @@ C
                 content: None,
                 text: None,
                 marks: None,
+                local_id: None,
+                parameters: None,
             }])],
         };
         let md = adf_to_markdown(&doc).unwrap();
