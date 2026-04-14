@@ -873,6 +873,9 @@ impl<'a> MarkdownParser<'a> {
                         if let Some(wt) = attrs.get("widthType") {
                             ms_attrs["widthType"] = serde_json::Value::String(wt.to_string());
                         }
+                        if let Some(mode) = attrs.get("mode") {
+                            ms_attrs["mode"] = serde_json::Value::String(mode.to_string());
+                        }
                         return Some(AdfNode {
                             node_type: "mediaSingle".to_string(),
                             attrs: Some(ms_attrs),
@@ -901,6 +904,9 @@ impl<'a> MarkdownParser<'a> {
                         }
                         if let Some(wt) = attrs.get("widthType") {
                             node_attrs["widthType"] = serde_json::Value::String(wt.to_string());
+                        }
+                        if let Some(mode) = attrs.get("mode") {
+                            node_attrs["mode"] = serde_json::Value::String(mode.to_string());
                         }
                     }
                     return Some(node);
@@ -2957,6 +2963,9 @@ fn render_media(
                 if let Some(wt) = p_attrs.get("widthType").and_then(serde_json::Value::as_str) {
                     parts.push(format!("widthType={wt}"));
                 }
+                if let Some(mode) = p_attrs.get("mode").and_then(serde_json::Value::as_str) {
+                    parts.push(format!("mode={mode}"));
+                }
             }
             output.push_str(&format!("{{{}}}", parts.join(" ")));
         } else {
@@ -2972,9 +2981,11 @@ fn render_media(
                 let layout = p_attrs.get("layout").and_then(serde_json::Value::as_str);
                 let width = p_attrs.get("width").and_then(serde_json::Value::as_u64);
                 let width_type = p_attrs.get("widthType").and_then(serde_json::Value::as_str);
+                let mode = p_attrs.get("mode").and_then(serde_json::Value::as_str);
                 let has_non_default = layout.is_some_and(|l| l != "center")
                     || width.is_some()
-                    || width_type.is_some();
+                    || width_type.is_some()
+                    || mode.is_some();
                 if has_non_default {
                     let mut parts = Vec::new();
                     if let Some(l) = layout {
@@ -2987,6 +2998,9 @@ fn render_media(
                     }
                     if let Some(wt) = width_type {
                         parts.push(format!("widthType={wt}"));
+                    }
+                    if let Some(mode) = p_attrs.get("mode").and_then(serde_json::Value::as_str) {
+                        parts.push(format!("mode={mode}"));
                     }
                     if !parts.is_empty() {
                         output.push_str(&format!("{{{}}}", parts.join(" ")));
@@ -7773,6 +7787,102 @@ mod tests {
         let ms_attrs = ms.attrs.as_ref().unwrap();
         assert_eq!(ms_attrs["widthType"], "pixel");
         assert_eq!(ms_attrs["width"], 312);
+    }
+
+    #[test]
+    fn file_media_mode_roundtrip() {
+        // mediaSingle with mode attr should survive round-trip (issue #431)
+        let adf_doc = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [{
+                "type": "mediaSingle",
+                "attrs": {"layout": "wide", "mode": "wide", "width": 1200},
+                "content": [{
+                    "type": "media",
+                    "attrs": {
+                        "type": "file",
+                        "id": "abc123",
+                        "collection": "test",
+                        "width": 1200,
+                        "height": 600
+                    }
+                }]
+            }]
+        });
+        let doc: crate::atlassian::adf::AdfDocument = serde_json::from_value(adf_doc).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("mode=wide"),
+            "expected mode=wide in markdown, got: {md}"
+        );
+        let doc2 = markdown_to_adf(&md).unwrap();
+        let ms = &doc2.content[0];
+        let ms_attrs = ms.attrs.as_ref().unwrap();
+        assert_eq!(ms_attrs["mode"], "wide");
+        assert_eq!(ms_attrs["layout"], "wide");
+        assert_eq!(ms_attrs["width"], 1200);
+    }
+
+    #[test]
+    fn external_media_mode_roundtrip() {
+        // External mediaSingle with mode attr should survive round-trip (issue #431)
+        let adf_doc = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [{
+                "type": "mediaSingle",
+                "attrs": {"layout": "wide", "mode": "wide"},
+                "content": [{
+                    "type": "media",
+                    "attrs": {
+                        "type": "external",
+                        "url": "https://example.com/image.png"
+                    }
+                }]
+            }]
+        });
+        let doc: crate::atlassian::adf::AdfDocument = serde_json::from_value(adf_doc).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("mode=wide"),
+            "expected mode=wide in markdown, got: {md}"
+        );
+        let doc2 = markdown_to_adf(&md).unwrap();
+        let ms = &doc2.content[0];
+        let ms_attrs = ms.attrs.as_ref().unwrap();
+        assert_eq!(ms_attrs["mode"], "wide");
+        assert_eq!(ms_attrs["layout"], "wide");
+    }
+
+    #[test]
+    fn media_mode_only_roundtrip() {
+        // mediaSingle with mode but default layout should still preserve mode (issue #431)
+        let adf_doc = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [{
+                "type": "mediaSingle",
+                "attrs": {"layout": "center", "mode": "default"},
+                "content": [{
+                    "type": "media",
+                    "attrs": {
+                        "type": "external",
+                        "url": "https://example.com/image.png"
+                    }
+                }]
+            }]
+        });
+        let doc: crate::atlassian::adf::AdfDocument = serde_json::from_value(adf_doc).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("mode=default"),
+            "expected mode=default in markdown, got: {md}"
+        );
+        let doc2 = markdown_to_adf(&md).unwrap();
+        let ms = &doc2.content[0];
+        let ms_attrs = ms.attrs.as_ref().unwrap();
+        assert_eq!(ms_attrs["mode"], "default");
     }
 
     #[test]
