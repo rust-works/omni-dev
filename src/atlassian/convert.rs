@@ -134,7 +134,7 @@ impl<'a> MarkdownParser<'a> {
             return None;
         }
 
-        let text = trimmed[level + 1..].trim();
+        let text = trimmed[level + 1..].trim_start();
         let inline_nodes = parse_inline(text);
 
         self.advance();
@@ -7282,6 +7282,59 @@ mod tests {
             last.text.as_deref(),
             Some(" "),
             "trailing space should be preserved in ordered list item"
+        );
+    }
+
+    #[test]
+    fn trailing_space_in_heading_text_preserved() {
+        // Issue #400: trailing space in heading text node trimmed on round-trip
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"heading","attrs":{"level":1},"content":[
+          {"type":"text","text":"Firefighting Engineers "}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let inlines = round_tripped.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            inlines[0].text.as_deref(),
+            Some("Firefighting Engineers "),
+            "trailing space in heading should be preserved"
+        );
+    }
+
+    #[test]
+    fn trailing_space_in_heading_before_bold_preserved() {
+        // Issue #400: trailing space before bold sibling in heading
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"heading","attrs":{"level":2},"content":[
+          {"type":"text","text":"Classic "},
+          {"type":"text","text":"bold","marks":[{"type":"strong"}]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let inlines = round_tripped.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            inlines[0].text.as_deref(),
+            Some("Classic "),
+            "trailing space in heading text before bold should be preserved"
+        );
+    }
+
+    #[test]
+    fn trailing_space_in_paragraph_text_preserved() {
+        // Issue #400: trailing space in paragraph text node preserved on round-trip
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"word followed by space "},
+          {"type":"text","text":"next node","marks":[{"type":"strong"}]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let inlines = round_tripped.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            inlines[0].text.as_deref(),
+            Some("word followed by space "),
+            "trailing space in paragraph text should be preserved"
         );
     }
 
