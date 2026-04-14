@@ -961,7 +961,7 @@ impl<'a> MarkdownParser<'a> {
     }
 
     fn parse_paragraph(&mut self) -> Result<AdfNode> {
-        let mut lines = Vec::new();
+        let mut lines: Vec<&str> = Vec::new();
 
         while !self.at_end() {
             let line = self.current_line();
@@ -974,6 +974,18 @@ impl<'a> MarkdownParser<'a> {
                 || (is_horizontal_rule(line) && !lines.is_empty())
             {
                 break;
+            }
+            // Strip 2-space indent from hardBreak continuation lines so
+            // the content round-trips correctly (issue #455).
+            let is_hardbreak_cont = !lines.is_empty()
+                && line.starts_with("  ")
+                && lines
+                    .last()
+                    .is_some_and(|prev| has_trailing_hard_break(prev));
+            if is_hardbreak_cont {
+                lines.push(&line[2..]);
+                self.advance();
+                continue;
             }
             if !lines.is_empty()
                 && (line.starts_with('#') || line.starts_with('>') || is_list_start(line))
@@ -2343,12 +2355,24 @@ fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) 
                 } else {
                     // Escape a leading list-marker pattern so paragraph
                     // text is not re-parsed as a list item (issue #402).
-                    let first = buf.lines().next().unwrap_or("");
-                    if is_list_start(first) {
-                        output.push_str(&escape_list_marker(first));
-                        output.push_str(&buf[first.len()..]);
-                    } else {
-                        output.push_str(&buf);
+                    // Indent continuation lines produced by hardBreaks so
+                    // they are not re-parsed as list items (issue #455).
+                    let mut is_first_line = true;
+                    for line in buf.split('\n') {
+                        if is_first_line {
+                            if is_list_start(line) {
+                                output.push_str(&escape_list_marker(line));
+                            } else {
+                                output.push_str(line);
+                            }
+                            is_first_line = false;
+                        } else {
+                            output.push('\n');
+                            if !line.is_empty() {
+                                output.push_str("  ");
+                            }
+                            output.push_str(line);
+                        }
                     }
                     output.push('\n');
                 }
@@ -4973,7 +4997,7 @@ mod tests {
             ])],
         };
         let md = adf_to_markdown(&doc).unwrap();
-        assert!(md.contains("Line 1\\\nLine 2"));
+        assert!(md.contains("Line 1\\\n  Line 2"));
     }
 
     #[test]
@@ -11062,6 +11086,194 @@ C
         merge_adjacent_text(&mut nodes);
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].text.as_deref().unwrap(), "abc");
+    }
+
+    // ── Issue #455: text after hardBreak in paragraph re-parsed as list ──
+
+    #[test]
+    fn issue_455_paragraph_hardbreak_ordered_marker_roundtrips() {
+        // Issue #455: "1. text" after a hardBreak in a paragraph must not
+        // become an ordered list.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"Introduction: "},
+          {"type":"hardBreak"},
+          {"type":"text","text":"1. This text follows a hardBreak"}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        assert_eq!(rt.content.len(), 1, "Should remain one block");
+        assert_eq!(rt.content[0].node_type, "paragraph");
+        let inlines = rt.content[0].content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types, vec!["text", "hardBreak", "text"]);
+        assert_eq!(
+            inlines[2].text.as_deref(),
+            Some("1. This text follows a hardBreak")
+        );
+    }
+
+    #[test]
+    fn issue_455_paragraph_hardbreak_bullet_marker_roundtrips() {
+        // Issue #455 variant: "- text" after a hardBreak in a paragraph.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"Intro"},
+          {"type":"hardBreak"},
+          {"type":"text","text":"- not a list item"}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        assert_eq!(rt.content.len(), 1);
+        assert_eq!(rt.content[0].node_type, "paragraph");
+        let inlines = rt.content[0].content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types, vec!["text", "hardBreak", "text"]);
+        assert_eq!(inlines[2].text.as_deref(), Some("- not a list item"));
+    }
+
+    #[test]
+    fn issue_455_paragraph_hardbreak_heading_marker_roundtrips() {
+        // Issue #455 variant: "# text" after a hardBreak in a paragraph.
+        let adf_json = r##"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"Intro"},
+          {"type":"hardBreak"},
+          {"type":"text","text":"# not a heading"}
+        ]}]}"##;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        assert_eq!(rt.content.len(), 1);
+        assert_eq!(rt.content[0].node_type, "paragraph");
+        let inlines = rt.content[0].content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types, vec!["text", "hardBreak", "text"]);
+        assert_eq!(inlines[2].text.as_deref(), Some("# not a heading"));
+    }
+
+    #[test]
+    fn issue_455_paragraph_hardbreak_blockquote_marker_roundtrips() {
+        // Issue #455 variant: "> text" after a hardBreak in a paragraph.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"Intro"},
+          {"type":"hardBreak"},
+          {"type":"text","text":"> not a blockquote"}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        assert_eq!(rt.content.len(), 1);
+        assert_eq!(rt.content[0].node_type, "paragraph");
+        let inlines = rt.content[0].content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types, vec!["text", "hardBreak", "text"]);
+        assert_eq!(inlines[2].text.as_deref(), Some("> not a blockquote"));
+    }
+
+    #[test]
+    fn issue_455_paragraph_multiple_hardbreaks_with_ordered_markers() {
+        // Multiple hardBreaks in a paragraph, each followed by "N. text".
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"Preamble"},
+          {"type":"hardBreak"},
+          {"type":"text","text":"1. First"},
+          {"type":"hardBreak"},
+          {"type":"text","text":"2. Second"},
+          {"type":"hardBreak"},
+          {"type":"text","text":"3. Third"}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        assert_eq!(rt.content.len(), 1);
+        assert_eq!(rt.content[0].node_type, "paragraph");
+        let inlines = rt.content[0].content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec![
+                "text",
+                "hardBreak",
+                "text",
+                "hardBreak",
+                "text",
+                "hardBreak",
+                "text"
+            ]
+        );
+        assert_eq!(inlines[2].text.as_deref(), Some("1. First"));
+        assert_eq!(inlines[4].text.as_deref(), Some("2. Second"));
+        assert_eq!(inlines[6].text.as_deref(), Some("3. Third"));
+    }
+
+    #[test]
+    fn issue_455_paragraph_hardbreak_jfm_indentation() {
+        // Verify that ADF→JFM output indents continuation lines.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"Intro"},
+          {"type":"hardBreak"},
+          {"type":"text","text":"1. continued"}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("Intro\\\n  1. continued"),
+            "Continuation should be 2-space-indented, got: {md:?}"
+        );
+    }
+
+    #[test]
+    fn issue_455_paragraph_hardbreak_from_jfm() {
+        // Verify that JFM with 2-space-indented continuation is parsed
+        // back as a single paragraph with hardBreak.
+        let md = "Intro\\\n  1. This is continuation text\n";
+        let doc = markdown_to_adf(md).unwrap();
+
+        assert_eq!(doc.content.len(), 1);
+        assert_eq!(doc.content[0].node_type, "paragraph");
+        let inlines = doc.content[0].content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types, vec!["text", "hardBreak", "text"]);
+        assert_eq!(
+            inlines[2].text.as_deref(),
+            Some("1. This is continuation text")
+        );
+    }
+
+    #[test]
+    fn issue_455_paragraph_starts_with_ordered_marker_and_hardbreak() {
+        // Coverage: first line IS a list marker AND paragraph has hardBreaks.
+        // Exercises the escape_list_marker path on the first line of a
+        // multi-line paragraph buf in the rendering code.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"1. Starting with a number"},
+          {"type":"hardBreak"},
+          {"type":"text","text":"continuation after break"}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        // First line should be escaped so it's not parsed as ordered list
+        assert!(
+            md.contains(r"1\. Starting with a number"),
+            "First line should have escaped list marker, got: {md:?}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+
+        assert_eq!(rt.content.len(), 1);
+        assert_eq!(rt.content[0].node_type, "paragraph");
+        let inlines = rt.content[0].content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types, vec!["text", "hardBreak", "text"]);
+        assert_eq!(
+            inlines[0].text.as_deref(),
+            Some("1. Starting with a number")
+        );
+        assert_eq!(inlines[2].text.as_deref(), Some("continuation after break"));
     }
 
     #[test]
