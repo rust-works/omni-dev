@@ -62,6 +62,14 @@ pub struct AdfNode {
     /// Inline marks applied to this node (bold, italic, link, etc.).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub marks: Option<Vec<AdfMark>>,
+
+    /// Top-level local ID (used by expand, nestedExpand, and other node types).
+    #[serde(rename = "localId", skip_serializing_if = "Option::is_none")]
+    pub local_id: Option<String>,
+
+    /// Top-level parameters (used by expand nodes with macroMetadata, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
 }
 
 impl AdfNode {
@@ -74,6 +82,8 @@ impl AdfNode {
             content: None,
             text: Some(content.to_string()),
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -86,6 +96,8 @@ impl AdfNode {
             content: None,
             text: Some(content.to_string()),
             marks: if marks.is_empty() { None } else { Some(marks) },
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -102,6 +114,8 @@ impl AdfNode {
             },
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -118,6 +132,8 @@ impl AdfNode {
             },
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -130,6 +146,8 @@ impl AdfNode {
             content: Some(vec![Self::text(text)]),
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -142,6 +160,8 @@ impl AdfNode {
             content: Some(content),
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -154,6 +174,8 @@ impl AdfNode {
             content: None,
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -166,6 +188,8 @@ impl AdfNode {
             content: Some(items),
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -178,6 +202,8 @@ impl AdfNode {
             content: Some(items),
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -190,6 +216,8 @@ impl AdfNode {
             content: Some(content),
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -202,6 +230,8 @@ impl AdfNode {
             content: None,
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -214,6 +244,8 @@ impl AdfNode {
             content: Some(rows),
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -226,6 +258,8 @@ impl AdfNode {
             content: Some(rows),
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -238,6 +272,8 @@ impl AdfNode {
             content: Some(cells),
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -250,6 +286,8 @@ impl AdfNode {
             content: Some(content),
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -262,6 +300,8 @@ impl AdfNode {
             content: Some(content),
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -274,6 +314,8 @@ impl AdfNode {
             content: Some(content),
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -286,6 +328,8 @@ impl AdfNode {
             content: Some(content),
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -298,6 +342,8 @@ impl AdfNode {
             content: Some(content),
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -310,6 +356,8 @@ impl AdfNode {
             content: None,
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -332,9 +380,13 @@ impl AdfNode {
                 content: None,
                 text: None,
                 marks: None,
+                local_id: None,
+                parameters: None,
             }]),
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -349,6 +401,8 @@ impl AdfNode {
             content: Some(items),
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -368,6 +422,8 @@ impl AdfNode {
             },
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -382,6 +438,8 @@ impl AdfNode {
             content: None,
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -398,6 +456,8 @@ impl AdfNode {
             content: None,
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -410,6 +470,8 @@ impl AdfNode {
             content: None,
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -422,6 +484,8 @@ impl AdfNode {
             content: None,
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -437,6 +501,8 @@ impl AdfNode {
             content: None,
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -451,6 +517,8 @@ impl AdfNode {
             content: None,
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -478,6 +546,8 @@ impl AdfNode {
             content: None,
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -492,6 +562,8 @@ impl AdfNode {
             content: Some(content),
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -505,6 +577,8 @@ impl AdfNode {
             content: Some(content),
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -518,6 +592,8 @@ impl AdfNode {
             content: Some(content),
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -532,6 +608,8 @@ impl AdfNode {
             content: Some(columns),
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -544,6 +622,8 @@ impl AdfNode {
             content: Some(content),
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -558,6 +638,8 @@ impl AdfNode {
             content: Some(items),
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -573,6 +655,8 @@ impl AdfNode {
             content: Some(content),
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -598,6 +682,8 @@ impl AdfNode {
             content: None,
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -613,6 +699,8 @@ impl AdfNode {
             content: Some(content),
             text: None,
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 
@@ -632,6 +720,8 @@ impl AdfNode {
             content: None,
             text: fallback_text.map(String::from),
             marks: None,
+            local_id: None,
+            parameters: None,
         }
     }
 }
