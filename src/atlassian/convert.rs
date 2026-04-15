@@ -1308,6 +1308,21 @@ fn escape_backticks(text: &str) -> String {
     out
 }
 
+/// Escapes square brackets (`[` and `]`) in text that will appear inside a
+/// markdown link's `[…]` delimiters.  Without this, a text node containing a
+/// literal `[` or `]` can create ambiguous markdown link syntax on round-trip
+/// (see issue #493).
+fn escape_link_brackets(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch == '[' || ch == ']' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Escapes bare URLs (`http://` and `https://`) in plain text so they are not
 /// parsed as `inlineCard` nodes during round-trip.  The leading `h` is
 /// backslash-escaped, which is enough to prevent the auto-link detector from
@@ -2048,12 +2063,16 @@ fn try_parse_bracketed_span(text: &str, i: usize) -> Option<(usize, Vec<AdfNode>
 
     // Find the matching ] by counting bracket depth (supports nested brackets
     // such as [[text](url)]{underline} for underline-before-link ordering).
+    // Backslash-escaped brackets are skipped (issue #493).
     let mut depth: usize = 0;
     let mut bracket_close = None;
+    let bs_bytes = rest.as_bytes();
     for (j, ch) in rest.char_indices() {
         match ch {
-            '[' => depth += 1,
-            ']' => {
+            '\\' if j + 1 < bs_bytes.len()
+                && (bs_bytes[j + 1] == b'[' || bs_bytes[j + 1] == b']') => {}
+            '[' if j == 0 || bs_bytes[j - 1] != b'\\' => depth += 1,
+            ']' if j == 0 || bs_bytes[j - 1] != b'\\' => {
                 depth -= 1;
                 if depth == 0 {
                     bracket_close = Some(j);
@@ -2333,13 +2352,17 @@ fn try_parse_link(text: &str, i: usize) -> Option<(usize, &str, &str)> {
         return None;
     }
 
-    // Find the matching ] by counting bracket depth
+    // Find the matching ] by counting bracket depth, skipping escaped brackets
     let mut depth: usize = 0;
     let mut text_end = None;
+    let bytes = rest.as_bytes();
     for (j, ch) in rest.char_indices() {
         match ch {
-            '[' => depth += 1,
-            ']' => {
+            '\\' if j + 1 < bytes.len() && (bytes[j + 1] == b'[' || bytes[j + 1] == b']') => {
+                // Skip backslash-escaped bracket (issue #493)
+            }
+            '[' if j == 0 || bytes[j - 1] != b'\\' => depth += 1,
+            ']' if j == 0 || bytes[j - 1] != b'\\' => {
                 depth -= 1;
                 if depth == 0 {
                     text_end = Some(j);
@@ -3928,10 +3951,10 @@ fn render_marked_text(text: &str, marks: &[AdfMark], output: &mut String) {
     let escaped = escape_emphasis_markers(text);
     let escaped = escape_emoji_shortcodes(&escaped);
     let escaped = escape_backticks(&escaped);
-    let escaped = if has_link.is_none() {
-        escape_bare_urls(&escaped)
+    let escaped = if has_link.is_some() {
+        escape_link_brackets(&escaped)
     } else {
-        escaped
+        escape_bare_urls(&escaped)
     };
     inner.push_str(&escaped);
     if inner_em {
@@ -7114,6 +7137,175 @@ mod tests {
                 .is_some_and(|m| m.iter().any(|mk| mk.mark_type == "link"))
         });
         assert!(has_link, "link mark should be preserved");
+    }
+
+    // ── Issue #493: bracket-link ambiguity ─────────────────────────────
+
+    #[test]
+    fn escape_link_brackets_unit() {
+        assert_eq!(escape_link_brackets("hello"), "hello");
+        assert_eq!(escape_link_brackets("["), "\\[");
+        assert_eq!(escape_link_brackets("]"), "\\]");
+        assert_eq!(escape_link_brackets("[PROJ-456]"), "\\[PROJ-456\\]");
+        assert_eq!(escape_link_brackets("a[b]c"), "a\\[b\\]c");
+    }
+
+    #[test]
+    fn bracket_text_with_link_mark_escapes_brackets() {
+        // A text node whose content is "[" with a link mark should escape
+        // the bracket so it does not create ambiguous markdown link syntax.
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text_with_marks(
+                "[",
+                vec![AdfMark::link("https://example.com")],
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert_eq!(md.trim(), "[\\[](https://example.com)");
+    }
+
+    #[test]
+    fn bracket_text_with_link_mark_round_trips() {
+        // Issue #493 reproducer: adjacent text nodes sharing a link mark
+        // where the first node's content is "[".
+        let adf_json = r#"{
+            "type": "doc",
+            "version": 1,
+            "content": [{
+                "type": "paragraph",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "[",
+                        "marks": [{"type": "link", "attrs": {"href": "https://example.com/ticket/123"}}]
+                    },
+                    {
+                        "type": "text",
+                        "text": "PROJ-456] Fix the auth bug",
+                        "marks": [
+                            {"type": "underline"},
+                            {"type": "link", "attrs": {"href": "https://example.com/ticket/123"}}
+                        ]
+                    }
+                ]
+            }]
+        }"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+
+        // The markdown should contain escaped brackets inside the link
+        assert!(jfm.contains("\\["), "opening bracket should be escaped");
+
+        // Round-trip: both text nodes must survive with link marks
+        let rt = markdown_to_adf(&jfm).unwrap();
+        let content = rt.content[0].content.as_ref().unwrap();
+
+        // All text nodes that were part of the link must still carry a link mark
+        let link_nodes: Vec<_> = content
+            .iter()
+            .filter(|n| {
+                n.marks
+                    .as_ref()
+                    .is_some_and(|m| m.iter().any(|mk| mk.mark_type == "link"))
+            })
+            .collect();
+        assert!(
+            !link_nodes.is_empty(),
+            "link mark must be preserved on round-trip"
+        );
+
+        // The combined text across all nodes should contain the original content
+        let all_text: String = content.iter().filter_map(|n| n.text.as_deref()).collect();
+        assert!(
+            all_text.contains('['),
+            "literal '[' must survive round-trip"
+        );
+        assert!(
+            all_text.contains("PROJ-456]"),
+            "continuation text must survive round-trip"
+        );
+    }
+
+    #[test]
+    fn closing_bracket_in_link_text_round_trips() {
+        // A text node containing "]" inside a link should be escaped and
+        // survive round-trip without breaking the link syntax.
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text_with_marks(
+                "item]",
+                vec![AdfMark::link("https://example.com")],
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert_eq!(md.trim(), "[item\\]](https://example.com)");
+
+        let rt = markdown_to_adf(&md).unwrap();
+        let content = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(content[0].text.as_deref(), Some("item]"));
+        assert!(content[0]
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|m| m.mark_type == "link"));
+    }
+
+    #[test]
+    fn brackets_in_link_text_round_trip() {
+        // Text containing both [ and ] inside a link should round-trip.
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text_with_marks(
+                "[PROJ-123]",
+                vec![AdfMark::link("https://example.com")],
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert_eq!(md.trim(), "[\\[PROJ-123\\]](https://example.com)");
+
+        let rt = markdown_to_adf(&md).unwrap();
+        let content = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(content[0].text.as_deref(), Some("[PROJ-123]"));
+        assert!(content[0]
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|m| m.mark_type == "link"));
+    }
+
+    #[test]
+    fn plain_text_brackets_not_escaped() {
+        // Brackets in plain text (no link mark) must NOT be escaped.
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text(
+                "see [PROJ-123] for details",
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert_eq!(md.trim(), "see [PROJ-123] for details");
+    }
+
+    #[test]
+    fn link_with_no_brackets_unchanged() {
+        // A normal link with no brackets in the text should be unaffected.
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text_with_marks(
+                "click here",
+                vec![AdfMark::link("https://example.com")],
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert_eq!(md.trim(), "[click here](https://example.com)");
     }
 
     #[test]
