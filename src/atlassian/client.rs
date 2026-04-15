@@ -2295,6 +2295,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_sprint_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "id": 42,
+                    "name": "Sprint 5",
+                    "state": "future",
+                    "startDate": "2026-05-01",
+                    "endDate": "2026-05-14",
+                    "goal": "Ship v2"
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let sprint = client
+            .create_sprint(
+                1,
+                "Sprint 5",
+                Some("2026-05-01"),
+                Some("2026-05-14"),
+                Some("Ship v2"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(sprint.id, 42);
+        assert_eq!(sprint.name, "Sprint 5");
+        assert_eq!(sprint.state, "future");
+        assert_eq!(sprint.goal.as_deref(), Some("Ship v2"));
+    }
+
+    #[tokio::test]
+    async fn create_sprint_minimal() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint"))
+            .respond_with(wiremock::ResponseTemplate::new(201).set_body_json(
+                serde_json::json!({"id": 43, "name": "Sprint 6", "state": "future"}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let sprint = client
+            .create_sprint(1, "Sprint 6", None, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(sprint.id, 43);
+        assert!(sprint.start_date.is_none());
+    }
+
+    #[tokio::test]
+    async fn create_sprint_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint"))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("Bad Request"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .create_sprint(999, "Bad", None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("400"));
+    }
+
+    #[tokio::test]
+    async fn update_sprint_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint/42"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"id": 42, "name": "Sprint 5 Updated", "state": "active"}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client
+            .update_sprint(
+                42,
+                Some("Sprint 5 Updated"),
+                Some("active"),
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn update_sprint_all_fields() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint/42"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"id": 42, "name": "Sprint 5", "state": "active"}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client
+            .update_sprint(
+                42,
+                Some("Sprint 5"),
+                Some("active"),
+                Some("2026-05-01"),
+                Some("2026-05-14"),
+                Some("Ship v2"),
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn update_sprint_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint/999"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .update_sprint(999, Some("Nope"), None, None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
     async fn get_issue_links_success() {
         let server = wiremock::MockServer::start().await;
 
@@ -4436,6 +4589,105 @@ impl AtlassianClient {
         let body = serde_json::json!({ "issues": issue_keys });
 
         let response = self.post_json(&url, &body).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        Ok(())
+    }
+
+    /// Creates a new sprint on an agile board.
+    pub async fn create_sprint(
+        &self,
+        board_id: u64,
+        name: &str,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+        goal: Option<&str>,
+    ) -> Result<AgileSprint> {
+        let url = format!("{}/rest/agile/1.0/sprint", self.instance_url);
+
+        let mut body = serde_json::json!({
+            "originBoardId": board_id,
+            "name": name
+        });
+        if let Some(sd) = start_date {
+            body["startDate"] = serde_json::Value::String(sd.to_string());
+        }
+        if let Some(ed) = end_date {
+            body["endDate"] = serde_json::Value::String(ed.to_string());
+        }
+        if let Some(g) = goal {
+            body["goal"] = serde_json::Value::String(g.to_string());
+        }
+
+        let response = self.post_json(&url, &body).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let entry: AgileSprintEntry = response
+            .json()
+            .await
+            .context("Failed to parse sprint create response")?;
+
+        Ok(AgileSprint {
+            id: entry.id,
+            name: entry.name,
+            state: entry.state,
+            start_date: entry.start_date,
+            end_date: entry.end_date,
+            goal: entry.goal,
+        })
+    }
+
+    /// Updates an existing sprint.
+    pub async fn update_sprint(
+        &self,
+        sprint_id: u64,
+        name: Option<&str>,
+        state: Option<&str>,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+        goal: Option<&str>,
+    ) -> Result<()> {
+        let url = format!("{}/rest/agile/1.0/sprint/{}", self.instance_url, sprint_id);
+
+        let mut body = serde_json::Map::new();
+        if let Some(n) = name {
+            body.insert("name".to_string(), serde_json::Value::String(n.to_string()));
+        }
+        if let Some(s) = state {
+            body.insert(
+                "state".to_string(),
+                serde_json::Value::String(s.to_string()),
+            );
+        }
+        if let Some(sd) = start_date {
+            body.insert(
+                "startDate".to_string(),
+                serde_json::Value::String(sd.to_string()),
+            );
+        }
+        if let Some(ed) = end_date {
+            body.insert(
+                "endDate".to_string(),
+                serde_json::Value::String(ed.to_string()),
+            );
+        }
+        if let Some(g) = goal {
+            body.insert("goal".to_string(), serde_json::Value::String(g.to_string()));
+        }
+
+        let response = self
+            .put_json(&url, &serde_json::Value::Object(body))
+            .await?;
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
