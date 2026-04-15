@@ -268,7 +268,13 @@ impl<'a> MarkdownParser<'a> {
             // Detect task list items: - [ ] or - [x]
             if let Some((state, text)) = try_parse_task_marker(after_marker) {
                 is_task_list = true;
-                let (item_text, local_id, para_local_id) = extract_trailing_local_id(text);
+                self.advance();
+                // Collect hardBreak continuation lines so that a trailing
+                // {localId=…} on the last continuation line is found by
+                // extract_trailing_local_id (issue #507).
+                let mut full_text = text.to_string();
+                self.collect_hardbreak_continuations(&mut full_text);
+                let (item_text, local_id, para_local_id) = extract_trailing_local_id(&full_text);
                 let inline_nodes = parse_inline(item_text);
                 // If a paraLocalId marker is present the original ADF had a
                 // paragraph wrapper around the inline content — restore it
@@ -289,7 +295,6 @@ impl<'a> MarkdownParser<'a> {
                         attrs["localId"] = serde_json::Value::String(id);
                     }
                 }
-                self.advance();
                 // Collect indented sub-content (e.g. nested task lists
                 // from malformed ADF where taskItem contains taskItem
                 // children directly — issue #489).
@@ -9358,6 +9363,71 @@ mod tests {
         let content = items[1].content.as_ref().unwrap();
         assert_eq!(content.len(), 1);
         assert_eq!(content[0].text.as_deref(), Some("done task"));
+    }
+
+    /// Issue #507: numeric localId on taskItem with hardBreak must survive
+    /// round-trip — the {localId=…} suffix lands on the continuation line
+    /// and must still be extracted by the parser.
+    #[test]
+    fn task_item_numeric_localid_with_hardbreak_roundtrip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"taskList","attrs":{"localId":""},"content":[{"type":"taskItem","attrs":{"localId":"42","state":"DONE"},"content":[{"type":"paragraph","content":[{"type":"text","text":"Engineering Onboarding Link","marks":[{"type":"link","attrs":{"href":"https://example.com/onboarding"}}]},{"type":"hardBreak"},{"type":"text","text":"(This has links to all the various useful tools!!)"}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        // localId must appear in the markdown output
+        assert!(md.contains("localId=42"), "localId=42 missing: {md}");
+        // Round-trip back to ADF
+        let rt = markdown_to_adf(&md).unwrap();
+        assert_eq!(rt.content.len(), 1, "exactly one top-level node");
+        let task_list = &rt.content[0];
+        assert_eq!(task_list.node_type, "taskList");
+        let items = task_list.content.as_ref().unwrap();
+        assert_eq!(items.len(), 1);
+        // localId preserved
+        assert_eq!(items[0].attrs.as_ref().unwrap()["localId"], "42");
+        assert_eq!(items[0].attrs.as_ref().unwrap()["state"], "DONE");
+        // Content structure preserved: paragraph with link + hardBreak + text
+        let para = &items[0].content.as_ref().unwrap()[0];
+        assert_eq!(para.node_type, "paragraph");
+        let inlines = para.content.as_ref().unwrap();
+        assert_eq!(inlines[0].node_type, "text");
+        assert_eq!(
+            inlines[0].text.as_deref(),
+            Some("Engineering Onboarding Link")
+        );
+        assert_eq!(inlines[1].node_type, "hardBreak");
+        assert_eq!(inlines[2].node_type, "text");
+        assert_eq!(
+            inlines[2].text.as_deref(),
+            Some("(This has links to all the various useful tools!!)")
+        );
+        // The {localId=…} must not appear as literal text in the ADF output
+        let rt_json = serde_json::to_string(&rt).unwrap();
+        assert!(
+            !rt_json.contains("{localId="),
+            "localId attr syntax should not leak into ADF text: {rt_json}"
+        );
+    }
+
+    /// Issue #507: multiple taskItems with hardBreaks and numeric localIds.
+    #[test]
+    fn task_item_multiple_hardbreak_localids_roundtrip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"taskList","attrs":{"localId":""},"content":[{"type":"taskItem","attrs":{"localId":"42","state":"DONE"},"content":[{"type":"paragraph","content":[{"type":"text","text":"first line"},{"type":"hardBreak"},{"type":"text","text":"second line"}]}]},{"type":"taskItem","attrs":{"localId":"67","state":"TODO"},"content":[{"type":"paragraph","content":[{"type":"text","text":"alpha"},{"type":"hardBreak"},{"type":"text","text":"beta"}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("localId=42"), "localId=42 missing: {md}");
+        assert!(md.contains("localId=67"), "localId=67 missing: {md}");
+        let rt = markdown_to_adf(&md).unwrap();
+        let items = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].attrs.as_ref().unwrap()["localId"], "42");
+        assert_eq!(items[1].attrs.as_ref().unwrap()["localId"], "67");
+        // Verify hardBreak content structure for both items
+        for item in items {
+            let para = &item.content.as_ref().unwrap()[0];
+            assert_eq!(para.node_type, "paragraph");
+            let inlines = para.content.as_ref().unwrap();
+            assert_eq!(inlines[1].node_type, "hardBreak");
+        }
     }
 
     /// Issue #447: regression — taskList with empty localId must not inject
