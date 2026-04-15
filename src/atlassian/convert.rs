@@ -1208,6 +1208,25 @@ fn escape_backticks(text: &str) -> String {
     out
 }
 
+/// Escapes bare URLs (`http://` and `https://`) in plain text so they are not
+/// parsed as `inlineCard` nodes during round-trip.  The leading `h` is
+/// backslash-escaped, which is enough to prevent the auto-link detector from
+/// matching the URL while the existing backslash-escape handler restores it on
+/// re-parse.
+fn escape_bare_urls(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    for (i, ch) in text.char_indices() {
+        if ch == 'h' {
+            let rest = &text[i..];
+            if rest.starts_with("http://") || rest.starts_with("https://") {
+                result.push('\\');
+            }
+        }
+        result.push(ch);
+    }
+    result
+}
+
 /// Escapes emoji shortcode patterns (`:name:`) in plain text so they are not
 /// parsed as emoji nodes during round-trip.  Only the leading colon is
 /// backslash-escaped, which is enough to prevent the parser from matching the
@@ -3650,6 +3669,11 @@ fn render_marked_text(text: &str, marks: &[AdfMark], output: &mut String) {
     let escaped = escape_emphasis_markers(text);
     let escaped = escape_emoji_shortcodes(&escaped);
     let escaped = escape_backticks(&escaped);
+    let escaped = if has_link.is_none() {
+        escape_bare_urls(&escaped)
+    } else {
+        escaped
+    };
     inner.push_str(&escaped);
     if inner_em {
         inner.push('*');
@@ -4871,6 +4895,27 @@ mod tests {
     }
 
     #[test]
+    fn escape_bare_urls_unit() {
+        assert_eq!(escape_bare_urls("hello"), "hello");
+        assert_eq!(escape_bare_urls(""), "");
+        assert_eq!(
+            escape_bare_urls("https://example.com"),
+            r"\https://example.com"
+        );
+        assert_eq!(
+            escape_bare_urls("http://example.com"),
+            r"\http://example.com"
+        );
+        assert_eq!(
+            escape_bare_urls("see https://a.com and https://b.com"),
+            r"see \https://a.com and \https://b.com"
+        );
+        // "http" without "://" is not a URL scheme — leave untouched
+        assert_eq!(escape_bare_urls("http header"), "http header");
+        assert_eq!(escape_bare_urls("https is secure"), "https is secure");
+    }
+
+    #[test]
     fn heading_not_valid_without_space() {
         // "#Title" without space should be a paragraph, not heading
         let doc = markdown_to_adf("#Title").unwrap();
@@ -5958,6 +6003,163 @@ mod tests {
         let doc = markdown_to_adf("Visit https://example.com/path today").unwrap();
         let md = adf_to_markdown(&doc).unwrap();
         assert!(md.contains(":card[https://example.com/path]"));
+    }
+
+    // ── Issue #475: plain-text URL must not become inlineCard ─────────
+
+    #[test]
+    fn plain_text_url_round_trips_as_text() {
+        // A text node whose content is a bare URL (no link mark) must
+        // survive ADF→JFM→ADF as a text node, not an inlineCard.
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "paragraph",
+                "content": [
+                    {"type": "text", "text": "https://example.com/some/path/to/resource"}
+                ]
+            }]
+        }"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        let roundtripped = markdown_to_adf(&jfm).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1, "should be a single node");
+        assert_eq!(content[0].node_type, "text");
+        assert_eq!(
+            content[0].text.as_deref(),
+            Some("https://example.com/some/path/to/resource")
+        );
+    }
+
+    #[test]
+    fn plain_text_url_amid_text_round_trips() {
+        // URL embedded in surrounding text, without link mark.
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "paragraph",
+                "content": [
+                    {"type": "text", "text": "see https://example.com for info"}
+                ]
+            }]
+        }"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        let roundtripped = markdown_to_adf(&jfm).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].node_type, "text");
+        assert_eq!(
+            content[0].text.as_deref(),
+            Some("see https://example.com for info")
+        );
+    }
+
+    #[test]
+    fn plain_text_multiple_urls_round_trips() {
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "paragraph",
+                "content": [
+                    {"type": "text", "text": "http://a.com and https://b.com"}
+                ]
+            }]
+        }"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        let roundtripped = markdown_to_adf(&jfm).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].node_type, "text");
+        assert_eq!(
+            content[0].text.as_deref(),
+            Some("http://a.com and https://b.com")
+        );
+    }
+
+    #[test]
+    fn plain_text_http_prefix_no_url_unchanged() {
+        // "http" without "://" should not be escaped or altered.
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "paragraph",
+                "content": [
+                    {"type": "text", "text": "the http header is important"}
+                ]
+            }]
+        }"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        let roundtripped = markdown_to_adf(&jfm).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            content[0].text.as_deref(),
+            Some("the http header is important")
+        );
+    }
+
+    #[test]
+    fn linked_url_text_not_double_escaped() {
+        // A text node with a link mark should render as [text](url),
+        // not escape the URL in the link text.
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "paragraph",
+                "content": [{
+                    "type": "text",
+                    "text": "https://example.com",
+                    "marks": [{"type": "link", "attrs": {"href": "https://example.com"}}]
+                }]
+            }]
+        }"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        // Should render as a self-link, not as escaped text
+        assert!(!jfm.contains(r"\https"));
+        // Round-trip should preserve the link mark
+        let roundtripped = markdown_to_adf(&jfm).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        let has_link = content.iter().any(|n| {
+            n.marks
+                .as_ref()
+                .is_some_and(|m| m.iter().any(|mk| mk.mark_type == "link"))
+        });
+        assert!(has_link, "link mark should be preserved");
+    }
+
+    #[test]
+    fn inline_card_still_round_trips() {
+        // An actual inlineCard node should still round-trip correctly
+        // (it uses :card[url] syntax, not bare URL).
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "paragraph",
+                "content": [
+                    {"type": "inlineCard", "attrs": {"url": "https://example.com/page"}}
+                ]
+            }]
+        }"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        assert!(jfm.contains(":card[https://example.com/page]"));
+        let roundtripped = markdown_to_adf(&jfm).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(content[0].node_type, "inlineCard");
+        assert_eq!(
+            content[0].attrs.as_ref().unwrap()["url"],
+            "https://example.com/page"
+        );
     }
 
     // ── Block-level attribute marks (Tier 5/6) ───────────────────────
