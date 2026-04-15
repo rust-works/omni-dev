@@ -263,9 +263,21 @@ impl<'a> MarkdownParser<'a> {
             // Detect task list items: - [ ] or - [x]
             if let Some((state, text)) = try_parse_task_marker(after_marker) {
                 is_task_list = true;
-                let (item_text, local_id, _para_local_id) = extract_trailing_local_id(text);
+                let (item_text, local_id, para_local_id) = extract_trailing_local_id(text);
                 let inline_nodes = parse_inline(item_text);
-                let mut task = AdfNode::task_item(state, inline_nodes);
+                // If a paraLocalId marker is present the original ADF had a
+                // paragraph wrapper around the inline content — restore it
+                // so the round-trip is lossless (issue #478).
+                let content = if let Some(ref plid) = para_local_id {
+                    let mut para = AdfNode::paragraph(inline_nodes);
+                    if plid != "_" {
+                        para.attrs = Some(serde_json::json!({"localId": plid}));
+                    }
+                    vec![para]
+                } else {
+                    inline_nodes
+                };
+                let mut task = AdfNode::task_item(state, content);
                 // Override the placeholder localId if one was parsed
                 if let Some(id) = local_id {
                     if let Some(ref mut attrs) = task.attrs {
@@ -3018,11 +3030,20 @@ fn emit_list_item_local_ids(
     if let Some(ref attrs) = item.attrs {
         maybe_push_local_id(attrs, &mut parts, opts);
     }
-    if let Some(ref attrs) = paragraph.attrs {
-        if let Some(local_id) = attrs.get("localId").and_then(serde_json::Value::as_str) {
-            if !local_id.is_empty() && local_id != "00000000-0000-0000-0000-000000000000" {
-                parts.push(format!("paraLocalId={local_id}"));
-            }
+    if paragraph.node_type == "paragraph" {
+        let has_real_id = paragraph
+            .attrs
+            .as_ref()
+            .and_then(|a| a.get("localId"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty() && *id != "00000000-0000-0000-0000-000000000000");
+        if let Some(local_id) = has_real_id {
+            parts.push(format!("paraLocalId={local_id}"));
+        } else if item.node_type == "taskItem" {
+            // taskItem content may or may not have a paragraph wrapper;
+            // emit a sentinel so the round-trip can distinguish the two
+            // forms and restore the wrapper (issue #478).
+            parts.push("paraLocalId=_".to_string());
         }
     }
     if !parts.is_empty() {
@@ -8219,6 +8240,150 @@ mod tests {
             rt.content[0].attrs.as_ref().unwrap()["localId"],
             "tl-xyz",
             "taskList localId should survive round-trip"
+        );
+    }
+
+    /// Issue #478: taskItem with paragraph wrapper (no localId) preserves wrapper on round-trip.
+    #[test]
+    fn task_item_paragraph_wrapper_roundtrip_no_localid() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"taskList","attrs":{"localId":"tl-001"},"content":[{"type":"taskItem","attrs":{"localId":"ti-001","state":"TODO"},"content":[{"type":"paragraph","content":[{"type":"text","text":"A task with paragraph wrapper"}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("paraLocalId=_"),
+            "should emit paraLocalId=_ sentinel: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let item = &rt.content[0].content.as_ref().unwrap()[0];
+        let content = item.content.as_ref().unwrap();
+        assert_eq!(content.len(), 1, "should have one child: {content:#?}");
+        assert_eq!(
+            content[0].node_type, "paragraph",
+            "child should be a paragraph: {content:#?}"
+        );
+        let para_content = content[0].content.as_ref().unwrap();
+        assert_eq!(
+            para_content[0].text.as_deref(),
+            Some("A task with paragraph wrapper")
+        );
+        // Paragraph should have no attrs (localId was absent in the original)
+        assert!(
+            content[0].attrs.is_none(),
+            "paragraph should have no attrs: {:?}",
+            content[0].attrs
+        );
+    }
+
+    /// Issue #478: taskItem with paragraph wrapper AND paraLocalId preserves both.
+    #[test]
+    fn task_item_paragraph_wrapper_roundtrip_with_localid() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"taskList","attrs":{"localId":"tl-001"},"content":[{"type":"taskItem","attrs":{"localId":"ti-001","state":"TODO"},"content":[{"type":"paragraph","attrs":{"localId":"p-001"},"content":[{"type":"text","text":"task with para id"}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("paraLocalId=p-001"),
+            "should emit paraLocalId=p-001: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let item = &rt.content[0].content.as_ref().unwrap()[0];
+        let content = item.content.as_ref().unwrap();
+        assert_eq!(content[0].node_type, "paragraph");
+        assert_eq!(
+            content[0].attrs.as_ref().unwrap()["localId"],
+            "p-001",
+            "paragraph localId should be preserved"
+        );
+    }
+
+    /// Issue #478: taskItem WITHOUT paragraph wrapper (unwrapped inline) still round-trips correctly.
+    #[test]
+    fn task_item_unwrapped_inline_no_paragraph_on_roundtrip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"taskList","attrs":{"localId":"tl-001"},"content":[{"type":"taskItem","attrs":{"localId":"ti-001","state":"TODO"},"content":[{"type":"text","text":"unwrapped task"}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            !md.contains("paraLocalId"),
+            "should NOT emit paraLocalId for unwrapped inline: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let item = &rt.content[0].content.as_ref().unwrap()[0];
+        let content = item.content.as_ref().unwrap();
+        assert_eq!(
+            content[0].node_type, "text",
+            "should remain unwrapped: {content:#?}"
+        );
+    }
+
+    /// Issue #478: DONE taskItem with paragraph wrapper round-trips.
+    #[test]
+    fn task_item_done_paragraph_wrapper_roundtrip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"taskList","attrs":{"localId":"tl-001"},"content":[{"type":"taskItem","attrs":{"localId":"ti-001","state":"DONE"},"content":[{"type":"paragraph","content":[{"type":"text","text":"completed task"}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("- [x]"), "should render as done: {md}");
+        let rt = markdown_to_adf(&md).unwrap();
+        let item = &rt.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(item.attrs.as_ref().unwrap()["state"], "DONE");
+        let content = item.content.as_ref().unwrap();
+        assert_eq!(content[0].node_type, "paragraph");
+    }
+
+    /// Issue #478: mixed taskItems — some with paragraph wrapper, some without.
+    #[test]
+    fn task_item_mixed_paragraph_and_unwrapped_roundtrip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"taskList","attrs":{"localId":"tl-001"},"content":[{"type":"taskItem","attrs":{"localId":"ti-001","state":"TODO"},"content":[{"type":"paragraph","content":[{"type":"text","text":"wrapped"}]}]},{"type":"taskItem","attrs":{"localId":"ti-002","state":"DONE"},"content":[{"type":"text","text":"unwrapped"}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let items = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 2);
+        // First item: paragraph wrapper preserved
+        let c1 = items[0].content.as_ref().unwrap();
+        assert_eq!(
+            c1[0].node_type, "paragraph",
+            "first item should have paragraph wrapper"
+        );
+        // Second item: no paragraph wrapper
+        let c2 = items[1].content.as_ref().unwrap();
+        assert_eq!(
+            c2[0].node_type, "text",
+            "second item should remain unwrapped"
+        );
+    }
+
+    /// Issue #478: taskItem with paragraph wrapper containing marks round-trips.
+    #[test]
+    fn task_item_paragraph_wrapper_with_marks_roundtrip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"taskList","attrs":{"localId":"tl-001"},"content":[{"type":"taskItem","attrs":{"localId":"ti-001","state":"TODO"},"content":[{"type":"paragraph","content":[{"type":"text","text":"bold "},{"type":"text","text":"text","marks":[{"type":"strong"}]}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let item = &rt.content[0].content.as_ref().unwrap()[0];
+        let content = item.content.as_ref().unwrap();
+        assert_eq!(content[0].node_type, "paragraph");
+        let para_children = content[0].content.as_ref().unwrap();
+        assert!(
+            para_children.len() >= 2,
+            "paragraph should contain multiple inline nodes"
+        );
+    }
+
+    /// Issue #478: strip_local_ids suppresses the paraLocalId=_ sentinel too.
+    #[test]
+    fn task_item_paragraph_wrapper_stripped_with_option() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"taskList","attrs":{"localId":"tl-001"},"content":[{"type":"taskItem","attrs":{"localId":"ti-001","state":"TODO"},"content":[{"type":"paragraph","content":[{"type":"text","text":"task"}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let opts = RenderOptions {
+            strip_local_ids: true,
+        };
+        let md = adf_to_markdown_with_options(&doc, &opts).unwrap();
+        assert!(
+            !md.contains("paraLocalId"),
+            "paraLocalId should be stripped: {md}"
+        );
+        assert!(
+            !md.contains("localId"),
+            "all localIds should be stripped: {md}"
         );
     }
 
