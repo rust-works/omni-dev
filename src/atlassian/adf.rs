@@ -397,6 +397,20 @@ impl AdfNode {
         }
     }
 
+    /// Creates a `mediaInline` node with the given attributes.
+    #[must_use]
+    pub fn media_inline(attrs: serde_json::Value) -> Self {
+        Self {
+            node_type: "mediaInline".to_string(),
+            attrs: Some(attrs),
+            content: None,
+            text: None,
+            marks: None,
+            local_id: None,
+            parameters: None,
+        }
+    }
+
     /// Creates a media single node wrapping an external image.
     #[must_use]
     pub fn media_single(url: &str, alt: Option<&str>) -> Self {
