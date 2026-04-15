@@ -70,7 +70,12 @@ impl<'a> MarkdownParser<'a> {
     fn collect_hardbreak_continuations(&mut self, full_text: &mut String) {
         while has_trailing_hard_break(full_text) && !self.at_end() {
             let next = self.current_line();
-            if let Some(stripped) = next.strip_prefix("  ") {
+            // Skip indented mediaSingle lines (`![`) — they are block-level
+            // siblings, not paragraph continuations (issue #490).
+            if let Some(stripped) = next
+                .strip_prefix("  ")
+                .filter(|s| !s.trim_start().starts_with("!["))
+            {
                 full_text.push('\n');
                 full_text.push_str(stripped);
                 self.advance();
@@ -13721,6 +13726,22 @@ C
     }
 
     #[test]
+    fn collect_hardbreak_continuations_stops_before_image_line() {
+        // An indented continuation that starts with `![` (mediaSingle syntax)
+        // must NOT be swallowed as a paragraph continuation (issue #490).
+        let input = "text\\\n  ![](url){type=file id=x}\n";
+        let mut parser = MarkdownParser::new(input);
+        parser.advance(); // skip first line
+        let mut text = "text\\".to_string();
+        parser.collect_hardbreak_continuations(&mut text);
+        // The image line should NOT have been consumed.
+        assert_eq!(text, "text\\");
+        // Parser should still be on the image line (not past it).
+        assert!(!parser.at_end());
+        assert!(parser.current_line().contains("![](url)"));
+    }
+
+    #[test]
     fn ordered_list_with_sub_content_after_hardbreak() {
         // Exercises the sub-content collection loop in parse_ordered_list
         // (lines 339-347) with a hardBreak item that also has a nested list.
@@ -14073,6 +14094,178 @@ C
         assert_eq!(ms_attrs["widthType"], "pixel");
         assert_eq!(ms_attrs["width"], 800);
         assert_eq!(ms_attrs["layout"], "wide");
+    }
+
+    // ── Issue #490: mediaSingle after hardBreak in listItem ─────
+
+    #[test]
+    fn issue_490_paragraph_with_hardbreak_then_media_single_roundtrip() {
+        // Reproducer from issue #490: paragraph with trailing hardBreak
+        // followed by mediaSingle inside a listItem.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[
+          {"type":"listItem","content":[
+            {"type":"paragraph","content":[
+              {"type":"text","text":"Item with image:"},
+              {"type":"hardBreak"}
+            ]},
+            {"type":"mediaSingle","attrs":{"layout":"center","width":400,"widthType":"pixel"},
+             "content":[{"type":"media","attrs":{
+               "id":"aabbccdd-1234-5678-abcd-aabbccdd1234",
+               "type":"file",
+               "collection":"contentId-123456",
+               "width":800,
+               "height":600
+             }}]}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let item = &rt.content[0].content.as_ref().unwrap()[0];
+        let children = item.content.as_ref().unwrap();
+        assert_eq!(children.len(), 2, "expected 2 children in listItem");
+        assert_eq!(children[0].node_type, "paragraph");
+        assert_eq!(
+            children[1].node_type, "mediaSingle",
+            "expected mediaSingle, got {:?}",
+            children[1].node_type
+        );
+        let media = &children[1].content.as_ref().unwrap()[0];
+        let m_attrs = media.attrs.as_ref().unwrap();
+        assert_eq!(m_attrs["id"], "aabbccdd-1234-5678-abcd-aabbccdd1234");
+        assert_eq!(m_attrs["collection"], "contentId-123456");
+        assert_eq!(m_attrs["height"], 600);
+        assert_eq!(m_attrs["width"], 800);
+    }
+
+    #[test]
+    fn issue_490_paragraph_with_hardbreak_then_media_single_ordered_list() {
+        // Same scenario but in an ordered list.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"orderedList","attrs":{"order":1},"content":[
+          {"type":"listItem","content":[
+            {"type":"paragraph","content":[
+              {"type":"text","text":"Step with screenshot:"},
+              {"type":"hardBreak"}
+            ]},
+            {"type":"mediaSingle","attrs":{"layout":"center"},
+             "content":[{"type":"media","attrs":{
+               "id":"ord-media-id","type":"file","collection":"col-ord","width":640,"height":480
+             }}]}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let item = &rt.content[0].content.as_ref().unwrap()[0];
+        let children = item.content.as_ref().unwrap();
+        assert_eq!(children.len(), 2, "expected 2 children in listItem");
+        assert_eq!(children[0].node_type, "paragraph");
+        assert_eq!(children[1].node_type, "mediaSingle");
+        let media = &children[1].content.as_ref().unwrap()[0];
+        assert_eq!(media.attrs.as_ref().unwrap()["id"], "ord-media-id");
+    }
+
+    #[test]
+    fn issue_490_hardbreak_continuation_does_not_swallow_media_line() {
+        // Directly tests that collect_hardbreak_continuations stops before
+        // an indented mediaSingle line.
+        let md = "- Item with image:\\\n  ![](){type=file id=test-490 collection=col height=100 width=200}\n";
+        let doc = markdown_to_adf(md).unwrap();
+
+        let item = &doc.content[0].content.as_ref().unwrap()[0];
+        let children = item.content.as_ref().unwrap();
+        assert_eq!(children.len(), 2, "expected 2 children in listItem");
+        assert_eq!(children[0].node_type, "paragraph");
+        assert_eq!(
+            children[1].node_type, "mediaSingle",
+            "expected mediaSingle as second child, got {:?}",
+            children[1].node_type
+        );
+        let media = &children[1].content.as_ref().unwrap()[0];
+        assert_eq!(media.attrs.as_ref().unwrap()["id"], "test-490");
+    }
+
+    #[test]
+    fn issue_490_hardbreak_continuation_still_works_for_text() {
+        // Ensure regular hardBreak continuations still work after the fix.
+        let md = "- first line\\\n  second line\n";
+        let doc = markdown_to_adf(md).unwrap();
+
+        let item = &doc.content[0].content.as_ref().unwrap()[0];
+        let children = item.content.as_ref().unwrap();
+        assert_eq!(
+            children.len(),
+            1,
+            "expected 1 child (paragraph) in listItem"
+        );
+        assert_eq!(children[0].node_type, "paragraph");
+        let inlines = children[0].content.as_ref().unwrap();
+        // Should contain: text("first line"), hardBreak, text("second line")
+        assert_eq!(inlines.len(), 3);
+        assert_eq!(inlines[0].node_type, "text");
+        assert_eq!(inlines[1].node_type, "hardBreak");
+        assert_eq!(inlines[2].node_type, "text");
+    }
+
+    #[test]
+    fn issue_490_external_media_after_hardbreak_roundtrip() {
+        // External image (URL-based) after a paragraph with hardBreak.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[
+          {"type":"listItem","content":[
+            {"type":"paragraph","content":[
+              {"type":"text","text":"See image:"},
+              {"type":"hardBreak"}
+            ]},
+            {"type":"mediaSingle","attrs":{"layout":"center"},
+             "content":[{"type":"media","attrs":{
+               "type":"external","url":"https://example.com/photo.png","alt":"photo"
+             }}]}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let item = &rt.content[0].content.as_ref().unwrap()[0];
+        let children = item.content.as_ref().unwrap();
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].node_type, "paragraph");
+        assert_eq!(children[1].node_type, "mediaSingle");
+        let media = &children[1].content.as_ref().unwrap()[0];
+        let m_attrs = media.attrs.as_ref().unwrap();
+        assert_eq!(m_attrs["url"], "https://example.com/photo.png");
+    }
+
+    #[test]
+    fn issue_490_multiple_hardbreaks_then_media_single() {
+        // Paragraph with multiple hardBreaks, then mediaSingle.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[
+          {"type":"listItem","content":[
+            {"type":"paragraph","content":[
+              {"type":"text","text":"line one"},
+              {"type":"hardBreak"},
+              {"type":"text","text":"line two"},
+              {"type":"hardBreak"}
+            ]},
+            {"type":"mediaSingle","attrs":{"layout":"center"},
+             "content":[{"type":"media","attrs":{
+               "type":"file","id":"multi-hb","collection":"col-m","width":320,"height":240
+             }}]}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let item = &rt.content[0].content.as_ref().unwrap()[0];
+        let children = item.content.as_ref().unwrap();
+        assert_eq!(children.len(), 2, "expected paragraph + mediaSingle");
+        assert_eq!(children[0].node_type, "paragraph");
+        assert_eq!(children[1].node_type, "mediaSingle");
+        let media = &children[1].content.as_ref().unwrap()[0];
+        assert_eq!(media.attrs.as_ref().unwrap()["id"], "multi-hb");
     }
 
     // ── Placeholder node tests ────────────────────────────────────
