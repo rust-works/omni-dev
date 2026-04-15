@@ -24,6 +24,10 @@ pub enum SprintSubcommands {
     Issues(IssuesCommand),
     /// Adds issues to a sprint.
     Add(AddCommand),
+    /// Creates a new sprint.
+    Create(CreateCommand),
+    /// Updates an existing sprint.
+    Update(UpdateCommand),
 }
 
 impl SprintCommand {
@@ -33,6 +37,8 @@ impl SprintCommand {
             SprintSubcommands::List(cmd) => cmd.execute().await,
             SprintSubcommands::Issues(cmd) => cmd.execute().await,
             SprintSubcommands::Add(cmd) => cmd.execute().await,
+            SprintSubcommands::Create(cmd) => cmd.execute().await,
+            SprintSubcommands::Update(cmd) => cmd.execute().await,
         }
     }
 }
@@ -138,6 +144,97 @@ impl AddCommand {
             keys.len(),
             self.sprint_id
         );
+        Ok(())
+    }
+}
+
+/// Creates a new sprint on a board.
+#[derive(Parser)]
+pub struct CreateCommand {
+    /// Board ID to create the sprint on.
+    #[arg(long)]
+    pub board_id: u64,
+
+    /// Sprint name.
+    #[arg(long)]
+    pub name: String,
+
+    /// Start date (ISO 8601, e.g., "2026-05-01").
+    #[arg(long)]
+    pub start_date: Option<String>,
+
+    /// End date (ISO 8601, e.g., "2026-05-14").
+    #[arg(long)]
+    pub end_date: Option<String>,
+
+    /// Sprint goal.
+    #[arg(long)]
+    pub goal: Option<String>,
+}
+
+impl CreateCommand {
+    /// Creates the sprint.
+    pub async fn execute(self) -> Result<()> {
+        let (client, _instance_url) = create_client()?;
+        let sprint = client
+            .create_sprint(
+                self.board_id,
+                &self.name,
+                self.start_date.as_deref(),
+                self.end_date.as_deref(),
+                self.goal.as_deref(),
+            )
+            .await?;
+
+        println!("Created sprint {} (id: {}).", sprint.name, sprint.id);
+        Ok(())
+    }
+}
+
+/// Updates an existing sprint.
+#[derive(Parser)]
+pub struct UpdateCommand {
+    /// Sprint ID.
+    #[arg(long)]
+    pub sprint_id: u64,
+
+    /// New sprint name.
+    #[arg(long)]
+    pub name: Option<String>,
+
+    /// New state (e.g., "active", "closed").
+    #[arg(long)]
+    pub state: Option<String>,
+
+    /// New start date (ISO 8601).
+    #[arg(long)]
+    pub start_date: Option<String>,
+
+    /// New end date (ISO 8601).
+    #[arg(long)]
+    pub end_date: Option<String>,
+
+    /// New sprint goal.
+    #[arg(long)]
+    pub goal: Option<String>,
+}
+
+impl UpdateCommand {
+    /// Updates the sprint.
+    pub async fn execute(self) -> Result<()> {
+        let (client, _instance_url) = create_client()?;
+        client
+            .update_sprint(
+                self.sprint_id,
+                self.name.as_deref(),
+                self.state.as_deref(),
+                self.start_date.as_deref(),
+                self.end_date.as_deref(),
+                self.goal.as_deref(),
+            )
+            .await?;
+
+        println!("Updated sprint {}.", self.sprint_id);
         Ok(())
     }
 }
@@ -485,6 +582,64 @@ mod tests {
             limit: 25,
             output: OutputFormat::Table,
         };
+        assert_eq!(cmd.state.as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn sprint_command_create_variant() {
+        let cmd = SprintCommand {
+            command: SprintSubcommands::Create(CreateCommand {
+                board_id: 1,
+                name: "Sprint 5".to_string(),
+                start_date: None,
+                end_date: None,
+                goal: None,
+            }),
+        };
+        assert!(matches!(cmd.command, SprintSubcommands::Create(_)));
+    }
+
+    #[test]
+    fn sprint_command_update_variant() {
+        let cmd = SprintCommand {
+            command: SprintSubcommands::Update(UpdateCommand {
+                sprint_id: 42,
+                name: Some("Updated".to_string()),
+                state: None,
+                start_date: None,
+                end_date: None,
+                goal: None,
+            }),
+        };
+        assert!(matches!(cmd.command, SprintSubcommands::Update(_)));
+    }
+
+    #[test]
+    fn create_command_all_fields() {
+        let cmd = CreateCommand {
+            board_id: 1,
+            name: "Sprint 5".to_string(),
+            start_date: Some("2026-05-01".to_string()),
+            end_date: Some("2026-05-14".to_string()),
+            goal: Some("Ship v2".to_string()),
+        };
+        assert_eq!(cmd.board_id, 1);
+        assert_eq!(cmd.name, "Sprint 5");
+        assert_eq!(cmd.goal.as_deref(), Some("Ship v2"));
+    }
+
+    #[test]
+    fn update_command_partial_fields() {
+        let cmd = UpdateCommand {
+            sprint_id: 42,
+            name: None,
+            state: Some("active".to_string()),
+            start_date: None,
+            end_date: None,
+            goal: Some("New goal".to_string()),
+        };
+        assert_eq!(cmd.sprint_id, 42);
+        assert!(cmd.name.is_none());
         assert_eq!(cmd.state.as_deref(), Some("active"));
     }
 }
