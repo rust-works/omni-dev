@@ -779,7 +779,7 @@ impl<'a> MarkdownParser<'a> {
         let adf_attrs = cell_attrs.as_ref().map(build_cell_attrs);
         let cell_marks = cell_attrs
             .as_ref()
-            .map(build_cell_marks)
+            .map(build_border_marks)
             .unwrap_or_default();
 
         let cell = if cell_marks.is_empty() {
@@ -1101,8 +1101,8 @@ fn build_cell_attrs(attrs: &crate::atlassian::attrs::Attrs) -> serde_json::Value
     adf
 }
 
-/// Extracts cell-level marks (e.g., border) from directive attributes.
-fn build_cell_marks(attrs: &crate::atlassian::attrs::Attrs) -> Vec<AdfMark> {
+/// Extracts border marks from directive attributes (used by table cells and media nodes).
+fn build_border_marks(attrs: &crate::atlassian::attrs::Attrs) -> Vec<AdfMark> {
     let mut marks = Vec::new();
     let border_color = attrs.get("border-color");
     let border_size = attrs.get("border-size");
@@ -1470,6 +1470,12 @@ fn try_parse_media_single_from_line(line: &str) -> Option<AdfNode> {
                 if let Some(mode) = attrs.get("mode") {
                     ms_attrs["mode"] = serde_json::Value::String(mode.to_string());
                 }
+                let border_marks = build_border_marks(&attrs);
+                let media_marks = if border_marks.is_empty() {
+                    None
+                } else {
+                    Some(border_marks)
+                };
                 return Some(AdfNode {
                     node_type: "mediaSingle".to_string(),
                     attrs: Some(ms_attrs),
@@ -1478,7 +1484,7 @@ fn try_parse_media_single_from_line(line: &str) -> Option<AdfNode> {
                         attrs: Some(media_attrs),
                         content: None,
                         text: None,
-                        marks: None,
+                        marks: media_marks,
                         local_id: None,
                         parameters: None,
                     }]),
@@ -1507,13 +1513,17 @@ fn try_parse_media_single_from_line(line: &str) -> Option<AdfNode> {
                     node_attrs["mode"] = serde_json::Value::String(mode.to_string());
                 }
             }
-            if let Some(local_id) = attrs.get("localId") {
-                if let Some(ref mut content) = node.content {
-                    if let Some(media) = content.first_mut() {
+            if let Some(ref mut content) = node.content {
+                if let Some(media) = content.first_mut() {
+                    if let Some(local_id) = attrs.get("localId") {
                         if let Some(ref mut media_attrs) = media.attrs {
                             media_attrs["localId"] =
                                 serde_json::Value::String(local_id.to_string());
                         }
+                    }
+                    let border_marks = build_border_marks(&attrs);
+                    if !border_marks.is_empty() {
+                        media.marks = Some(border_marks);
                     }
                 }
             }
@@ -3410,6 +3420,24 @@ fn render_inline_content_from_first_paragraph(
     }
 }
 
+/// Appends border mark attributes (border-color, border-size) to a parts vec.
+fn push_border_mark_attrs(marks: &Option<Vec<AdfMark>>, parts: &mut Vec<String>) {
+    if let Some(ref marks) = marks {
+        for mark in marks {
+            if mark.mark_type == "border" {
+                if let Some(ref attrs) = mark.attrs {
+                    if let Some(color) = attrs.get("color").and_then(serde_json::Value::as_str) {
+                        parts.push(format!("border-color={color}"));
+                    }
+                    if let Some(size) = attrs.get("size").and_then(serde_json::Value::as_u64) {
+                        parts.push(format!("border-size={size}"));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Renders a media node as a markdown image, with optional parent (mediaSingle) attrs.
 fn render_media(
     node: &AdfNode,
@@ -3461,6 +3489,7 @@ fn render_media(
                     parts.push(format!("mode={mode}"));
                 }
             }
+            push_border_mark_attrs(&node.marks, &mut parts);
             output.push_str(&format!("{{{}}}", parts.join(" ")));
         } else {
             // External image
@@ -3493,6 +3522,7 @@ fn render_media(
                     }
                 }
                 maybe_push_local_id(attrs, &mut parts, opts);
+                push_border_mark_attrs(&node.marks, &mut parts);
                 if !parts.is_empty() {
                     output.push_str(&format!("{{{}}}", parts.join(" ")));
                 }
@@ -8195,6 +8225,110 @@ mod tests {
         assert_eq!(marks[0].mark_type, "border");
         assert_eq!(marks[0].attrs.as_ref().unwrap()["color"], "#ff0000");
         assert_eq!(marks[0].attrs.as_ref().unwrap()["size"], 1);
+    }
+
+    #[test]
+    fn media_file_border_mark_roundtrip() {
+        let adf_json = r##"{"version":1,"type":"doc","content":[{"type":"mediaSingle","attrs":{"layout":"center","width":400,"widthType":"pixel"},"content":[{"type":"media","attrs":{"id":"aabbccdd-1234-5678-abcd-aabbccdd1234","type":"file","collection":"contentId-123456","width":800,"height":600},"marks":[{"type":"border","attrs":{"color":"#091e4224","size":2}}]}]}]}"##;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("border-color=#091e4224"),
+            "media should have border-color in md: {md}"
+        );
+        assert!(
+            md.contains("border-size=2"),
+            "media should have border-size in md: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let media_single = &rt.content[0];
+        let media = &media_single.content.as_ref().unwrap()[0];
+        assert_eq!(media.node_type, "media");
+        let marks = media.marks.as_ref().expect("media should have marks");
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].mark_type, "border");
+        let attrs = marks[0].attrs.as_ref().unwrap();
+        assert_eq!(attrs["color"], "#091e4224");
+        assert_eq!(attrs["size"], 2);
+    }
+
+    #[test]
+    fn media_external_border_mark_roundtrip() {
+        let adf_json = r##"{"version":1,"type":"doc","content":[{"type":"mediaSingle","attrs":{"layout":"center"},"content":[{"type":"media","attrs":{"type":"external","url":"https://example.com/img.png"},"marks":[{"type":"border","attrs":{"color":"#ff0000","size":3}}]}]}]}"##;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("border-color=#ff0000"),
+            "external media should have border-color in md: {md}"
+        );
+        assert!(
+            md.contains("border-size=3"),
+            "external media should have border-size in md: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let media = &rt.content[0].content.as_ref().unwrap()[0];
+        let marks = media.marks.as_ref().expect("media should have marks");
+        assert_eq!(marks[0].mark_type, "border");
+        assert_eq!(marks[0].attrs.as_ref().unwrap()["color"], "#ff0000");
+        assert_eq!(marks[0].attrs.as_ref().unwrap()["size"], 3);
+    }
+
+    #[test]
+    fn media_file_no_border_mark_unchanged() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"mediaSingle","attrs":{"layout":"center"},"content":[{"type":"media","attrs":{"id":"abc-123","type":"file","collection":"col-1","width":100,"height":100}}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            !md.contains("border-color"),
+            "no border attrs expected: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let media = &rt.content[0].content.as_ref().unwrap()[0];
+        assert!(media.marks.is_none(), "no marks expected on plain media");
+    }
+
+    #[test]
+    fn media_border_size_only_defaults_color() {
+        let adf_json = r##"{"version":1,"type":"doc","content":[{"type":"mediaSingle","attrs":{"layout":"center"},"content":[{"type":"media","attrs":{"id":"abc","type":"file","collection":"col"},"marks":[{"type":"border","attrs":{"size":4}}]}]}]}"##;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("border-size=4"), "md: {md}");
+        let rt = markdown_to_adf(&md).unwrap();
+        let media = &rt.content[0].content.as_ref().unwrap()[0];
+        let marks = media.marks.as_ref().expect("should have border mark");
+        assert_eq!(marks[0].attrs.as_ref().unwrap()["color"], "#000000");
+        assert_eq!(marks[0].attrs.as_ref().unwrap()["size"], 4);
+    }
+
+    #[test]
+    fn media_border_color_only_defaults_size() {
+        let adf_json = r##"{"version":1,"type":"doc","content":[{"type":"mediaSingle","attrs":{"layout":"center"},"content":[{"type":"media","attrs":{"id":"abc","type":"file","collection":"col"},"marks":[{"type":"border","attrs":{"color":"#00ff00"}}]}]}]}"##;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("border-color=#00ff00"), "md: {md}");
+        let rt = markdown_to_adf(&md).unwrap();
+        let media = &rt.content[0].content.as_ref().unwrap()[0];
+        let marks = media.marks.as_ref().expect("should have border mark");
+        assert_eq!(marks[0].attrs.as_ref().unwrap()["color"], "#00ff00");
+        assert_eq!(marks[0].attrs.as_ref().unwrap()["size"], 1);
+    }
+
+    #[test]
+    fn media_border_with_other_attrs_roundtrip() {
+        let adf_json = r##"{"version":1,"type":"doc","content":[{"type":"mediaSingle","attrs":{"layout":"wide","width":600,"widthType":"pixel"},"content":[{"type":"media","attrs":{"id":"xyz","type":"file","collection":"col","width":1200,"height":800},"marks":[{"type":"border","attrs":{"color":"#091e4224","size":2}}]}]}]}"##;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("layout=wide"), "md: {md}");
+        assert!(md.contains("mediaWidth=600"), "md: {md}");
+        assert!(md.contains("border-color=#091e4224"), "md: {md}");
+        assert!(md.contains("border-size=2"), "md: {md}");
+        let rt = markdown_to_adf(&md).unwrap();
+        let ms = &rt.content[0];
+        assert_eq!(ms.attrs.as_ref().unwrap()["layout"], "wide");
+        let media = &ms.content.as_ref().unwrap()[0];
+        let marks = media.marks.as_ref().expect("should have marks");
+        assert_eq!(marks[0].attrs.as_ref().unwrap()["color"], "#091e4224");
+        assert_eq!(marks[0].attrs.as_ref().unwrap()["size"], 2);
     }
 
     #[test]
