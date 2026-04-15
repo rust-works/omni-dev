@@ -6,6 +6,7 @@ pub(crate) mod changelog;
 pub(crate) mod comment;
 pub(crate) mod create;
 pub(crate) mod delete;
+pub(crate) mod dev;
 pub(crate) mod edit;
 pub(crate) mod field;
 pub(crate) mod link;
@@ -46,6 +47,8 @@ pub enum JiraSubcommands {
     Comment(comment::CommentCommand),
     /// Deletes a JIRA issue.
     Delete(delete::DeleteCommand),
+    /// Shows development status (linked PRs, branches, repositories) for a JIRA issue.
+    Dev(dev::DevCommand),
     /// Lists JIRA projects.
     Project(project::ProjectCommand),
     /// Manages JIRA field definitions and options.
@@ -74,6 +77,7 @@ impl JiraCommand {
             JiraSubcommands::Transition(cmd) => cmd.execute().await,
             JiraSubcommands::Comment(cmd) => cmd.execute().await,
             JiraSubcommands::Delete(cmd) => cmd.execute().await,
+            JiraSubcommands::Dev(cmd) => cmd.execute().await,
             JiraSubcommands::Project(cmd) => cmd.execute().await,
             JiraSubcommands::Field(cmd) => cmd.execute().await,
             JiraSubcommands::Board(cmd) => cmd.execute().await,
@@ -191,6 +195,20 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Delete(_)));
+    }
+
+    #[test]
+    fn jira_subcommands_dev_variant() {
+        let cmd = JiraCommand {
+            command: JiraSubcommands::Dev(dev::DevCommand {
+                key: "PROJ-1".to_string(),
+                r#type: None,
+                app: None,
+                summary: false,
+                output: OutputFormat::Table,
+            }),
+        };
+        assert!(matches!(cmd.command, JiraSubcommands::Dev(_)));
     }
 
     #[test]
