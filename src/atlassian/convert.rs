@@ -1715,14 +1715,11 @@ fn parse_inline(text: &str) -> Vec<AdfNode> {
                 chars.next(); // consume the 'n'
                 plain_start = chars.peek().map_or(text.len(), |&(idx, _)| idx);
             }
-            '\\' if i + 1 < text.len()
-                && !text[i..].starts_with("\\\n")
-                && text.as_bytes()[i + 1] != b'\\' =>
-            {
+            '\\' if i + 1 < text.len() && !text[i..].starts_with("\\\n") => {
                 // Backslash escape: skip the backslash and treat the next
-                // character as literal text (e.g. `2\. text` → `2. text`,
-                // `\*word\*` → `*word*` without emphasis,
-                // `\:fire:` → `:fire:` without emoji parsing).
+                // character as literal text (e.g. `\\` → `\`,
+                // `2\. text` → `2. text`, `\*word\*` → `*word*` without
+                // emphasis, `\:fire:` → `:fire:` without emoji parsing).
                 flush_plain(text, plain_start, i, &mut nodes);
                 chars.next(); // consume the backslash
                               // Set plain_start to the escaped character so it is included
@@ -3521,6 +3518,18 @@ fn render_inline_node(node: &AdfNode, output: &mut String, opts: &RenderOptions)
         "text" => {
             let text = node.text.as_deref().unwrap_or("");
             let marks = node.marks.as_deref().unwrap_or(&[]);
+            let has_code = marks.iter().any(|m| m.mark_type == "code");
+            // Issue #477: Escape literal backslashes before the newline
+            // encoding below so they are not consumed as JFM escape
+            // sequences on round-trip.  Code marks emit content verbatim,
+            // so backslash escaping is skipped for them.
+            let owned;
+            let text = if !has_code {
+                owned = text.replace('\\', "\\\\");
+                owned.as_str()
+            } else {
+                text
+            };
             // Issue #454: A literal newline inside a text node is escaped
             // as the two-character sequence `\n` so it survives round-trip
             // as a single text node instead of splitting into paragraphs or
@@ -5033,6 +5042,137 @@ mod tests {
         assert_eq!(escape_backticks("a ` b"), r"a \` b");
         assert_eq!(escape_backticks(""), "");
         assert_eq!(escape_backticks("`a` and `b`"), r"\`a\` and \`b\`");
+    }
+
+    // ── Issue #477: backslash escaping ──────────────────────────────
+
+    #[test]
+    fn backslash_in_text_roundtrip() {
+        // The original reproducer from issue #477
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"The path is C:\\Users\\admin\\file.txt"}]}]}"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        let roundtripped = markdown_to_adf(&jfm).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1, "should round-trip as a single text node");
+        assert_eq!(
+            content[0].text.as_deref(),
+            Some(r"The path is C:\Users\admin\file.txt")
+        );
+    }
+
+    #[test]
+    fn backslash_emitted_as_double_backslash() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"a\\b"}]}]}"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        assert!(
+            jfm.contains(r"a\\b"),
+            "JFM should contain escaped backslash: {jfm}"
+        );
+    }
+
+    #[test]
+    fn consecutive_backslashes_roundtrip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"a\\\\b"}]}]}"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        let roundtripped = markdown_to_adf(&jfm).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            content[0].text.as_deref(),
+            Some(r"a\\b"),
+            "consecutive backslashes should survive round-trip"
+        );
+    }
+
+    #[test]
+    fn backslash_with_strong_mark_roundtrip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"C:\\Users","marks":[{"type":"strong"}]}]}]}"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        let roundtripped = markdown_to_adf(&jfm).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        let strong_node = content.iter().find(|n| {
+            n.marks
+                .as_ref()
+                .is_some_and(|m| m.iter().any(|mk| mk.mark_type == "strong"))
+        });
+        assert!(strong_node.is_some(), "should have a strong-marked node");
+        assert_eq!(strong_node.unwrap().text.as_deref(), Some(r"C:\Users"));
+    }
+
+    #[test]
+    fn backslash_with_code_mark_not_escaped() {
+        // Code marks emit content verbatim — backslashes should NOT be escaped
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"C:\\Users","marks":[{"type":"code"}]}]}]}"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        assert_eq!(jfm.trim(), r"`C:\Users`");
+        let roundtripped = markdown_to_adf(&jfm).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        let code_node = content.iter().find(|n| {
+            n.marks
+                .as_ref()
+                .is_some_and(|m| m.iter().any(|mk| mk.mark_type == "code"))
+        });
+        assert!(code_node.is_some(), "should have a code-marked node");
+        assert_eq!(code_node.unwrap().text.as_deref(), Some(r"C:\Users"));
+    }
+
+    #[test]
+    fn backslash_before_special_chars_roundtrip() {
+        // Backslash before characters that are themselves escaped (* ` :)
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"\\*not bold\\*"}]}]}"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        let roundtripped = markdown_to_adf(&jfm).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            content[0].text.as_deref(),
+            Some(r"\*not bold\*"),
+            "backslash before special char should survive round-trip"
+        );
+    }
+
+    #[test]
+    fn backslash_and_newline_in_text_roundtrip() {
+        // Text with both backslashes and embedded newlines
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"C:\\path\nline2"}]}]}"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        let roundtripped = markdown_to_adf(&jfm).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            content[0].text.as_deref(),
+            Some("C:\\path\nline2"),
+            "backslash and newline should both survive round-trip"
+        );
+    }
+
+    #[test]
+    fn lone_backslash_roundtrip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"a \\ b"}]}]}"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        let roundtripped = markdown_to_adf(&jfm).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(content[0].text.as_deref(), Some(r"a \ b"));
+    }
+
+    #[test]
+    fn trailing_backslash_in_text_roundtrip() {
+        // A trailing backslash in text content (not a hardBreak) should round-trip
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"end\\"}]}]}"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        let roundtripped = markdown_to_adf(&jfm).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            content[0].text.as_deref(),
+            Some(r"end\"),
+            "trailing backslash should survive round-trip"
+        );
     }
 
     #[test]
