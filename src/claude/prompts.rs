@@ -67,7 +67,7 @@ TYPE SELECTION RULES (must match the commit checker's expectations):
 2. File-type constraints:
    - If only source code files (.rs, .py, .js, etc.) changed, NEVER use `docs`
    - If only test files changed, prefer `test`
-   - If only CI files (.github/, etc.) changed, prefer `ci`
+   - If only CI/CD files changed, prefer `ci` — but use the detected_scope for more specific matches
    - Changing doc comments or help text in source code is `refactor` or `fix`, not `docs`
 3. Before finalizing, verify: would the commit checker accept this type given the files that changed?
 
