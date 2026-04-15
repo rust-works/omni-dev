@@ -851,8 +851,32 @@ impl<'a> MarkdownParser<'a> {
 
     fn try_image(&mut self) -> Option<AdfNode> {
         let line = self.current_line().trim();
-        let node = try_parse_media_single_from_line(line)?;
+        let mut node = try_parse_media_single_from_line(line)?;
         self.advance();
+
+        // Check for a trailing :::caption directive
+        if !self.at_end() {
+            if let Some((d, _)) = try_parse_container_open(self.current_line()) {
+                if d.name == "caption" {
+                    self.advance(); // past :::caption
+                    let mut caption_lines = Vec::new();
+                    while !self.at_end() {
+                        if is_container_close(self.current_line(), 3) {
+                            self.advance(); // past :::
+                            break;
+                        }
+                        caption_lines.push(self.current_line());
+                        self.advance();
+                    }
+                    let caption_text = caption_lines.join("\n");
+                    let inline_nodes = parse_inline(&caption_text);
+                    if let Some(ref mut content) = node.content {
+                        content.push(AdfNode::caption(inline_nodes));
+                    }
+                }
+            }
+        }
+
         Some(node)
     }
 
@@ -2575,6 +2599,18 @@ fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) 
                 for child in content {
                     if child.node_type == "media" {
                         render_media(child, node.attrs.as_ref(), output, opts);
+                    }
+                }
+                for child in content {
+                    if child.node_type == "caption" {
+                        output.push_str(":::caption\n");
+                        if let Some(ref caption_content) = child.content {
+                            for inline in caption_content {
+                                render_inline_node(inline, output, opts);
+                            }
+                            output.push('\n');
+                        }
+                        output.push_str(":::\n");
                     }
                 }
             }
@@ -9730,6 +9766,233 @@ mod tests {
         assert_eq!(attrs["height"], 56);
         assert_eq!(attrs["width"], 312);
         assert_eq!(attrs["alt"], "Screenshot.png");
+    }
+
+    // ── mediaSingle caption tests (issue #470) ──────────────────────────
+
+    #[test]
+    fn media_single_caption_adf_to_markdown() {
+        let adf_doc = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [{
+                "type": "mediaSingle",
+                "attrs": {"layout": "center", "width": 400, "widthType": "pixel"},
+                "content": [
+                    {
+                        "type": "media",
+                        "attrs": {
+                            "id": "aabbccdd-1234-5678-abcd-aabbccdd1234",
+                            "type": "file",
+                            "collection": "contentId-123456",
+                            "width": 800,
+                            "height": 600
+                        }
+                    },
+                    {
+                        "type": "caption",
+                        "content": [{"type": "text", "text": "An image caption here"}]
+                    }
+                ]
+            }]
+        });
+        let doc: crate::atlassian::adf::AdfDocument = serde_json::from_value(adf_doc).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains(":::caption"),
+            "expected :::caption in markdown, got: {md}"
+        );
+        assert!(
+            md.contains("An image caption here"),
+            "expected caption text in markdown, got: {md}"
+        );
+    }
+
+    #[test]
+    fn media_single_caption_markdown_to_adf() {
+        let md = "![Screenshot](){type=file id=abc-123 collection=contentId-456 height=600 width=800}\n:::caption\nAn image caption here\n:::\n";
+        let doc = markdown_to_adf(md).unwrap();
+        let ms = &doc.content[0];
+        assert_eq!(ms.node_type, "mediaSingle");
+        let content = ms.content.as_ref().unwrap();
+        assert_eq!(content.len(), 2, "expected media + caption children");
+        assert_eq!(content[0].node_type, "media");
+        assert_eq!(content[1].node_type, "caption");
+        let caption_content = content[1].content.as_ref().unwrap();
+        assert_eq!(
+            caption_content[0].text.as_deref(),
+            Some("An image caption here")
+        );
+    }
+
+    #[test]
+    fn media_single_caption_round_trip() {
+        // Full round-trip: ADF → JFM → ADF preserves caption
+        let adf_doc = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [{
+                "type": "mediaSingle",
+                "attrs": {"layout": "center", "width": 400, "widthType": "pixel"},
+                "content": [
+                    {
+                        "type": "media",
+                        "attrs": {
+                            "id": "aabbccdd-1234-5678-abcd-aabbccdd1234",
+                            "type": "file",
+                            "collection": "contentId-123456",
+                            "width": 800,
+                            "height": 600
+                        }
+                    },
+                    {
+                        "type": "caption",
+                        "content": [{"type": "text", "text": "An image caption here"}]
+                    }
+                ]
+            }]
+        });
+        let doc: crate::atlassian::adf::AdfDocument = serde_json::from_value(adf_doc).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let doc2 = markdown_to_adf(&md).unwrap();
+        let ms = &doc2.content[0];
+        assert_eq!(ms.node_type, "mediaSingle");
+        let content = ms.content.as_ref().unwrap();
+        assert_eq!(
+            content.len(),
+            2,
+            "expected media + caption after round-trip"
+        );
+        assert_eq!(content[1].node_type, "caption");
+        let caption_content = content[1].content.as_ref().unwrap();
+        assert_eq!(
+            caption_content[0].text.as_deref(),
+            Some("An image caption here")
+        );
+    }
+
+    #[test]
+    fn media_single_caption_with_inline_marks() {
+        let adf_doc = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [{
+                "type": "mediaSingle",
+                "attrs": {"layout": "center"},
+                "content": [
+                    {
+                        "type": "media",
+                        "attrs": {"type": "external", "url": "https://example.com/img.png"}
+                    },
+                    {
+                        "type": "caption",
+                        "content": [
+                            {"type": "text", "text": "A "},
+                            {"type": "text", "text": "bold", "marks": [{"type": "strong"}]},
+                            {"type": "text", "text": " caption"}
+                        ]
+                    }
+                ]
+            }]
+        });
+        let doc: crate::atlassian::adf::AdfDocument = serde_json::from_value(adf_doc).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("**bold**"),
+            "expected bold in caption, got: {md}"
+        );
+
+        let doc2 = markdown_to_adf(&md).unwrap();
+        let content = doc2.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 2, "expected media + caption");
+        assert_eq!(content[1].node_type, "caption");
+        let caption_inlines = content[1].content.as_ref().unwrap();
+        let bold_node = caption_inlines
+            .iter()
+            .find(|n| n.text.as_deref() == Some("bold"))
+            .unwrap();
+        let marks = bold_node.marks.as_ref().unwrap();
+        assert_eq!(marks[0].mark_type, "strong");
+    }
+
+    #[test]
+    fn media_single_no_caption_unaffected() {
+        // Existing mediaSingle without caption should be unaffected
+        let adf_doc = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [{
+                "type": "mediaSingle",
+                "attrs": {"layout": "center"},
+                "content": [{
+                    "type": "media",
+                    "attrs": {"type": "external", "url": "https://example.com/img.png"}
+                }]
+            }]
+        });
+        let doc: crate::atlassian::adf::AdfDocument = serde_json::from_value(adf_doc).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            !md.contains(":::caption"),
+            "should not emit caption when none present"
+        );
+        let doc2 = markdown_to_adf(&md).unwrap();
+        let content = doc2.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1, "should only have media child");
+        assert_eq!(content[0].node_type, "media");
+    }
+
+    #[test]
+    fn media_single_empty_caption_round_trip() {
+        // Caption node with no content should still round-trip
+        let adf_doc = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [{
+                "type": "mediaSingle",
+                "attrs": {"layout": "center"},
+                "content": [
+                    {
+                        "type": "media",
+                        "attrs": {"type": "external", "url": "https://example.com/img.png"}
+                    },
+                    {
+                        "type": "caption"
+                    }
+                ]
+            }]
+        });
+        let doc: crate::atlassian::adf::AdfDocument = serde_json::from_value(adf_doc).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains(":::caption"),
+            "expected :::caption even for empty caption, got: {md}"
+        );
+        assert!(
+            md.contains(":::\n"),
+            "expected closing ::: fence, got: {md}"
+        );
+    }
+
+    #[test]
+    fn media_single_external_caption_round_trip() {
+        // External image with caption round-trips
+        let md = "![alt](https://example.com/img.png)\n:::caption\nImage description\n:::\n";
+        let doc = markdown_to_adf(md).unwrap();
+        let ms = &doc.content[0];
+        assert_eq!(ms.node_type, "mediaSingle");
+        let content = ms.content.as_ref().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0].node_type, "media");
+        assert_eq!(content[1].node_type, "caption");
+
+        let md2 = adf_to_markdown(&doc).unwrap();
+        let doc2 = markdown_to_adf(&md2).unwrap();
+        let content2 = doc2.content[0].content.as_ref().unwrap();
+        assert_eq!(content2.len(), 2);
+        assert_eq!(content2[1].node_type, "caption");
+        let caption_text = content2[1].content.as_ref().unwrap();
+        assert_eq!(caption_text[0].text.as_deref(), Some("Image description"));
     }
 
     #[test]
