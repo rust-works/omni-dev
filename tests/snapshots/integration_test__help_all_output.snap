@@ -850,6 +850,8 @@ Commands:
   list    Lists sprints for a board
   issues  Lists issues in a sprint
   add     Adds issues to a sprint
+  create  Creates a new sprint
+  update  Updates an existing sprint
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -868,6 +870,23 @@ Options:
       --sprint-id <SPRINT_ID>  Sprint ID
       --issues <ISSUES>        Comma-separated issue keys (e.g., "PROJ-1,PROJ-2")
   -h, --help                   Print help
+
+
+================================================================================
+
+omni-dev atlassian jira sprint create - Creates a new sprint
+
+Creates a new sprint
+
+Usage: create [OPTIONS] --board-id <BOARD_ID> --name <NAME>
+
+Options:
+      --board-id <BOARD_ID>      Board ID to create the sprint on
+      --name <NAME>              Sprint name
+      --start-date <START_DATE>  Start date (ISO 8601, e.g., "2026-05-01")
+      --end-date <END_DATE>      End date (ISO 8601, e.g., "2026-05-14")
+      --goal <GOAL>              Sprint goal
+  -h, --help                     Print help
 
 
 ================================================================================
@@ -900,6 +919,24 @@ Options:
       --limit <LIMIT>        Maximum number of results, 0 for unlimited (default: 50) [default: 50]
   -o, --output <OUTPUT>      Output format [default: table] [possible values: table, json, yaml]
   -h, --help                 Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian jira sprint update - Updates an existing sprint
+
+Updates an existing sprint
+
+Usage: update [OPTIONS] --sprint-id <SPRINT_ID>
+
+Options:
+      --sprint-id <SPRINT_ID>    Sprint ID
+      --name <NAME>              New sprint name
+      --state <STATE>            New state (e.g., "active", "closed")
+      --start-date <START_DATE>  New start date (ISO 8601)
+      --end-date <END_DATE>      New end date (ISO 8601)
+      --goal <GOAL>              New sprint goal
+  -h, --help                     Print help
 
 
 ================================================================================
