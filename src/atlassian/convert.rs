@@ -3715,12 +3715,29 @@ fn render_inline_node(node: &AdfNode, output: &mut String, opts: &RenderOptions)
             // as the two-character sequence `\n` so it survives round-trip
             // as a single text node instead of splitting into paragraphs or
             // being converted to hardBreak nodes.
-            if text.contains('\n') {
-                let escaped = text.replace('\n', "\\n");
-                render_marked_text(&escaped, marks, output);
+            let owned_nl;
+            let text = if text.contains('\n') {
+                owned_nl = text.replace('\n', "\\n");
+                owned_nl.as_str()
             } else {
-                render_marked_text(text, marks, output);
-            }
+                text
+            };
+            // Issue #510: Two or more trailing spaces at the end of a text
+            // node would be misinterpreted as a hardBreak marker on
+            // round-trip (and collapse the following paragraph).  Escape the
+            // last space with a backslash so the parser treats it as a
+            // literal space instead of a line-break signal.
+            let owned_ts;
+            let text = if !has_code && text.ends_with("  ") {
+                let mut s = text.to_string();
+                // Insert backslash before the final space: "foo  " → "foo \ "
+                s.insert(s.len() - 1, '\\');
+                owned_ts = s;
+                owned_ts.as_str()
+            } else {
+                text
+            };
+            render_marked_text(text, marks, output);
         }
         "hardBreak" => {
             output.push_str("\\\n");
@@ -16209,5 +16226,193 @@ C
             "space after hardBreak in list item should survive round-trip"
         );
         assert_eq!(inlines[2].text.as_deref(), Some(" "));
+    }
+
+    // ── Issue #510: trailing spaces in text node should not become hardBreak ──
+
+    #[test]
+    fn issue_510_trailing_double_space_paragraph_roundtrip() {
+        // Two trailing spaces in a text node must survive round-trip without
+        // being converted to a hardBreak or merging the next paragraph.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"first paragraph with trailing spaces  "}]},{"type":"paragraph","content":[{"type":"text","text":"second paragraph"}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        // Must produce two separate paragraphs
+        assert_eq!(
+            rt.content.len(),
+            2,
+            "should produce two paragraphs, got: {}",
+            rt.content.len()
+        );
+        assert_eq!(rt.content[0].node_type, "paragraph");
+        assert_eq!(rt.content[1].node_type, "paragraph");
+
+        // First paragraph text preserves trailing spaces
+        let p1 = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            p1[0].text.as_deref(),
+            Some("first paragraph with trailing spaces  "),
+            "trailing spaces should be preserved in first paragraph"
+        );
+
+        // Second paragraph is intact
+        let p2 = rt.content[1].content.as_ref().unwrap();
+        assert_eq!(p2[0].text.as_deref(), Some("second paragraph"));
+
+        // No hardBreak nodes should exist
+        let all_types: Vec<&str> = p1.iter().map(|n| n.node_type.as_str()).collect();
+        assert!(
+            !all_types.contains(&"hardBreak"),
+            "trailing spaces should not produce hardBreak, got: {all_types:?}"
+        );
+    }
+
+    #[test]
+    fn issue_510_trailing_triple_space_roundtrip() {
+        // Three trailing spaces also must not become a hardBreak.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"text   "}]},{"type":"paragraph","content":[{"type":"text","text":"next"}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        assert_eq!(rt.content.len(), 2, "should still be two paragraphs");
+        let p1 = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            p1[0].text.as_deref(),
+            Some("text   "),
+            "three trailing spaces should be preserved"
+        );
+    }
+
+    #[test]
+    fn issue_510_trailing_spaces_with_backslash_roundtrip() {
+        // Text ending with backslash + trailing spaces: both must survive.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"end\\  "}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let p = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            p[0].text.as_deref(),
+            Some("end\\  "),
+            "backslash + trailing spaces should both survive"
+        );
+    }
+
+    #[test]
+    fn issue_510_jfm_contains_escaped_trailing_space() {
+        // Verify the serializer actually emits the backslash-space escape.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"hello  "}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains(r"\ "),
+            "JFM should contain backslash-space escape for trailing spaces, got: {md:?}"
+        );
+        // Must NOT end with two plain spaces before newline
+        for line in md.lines() {
+            assert!(
+                !line.ends_with("  "),
+                "no JFM line should end with two plain spaces, got: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_510_single_trailing_space_not_escaped() {
+        // A single trailing space should NOT be escaped (not a hardBreak trigger).
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"word "}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            !md.contains('\\'),
+            "single trailing space should not be escaped, got: {md:?}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let p = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(p[0].text.as_deref(), Some("word "));
+    }
+
+    #[test]
+    fn issue_510_trailing_spaces_in_heading_roundtrip() {
+        // Trailing double-spaces in a heading text node should also survive.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"heading","attrs":{"level":2},"content":[{"type":"text","text":"heading  "}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let h = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            h[0].text.as_deref(),
+            Some("heading  "),
+            "trailing spaces in heading should be preserved"
+        );
+    }
+
+    #[test]
+    fn issue_510_trailing_spaces_in_list_item_roundtrip() {
+        // Trailing double-spaces in a bullet list item text node.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"item  "}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let list = &rt.content[0];
+        let item = &list.content.as_ref().unwrap()[0];
+        let para = &item.content.as_ref().unwrap()[0];
+        let inlines = para.content.as_ref().unwrap();
+        assert_eq!(
+            inlines[0].text.as_deref(),
+            Some("item  "),
+            "trailing spaces in list item should be preserved"
+        );
+    }
+
+    #[test]
+    fn issue_510_trailing_spaces_with_bold_mark_roundtrip() {
+        // Trailing spaces in a bold-marked text node: the closing **
+        // comes after the spaces, so the line doesn't end with spaces.
+        // But the escape should still be applied (and be harmless).
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"bold  ","marks":[{"type":"strong"}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let p = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            p[0].text.as_deref(),
+            Some("bold  "),
+            "trailing spaces in bold text should be preserved"
+        );
+    }
+
+    #[test]
+    fn issue_510_hardbreak_between_paragraphs_still_works() {
+        // Actual hardBreak nodes must still round-trip correctly.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"line one"},{"type":"hardBreak"},{"type":"text","text":"line two"}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let inlines = rt.content[0].content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec!["text", "hardBreak", "text"],
+            "explicit hardBreak should still round-trip"
+        );
+    }
+
+    #[test]
+    fn issue_510_all_spaces_text_node_roundtrip() {
+        // A text node that is entirely spaces (2+) should survive.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"  "}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let p = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            p[0].text.as_deref(),
+            Some("  "),
+            "space-only text node should survive round-trip"
+        );
     }
 }
