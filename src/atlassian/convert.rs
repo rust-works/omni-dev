@@ -3405,6 +3405,57 @@ fn render_inline_node(node: &AdfNode, output: &mut String, opts: &RenderOptions)
         "hardBreak" => {
             output.push_str("\\\n");
         }
+        other => {
+            // Issue #471: Non-text inline nodes (emoji, status, date, mention, etc.)
+            // may carry annotation marks. Render the node body first, then wrap it
+            // in bracketed-span syntax if annotation marks are present.
+            let mut body = String::new();
+            render_non_text_inline_body(other, node, &mut body, opts);
+
+            let annotations: Vec<&AdfMark> = node
+                .marks
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .filter(|m| m.mark_type == "annotation")
+                .collect();
+
+            if annotations.is_empty() {
+                output.push_str(&body);
+            } else {
+                let mut attr_parts = Vec::new();
+                for ann in &annotations {
+                    if let Some(ref attrs) = ann.attrs {
+                        if let Some(id) = attrs.get("id").and_then(serde_json::Value::as_str) {
+                            let escaped = id.replace('\\', "\\\\").replace('"', "\\\"");
+                            attr_parts.push(format!("annotation-id=\"{escaped}\""));
+                        }
+                        if let Some(at) = attrs
+                            .get("annotationType")
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            attr_parts.push(format!("annotation-type={at}"));
+                        }
+                    }
+                }
+                output.push('[');
+                output.push_str(&body);
+                output.push_str("]{");
+                output.push_str(&attr_parts.join(" "));
+                output.push('}');
+            }
+        }
+    }
+}
+
+/// Renders the body of a non-text inline node (without mark wrapping).
+fn render_non_text_inline_body(
+    node_type: &str,
+    node: &AdfNode,
+    output: &mut String,
+    opts: &RenderOptions,
+) {
+    match node_type {
         "inlineCard" => {
             if let Some(ref attrs) = node.attrs {
                 if let Some(url) = attrs.get("url").and_then(serde_json::Value::as_str) {
@@ -6785,6 +6836,240 @@ mod tests {
             2,
             "should have 2 annotation marks, got: {annotations:?}"
         );
+    }
+
+    // ── Issue #471: annotation marks on non-text inline nodes ─────────
+
+    #[test]
+    fn annotation_on_emoji_round_trip() {
+        // Issue #471: annotation mark on emoji node should survive round-trip
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"emoji","attrs":{"id":"1f4dd","shortName":":memo:","text":"📝"},"marks":[
+            {"type":"annotation","attrs":{"id":"ccddee11-2233-4455-aabb-ccddee112233","annotationType":"inlineComment"}}
+          ]},
+          {"type":"text","text":" annotated text","marks":[
+            {"type":"annotation","attrs":{"id":"ccddee11-2233-4455-aabb-ccddee112233","annotationType":"inlineComment"}}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("annotation-id="),
+            "JFM should contain annotation-id for emoji, got: {md}"
+        );
+
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let nodes = round_tripped.content[0].content.as_ref().unwrap();
+
+        // Emoji node should retain annotation mark
+        let emoji_node = nodes.iter().find(|n| n.node_type == "emoji").unwrap();
+        let emoji_marks = emoji_node.marks.as_ref().expect("emoji should have marks");
+        assert!(
+            emoji_marks.iter().any(|m| m.mark_type == "annotation"),
+            "emoji should have annotation mark, got: {emoji_marks:?}"
+        );
+        let ann = emoji_marks
+            .iter()
+            .find(|m| m.mark_type == "annotation")
+            .unwrap();
+        assert_eq!(
+            ann.attrs.as_ref().unwrap()["id"],
+            "ccddee11-2233-4455-aabb-ccddee112233"
+        );
+
+        // Text node should also retain annotation mark
+        let text_node = nodes.iter().find(|n| n.node_type == "text").unwrap();
+        let text_marks = text_node.marks.as_ref().expect("text should have marks");
+        assert!(
+            text_marks.iter().any(|m| m.mark_type == "annotation"),
+            "text should have annotation mark"
+        );
+    }
+
+    #[test]
+    fn annotation_on_status_round_trip() {
+        let mut status = AdfNode::status("In Progress", "blue");
+        status.marks = Some(vec![AdfMark::annotation("ann-status-1", "inlineComment")]);
+
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![status])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("annotation-id="),
+            "JFM should contain annotation-id for status, got: {md}"
+        );
+
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let nodes = round_tripped.content[0].content.as_ref().unwrap();
+        let status_node = nodes.iter().find(|n| n.node_type == "status").unwrap();
+        let marks = status_node
+            .marks
+            .as_ref()
+            .expect("status should have marks");
+        assert!(
+            marks.iter().any(|m| m.mark_type == "annotation"),
+            "status should have annotation mark, got: {marks:?}"
+        );
+    }
+
+    #[test]
+    fn annotation_on_date_round_trip() {
+        let mut date = AdfNode::date("1704067200000");
+        date.marks = Some(vec![AdfMark::annotation("ann-date-1", "inlineComment")]);
+
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![date])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("annotation-id="),
+            "JFM should contain annotation-id for date, got: {md}"
+        );
+
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let nodes = round_tripped.content[0].content.as_ref().unwrap();
+        let date_node = nodes.iter().find(|n| n.node_type == "date").unwrap();
+        let marks = date_node.marks.as_ref().expect("date should have marks");
+        assert!(
+            marks.iter().any(|m| m.mark_type == "annotation"),
+            "date should have annotation mark, got: {marks:?}"
+        );
+    }
+
+    #[test]
+    fn annotation_on_mention_round_trip() {
+        let mut mention = AdfNode::mention("user-123", "@Alice");
+        mention.marks = Some(vec![AdfMark::annotation("ann-mention-1", "inlineComment")]);
+
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![mention])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("annotation-id="),
+            "JFM should contain annotation-id for mention, got: {md}"
+        );
+
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let nodes = round_tripped.content[0].content.as_ref().unwrap();
+        let mention_node = nodes.iter().find(|n| n.node_type == "mention").unwrap();
+        let marks = mention_node
+            .marks
+            .as_ref()
+            .expect("mention should have marks");
+        assert!(
+            marks.iter().any(|m| m.mark_type == "annotation"),
+            "mention should have annotation mark, got: {marks:?}"
+        );
+    }
+
+    #[test]
+    fn annotation_on_inline_card_round_trip() {
+        let mut card = AdfNode::inline_card("https://example.com");
+        card.marks = Some(vec![AdfMark::annotation("ann-card-1", "inlineComment")]);
+
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![card])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("annotation-id="),
+            "JFM should contain annotation-id for inlineCard, got: {md}"
+        );
+
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let nodes = round_tripped.content[0].content.as_ref().unwrap();
+        let card_node = nodes.iter().find(|n| n.node_type == "inlineCard").unwrap();
+        let marks = card_node
+            .marks
+            .as_ref()
+            .expect("inlineCard should have marks");
+        assert!(
+            marks.iter().any(|m| m.mark_type == "annotation"),
+            "inlineCard should have annotation mark, got: {marks:?}"
+        );
+    }
+
+    #[test]
+    fn annotation_on_placeholder_round_trip() {
+        let mut placeholder = AdfNode::placeholder("Enter text here");
+        placeholder.marks = Some(vec![AdfMark::annotation("ann-ph-1", "inlineComment")]);
+
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![placeholder])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("annotation-id="),
+            "JFM should contain annotation-id for placeholder, got: {md}"
+        );
+
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let nodes = round_tripped.content[0].content.as_ref().unwrap();
+        let ph_node = nodes.iter().find(|n| n.node_type == "placeholder").unwrap();
+        let marks = ph_node
+            .marks
+            .as_ref()
+            .expect("placeholder should have marks");
+        assert!(
+            marks.iter().any(|m| m.mark_type == "annotation"),
+            "placeholder should have annotation mark, got: {marks:?}"
+        );
+    }
+
+    #[test]
+    fn multiple_annotations_on_emoji_round_trip() {
+        // Multiple annotation marks on a single emoji node
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"emoji","attrs":{"shortName":":fire:","text":"🔥"},"marks":[
+            {"type":"annotation","attrs":{"id":"ann-1","annotationType":"inlineComment"}},
+            {"type":"annotation","attrs":{"id":"ann-2","annotationType":"inlineComment"}}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let nodes = round_tripped.content[0].content.as_ref().unwrap();
+        let emoji_node = nodes.iter().find(|n| n.node_type == "emoji").unwrap();
+        let marks = emoji_node.marks.as_ref().expect("emoji should have marks");
+        let annotations: Vec<_> = marks
+            .iter()
+            .filter(|m| m.mark_type == "annotation")
+            .collect();
+        assert_eq!(
+            annotations.len(),
+            2,
+            "emoji should have 2 annotation marks, got: {annotations:?}"
+        );
+    }
+
+    #[test]
+    fn emoji_without_annotation_unchanged() {
+        // Ensure emoji nodes without annotation marks are not affected
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::emoji(":fire:")])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        // Should NOT have bracketed span wrapping
+        assert!(
+            !md.contains('['),
+            "emoji without annotation should not be wrapped in brackets, got: {md}"
+        );
+        assert!(md.contains(":fire:"));
     }
 
     // ── Inline directive tests (Tier 4) ───────────────────────────────
