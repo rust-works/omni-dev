@@ -1501,7 +1501,8 @@ fn try_parse_media_single_from_line(line: &str) -> Option<AdfNode> {
     let (alt, url) = parse_image_syntax(line)?;
     let alt_opt = if alt.is_empty() { None } else { Some(alt) };
 
-    let img_end = line.find(')').unwrap_or(line.len()) + 1;
+    let paren_open = line.find("](")? + 1; // index of '('
+    let img_end = find_closing_paren(line, paren_open)? + 1;
     let after_img = line[img_end..].trim_start();
 
     if after_img.starts_with('{') {
@@ -1619,9 +1620,9 @@ fn parse_image_syntax(line: &str) -> Option<(&str, &str)> {
 
     let alt_end = line.find("](")?;
     let alt = &line[2..alt_end];
-    let url_start = alt_end + 2;
-    let url_end = line[url_start..].find(')')? + url_start;
-    let url = &line[url_start..url_end];
+    let paren_start = alt_end + 1; // index of the '('
+    let url_end = find_closing_paren(line, paren_start)?;
+    let url = &line[paren_start + 1..url_end];
 
     Some((alt, url))
 }
@@ -2354,6 +2355,27 @@ fn parse_emoji_with_attrs(text: &str, shortcode_end: usize, short_name: &str) ->
     }
 }
 
+/// Finds the closing `)` that matches the opening `(` at position `open`,
+/// counting nested parentheses so that URLs containing `(` and `)` are
+/// handled correctly.  Returns the index of the matching `)` relative to
+/// the start of `s`, or `None` if no match is found.
+fn find_closing_paren(s: &str, open: usize) -> Option<usize> {
+    let mut depth: usize = 0;
+    for (j, ch) in s[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + j);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Tries to parse [text](url) starting at position `i`.
 ///
 /// Uses bracket depth counting to find the matching `]`, so that `[` characters
@@ -2393,9 +2415,9 @@ fn try_parse_link(text: &str, i: usize) -> Option<(usize, &str, &str)> {
     if !after_bracket.starts_with('(') {
         return None;
     }
-    let url_start = text_end + 2;
-    let url_end = rest[url_start..].find(')')? + url_start;
-    let href = &rest[url_start..url_end];
+    let url_start = text_end + 1; // index of the '('
+    let url_end = find_closing_paren(rest, url_start)?;
+    let href = &rest[url_start + 1..url_end];
 
     Some((i + url_end + 1, link_text, href))
 }
@@ -10278,6 +10300,101 @@ mod tests {
     #[test]
     fn parse_image_syntax_not_image() {
         assert!(parse_image_syntax("not an image").is_none());
+    }
+
+    // ── find_closing_paren tests ────────────────────────────────────
+
+    #[test]
+    fn find_closing_paren_simple() {
+        assert_eq!(find_closing_paren("(hello)", 0), Some(6));
+    }
+
+    #[test]
+    fn find_closing_paren_nested() {
+        assert_eq!(find_closing_paren("(a(b)c)", 0), Some(6));
+    }
+
+    #[test]
+    fn find_closing_paren_unmatched() {
+        assert_eq!(find_closing_paren("(no close", 0), None);
+    }
+
+    #[test]
+    fn find_closing_paren_offset() {
+        // Start scanning from the second '('
+        assert_eq!(find_closing_paren("xx(inner)", 2), Some(8));
+    }
+
+    // ── Parentheses-in-URL tests (issue #509) ──────────────────────
+
+    #[test]
+    fn try_parse_link_url_with_parens() {
+        let input = "[here](https://example.com/faq#access-(permissions)-rest)";
+        let result = try_parse_link(input, 0);
+        assert_eq!(
+            result,
+            Some((
+                input.len(),
+                "here",
+                "https://example.com/faq#access-(permissions)-rest"
+            ))
+        );
+    }
+
+    #[test]
+    fn try_parse_link_url_no_parens() {
+        let input = "[text](https://example.com)";
+        let result = try_parse_link(input, 0);
+        assert_eq!(result, Some((input.len(), "text", "https://example.com")));
+    }
+
+    #[test]
+    fn try_parse_link_url_with_multiple_nested_parens() {
+        let input = "[x](http://en.wikipedia.org/wiki/Foo_(bar_(baz)))";
+        let result = try_parse_link(input, 0);
+        assert_eq!(
+            result,
+            Some((
+                input.len(),
+                "x",
+                "http://en.wikipedia.org/wiki/Foo_(bar_(baz))"
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_image_syntax_url_with_parens() {
+        let result = parse_image_syntax("![alt](https://example.com/page_(1))");
+        assert_eq!(result, Some(("alt", "https://example.com/page_(1)")));
+    }
+
+    #[test]
+    fn parse_image_syntax_url_no_parens() {
+        let result = parse_image_syntax("![alt](https://example.com)");
+        assert_eq!(result, Some(("alt", "https://example.com")));
+    }
+
+    #[test]
+    fn link_with_parens_round_trip() {
+        let href = "https://example.com/faq#I-need-access-(permissions)-added-in-Monitor";
+        let mut text_node = AdfNode::text("here");
+        text_node.marks = Some(vec![AdfMark::link(href)]);
+        let adf_input = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![text_node])],
+        };
+
+        let jfm = adf_to_markdown(&adf_input).unwrap();
+        let adf_output = markdown_to_adf(&jfm).unwrap();
+
+        // Extract the href from the round-tripped ADF
+        let para = &adf_output.content[0];
+        let text_node = &para.content.as_ref().unwrap()[0];
+        let mark = &text_node.marks.as_ref().unwrap()[0];
+        let result_href = mark.attrs.as_ref().unwrap()["href"].as_str().unwrap();
+
+        assert_eq!(result_href, href);
     }
 
     #[test]
