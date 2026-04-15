@@ -2823,6 +2823,12 @@ fn render_list_item_content(item: &AdfNode, output: &mut String, opts: &RenderOp
     if first.node_type == "paragraph" {
         let mut buf = String::new();
         render_inline_content(first, &mut buf, opts);
+        // A trailing hardBreak produces a trailing `\\\n` in the buffer.
+        // Strip the final newline so it doesn't create a blank line after
+        // the list item marker, which would split the list on re-parse
+        // (issue #472).  The `\` is kept so round-trip preserves the
+        // hardBreak, and `output.push('\n')` below supplies the terminator.
+        let buf = buf.trim_end_matches('\n');
         // Indent continuation lines produced by hardBreaks so they stay
         // within the list item when re-parsed (issue #402).
         let mut is_first_line = true;
@@ -12696,5 +12702,281 @@ C
         assert_eq!(inlines[0].text.as_deref(), Some("before"));
         assert_eq!(inlines[2].text.as_deref(), Some("mid\ndle"));
         assert_eq!(inlines[4].text.as_deref(), Some("after"));
+    }
+
+    // ---- Issue #472 tests ----
+
+    #[test]
+    fn issue_472_bullet_list_trailing_hardbreak_roundtrips() {
+        // Issue #472: trailing hardBreak at end of listItem paragraph must
+        // not split the parent bulletList on round-trip.
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"bulletList","content":[
+            {"type":"listItem","content":[
+              {"type":"paragraph","content":[
+                {"type":"text","text":"First item"},
+                {"type":"hardBreak"}
+              ]}
+            ]},
+            {"type":"listItem","content":[
+              {"type":"paragraph","content":[
+                {"type":"text","text":"Second item"}
+              ]}
+            ]}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        // Must remain a single bulletList
+        assert_eq!(
+            rt.content.len(),
+            1,
+            "Should be 1 block (bulletList), got {}",
+            rt.content.len()
+        );
+        assert_eq!(rt.content[0].node_type, "bulletList");
+        let items = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            items.len(),
+            2,
+            "Should have 2 listItems, got {}",
+            items.len()
+        );
+
+        // First item: text + hardBreak (trailing)
+        let p1 = items[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap();
+        let types1: Vec<&str> = p1.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types1, vec!["text", "hardBreak"]);
+        assert_eq!(p1[0].text.as_deref(), Some("First item"));
+
+        // Second item: text only
+        let p2 = items[1].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap();
+        assert_eq!(p2[0].text.as_deref(), Some("Second item"));
+    }
+
+    #[test]
+    fn issue_472_ordered_list_trailing_hardbreak_roundtrips() {
+        // Ordered list variant of issue #472.
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"orderedList","attrs":{"order":1},"content":[
+            {"type":"listItem","content":[
+              {"type":"paragraph","content":[
+                {"type":"text","text":"Alpha"},
+                {"type":"hardBreak"}
+              ]}
+            ]},
+            {"type":"listItem","content":[
+              {"type":"paragraph","content":[
+                {"type":"text","text":"Beta"}
+              ]}
+            ]}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        assert_eq!(rt.content.len(), 1);
+        assert_eq!(rt.content[0].node_type, "orderedList");
+        let items = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 2);
+
+        let p1 = items[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap();
+        let types1: Vec<&str> = p1.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types1, vec!["text", "hardBreak"]);
+        assert_eq!(p1[0].text.as_deref(), Some("Alpha"));
+    }
+
+    #[test]
+    fn issue_472_trailing_hardbreak_jfm_no_blank_line() {
+        // The rendered JFM must not contain a blank line after the
+        // trailing hardBreak — that would split the list.
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"bulletList","content":[
+            {"type":"listItem","content":[
+              {"type":"paragraph","content":[
+                {"type":"text","text":"Hello"},
+                {"type":"hardBreak"}
+              ]}
+            ]},
+            {"type":"listItem","content":[
+              {"type":"paragraph","content":[
+                {"type":"text","text":"World"}
+              ]}
+            ]}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+
+        // Should produce "- Hello\\n- World\n" (no blank line between items).
+        assert_eq!(md, "- Hello\\\n- World\n");
+    }
+
+    #[test]
+    fn issue_472_multiple_trailing_hardbreaks_roundtrip() {
+        // Multiple trailing hardBreaks at the end of a listItem paragraph.
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"bulletList","content":[
+            {"type":"listItem","content":[
+              {"type":"paragraph","content":[
+                {"type":"text","text":"Item"},
+                {"type":"hardBreak"},
+                {"type":"hardBreak"}
+              ]}
+            ]},
+            {"type":"listItem","content":[
+              {"type":"paragraph","content":[
+                {"type":"text","text":"Next"}
+              ]}
+            ]}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        // Must remain a single bulletList
+        assert_eq!(rt.content.len(), 1);
+        assert_eq!(rt.content[0].node_type, "bulletList");
+        let items = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 2);
+
+        // First item should preserve both hardBreaks
+        let p1 = items[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap();
+        let types1: Vec<&str> = p1.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types1, vec!["text", "hardBreak", "hardBreak"]);
+    }
+
+    #[test]
+    fn issue_472_hardbreak_mid_and_trailing_roundtrip() {
+        // A hardBreak in the middle AND at the end of a listItem paragraph.
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"bulletList","content":[
+            {"type":"listItem","content":[
+              {"type":"paragraph","content":[
+                {"type":"text","text":"Line one"},
+                {"type":"hardBreak"},
+                {"type":"text","text":"Line two"},
+                {"type":"hardBreak"}
+              ]}
+            ]},
+            {"type":"listItem","content":[
+              {"type":"paragraph","content":[
+                {"type":"text","text":"Other item"}
+              ]}
+            ]}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        assert_eq!(rt.content.len(), 1);
+        assert_eq!(rt.content[0].node_type, "bulletList");
+        let items = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 2);
+
+        let p1 = items[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap();
+        let types1: Vec<&str> = p1.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types1, vec!["text", "hardBreak", "text", "hardBreak"]);
+        assert_eq!(p1[0].text.as_deref(), Some("Line one"));
+        assert_eq!(p1[2].text.as_deref(), Some("Line two"));
+    }
+
+    #[test]
+    fn issue_472_only_hardbreak_in_listitem_paragraph() {
+        // Edge case: paragraph contains only a hardBreak, no text.
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"bulletList","content":[
+            {"type":"listItem","content":[
+              {"type":"paragraph","content":[
+                {"type":"hardBreak"}
+              ]}
+            ]},
+            {"type":"listItem","content":[
+              {"type":"paragraph","content":[
+                {"type":"text","text":"After"}
+              ]}
+            ]}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        // Must remain a single bulletList with 2 items
+        assert_eq!(rt.content.len(), 1);
+        assert_eq!(rt.content[0].node_type, "bulletList");
+        let items = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn issue_472_three_items_middle_has_trailing_hardbreak() {
+        // Three-item list where only the middle item has a trailing hardBreak.
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"bulletList","content":[
+            {"type":"listItem","content":[
+              {"type":"paragraph","content":[
+                {"type":"text","text":"First"}
+              ]}
+            ]},
+            {"type":"listItem","content":[
+              {"type":"paragraph","content":[
+                {"type":"text","text":"Second"},
+                {"type":"hardBreak"}
+              ]}
+            ]},
+            {"type":"listItem","content":[
+              {"type":"paragraph","content":[
+                {"type":"text","text":"Third"}
+              ]}
+            ]}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        assert_eq!(rt.content.len(), 1);
+        assert_eq!(rt.content[0].node_type, "bulletList");
+        let items = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(
+            items[0].content.as_ref().unwrap()[0]
+                .content
+                .as_ref()
+                .unwrap()[0]
+                .text
+                .as_deref(),
+            Some("First")
+        );
+        assert_eq!(
+            items[2].content.as_ref().unwrap()[0]
+                .content
+                .as_ref()
+                .unwrap()[0]
+                .text
+                .as_deref(),
+            Some("Third")
+        );
     }
 }
