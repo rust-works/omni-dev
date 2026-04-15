@@ -565,6 +565,7 @@ impl<'a> MarkdownParser<'a> {
         let mut columns = Vec::new();
         let mut current_column_lines: Vec<String> = Vec::new();
         let mut current_width: f64 = 50.0;
+        let mut current_dir_attrs: Option<crate::atlassian::attrs::Attrs> = None;
         let mut in_column = false;
         let mut depth: usize = 0;
 
@@ -579,7 +580,9 @@ impl<'a> MarkdownParser<'a> {
                     if in_column && !current_column_lines.is_empty() {
                         let col_text = current_column_lines.join("\n");
                         let blocks = MarkdownParser::new(&col_text).parse_blocks()?;
-                        columns.push(AdfNode::layout_column(current_width, blocks));
+                        let mut col = AdfNode::layout_column(current_width, blocks);
+                        pass_through_local_id(&current_dir_attrs, &mut col);
+                        columns.push(col);
                         current_column_lines.clear();
                     }
                     current_width = col_d
@@ -588,6 +591,7 @@ impl<'a> MarkdownParser<'a> {
                         .and_then(|a| a.get("width"))
                         .and_then(|w| w.parse::<f64>().ok())
                         .unwrap_or(50.0);
+                    current_dir_attrs = col_d.attrs;
                     in_column = true;
                     i += 1;
                     continue;
@@ -606,8 +610,11 @@ impl<'a> MarkdownParser<'a> {
                 // End of column
                 let col_text = current_column_lines.join("\n");
                 let blocks = MarkdownParser::new(&col_text).parse_blocks()?;
-                columns.push(AdfNode::layout_column(current_width, blocks));
+                let mut col = AdfNode::layout_column(current_width, blocks);
+                pass_through_local_id(&current_dir_attrs, &mut col);
+                columns.push(col);
                 current_column_lines.clear();
+                current_dir_attrs = None;
                 in_column = false;
                 i += 1;
                 continue;
@@ -622,7 +629,9 @@ impl<'a> MarkdownParser<'a> {
         if in_column && !current_column_lines.is_empty() {
             let col_text = current_column_lines.join("\n");
             let blocks = MarkdownParser::new(&col_text).parse_blocks()?;
-            columns.push(AdfNode::layout_column(current_width, blocks));
+            let mut col = AdfNode::layout_column(current_width, blocks);
+            pass_through_local_id(&current_dir_attrs, &mut col);
+            columns.push(col);
         }
 
         Ok(columns)
@@ -2766,7 +2775,11 @@ fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) 
                             .and_then(|a| a.get("width"))
                             .and_then(serde_json::Value::as_f64)
                             .unwrap_or(50.0);
-                        output.push_str(&format!(":::column{{width={width}}}\n"));
+                        let mut parts = vec![format!("width={width}")];
+                        if let Some(ref attrs) = child.attrs {
+                            maybe_push_local_id(attrs, &mut parts, opts);
+                        }
+                        output.push_str(&format!(":::column{{{}}}\n", parts.join(" ")));
                         if let Some(ref col_content) = child.content {
                             render_block_children(col_content, output, opts);
                         }
@@ -5978,6 +5991,122 @@ mod tests {
         assert!(md.contains(":::column{width=50}"));
         assert!(md.contains("Left."));
         assert!(md.contains("Right."));
+    }
+
+    #[test]
+    fn layout_column_localid_roundtrip() {
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "layoutSection",
+                "content": [
+                    {
+                        "type": "layoutColumn",
+                        "attrs": {"width": 50.0, "localId": "aabb112233cc"},
+                        "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Left"}]}]
+                    },
+                    {
+                        "type": "layoutColumn",
+                        "attrs": {"width": 50.0, "localId": "ddeeff445566"},
+                        "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Right"}]}]
+                    }
+                ]
+            }]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("localId=aabb112233cc"),
+            "first column localId should appear in markdown: {md}"
+        );
+        assert!(
+            md.contains("localId=ddeeff445566"),
+            "second column localId should appear in markdown: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let cols = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            cols[0].attrs.as_ref().unwrap()["localId"],
+            "aabb112233cc",
+            "first column localId should round-trip"
+        );
+        assert_eq!(
+            cols[1].attrs.as_ref().unwrap()["localId"],
+            "ddeeff445566",
+            "second column localId should round-trip"
+        );
+    }
+
+    #[test]
+    fn layout_column_without_localid() {
+        let md =
+            "::::layout\n:::column{width=50}\nLeft.\n:::\n:::column{width=50}\nRight.\n:::\n::::";
+        let doc = markdown_to_adf(md).unwrap();
+        let cols = doc.content[0].content.as_ref().unwrap();
+        assert!(
+            cols[0].attrs.as_ref().unwrap().get("localId").is_none(),
+            "column without localId should not gain one"
+        );
+        let md2 = adf_to_markdown(&doc).unwrap();
+        assert!(
+            !md2.contains("localId"),
+            "no localId should appear in output: {md2}"
+        );
+    }
+
+    #[test]
+    fn layout_column_localid_stripped_when_option_set() {
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "layoutSection",
+                "content": [{
+                    "type": "layoutColumn",
+                    "attrs": {"width": 50.0, "localId": "aabb112233cc"},
+                    "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Col"}]}]
+                }]
+            }]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let opts = RenderOptions {
+            strip_local_ids: true,
+            ..Default::default()
+        };
+        let md = adf_to_markdown_with_options(&doc, &opts).unwrap();
+        assert!(!md.contains("localId"), "localId should be stripped: {md}");
+    }
+
+    #[test]
+    fn layout_column_localid_flush_previous() {
+        // Columns open without explicit `:::` close → flush-previous path
+        let md = "::::layout\n:::column{width=50 localId=aabb112233cc}\nLeft.\n:::column{width=50 localId=ddeeff445566}\nRight.\n:::\n::::";
+        let doc = markdown_to_adf(md).unwrap();
+        let cols = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            cols[0].attrs.as_ref().unwrap()["localId"],
+            "aabb112233cc",
+            "flush-previous column should preserve localId"
+        );
+        assert_eq!(
+            cols[1].attrs.as_ref().unwrap()["localId"],
+            "ddeeff445566",
+            "second column localId should be preserved"
+        );
+    }
+
+    #[test]
+    fn layout_column_localid_flush_last() {
+        // Layout with no closing fence → column never explicitly closed → flush-last path
+        let md = "::::layout\n:::column{width=50 localId=aabb112233cc}\nOnly column.";
+        let doc = markdown_to_adf(md).unwrap();
+        let cols = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            cols[0].attrs.as_ref().unwrap()["localId"],
+            "aabb112233cc",
+            "flush-last column should preserve localId"
+        );
     }
 
     #[test]
