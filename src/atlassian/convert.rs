@@ -1072,7 +1072,14 @@ impl<'a> MarkdownParser<'a> {
             // content. This prevents infinite loops when a line looks like a
             // block starter but doesn't actually match any block parser (e.g.,
             // "#NoSpace" which is not a valid heading).
-            if line.trim().is_empty()
+            // Issue #494: A whitespace-only line that follows a hardBreak
+            // marker (trailing backslash or two trailing spaces) is a
+            // continuation, not a paragraph break.  Let it fall through to
+            // the `is_hardbreak_cont` check below.
+            if (line.trim().is_empty()
+                && !lines
+                    .last()
+                    .is_some_and(|prev| has_trailing_hard_break(prev)))
                 || line.starts_with("```")
                 || (is_horizontal_rule(line) && !lines.is_empty())
             {
@@ -15325,5 +15332,153 @@ C
                 .as_deref(),
             Some("Third")
         );
+    }
+
+    // ── Issue #494: trailing space-only text node after hardBreak ────
+
+    #[test]
+    fn issue_494_space_after_hardbreak_roundtrip() {
+        // The original reproducer from issue #494: a single space text
+        // node following a hardBreak is silently dropped on round-trip.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"Some text"},
+          {"type":"hardBreak"},
+          {"type":"text","text":" "}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let inlines = rt.content[0].content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec!["text", "hardBreak", "text"],
+            "space-only text node after hardBreak should survive round-trip"
+        );
+        assert_eq!(inlines[2].text.as_deref(), Some(" "));
+    }
+
+    #[test]
+    fn issue_494_multiple_spaces_after_hardbreak_roundtrip() {
+        // Multiple spaces after hardBreak should also survive.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"Hello"},
+          {"type":"hardBreak"},
+          {"type":"text","text":"   "}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let inlines = rt.content[0].content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec!["text", "hardBreak", "text"],
+            "multi-space text node after hardBreak should survive round-trip"
+        );
+        assert_eq!(inlines[2].text.as_deref(), Some("   "));
+    }
+
+    #[test]
+    fn issue_494_space_then_text_after_hardbreak_roundtrip() {
+        // Space followed by real text after hardBreak — the space should
+        // be preserved as part of the text node.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"Before"},
+          {"type":"hardBreak"},
+          {"type":"text","text":" After"}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let inlines = rt.content[0].content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(types, vec!["text", "hardBreak", "text"]);
+        assert_eq!(inlines[2].text.as_deref(), Some(" After"));
+    }
+
+    #[test]
+    fn issue_494_hardbreak_then_space_then_hardbreak_roundtrip() {
+        // Space sandwiched between two hardBreaks.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"A"},
+          {"type":"hardBreak"},
+          {"type":"text","text":" "},
+          {"type":"hardBreak"},
+          {"type":"text","text":"B"}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let inlines = rt.content[0].content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec!["text", "hardBreak", "text", "hardBreak", "text"],
+            "space between two hardBreaks should survive round-trip"
+        );
+        assert_eq!(inlines[2].text.as_deref(), Some(" "));
+        assert_eq!(inlines[4].text.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn issue_494_trailing_space_hardbreak_style_not_confused() {
+        // A plain paragraph break (blank line) should still work after
+        // a line that does NOT end with a hardBreak marker.
+        let md = "first paragraph\n\nsecond paragraph\n";
+        let doc = markdown_to_adf(md).unwrap();
+        assert_eq!(
+            doc.content.len(),
+            2,
+            "blank line should still separate paragraphs"
+        );
+    }
+
+    #[test]
+    fn issue_494_space_after_trailing_space_hardbreak_roundtrip() {
+        // Same bug but with trailing-space style hardBreak (two spaces
+        // before newline) instead of backslash style.
+        let md = "line one  \n   \n";
+        // The above is: "line one" + trailing-space hardBreak + continuation
+        // line "   " (2-space indent + 1 space content).  The space-only
+        // continuation should not be treated as a blank paragraph break.
+        let doc = markdown_to_adf(md).unwrap();
+        let inlines = doc.content[0].content.as_ref().unwrap();
+        let has_text_after_break = inlines.iter().any(|n| {
+            n.node_type == "text"
+                && n.text
+                    .as_deref()
+                    .is_some_and(|t| t.trim().is_empty() && !t.is_empty())
+        });
+        assert!(
+            has_text_after_break || inlines.len() >= 2,
+            "space-only line after trailing-space hardBreak should be preserved"
+        );
+    }
+
+    #[test]
+    fn issue_494_space_after_hardbreak_in_list_item_roundtrip() {
+        // Exercises the same bug inside a list item context.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[
+          {"type":"listItem","content":[{"type":"paragraph","content":[
+            {"type":"text","text":"item"},
+            {"type":"hardBreak"},
+            {"type":"text","text":" "}
+          ]}]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let list = &rt.content[0];
+        let item = &list.content.as_ref().unwrap()[0];
+        let para = &item.content.as_ref().unwrap()[0];
+        let inlines = para.content.as_ref().unwrap();
+        let types: Vec<&str> = inlines.iter().map(|n| n.node_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec!["text", "hardBreak", "text"],
+            "space after hardBreak in list item should survive round-trip"
+        );
+        assert_eq!(inlines[2].text.as_deref(), Some(" "));
     }
 }
