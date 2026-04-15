@@ -289,8 +289,44 @@ impl<'a> MarkdownParser<'a> {
                         attrs["localId"] = serde_json::Value::String(id);
                     }
                 }
-                items.push(task);
                 self.advance();
+                // Collect indented sub-content (e.g. nested task lists
+                // from malformed ADF where taskItem contains taskItem
+                // children directly — issue #489).
+                let mut sub_lines: Vec<String> = Vec::new();
+                while !self.at_end() && self.current_line().starts_with("  ") {
+                    let stripped = &self.current_line()[2..];
+                    sub_lines.push(stripped.to_string());
+                    self.advance();
+                }
+                if !sub_lines.is_empty() {
+                    let sub_text = sub_lines.join("\n");
+                    let mut nested = MarkdownParser::new(&sub_text).parse_blocks()?;
+                    // When the task item has no inline text and its
+                    // sub-content is a single taskList, this is a
+                    // container taskItem from malformed ADF (issue #489).
+                    // Unwrap the taskList so the taskItem children sit
+                    // directly in the container, and drop the spurious
+                    // `state` attr that was injected by the checkbox
+                    // marker.
+                    let is_empty = task.content.as_ref().map_or(true, Vec::is_empty);
+                    if is_empty && nested.len() == 1 && nested[0].node_type == "taskList" {
+                        if let Some(task_items) = nested.remove(0).content {
+                            task.content = Some(task_items);
+                        }
+                        if let Some(ref mut attrs) = task.attrs {
+                            if let Some(obj) = attrs.as_object_mut() {
+                                obj.remove("state");
+                            }
+                        }
+                    } else {
+                        match task.content {
+                            Some(ref mut content) => content.append(&mut nested),
+                            None => task.content = Some(nested),
+                        }
+                    }
+                }
+                items.push(task);
             } else {
                 let first_line = &trimmed[2..];
                 self.advance();
@@ -2996,6 +3032,37 @@ fn render_list_item_content(item: &AdfNode, output: &mut String, opts: &RenderOp
         output.push('\n');
         // Any remaining children are block nodes — fall through to the
         // indented-block loop below.
+    } else if first.node_type == "taskItem" {
+        // Malformed ADF: taskItem.content contains nested taskItem nodes
+        // directly (seen in some Confluence pages).  Render them as an
+        // indented nested task list to preserve the data without
+        // corrupting the surrounding structure (issue #489).
+        let bare = AdfNode::text("");
+        emit_list_item_local_ids(item, &bare, output, opts);
+        output.push('\n');
+        for child in content {
+            if child.node_type == "taskItem" {
+                let state = child
+                    .attrs
+                    .as_ref()
+                    .and_then(|a| a.get("state"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("TODO");
+                let marker = if state == "DONE" { "- [x] " } else { "- [ ] " };
+                output.push_str("  ");
+                output.push_str(marker);
+                render_list_item_content(child, output, opts);
+            } else {
+                let mut nested = String::new();
+                render_block_node(child, &mut nested, opts);
+                for line in nested.lines() {
+                    output.push_str("  ");
+                    output.push_str(line);
+                    output.push('\n');
+                }
+            }
+        }
+        return;
     } else {
         render_block_node(first, output, opts);
         rest_start = 1;
@@ -4405,6 +4472,270 @@ mod tests {
         let doc: AdfDocument = serde_json::from_str(json).unwrap();
         let md = adf_to_markdown(&doc).unwrap();
         assert!(md.contains("- [ ] "), "got: {md}");
+        assert!(!md.contains("adf-unsupported"), "got: {md}");
+    }
+
+    /// Issue #489: nested taskItem inside taskItem.content renders as indented
+    /// task items instead of corrupting the surrounding taskList.
+    #[test]
+    fn adf_nested_task_item_renders_without_corruption() {
+        let json = r#"{
+            "type": "doc",
+            "version": 1,
+            "content": [{
+                "type": "taskList",
+                "attrs": {"localId": ""},
+                "content": [
+                    {
+                        "type": "taskItem",
+                        "attrs": {"localId": "aabbccdd-1234-5678-abcd-aabbccdd1234", "state": "TODO"},
+                        "content": [{"type": "text", "text": "Normal task"}]
+                    },
+                    {
+                        "type": "taskItem",
+                        "attrs": {"localId": ""},
+                        "content": [
+                            {
+                                "type": "taskItem",
+                                "attrs": {"localId": "bbccddee-2345-6789-bcde-bbccddee2345", "state": "TODO"},
+                                "content": [{"type": "text", "text": "Nested task one"}]
+                            },
+                            {
+                                "type": "taskItem",
+                                "attrs": {"localId": "ccddee11-3456-7890-cdef-ccddee113456", "state": "DONE"},
+                                "content": [{"type": "text", "text": "Nested task two"}]
+                            }
+                        ]
+                    }
+                ]
+            }]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        // Normal task preserved
+        assert!(md.contains("- [ ] Normal task"), "got: {md}");
+        // Nested tasks rendered as indented task items, not adf-unsupported
+        assert!(!md.contains("adf-unsupported"), "got: {md}");
+        assert!(md.contains("  - [ ] Nested task one"), "got: {md}");
+        assert!(md.contains("  - [x] Nested task two"), "got: {md}");
+    }
+
+    /// Issue #489: round-trip of nested taskItem preserves data.
+    #[test]
+    fn round_trip_nested_task_item() {
+        let json = r#"{
+            "type": "doc",
+            "version": 1,
+            "content": [{
+                "type": "taskList",
+                "attrs": {"localId": ""},
+                "content": [
+                    {
+                        "type": "taskItem",
+                        "attrs": {"localId": "task-001", "state": "TODO"},
+                        "content": [{"type": "text", "text": "Normal task"}]
+                    },
+                    {
+                        "type": "taskItem",
+                        "attrs": {"localId": ""},
+                        "content": [
+                            {
+                                "type": "taskItem",
+                                "attrs": {"localId": "task-002", "state": "TODO"},
+                                "content": [{"type": "text", "text": "Nested one"}]
+                            },
+                            {
+                                "type": "taskItem",
+                                "attrs": {"localId": "task-003", "state": "DONE"},
+                                "content": [{"type": "text", "text": "Nested two"}]
+                            }
+                        ]
+                    }
+                ]
+            }]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let doc2 = markdown_to_adf(&md).unwrap();
+
+        // Top-level structure: taskList with 2 items
+        assert_eq!(doc2.content[0].node_type, "taskList");
+        let items = doc2.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 2, "expected 2 top-level items, got: {items:?}");
+
+        // First item: normal task preserved
+        assert_eq!(items[0].attrs.as_ref().unwrap()["state"], "TODO");
+        assert_eq!(items[0].attrs.as_ref().unwrap()["localId"], "task-001");
+        let first_content = items[0].content.as_ref().unwrap();
+        assert_eq!(first_content[0].text.as_deref(), Some("Normal task"));
+
+        // Second item: container taskItem — no spurious `state` attr
+        let container = &items[1];
+        assert_eq!(container.node_type, "taskItem");
+        let c_attrs = container.attrs.as_ref().unwrap();
+        assert!(
+            c_attrs.get("state").is_none(),
+            "container should have no state attr, got: {c_attrs:?}"
+        );
+
+        // Children are bare taskItems, NOT wrapped in a taskList
+        let container_content = container.content.as_ref().unwrap();
+        assert_eq!(
+            container_content.len(),
+            2,
+            "expected 2 bare taskItem children"
+        );
+        assert_eq!(container_content[0].node_type, "taskItem");
+        assert_eq!(
+            container_content[0].attrs.as_ref().unwrap()["state"],
+            "TODO"
+        );
+        assert_eq!(
+            container_content[0].attrs.as_ref().unwrap()["localId"],
+            "task-002"
+        );
+        assert_eq!(container_content[1].node_type, "taskItem");
+        assert_eq!(
+            container_content[1].attrs.as_ref().unwrap()["state"],
+            "DONE"
+        );
+        assert_eq!(
+            container_content[1].attrs.as_ref().unwrap()["localId"],
+            "task-003"
+        );
+    }
+
+    /// Issue #489: nested taskItem with localIds on both container and children.
+    #[test]
+    fn adf_nested_task_item_preserves_local_ids() {
+        let json = r#"{
+            "type": "doc",
+            "version": 1,
+            "content": [{
+                "type": "taskList",
+                "attrs": {"localId": "list-001"},
+                "content": [{
+                    "type": "taskItem",
+                    "attrs": {"localId": "container-001", "state": "TODO"},
+                    "content": [{
+                        "type": "taskItem",
+                        "attrs": {"localId": "child-001", "state": "DONE"},
+                        "content": [{"type": "text", "text": "Nested child"}]
+                    }]
+                }]
+            }]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        // Container localId is emitted
+        assert!(
+            md.contains("localId=container-001"),
+            "container localId missing: {md}"
+        );
+        // Child localId is emitted
+        assert!(
+            md.contains("localId=child-001"),
+            "child localId missing: {md}"
+        );
+        assert!(!md.contains("adf-unsupported"), "got: {md}");
+    }
+
+    /// Issue #489: nested taskItem content mixed with a non-taskItem block node.
+    /// Covers the else branch in the renderer where a child is not a taskItem.
+    #[test]
+    fn adf_nested_task_item_mixed_with_block_node() {
+        let json = r#"{
+            "type": "doc",
+            "version": 1,
+            "content": [{
+                "type": "taskList",
+                "attrs": {"localId": ""},
+                "content": [{
+                    "type": "taskItem",
+                    "attrs": {"localId": "", "state": "TODO"},
+                    "content": [
+                        {
+                            "type": "taskItem",
+                            "attrs": {"localId": "", "state": "TODO"},
+                            "content": [{"type": "text", "text": "A nested task"}]
+                        },
+                        {
+                            "type": "paragraph",
+                            "content": [{"type": "text", "text": "Stray paragraph"}]
+                        }
+                    ]
+                }]
+            }]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("  - [ ] A nested task"), "got: {md}");
+        assert!(md.contains("  Stray paragraph"), "got: {md}");
+        assert!(!md.contains("adf-unsupported"), "got: {md}");
+    }
+
+    /// Issue #489: task item with inline text AND indented sub-content.
+    /// Covers the parser's `Some` branch when appending nested blocks to
+    /// an existing content vec.
+    #[test]
+    fn task_item_with_text_and_nested_sub_content() {
+        let md = "- [ ] Parent task\n  - [ ] Sub task\n";
+        let doc = markdown_to_adf(md).unwrap();
+        assert_eq!(doc.content[0].node_type, "taskList");
+        let items = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 1, "got: {items:?}");
+        let parent = &items[0];
+        assert_eq!(parent.attrs.as_ref().unwrap()["state"], "TODO");
+        let parent_content = parent.content.as_ref().unwrap();
+        // First child: inline text
+        assert_eq!(parent_content[0].text.as_deref(), Some("Parent task"));
+        // Second child: nested taskList
+        assert_eq!(parent_content[1].node_type, "taskList");
+        let nested = parent_content[1].content.as_ref().unwrap();
+        assert_eq!(nested.len(), 1);
+        assert_eq!(nested[0].attrs.as_ref().unwrap()["state"], "TODO");
+    }
+
+    /// Issue #489: empty task item with non-taskList sub-content (e.g. a
+    /// paragraph).  Exercises the `None` branch when the sub-content does
+    /// not qualify for container-unwrap.
+    #[test]
+    fn task_item_empty_with_non_tasklist_sub_content() {
+        let md = "- [ ] \n  Some paragraph text\n";
+        let doc = markdown_to_adf(md).unwrap();
+        assert_eq!(doc.content[0].node_type, "taskList");
+        let items = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(item.attrs.as_ref().unwrap()["state"], "TODO");
+        let content = item.content.as_ref().unwrap();
+        // Sub-content is a paragraph (not unwrapped since it's not a taskList)
+        assert_eq!(content[0].node_type, "paragraph");
+    }
+
+    /// Issue #489: single nested taskItem (edge case — only one child).
+    #[test]
+    fn adf_nested_task_item_single_child() {
+        let json = r#"{
+            "type": "doc",
+            "version": 1,
+            "content": [{
+                "type": "taskList",
+                "attrs": {"localId": ""},
+                "content": [{
+                    "type": "taskItem",
+                    "attrs": {"localId": "", "state": "TODO"},
+                    "content": [{
+                        "type": "taskItem",
+                        "attrs": {"localId": "", "state": "DONE"},
+                        "content": [{"type": "text", "text": "Only child"}]
+                    }]
+                }]
+            }]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("  - [x] Only child"), "got: {md}");
         assert!(!md.contains("adf-unsupported"), "got: {md}");
     }
 
