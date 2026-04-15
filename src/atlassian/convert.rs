@@ -170,7 +170,10 @@ impl<'a> MarkdownParser<'a> {
         }
 
         let language = line[3..].trim();
-        let language = if language.is_empty() {
+        let language = if language == "\"\"" {
+            // Explicit empty language attr encoded as ```""
+            Some(String::new())
+        } else if language.is_empty() {
             None
         } else {
             Some(language.to_string())
@@ -2657,14 +2660,18 @@ fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) 
             output.push('\n');
         }
         "codeBlock" => {
-            let language = node
-                .attrs
-                .as_ref()
-                .and_then(|a| a.get("language"))
+            let language_value = node.attrs.as_ref().and_then(|a| a.get("language"));
+            let language = language_value
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
             output.push_str("```");
-            output.push_str(language);
+            if language.is_empty() && language_value.is_some() {
+                // Explicit empty language attr: encode as ```"" to distinguish
+                // from a codeBlock with no attrs at all (plain ```).
+                output.push_str("\"\"");
+            } else {
+                output.push_str(language);
+            }
             output.push('\n');
             if let Some(ref content) = node.content {
                 for child in content {
@@ -4286,6 +4293,15 @@ mod tests {
     }
 
     #[test]
+    fn code_block_empty_language() {
+        let md = "```\"\"\nsome code\n```";
+        let doc = markdown_to_adf(md).unwrap();
+        assert_eq!(doc.content[0].node_type, "codeBlock");
+        let attrs = doc.content[0].attrs.as_ref().unwrap();
+        assert_eq!(attrs["language"], "");
+    }
+
+    #[test]
     fn horizontal_rule() {
         let doc = markdown_to_adf("---").unwrap();
         assert_eq!(doc.content[0].node_type, "rule");
@@ -5086,6 +5102,44 @@ mod tests {
 
         assert!(restored.contains("```python"));
         assert!(restored.contains("print('hello')"));
+    }
+
+    #[test]
+    fn round_trip_code_block_no_attrs() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+            {"type":"codeBlock","content":[{"type":"text","text":"plain code"}]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        assert!(doc.content[0].attrs.is_none());
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        assert!(round_tripped.content[0].attrs.is_none());
+    }
+
+    #[test]
+    fn round_trip_code_block_empty_language() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+            {"type":"codeBlock","attrs":{"language":""},"content":[{"type":"text","text":"simple code block no backtick"}]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let attrs = doc.content[0].attrs.as_ref().unwrap();
+        assert_eq!(attrs["language"], "");
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let rt_attrs = round_tripped.content[0].attrs.as_ref().unwrap();
+        assert_eq!(rt_attrs["language"], "");
+    }
+
+    #[test]
+    fn round_trip_code_block_with_language() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+            {"type":"codeBlock","attrs":{"language":"python"},"content":[{"type":"text","text":"print('hi')"}]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let rt_attrs = round_tripped.content[0].attrs.as_ref().unwrap();
+        assert_eq!(rt_attrs["language"], "python");
     }
 
     #[test]
@@ -6521,6 +6575,18 @@ mod tests {
         };
         let md = adf_to_markdown(&doc).unwrap();
         assert!(md.contains("```\n"));
+        assert!(md.contains("plain code"));
+    }
+
+    #[test]
+    fn adf_code_block_empty_language_to_markdown() {
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::code_block(Some(""), "plain code")],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("```\"\"\n"));
         assert!(md.contains("plain code"));
     }
 
