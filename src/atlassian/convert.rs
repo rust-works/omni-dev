@@ -2100,6 +2100,35 @@ fn try_dispatch_inline_directive(text: &str, pos: usize) -> Option<(AdfNode, usi
             }
         }
         "placeholder" => AdfNode::placeholder(content),
+        "media-inline" => {
+            let mut json_attrs = serde_json::Map::new();
+            if let Some(ref attrs) = d.attrs {
+                for key in &["type", "id", "collection", "url", "alt", "width", "height"] {
+                    if let Some(val) = attrs.get(key) {
+                        if *key == "width" || *key == "height" {
+                            if let Ok(n) = val.parse::<u64>() {
+                                json_attrs.insert(
+                                    (*key).to_string(),
+                                    serde_json::Value::Number(n.into()),
+                                );
+                                continue;
+                            }
+                        }
+                        json_attrs.insert(
+                            (*key).to_string(),
+                            serde_json::Value::String(val.to_string()),
+                        );
+                    }
+                }
+                if let Some(local_id) = attrs.get("localId") {
+                    json_attrs.insert(
+                        "localId".to_string(),
+                        serde_json::Value::String(local_id.to_string()),
+                    );
+                }
+            }
+            AdfNode::media_inline(serde_json::Value::Object(json_attrs))
+        }
         "extension" => {
             let ext_type = d.attrs.as_ref().and_then(|a| a.get("type")).unwrap_or("");
             let ext_key = d.attrs.as_ref().and_then(|a| a.get("key")).unwrap_or("");
@@ -3592,6 +3621,36 @@ fn render_non_text_inline_body(
                 output.push_str(&format!(
                     ":extension[{fallback}]{{type={ext_type} key={ext_key}}}"
                 ));
+            }
+        }
+        "mediaInline" => {
+            if let Some(ref attrs) = node.attrs {
+                let mut attr_parts = Vec::new();
+                if let Some(media_type) = attrs.get("type").and_then(serde_json::Value::as_str) {
+                    attr_parts.push(format!("type={media_type}"));
+                }
+                if let Some(id) = attrs.get("id").and_then(serde_json::Value::as_str) {
+                    attr_parts.push(format!("id={id}"));
+                }
+                if let Some(collection) =
+                    attrs.get("collection").and_then(serde_json::Value::as_str)
+                {
+                    attr_parts.push(format!("collection={collection}"));
+                }
+                if let Some(url) = attrs.get("url").and_then(serde_json::Value::as_str) {
+                    attr_parts.push(format!("url={url}"));
+                }
+                if let Some(alt) = attrs.get("alt").and_then(serde_json::Value::as_str) {
+                    attr_parts.push(format!("alt={alt}"));
+                }
+                if let Some(width) = attrs.get("width").and_then(serde_json::Value::as_u64) {
+                    attr_parts.push(format!("width={width}"));
+                }
+                if let Some(height) = attrs.get("height").and_then(serde_json::Value::as_u64) {
+                    attr_parts.push(format!("height={height}"));
+                }
+                maybe_push_local_id(attrs, &mut attr_parts, opts);
+                output.push_str(&format!(":media-inline[]{{{}}}", attr_parts.join(" ")));
             }
         }
         _ => {
@@ -5195,6 +5254,160 @@ mod tests {
         };
         let md = adf_to_markdown(&doc).unwrap();
         assert!(md.contains("<!-- unsupported inline: unknownInline -->"));
+    }
+
+    // ── mediaInline tests (issue #476) ─────────────────────────────────
+
+    #[test]
+    fn adf_media_inline_to_markdown() {
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![
+                AdfNode::text("see "),
+                AdfNode::media_inline(serde_json::json!({
+                    "type": "image",
+                    "id": "abcdef01-2345-6789-abcd-abcdef012345",
+                    "collection": "contentId-111111",
+                    "width": 200,
+                    "height": 100
+                })),
+                AdfNode::text(" for details"),
+            ])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains(":media-inline[]{"), "got: {md}");
+        assert!(md.contains("type=image"));
+        assert!(md.contains("id=abcdef01-2345-6789-abcd-abcdef012345"));
+        assert!(md.contains("collection=contentId-111111"));
+        assert!(md.contains("width=200"));
+        assert!(md.contains("height=100"));
+        assert!(!md.contains("<!-- unsupported inline"));
+    }
+
+    #[test]
+    fn media_inline_round_trip() {
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![
+                AdfNode::text("see "),
+                AdfNode::media_inline(serde_json::json!({
+                    "type": "image",
+                    "id": "abcdef01-2345-6789-abcd-abcdef012345",
+                    "collection": "contentId-111111",
+                    "width": 200,
+                    "height": 100
+                })),
+                AdfNode::text(" for details"),
+            ])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let content = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(content[0].text.as_deref(), Some("see "));
+        assert_eq!(content[1].node_type, "mediaInline");
+        let attrs = content[1].attrs.as_ref().unwrap();
+        assert_eq!(attrs["type"], "image");
+        assert_eq!(attrs["id"], "abcdef01-2345-6789-abcd-abcdef012345");
+        assert_eq!(attrs["collection"], "contentId-111111");
+        assert_eq!(attrs["width"], 200);
+        assert_eq!(attrs["height"], 100);
+        assert_eq!(content[2].text.as_deref(), Some(" for details"));
+    }
+
+    #[test]
+    fn media_inline_external_url_round_trip() {
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::media_inline(
+                serde_json::json!({
+                    "type": "external",
+                    "url": "https://example.com/image.png",
+                    "alt": "example",
+                    "width": 400,
+                    "height": 300
+                }),
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let content = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(content[0].node_type, "mediaInline");
+        let attrs = content[0].attrs.as_ref().unwrap();
+        assert_eq!(attrs["type"], "external");
+        assert_eq!(attrs["url"], "https://example.com/image.png");
+        assert_eq!(attrs["alt"], "example");
+        assert_eq!(attrs["width"], 400);
+        assert_eq!(attrs["height"], 300);
+    }
+
+    #[test]
+    fn media_inline_minimal_attrs() {
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::media_inline(
+                serde_json::json!({"type": "file", "id": "abc-123"}),
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let content = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(content[0].node_type, "mediaInline");
+        let attrs = content[0].attrs.as_ref().unwrap();
+        assert_eq!(attrs["type"], "file");
+        assert_eq!(attrs["id"], "abc-123");
+    }
+
+    #[test]
+    fn media_inline_from_issue_476_reproducer() {
+        // Exact reproducer from issue #476
+        let adf_json: serde_json::Value = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "paragraph",
+                    "content": [
+                        {"type": "text", "text": "see "},
+                        {
+                            "type": "mediaInline",
+                            "attrs": {
+                                "collection": "contentId-111111",
+                                "height": 100,
+                                "id": "abcdef01-2345-6789-abcd-abcdef012345",
+                                "localId": "aabbccdd-1234-5678-abcd-aabbccdd1234",
+                                "type": "image",
+                                "width": 200
+                            }
+                        },
+                        {"type": "text", "text": " for details"}
+                    ]
+                }
+            ]
+        });
+        let doc: AdfDocument = serde_json::from_value(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            !md.contains("<!-- unsupported inline"),
+            "mediaInline should not be unsupported; got: {md}"
+        );
+
+        let rt = markdown_to_adf(&md).unwrap();
+        let content = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(content[1].node_type, "mediaInline");
+        let attrs = content[1].attrs.as_ref().unwrap();
+        assert_eq!(attrs["type"], "image");
+        assert_eq!(attrs["id"], "abcdef01-2345-6789-abcd-abcdef012345");
+        assert_eq!(attrs["collection"], "contentId-111111");
+        assert_eq!(attrs["width"], 200);
+        assert_eq!(attrs["height"], 100);
+        assert_eq!(attrs["localId"], "aabbccdd-1234-5678-abcd-aabbccdd1234");
     }
 
     #[test]
