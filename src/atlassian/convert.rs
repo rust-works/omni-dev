@@ -139,7 +139,7 @@ impl<'a> MarkdownParser<'a> {
             return None;
         }
 
-        let mut full_text = trimmed[level + 1..].trim_start().to_string();
+        let mut full_text = trimmed[level + 1..].to_string();
         self.advance();
         // Collect indented continuation lines produced by hardBreaks (issue #433).
         self.collect_hardbreak_continuations(&mut full_text);
@@ -10313,6 +10313,54 @@ mod tests {
             inlines[0].text.as_deref(),
             Some("Classic "),
             "trailing space in heading text before bold should be preserved"
+        );
+    }
+
+    #[test]
+    fn leading_space_in_heading_text_preserved() {
+        // Issue #492: leading spaces in heading text node stripped on round-trip
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"heading","attrs":{"level":3},"content":[
+          {"type":"text","text":"  #general-channel"}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let inlines = round_tripped.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            inlines[0].text.as_deref(),
+            Some("  #general-channel"),
+            "leading spaces in heading text should be preserved"
+        );
+    }
+
+    #[test]
+    fn leading_space_in_heading_before_bold_preserved() {
+        // Issue #492: leading space before bold sibling in heading
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"heading","attrs":{"level":2},"content":[
+          {"type":"text","text":"   indented"},
+          {"type":"text","text":" bold","marks":[{"type":"strong"}]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let inlines = round_tripped.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            inlines[0].text.as_deref(),
+            Some("   indented"),
+            "leading spaces in heading text before bold should be preserved"
+        );
+    }
+
+    #[test]
+    fn heading_multiple_leading_spaces_markdown_parse() {
+        // Issue #492: verify JFM parsing preserves leading spaces
+        let md = "### \t  #general-channel";
+        let doc = markdown_to_adf(md).unwrap();
+        let inlines = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            inlines[0].text.as_deref(),
+            Some("\t  #general-channel"),
+            "leading whitespace in heading text should be preserved during JFM parsing"
         );
     }
 
