@@ -354,30 +354,9 @@ impl<'a> MarkdownParser<'a> {
                     }
                     break;
                 }
-                // If the first line is a block-level image, parse as mediaSingle
-                // instead of wrapping in a paragraph (issue #430).
-                let first_node = if let Some(media) = try_parse_media_single_from_line(item_text) {
-                    media
-                } else {
-                    AdfNode::paragraph(parse_inline(item_text))
-                };
-                if sub_lines.is_empty() {
-                    items.push(list_item_with_local_id(
-                        vec![first_node],
-                        local_id,
-                        para_local_id,
-                    ));
-                } else {
-                    let sub_text = sub_lines.join("\n");
-                    let mut nested = MarkdownParser::new(&sub_text).parse_blocks()?;
-                    let mut item_content = vec![first_node];
-                    item_content.append(&mut nested);
-                    items.push(list_item_with_local_id(
-                        item_content,
-                        local_id,
-                        para_local_id,
-                    ));
-                }
+                let item_content =
+                    parse_list_item_first_line(item_text, sub_lines, local_id, para_local_id)?;
+                items.push(item_content);
             }
         }
 
@@ -414,30 +393,9 @@ impl<'a> MarkdownParser<'a> {
                     }
                     break;
                 }
-                // If the first line is a block-level image, parse as mediaSingle
-                // instead of wrapping in a paragraph (issue #430).
-                let first_node = if let Some(media) = try_parse_media_single_from_line(item_text) {
-                    media
-                } else {
-                    AdfNode::paragraph(parse_inline(item_text))
-                };
-                if sub_lines.is_empty() {
-                    items.push(list_item_with_local_id(
-                        vec![first_node],
-                        local_id,
-                        para_local_id,
-                    ));
-                } else {
-                    let sub_text = sub_lines.join("\n");
-                    let mut nested = MarkdownParser::new(&sub_text).parse_blocks()?;
-                    let mut item_content = vec![first_node];
-                    item_content.append(&mut nested);
-                    items.push(list_item_with_local_id(
-                        item_content,
-                        local_id,
-                        para_local_id,
-                    ));
-                }
+                let item_content =
+                    parse_list_item_first_line(item_text, sub_lines, local_id, para_local_id)?;
+                items.push(item_content);
             } else {
                 break;
             }
@@ -2525,6 +2483,56 @@ fn extract_trailing_local_id(text: &str) -> (&str, Option<String>, Option<String
 
 /// Creates a `listItem` node, optionally with a `localId` attribute
 /// and a `paraLocalId` on its first paragraph child.
+/// Parses the first line of a list item and any indented sub-content into
+/// an `AdfNode::list_item`.  When the first line is a code fence opener
+/// (`` ``` ``), the line is folded into the sub-content so the block-level
+/// code fence parser handles it correctly (issue #511).
+fn parse_list_item_first_line(
+    item_text: &str,
+    sub_lines: Vec<String>,
+    local_id: Option<String>,
+    para_local_id: Option<String>,
+) -> Result<AdfNode> {
+    if item_text.starts_with("```") {
+        // Treat the code fence opener + indented body as block content.
+        let mut all_lines = vec![item_text.to_string()];
+        all_lines.extend(sub_lines);
+        let combined = all_lines.join("\n");
+        let nested = MarkdownParser::new(&combined).parse_blocks()?;
+        Ok(list_item_with_local_id(nested, local_id, para_local_id))
+    } else if let Some(media) = try_parse_media_single_from_line(item_text) {
+        // Block-level image (issue #430).
+        if sub_lines.is_empty() {
+            Ok(list_item_with_local_id(
+                vec![media],
+                local_id,
+                para_local_id,
+            ))
+        } else {
+            let sub_text = sub_lines.join("\n");
+            let mut nested = MarkdownParser::new(&sub_text).parse_blocks()?;
+            let mut content = vec![media];
+            content.append(&mut nested);
+            Ok(list_item_with_local_id(content, local_id, para_local_id))
+        }
+    } else {
+        let first_node = AdfNode::paragraph(parse_inline(item_text));
+        if sub_lines.is_empty() {
+            Ok(list_item_with_local_id(
+                vec![first_node],
+                local_id,
+                para_local_id,
+            ))
+        } else {
+            let sub_text = sub_lines.join("\n");
+            let mut nested = MarkdownParser::new(&sub_text).parse_blocks()?;
+            let mut content = vec![first_node];
+            content.append(&mut nested);
+            Ok(list_item_with_local_id(content, local_id, para_local_id))
+        }
+    }
+}
+
 fn list_item_with_local_id(
     mut content: Vec<AdfNode>,
     local_id: Option<String>,
@@ -3136,7 +3144,23 @@ fn render_list_item_content(item: &AdfNode, output: &mut String, opts: &RenderOp
         }
         return;
     } else {
-        render_block_node(first, output, opts);
+        // The first child is a block-level node (e.g. codeBlock).
+        // Render to a buffer and indent continuation lines so the
+        // entire block sits inside the list item (issue #511).
+        let mut buf = String::new();
+        render_block_node(first, &mut buf, opts);
+        let mut is_first = true;
+        for line in buf.lines() {
+            if is_first {
+                output.push_str(line);
+                output.push('\n');
+                is_first = false;
+            } else {
+                output.push_str("  ");
+                output.push_str(line);
+                output.push('\n');
+            }
+        }
         rest_start = 1;
     }
     for child in &content[rest_start..] {
@@ -4894,6 +4918,213 @@ mod tests {
         let md = adf_to_markdown(&doc).unwrap();
         assert!(md.contains("```rust"), "got: {md}");
         assert!(md.contains("let x = 1;"), "got: {md}");
+        // Continuation lines must be indented so the block stays inside
+        // the list item on round-trip (issue #511).
+        for line in md.lines() {
+            if line.starts_with("- ") {
+                continue; // first line with list marker
+            }
+            if line.trim().is_empty() {
+                continue;
+            }
+            assert!(
+                line.starts_with("  "),
+                "continuation line not indented: {line:?}"
+            );
+        }
+    }
+
+    /// Round-trip a codeBlock inside a listItem whose content contains a
+    /// backtick character — the exact reproducer from issue #511.
+    #[test]
+    fn code_block_in_list_item_backtick_roundtrip() {
+        let json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "bulletList",
+                "content": [{
+                    "type": "listItem",
+                    "content": [{
+                        "type": "codeBlock",
+                        "attrs": {"language": ""},
+                        "content": [{"type": "text", "text": "error: some value with a backtick ` at end"}]
+                    }]
+                }]
+            }]
+        }"#;
+        let original: AdfDocument = serde_json::from_str(json).unwrap();
+        let md = adf_to_markdown(&original).unwrap();
+        let roundtripped = markdown_to_adf(&md).unwrap();
+        let list = &roundtripped.content[0];
+        assert_eq!(list.node_type, "bulletList", "top node: {}", list.node_type);
+        let item = &list.content.as_ref().unwrap()[0];
+        let first_child = &item.content.as_ref().unwrap()[0];
+        assert_eq!(
+            first_child.node_type, "codeBlock",
+            "expected codeBlock, got: {}",
+            first_child.node_type
+        );
+        let text = first_child.content.as_ref().unwrap()[0]
+            .text
+            .as_deref()
+            .unwrap();
+        assert_eq!(text, "error: some value with a backtick ` at end");
+    }
+
+    /// Code block with language tag inside a list item round-trips.
+    #[test]
+    fn code_block_with_language_in_list_item_roundtrip() {
+        let json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "bulletList",
+                "content": [{
+                    "type": "listItem",
+                    "content": [{
+                        "type": "codeBlock",
+                        "attrs": {"language": "rust"},
+                        "content": [{"type": "text", "text": "fn main() {\n    println!(\"hello\");\n}"}]
+                    }]
+                }]
+            }]
+        }"#;
+        let original: AdfDocument = serde_json::from_str(json).unwrap();
+        let md = adf_to_markdown(&original).unwrap();
+        let roundtripped = markdown_to_adf(&md).unwrap();
+        let item = &roundtripped.content[0].content.as_ref().unwrap()[0];
+        let code = &item.content.as_ref().unwrap()[0];
+        assert_eq!(code.node_type, "codeBlock");
+        let lang = code
+            .attrs
+            .as_ref()
+            .and_then(|a| a.get("language"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        assert_eq!(lang, "rust");
+        let text = code.content.as_ref().unwrap()[0].text.as_deref().unwrap();
+        assert!(text.contains("println!"), "code content: {text}");
+    }
+
+    /// Code block in an ordered list item round-trips correctly.
+    #[test]
+    fn code_block_in_ordered_list_item_roundtrip() {
+        let json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "orderedList",
+                "attrs": {"order": 1},
+                "content": [{
+                    "type": "listItem",
+                    "content": [{
+                        "type": "codeBlock",
+                        "attrs": {"language": ""},
+                        "content": [{"type": "text", "text": "backtick ` here"}]
+                    }]
+                }]
+            }]
+        }"#;
+        let original: AdfDocument = serde_json::from_str(json).unwrap();
+        let md = adf_to_markdown(&original).unwrap();
+        let roundtripped = markdown_to_adf(&md).unwrap();
+        let list = &roundtripped.content[0];
+        assert_eq!(list.node_type, "orderedList");
+        let item = &list.content.as_ref().unwrap()[0];
+        let code = &item.content.as_ref().unwrap()[0];
+        assert_eq!(code.node_type, "codeBlock");
+        let text = code.content.as_ref().unwrap()[0].text.as_deref().unwrap();
+        assert_eq!(text, "backtick ` here");
+    }
+
+    /// A list item with a code block followed by a paragraph round-trips.
+    #[test]
+    fn code_block_then_paragraph_in_list_item() {
+        let json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "bulletList",
+                "content": [{
+                    "type": "listItem",
+                    "content": [
+                        {
+                            "type": "codeBlock",
+                            "attrs": {"language": ""},
+                            "content": [{"type": "text", "text": "code with ` backtick"}]
+                        },
+                        {
+                            "type": "paragraph",
+                            "content": [{"type": "text", "text": "description"}]
+                        }
+                    ]
+                }]
+            }]
+        }"#;
+        let original: AdfDocument = serde_json::from_str(json).unwrap();
+        let md = adf_to_markdown(&original).unwrap();
+        let roundtripped = markdown_to_adf(&md).unwrap();
+        let item = &roundtripped.content[0].content.as_ref().unwrap()[0];
+        let children = item.content.as_ref().unwrap();
+        assert_eq!(children[0].node_type, "codeBlock");
+        assert_eq!(children[1].node_type, "paragraph");
+    }
+
+    /// Multiple backticks in code block content round-trip.
+    #[test]
+    fn code_block_multiple_backticks_in_list_item() {
+        let json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "bulletList",
+                "content": [{
+                    "type": "listItem",
+                    "content": [{
+                        "type": "codeBlock",
+                        "attrs": {"language": ""},
+                        "content": [{"type": "text", "text": "a ` b `` c ``` d"}]
+                    }]
+                }]
+            }]
+        }"#;
+        let original: AdfDocument = serde_json::from_str(json).unwrap();
+        let md = adf_to_markdown(&original).unwrap();
+        let roundtripped = markdown_to_adf(&md).unwrap();
+        let item = &roundtripped.content[0].content.as_ref().unwrap()[0];
+        let code = &item.content.as_ref().unwrap()[0];
+        assert_eq!(code.node_type, "codeBlock");
+        let text = code.content.as_ref().unwrap()[0].text.as_deref().unwrap();
+        assert_eq!(text, "a ` b `` c ``` d");
+    }
+
+    /// Media as the first child of a list item with a subsequent paragraph
+    /// exercises the media + sub_lines branch in `parse_list_item_first_line`.
+    #[test]
+    fn media_first_child_with_sub_content_in_list_item() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[
+          {"type":"listItem","content":[
+            {"type":"mediaSingle","attrs":{"layout":"center"},
+             "content":[{"type":"media","attrs":{"type":"file","id":"img-99","collection":"col-x","height":50,"width":100}}]},
+            {"type":"paragraph","content":[{"type":"text","text":"Caption below"}]}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let item = &rt.content[0].content.as_ref().unwrap()[0];
+        let children = item.content.as_ref().unwrap();
+        assert_eq!(
+            children.len(),
+            2,
+            "expected 2 children, got {}",
+            children.len()
+        );
+        assert_eq!(children[0].node_type, "mediaSingle");
+        let media = &children[0].content.as_ref().unwrap()[0];
+        assert_eq!(media.attrs.as_ref().unwrap()["id"], "img-99");
+        assert_eq!(children[1].node_type, "paragraph");
     }
 
     #[test]
