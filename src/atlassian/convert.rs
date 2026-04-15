@@ -1136,8 +1136,16 @@ fn build_cell_attrs(attrs: &crate::atlassian::attrs::Attrs) -> serde_json::Value
     if let Some(colwidth) = attrs.get("colwidth") {
         let widths: Vec<serde_json::Value> = colwidth
             .split(',')
-            .filter_map(|s| s.trim().parse::<f64>().ok())
-            .map(|n| serde_json::json!(n))
+            .filter_map(|s| {
+                let s = s.trim();
+                // Preserve the original number type: values without a decimal point
+                // are emitted as integers, values with a decimal point as floats.
+                if s.contains('.') {
+                    s.parse::<f64>().ok().map(|n| serde_json::json!(n))
+                } else {
+                    s.parse::<u64>().ok().map(|n| serde_json::json!(n))
+                }
+            })
             .collect();
         if !widths.is_empty() {
             adf["colwidth"] = serde_json::Value::Array(widths);
@@ -3428,13 +3436,20 @@ fn build_cell_attrs_string(cell: &AdfNode) -> String {
     if let Some(colwidth) = attrs.get("colwidth").and_then(serde_json::Value::as_array) {
         let widths: Vec<String> = colwidth
             .iter()
-            .filter_map(serde_json::Value::as_f64)
-            .map(|n| {
-                // Always format as float to preserve Confluence's representation
-                if n.fract() == 0.0 {
-                    format!("{n:.1}")
+            .filter_map(|v| {
+                // Preserve the original number type: integers stay as integers,
+                // floats stay as floats (e.g. Confluence's 254.0 representation).
+                if let Some(n) = v.as_u64() {
+                    Some(n.to_string())
+                } else if let Some(n) = v.as_f64() {
+                    if n.fract() == 0.0 {
+                        format!("{n:.1}")
+                    } else {
+                        n.to_string()
+                    }
+                    .into()
                 } else {
-                    n.to_string()
+                    None
                 }
             })
             .collect();
@@ -10486,10 +10501,7 @@ mod tests {
             .as_ref()
             .unwrap()[0];
         let colwidth = cell.attrs.as_ref().unwrap()["colwidth"].as_array().unwrap();
-        assert_eq!(
-            colwidth,
-            &[serde_json::json!(100.0), serde_json::json!(200.0)]
-        );
+        assert_eq!(colwidth, &[serde_json::json!(100), serde_json::json!(200)]);
     }
 
     #[test]
@@ -10563,6 +10575,115 @@ mod tests {
             colwidth,
             &[serde_json::json!(254.0), serde_json::json!(416.0)],
             "colwidth should preserve float values"
+        );
+    }
+
+    #[test]
+    fn colwidth_integer_preserved_in_roundtrip() {
+        // Issue #459: colwidth integer values emitted as floats after round-trip
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"table","content":[{"type":"tableRow","content":[{"type":"tableCell","attrs":{"colspan":1,"colwidth":[150],"rowspan":1},"content":[{"type":"paragraph","content":[{"type":"text","text":"cell"}]}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("colwidth=150"),
+            "expected colwidth=150 (no decimal) in markdown, got: {md}"
+        );
+        assert!(
+            !md.contains("colwidth=150.0"),
+            "colwidth should not have .0 suffix for integers, got: {md}"
+        );
+        // Round-trip back to ADF
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let cell = &round_tripped.content[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap()[0];
+        let colwidth = cell.attrs.as_ref().unwrap()["colwidth"].as_array().unwrap();
+        assert_eq!(
+            colwidth,
+            &[serde_json::json!(150)],
+            "colwidth should preserve integer values"
+        );
+        // Verify JSON serialization uses integer, not float
+        let json_output = serde_json::to_string(&round_tripped).unwrap();
+        assert!(
+            json_output.contains(r#""colwidth":[150]"#),
+            "JSON should contain integer colwidth, got: {json_output}"
+        );
+    }
+
+    #[test]
+    fn colwidth_mixed_int_and_float_roundtrip() {
+        // Integer colwidth from standard ADF and float colwidth from Confluence
+        // should each preserve their original type through round-trip.
+        let int_json = r#"{"version":1,"type":"doc","content":[{"type":"table","content":[{"type":"tableRow","content":[{"type":"tableCell","attrs":{"colwidth":[100,200]}}]}]}]}"#;
+        let float_json = r#"{"version":1,"type":"doc","content":[{"type":"table","content":[{"type":"tableRow","content":[{"type":"tableCell","attrs":{"colwidth":[100.0,200.0]}}]}]}]}"#;
+
+        // Integer input → integer output
+        let int_doc: AdfDocument = serde_json::from_str(int_json).unwrap();
+        let int_md = adf_to_markdown(&int_doc).unwrap();
+        assert!(
+            int_md.contains("colwidth=100,200"),
+            "integer colwidth in md: {int_md}"
+        );
+        let int_rt = markdown_to_adf(&int_md).unwrap();
+        let int_serial = serde_json::to_string(&int_rt).unwrap();
+        assert!(
+            int_serial.contains(r#""colwidth":[100,200]"#),
+            "integer colwidth in JSON: {int_serial}"
+        );
+
+        // Float input → float output
+        let float_doc: AdfDocument = serde_json::from_str(float_json).unwrap();
+        let float_md = adf_to_markdown(&float_doc).unwrap();
+        assert!(
+            float_md.contains("colwidth=100.0,200.0"),
+            "float colwidth in md: {float_md}"
+        );
+        let float_rt = markdown_to_adf(&float_md).unwrap();
+        let float_serial = serde_json::to_string(&float_rt).unwrap();
+        assert!(
+            float_serial.contains(r#""colwidth":[100.0,200.0]"#),
+            "float colwidth in JSON: {float_serial}"
+        );
+    }
+
+    #[test]
+    fn colwidth_fractional_float_preserved() {
+        // Covers the fractional-float branch (n.fract() != 0.0) in build_cell_attrs_string
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"table","content":[{"type":"tableRow","content":[{"type":"tableCell","attrs":{"colwidth":[100.5]},"content":[{"type":"paragraph","content":[{"type":"text","text":"cell"}]}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("colwidth=100.5"),
+            "expected colwidth=100.5 in markdown, got: {md}"
+        );
+    }
+
+    #[test]
+    fn colwidth_non_numeric_values_skipped() {
+        // Covers the None branch for non-numeric colwidth entries in build_cell_attrs_string
+        let adf_doc = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [{
+                "type": "table",
+                "content": [{
+                    "type": "tableRow",
+                    "content": [{
+                        "type": "tableCell",
+                        "attrs": { "colwidth": ["invalid"] },
+                        "content": [{ "type": "paragraph", "content": [{ "type": "text", "text": "cell" }] }]
+                    }]
+                }]
+            }]
+        });
+        let doc: AdfDocument = serde_json::from_value(adf_doc).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        // Non-numeric values are filtered out, so colwidth should not appear
+        assert!(
+            !md.contains("colwidth"),
+            "non-numeric colwidth should be filtered out, got: {md}"
         );
     }
 
