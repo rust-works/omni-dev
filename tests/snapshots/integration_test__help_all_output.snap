@@ -386,6 +386,7 @@ Commands:
   transition  Lists or executes workflow transitions on a JIRA issue
   comment     Manages comments on a JIRA issue
   delete      Deletes a JIRA issue
+  dev         Shows development status (linked PRs, branches, repositories) for a JIRA issue
   project     Lists JIRA projects
   field       Manages JIRA field definitions and options
   board       Manages JIRA agile boards
@@ -599,6 +600,25 @@ Arguments:
 Options:
       --force  Skips the confirmation prompt
   -h, --help   Print help
+
+
+================================================================================
+
+omni-dev atlassian jira dev - Shows development status (linked PRs, branches, repositories) for a JIRA issue
+
+Shows development status (linked PRs, branches, repositories) for a JIRA issue
+
+Usage: dev [OPTIONS] <KEY>
+
+Arguments:
+  <KEY>  JIRA issue key (e.g., PROJ-123)
+
+Options:
+      --type <TYPE>      Data type filter [possible values: pullrequest, branch, repository]
+      --app <APP>        Application type filter (e.g., GitHub, bitbucket, stash). If omitted, queries all available integrations
+      --summary          Show summary counts instead of full details
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================

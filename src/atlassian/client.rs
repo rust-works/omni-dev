@@ -3,6 +3,7 @@
 //! Provides HTTP access to JIRA Cloud REST API v3 for reading and
 //! writing issues. Uses Basic Auth (email + API token).
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -299,6 +300,123 @@ pub struct JiraTransition {
     pub id: String,
     /// Transition name (e.g., "In Progress", "Done").
     pub name: String,
+}
+
+/// A pull request from Jira's DevStatus API.
+#[derive(Debug, Clone, Serialize)]
+pub struct JiraDevPullRequest {
+    /// PR identifier (e.g., "#2174").
+    pub id: String,
+    /// PR title.
+    pub name: String,
+    /// Status (e.g., "OPEN", "MERGED", "DECLINED").
+    pub status: String,
+    /// URL to the pull request.
+    pub url: String,
+    /// Repository name (e.g., "org/repo").
+    pub repository_name: String,
+    /// Source branch name.
+    pub source_branch: String,
+    /// Destination branch name.
+    pub destination_branch: String,
+    /// PR author name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    /// Reviewer names.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reviewers: Vec<String>,
+    /// Number of comments on the PR.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment_count: Option<u32>,
+    /// Last update timestamp (ISO 8601).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_update: Option<String>,
+}
+
+/// A commit from Jira's DevStatus API.
+#[derive(Debug, Clone, Serialize)]
+pub struct JiraDevCommit {
+    /// Full commit SHA.
+    pub id: String,
+    /// Short commit SHA.
+    pub display_id: String,
+    /// Commit message.
+    pub message: String,
+    /// Commit author name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    /// Author timestamp (ISO 8601).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+    /// URL to the commit.
+    pub url: String,
+    /// Number of files changed.
+    pub file_count: u32,
+    /// Whether this is a merge commit.
+    pub merge: bool,
+}
+
+/// A branch from Jira's DevStatus API.
+#[derive(Debug, Clone, Serialize)]
+pub struct JiraDevBranch {
+    /// Branch name.
+    pub name: String,
+    /// URL to the branch.
+    pub url: String,
+    /// Repository name (e.g., "org/repo").
+    pub repository_name: String,
+    /// URL to create a pull request from this branch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub create_pr_url: Option<String>,
+    /// Most recent commit on this branch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_commit: Option<JiraDevCommit>,
+}
+
+/// A repository from Jira's DevStatus API.
+#[derive(Debug, Clone, Serialize)]
+pub struct JiraDevRepository {
+    /// Repository name (e.g., "org/repo").
+    pub name: String,
+    /// URL to the repository.
+    pub url: String,
+    /// Commits linked to this issue in the repository.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub commits: Vec<JiraDevCommit>,
+}
+
+/// Development status information for a Jira issue.
+#[derive(Debug, Clone, Serialize)]
+pub struct JiraDevStatus {
+    /// Linked pull requests.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pull_requests: Vec<JiraDevPullRequest>,
+    /// Linked branches.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub branches: Vec<JiraDevBranch>,
+    /// Linked repositories.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub repositories: Vec<JiraDevRepository>,
+}
+
+/// Summary counts for a category of development status.
+#[derive(Debug, Clone, Serialize)]
+pub struct JiraDevStatusCount {
+    /// Number of items.
+    pub count: u32,
+    /// Application type names that have data (e.g., "GitHub", "bitbucket").
+    pub providers: Vec<String>,
+}
+
+/// High-level development status summary for a Jira issue.
+#[derive(Debug, Clone, Serialize)]
+pub struct JiraDevStatusSummary {
+    /// Pull request summary.
+    pub pullrequest: JiraDevStatusCount,
+    /// Branch summary.
+    pub branch: JiraDevStatusCount,
+    /// Repository summary.
+    pub repository: JiraDevStatusCount,
 }
 
 // ── Internal API response structs ───────────────────────────────────
@@ -627,6 +745,155 @@ struct JiraCreateResponse {
     id: String,
     #[serde(rename = "self")]
     self_url: String,
+}
+
+// ── DevStatus API response structs ─────────────────────────────────
+
+/// Minimal response for resolving an issue key to its numeric ID.
+#[derive(Deserialize)]
+struct JiraIssueIdResponse {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct DevStatusResponse {
+    #[serde(default)]
+    detail: Vec<DevStatusDetail>,
+}
+
+#[derive(Deserialize)]
+struct DevStatusDetail {
+    #[serde(rename = "pullRequests", default)]
+    pull_requests: Vec<DevStatusPullRequest>,
+    #[serde(default)]
+    branches: Vec<DevStatusBranch>,
+    #[serde(default)]
+    repositories: Vec<DevStatusRepositoryEntry>,
+}
+
+#[derive(Deserialize)]
+struct DevStatusPullRequest {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    url: String,
+    #[serde(rename = "repositoryName", default)]
+    repository_name: String,
+    #[serde(default)]
+    source: Option<DevStatusBranchRef>,
+    #[serde(default)]
+    destination: Option<DevStatusBranchRef>,
+    #[serde(default)]
+    author: Option<DevStatusAuthor>,
+    #[serde(default)]
+    reviewers: Vec<DevStatusReviewer>,
+    #[serde(rename = "commentCount", default)]
+    comment_count: Option<u32>,
+    #[serde(rename = "lastUpdate", default)]
+    last_update: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DevStatusBranchRef {
+    #[serde(default)]
+    branch: String,
+}
+
+#[derive(Deserialize)]
+struct DevStatusAuthor {
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct DevStatusReviewer {
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct DevStatusCommit {
+    #[serde(default)]
+    id: String,
+    #[serde(rename = "displayId", default)]
+    display_id: String,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    author: Option<DevStatusAuthor>,
+    #[serde(rename = "authorTimestamp", default)]
+    author_timestamp: Option<String>,
+    #[serde(default)]
+    url: String,
+    #[serde(rename = "fileCount", default)]
+    file_count: u32,
+    #[serde(default)]
+    merge: bool,
+}
+
+#[derive(Deserialize)]
+struct DevStatusBranch {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    url: String,
+    #[serde(rename = "repositoryName", default)]
+    repository_name: String,
+    #[serde(rename = "createPullRequestUrl", default)]
+    create_pr_url: Option<String>,
+    #[serde(rename = "lastCommit", default)]
+    last_commit: Option<DevStatusCommit>,
+}
+
+#[derive(Deserialize)]
+struct DevStatusRepositoryEntry {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    commits: Vec<DevStatusCommit>,
+}
+
+// ── DevStatus summary response structs ────────────────────────────
+
+#[derive(Deserialize)]
+struct DevStatusSummaryResponse {
+    #[serde(default)]
+    summary: DevStatusSummaryData,
+}
+
+#[derive(Deserialize, Default)]
+struct DevStatusSummaryData {
+    #[serde(default)]
+    pullrequest: Option<DevStatusSummaryCategory>,
+    #[serde(default)]
+    branch: Option<DevStatusSummaryCategory>,
+    #[serde(default)]
+    repository: Option<DevStatusSummaryCategory>,
+}
+
+#[derive(Deserialize)]
+struct DevStatusSummaryCategory {
+    overall: Option<DevStatusSummaryOverall>,
+    #[serde(rename = "byInstanceType", default)]
+    by_instance_type: HashMap<String, DevStatusSummaryInstance>,
+}
+
+#[derive(Deserialize)]
+struct DevStatusSummaryOverall {
+    #[serde(default)]
+    count: u32,
+}
+
+#[derive(Deserialize)]
+struct DevStatusSummaryInstance {
+    #[serde(default)]
+    name: String,
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -2832,6 +3099,496 @@ mod tests {
         let err = client.get_myself().await.unwrap_err();
         assert!(err.to_string().contains("401"));
     }
+
+    // ── get_issue_id ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_issue_id_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"id": "12345", "key": "PROJ-1", "fields": {}}),
+                ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let id = client.get_issue_id("PROJ-1").await.unwrap();
+        assert_eq!(id, "12345");
+    }
+
+    #[tokio::test]
+    async fn get_issue_id_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/NOPE-1"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.get_issue_id("NOPE-1").await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    // ── get_dev_status_summary ────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_dev_status_summary_success() {
+        let server = wiremock::MockServer::start().await;
+
+        // Mock issue ID resolution.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"id": "10001", "key": "PROJ-1", "fields": {}}),
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        // Mock summary endpoint.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/dev-status/1.0/issue/summary",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "summary": {
+                        "pullrequest": {
+                            "overall": {"count": 2},
+                            "byInstanceType": {"GitHub": {"count": 2, "name": "GitHub"}}
+                        },
+                        "branch": {
+                            "overall": {"count": 1},
+                            "byInstanceType": {"GitHub": {"count": 1, "name": "GitHub"}}
+                        },
+                        "repository": {
+                            "overall": {"count": 1},
+                            "byInstanceType": {}
+                        }
+                    }
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let summary = client.get_dev_status_summary("PROJ-1").await.unwrap();
+        assert_eq!(summary.pullrequest.count, 2);
+        assert_eq!(summary.pullrequest.providers, vec!["GitHub"]);
+        assert_eq!(summary.branch.count, 1);
+        assert_eq!(summary.repository.count, 1);
+        assert!(summary.repository.providers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_dev_status_summary_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"id": "10001", "key": "PROJ-1", "fields": {}}),
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/dev-status/1.0/issue/summary",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.get_dev_status_summary("PROJ-1").await.unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    // ── get_dev_status ────────────────────────────────────────────
+
+    /// Helper: mounts a mock for issue ID resolution returning id "10001".
+    async fn mount_issue_id_mock(server: &wiremock::MockServer) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"id": "10001", "key": "PROJ-1", "fields": {}}),
+                ),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// Helper: mounts a mock for the dev-status summary returning GitHub as the only provider.
+    async fn mount_summary_mock(server: &wiremock::MockServer) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/dev-status/1.0/issue/summary",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "summary": {
+                        "pullrequest": {
+                            "overall": {"count": 1},
+                            "byInstanceType": {"GitHub": {"count": 1, "name": "GitHub"}}
+                        },
+                        "branch": {
+                            "overall": {"count": 0},
+                            "byInstanceType": {}
+                        },
+                        "repository": {
+                            "overall": {"count": 0},
+                            "byInstanceType": {}
+                        }
+                    }
+                })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    fn dev_status_detail_response() -> serde_json::Value {
+        serde_json::json!({
+            "detail": [{
+                "pullRequests": [{
+                    "id": "#42",
+                    "name": "Fix login bug",
+                    "status": "MERGED",
+                    "url": "https://github.com/org/repo/pull/42",
+                    "repositoryName": "org/repo",
+                    "source": {"branch": "fix-login"},
+                    "destination": {"branch": "main"},
+                    "author": {"name": "Alice"},
+                    "reviewers": [{"name": "Bob"}],
+                    "commentCount": 3,
+                    "lastUpdate": "2024-01-15T10:30:00.000+0000"
+                }],
+                "branches": [{
+                    "name": "fix-login",
+                    "url": "https://github.com/org/repo/tree/fix-login",
+                    "repositoryName": "org/repo",
+                    "createPullRequestUrl": "https://github.com/org/repo/compare/fix-login",
+                    "lastCommit": {
+                        "id": "abc123def456",
+                        "displayId": "abc123d",
+                        "message": "Fix the login",
+                        "author": {"name": "Alice"},
+                        "authorTimestamp": "2024-01-14T08:00:00.000+0000",
+                        "url": "https://github.com/org/repo/commit/abc123d",
+                        "fileCount": 2,
+                        "merge": false
+                    }
+                }],
+                "repositories": [{
+                    "name": "org/repo",
+                    "url": "https://github.com/org/repo",
+                    "commits": [{
+                        "id": "abc123def456",
+                        "displayId": "abc123d",
+                        "message": "Fix the login",
+                        "author": {"name": "Alice"},
+                        "authorTimestamp": "2024-01-14T08:00:00.000+0000",
+                        "url": "https://github.com/org/repo/commit/abc123d",
+                        "fileCount": 2,
+                        "merge": false
+                    }]
+                }],
+                "_instance": {"name": "GitHub", "type": "GitHub"}
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn get_dev_status_pullrequest_fields() {
+        let server = wiremock::MockServer::start().await;
+        mount_issue_id_mock(&server).await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/dev-status/1.0/issue/detail",
+            ))
+            .and(wiremock::matchers::query_param("dataType", "pullrequest"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(dev_status_detail_response()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let status = client
+            .get_dev_status("PROJ-1", Some("pullrequest"), Some("GitHub"))
+            .await
+            .unwrap();
+
+        assert_eq!(status.pull_requests.len(), 1);
+        let pr = &status.pull_requests[0];
+        assert_eq!(pr.id, "#42");
+        assert_eq!(pr.status, "MERGED");
+        assert_eq!(pr.author.as_deref(), Some("Alice"));
+        assert_eq!(pr.reviewers, vec!["Bob"]);
+        assert_eq!(pr.comment_count, Some(3));
+        assert!(pr.last_update.is_some());
+        assert_eq!(pr.source_branch, "fix-login");
+        assert_eq!(pr.destination_branch, "main");
+    }
+
+    #[tokio::test]
+    async fn get_dev_status_branch_fields() {
+        let server = wiremock::MockServer::start().await;
+        mount_issue_id_mock(&server).await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/dev-status/1.0/issue/detail",
+            ))
+            .and(wiremock::matchers::query_param("dataType", "branch"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(dev_status_detail_response()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let status = client
+            .get_dev_status("PROJ-1", Some("branch"), Some("GitHub"))
+            .await
+            .unwrap();
+
+        assert_eq!(status.branches.len(), 1);
+        let branch = &status.branches[0];
+        assert_eq!(branch.name, "fix-login");
+        assert!(branch.create_pr_url.is_some());
+        let commit = branch.last_commit.as_ref().unwrap();
+        assert_eq!(commit.display_id, "abc123d");
+        assert_eq!(commit.file_count, 2);
+        assert!(!commit.merge);
+    }
+
+    #[tokio::test]
+    async fn get_dev_status_repository_with_commits() {
+        let server = wiremock::MockServer::start().await;
+        mount_issue_id_mock(&server).await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/dev-status/1.0/issue/detail",
+            ))
+            .and(wiremock::matchers::query_param("dataType", "repository"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(dev_status_detail_response()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let status = client
+            .get_dev_status("PROJ-1", Some("repository"), Some("GitHub"))
+            .await
+            .unwrap();
+
+        assert_eq!(status.repositories.len(), 1);
+        assert_eq!(status.repositories[0].commits.len(), 1);
+        assert_eq!(status.repositories[0].commits[0].display_id, "abc123d");
+        assert_eq!(
+            status.repositories[0].commits[0].author.as_deref(),
+            Some("Alice")
+        );
+    }
+
+    #[tokio::test]
+    async fn get_dev_status_auto_discovers_providers() {
+        let server = wiremock::MockServer::start().await;
+        mount_issue_id_mock(&server).await;
+        mount_summary_mock(&server).await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/dev-status/1.0/issue/detail",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(dev_status_detail_response()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let status = client
+            .get_dev_status("PROJ-1", Some("pullrequest"), None)
+            .await
+            .unwrap();
+
+        assert_eq!(status.pull_requests.len(), 1);
+        assert_eq!(status.pull_requests[0].name, "Fix login bug");
+    }
+
+    #[tokio::test]
+    async fn get_dev_status_empty_response() {
+        let server = wiremock::MockServer::start().await;
+        mount_issue_id_mock(&server).await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/dev-status/1.0/issue/detail",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"detail": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let status = client
+            .get_dev_status("PROJ-1", None, Some("GitHub"))
+            .await
+            .unwrap();
+
+        assert!(status.pull_requests.is_empty());
+        assert!(status.branches.is_empty());
+        assert!(status.repositories.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_dev_status_detail_api_error() {
+        let server = wiremock::MockServer::start().await;
+        mount_issue_id_mock(&server).await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/dev-status/1.0/issue/detail",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("Server Error"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .get_dev_status("PROJ-1", Some("pullrequest"), Some("GitHub"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("500"));
+    }
+
+    #[tokio::test]
+    async fn get_dev_status_with_data_type_filter() {
+        let server = wiremock::MockServer::start().await;
+        mount_issue_id_mock(&server).await;
+
+        // Only return branch data.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/dev-status/1.0/issue/detail",
+            ))
+            .and(wiremock::matchers::query_param("dataType", "branch"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "detail": [{
+                        "pullRequests": [],
+                        "branches": [{
+                            "name": "feature-x",
+                            "url": "https://github.com/org/repo/tree/feature-x",
+                            "repositoryName": "org/repo"
+                        }],
+                        "repositories": []
+                    }]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let status = client
+            .get_dev_status("PROJ-1", Some("branch"), Some("GitHub"))
+            .await
+            .unwrap();
+
+        assert!(status.pull_requests.is_empty());
+        assert_eq!(status.branches.len(), 1);
+        assert_eq!(status.branches[0].name, "feature-x");
+        assert!(status.branches[0].last_commit.is_none());
+        assert!(status.branches[0].create_pr_url.is_none());
+        assert!(status.repositories.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_dev_status_summary_empty() {
+        let server = wiremock::MockServer::start().await;
+        mount_issue_id_mock(&server).await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/dev-status/1.0/issue/summary",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"summary": {}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let summary = client.get_dev_status_summary("PROJ-1").await.unwrap();
+        assert_eq!(summary.pullrequest.count, 0);
+        assert_eq!(summary.branch.count, 0);
+        assert_eq!(summary.repository.count, 0);
+    }
+
+    #[tokio::test]
+    async fn convert_commit_maps_all_fields() {
+        let internal = DevStatusCommit {
+            id: "abc123".to_string(),
+            display_id: "abc".to_string(),
+            message: "Test commit".to_string(),
+            author: Some(DevStatusAuthor {
+                name: "Alice".to_string(),
+            }),
+            author_timestamp: Some("2024-01-01T00:00:00.000+0000".to_string()),
+            url: "https://example.com/commit/abc".to_string(),
+            file_count: 5,
+            merge: true,
+        };
+        let public = AtlassianClient::convert_commit(internal);
+        assert_eq!(public.id, "abc123");
+        assert_eq!(public.display_id, "abc");
+        assert_eq!(public.message, "Test commit");
+        assert_eq!(public.author.as_deref(), Some("Alice"));
+        assert!(public.timestamp.is_some());
+        assert_eq!(public.file_count, 5);
+        assert!(public.merge);
+    }
+
+    #[tokio::test]
+    async fn convert_commit_no_author() {
+        let internal = DevStatusCommit {
+            id: "def456".to_string(),
+            display_id: "def".to_string(),
+            message: "Anonymous".to_string(),
+            author: None,
+            author_timestamp: None,
+            url: "https://example.com/commit/def".to_string(),
+            file_count: 0,
+            merge: false,
+        };
+        let public = AtlassianClient::convert_commit(internal);
+        assert!(public.author.is_none());
+        assert!(public.timestamp.is_none());
+    }
 }
 
 impl AtlassianClient {
@@ -3803,6 +4560,196 @@ impl AtlassianClient {
             return Err(AtlassianError::ApiRequestFailed { status, body }.into());
         }
         Ok(())
+    }
+
+    /// Resolves a JIRA issue key to its numeric ID.
+    pub async fn get_issue_id(&self, key: &str) -> Result<String> {
+        let url = format!("{}/rest/api/3/issue/{}?fields=", self.instance_url, key);
+        let response = self.get_json(&url).await?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+        let resp: JiraIssueIdResponse = response
+            .json()
+            .await
+            .context("Failed to parse issue ID response")?;
+        Ok(resp.id)
+    }
+
+    /// Fetches a development status summary (counts per category) for a JIRA issue.
+    ///
+    /// Uses the DevStatus summary endpoint. Returns counts and provider names
+    /// for each category (pull requests, branches, repositories).
+    pub async fn get_dev_status_summary(&self, key: &str) -> Result<JiraDevStatusSummary> {
+        let issue_id = self.get_issue_id(key).await?;
+        let url = format!(
+            "{}/rest/dev-status/1.0/issue/summary?issueId={}",
+            self.instance_url, issue_id
+        );
+        let response = self.get_json(&url).await?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+        let resp: DevStatusSummaryResponse = response
+            .json()
+            .await
+            .context("Failed to parse DevStatus summary response")?;
+
+        fn extract_count(cat: Option<DevStatusSummaryCategory>) -> JiraDevStatusCount {
+            match cat {
+                Some(c) => JiraDevStatusCount {
+                    count: c.overall.map_or(0, |o| o.count),
+                    providers: c
+                        .by_instance_type
+                        .into_values()
+                        .map(|i| i.name)
+                        .filter(|n| !n.is_empty())
+                        .collect(),
+                },
+                None => JiraDevStatusCount {
+                    count: 0,
+                    providers: Vec::new(),
+                },
+            }
+        }
+
+        Ok(JiraDevStatusSummary {
+            pullrequest: extract_count(resp.summary.pullrequest),
+            branch: extract_count(resp.summary.branch),
+            repository: extract_count(resp.summary.repository),
+        })
+    }
+
+    /// Fetches development status (PRs, branches, repositories) for a JIRA issue.
+    ///
+    /// Uses the DevStatus API which requires the numeric issue ID. The key is
+    /// resolved automatically via [`get_issue_id`](Self::get_issue_id).
+    ///
+    /// If `application_type` is `None`, discovers available providers via the
+    /// summary endpoint and queries each one. If `Some`, queries only that
+    /// provider (e.g., "GitHub", "bitbucket", "stash").
+    pub async fn get_dev_status(
+        &self,
+        key: &str,
+        data_type: Option<&str>,
+        application_type: Option<&str>,
+    ) -> Result<JiraDevStatus> {
+        let issue_id = self.get_issue_id(key).await?;
+
+        let app_types: Vec<String> = if let Some(app) = application_type {
+            vec![app.to_string()]
+        } else {
+            // Discover available providers via the summary endpoint.
+            let summary = self.get_dev_status_summary(key).await?;
+            let mut providers: Vec<String> = Vec::new();
+            for p in summary
+                .pullrequest
+                .providers
+                .into_iter()
+                .chain(summary.branch.providers)
+                .chain(summary.repository.providers)
+            {
+                if !providers.contains(&p) {
+                    providers.push(p);
+                }
+            }
+            if providers.is_empty() {
+                providers.push("GitHub".to_string());
+            }
+            providers
+        };
+
+        let data_types: Vec<&str> = match data_type {
+            Some(dt) => vec![dt],
+            None => vec!["pullrequest", "branch", "repository"],
+        };
+
+        let mut status = JiraDevStatus {
+            pull_requests: Vec::new(),
+            branches: Vec::new(),
+            repositories: Vec::new(),
+        };
+
+        for app in &app_types {
+            for dt in &data_types {
+                let url = format!(
+                    "{}/rest/dev-status/1.0/issue/detail?issueId={}&applicationType={}&dataType={}",
+                    self.instance_url, issue_id, app, dt
+                );
+                let response = self.get_json(&url).await?;
+                if !response.status().is_success() {
+                    let http_status = response.status().as_u16();
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(AtlassianError::ApiRequestFailed {
+                        status: http_status,
+                        body,
+                    }
+                    .into());
+                }
+
+                let resp: DevStatusResponse = response
+                    .json()
+                    .await
+                    .context("Failed to parse DevStatus response")?;
+
+                for detail in resp.detail {
+                    for pr in detail.pull_requests {
+                        status.pull_requests.push(JiraDevPullRequest {
+                            id: pr.id,
+                            name: pr.name,
+                            status: pr.status,
+                            url: pr.url,
+                            repository_name: pr.repository_name,
+                            source_branch: pr.source.map(|s| s.branch).unwrap_or_default(),
+                            destination_branch: pr
+                                .destination
+                                .map(|d| d.branch)
+                                .unwrap_or_default(),
+                            author: pr.author.map(|a| a.name),
+                            reviewers: pr.reviewers.into_iter().map(|r| r.name).collect(),
+                            comment_count: pr.comment_count,
+                            last_update: pr.last_update,
+                        });
+                    }
+                    for branch in detail.branches {
+                        status.branches.push(JiraDevBranch {
+                            name: branch.name,
+                            url: branch.url,
+                            repository_name: branch.repository_name,
+                            create_pr_url: branch.create_pr_url,
+                            last_commit: branch.last_commit.map(Self::convert_commit),
+                        });
+                    }
+                    for repo in detail.repositories {
+                        status.repositories.push(JiraDevRepository {
+                            name: repo.name,
+                            url: repo.url,
+                            commits: repo.commits.into_iter().map(Self::convert_commit).collect(),
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(status)
+    }
+
+    /// Converts an internal `DevStatusCommit` to a public `JiraDevCommit`.
+    fn convert_commit(c: DevStatusCommit) -> JiraDevCommit {
+        JiraDevCommit {
+            id: c.id,
+            display_id: c.display_id,
+            message: c.message,
+            author: c.author.map(|a| a.name),
+            timestamp: c.author_timestamp,
+            url: c.url,
+            file_count: c.file_count,
+            merge: c.merge,
+        }
     }
 
     /// Gets attachment metadata for a JIRA issue.
