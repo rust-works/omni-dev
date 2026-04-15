@@ -545,6 +545,13 @@ impl<'a> MarkdownParser<'a> {
                     if let Some(local_id) = dir_attrs.get("localId") {
                         node_attrs["localId"] = serde_json::Value::String(local_id.to_string());
                     }
+                    if let Some(params_str) = dir_attrs.get("params") {
+                        if let Ok(params_val) =
+                            serde_json::from_str::<serde_json::Value>(params_str)
+                        {
+                            node_attrs["parameters"] = params_val;
+                        }
+                    }
                 }
                 node
             }
@@ -2792,6 +2799,11 @@ fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) 
                 let mut attr_parts = vec![format!("type={ext_type}"), format!("key={ext_key}")];
                 if let Some(layout) = attrs.get("layout").and_then(serde_json::Value::as_str) {
                     attr_parts.push(format!("layout={layout}"));
+                }
+                if let Some(params) = attrs.get("parameters") {
+                    if let Ok(json_str) = serde_json::to_string(params) {
+                        attr_parts.push(format!("params='{json_str}'"));
+                    }
                 }
                 maybe_push_local_id(attrs, &mut attr_parts, opts);
                 output.push_str(&format!(":::extension{{{}}}\n", attr_parts.join(" ")));
@@ -9099,6 +9111,41 @@ mod tests {
         let round_tripped = markdown_to_adf(&md).unwrap();
         let attrs = round_tripped.content[0].attrs.as_ref().unwrap();
         assert_eq!(attrs["layout"], "wide", "layout should be preserved");
+    }
+
+    #[test]
+    fn bodied_extension_parameters_preserved_in_roundtrip() {
+        // Issue #473: parameters block inside bodiedExtension.attrs was dropped
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"bodiedExtension","attrs":{"extensionType":"com.atlassian.confluence.macro.core","extensionKey":"details","layout":"default","localId":"aabbccdd-1234","parameters":{"macroMetadata":{"macroId":{"value":"bbccddee-2345"},"schemaVersion":{"value":"1"},"title":"Page Properties"},"macroParams":{}}},
+           "content":[{"type":"paragraph","content":[{"type":"text","text":"Content inside bodied extension"}]}]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("params="),
+            "JFM should contain params attribute, got: {md}"
+        );
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let attrs = round_tripped.content[0].attrs.as_ref().unwrap();
+        assert_eq!(
+            attrs["parameters"]["macroMetadata"]["title"], "Page Properties",
+            "parameters should be preserved in round-trip"
+        );
+        assert_eq!(attrs["extensionKey"], "details");
+        assert_eq!(attrs["layout"], "default");
+        assert_eq!(attrs["localId"], "aabbccdd-1234");
+    }
+
+    #[test]
+    fn bodied_extension_malformed_params_ignored() {
+        // Malformed params JSON should be silently ignored, not crash
+        let md = ":::extension{type=com.atlassian.macro key=details params='not-valid-json'}\nContent\n:::\n";
+        let doc = markdown_to_adf(md).unwrap();
+        let attrs = doc.content[0].attrs.as_ref().unwrap();
+        assert_eq!(attrs["extensionKey"], "details");
+        // parameters should be absent since the JSON was invalid
+        assert!(attrs.get("parameters").is_none());
     }
 
     #[test]
