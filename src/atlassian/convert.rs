@@ -3828,9 +3828,9 @@ fn render_marked_text(text: &str, marks: &[AdfMark], output: &mut String) {
     };
 
     // Partition formatting marks into outer (before link) and inner (after link / no link).
-    let outer_strike = has_strike && is_before_link("strike");
-    let outer_strong = has_strong && is_before_link("strong");
-    let outer_em = has_em && is_before_link("em");
+    let mut outer_strike = has_strike && is_before_link("strike");
+    let mut outer_strong = has_strong && is_before_link("strong");
+    let mut outer_em = has_em && is_before_link("em");
     let inner_strike = has_strike && !outer_strike;
     let inner_strong = has_strong && !outer_strong;
     let inner_em = has_em && !outer_em;
@@ -3960,8 +3960,64 @@ fn render_marked_text(text: &str, marks: &[AdfMark], output: &mut String) {
                     .is_some_and(|lp| marks[..lp].iter().any(|m| m.mark_type == "annotation"))
             {
                 // Bracketed span wraps the link: [[text](url)]{underline}
-                let link_part = format!("[{inner}]({href})");
-                core = format!("[{link_part}]{{{}}}", attr_parts.join(" "));
+                // Outer formatting marks that appear after underline in the
+                // original mark array must go inside the brackets so that
+                // round-trip parsing restores the original mark order.
+                let underline_pos = marks.iter().position(|m| m.mark_type == "underline");
+                let bracket_inner_strike = outer_strike
+                    && underline_pos.is_some_and(|up| {
+                        marks
+                            .iter()
+                            .position(|m| m.mark_type == "strike")
+                            .is_some_and(|sp| sp > up)
+                    });
+                let bracket_inner_strong = outer_strong
+                    && underline_pos.is_some_and(|up| {
+                        marks
+                            .iter()
+                            .position(|m| m.mark_type == "strong")
+                            .is_some_and(|sp| sp > up)
+                    });
+                let bracket_inner_em = outer_em
+                    && underline_pos.is_some_and(|up| {
+                        marks
+                            .iter()
+                            .position(|m| m.mark_type == "em")
+                            .is_some_and(|sp| sp > up)
+                    });
+
+                let mut bracket_content = String::new();
+                if bracket_inner_strike {
+                    bracket_content.push_str("~~");
+                }
+                if bracket_inner_strong {
+                    bracket_content.push_str("**");
+                }
+                if bracket_inner_em {
+                    bracket_content.push('*');
+                }
+                bracket_content.push_str(&format!("[{inner}]({href})"));
+                if bracket_inner_em {
+                    bracket_content.push('*');
+                }
+                if bracket_inner_strong {
+                    bracket_content.push_str("**");
+                }
+                if bracket_inner_strike {
+                    bracket_content.push_str("~~");
+                }
+
+                if bracket_inner_strike {
+                    outer_strike = false;
+                }
+                if bracket_inner_strong {
+                    outer_strong = false;
+                }
+                if bracket_inner_em {
+                    outer_em = false;
+                }
+
+                core = format!("[{bracket_content}]{{{}}}", attr_parts.join(" "));
             } else {
                 // Link wraps the bracketed span: [[text]{underline}](url)
                 core.push('[');
@@ -7238,6 +7294,147 @@ mod tests {
         assert_eq!(
             mark_types,
             vec!["link", "underline"],
+            "mark order should be preserved, got: {mark_types:?}"
+        );
+    }
+
+    #[test]
+    fn mark_ordering_underline_strong_link_preserved() {
+        // Issue #491: [underline, strong, link] reordered to [strong, underline, link]
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"bold underlined link","marks":[
+            {"type":"underline"},
+            {"type":"strong"},
+            {"type":"link","attrs":{"href":"https://example.com/page"}}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(
+            mark_types,
+            vec!["underline", "strong", "link"],
+            "mark order should be preserved, got: {mark_types:?}"
+        );
+    }
+
+    #[test]
+    fn mark_ordering_strong_underline_link_preserved() {
+        // Issue #491: verify [strong, underline, link] is preserved
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"bold underlined link","marks":[
+            {"type":"strong"},
+            {"type":"underline"},
+            {"type":"link","attrs":{"href":"https://example.com/page"}}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(
+            mark_types,
+            vec!["strong", "underline", "link"],
+            "mark order should be preserved, got: {mark_types:?}"
+        );
+    }
+
+    #[test]
+    fn mark_ordering_underline_em_link_preserved() {
+        // Issue #491: verify [underline, em, link] is preserved
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"italic underlined link","marks":[
+            {"type":"underline"},
+            {"type":"em"},
+            {"type":"link","attrs":{"href":"https://example.com/page"}}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(
+            mark_types,
+            vec!["underline", "em", "link"],
+            "mark order should be preserved, got: {mark_types:?}"
+        );
+    }
+
+    #[test]
+    fn mark_ordering_underline_strike_link_preserved() {
+        // Issue #491: verify [underline, strike, link] is preserved
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"struck underlined link","marks":[
+            {"type":"underline"},
+            {"type":"strike"},
+            {"type":"link","attrs":{"href":"https://example.com/page"}}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(
+            mark_types,
+            vec!["underline", "strike", "link"],
+            "mark order should be preserved, got: {mark_types:?}"
+        );
+    }
+
+    #[test]
+    fn mark_ordering_underline_strong_em_link_preserved() {
+        // Issue #491: verify four-mark combo [underline, strong, em, link] is preserved
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"all the marks","marks":[
+            {"type":"underline"},
+            {"type":"strong"},
+            {"type":"em"},
+            {"type":"link","attrs":{"href":"https://example.com/page"}}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(
+            mark_types,
+            vec!["underline", "strong", "em", "link"],
             "mark order should be preserved, got: {mark_types:?}"
         );
     }
