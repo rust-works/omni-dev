@@ -3912,25 +3912,52 @@ fn render_marked_text(text: &str, marks: &[AdfMark], output: &mut String) {
     let has_strike = marks.iter().any(|m| m.mark_type == "strike");
 
     if has_code {
-        // Code marks override other formatting in markdown
+        // Code marks override other formatting in markdown.
+        // However, annotation marks must still be preserved via bracketed-span syntax.
+        let annotations: Vec<&AdfMark> = marks
+            .iter()
+            .filter(|m| m.mark_type == "annotation")
+            .collect();
+
+        let mut code_str = String::new();
         if let Some(link_mark) = has_link {
-            let href = link_mark
-                .attrs
-                .as_ref()
-                .and_then(|a| a.get("href"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            output.push('[');
-            output.push('`');
-            output.push_str(text);
-            output.push('`');
-            output.push_str("](");
-            output.push_str(href);
-            output.push(')');
+            let href = link_href(link_mark);
+            code_str.push('[');
+            code_str.push('`');
+            code_str.push_str(text);
+            code_str.push('`');
+            code_str.push_str("](");
+            code_str.push_str(href);
+            code_str.push(')');
         } else {
-            output.push('`');
-            output.push_str(text);
-            output.push('`');
+            code_str.push('`');
+            code_str.push_str(text);
+            code_str.push('`');
+        }
+
+        if annotations.is_empty() {
+            output.push_str(&code_str);
+        } else {
+            let mut attr_parts = Vec::new();
+            for ann in &annotations {
+                if let Some(ref attrs) = ann.attrs {
+                    if let Some(id) = attrs.get("id").and_then(serde_json::Value::as_str) {
+                        let escaped = id.replace('\\', "\\\\").replace('"', "\\\"");
+                        attr_parts.push(format!("annotation-id=\"{escaped}\""));
+                    }
+                    if let Some(at) = attrs
+                        .get("annotationType")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        attr_parts.push(format!("annotation-type={at}"));
+                    }
+                }
+            }
+            output.push('[');
+            output.push_str(&code_str);
+            output.push_str("]{");
+            output.push_str(&attr_parts.join(" "));
+            output.push('}');
         }
         return;
     }
@@ -8176,6 +8203,142 @@ mod tests {
             marks.iter().any(|m| m.mark_type == "link"),
             "should have link mark, got: {:?}",
             marks.iter().map(|m| &m.mark_type).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn annotation_and_code_marks_both_preserved() {
+        // Issue #508: annotation mark dropped when combined with code mark
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"some text with "},
+          {"type":"text","text":"annotated code","marks":[
+            {"type":"annotation","attrs":{"annotationType":"inlineComment","id":"aabbccdd-1234-5678-abcd-000000000001"}},
+            {"type":"code"}
+          ]},
+          {"type":"text","text":" remaining text"}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("annotation-id="),
+            "JFM should contain annotation-id, got: {md}"
+        );
+        assert!(
+            md.contains('`'),
+            "JFM should contain backticks for code, got: {md}"
+        );
+
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let nodes = round_tripped.content[0].content.as_ref().unwrap();
+        // Find the text node with "annotated code"
+        let code_node = nodes
+            .iter()
+            .find(|n| n.text.as_deref() == Some("annotated code"))
+            .expect("should have 'annotated code' text node");
+        let marks = code_node.marks.as_ref().expect("should have marks");
+        assert!(
+            marks.iter().any(|m| m.mark_type == "annotation"),
+            "should have annotation mark, got: {:?}",
+            marks.iter().map(|m| &m.mark_type).collect::<Vec<_>>()
+        );
+        assert!(
+            marks.iter().any(|m| m.mark_type == "code"),
+            "should have code mark, got: {:?}",
+            marks.iter().map(|m| &m.mark_type).collect::<Vec<_>>()
+        );
+        let ann = marks.iter().find(|m| m.mark_type == "annotation").unwrap();
+        let attrs = ann.attrs.as_ref().unwrap();
+        assert_eq!(attrs["id"], "aabbccdd-1234-5678-abcd-000000000001");
+        assert_eq!(attrs["annotationType"], "inlineComment");
+    }
+
+    #[test]
+    fn annotation_and_code_and_link_marks_all_preserved() {
+        // annotation + code + link should all survive round-trip
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text_with_marks(
+                "linked code",
+                vec![
+                    AdfMark::annotation("ann-001", "inlineComment"),
+                    AdfMark::code(),
+                    AdfMark::link("https://example.com"),
+                ],
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("annotation-id="),
+            "JFM should contain annotation-id, got: {md}"
+        );
+        assert!(md.contains('`'), "JFM should contain backticks, got: {md}");
+        assert!(
+            md.contains("](https://example.com)"),
+            "JFM should contain link, got: {md}"
+        );
+
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let text_node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let marks = text_node.marks.as_ref().expect("should have marks");
+        assert!(
+            marks.iter().any(|m| m.mark_type == "annotation"),
+            "should have annotation mark, got: {:?}",
+            marks.iter().map(|m| &m.mark_type).collect::<Vec<_>>()
+        );
+        assert!(
+            marks.iter().any(|m| m.mark_type == "code"),
+            "should have code mark, got: {:?}",
+            marks.iter().map(|m| &m.mark_type).collect::<Vec<_>>()
+        );
+        assert!(
+            marks.iter().any(|m| m.mark_type == "link"),
+            "should have link mark, got: {:?}",
+            marks.iter().map(|m| &m.mark_type).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn multiple_annotations_and_code_mark_preserved() {
+        // Multiple annotation marks on a code node should all survive
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text_with_marks(
+                "doubly annotated",
+                vec![
+                    AdfMark::annotation("ann-aaa", "inlineComment"),
+                    AdfMark::annotation("ann-bbb", "inlineComment"),
+                    AdfMark::code(),
+                ],
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("ann-aaa"),
+            "JFM should contain first annotation id, got: {md}"
+        );
+        assert!(
+            md.contains("ann-bbb"),
+            "JFM should contain second annotation id, got: {md}"
+        );
+
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let text_node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let marks = text_node.marks.as_ref().expect("should have marks");
+        let ann_marks: Vec<_> = marks
+            .iter()
+            .filter(|m| m.mark_type == "annotation")
+            .collect();
+        assert_eq!(
+            ann_marks.len(),
+            2,
+            "should have 2 annotation marks, got: {}",
+            ann_marks.len()
+        );
+        assert!(
+            marks.iter().any(|m| m.mark_type == "code"),
+            "should have code mark"
         );
     }
 
