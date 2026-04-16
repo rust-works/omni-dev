@@ -50,17 +50,11 @@ pub fn check_ai_credentials(model_override: Option<&str>) -> Result<AiCredential
     use crate::utils::settings::{get_env_var, get_env_vars};
 
     // Check provider selection flags
-    let use_openai = get_env_var("USE_OPENAI")
-        .map(|val| val == "true")
-        .unwrap_or(false);
+    let use_openai = get_env_var("USE_OPENAI").is_ok_and(|val| val == "true");
 
-    let use_ollama = get_env_var("USE_OLLAMA")
-        .map(|val| val == "true")
-        .unwrap_or(false);
+    let use_ollama = get_env_var("USE_OLLAMA").is_ok_and(|val| val == "true");
 
-    let use_bedrock = get_env_var("CLAUDE_CODE_USE_BEDROCK")
-        .map(|val| val == "true")
-        .unwrap_or(false);
+    let use_bedrock = get_env_var("CLAUDE_CODE_USE_BEDROCK").is_ok_and(|val| val == "true");
 
     // Check Ollama (no credentials required, just model)
     if use_ollama {

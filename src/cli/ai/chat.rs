@@ -112,11 +112,9 @@ fn read_user_input() -> Result<Option<String>> {
                     eprint!("{c}");
                     io::stderr().flush()?;
                 }
-                KeyCode::Backspace => {
-                    if buffer.pop().is_some() {
-                        eprint!("\x08 \x08");
-                        io::stderr().flush()?;
-                    }
+                KeyCode::Backspace if buffer.pop().is_some() => {
+                    eprint!("\x08 \x08");
+                    io::stderr().flush()?;
                 }
                 _ => {}
             }
