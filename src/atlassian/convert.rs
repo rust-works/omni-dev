@@ -2720,7 +2720,16 @@ fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) 
         }
         "blockquote" => {
             if let Some(ref content) = node.content {
-                for child in content {
+                for (i, child) in content.iter().enumerate() {
+                    // Separate consecutive paragraph siblings with a blank
+                    // blockquote-prefixed line so they re-parse as distinct
+                    // paragraphs rather than being merged into one (issue #531).
+                    if i > 0
+                        && child.node_type == "paragraph"
+                        && content[i - 1].node_type == "paragraph"
+                    {
+                        output.push_str(">\n");
+                    }
                     let mut inner = String::new();
                     render_block_node(child, &mut inner, opts);
                     for line in inner.lines() {
@@ -17611,5 +17620,109 @@ C
             .map(|n| n.node_type.as_str())
             .collect();
         assert_eq!(types, vec!["text", "hardBreak", "text"]);
+    }
+
+    #[test]
+    fn issue_531_blockquote_hardbreak_then_two_paragraphs_roundtrips() {
+        // The exact reproducer from issue #531: blockquote with first
+        // paragraph containing hardBreak nodes, followed by two sibling
+        // paragraphs.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"blockquote","content":[{"type":"paragraph","content":[{"type":"text","text":"preamble"},{"type":"hardBreak"},{"type":"text","text":"\u00a0"},{"type":"hardBreak"},{"type":"text","text":"line with "},{"marks":[{"type":"code"}],"text":"code","type":"text"},{"type":"text","text":". "}]},{"type":"paragraph","content":[{"type":"text","text":"second paragraph"}]},{"type":"paragraph","content":[{"type":"text","text":"third paragraph"}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let children = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            children.len(),
+            3,
+            "Expected 3 paragraphs in blockquote, got {}",
+            children.len()
+        );
+        assert_eq!(children[0].node_type, "paragraph");
+        assert_eq!(children[1].node_type, "paragraph");
+        assert_eq!(children[2].node_type, "paragraph");
+
+        let text1 = children[1].content.as_ref().unwrap()[0]
+            .text
+            .as_deref()
+            .unwrap();
+        assert_eq!(text1, "second paragraph");
+        let text2 = children[2].content.as_ref().unwrap()[0]
+            .text
+            .as_deref()
+            .unwrap();
+        assert_eq!(text2, "third paragraph");
+    }
+
+    #[test]
+    fn issue_531_blockquote_two_paragraphs_without_hardbreak_roundtrips() {
+        // Two simple paragraphs inside a blockquote, no hardBreak.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"blockquote","content":[{"type":"paragraph","content":[{"type":"text","text":"first"}]},{"type":"paragraph","content":[{"type":"text","text":"second"}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let children = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            children.len(),
+            2,
+            "Expected 2 paragraphs in blockquote, got {}",
+            children.len()
+        );
+        assert_eq!(children[0].node_type, "paragraph");
+        assert_eq!(children[1].node_type, "paragraph");
+    }
+
+    #[test]
+    fn issue_531_blockquote_three_paragraphs_no_hardbreak_roundtrips() {
+        // Three paragraphs, none with hardBreak.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"blockquote","content":[{"type":"paragraph","content":[{"type":"text","text":"alpha"}]},{"type":"paragraph","content":[{"type":"text","text":"beta"}]},{"type":"paragraph","content":[{"type":"text","text":"gamma"}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let children = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            children.len(),
+            3,
+            "Expected 3 paragraphs in blockquote, got {}",
+            children.len()
+        );
+        for child in children {
+            assert_eq!(child.node_type, "paragraph");
+        }
+    }
+
+    #[test]
+    fn issue_531_blockquote_paragraph_then_list_no_spurious_blank() {
+        // A paragraph followed by a nested list inside a blockquote —
+        // should NOT insert a blank separator line.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"blockquote","content":[{"type":"paragraph","content":[{"type":"text","text":"intro"}]},{"type":"bulletList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"item one"}]}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let children = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(children[0].node_type, "paragraph");
+        assert_eq!(children[1].node_type, "bulletList");
+    }
+
+    #[test]
+    fn issue_531_blockquote_single_paragraph_unchanged() {
+        // A single paragraph in a blockquote should remain unchanged.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"blockquote","content":[{"type":"paragraph","content":[{"type":"text","text":"solo"}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let children = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].node_type, "paragraph");
+        let text = children[0].content.as_ref().unwrap()[0]
+            .text
+            .as_deref()
+            .unwrap();
+        assert_eq!(text, "solo");
     }
 }
