@@ -384,91 +384,16 @@ impl CommitAnalysis {
     /// with ", ". If no scope definitions match, the existing detected_scope
     /// is kept as a fallback.
     pub fn refine_scope(&mut self, scope_defs: &[ScopeDefinition]) {
-        if scope_defs.is_empty() {
-            return;
-        }
         let files: Vec<&str> = self
             .file_changes
             .file_list
             .iter()
             .map(|f| f.file.as_str())
             .collect();
-        if files.is_empty() {
-            return;
+
+        if let Some(resolved) = resolve_scope(&files, scope_defs) {
+            self.detected_scope = resolved;
         }
-
-        let mut matches: Vec<(&str, usize)> = Vec::new();
-        for scope_def in scope_defs {
-            if let Some(specificity) = Self::scope_matches_files(&files, &scope_def.file_patterns) {
-                matches.push((&scope_def.name, specificity));
-            }
-        }
-
-        if matches.is_empty() {
-            return;
-        }
-
-        // SAFETY: matches is non-empty (guarded by early return above)
-        #[allow(clippy::expect_used)] // Guarded by is_empty() check above
-        let max_specificity = matches.iter().map(|(_, s)| *s).max().expect("non-empty");
-        let best: Vec<&str> = matches
-            .into_iter()
-            .filter(|(_, s)| *s == max_specificity)
-            .map(|(name, _)| name)
-            .collect();
-
-        self.detected_scope = best.join(", ");
-    }
-
-    /// Checks if a scope's file_patterns match any of the given files.
-    ///
-    /// Returns `Some(max_specificity)` if at least one file matches the scope
-    /// (after applying negation patterns), or `None` if no file matches.
-    fn scope_matches_files(files: &[&str], patterns: &[String]) -> Option<usize> {
-        let mut positive = Vec::new();
-        let mut negative = Vec::new();
-        for pat in patterns {
-            if let Some(stripped) = pat.strip_prefix('!') {
-                negative.push(stripped);
-            } else {
-                positive.push(pat.as_str());
-            }
-        }
-
-        // Build negative matchers
-        let neg_matchers: Vec<_> = negative
-            .iter()
-            .filter_map(|p| Glob::new(p).ok().map(|g| g.compile_matcher()))
-            .collect();
-
-        let mut max_specificity: Option<usize> = None;
-        for pat in &positive {
-            let Ok(glob) = Glob::new(pat) else {
-                continue;
-            };
-            let matcher = glob.compile_matcher();
-            for file in files {
-                if matcher.is_match(file) && !neg_matchers.iter().any(|neg| neg.is_match(file)) {
-                    let specificity = Self::count_specificity(pat);
-                    max_specificity =
-                        Some(max_specificity.map_or(specificity, |cur| cur.max(specificity)));
-                }
-            }
-        }
-        max_specificity
-    }
-
-    /// Counts the number of literal (non-wildcard) path segments in a glob pattern.
-    ///
-    /// - `docs/adrs/**` → 2 (`docs`, `adrs`)
-    /// - `docs/**` → 1 (`docs`)
-    /// - `*.md` → 0
-    /// - `src/main/scala/**` → 3
-    fn count_specificity(pattern: &str) -> usize {
-        pattern
-            .split('/')
-            .filter(|segment| !segment.contains('*') && !segment.contains('?'))
-            .count()
     }
 
     /// Generates a proposed conventional commit message.
@@ -799,6 +724,134 @@ impl CommitInfoForAI {
     }
 }
 
+/// Resolves the best scope for a set of files using scope definition file patterns.
+///
+/// More specific patterns (more literal path components) win regardless of
+/// definition order in `scopes.yaml`. Equally specific matches are joined
+/// with ", ". Returns `None` when `scope_defs` or `files` is empty, or no
+/// scope definition matches.
+pub fn resolve_scope(files: &[&str], scope_defs: &[ScopeDefinition]) -> Option<String> {
+    if scope_defs.is_empty() || files.is_empty() {
+        return None;
+    }
+
+    let mut matches: Vec<(&str, usize)> = Vec::new();
+    for scope_def in scope_defs {
+        if let Some(specificity) = scope_matches_files(files, &scope_def.file_patterns) {
+            matches.push((&scope_def.name, specificity));
+        }
+    }
+
+    if matches.is_empty() {
+        return None;
+    }
+
+    // SAFETY: matches is non-empty (guarded by early return above)
+    #[allow(clippy::expect_used)] // Guarded by is_empty() check above
+    let max_specificity = matches.iter().map(|(_, s)| *s).max().expect("non-empty");
+    let best: Vec<&str> = matches
+        .into_iter()
+        .filter(|(_, s)| *s == max_specificity)
+        .map(|(name, _)| name)
+        .collect();
+
+    Some(best.join(", "))
+}
+
+/// Replaces the scope in a conventional commit message with the deterministically
+/// resolved scope based on the given files and scope definitions.
+///
+/// If the message does not contain a conventional commit scope, or if no scope
+/// can be resolved from the files, the message is returned unchanged.
+pub fn refine_message_scope(
+    message: &str,
+    files: &[&str],
+    scope_defs: &[ScopeDefinition],
+) -> String {
+    let Some(resolved) = resolve_scope(files, scope_defs) else {
+        return message.to_string();
+    };
+
+    // Split into first line and rest
+    let (first_line, rest) = message
+        .split_once('\n')
+        .map_or((message, ""), |(f, r)| (f, r));
+
+    let Some(caps) = SCOPE_RE.captures(first_line) else {
+        return message.to_string();
+    };
+
+    // Determine which capture group matched (group 1 = breaking, group 2 = normal)
+    let existing_scope = caps
+        .get(1)
+        .or_else(|| caps.get(2))
+        .map_or("", |m| m.as_str());
+
+    if existing_scope == resolved {
+        return message.to_string();
+    }
+
+    let new_first_line =
+        first_line.replacen(&format!("({existing_scope})"), &format!("({resolved})"), 1);
+
+    if rest.is_empty() {
+        new_first_line
+    } else {
+        format!("{new_first_line}\n{rest}")
+    }
+}
+
+/// Checks if a scope's file patterns match any of the given files.
+///
+/// Returns `Some(max_specificity)` if at least one file matches the scope
+/// (after applying negation patterns), or `None` if no file matches.
+fn scope_matches_files(files: &[&str], patterns: &[String]) -> Option<usize> {
+    let mut positive = Vec::new();
+    let mut negative = Vec::new();
+    for pat in patterns {
+        if let Some(stripped) = pat.strip_prefix('!') {
+            negative.push(stripped);
+        } else {
+            positive.push(pat.as_str());
+        }
+    }
+
+    // Build negative matchers
+    let neg_matchers: Vec<_> = negative
+        .iter()
+        .filter_map(|p| Glob::new(p).ok().map(|g| g.compile_matcher()))
+        .collect();
+
+    let mut max_specificity: Option<usize> = None;
+    for pat in &positive {
+        let Ok(glob) = Glob::new(pat) else {
+            continue;
+        };
+        let matcher = glob.compile_matcher();
+        for file in files {
+            if matcher.is_match(file) && !neg_matchers.iter().any(|neg| neg.is_match(file)) {
+                let specificity = count_specificity(pat);
+                max_specificity =
+                    Some(max_specificity.map_or(specificity, |cur| cur.max(specificity)));
+            }
+        }
+    }
+    max_specificity
+}
+
+/// Counts the number of literal (non-wildcard) path segments in a glob pattern.
+///
+/// - `docs/adrs/**` → 2 (`docs`, `adrs`)
+/// - `docs/**` → 1 (`docs`)
+/// - `*.md` → 0
+/// - `src/main/scala/**` → 3
+fn count_specificity(pattern: &str) -> usize {
+    pattern
+        .split('/')
+        .filter(|segment| !segment.contains('*') && !segment.contains('?'))
+        .count()
+}
+
 impl CommitAnalysisForAI {
     /// Converts from a basic `CommitAnalysis` by loading diff content from file.
     pub fn from_commit_analysis(analysis: CommitAnalysis) -> Result<Self> {
@@ -955,22 +1008,22 @@ mod tests {
 
     #[test]
     fn count_specificity_deep_path() {
-        assert_eq!(CommitAnalysis::count_specificity("src/main/scala/**"), 3);
+        assert_eq!(super::count_specificity("src/main/scala/**"), 3);
     }
 
     #[test]
     fn count_specificity_shallow() {
-        assert_eq!(CommitAnalysis::count_specificity("docs/**"), 1);
+        assert_eq!(super::count_specificity("docs/**"), 1);
     }
 
     #[test]
     fn count_specificity_wildcard_only() {
-        assert_eq!(CommitAnalysis::count_specificity("*.md"), 0);
+        assert_eq!(super::count_specificity("*.md"), 0);
     }
 
     #[test]
     fn count_specificity_no_wildcards() {
-        assert_eq!(CommitAnalysis::count_specificity("src/lib.rs"), 2);
+        assert_eq!(super::count_specificity("src/lib.rs"), 2);
     }
 
     // ── scope_matches_files ──────────────────────────────────────────
@@ -979,14 +1032,14 @@ mod tests {
     fn scope_matches_positive_patterns() {
         let patterns = vec!["src/cli/**".to_string()];
         let files = &["src/cli/commands.rs"];
-        assert!(CommitAnalysis::scope_matches_files(files, &patterns).is_some());
+        assert!(super::scope_matches_files(files, &patterns).is_some());
     }
 
     #[test]
     fn scope_matches_no_match() {
         let patterns = vec!["src/cli/**".to_string()];
         let files = &["src/git/remote.rs"];
-        assert!(CommitAnalysis::scope_matches_files(files, &patterns).is_none());
+        assert!(super::scope_matches_files(files, &patterns).is_none());
     }
 
     #[test]
@@ -994,11 +1047,11 @@ mod tests {
         let patterns = vec!["src/**".to_string(), "!src/test/**".to_string()];
         // File in src/ but not in src/test/ should match
         let files = &["src/lib.rs"];
-        assert!(CommitAnalysis::scope_matches_files(files, &patterns).is_some());
+        assert!(super::scope_matches_files(files, &patterns).is_some());
 
         // File in src/test/ should be excluded
         let test_files = &["src/test/helper.rs"];
-        assert!(CommitAnalysis::scope_matches_files(test_files, &patterns).is_none());
+        assert!(super::scope_matches_files(test_files, &patterns).is_none());
     }
 
     // ── refine_scope ─────────────────────────────────────────────────
@@ -1088,6 +1141,79 @@ mod tests {
             "expected joined scopes, got: {}",
             analysis.detected_scope
         );
+    }
+
+    // ── refine_message_scope ───────────────────────────────────────────
+
+    #[test]
+    fn refine_message_scope_replaces_less_specific() {
+        let scope_defs = vec![
+            make_scope_def("ci", &[".github/**"]),
+            make_scope_def("workflows", &[".github/workflows/**"]),
+        ];
+        let files = &[".github/workflows/ci.yml"];
+        let result = super::refine_message_scope(
+            "chore(ci): bump EmbarkStudios/cargo-deny-action from 2.0.15 to 2.0.17",
+            files,
+            &scope_defs,
+        );
+        assert_eq!(
+            result,
+            "chore(workflows): bump EmbarkStudios/cargo-deny-action from 2.0.15 to 2.0.17"
+        );
+    }
+
+    #[test]
+    fn refine_message_scope_keeps_already_correct() {
+        let scope_defs = vec![
+            make_scope_def("ci", &[".github/**"]),
+            make_scope_def("workflows", &[".github/workflows/**"]),
+        ];
+        let files = &[".github/workflows/ci.yml"];
+        let msg = "chore(workflows): bump something";
+        assert_eq!(super::refine_message_scope(msg, files, &scope_defs), msg);
+    }
+
+    #[test]
+    fn refine_message_scope_no_scope_in_message() {
+        let scope_defs = vec![make_scope_def("cli", &["src/cli/**"])];
+        let files = &["src/cli/commands.rs"];
+        let msg = "chore: do something";
+        assert_eq!(super::refine_message_scope(msg, files, &scope_defs), msg);
+    }
+
+    #[test]
+    fn refine_message_scope_preserves_body() {
+        let scope_defs = vec![
+            make_scope_def("ci", &[".github/**"]),
+            make_scope_def("workflows", &[".github/workflows/**"]),
+        ];
+        let files = &[".github/workflows/ci.yml"];
+        let msg = "chore(ci): bump dep\n\nSome body text\nMore details";
+        let result = super::refine_message_scope(msg, files, &scope_defs);
+        assert_eq!(
+            result,
+            "chore(workflows): bump dep\n\nSome body text\nMore details"
+        );
+    }
+
+    #[test]
+    fn refine_message_scope_breaking_change() {
+        let scope_defs = vec![
+            make_scope_def("ci", &[".github/**"]),
+            make_scope_def("workflows", &[".github/workflows/**"]),
+        ];
+        let files = &[".github/workflows/ci.yml"];
+        let result = super::refine_message_scope("feat!(ci): breaking change", files, &scope_defs);
+        assert_eq!(result, "feat!(workflows): breaking change");
+    }
+
+    #[test]
+    fn refine_message_scope_no_matching_scope_defs() {
+        let scope_defs = vec![make_scope_def("cli", &["src/cli/**"])];
+        let files = &["README.md"];
+        let msg = "docs(docs): update readme";
+        assert_eq!(super::refine_message_scope(msg, files, &scope_defs), msg);
     }
 
     // ── run_pre_validation_checks ────────────────────────────────────
@@ -1213,7 +1339,7 @@ mod tests {
             #[test]
             fn count_specificity_nonnegative(pattern in ".*") {
                 // usize is always >= 0; this test catches panics on arbitrary input
-                let _ = CommitAnalysis::count_specificity(&pattern);
+                let _ = super::count_specificity(&pattern);
             }
 
             #[test]
@@ -1221,7 +1347,7 @@ mod tests {
                 segments in proptest::collection::vec("[a-z*?]{1,10}", 1..6),
             ) {
                 let pattern = segments.join("/");
-                let result = CommitAnalysis::count_specificity(&pattern);
+                let result = super::count_specificity(&pattern);
                 prop_assert!(result <= segments.len());
             }
         }
