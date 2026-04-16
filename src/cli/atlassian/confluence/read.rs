@@ -5,7 +5,7 @@ use clap::Parser;
 
 use crate::atlassian::confluence_api::ConfluenceApi;
 use crate::cli::atlassian::format::ContentFormat;
-use crate::cli::atlassian::helpers::{create_client, execute_read};
+use crate::cli::atlassian::helpers::{create_client, run_read};
 
 /// Fetches a Confluence page and outputs it as JFM markdown or ADF JSON.
 #[derive(Parser)]
@@ -28,7 +28,7 @@ impl ReadCommand {
         let (client, instance_url) = create_client()?;
         let api = ConfluenceApi::new(client);
 
-        execute_read(
+        run_read(
             &self.id,
             self.output.as_deref(),
             &self.format,

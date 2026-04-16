@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::Parser;
 
 use crate::atlassian::confluence_api::ConfluenceApi;
-use crate::cli::atlassian::helpers::{create_client, execute_edit};
+use crate::cli::atlassian::helpers::{create_client, run_edit};
 
 /// Interactive fetch-edit-push cycle for a Confluence page.
 #[derive(Parser)]
@@ -19,7 +19,7 @@ impl EditCommand {
         let (client, instance_url) = create_client()?;
         let api = ConfluenceApi::new(client);
 
-        execute_edit(&self.id, &api, &instance_url).await
+        run_edit(&self.id, &api, &instance_url).await
     }
 }
 
