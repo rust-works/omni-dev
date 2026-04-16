@@ -15,6 +15,7 @@ pub(crate) mod read;
 pub(crate) mod search;
 pub(crate) mod sprint;
 pub(crate) mod transition;
+pub(crate) mod watcher;
 pub(crate) mod worklog;
 pub(crate) mod write;
 
@@ -64,6 +65,8 @@ pub enum JiraSubcommands {
     Changelog(changelog::ChangelogCommand),
     /// Downloads JIRA issue attachments.
     Attachment(attachment::AttachmentCommand),
+    /// Manages watchers on a JIRA issue.
+    Watcher(watcher::WatcherCommand),
     /// Manages worklogs (time tracking) on a JIRA issue.
     Worklog(worklog::WorklogCommand),
 }
@@ -88,6 +91,7 @@ impl JiraCommand {
             JiraSubcommands::Link(cmd) => cmd.execute().await,
             JiraSubcommands::Changelog(cmd) => cmd.execute().await,
             JiraSubcommands::Attachment(cmd) => cmd.execute().await,
+            JiraSubcommands::Watcher(cmd) => cmd.execute().await,
             JiraSubcommands::Worklog(cmd) => cmd.execute().await,
         }
     }
@@ -307,6 +311,19 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Attachment(_)));
+    }
+
+    #[test]
+    fn jira_subcommands_watcher_variant() {
+        let cmd = JiraCommand {
+            command: JiraSubcommands::Watcher(watcher::WatcherCommand {
+                command: watcher::WatcherSubcommands::List(watcher::ListCommand {
+                    key: "PROJ-1".to_string(),
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        assert!(matches!(cmd.command, JiraSubcommands::Watcher(_)));
     }
 
     #[test]
