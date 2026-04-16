@@ -12,6 +12,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::atlassian::adf::AdfDocument;
+use crate::atlassian::convert::adf_to_markdown;
 use crate::atlassian::error::AtlassianError;
 
 /// HTTP request timeout for Atlassian API calls.
@@ -419,6 +420,33 @@ pub struct JiraDevStatusSummary {
     pub repository: JiraDevStatusCount,
 }
 
+/// A JIRA issue worklog entry.
+#[derive(Debug, Clone, Serialize)]
+pub struct JiraWorklog {
+    /// Worklog ID.
+    pub id: String,
+    /// Author display name.
+    pub author: String,
+    /// Time spent in human-readable format (e.g., "2h 30m").
+    pub time_spent: String,
+    /// Time spent in seconds.
+    pub time_spent_seconds: u64,
+    /// ISO 8601 timestamp when the work was started.
+    pub started: String,
+    /// Comment text (plain text, extracted from ADF).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+}
+
+/// Result from listing JIRA worklogs.
+#[derive(Debug, Clone, Serialize)]
+pub struct JiraWorklogList {
+    /// Worklog entries.
+    pub worklogs: Vec<JiraWorklog>,
+    /// Total number of worklogs.
+    pub total: u32,
+}
+
 // ── Internal API response structs ───────────────────────────────────
 
 #[derive(Deserialize)]
@@ -488,6 +516,26 @@ struct JiraCommentEntry {
 struct JiraCommentAuthor {
     #[serde(rename = "displayName")]
     display_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct JiraWorklogResponse {
+    #[serde(default)]
+    worklogs: Vec<JiraWorklogEntry>,
+    #[serde(default)]
+    total: u32,
+}
+
+#[derive(Deserialize)]
+struct JiraWorklogEntry {
+    id: String,
+    author: Option<JiraCommentAuthor>,
+    #[serde(rename = "timeSpent")]
+    time_spent: Option<String>,
+    #[serde(rename = "timeSpentSeconds", default)]
+    time_spent_seconds: u64,
+    started: Option<String>,
+    comment: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -3742,6 +3790,279 @@ mod tests {
         assert!(public.author.is_none());
         assert!(public.timestamp.is_none());
     }
+
+    // ── extract_worklog_comment ────────────────────────────────────
+
+    #[test]
+    fn extract_worklog_comment_none() {
+        assert_eq!(AtlassianClient::extract_worklog_comment(None), None);
+    }
+
+    #[test]
+    fn extract_worklog_comment_valid_adf() {
+        let adf = serde_json::json!({
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "paragraph",
+                "content": [{"type": "text", "text": "Fixed the login bug"}]
+            }]
+        });
+        let result = AtlassianClient::extract_worklog_comment(Some(&adf));
+        assert_eq!(result.as_deref(), Some("Fixed the login bug"));
+    }
+
+    #[test]
+    fn extract_worklog_comment_empty_adf() {
+        let adf = serde_json::json!({
+            "version": 1,
+            "type": "doc",
+            "content": []
+        });
+        let result = AtlassianClient::extract_worklog_comment(Some(&adf));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn extract_worklog_comment_invalid_json() {
+        let invalid = serde_json::json!({"not": "adf"});
+        let result = AtlassianClient::extract_worklog_comment(Some(&invalid));
+        assert_eq!(result, None);
+    }
+
+    // ── worklog deserialization ────────────────────────────────────
+
+    #[test]
+    fn worklog_response_deserializes() {
+        let json = r#"{
+            "worklogs": [
+                {
+                    "id": "100",
+                    "author": {"displayName": "Alice"},
+                    "timeSpent": "2h",
+                    "timeSpentSeconds": 7200,
+                    "started": "2026-04-16T09:00:00.000+0000",
+                    "comment": {
+                        "version": 1,
+                        "type": "doc",
+                        "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Debugging"}]}]
+                    }
+                },
+                {
+                    "id": "101",
+                    "author": {"displayName": "Bob"},
+                    "timeSpent": "1d",
+                    "timeSpentSeconds": 28800,
+                    "started": "2026-04-15T10:00:00.000+0000"
+                }
+            ],
+            "total": 2
+        }"#;
+        let resp: JiraWorklogResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.total, 2);
+        assert_eq!(resp.worklogs.len(), 2);
+        assert_eq!(resp.worklogs[0].id, "100");
+        assert_eq!(resp.worklogs[0].time_spent.as_deref(), Some("2h"));
+        assert_eq!(resp.worklogs[0].time_spent_seconds, 7200);
+        assert!(resp.worklogs[0].comment.is_some());
+        assert!(resp.worklogs[1].comment.is_none());
+    }
+
+    #[test]
+    fn worklog_response_empty() {
+        let json = r#"{"worklogs": [], "total": 0}"#;
+        let resp: JiraWorklogResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.total, 0);
+        assert!(resp.worklogs.is_empty());
+    }
+
+    #[test]
+    fn worklog_response_missing_optional_fields() {
+        let json = r#"{
+            "worklogs": [{
+                "id": "200",
+                "timeSpentSeconds": 3600
+            }],
+            "total": 1
+        }"#;
+        let resp: JiraWorklogResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.worklogs[0].author.is_none());
+        assert!(resp.worklogs[0].time_spent.is_none());
+        assert!(resp.worklogs[0].started.is_none());
+    }
+
+    // ── worklog wiremock tests ────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_worklogs_success() {
+        let server = wiremock::MockServer::start().await;
+
+        let worklog_json = serde_json::json!({
+            "worklogs": [
+                {
+                    "id": "100",
+                    "author": {"displayName": "Alice"},
+                    "timeSpent": "2h",
+                    "timeSpentSeconds": 7200,
+                    "started": "2026-04-16T09:00:00.000+0000",
+                    "comment": {
+                        "version": 1,
+                        "type": "doc",
+                        "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Debugging login"}]}]
+                    }
+                },
+                {
+                    "id": "101",
+                    "author": {"displayName": "Bob"},
+                    "timeSpent": "1d",
+                    "timeSpentSeconds": 28800,
+                    "started": "2026-04-15T10:00:00.000+0000"
+                }
+            ],
+            "total": 2
+        });
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1/worklog"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(worklog_json))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.get_worklogs("PROJ-1", 50).await.unwrap();
+
+        assert_eq!(result.total, 2);
+        assert_eq!(result.worklogs.len(), 2);
+        assert_eq!(result.worklogs[0].author, "Alice");
+        assert_eq!(result.worklogs[0].time_spent, "2h");
+        assert_eq!(result.worklogs[0].time_spent_seconds, 7200);
+        assert_eq!(
+            result.worklogs[0].comment.as_deref(),
+            Some("Debugging login")
+        );
+        assert_eq!(result.worklogs[1].author, "Bob");
+        assert_eq!(result.worklogs[1].comment, None);
+    }
+
+    #[tokio::test]
+    async fn get_worklogs_empty() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1/worklog"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"worklogs": [], "total": 0})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.get_worklogs("PROJ-1", 50).await.unwrap();
+
+        assert_eq!(result.total, 0);
+        assert!(result.worklogs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_worklogs_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1/worklog"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.get_worklogs("PROJ-1", 50).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn add_worklog_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1/worklog"))
+            .respond_with(wiremock::ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.add_worklog("PROJ-1", "2h", None, None).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn add_worklog_with_all_fields() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1/worklog"))
+            .respond_with(wiremock::ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client
+            .add_worklog(
+                "PROJ-1",
+                "2h 30m",
+                Some("2026-04-16T09:00:00.000+0000"),
+                Some("Fixed the bug"),
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn add_worklog_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1/worklog"))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("Bad Request"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.add_worklog("PROJ-1", "2h", None, None).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_worklogs_respects_limit() {
+        let server = wiremock::MockServer::start().await;
+
+        let worklog_json = serde_json::json!({
+            "worklogs": [
+                {"id": "1", "author": {"displayName": "A"}, "timeSpent": "1h", "timeSpentSeconds": 3600, "started": "2026-04-16T09:00:00.000+0000"},
+                {"id": "2", "author": {"displayName": "B"}, "timeSpent": "2h", "timeSpentSeconds": 7200, "started": "2026-04-16T10:00:00.000+0000"},
+                {"id": "3", "author": {"displayName": "C"}, "timeSpent": "3h", "timeSpentSeconds": 10800, "started": "2026-04-16T11:00:00.000+0000"}
+            ],
+            "total": 3
+        });
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1/worklog"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(worklog_json))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.get_worklogs("PROJ-1", 2).await.unwrap();
+
+        assert_eq!(result.worklogs.len(), 2);
+        assert_eq!(result.total, 3);
+    }
 }
 
 impl AtlassianClient {
@@ -4114,6 +4435,105 @@ impl AtlassianClient {
         }
 
         Ok(())
+    }
+
+    /// Lists worklogs for a JIRA issue.
+    pub async fn get_worklogs(&self, key: &str, limit: u32) -> Result<JiraWorklogList> {
+        let effective_limit = if limit == 0 { u32::MAX } else { limit };
+        let url = format!(
+            "{}/rest/api/3/issue/{}/worklog?maxResults={}",
+            self.instance_url,
+            key,
+            effective_limit.min(5000)
+        );
+
+        let response = self.get_json(&url).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let resp: JiraWorklogResponse = response
+            .json()
+            .await
+            .context("Failed to parse worklog response")?;
+
+        let worklogs: Vec<JiraWorklog> = resp
+            .worklogs
+            .into_iter()
+            .take(effective_limit as usize)
+            .map(|w| JiraWorklog {
+                id: w.id,
+                author: w.author.and_then(|a| a.display_name).unwrap_or_default(),
+                time_spent: w.time_spent.unwrap_or_default(),
+                time_spent_seconds: w.time_spent_seconds,
+                started: w.started.unwrap_or_default(),
+                comment: Self::extract_worklog_comment(w.comment.as_ref()),
+            })
+            .collect();
+
+        Ok(JiraWorklogList {
+            total: resp.total,
+            worklogs,
+        })
+    }
+
+    /// Adds a worklog entry to a JIRA issue.
+    pub async fn add_worklog(
+        &self,
+        key: &str,
+        time_spent: &str,
+        started: Option<&str>,
+        comment: Option<&str>,
+    ) -> Result<()> {
+        let url = format!("{}/rest/api/3/issue/{}/worklog", self.instance_url, key);
+
+        let mut body = serde_json::json!({
+            "timeSpent": time_spent,
+        });
+
+        if let Some(started) = started {
+            body["started"] = serde_json::Value::String(started.to_string());
+        }
+
+        if let Some(comment_text) = comment {
+            body["comment"] = serde_json::json!({
+                "type": "doc",
+                "version": 1,
+                "content": [{
+                    "type": "paragraph",
+                    "content": [{
+                        "type": "text",
+                        "text": comment_text
+                    }]
+                }]
+            });
+        }
+
+        let response = self.post_json(&url, &body).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        Ok(())
+    }
+
+    /// Extracts plain text from a worklog comment ADF value.
+    fn extract_worklog_comment(adf_value: Option<&serde_json::Value>) -> Option<String> {
+        let adf_value = adf_value?;
+        let adf: AdfDocument = serde_json::from_value(adf_value.clone()).ok()?;
+        let md = adf_to_markdown(&adf).ok()?;
+        let trimmed = md.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
     }
 
     /// Lists available transitions for a JIRA issue.
