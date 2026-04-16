@@ -43,3 +43,4 @@ by Michael Nygard.
 | [ADR-0017](adr-0017.md)  | ✅ Accepted | 2026-02-25 | Per-File Diff Splitting for Token Budget Fitting                                       |
 | [ADR-0018](adr-0018.md)  | ✅ Accepted | 2026-02-25 | Automatic Context Detection for Adaptive AI Prompts                                    |
 | [ADR-0019](adr-0019.md)  | ✅ Accepted | 2026-02-25 | Ecosystem-Aware Scope Auto-Detection                                                   |
+| [ADR-0020](adr-0020.md)  | ✅ Proposed | 2026-04-16 | JFM — A Markdown Dialect for Bidirectional ADF Interchange                             |
