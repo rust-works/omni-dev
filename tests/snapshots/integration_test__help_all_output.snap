@@ -181,6 +181,7 @@ Confluence page management, search, and more
 Usage: confluence <COMMAND>
 
 Commands:
+  comment   Manages comments on a Confluence page
   read      Fetches a Confluence page and outputs it as JFM markdown or ADF JSON
   write     Pushes content to a Confluence page
   edit      Interactive fetch-edit-push cycle for a Confluence page
@@ -192,6 +193,57 @@ Commands:
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian confluence comment - Manages comments on a Confluence page
+
+Manages comments on a Confluence page
+
+Usage: comment <COMMAND>
+
+Commands:
+  list  Lists comments on a Confluence page
+  add   Adds a comment to a Confluence page
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian confluence comment add - Adds a comment to a Confluence page
+
+Adds a comment to a Confluence page
+
+Usage: add [OPTIONS] <ID> [FILE]
+
+Arguments:
+  <ID>    Confluence page ID
+  [FILE]  Input file (reads from stdin if omitted or "-")
+
+Options:
+      --format <FORMAT>  Input format [default: jfm] [possible values: jfm, adf]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian confluence comment list - Lists comments on a Confluence page
+
+Lists comments on a Confluence page
+
+Usage: list [OPTIONS] <ID>
+
+Arguments:
+  <ID>  Confluence page ID
+
+Options:
+      --limit <LIMIT>    Maximum number of comments to display [default: 25]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================
