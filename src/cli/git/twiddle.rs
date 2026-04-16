@@ -5,6 +5,8 @@ use clap::Parser;
 use tracing::debug;
 
 use super::parse_beta_header;
+use crate::data::amendments::AmendmentFile;
+use crate::data::RepositoryView;
 
 /// Twiddle command options.
 #[derive(Parser)]
@@ -179,7 +181,7 @@ impl TwiddleCommand {
             println!("🤖 Analyzing commits with Claude AI...");
         }
 
-        let amendments = if let Some(ctx) = context {
+        let mut amendments = if let Some(ctx) = context {
             claude_client
                 .generate_contextual_amendments_with_options(&full_repo_view, &ctx, self.is_fresh())
                 .await?
@@ -188,6 +190,8 @@ impl TwiddleCommand {
                 .generate_amendments_with_options(&full_repo_view, self.is_fresh())
                 .await?
         };
+
+        refine_amendment_scopes(&mut amendments, &full_repo_view, &scope_defs);
 
         // 6. Handle different output modes
         if let Some(save_path) = self.save_only {
@@ -250,7 +254,6 @@ impl TwiddleCommand {
 
         use crate::claude::batch;
         use crate::claude::token_budget;
-        use crate::data::amendments::AmendmentFile;
 
         let concurrency = self.concurrency;
 
@@ -497,7 +500,7 @@ impl TwiddleCommand {
         // Reduce phase: optional coherence pass
         // Skip when all commits were in a single batch (AI already saw them together)
         let single_batch = batch_plan.batches.len() <= 1;
-        let all_amendments = if !self.no_coherence && !single_batch && successes.len() >= 2 {
+        let mut all_amendments = if !self.no_coherence && !single_batch && successes.len() >= 2 {
             println!("🔗 Running cross-commit coherence pass...");
             match claude_client.refine_amendments_coherence(&successes).await {
                 Ok(refined) => refined,
@@ -513,6 +516,8 @@ impl TwiddleCommand {
                 amendments: successes.into_iter().map(|(a, _)| a).collect(),
             }
         };
+
+        refine_amendment_scopes(&mut all_amendments, &full_repo_view, &scope_defs);
 
         println!(
             "✅ All commits processed! Found {} amendments.",
@@ -1058,8 +1063,6 @@ impl TwiddleCommand {
     /// If the check finds errors with suggestions, automatically applies the
     /// suggestions and re-checks, up to 3 retries.
     async fn run_post_twiddle_check(&self) -> Result<()> {
-        use crate::data::amendments::AmendmentFile;
-
         const MAX_CHECK_RETRIES: u32 = 3;
 
         // Load guidelines, scopes, and Claude client once (they don't change between retries)
@@ -1736,6 +1739,32 @@ fn format_scope_list(scopes: &[crate::data::context::ScopeDefinition]) -> String
         .map(|s| s.name.as_str())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Refine scopes in generated amendment messages using the same deterministic
+/// file-pattern logic the checker uses, so generator and checker agree.
+fn refine_amendment_scopes(
+    amendments: &mut AmendmentFile,
+    repo_view: &RepositoryView,
+    scope_defs: &[crate::data::context::ScopeDefinition],
+) {
+    for amendment in &mut amendments.amendments {
+        if let Some(commit) = repo_view
+            .commits
+            .iter()
+            .find(|c| c.hash == amendment.commit)
+        {
+            let files: Vec<&str> = commit
+                .analysis
+                .file_changes
+                .file_list
+                .iter()
+                .map(|f| f.file.as_str())
+                .collect();
+            amendment.message =
+                crate::git::refine_message_scope(&amendment.message, &files, scope_defs);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2423,5 +2452,93 @@ mod tests {
         .unwrap();
         assert!(failed.is_empty(), "retry succeeded → failed cleared");
         assert_eq!(successes.len(), 1);
+    }
+
+    #[test]
+    fn refine_amendment_scopes_replaces_scope_from_file_patterns() {
+        use crate::data::amendments::Amendment;
+        use crate::data::context::ScopeDefinition;
+        use crate::git::commit::FileChange;
+
+        // Build a commit whose files match the "cli" scope pattern.
+        let (mut commit, _tmp) = make_twiddle_commit("aaa00000");
+        commit.analysis.file_changes.file_list = vec![FileChange {
+            status: "M".to_string(),
+            file: "src/cli/git/twiddle.rs".to_string(),
+        }];
+
+        let repo_view = make_twiddle_repo_view(vec![commit]);
+
+        let scope_defs = vec![ScopeDefinition {
+            name: "cli".to_string(),
+            description: "CLI commands".to_string(),
+            examples: vec![],
+            file_patterns: vec!["src/cli/**".to_string()],
+        }];
+
+        let mut amendments = AmendmentFile {
+            amendments: vec![Amendment {
+                commit: "aaa00000".to_string(),
+                message: "fix(wrong-scope): tweak something".to_string(),
+                summary: None,
+            }],
+        };
+
+        refine_amendment_scopes(&mut amendments, &repo_view, &scope_defs);
+
+        assert_eq!(
+            amendments.amendments[0].message,
+            "fix(cli): tweak something",
+        );
+    }
+
+    #[test]
+    fn refine_amendment_scopes_no_match_leaves_message_unchanged() {
+        use crate::data::amendments::Amendment;
+
+        let (commit, _tmp) = make_twiddle_commit("bbb00000");
+        let repo_view = make_twiddle_repo_view(vec![commit]);
+
+        let mut amendments = AmendmentFile {
+            amendments: vec![Amendment {
+                commit: "bbb00000".to_string(),
+                message: "feat(stuff): add feature".to_string(),
+                summary: None,
+            }],
+        };
+
+        // No scope defs → no refinement.
+        refine_amendment_scopes(&mut amendments, &repo_view, &[]);
+
+        assert_eq!(amendments.amendments[0].message, "feat(stuff): add feature",);
+    }
+
+    #[test]
+    fn refine_amendment_scopes_skips_unknown_commits() {
+        use crate::data::amendments::Amendment;
+        use crate::data::context::ScopeDefinition;
+
+        let (commit, _tmp) = make_twiddle_commit("ccc00000");
+        let repo_view = make_twiddle_repo_view(vec![commit]);
+
+        let scope_defs = vec![ScopeDefinition {
+            name: "cli".to_string(),
+            description: "CLI".to_string(),
+            examples: vec![],
+            file_patterns: vec!["src/cli/**".to_string()],
+        }];
+
+        let mut amendments = AmendmentFile {
+            amendments: vec![Amendment {
+                commit: "unknown_hash".to_string(),
+                message: "fix(wrong): something".to_string(),
+                summary: None,
+            }],
+        };
+
+        refine_amendment_scopes(&mut amendments, &repo_view, &scope_defs);
+
+        // Message unchanged because commit wasn't found in repo_view.
+        assert_eq!(amendments.amendments[0].message, "fix(wrong): something",);
     }
 }
