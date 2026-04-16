@@ -153,6 +153,44 @@ struct ConfluenceAddCommentRequest {
     body: ConfluenceUpdateBody,
 }
 
+// ── Labels ─────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ConfluenceLabelsResponse {
+    results: Vec<ConfluenceLabelEntry>,
+    #[serde(rename = "_links", default)]
+    links: Option<ConfluenceLabelsLinks>,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceLabelEntry {
+    id: String,
+    name: String,
+    prefix: String,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceLabelsLinks {
+    next: Option<String>,
+}
+
+/// A label on a Confluence page.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfluenceLabel {
+    /// Label ID.
+    pub id: String,
+    /// Label name.
+    pub name: String,
+    /// Label prefix (e.g. "global").
+    pub prefix: String,
+}
+
+#[derive(Serialize)]
+struct ConfluenceAddLabelEntry {
+    prefix: String,
+    name: String,
+}
+
 // ── Create request ─────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -599,6 +637,104 @@ impl ConfluenceApi {
             .context("Failed to parse Confluence space response")?;
 
         Ok(space.key)
+    }
+
+    /// Fetches all labels on a Confluence page, handling pagination.
+    pub async fn get_labels(&self, page_id: &str) -> Result<Vec<ConfluenceLabel>> {
+        let mut all_labels = Vec::new();
+        let mut url = format!(
+            "{}/wiki/api/v2/pages/{}/labels",
+            self.client.instance_url(),
+            page_id
+        );
+
+        loop {
+            let response = self
+                .client
+                .get_json(&url)
+                .await
+                .context("Failed to fetch page labels")?;
+
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+            }
+
+            let resp: ConfluenceLabelsResponse = response
+                .json()
+                .await
+                .context("Failed to parse labels response")?;
+
+            let page_count = resp.results.len();
+            for entry in resp.results {
+                all_labels.push(ConfluenceLabel {
+                    id: entry.id,
+                    name: entry.name,
+                    prefix: entry.prefix,
+                });
+            }
+
+            match resp.links.and_then(|l| l.next) {
+                Some(next_path) if page_count > 0 => {
+                    url = format!("{}{}", self.client.instance_url(), next_path);
+                }
+                _ => break,
+            }
+        }
+
+        Ok(all_labels)
+    }
+
+    /// Adds one or more labels to a Confluence page.
+    pub async fn add_labels(&self, page_id: &str, labels: &[String]) -> Result<()> {
+        let url = format!(
+            "{}/wiki/rest/api/content/{}/label",
+            self.client.instance_url(),
+            page_id
+        );
+
+        let body: Vec<ConfluenceAddLabelEntry> = labels
+            .iter()
+            .map(|name| ConfluenceAddLabelEntry {
+                prefix: "global".to_string(),
+                name: name.clone(),
+            })
+            .collect();
+
+        let response = self
+            .client
+            .post_json(&url, &body)
+            .await
+            .context("Failed to add labels")?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        Ok(())
+    }
+
+    /// Removes a label from a Confluence page.
+    pub async fn remove_label(&self, page_id: &str, label_name: &str) -> Result<()> {
+        let url = format!(
+            "{}/wiki/rest/api/content/{}/label/{}",
+            self.client.instance_url(),
+            page_id,
+            label_name
+        );
+
+        let response = self.client.delete(&url).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        Ok(())
     }
 }
 
@@ -1394,5 +1530,232 @@ mod tests {
         let adf = AdfDocument::new();
         let err = api.add_page_comment("12345", &adf).await.unwrap_err();
         assert!(err.to_string().contains("403"));
+    }
+
+    // ── get_labels ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_labels_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12345/labels"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {"id": "1", "name": "architecture", "prefix": "global"},
+                        {"id": "2", "name": "draft", "prefix": "global"}
+                    ]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let labels = api.get_labels("12345").await.unwrap();
+
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels[0].name, "architecture");
+        assert_eq!(labels[0].prefix, "global");
+        assert_eq!(labels[1].name, "draft");
+    }
+
+    #[tokio::test]
+    async fn get_labels_with_pagination() {
+        let server = wiremock::MockServer::start().await;
+
+        // First page returns one label with a next link.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12345/labels"))
+            .and(wiremock::matchers::query_param_is_missing("cursor"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {"id": "1", "name": "architecture", "prefix": "global"}
+                    ],
+                    "_links": {
+                        "next": "/wiki/api/v2/pages/12345/labels?cursor=page2"
+                    }
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Second page returns another label with no next link.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12345/labels"))
+            .and(wiremock::matchers::query_param("cursor", "page2"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {"id": "2", "name": "draft", "prefix": "global"}
+                    ]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let labels = api.get_labels("12345").await.unwrap();
+
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels[0].name, "architecture");
+        assert_eq!(labels[1].name, "draft");
+    }
+
+    #[tokio::test]
+    async fn get_labels_empty() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12345/labels"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": []})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let labels = api.get_labels("12345").await.unwrap();
+        assert!(labels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_labels_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/99999/labels"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = api.get_labels("99999").await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    // ── add_labels ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn add_labels_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/label",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {"prefix": "global", "name": "architecture", "id": "1"},
+                        {"prefix": "global", "name": "draft", "id": "2"}
+                    ]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let result = api
+            .add_labels("12345", &["architecture".to_string(), "draft".to_string()])
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn add_labels_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/99999/label",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = api
+            .add_labels("99999", &["test".to_string()])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    // ── remove_label ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn remove_label_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/label/architecture",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let result = api.remove_label("12345", "architecture").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn remove_label_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/99999/label/missing",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = api.remove_label("99999", "missing").await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    // ── label struct serialization ────────────────────────────────
+
+    #[test]
+    fn confluence_label_entry_deserialization() {
+        let json = r#"{"id": "1", "name": "architecture", "prefix": "global"}"#;
+        let entry: ConfluenceLabelEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.id, "1");
+        assert_eq!(entry.name, "architecture");
+        assert_eq!(entry.prefix, "global");
+    }
+
+    #[test]
+    fn confluence_add_label_entry_serialization() {
+        let entry = ConfluenceAddLabelEntry {
+            prefix: "global".to_string(),
+            name: "test".to_string(),
+        };
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["prefix"], "global");
+        assert_eq!(json["name"], "test");
     }
 }

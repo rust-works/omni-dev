@@ -5,6 +5,7 @@ pub(crate) mod create;
 pub(crate) mod delete;
 pub(crate) mod download;
 pub(crate) mod edit;
+pub(crate) mod label;
 pub(crate) mod read;
 pub(crate) mod search;
 pub(crate) mod user;
@@ -38,6 +39,8 @@ pub enum ConfluenceSubcommands {
     Create(create::CreateCommand),
     /// Deletes a Confluence page.
     Delete(delete::DeleteCommand),
+    /// Manages labels on Confluence pages.
+    Label(label::LabelCommand),
     /// Recursively downloads a Confluence page tree.
     Download(download::DownloadCommand),
     /// Confluence user operations.
@@ -54,6 +57,7 @@ impl ConfluenceCommand {
             ConfluenceSubcommands::Edit(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Search(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Create(cmd) => cmd.execute().await,
+            ConfluenceSubcommands::Label(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Delete(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Download(cmd) => cmd.execute().await,
             ConfluenceSubcommands::User(cmd) => cmd.execute().await,
@@ -143,6 +147,19 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::Create(_)));
+    }
+
+    #[test]
+    fn confluence_subcommands_label_variant() {
+        let cmd = ConfluenceCommand {
+            command: ConfluenceSubcommands::Label(label::LabelCommand {
+                command: label::LabelSubcommands::List(label::ListCommand {
+                    id: "12345".to_string(),
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        assert!(matches!(cmd.command, ConfluenceSubcommands::Label(_)));
     }
 
     #[test]
