@@ -3210,15 +3210,19 @@ fn render_list_item_content(item: &AdfNode, output: &mut String, opts: &RenderOp
         }
         return;
     } else {
-        // The first child is a block-level node (e.g. codeBlock).
-        // Render to a buffer and indent continuation lines so the
-        // entire block sits inside the list item (issue #511).
+        // Block-level first child (e.g. codeBlock, mediaSingle).
+        // Render to a buffer so we can:
+        //  1. Append listItem localId attrs to the first line (issue #525)
+        //  2. Indent continuation lines so multi-line blocks stay inside
+        //     the list item (issue #511)
         let mut buf = String::new();
         render_block_node(first, &mut buf, opts);
+        let bare = AdfNode::text("");
         let mut is_first = true;
         for line in buf.lines() {
             if is_first {
                 output.push_str(line);
+                emit_list_item_local_ids(item, &bare, output, opts);
                 output.push('\n');
                 is_first = false;
             } else {
@@ -16287,6 +16291,148 @@ C
         assert_eq!(children[1].node_type, "mediaSingle");
         let media = &children[1].content.as_ref().unwrap()[0];
         assert_eq!(media.attrs.as_ref().unwrap()["id"], "multi-hb");
+    }
+
+    // ── Issue #525: listItem localId dropped when content includes mediaSingle ──
+
+    #[test]
+    fn issue_525_listitem_localid_with_mediasingle_roundtrip() {
+        // Exact reproducer from issue #525: listItem with UUID localId whose
+        // content includes mediaSingle + paragraph + nested bulletList.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[{"type":"listItem","attrs":{"localId":"aabbccdd-1234-5678-abcd-000000000001"},"content":[{"type":"mediaSingle","attrs":{"layout":"center","width":100,"widthType":"pixel"},"content":[{"type":"media","attrs":{"id":"aabbccdd-1234-5678-abcd-000000000002","type":"file","collection":"test-collection","height":100,"width":100}}]},{"type":"paragraph","content":[{"type":"text","text":"some text"}]},{"type":"bulletList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"nested item"}]}]}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let list = &rt.content[0];
+        assert_eq!(list.node_type, "bulletList");
+        let item = &list.content.as_ref().unwrap()[0];
+        // The localId must be preserved on the listItem.
+        let item_attrs = item.attrs.as_ref().expect("listItem attrs must be present");
+        assert_eq!(
+            item_attrs["localId"], "aabbccdd-1234-5678-abcd-000000000001",
+            "listItem localId must survive round-trip"
+        );
+        let children = item.content.as_ref().unwrap();
+        assert_eq!(
+            children.len(),
+            3,
+            "expected mediaSingle + paragraph + bulletList"
+        );
+        assert_eq!(children[0].node_type, "mediaSingle");
+        assert_eq!(children[1].node_type, "paragraph");
+        assert_eq!(children[2].node_type, "bulletList");
+    }
+
+    #[test]
+    fn issue_525_listitem_localid_with_mediasingle_only() {
+        // Minimal case: listItem with localId whose sole child is mediaSingle.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[
+          {"type":"listItem","attrs":{"localId":"li-media-only"},"content":[
+            {"type":"mediaSingle","attrs":{"layout":"center"},
+             "content":[{"type":"media","attrs":{"type":"file","id":"m-001","collection":"c1","height":50,"width":100}}]}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let item = &rt.content[0].content.as_ref().unwrap()[0];
+        let item_attrs = item.attrs.as_ref().expect("listItem attrs must be present");
+        assert_eq!(
+            item_attrs["localId"], "li-media-only",
+            "listItem localId must survive when sole child is mediaSingle"
+        );
+        assert_eq!(item.content.as_ref().unwrap()[0].node_type, "mediaSingle");
+    }
+
+    #[test]
+    fn issue_525_listitem_localid_with_external_media() {
+        // External image (URL-based) as first child with listItem localId.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[
+          {"type":"listItem","attrs":{"localId":"li-ext-media"},"content":[
+            {"type":"mediaSingle","attrs":{"layout":"center"},
+             "content":[{"type":"media","attrs":{"type":"external","url":"https://example.com/img.png","alt":"photo"}}]}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let item = &rt.content[0].content.as_ref().unwrap()[0];
+        let item_attrs = item.attrs.as_ref().expect("listItem attrs must be present");
+        assert_eq!(
+            item_attrs["localId"], "li-ext-media",
+            "listItem localId must survive with external mediaSingle"
+        );
+    }
+
+    #[test]
+    fn issue_525_listitem_localid_with_mediasingle_in_ordered_list() {
+        // Same bug in an ordered list.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"orderedList","attrs":{"order":1},"content":[
+          {"type":"listItem","attrs":{"localId":"li-ord-media"},"content":[
+            {"type":"mediaSingle","attrs":{"layout":"center","width":200,"widthType":"pixel"},
+             "content":[{"type":"media","attrs":{"type":"file","id":"ord-m-001","collection":"col-ord","height":80,"width":160}}]},
+            {"type":"paragraph","content":[{"type":"text","text":"ordered item text"}]}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let item = &rt.content[0].content.as_ref().unwrap()[0];
+        let item_attrs = item.attrs.as_ref().expect("listItem attrs must be present");
+        assert_eq!(
+            item_attrs["localId"], "li-ord-media",
+            "listItem localId must survive in ordered list with mediaSingle"
+        );
+        let children = item.content.as_ref().unwrap();
+        assert_eq!(children[0].node_type, "mediaSingle");
+        assert_eq!(children[1].node_type, "paragraph");
+    }
+
+    #[test]
+    fn issue_525_jfm_localid_on_mediasingle_line_parses_correctly() {
+        // Verify JFM→ADF: trailing {localId=...} on a mediaSingle line
+        // is assigned to the listItem, not the media node.
+        let md = "- ![](){type=file id=test-525 collection=col height=100 width=200 mediaWidth=100 widthType=pixel} {localId=li-jfm-525}\n";
+        let doc = markdown_to_adf(md).unwrap();
+
+        let item = &doc.content[0].content.as_ref().unwrap()[0];
+        let item_attrs = item
+            .attrs
+            .as_ref()
+            .expect("listItem attrs must be present from JFM");
+        assert_eq!(item_attrs["localId"], "li-jfm-525");
+        assert_eq!(item.content.as_ref().unwrap()[0].node_type, "mediaSingle");
+    }
+
+    #[test]
+    fn issue_525_encoding_emits_localid_on_mediasingle_line() {
+        // Verify the ADF→JFM encoding: localId appears on the same line
+        // as the mediaSingle image syntax.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[
+          {"type":"listItem","attrs":{"localId":"li-emit-check"},"content":[
+            {"type":"mediaSingle","attrs":{"layout":"center"},
+             "content":[{"type":"media","attrs":{"type":"file","id":"m-emit","collection":"c-emit","height":10,"width":20}}]}
+          ]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("{localId=li-emit-check}"),
+            "expected localId in JFM output, got: {md}"
+        );
+        // The localId must be on the same line as the image
+        for line in md.lines() {
+            if line.contains("![") {
+                assert!(
+                    line.contains("localId=li-emit-check"),
+                    "localId must be on the same line as the image: {line}"
+                );
+            }
+        }
     }
 
     // ── Placeholder node tests ────────────────────────────────────
