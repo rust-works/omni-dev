@@ -15,7 +15,7 @@ use crate::atlassian::document::{content_item_to_document, JfmDocument};
 use super::format::ContentFormat;
 
 /// Fetches content and outputs it in the specified format.
-pub async fn execute_read(
+pub async fn run_read(
     id: &str,
     output: Option<&str>,
     format: &ContentFormat,
@@ -100,7 +100,7 @@ pub fn print_create_dry_run(
 }
 
 /// Confirms and pushes content to the target.
-pub async fn execute_write(
+pub async fn run_write(
     id: &str,
     adf: &AdfDocument,
     title: &str,
@@ -132,7 +132,7 @@ pub async fn execute_write(
 }
 
 /// Interactive fetch-edit-push cycle.
-pub async fn execute_edit(id: &str, api: &dyn AtlassianApi, instance_url: &str) -> Result<()> {
+pub async fn run_edit(id: &str, api: &dyn AtlassianApi, instance_url: &str) -> Result<()> {
     use tracing::debug;
 
     // 1. Fetch the content
@@ -534,10 +534,10 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // ── execute_read ───────────────────────────────────────────────
+    // ── run_read ───────────────────────────────────────────────
 
     #[tokio::test]
-    async fn execute_read_jfm_to_stdout() {
+    async fn run_read_jfm_to_stdout() {
         let adf_body = serde_json::json!({
             "version": 1,
             "type": "doc",
@@ -545,7 +545,7 @@ mod tests {
         });
         let api = MockApi::jira_issue(Some(adf_body));
 
-        let result = execute_read(
+        let result = run_read(
             "PROJ-1",
             None,
             &ContentFormat::Jfm,
@@ -557,7 +557,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_read_adf_to_stdout() {
+    async fn run_read_adf_to_stdout() {
         let adf_body = serde_json::json!({
             "version": 1,
             "type": "doc",
@@ -565,7 +565,7 @@ mod tests {
         });
         let api = MockApi::jira_issue(Some(adf_body));
 
-        let result = execute_read(
+        let result = run_read(
             "PROJ-1",
             None,
             &ContentFormat::Adf,
@@ -577,10 +577,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_read_adf_null_body() {
+    async fn run_read_adf_null_body() {
         let api = MockApi::jira_issue(None);
 
-        let result = execute_read(
+        let result = run_read(
             "PROJ-1",
             None,
             &ContentFormat::Adf,
@@ -592,7 +592,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_read_jfm_to_file() {
+    async fn run_read_jfm_to_file() {
         let adf_body = serde_json::json!({
             "version": 1,
             "type": "doc",
@@ -603,7 +603,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let out_path = temp_dir.path().join("out.md");
 
-        let result = execute_read(
+        let result = run_read(
             "PROJ-1",
             Some(out_path.to_str().unwrap()),
             &ContentFormat::Jfm,
@@ -618,7 +618,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_read_adf_to_file() {
+    async fn run_read_adf_to_file() {
         let adf_body = serde_json::json!({
             "version": 1,
             "type": "doc",
@@ -629,7 +629,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let out_path = temp_dir.path().join("out.json");
 
-        let result = execute_read(
+        let result = run_read(
             "PROJ-1",
             Some(out_path.to_str().unwrap()),
             &ContentFormat::Adf,
@@ -642,7 +642,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_read_confluence_jfm() {
+    async fn run_read_confluence_jfm() {
         let adf_body = serde_json::json!({
             "version": 1,
             "type": "doc",
@@ -650,7 +650,7 @@ mod tests {
         });
         let api = MockApi::confluence_page(Some(adf_body));
 
-        let result = execute_read(
+        let result = run_read(
             "12345",
             None,
             &ContentFormat::Jfm,
@@ -661,24 +661,24 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // ── execute_write ──────────────────────────────────────────────
+    // ── run_write ──────────────────────────────────────────────
 
     #[tokio::test]
-    async fn execute_write_force_with_title() {
+    async fn run_write_force_with_title() {
         let api = MockApi::jira_issue(None);
         let adf = AdfDocument::new();
 
-        let result = execute_write("PROJ-1", &adf, "My Title", true, &api).await;
+        let result = run_write("PROJ-1", &adf, "My Title", true, &api).await;
         assert!(result.is_ok());
         assert!(api.was_update_called());
     }
 
     #[tokio::test]
-    async fn execute_write_force_empty_title() {
+    async fn run_write_force_empty_title() {
         let api = MockApi::jira_issue(None);
         let adf = AdfDocument::new();
 
-        let result = execute_write("PROJ-1", &adf, "", true, &api).await;
+        let result = run_write("PROJ-1", &adf, "", true, &api).await;
         assert!(result.is_ok());
         assert!(api.was_update_called());
     }

@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::Parser;
 
 use crate::atlassian::jira_api::JiraApi;
-use crate::cli::atlassian::helpers::{create_client, execute_edit};
+use crate::cli::atlassian::helpers::{create_client, run_edit};
 
 /// Interactive fetch-edit-push cycle for a JIRA issue.
 #[derive(Parser)]
@@ -19,7 +19,7 @@ impl EditCommand {
         let (client, instance_url) = create_client()?;
         let api = JiraApi::new(client);
 
-        execute_edit(&self.key, &api, &instance_url).await
+        run_edit(&self.key, &api, &instance_url).await
     }
 }
 
