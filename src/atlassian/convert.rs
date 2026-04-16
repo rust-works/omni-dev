@@ -3213,7 +3213,23 @@ fn render_list_item_content(item: &AdfNode, output: &mut String, opts: &RenderOp
         }
         rest_start = 1;
     }
-    for child in &content[rest_start..] {
+    let rest = &content[rest_start..];
+    for (i, child) in rest.iter().enumerate() {
+        // Separate consecutive paragraph siblings with a blank indented
+        // line so they re-parse as distinct paragraphs rather than being
+        // merged into one (issue #522).
+        if child.node_type == "paragraph" {
+            let prev_is_para = if i == 0 {
+                // First rest child — check whether the first-line node
+                // (rendered above) was a paragraph.
+                first.node_type == "paragraph"
+            } else {
+                rest[i - 1].node_type == "paragraph"
+            };
+            if prev_is_para {
+                output.push_str("  \n");
+            }
+        }
         let mut nested = String::new();
         render_block_node(child, &mut nested, opts);
         for line in nested.lines() {
@@ -17068,5 +17084,167 @@ C
             Some("  "),
             "space-only text node should survive round-trip"
         );
+    }
+
+    // ── Issue #522: listItem multi-paragraph merge ──────────────────────
+
+    #[test]
+    fn issue_522_listitem_hardbreak_then_two_paragraphs_roundtrips() {
+        // The exact reproducer from issue #522: first paragraph has
+        // hardBreak nodes, followed by two sibling paragraphs.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"preamble"},{"type":"hardBreak"},{"type":"text","text":"\u00a0"},{"type":"hardBreak"},{"type":"text","text":"line with "},{"marks":[{"type":"code"}],"text":"code","type":"text"},{"type":"text","text":". "}]},{"type":"paragraph","content":[{"type":"text","text":"second paragraph"}]},{"type":"paragraph","content":[{"type":"text","text":"third paragraph"}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let items = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 1);
+        let children = items[0].content.as_ref().unwrap();
+        assert_eq!(
+            children.len(),
+            3,
+            "Expected 3 paragraphs in listItem, got {}",
+            children.len()
+        );
+        assert_eq!(children[0].node_type, "paragraph");
+        assert_eq!(children[1].node_type, "paragraph");
+        assert_eq!(children[2].node_type, "paragraph");
+
+        // Verify the text content of each paragraph
+        let text1 = children[1].content.as_ref().unwrap()[0]
+            .text
+            .as_deref()
+            .unwrap();
+        assert_eq!(text1, "second paragraph");
+        let text2 = children[2].content.as_ref().unwrap()[0]
+            .text
+            .as_deref()
+            .unwrap();
+        assert_eq!(text2, "third paragraph");
+    }
+
+    #[test]
+    fn issue_522_ordered_list_hardbreak_then_paragraphs_roundtrips() {
+        // Same scenario in an ordered list.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"orderedList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"first"},{"type":"hardBreak"},{"type":"text","text":"continued"}]},{"type":"paragraph","content":[{"type":"text","text":"second para"}]},{"type":"paragraph","content":[{"type":"text","text":"third para"}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let items = rt.content[0].content.as_ref().unwrap();
+        let children = items[0].content.as_ref().unwrap();
+        assert_eq!(
+            children.len(),
+            3,
+            "Expected 3 paragraphs in ordered listItem, got {}",
+            children.len()
+        );
+        assert_eq!(children[1].node_type, "paragraph");
+        assert_eq!(children[2].node_type, "paragraph");
+        assert_eq!(
+            children[1].content.as_ref().unwrap()[0]
+                .text
+                .as_deref()
+                .unwrap(),
+            "second para"
+        );
+        assert_eq!(
+            children[2].content.as_ref().unwrap()[0]
+                .text
+                .as_deref()
+                .unwrap(),
+            "third para"
+        );
+    }
+
+    #[test]
+    fn issue_522_two_paragraphs_without_hardbreak_roundtrips() {
+        // Two paragraphs without hardBreak — should also remain separate.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"first paragraph"}]},{"type":"paragraph","content":[{"type":"text","text":"second paragraph"}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let items = rt.content[0].content.as_ref().unwrap();
+        let children = items[0].content.as_ref().unwrap();
+        assert_eq!(
+            children.len(),
+            2,
+            "Expected 2 paragraphs in listItem, got {}",
+            children.len()
+        );
+        assert_eq!(children[0].node_type, "paragraph");
+        assert_eq!(children[1].node_type, "paragraph");
+    }
+
+    #[test]
+    fn issue_522_paragraph_then_nested_list_no_spurious_blank() {
+        // A paragraph followed by a nested list should NOT get a blank
+        // separator (only paragraph-paragraph transitions need one).
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"parent"}]},{"type":"bulletList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"child"}]}]}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        // Should not contain a blank indented line between parent text and sub-list
+        assert!(
+            !md.contains("  \n  -"),
+            "No blank separator between paragraph and nested list"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let items = rt.content[0].content.as_ref().unwrap();
+        let children = items[0].content.as_ref().unwrap();
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].node_type, "paragraph");
+        assert_eq!(children[1].node_type, "bulletList");
+    }
+
+    #[test]
+    fn issue_522_three_paragraphs_no_hardbreak_roundtrips() {
+        // Three plain paragraphs (no hardBreak) inside a single listItem.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"alpha"}]},{"type":"paragraph","content":[{"type":"text","text":"bravo"}]},{"type":"paragraph","content":[{"type":"text","text":"charlie"}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let items = rt.content[0].content.as_ref().unwrap();
+        let children = items[0].content.as_ref().unwrap();
+        assert_eq!(
+            children.len(),
+            3,
+            "Expected 3 paragraphs, got {}",
+            children.len()
+        );
+        for (i, child) in children.iter().enumerate() {
+            assert_eq!(
+                child.node_type, "paragraph",
+                "Child {} should be a paragraph",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn issue_522_multiple_list_items_each_with_paragraphs() {
+        // Multiple list items, each with multiple paragraphs.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"item1 p1"}]},{"type":"paragraph","content":[{"type":"text","text":"item1 p2"}]}]},{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"item2 p1"},{"type":"hardBreak"},{"type":"text","text":"item2 cont"}]},{"type":"paragraph","content":[{"type":"text","text":"item2 p2"}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let items = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 2, "Expected 2 list items");
+
+        let item1 = items[0].content.as_ref().unwrap();
+        assert_eq!(item1.len(), 2, "Item 1 should have 2 paragraphs");
+
+        let item2 = items[1].content.as_ref().unwrap();
+        assert_eq!(item2.len(), 2, "Item 2 should have 2 paragraphs");
+        // Verify hardBreak is preserved in item2's first paragraph
+        let item2_p1_inlines = item2[0].content.as_ref().unwrap();
+        let types: Vec<&str> = item2_p1_inlines
+            .iter()
+            .map(|n| n.node_type.as_str())
+            .collect();
+        assert_eq!(types, vec!["text", "hardBreak", "text"]);
     }
 }
