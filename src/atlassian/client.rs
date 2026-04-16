@@ -130,6 +130,26 @@ pub struct ConfluenceSearchResults {
     pub total: u32,
 }
 
+/// A Confluence user in search results.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfluenceUserSearchResult {
+    /// Account ID (unique identifier).
+    pub account_id: String,
+    /// Display name.
+    pub display_name: String,
+    /// Email address.
+    pub email: Option<String>,
+}
+
+/// Result from searching Confluence users.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfluenceUserSearchResults {
+    /// Matching users.
+    pub users: Vec<ConfluenceUserSearchResult>,
+    /// Total number of matching results.
+    pub total: u32,
+}
+
 /// A JIRA issue comment.
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraComment {
@@ -574,6 +594,25 @@ struct ConfluenceContentSearchEntry {
 #[derive(Deserialize)]
 struct ConfluenceExpandable {
     space: Option<String>,
+}
+
+// ── Confluence user search API response structs ───────────────────
+
+#[derive(Deserialize)]
+struct ConfluenceUserSearchResponse {
+    results: Vec<ConfluenceUserSearchEntry>,
+    #[serde(rename = "_links", default)]
+    links: Option<ConfluenceSearchLinks>,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceUserSearchEntry {
+    #[serde(rename = "accountId")]
+    account_id: String,
+    #[serde(rename = "displayName")]
+    display_name: String,
+    #[serde(default)]
+    email: Option<String>,
 }
 
 // ── Agile API response structs ─────────────────────────────────────
@@ -1945,6 +1984,167 @@ mod tests {
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
         let result = client.search_confluence("type = page", 10).await.unwrap();
         assert_eq!(result.results[0].space_key, "");
+    }
+
+    // ── search_confluence_users ─────────────────────────────────
+
+    #[tokio::test]
+    async fn search_confluence_users_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/search/user"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {
+                            "accountId": "abc123",
+                            "displayName": "Alice Smith",
+                            "email": "alice@example.com"
+                        },
+                        {
+                            "accountId": "def456",
+                            "displayName": "Bob Jones",
+                            "email": "bob@example.com"
+                        }
+                    ]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.search_confluence_users("alice", 25).await.unwrap();
+
+        assert_eq!(result.total, 2);
+        assert_eq!(result.users.len(), 2);
+        assert_eq!(result.users[0].account_id, "abc123");
+        assert_eq!(result.users[0].display_name, "Alice Smith");
+        assert_eq!(result.users[0].email.as_deref(), Some("alice@example.com"));
+        assert_eq!(result.users[1].account_id, "def456");
+        assert_eq!(result.users[1].display_name, "Bob Jones");
+    }
+
+    #[tokio::test]
+    async fn search_confluence_users_empty() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/search/user"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": []})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client
+            .search_confluence_users("nonexistent", 25)
+            .await
+            .unwrap();
+        assert_eq!(result.total, 0);
+        assert!(result.users.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_confluence_users_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/search/user"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .search_confluence_users("alice", 25)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn search_confluence_users_missing_email() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/search/user"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {
+                            "accountId": "xyz789",
+                            "displayName": "No Email User"
+                        }
+                    ]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client
+            .search_confluence_users("no email", 25)
+            .await
+            .unwrap();
+        assert_eq!(result.users.len(), 1);
+        assert_eq!(result.users[0].display_name, "No Email User");
+        assert!(result.users[0].email.is_none());
+    }
+
+    #[tokio::test]
+    async fn search_confluence_users_pagination() {
+        let server = wiremock::MockServer::start().await;
+
+        // First page returns one result with a next link
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/search/user"))
+            .and(wiremock::matchers::query_param("start", "0"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {
+                            "accountId": "page1",
+                            "displayName": "User One"
+                        }
+                    ],
+                    "_links": {"next": "/wiki/rest/api/search/user?start=1"}
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Second page returns one result with no next link
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/search/user"))
+            .and(wiremock::matchers::query_param("start", "1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {
+                            "accountId": "page2",
+                            "displayName": "User Two"
+                        }
+                    ]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.search_confluence_users("user", 0).await.unwrap();
+
+        assert_eq!(result.total, 2);
+        assert_eq!(result.users[0].account_id, "page1");
+        assert_eq!(result.users[1].account_id, "page2");
     }
 
     #[tokio::test]
@@ -4892,6 +5092,72 @@ impl AtlassianClient {
         let total = all_results.len() as u32;
         Ok(ConfluenceSearchResults {
             results: all_results,
+            total,
+        })
+    }
+
+    /// Searches Confluence users by display name or email.
+    pub async fn search_confluence_users(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<ConfluenceUserSearchResults> {
+        let effective_limit = if limit == 0 { u32::MAX } else { limit };
+        let mut all_results = Vec::new();
+        let mut start: u32 = 0;
+
+        let cql = format!("user.fullname~\"{query}\"");
+
+        loop {
+            let remaining = effective_limit.saturating_sub(all_results.len() as u32);
+            if remaining == 0 {
+                break;
+            }
+            let page_size = remaining.min(PAGE_SIZE);
+
+            let base = format!("{}/wiki/rest/api/search/user", self.instance_url);
+            let url = reqwest::Url::parse_with_params(
+                &base,
+                &[
+                    ("cql", cql.as_str()),
+                    ("limit", &page_size.to_string()),
+                    ("start", &start.to_string()),
+                ],
+            )
+            .context("Failed to build Confluence user search URL")?;
+
+            let response = self.get_json(url.as_str()).await?;
+
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+            }
+
+            let resp: ConfluenceUserSearchResponse = response
+                .json()
+                .await
+                .context("Failed to parse Confluence user search response")?;
+
+            let page_count = resp.results.len() as u32;
+            for r in resp.results {
+                all_results.push(ConfluenceUserSearchResult {
+                    account_id: r.account_id,
+                    display_name: r.display_name,
+                    email: r.email,
+                });
+            }
+
+            let has_next = resp.links.and_then(|l| l.next).is_some();
+            if !has_next || page_count == 0 {
+                break;
+            }
+            start += page_count;
+        }
+
+        let total = all_results.len() as u32;
+        Ok(ConfluenceUserSearchResults {
+            users: all_results,
             total,
         })
     }

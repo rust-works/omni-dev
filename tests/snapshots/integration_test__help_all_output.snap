@@ -189,6 +189,7 @@ Commands:
   create    Creates a new Confluence page
   delete    Deletes a Confluence page
   download  Recursively downloads a Confluence page tree
+  user      Confluence user operations
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -348,6 +349,37 @@ Options:
       --cql <CQL>        Raw CQL query string (e.g., "space = ENG AND title ~ 'architecture'")
       --space <SPACE>    Filter by space key
       --title <TITLE>    Filter by title (substring match)
+      --limit <LIMIT>    Maximum number of results, 0 for unlimited (default: 25) [default: 25]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian confluence user - Confluence user operations
+
+Confluence user operations
+
+Usage: user <COMMAND>
+
+Commands:
+  search  Searches Confluence users by display name or email
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian confluence user search - Searches Confluence users by display name or email
+
+Searches Confluence users by display name or email
+
+Usage: search [OPTIONS] --query <QUERY>
+
+Options:
+      --query <QUERY>    Search text (matches display name or email)
       --limit <LIMIT>    Maximum number of results, 0 for unlimited (default: 25) [default: 25]
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml]
   -h, --help             Print help (see more with '--help')
