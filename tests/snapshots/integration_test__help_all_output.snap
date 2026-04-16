@@ -394,6 +394,7 @@ Commands:
   link        Manages JIRA issue links
   changelog   Shows change history for JIRA issues
   attachment  Downloads JIRA issue attachments
+  worklog     Manages worklogs (time tracking) on a JIRA issue
   help        Print this message or the help of the given subcommand(s)
 
 Options:
@@ -953,6 +954,58 @@ Arguments:
 
 Options:
       --list             Lists available transitions (same as omitting the transition argument)
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian jira worklog - Manages worklogs (time tracking) on a JIRA issue
+
+Manages worklogs (time tracking) on a JIRA issue
+
+Usage: worklog <COMMAND>
+
+Commands:
+  list  Lists worklogs on a JIRA issue
+  add   Adds a worklog entry to a JIRA issue
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian jira worklog add - Adds a worklog entry to a JIRA issue
+
+Adds a worklog entry to a JIRA issue
+
+Usage: add [OPTIONS] --time-spent <TIME_SPENT> <KEY>
+
+Arguments:
+  <KEY>  JIRA issue key (e.g., PROJ-123)
+
+Options:
+      --time-spent <TIME_SPENT>  Time spent in JIRA duration format (e.g., "2h 30m", "1d", "45m")
+      --started <STARTED>        When the work was started (ISO 8601, e.g., "2026-04-16T09:00:00.000+0000")
+      --comment <COMMENT>        Comment describing the work performed
+  -h, --help                     Print help
+
+
+================================================================================
+
+omni-dev atlassian jira worklog list - Lists worklogs on a JIRA issue
+
+Lists worklogs on a JIRA issue
+
+Usage: list [OPTIONS] <KEY>
+
+Arguments:
+  <KEY>  JIRA issue key (e.g., PROJ-123)
+
+Options:
+      --limit <LIMIT>    Maximum number of results, 0 for unlimited (default: 50) [default: 50]
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml]
   -h, --help             Print help (see more with '--help')
 
