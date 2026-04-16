@@ -64,7 +64,7 @@ pub struct JiraIssue {
 }
 
 /// Response from the JIRA `/myself` endpoint.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JiraUser {
     /// User display name.
     #[serde(rename = "displayName")]
@@ -77,6 +77,16 @@ pub struct JiraUser {
     /// Account ID.
     #[serde(rename = "accountId")]
     pub account_id: String,
+}
+
+/// Result from listing watchers on a JIRA issue.
+#[derive(Debug, Clone, Serialize)]
+pub struct JiraWatcherList {
+    /// Watchers on the issue.
+    pub watchers: Vec<JiraUser>,
+
+    /// Total number of watchers.
+    pub watch_count: u32,
 }
 
 /// Result from creating a JIRA issue via the REST API.
@@ -3261,6 +3271,172 @@ mod tests {
         assert!(err.to_string().contains("403"));
     }
 
+    // ── get_watchers ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_watchers_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/watchers",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "watchCount": 2,
+                    "watchers": [
+                        {
+                            "accountId": "abc123",
+                            "displayName": "Alice",
+                            "emailAddress": "alice@example.com"
+                        },
+                        {
+                            "accountId": "def456",
+                            "displayName": "Bob"
+                        }
+                    ]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.get_watchers("PROJ-1").await.unwrap();
+
+        assert_eq!(result.watch_count, 2);
+        assert_eq!(result.watchers.len(), 2);
+        assert_eq!(result.watchers[0].display_name, "Alice");
+        assert_eq!(result.watchers[0].account_id, "abc123");
+        assert_eq!(
+            result.watchers[0].email_address.as_deref(),
+            Some("alice@example.com")
+        );
+        assert_eq!(result.watchers[1].display_name, "Bob");
+        assert!(result.watchers[1].email_address.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_watchers_empty() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/watchers",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "watchCount": 0,
+                    "watchers": []
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.get_watchers("PROJ-1").await.unwrap();
+
+        assert_eq!(result.watch_count, 0);
+        assert!(result.watchers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_watchers_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/NOPE-1/watchers",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.get_watchers("NOPE-1").await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    // ── add_watcher ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn add_watcher_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/watchers",
+            ))
+            .and(wiremock::matchers::body_json(serde_json::json!("abc123")))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.add_watcher("PROJ-1", "abc123").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn add_watcher_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/watchers",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.add_watcher("PROJ-1", "abc123").await.unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    // ── remove_watcher ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn remove_watcher_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/watchers",
+            ))
+            .and(wiremock::matchers::query_param("accountId", "abc123"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.remove_watcher("PROJ-1", "abc123").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn remove_watcher_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/watchers",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.remove_watcher("PROJ-1", "abc123").await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
     #[tokio::test]
     async fn get_myself_success() {
         let server = wiremock::MockServer::start().await;
@@ -5674,6 +5850,75 @@ impl AtlassianClient {
     /// Deletes a JIRA issue.
     pub async fn delete_issue(&self, key: &str) -> Result<()> {
         let url = format!("{}/rest/api/3/issue/{}", self.instance_url, key);
+
+        let response = self.delete(&url).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        Ok(())
+    }
+
+    /// Lists watchers on a JIRA issue.
+    pub async fn get_watchers(&self, key: &str) -> Result<JiraWatcherList> {
+        let url = format!("{}/rest/api/3/issue/{}/watchers", self.instance_url, key);
+
+        let response = self.get_json(&url).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let json: serde_json::Value = response
+            .json()
+            .await
+            .context("Failed to parse watchers response")?;
+
+        let watch_count = json["watchCount"].as_u64().unwrap_or(0) as u32;
+
+        let watchers = json["watchers"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| serde_json::from_value::<JiraUser>(v.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(JiraWatcherList {
+            watchers,
+            watch_count,
+        })
+    }
+
+    /// Adds a user as a watcher on a JIRA issue.
+    pub async fn add_watcher(&self, key: &str, account_id: &str) -> Result<()> {
+        let url = format!("{}/rest/api/3/issue/{}/watchers", self.instance_url, key);
+
+        let body = serde_json::json!(account_id);
+
+        let response = self.post_json(&url, &body).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        Ok(())
+    }
+
+    /// Removes a user from watchers on a JIRA issue.
+    pub async fn remove_watcher(&self, key: &str, account_id: &str) -> Result<()> {
+        let url = format!(
+            "{}/rest/api/3/issue/{}/watchers?accountId={}",
+            self.instance_url, key, account_id
+        );
 
         let response = self.delete(&url).await?;
 
