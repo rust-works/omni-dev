@@ -3136,8 +3136,25 @@ fn render_list_item_content(item: &AdfNode, output: &mut String, opts: &RenderOp
             .iter()
             .position(|c| !is_inline_node_type(&c.node_type))
             .unwrap_or(content.len());
+        let mut buf = String::new();
         for child in &content[..rest_start] {
-            render_inline_node(child, output, opts);
+            render_inline_node(child, &mut buf, opts);
+        }
+        // Indent continuation lines produced by hardBreaks so they stay
+        // within the list item when re-parsed (issue #521).
+        let buf = buf.trim_end_matches('\n');
+        let mut is_first_line = true;
+        for line in buf.split('\n') {
+            if is_first_line {
+                output.push_str(line);
+                is_first_line = false;
+            } else {
+                output.push('\n');
+                if !line.is_empty() {
+                    output.push_str("  ");
+                }
+                output.push_str(line);
+            }
         }
         // No paragraph wrapper — pass a bare node so paraLocalId is omitted.
         let bare = AdfNode::text("");
@@ -10087,6 +10104,89 @@ mod tests {
             let inlines = para.content.as_ref().unwrap();
             assert_eq!(inlines[1].node_type, "hardBreak");
         }
+    }
+
+    /// Issue #521: sibling taskItems with numeric localIds and hardBreak —
+    /// unwrapped inline content.  The hardBreak continuation line must be
+    /// indented so it stays within the list item, and both localIds must
+    /// survive the round-trip.
+    #[test]
+    fn task_item_sibling_localid_hardbreak_unwrapped_roundtrip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"taskList","attrs":{"localId":""},"content":[{"type":"taskItem","attrs":{"localId":"42","state":"DONE"},"content":[{"type":"text","text":"link text","marks":[{"type":"link","attrs":{"href":"https://example.com/page"}}]},{"type":"hardBreak"},{"type":"text","text":"(parenthetical note after hard break)"}]},{"type":"taskItem","attrs":{"localId":"69","state":"DONE"},"content":[{"type":"text","text":"second task item"}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        // Continuation line must be indented
+        assert!(
+            md.contains("  (parenthetical"),
+            "continuation line should be 2-space indented: {md}"
+        );
+        assert!(md.contains("localId=42"), "localId=42 missing: {md}");
+        assert!(md.contains("localId=69"), "localId=69 missing: {md}");
+        let rt = markdown_to_adf(&md).unwrap();
+        // Must remain a single taskList with 2 items
+        assert_eq!(
+            rt.content.len(),
+            1,
+            "should be one taskList: {:#?}",
+            rt.content
+        );
+        assert_eq!(rt.content[0].node_type, "taskList");
+        let items = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 2, "should have 2 taskItems");
+        assert_eq!(items[0].attrs.as_ref().unwrap()["localId"], "42");
+        assert_eq!(items[1].attrs.as_ref().unwrap()["localId"], "69");
+        // Verify first item has hardBreak
+        let first_content = items[0].content.as_ref().unwrap();
+        assert!(
+            first_content.iter().any(|n| n.node_type == "hardBreak"),
+            "first item should contain hardBreak"
+        );
+        // Verify second item content
+        let second_content = items[1].content.as_ref().unwrap();
+        assert_eq!(second_content[0].node_type, "text");
+        assert_eq!(
+            second_content[0].text.as_deref().unwrap(),
+            "second task item"
+        );
+    }
+
+    /// Issue #521: sibling taskItems with paragraph-wrapped content and
+    /// hardBreak — localIds must not be swapped or lost.
+    #[test]
+    fn task_item_sibling_localid_hardbreak_paragraph_roundtrip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"taskList","attrs":{"localId":""},"content":[{"type":"taskItem","attrs":{"localId":"42","state":"DONE"},"content":[{"type":"paragraph","content":[{"type":"text","text":"link text","marks":[{"type":"link","attrs":{"href":"https://example.com/page"}}]},{"type":"hardBreak"},{"type":"text","text":"(parenthetical note after hard break)"}]}]},{"type":"taskItem","attrs":{"localId":"69","state":"DONE"},"content":[{"type":"paragraph","content":[{"type":"text","text":"second task item"}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        assert_eq!(
+            rt.content.len(),
+            1,
+            "should be one taskList: {:#?}",
+            rt.content
+        );
+        let items = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].attrs.as_ref().unwrap()["localId"], "42");
+        assert_eq!(items[1].attrs.as_ref().unwrap()["localId"], "69");
+    }
+
+    /// Issue #521: three sibling taskItems — the middle one has a hardBreak.
+    /// Ensures localIds don't leak between adjacent items.
+    #[test]
+    fn task_item_three_siblings_middle_hardbreak_roundtrip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"taskList","attrs":{"localId":""},"content":[{"type":"taskItem","attrs":{"localId":"10","state":"TODO"},"content":[{"type":"text","text":"first"}]},{"type":"taskItem","attrs":{"localId":"20","state":"DONE"},"content":[{"type":"text","text":"alpha"},{"type":"hardBreak"},{"type":"text","text":"beta"}]},{"type":"taskItem","attrs":{"localId":"30","state":"TODO"},"content":[{"type":"text","text":"third"}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        assert_eq!(rt.content.len(), 1);
+        let items = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].attrs.as_ref().unwrap()["localId"], "10");
+        assert_eq!(items[1].attrs.as_ref().unwrap()["localId"], "20");
+        assert_eq!(items[2].attrs.as_ref().unwrap()["localId"], "30");
+        // Middle item should have hardBreak
+        let mid_content = items[1].content.as_ref().unwrap();
+        assert!(mid_content.iter().any(|n| n.node_type == "hardBreak"));
     }
 
     /// Issue #447: regression — taskList with empty localId must not inject
