@@ -705,6 +705,7 @@ impl<'a> MarkdownParser<'a> {
                     continue;
                 }
                 if d.name == "caption" {
+                    let dir_attrs = d.attrs.clone();
                     i += 1;
                     let mut caption_lines = Vec::new();
                     while i < lines.len() {
@@ -717,7 +718,9 @@ impl<'a> MarkdownParser<'a> {
                     }
                     let caption_text = caption_lines.join("\n");
                     let inline_nodes = parse_inline(&caption_text);
-                    rows.push(AdfNode::caption(inline_nodes));
+                    let mut caption = AdfNode::caption(inline_nodes);
+                    pass_through_local_id(&dir_attrs, &mut caption);
+                    rows.push(caption);
                     continue;
                 }
             }
@@ -913,6 +916,7 @@ impl<'a> MarkdownParser<'a> {
         if !self.at_end() {
             if let Some((d, _)) = try_parse_container_open(self.current_line()) {
                 if d.name == "caption" {
+                    let dir_attrs = d.attrs;
                     self.advance(); // past :::caption
                     let mut caption_lines = Vec::new();
                     while !self.at_end() {
@@ -925,8 +929,10 @@ impl<'a> MarkdownParser<'a> {
                     }
                     let caption_text = caption_lines.join("\n");
                     let inline_nodes = parse_inline(&caption_text);
+                    let mut caption = AdfNode::caption(inline_nodes);
+                    pass_through_local_id(&dir_attrs, &mut caption);
                     if let Some(ref mut content) = node.content {
-                        content.push(AdfNode::caption(inline_nodes));
+                        content.push(caption);
                     }
                 }
             }
@@ -2794,7 +2800,15 @@ fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) 
                 }
                 for child in content {
                     if child.node_type == "caption" {
-                        output.push_str(":::caption\n");
+                        let mut cap_parts = Vec::new();
+                        if let Some(ref attrs) = child.attrs {
+                            maybe_push_local_id(attrs, &mut cap_parts, opts);
+                        }
+                        if cap_parts.is_empty() {
+                            output.push_str(":::caption\n");
+                        } else {
+                            output.push_str(&format!(":::caption{{{}}}\n", cap_parts.join(" ")));
+                        }
                         if let Some(ref caption_content) = child.content {
                             for inline in caption_content {
                                 render_inline_node(inline, output, opts);
@@ -3449,7 +3463,15 @@ fn render_directive_table(
 
     for row in rows {
         if row.node_type == "caption" {
-            output.push_str(":::caption\n");
+            let mut cap_parts = Vec::new();
+            if let Some(ref attrs) = row.attrs {
+                maybe_push_local_id(attrs, &mut cap_parts, opts);
+            }
+            if cap_parts.is_empty() {
+                output.push_str(":::caption\n");
+            } else {
+                output.push_str(&format!(":::caption{{{}}}\n", cap_parts.join(" ")));
+            }
             if let Some(ref content) = row.content {
                 for child in content {
                     render_inline_node(child, output, opts);
@@ -12694,6 +12716,57 @@ mod tests {
         assert_eq!(caption_text[0].text.as_deref(), Some("Image description"));
     }
 
+    // ── mediaSingle caption localId tests (issue #524) ─────────────────
+
+    #[test]
+    fn media_single_caption_localid_roundtrip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"mediaSingle","attrs":{"layout":"center"},"content":[{"type":"media","attrs":{"id":"aabbccdd-1234-5678-abcd-000000000001","type":"file","collection":"test-collection"}},{"type":"caption","attrs":{"localId":"9da8c2104471"},"content":[{"type":"text","text":"a caption with hex localId"}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("localId=9da8c2104471"),
+            "caption localId should appear in markdown: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let content = rt.content[0].content.as_ref().unwrap();
+        let caption = &content[1];
+        assert_eq!(caption.node_type, "caption");
+        assert_eq!(
+            caption.attrs.as_ref().unwrap()["localId"],
+            "9da8c2104471",
+            "caption localId should round-trip"
+        );
+    }
+
+    #[test]
+    fn media_single_caption_without_localid() {
+        let md = "![Screenshot](){type=file id=abc-123 collection=contentId-456 height=600 width=800}\n:::caption\nPlain caption\n:::\n";
+        let doc = markdown_to_adf(md).unwrap();
+        let caption = &doc.content[0].content.as_ref().unwrap()[1];
+        assert_eq!(caption.node_type, "caption");
+        assert!(
+            caption.attrs.is_none(),
+            "caption without localId should not gain attrs"
+        );
+        let md2 = adf_to_markdown(&doc).unwrap();
+        assert!(
+            !md2.contains("localId"),
+            "no localId should appear in output: {md2}"
+        );
+    }
+
+    #[test]
+    fn media_single_caption_localid_stripped_when_option_set() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"mediaSingle","attrs":{"layout":"center"},"content":[{"type":"media","attrs":{"id":"aabbccdd-1234-5678-abcd-000000000001","type":"file","collection":"test-collection"}},{"type":"caption","attrs":{"localId":"9da8c2104471"},"content":[{"type":"text","text":"stripped caption"}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let opts = RenderOptions {
+            strip_local_ids: true,
+            ..Default::default()
+        };
+        let md = adf_to_markdown_with_options(&doc, &opts).unwrap();
+        assert!(!md.contains("localId"), "localId should be stripped: {md}");
+    }
+
     #[test]
     fn table_width_roundtrip() {
         // ADF table with width attribute
@@ -14438,6 +14511,72 @@ C
                 .is_some_and(|m| m.iter().any(|mk| mk.mark_type == "strong"))
         });
         assert!(bold_node.is_some(), "bold mark lost in caption round-trip");
+    }
+
+    // ── table caption localId tests (issue #524) ──────────────────────
+
+    #[test]
+    fn table_caption_localid_roundtrip() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"table","attrs":{"isNumberColumnEnabled":false,"layout":"default"},"content":[
+          {"type":"tableRow","content":[{"type":"tableCell","attrs":{},"content":[{"type":"paragraph","content":[{"type":"text","text":"cell"}]}]}]},
+          {"type":"caption","attrs":{"localId":"abcdef123456"},"content":[{"type":"text","text":"Table with localId"}]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("localId=abcdef123456"),
+            "table caption localId should appear in markdown: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let caption = rt.content[0]
+            .content
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|n| n.node_type == "caption")
+            .expect("caption should survive round-trip");
+        assert_eq!(
+            caption.attrs.as_ref().unwrap()["localId"],
+            "abcdef123456",
+            "table caption localId should round-trip"
+        );
+    }
+
+    #[test]
+    fn table_caption_without_localid_unchanged() {
+        let md = "::::table\n:::tr\n:::td\ncell\n:::\n:::\n:::caption\nPlain caption\n:::\n::::\n";
+        let doc = markdown_to_adf(md).unwrap();
+        let caption = doc.content[0]
+            .content
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|n| n.node_type == "caption")
+            .unwrap();
+        assert!(
+            caption.attrs.is_none(),
+            "table caption without localId should not gain attrs"
+        );
+        let md2 = adf_to_markdown(&doc).unwrap();
+        assert!(!md2.contains("localId"), "no localId should appear: {md2}");
+    }
+
+    #[test]
+    fn table_caption_localid_stripped_when_option_set() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"table","attrs":{"isNumberColumnEnabled":false,"layout":"default"},"content":[
+          {"type":"tableRow","content":[{"type":"tableCell","attrs":{},"content":[{"type":"paragraph","content":[{"type":"text","text":"cell"}]}]}]},
+          {"type":"caption","attrs":{"localId":"abcdef123456"},"content":[{"type":"text","text":"Stripped"}]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let opts = RenderOptions {
+            strip_local_ids: true,
+            ..Default::default()
+        };
+        let md = adf_to_markdown_with_options(&doc, &opts).unwrap();
+        assert!(
+            !md.contains("localId"),
+            "table caption localId should be stripped: {md}"
+        );
     }
 
     #[test]
