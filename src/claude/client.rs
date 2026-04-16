@@ -1500,18 +1500,12 @@ pub fn create_default_claude_client(
     use crate::utils::settings::{get_env_var, get_env_vars};
 
     // Check if we should use OpenAI-compatible API (OpenAI or Ollama)
-    let use_openai = get_env_var("USE_OPENAI")
-        .map(|val| val == "true")
-        .unwrap_or(false);
+    let use_openai = get_env_var("USE_OPENAI").is_ok_and(|val| val == "true");
 
-    let use_ollama = get_env_var("USE_OLLAMA")
-        .map(|val| val == "true")
-        .unwrap_or(false);
+    let use_ollama = get_env_var("USE_OLLAMA").is_ok_and(|val| val == "true");
 
     // Check if we should use Bedrock
-    let use_bedrock = get_env_var("CLAUDE_CODE_USE_BEDROCK")
-        .map(|val| val == "true")
-        .unwrap_or(false);
+    let use_bedrock = get_env_var("CLAUDE_CODE_USE_BEDROCK").is_ok_and(|val| val == "true");
 
     debug!(
         use_openai = use_openai,

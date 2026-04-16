@@ -53,12 +53,12 @@ impl ListCommand {
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
         let api = ConfluenceApi::new(client);
-        execute_list(&api, &self.id, &self.output).await
+        run_list(&api, &self.id, &self.output).await
     }
 }
 
 /// Fetches and displays labels for a page.
-async fn execute_list(api: &ConfluenceApi, id: &str, output: &OutputFormat) -> Result<()> {
+async fn run_list(api: &ConfluenceApi, id: &str, output: &OutputFormat) -> Result<()> {
     let labels = api.get_labels(id).await?;
     display_labels(&labels, output)
 }
@@ -88,12 +88,12 @@ impl AddCommand {
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
         let api = ConfluenceApi::new(client);
-        execute_add(&api, &self.id, &self.labels).await
+        run_add(&api, &self.id, &self.labels).await
     }
 }
 
 /// Adds labels to a page and prints confirmation.
-async fn execute_add(api: &ConfluenceApi, id: &str, labels: &[String]) -> Result<()> {
+async fn run_add(api: &ConfluenceApi, id: &str, labels: &[String]) -> Result<()> {
     api.add_labels(id, labels).await?;
     print_add_confirmation(labels.len(), id);
     Ok(())
@@ -120,12 +120,12 @@ impl RemoveCommand {
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
         let api = ConfluenceApi::new(client);
-        execute_remove(&api, &self.id, &self.labels).await
+        run_remove(&api, &self.id, &self.labels).await
     }
 }
 
 /// Removes labels from a page and prints confirmation.
-async fn execute_remove(api: &ConfluenceApi, id: &str, labels: &[String]) -> Result<()> {
+async fn run_remove(api: &ConfluenceApi, id: &str, labels: &[String]) -> Result<()> {
     for label in labels {
         api.remove_label(id, label).await?;
     }
@@ -287,10 +287,10 @@ mod tests {
         print_remove_confirmation(2, "12345");
     }
 
-    // ── execute_list (wiremock) ──────────────────────────────────
+    // ── run_list (wiremock) ──────────────────────────────────
 
     #[tokio::test]
-    async fn execute_list_table_output() {
+    async fn run_list_table_output() {
         let server = wiremock::MockServer::start().await;
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -311,13 +311,11 @@ mod tests {
             crate::atlassian::client::AtlassianClient::new(&server.uri(), "u@t.com", "tok")
                 .unwrap();
         let api = ConfluenceApi::new(client);
-        assert!(execute_list(&api, "12345", &OutputFormat::Table)
-            .await
-            .is_ok());
+        assert!(run_list(&api, "12345", &OutputFormat::Table).await.is_ok());
     }
 
     #[tokio::test]
-    async fn execute_list_json_output() {
+    async fn run_list_json_output() {
         let server = wiremock::MockServer::start().await;
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -337,15 +335,13 @@ mod tests {
             crate::atlassian::client::AtlassianClient::new(&server.uri(), "u@t.com", "tok")
                 .unwrap();
         let api = ConfluenceApi::new(client);
-        assert!(execute_list(&api, "12345", &OutputFormat::Json)
-            .await
-            .is_ok());
+        assert!(run_list(&api, "12345", &OutputFormat::Json).await.is_ok());
     }
 
-    // ── execute_add (wiremock) ────────────────────────────────────
+    // ── run_add (wiremock) ────────────────────────────────────
 
     #[tokio::test]
-    async fn execute_add_success() {
+    async fn run_add_success() {
         let server = wiremock::MockServer::start().await;
 
         wiremock::Mock::given(wiremock::matchers::method("POST"))
@@ -365,15 +361,13 @@ mod tests {
             crate::atlassian::client::AtlassianClient::new(&server.uri(), "u@t.com", "tok")
                 .unwrap();
         let api = ConfluenceApi::new(client);
-        assert!(execute_add(&api, "12345", &["arch".to_string()])
-            .await
-            .is_ok());
+        assert!(run_add(&api, "12345", &["arch".to_string()]).await.is_ok());
     }
 
-    // ── execute_remove (wiremock) ─────────────────────────────────
+    // ── run_remove (wiremock) ─────────────────────────────────
 
     #[tokio::test]
-    async fn execute_remove_success() {
+    async fn run_remove_success() {
         let server = wiremock::MockServer::start().await;
 
         wiremock::Mock::given(wiremock::matchers::method("DELETE"))
@@ -389,13 +383,13 @@ mod tests {
             crate::atlassian::client::AtlassianClient::new(&server.uri(), "u@t.com", "tok")
                 .unwrap();
         let api = ConfluenceApi::new(client);
-        assert!(execute_remove(&api, "12345", &["draft".to_string()])
+        assert!(run_remove(&api, "12345", &["draft".to_string()])
             .await
             .is_ok());
     }
 
     #[tokio::test]
-    async fn execute_remove_multiple() {
+    async fn run_remove_multiple() {
         let server = wiremock::MockServer::start().await;
 
         for label in &["draft", "old"] {
@@ -414,7 +408,7 @@ mod tests {
                 .unwrap();
         let api = ConfluenceApi::new(client);
         assert!(
-            execute_remove(&api, "12345", &["draft".to_string(), "old".to_string()])
+            run_remove(&api, "12345", &["draft".to_string(), "old".to_string()])
                 .await
                 .is_ok()
         );

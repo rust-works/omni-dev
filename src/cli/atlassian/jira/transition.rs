@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::Parser;
 
-use crate::atlassian::client::JiraTransition;
+use crate::atlassian::client::{AtlassianClient, JiraTransition};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -29,23 +29,41 @@ impl TransitionCommand {
     /// Executes the transition command.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        let transitions = client.get_transitions(&self.key).await?;
-
-        let Some(target) = self.transition.as_deref().filter(|_| !self.list) else {
-            if output_as(&transitions, &self.output)? {
-                return Ok(());
-            }
-            print_transitions(&transitions);
-            return Ok(());
-        };
-
-        let matched = resolve_transition(target, &transitions)?;
-
-        client.do_transition(&self.key, &matched.id).await?;
-        println!("Transitioned {} to \"{}\".", self.key, matched.name);
-
-        Ok(())
+        run_transition(
+            &client,
+            &self.key,
+            self.transition.as_deref(),
+            self.list,
+            &self.output,
+        )
+        .await
     }
+}
+
+/// Lists or executes a transition on an issue.
+async fn run_transition(
+    client: &AtlassianClient,
+    key: &str,
+    transition: Option<&str>,
+    list: bool,
+    output: &OutputFormat,
+) -> Result<()> {
+    let transitions = client.get_transitions(key).await?;
+
+    let Some(target) = transition.filter(|_| !list) else {
+        if output_as(&transitions, output)? {
+            return Ok(());
+        }
+        print_transitions(&transitions);
+        return Ok(());
+    };
+
+    let matched = resolve_transition(target, &transitions)?;
+
+    client.do_transition(key, &matched.id).await?;
+    println!("Transitioned {key} to \"{}\".", matched.name);
+
+    Ok(())
 }
 
 /// Resolves a transition by exact ID or case-insensitive name match.
@@ -226,6 +244,127 @@ mod tests {
     #[test]
     fn print_transitions_empty() {
         print_transitions(&[]);
+    }
+
+    // ── run_transition (wiremock) ────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_transition_list_mode() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/transitions",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "transitions": [
+                        {"id": "11", "name": "In Progress"},
+                        {"id": "21", "name": "Done"}
+                    ]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "u@t.com", "tok")
+                .unwrap();
+        assert!(
+            run_transition(&client, "PROJ-1", None, true, &OutputFormat::Table)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_transition_execute_by_name() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/transitions",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "transitions": [
+                        {"id": "11", "name": "In Progress"},
+                        {"id": "21", "name": "Done"}
+                    ]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/transitions",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "u@t.com", "tok")
+                .unwrap();
+        assert!(
+            run_transition(&client, "PROJ-1", Some("Done"), false, &OutputFormat::Table)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_transition_resolve_not_found() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/transitions",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "transitions": [{"id": "11", "name": "In Progress"}]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "u@t.com", "tok")
+                .unwrap();
+        let err = run_transition(
+            &client,
+            "PROJ-1",
+            Some("Nonexistent"),
+            false,
+            &OutputFormat::Table,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("No transition matching"));
+    }
+
+    #[tokio::test]
+    async fn run_transition_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/NOPE-1/transitions",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "u@t.com", "tok")
+                .unwrap();
+        let err = run_transition(&client, "NOPE-1", None, true, &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
     }
 
     // ── TransitionCommand struct ───────────────────────────────────

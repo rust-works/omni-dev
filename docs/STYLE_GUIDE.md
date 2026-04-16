@@ -1244,43 +1244,65 @@ HTTP layer uncovered, which CI coverage checks will flag as a patch coverage gap
 
 ### Situation
 
-Adding a new CLI command in `src/cli/atlassian/jira/`.
+Adding or modifying a CLI command in `src/cli/atlassian/`.
 
 ### Guidance
 
-Do not put business logic directly inside `execute` methods that call `create_client()`.
-Instead, extract the core logic into a standalone `run_*` function that accepts an
-`&AtlassianClient` (and any other needed parameters) and have `execute` delegate to it:
+`create_client()` reads credentials from the environment, making any code after it
+unreachable in unit tests. When an `execute` method contains **non-trivial logic** beyond
+`create_client()`, extract that logic into a standalone `run_*` function that accepts an
+`&AtlassianClient` (or the relevant API wrapper) so it can be tested with wiremock.
+
+**Extract when** the `execute` body contains any of:
+
+- Multi-step orchestration (e.g., fetch → resolve → mutate → confirm).
+- Branching or validation on user input (e.g., resolving a transition by name/ID,
+  parsing and validating issue keys, confirmation prompts).
+- Logic that combines results from multiple API calls.
+
+```rust
+impl TransitionCommand {
+    pub async fn execute(self) -> Result<()> {
+        let (client, _instance_url) = create_client()?;
+        run_transition(&client, &self.key, self.transition.as_deref(), self.list, &self.output).await
+    }
+}
+
+async fn run_transition(
+    client: &AtlassianClient, key: &str, transition: Option<&str>, list: bool, output: &OutputFormat,
+) -> Result<()> {
+    let transitions = client.get_transitions(key).await?;
+    // ... resolve, execute, print ...
+}
+```
+
+Write tests for `run_*` functions covering the success path, structured output formats
+(JSON/YAML), and API error propagation.
+
+**Do not extract when** `execute` is a trivial pipeline — a single API call fed directly
+into `output_as` / print with no branching or validation:
 
 ```rust
 impl ListCommand {
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        run_list(&client, &self.key, &self.output).await
+        let result = client.get_projects(self.limit).await?;
+        if output_as(&result, &self.output)? {
+            return Ok(());
+        }
+        print_projects(&result);
+        Ok(())
     }
-}
-
-async fn run_list(client: &AtlassianClient, key: &str, output: &OutputFormat) -> Result<()> {
-    let result = client.get_watchers(key).await?;
-    if output_as(&result, output)? {
-        return Ok(());
-    }
-    print_watchers(&result);
-    Ok(())
 }
 ```
 
-The `run_*` functions are testable against a `wiremock::MockServer` by constructing an
-`AtlassianClient` pointed at the mock server. Write tests covering the success path,
-structured output formats (JSON/YAML), and API error propagation.
-
-The thin `execute` wrapper (just `create_client()` + delegation) is the only untestable
-code and should remain minimal.
+Here the client method itself should have wiremock tests (per STYLE-0024), and extraction
+would add indirection without catching additional bugs. Inline is fine.
 
 ### Motivation
 
-`create_client()` reads credentials from the environment, making any code after it
-unreachable in unit tests. Extracting `run_*` functions moves all testable logic —
-API calls, response handling, output formatting — behind an injectable dependency.
-This avoids patch coverage gaps that would otherwise require integration tests or
-environment mocking to close.
+The goal is **testability of logic that can break**, not mechanical conformance. Extracting
+a trivial pipeline adds a function boundary and a signature to maintain without delivering
+new test coverage beyond what STYLE-0024 client tests already provide. Reserving extraction
+for commands with real orchestration or validation keeps the codebase lean while ensuring
+the code most likely to harbour bugs is covered.
