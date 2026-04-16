@@ -104,6 +104,55 @@ pub struct ChildPage {
     pub title: String,
 }
 
+// ── Comment types ─────────────────────────────────────────────────
+
+/// A comment on a Confluence page.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfluenceComment {
+    /// Comment ID.
+    pub id: String,
+    /// Author display name.
+    pub author: String,
+    /// Comment body as raw ADF JSON.
+    pub body_adf: Option<serde_json::Value>,
+    /// ISO 8601 creation timestamp.
+    pub created: String,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceCommentsResponse {
+    results: Vec<ConfluenceCommentEntry>,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceCommentEntry {
+    id: String,
+    #[serde(default)]
+    version: Option<ConfluenceCommentVersion>,
+    #[serde(default)]
+    body: Option<ConfluenceCommentBody>,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceCommentVersion {
+    #[serde(rename = "authorId", default)]
+    author_id: Option<String>,
+    #[serde(rename = "createdAt", default)]
+    created_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceCommentBody {
+    atlas_doc_format: Option<ConfluenceAtlasDoc>,
+}
+
+#[derive(Serialize)]
+struct ConfluenceAddCommentRequest {
+    #[serde(rename = "pageId")]
+    page_id: String,
+    body: ConfluenceUpdateBody,
+}
+
 // ── Create request ─────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -444,6 +493,85 @@ impl ConfluenceApi {
         }
 
         Ok(all_children)
+    }
+
+    /// Lists footer comments on a Confluence page.
+    pub async fn get_page_comments(&self, page_id: &str) -> Result<Vec<ConfluenceComment>> {
+        let url = format!(
+            "{}/wiki/api/v2/pages/{}/footer-comments?body-format=atlas_doc_format",
+            self.client.instance_url(),
+            page_id
+        );
+
+        let response = self
+            .client
+            .get_json(&url)
+            .await
+            .context("Failed to fetch Confluence page comments")?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let resp: ConfluenceCommentsResponse = response
+            .json()
+            .await
+            .context("Failed to parse Confluence comments response")?;
+
+        Ok(resp
+            .results
+            .into_iter()
+            .map(|c| {
+                let body_adf = c.body.and_then(|b| {
+                    b.atlas_doc_format
+                        .and_then(|a| serde_json::from_str(&a.value).ok())
+                });
+                let author = c
+                    .version
+                    .as_ref()
+                    .and_then(|v| v.author_id.clone())
+                    .unwrap_or_default();
+                let created = c.version.and_then(|v| v.created_at).unwrap_or_default();
+                ConfluenceComment {
+                    id: c.id,
+                    author,
+                    body_adf,
+                    created,
+                }
+            })
+            .collect())
+    }
+
+    /// Adds a footer comment to a Confluence page.
+    pub async fn add_page_comment(&self, page_id: &str, body_adf: &AdfDocument) -> Result<()> {
+        let adf_json =
+            serde_json::to_string(body_adf).context("Failed to serialize ADF document")?;
+
+        let request = ConfluenceAddCommentRequest {
+            page_id: page_id.to_string(),
+            body: ConfluenceUpdateBody {
+                representation: "atlas_doc_format".to_string(),
+                value: adf_json,
+            },
+        };
+
+        let url = format!("{}/wiki/api/v2/footer-comments", self.client.instance_url());
+
+        let response = self
+            .client
+            .post_json(&url, &request)
+            .await
+            .context("Failed to add Confluence page comment")?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        Ok(())
     }
 
     /// Resolves a space ID to a space key via the Confluence API.
@@ -1062,5 +1190,209 @@ mod tests {
         let key = api.resolve_space_key("unknown").await.unwrap();
         // Falls back to the space ID when lookup fails
         assert_eq!(key, "unknown");
+    }
+
+    // ── get_page_comments ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_page_comments_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/footer-comments",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {
+                            "id": "100",
+                            "version": {
+                                "authorId": "user-abc",
+                                "createdAt": "2026-04-01T10:00:00.000Z"
+                            },
+                            "body": {
+                                "atlas_doc_format": {
+                                    "value": "{\"version\":1,\"type\":\"doc\",\"content\":[]}"
+                                }
+                            }
+                        },
+                        {
+                            "id": "101",
+                            "version": {
+                                "authorId": "user-def",
+                                "createdAt": "2026-04-02T14:00:00.000Z"
+                            }
+                        }
+                    ]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let comments = api.get_page_comments("12345").await.unwrap();
+
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].id, "100");
+        assert_eq!(comments[0].author, "user-abc");
+        assert!(comments[0].body_adf.is_some());
+        assert_eq!(comments[1].id, "101");
+        assert!(comments[1].body_adf.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_page_comments_malformed_adf_body() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/footer-comments",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {
+                            "id": "100",
+                            "version": {
+                                "authorId": "user-abc",
+                                "createdAt": "2026-04-01T10:00:00.000Z"
+                            },
+                            "body": {
+                                "atlas_doc_format": {
+                                    "value": "{ invalid json }"
+                                }
+                            }
+                        }
+                    ]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let comments = api.get_page_comments("12345").await.unwrap();
+
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].id, "100");
+        // Malformed ADF silently becomes None
+        assert!(comments[0].body_adf.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_page_comments_missing_version() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/footer-comments",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {
+                            "id": "100"
+                        }
+                    ]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let comments = api.get_page_comments("12345").await.unwrap();
+
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].author, "");
+        assert_eq!(comments[0].created, "");
+        assert!(comments[0].body_adf.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_page_comments_empty() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/footer-comments",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": []})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let comments = api.get_page_comments("12345").await.unwrap();
+        assert!(comments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_page_comments_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/99999/footer-comments",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = api.get_page_comments("99999").await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    // ── add_page_comment ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn add_page_comment_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/wiki/api/v2/footer-comments"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "200"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let adf = AdfDocument::new();
+        let result = api.add_page_comment("12345", &adf).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn add_page_comment_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/wiki/api/v2/footer-comments"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let adf = AdfDocument::new();
+        let err = api.add_page_comment("12345", &adf).await.unwrap_err();
+        assert!(err.to_string().contains("403"));
     }
 }
