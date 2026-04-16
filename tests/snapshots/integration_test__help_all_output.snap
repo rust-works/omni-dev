@@ -188,6 +188,7 @@ Commands:
   search    Searches Confluence pages using CQL
   create    Creates a new Confluence page
   delete    Deletes a Confluence page
+  label     Manages labels on Confluence pages
   download  Recursively downloads a Confluence page tree
   user      Confluence user operations
   help      Print this message or the help of the given subcommand(s)
@@ -318,6 +319,72 @@ Arguments:
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian confluence label - Manages labels on Confluence pages
+
+Manages labels on Confluence pages
+
+Usage: label <COMMAND>
+
+Commands:
+  list    Lists labels on a Confluence page
+  add     Adds labels to a Confluence page
+  remove  Removes labels from a Confluence page
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian confluence label add - Adds labels to a Confluence page
+
+Adds labels to a Confluence page
+
+Usage: add --labels <LABELS> <ID>
+
+Arguments:
+  <ID>  Confluence page ID (e.g., 12345678)
+
+Options:
+      --labels <LABELS>  Comma-separated list of labels to add
+  -h, --help             Print help
+
+
+================================================================================
+
+omni-dev atlassian confluence label list - Lists labels on a Confluence page
+
+Lists labels on a Confluence page
+
+Usage: list [OPTIONS] <ID>
+
+Arguments:
+  <ID>  Confluence page ID (e.g., 12345678)
+
+Options:
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian confluence label remove - Removes labels from a Confluence page
+
+Removes labels from a Confluence page
+
+Usage: remove --labels <LABELS> <ID>
+
+Arguments:
+  <ID>  Confluence page ID (e.g., 12345678)
+
+Options:
+      --labels <LABELS>  Comma-separated list of labels to remove
+  -h, --help             Print help
 
 
 ================================================================================
