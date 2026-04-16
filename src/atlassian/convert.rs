@@ -1681,9 +1681,11 @@ fn parse_inline(text: &str) -> Vec<AdfNode> {
             '[' => {
                 if let Some((end, link_text, href)) = try_parse_link(text, i) {
                     flush_plain(text, plain_start, i, &mut nodes);
-                    if link_text == href {
-                        // Bare URL link [url](url): emit as text with link mark,
+                    if link_text.starts_with("http://") || link_text.starts_with("https://") {
+                        // URL-as-link-text: emit as text with link mark,
                         // not via parse_inline which would produce an inlineCard.
+                        // Covers both exact matches and trailing-slash mismatches
+                        // (issue #523).
                         nodes.push(AdfNode::text_with_marks(
                             link_text,
                             vec![AdfMark::link(href)],
@@ -7140,6 +7142,23 @@ mod tests {
     }
 
     #[test]
+    fn url_link_text_with_trailing_slash_mismatch_becomes_link_mark() {
+        // Issue #523: [url](url/) where text and href differ only by trailing
+        // slash should produce a text node with link mark, not an inlineCard.
+        let doc =
+            markdown_to_adf("[https://octopz.example.com](https://octopz.example.com/)").unwrap();
+        let node = &doc.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(node.node_type, "text");
+        assert_eq!(node.text.as_deref(), Some("https://octopz.example.com"));
+        let mark = &node.marks.as_ref().unwrap()[0];
+        assert_eq!(mark.mark_type, "link");
+        assert_eq!(
+            mark.attrs.as_ref().unwrap()["href"],
+            "https://octopz.example.com/"
+        );
+    }
+
+    #[test]
     fn named_link_does_not_become_inline_card() {
         // [#4668](url) — text differs from url, stays as a link mark
         let doc = markdown_to_adf("[#4668](https://github.com/org/repo/pull/4668)").unwrap();
@@ -7773,6 +7792,67 @@ mod tests {
             content[0].text.as_deref(),
             Some("https://example.com/some/path/to/resource")
         );
+    }
+
+    #[test]
+    fn url_text_with_link_mark_round_trips_as_text_node() {
+        // Issue #523: A text node whose content is a URL with a link mark
+        // (href differs by trailing slash) must round-trip as text+link,
+        // not become an inlineCard.
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "paragraph",
+                "content": [{
+                    "type": "text",
+                    "text": "https://octopz.example.com",
+                    "marks": [{"type": "link", "attrs": {"href": "https://octopz.example.com/"}}]
+                }]
+            }]
+        }"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        let roundtripped = markdown_to_adf(&jfm).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1, "should be a single node");
+        assert_eq!(content[0].node_type, "text", "must be text, not inlineCard");
+        assert_eq!(
+            content[0].text.as_deref(),
+            Some("https://octopz.example.com")
+        );
+        let mark = &content[0].marks.as_ref().unwrap()[0];
+        assert_eq!(mark.mark_type, "link");
+        assert_eq!(
+            mark.attrs.as_ref().unwrap()["href"],
+            "https://octopz.example.com/"
+        );
+    }
+
+    #[test]
+    fn url_text_with_exact_link_mark_round_trips() {
+        // Variant: text and href are identical (no trailing slash difference).
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "paragraph",
+                "content": [{
+                    "type": "text",
+                    "text": "https://example.com/path",
+                    "marks": [{"type": "link", "attrs": {"href": "https://example.com/path"}}]
+                }]
+            }]
+        }"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        let roundtripped = markdown_to_adf(&jfm).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1, "should be a single node");
+        assert_eq!(content[0].node_type, "text");
+        assert_eq!(content[0].text.as_deref(), Some("https://example.com/path"));
+        let mark = &content[0].marks.as_ref().unwrap()[0];
+        assert_eq!(mark.mark_type, "link");
     }
 
     #[test]
