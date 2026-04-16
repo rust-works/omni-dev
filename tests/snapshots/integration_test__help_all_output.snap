@@ -394,6 +394,7 @@ Commands:
   link        Manages JIRA issue links
   changelog   Shows change history for JIRA issues
   attachment  Downloads JIRA issue attachments
+  watcher     Manages watchers on a JIRA issue
   worklog     Manages worklogs (time tracking) on a JIRA issue
   help        Print this message or the help of the given subcommand(s)
 
@@ -956,6 +957,72 @@ Options:
       --list             Lists available transitions (same as omitting the transition argument)
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian jira watcher - Manages watchers on a JIRA issue
+
+Manages watchers on a JIRA issue
+
+Usage: watcher <COMMAND>
+
+Commands:
+  list    Lists current watchers on an issue
+  add     Adds a user as a watcher on an issue
+  remove  Removes a user from watchers on an issue
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian jira watcher add - Adds a user as a watcher on an issue
+
+Adds a user as a watcher on an issue
+
+Usage: add --user <USER> <KEY>
+
+Arguments:
+  <KEY>  Issue key (e.g., "PROJ-123")
+
+Options:
+      --user <USER>  Account ID of the user to add
+  -h, --help         Print help
+
+
+================================================================================
+
+omni-dev atlassian jira watcher list - Lists current watchers on an issue
+
+Lists current watchers on an issue
+
+Usage: list [OPTIONS] <KEY>
+
+Arguments:
+  <KEY>  Issue key (e.g., "PROJ-123")
+
+Options:
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian jira watcher remove - Removes a user from watchers on an issue
+
+Removes a user from watchers on an issue
+
+Usage: remove --user <USER> <KEY>
+
+Arguments:
+  <KEY>  Issue key (e.g., "PROJ-123")
+
+Options:
+      --user <USER>  Account ID of the user to remove
+  -h, --help         Print help
 
 
 ================================================================================
