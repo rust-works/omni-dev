@@ -18,6 +18,8 @@ which tags apply to the changes and search this file for those tags. Each rule h
 | Adding or changing error handling                | `error-handling`                         |
 | Creating or restructuring a module/file          | `module-organization`, `naming`          |
 | Writing or updating tests                        | `testing`                                |
+| Adding a new Atlassian API client method         | `testing`, `api-design`                  |
+| Adding a new CLI command                         | `testing`, `module-organization`         |
 | Changing visibility (`pub`, `pub(crate)`)        | `api-design`, `module-organization`      |
 | Adding constants or replacing magic values       | `code-style`, `naming`                   |
 | Writing commit messages                          | `commits`                                |
@@ -1179,3 +1181,106 @@ message against the guidelines in `.omni-dev/commit-guidelines.md`. The skill ca
 Running the twiddle step after commit creation catches scope, casing, and footer
 violations before they reach the remote, avoiding the costly reset-and-redo cycle
 required to rewrite history once a commit has been merged to `main`.
+
+---
+
+## STYLE-0024: Wiremock tests for Atlassian client methods
+
+**Tags:** `testing`, `api-design`
+
+### Situation
+
+Adding a new public method to `AtlassianClient` in `src/atlassian/client.rs`.
+
+### Guidance
+
+Every new public method on `AtlassianClient` must have corresponding `#[tokio::test]`
+tests using `wiremock::MockServer`. At minimum, cover three cases:
+
+1. **Success** — mock the expected HTTP method and path, return a valid response, and
+   assert on the parsed result fields.
+2. **Empty / edge case** — return a valid but minimal response (e.g., empty list, zero
+   count) and assert the method handles it gracefully.
+3. **API error** — return a non-success status code (e.g., 404, 403) and assert the
+   error is propagated with the status code in the message.
+
+Follow the existing test pattern in `client.rs`:
+
+```rust
+#[tokio::test]
+async fn get_watchers_success() {
+    let server = wiremock::MockServer::start().await;
+
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1/watchers"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "watchCount": 1,
+                "watchers": [{"accountId": "abc123", "displayName": "Alice"}]
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+    let result = client.get_watchers("PROJ-1").await.unwrap();
+    assert_eq!(result.watchers.len(), 1);
+}
+```
+
+### Motivation
+
+Client methods are the project's primary integration boundary with the Atlassian REST
+API. Wiremock tests verify request construction (method, path, query params, body) and
+response parsing without hitting a live API. Skipping these tests leaves the entire
+HTTP layer uncovered, which CI coverage checks will flag as a patch coverage gap.
+
+---
+
+## STYLE-0025: Testable CLI execute methods
+
+**Tags:** `testing`, `module-organization`
+
+### Situation
+
+Adding a new CLI command in `src/cli/atlassian/jira/`.
+
+### Guidance
+
+Do not put business logic directly inside `execute` methods that call `create_client()`.
+Instead, extract the core logic into a standalone `run_*` function that accepts an
+`&AtlassianClient` (and any other needed parameters) and have `execute` delegate to it:
+
+```rust
+impl ListCommand {
+    pub async fn execute(self) -> Result<()> {
+        let (client, _instance_url) = create_client()?;
+        run_list(&client, &self.key, &self.output).await
+    }
+}
+
+async fn run_list(client: &AtlassianClient, key: &str, output: &OutputFormat) -> Result<()> {
+    let result = client.get_watchers(key).await?;
+    if output_as(&result, output)? {
+        return Ok(());
+    }
+    print_watchers(&result);
+    Ok(())
+}
+```
+
+The `run_*` functions are testable against a `wiremock::MockServer` by constructing an
+`AtlassianClient` pointed at the mock server. Write tests covering the success path,
+structured output formats (JSON/YAML), and API error propagation.
+
+The thin `execute` wrapper (just `create_client()` + delegation) is the only untestable
+code and should remain minimal.
+
+### Motivation
+
+`create_client()` reads credentials from the environment, making any code after it
+unreachable in unit tests. Extracting `run_*` functions moves all testable logic —
+API calls, response handling, output formatting — behind an injectable dependency.
+This avoids patch coverage gaps that would otherwise require integration tests or
+environment mocking to close.
