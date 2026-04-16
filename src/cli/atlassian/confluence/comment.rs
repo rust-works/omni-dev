@@ -57,13 +57,7 @@ impl ListCommand {
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
         let api = ConfluenceApi::new(client);
-        let mut comments = api.get_page_comments(&self.id).await?;
-        comments.truncate(self.limit);
-        if output_as(&comments, &self.output)? {
-            return Ok(());
-        }
-        print_comments(&comments);
-        Ok(())
+        run_list_comments(&api, &self.id, self.limit, &self.output).await
     }
 }
 
@@ -88,10 +82,7 @@ impl AddCommand {
 
         let (client, _instance_url) = create_client()?;
         let api = ConfluenceApi::new(client);
-        api.add_page_comment(&self.id, &adf).await?;
-
-        println!("Comment added to page {}.", self.id);
-        Ok(())
+        run_add_comment(&api, &self.id, &adf).await
     }
 
     /// Parses the input file into an ADF document.
@@ -114,6 +105,29 @@ impl AddCommand {
             }
         }
     }
+}
+
+/// Fetches and displays comments for a page.
+async fn run_list_comments(
+    api: &ConfluenceApi,
+    id: &str,
+    limit: usize,
+    output: &OutputFormat,
+) -> Result<()> {
+    let mut comments = api.get_page_comments(id).await?;
+    comments.truncate(limit);
+    if output_as(&comments, output)? {
+        return Ok(());
+    }
+    print_comments(&comments);
+    Ok(())
+}
+
+/// Posts a comment to a page.
+async fn run_add_comment(api: &ConfluenceApi, id: &str, adf: &AdfDocument) -> Result<()> {
+    api.add_page_comment(id, adf).await?;
+    println!("Comment added to page {id}.");
+    Ok(())
 }
 
 /// Prints comments in a readable format.

@@ -5,6 +5,7 @@ use std::io::{self, BufRead, Write};
 use anyhow::Result;
 use clap::Parser;
 
+use crate::atlassian::client::AtlassianClient;
 use crate::cli::atlassian::helpers::create_client;
 
 /// Deletes a JIRA issue.
@@ -32,11 +33,15 @@ impl DeleteCommand {
             }
         }
 
-        client.delete_issue(&self.key).await?;
-        println!("Deleted {}.", self.key);
-
-        Ok(())
+        run_delete(&client, &self.key).await
     }
+}
+
+/// Deletes a JIRA issue.
+async fn run_delete(client: &AtlassianClient, key: &str) -> Result<()> {
+    client.delete_issue(key).await?;
+    println!("Deleted {key}.");
+    Ok(())
 }
 
 /// Formats the deletion confirmation prompt.

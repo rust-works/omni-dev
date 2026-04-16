@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::Parser;
 
-use crate::atlassian::client::JiraSearchResult;
+use crate::atlassian::client::{AtlassianClient, JiraSearchResult};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -40,14 +40,7 @@ impl SearchCommand {
     pub async fn execute(self) -> Result<()> {
         let jql = self.build_jql()?;
         let (client, _instance_url) = create_client()?;
-
-        let result = client.search_issues(&jql, self.limit).await?;
-        if output_as(&result, &self.output)? {
-            return Ok(());
-        }
-        print_search_results(&result);
-
-        Ok(())
+        run_search(&client, &jql, self.limit, &self.output).await
     }
 
     /// Builds a JQL query from the provided flags, or returns the raw `--jql` value.
@@ -76,6 +69,21 @@ impl SearchCommand {
 
         Ok(clauses.join(" AND "))
     }
+}
+
+/// Searches issues by JQL and displays results.
+async fn run_search(
+    client: &AtlassianClient,
+    jql: &str,
+    limit: u32,
+    output: &OutputFormat,
+) -> Result<()> {
+    let result = client.search_issues(jql, limit).await?;
+    if output_as(&result, output)? {
+        return Ok(());
+    }
+    print_search_results(&result);
+    Ok(())
 }
 
 /// Prints search results: empty message, table, or table with pagination note.

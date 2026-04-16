@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::atlassian::client::{AgileBoardList, JiraSearchResult};
+use crate::atlassian::client::{AgileBoardList, AtlassianClient, JiraSearchResult};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -58,14 +58,14 @@ impl ListCommand {
     /// Fetches and displays boards.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        let result = client
-            .get_boards(self.project.as_deref(), self.r#type.as_deref(), self.limit)
-            .await?;
-        if output_as(&result, &self.output)? {
-            return Ok(());
-        }
-        print_boards(&result);
-        Ok(())
+        run_list_boards(
+            &client,
+            self.project.as_deref(),
+            self.r#type.as_deref(),
+            self.limit,
+            &self.output,
+        )
+        .await
     }
 }
 
@@ -93,15 +93,47 @@ impl IssuesCommand {
     /// Fetches and displays board issues.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        let result = client
-            .get_board_issues(self.board_id, self.jql.as_deref(), self.limit)
-            .await?;
-        if output_as(&result, &self.output)? {
-            return Ok(());
-        }
-        print_board_issues(&result);
-        Ok(())
+        run_board_issues(
+            &client,
+            self.board_id,
+            self.jql.as_deref(),
+            self.limit,
+            &self.output,
+        )
+        .await
     }
+}
+
+/// Fetches and displays boards.
+async fn run_list_boards(
+    client: &AtlassianClient,
+    project: Option<&str>,
+    board_type: Option<&str>,
+    limit: u32,
+    output: &OutputFormat,
+) -> Result<()> {
+    let result = client.get_boards(project, board_type, limit).await?;
+    if output_as(&result, output)? {
+        return Ok(());
+    }
+    print_boards(&result);
+    Ok(())
+}
+
+/// Fetches and displays issues on a board.
+async fn run_board_issues(
+    client: &AtlassianClient,
+    board_id: u64,
+    jql: Option<&str>,
+    limit: u32,
+    output: &OutputFormat,
+) -> Result<()> {
+    let result = client.get_board_issues(board_id, jql, limit).await?;
+    if output_as(&result, output)? {
+        return Ok(());
+    }
+    print_board_issues(&result);
+    Ok(())
 }
 
 /// Prints boards as a formatted table.
