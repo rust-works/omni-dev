@@ -7,6 +7,7 @@ pub(crate) mod download;
 pub(crate) mod edit;
 pub(crate) mod read;
 pub(crate) mod search;
+pub(crate) mod user;
 pub(crate) mod write;
 
 use anyhow::Result;
@@ -39,6 +40,8 @@ pub enum ConfluenceSubcommands {
     Delete(delete::DeleteCommand),
     /// Recursively downloads a Confluence page tree.
     Download(download::DownloadCommand),
+    /// Confluence user operations.
+    User(user::UserCommand),
 }
 
 impl ConfluenceCommand {
@@ -53,6 +56,7 @@ impl ConfluenceCommand {
             ConfluenceSubcommands::Create(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Delete(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Download(cmd) => cmd.execute().await,
+            ConfluenceSubcommands::User(cmd) => cmd.execute().await,
         }
     }
 }
@@ -151,6 +155,20 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::Delete(_)));
+    }
+
+    #[test]
+    fn confluence_subcommands_user_variant() {
+        let cmd = ConfluenceCommand {
+            command: ConfluenceSubcommands::User(user::UserCommand {
+                command: user::UserSubcommands::Search(user::UserSearchCommand {
+                    query: "alice".to_string(),
+                    limit: 25,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        assert!(matches!(cmd.command, ConfluenceSubcommands::User(_)));
     }
 
     #[test]
