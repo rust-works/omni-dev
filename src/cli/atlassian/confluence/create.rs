@@ -57,18 +57,7 @@ impl CreateCommand {
 
         let (client, _instance_url) = create_client()?;
         let api = ConfluenceApi::new(client);
-
-        let page_id = api
-            .create_page(
-                &params.space,
-                &params.title,
-                &params.adf,
-                params.parent_id.as_deref(),
-            )
-            .await?;
-
-        println!("{page_id}");
-        Ok(())
+        run_create(&api, &params).await
     }
 
     /// Resolves creation parameters from input file and CLI flags.
@@ -137,6 +126,21 @@ impl CreateCommand {
             adf,
         })
     }
+}
+
+/// Creates a Confluence page from resolved parameters.
+async fn run_create(api: &ConfluenceApi, params: &CreateParams) -> Result<()> {
+    let page_id = api
+        .create_page(
+            &params.space,
+            &params.title,
+            &params.adf,
+            params.parent_id.as_deref(),
+        )
+        .await?;
+
+    println!("{page_id}");
+    Ok(())
 }
 
 /// Prints a dry-run summary for page creation.

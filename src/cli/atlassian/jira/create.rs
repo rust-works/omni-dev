@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use crate::atlassian::adf::AdfDocument;
+use crate::atlassian::client::AtlassianClient;
 use crate::atlassian::convert::markdown_to_adf;
 use crate::atlassian::document::{JfmDocument, JfmFrontmatter};
 use crate::cli::atlassian::format::ContentFormat;
@@ -62,18 +63,7 @@ impl CreateCommand {
         }
 
         let (client, _instance_url) = create_client()?;
-        let result = client
-            .create_issue(
-                &params.project,
-                &params.issue_type,
-                &params.summary,
-                Some(&params.adf),
-                &params.labels,
-            )
-            .await?;
-
-        println!("{}", result.key);
-        Ok(())
+        run_create(&client, &params).await
     }
 
     /// Resolves creation parameters from input file and CLI flags.
@@ -161,6 +151,22 @@ impl CreateCommand {
             adf,
         })
     }
+}
+
+/// Creates a JIRA issue from resolved parameters.
+async fn run_create(client: &AtlassianClient, params: &CreateParams) -> Result<()> {
+    let result = client
+        .create_issue(
+            &params.project,
+            &params.issue_type,
+            &params.summary,
+            Some(&params.adf),
+            &params.labels,
+        )
+        .await?;
+
+    println!("{}", result.key);
+    Ok(())
 }
 
 #[cfg(test)]

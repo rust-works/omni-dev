@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::atlassian::client::{JiraField, JiraFieldOption};
+use crate::atlassian::client::{AtlassianClient, JiraField, JiraFieldOption};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -50,13 +50,7 @@ impl ListCommand {
     /// Fetches and displays field definitions.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        let fields = client.get_fields().await?;
-        let filtered = filter_fields(&fields, self.search.as_deref());
-        if output_as(&filtered, &self.output)? {
-            return Ok(());
-        }
-        print_fields(&filtered);
-        Ok(())
+        run_list_fields(&client, self.search.as_deref(), &self.output).await
     }
 }
 
@@ -80,15 +74,44 @@ impl OptionsCommand {
     /// Fetches and displays field options.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        let options = client
-            .get_field_options(&self.field_id, self.context_id.as_deref())
-            .await?;
-        if output_as(&options, &self.output)? {
-            return Ok(());
-        }
-        print_options(&options);
-        Ok(())
+        run_field_options(
+            &client,
+            &self.field_id,
+            self.context_id.as_deref(),
+            &self.output,
+        )
+        .await
     }
+}
+
+/// Fetches, filters, and displays field definitions.
+async fn run_list_fields(
+    client: &AtlassianClient,
+    search: Option<&str>,
+    output: &OutputFormat,
+) -> Result<()> {
+    let fields = client.get_fields().await?;
+    let filtered = filter_fields(&fields, search);
+    if output_as(&filtered, output)? {
+        return Ok(());
+    }
+    print_fields(&filtered);
+    Ok(())
+}
+
+/// Fetches and displays options for a custom field.
+async fn run_field_options(
+    client: &AtlassianClient,
+    field_id: &str,
+    context_id: Option<&str>,
+    output: &OutputFormat,
+) -> Result<()> {
+    let options = client.get_field_options(field_id, context_id).await?;
+    if output_as(&options, output)? {
+        return Ok(());
+    }
+    print_options(&options);
+    Ok(())
 }
 
 /// Filters fields by a case-insensitive substring match on the name.

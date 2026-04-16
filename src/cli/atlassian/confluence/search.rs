@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::Parser;
 
-use crate::atlassian::client::ConfluenceSearchResults;
+use crate::atlassian::client::{AtlassianClient, ConfluenceSearchResults};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -36,14 +36,7 @@ impl SearchCommand {
     pub async fn execute(self) -> Result<()> {
         let cql = self.build_cql()?;
         let (client, _instance_url) = create_client()?;
-
-        let result = client.search_confluence(&cql, self.limit).await?;
-        if output_as(&result, &self.output)? {
-            return Ok(());
-        }
-        print_search_results(&result);
-
-        Ok(())
+        run_confluence_search(&client, &cql, self.limit, &self.output).await
     }
 
     /// Builds a CQL query from the provided flags, or returns the raw `--cql` value.
@@ -69,6 +62,21 @@ impl SearchCommand {
 
         Ok(clauses.join(" AND "))
     }
+}
+
+/// Searches Confluence pages and displays results.
+async fn run_confluence_search(
+    client: &AtlassianClient,
+    cql: &str,
+    limit: u32,
+    output: &OutputFormat,
+) -> Result<()> {
+    let result = client.search_confluence(cql, limit).await?;
+    if output_as(&result, output)? {
+        return Ok(());
+    }
+    print_search_results(&result);
+    Ok(())
 }
 
 /// Prints search results as a formatted table.

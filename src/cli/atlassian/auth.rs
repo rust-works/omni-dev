@@ -83,21 +83,25 @@ impl StatusCommand {
     /// Verifies credentials by calling the JIRA API.
     pub async fn execute(self) -> Result<()> {
         let credentials = auth::load_credentials()?;
-
-        println!("Checking authentication to {}...", credentials.instance_url);
-
         let client = AtlassianClient::from_credentials(&credentials)?;
-        let user = client.get_myself().await?;
-
-        println!("Authenticated as: {}", user.display_name);
-        if let Some(ref email) = user.email_address {
-            println!("Email: {email}");
-        }
-        println!("Account ID: {}", user.account_id);
-        println!("Instance: {}", credentials.instance_url);
-
-        Ok(())
+        run_auth_status(&client, &credentials.instance_url).await
     }
+}
+
+/// Verifies authentication and displays the current user.
+async fn run_auth_status(client: &AtlassianClient, instance_url: &str) -> Result<()> {
+    println!("Checking authentication to {instance_url}...");
+
+    let user = client.get_myself().await?;
+
+    println!("Authenticated as: {}", user.display_name);
+    if let Some(ref email) = user.email_address {
+        println!("Email: {email}");
+    }
+    println!("Account ID: {}", user.account_id);
+    println!("Instance: {instance_url}");
+
+    Ok(())
 }
 
 /// Prompts the user for input on a single line.

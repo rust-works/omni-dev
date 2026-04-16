@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::atlassian::client::JiraProjectList;
+use crate::atlassian::client::{AtlassianClient, JiraProjectList};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -47,13 +47,22 @@ impl ListCommand {
     /// Fetches and displays projects.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        let result = client.get_projects(self.limit).await?;
-        if output_as(&result, &self.output)? {
-            return Ok(());
-        }
-        print_projects(&result);
-        Ok(())
+        run_list_projects(&client, self.limit, &self.output).await
     }
+}
+
+/// Fetches and displays projects.
+async fn run_list_projects(
+    client: &AtlassianClient,
+    limit: u32,
+    output: &OutputFormat,
+) -> Result<()> {
+    let result = client.get_projects(limit).await?;
+    if output_as(&result, output)? {
+        return Ok(());
+    }
+    print_projects(&result);
+    Ok(())
 }
 
 /// Prints projects as a formatted table.

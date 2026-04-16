@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::atlassian::adf::AdfDocument;
-use crate::atlassian::client::JiraComment;
+use crate::atlassian::client::{AtlassianClient, JiraComment};
 use crate::atlassian::convert::{adf_to_markdown, markdown_to_adf};
 use crate::atlassian::document::JfmDocument;
 use crate::cli::atlassian::format::{output_as, ContentFormat, OutputFormat};
@@ -52,12 +52,7 @@ impl ListCommand {
     /// Fetches and displays comments.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        let comments = client.get_comments(&self.key).await?;
-        if output_as(&comments, &self.output)? {
-            return Ok(());
-        }
-        print_comments(&comments);
-        Ok(())
+        run_list_comments(&client, &self.key, &self.output).await
     }
 }
 
@@ -81,10 +76,7 @@ impl AddCommand {
         let adf = self.parse_input()?;
 
         let (client, _instance_url) = create_client()?;
-        client.add_comment(&self.key, &adf).await?;
-
-        println!("Comment added to {}.", self.key);
-        Ok(())
+        run_add_comment(&client, &self.key, &adf).await
     }
 
     /// Parses the input file into an ADF document.
@@ -107,6 +99,27 @@ impl AddCommand {
             }
         }
     }
+}
+
+/// Fetches and displays comments for an issue.
+async fn run_list_comments(
+    client: &AtlassianClient,
+    key: &str,
+    output: &OutputFormat,
+) -> Result<()> {
+    let comments = client.get_comments(key).await?;
+    if output_as(&comments, output)? {
+        return Ok(());
+    }
+    print_comments(&comments);
+    Ok(())
+}
+
+/// Posts a comment to an issue.
+async fn run_add_comment(client: &AtlassianClient, key: &str, adf: &AdfDocument) -> Result<()> {
+    client.add_comment(key, adf).await?;
+    println!("Comment added to {key}.");
+    Ok(())
 }
 
 /// Prints comments in a readable format.

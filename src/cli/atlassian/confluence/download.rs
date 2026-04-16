@@ -130,116 +130,128 @@ impl DownloadCommand {
     pub async fn execute(self) -> Result<()> {
         let (client, instance_url) = create_client()?;
         let api = Arc::new(ConfluenceApi::new(client));
-        let semaphore = Arc::new(Semaphore::new(self.concurrency));
-        let stats = Arc::new(DownloadStats::new());
-        let log_entries: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
-        let manifest_entries: Arc<Mutex<BTreeMap<String, ManifestEntry>>> =
-            Arc::new(Mutex::new(BTreeMap::new()));
+        run_download(
+            &api,
+            &instance_url,
+            &self.id,
+            &self.output_dir,
+            &self.format,
+            self.concurrency,
+            self.max_depth,
+            self.resume,
+            &self.on_conflict,
+        )
+        .await
+    }
+}
 
-        let timestamp = Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
-        let backup_dir = self.output_dir.join(".backups").join(&timestamp);
+/// Recursively downloads a Confluence page tree.
+#[allow(clippy::too_many_arguments)]
+async fn run_download(
+    api: &Arc<ConfluenceApi>,
+    instance_url: &str,
+    id: &str,
+    output_dir: &Path,
+    format: &ContentFormat,
+    concurrency: usize,
+    max_depth: u32,
+    resume: bool,
+    on_conflict: &OnConflict,
+) -> Result<()> {
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let stats = Arc::new(DownloadStats::new());
+    let log_entries: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let manifest_entries: Arc<Mutex<BTreeMap<String, ManifestEntry>>> =
+        Arc::new(Mutex::new(BTreeMap::new()));
 
-        let config = Arc::new(DownloadConfig {
-            ext: file_extension(&self.format),
-            format: self.format,
-            instance_url,
-            on_conflict: self.on_conflict,
-            backup_dir,
-        });
+    let timestamp = Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
+    let backup_dir = output_dir.join(".backups").join(&timestamp);
 
-        // Load existing manifest for resume
-        let old_manifest = if self.resume {
-            load_manifest(&self.output_dir)
-        } else {
-            BTreeMap::new()
-        };
+    let config = Arc::new(DownloadConfig {
+        ext: file_extension(format),
+        format: format.clone(),
+        instance_url: instance_url.to_string(),
+        on_conflict: on_conflict.clone(),
+        backup_dir,
+    });
 
-        // Fetch root page to get its title
-        eprintln!("Fetching root page {}...", self.id);
-        let root = api.get_content(&self.id).await?;
-        let root_slug = slugify(&root.title);
-        let root_dir = self.output_dir.join(format!("{}-{}", root.id, root_slug));
+    // Load existing manifest for resume
+    let old_manifest = if resume {
+        load_manifest(output_dir)
+    } else {
+        BTreeMap::new()
+    };
 
-        let root_parent = match &root.metadata {
-            crate::atlassian::api::ContentMetadata::Confluence { parent_id, .. } => {
-                parent_id.clone()
-            }
-            crate::atlassian::api::ContentMetadata::Jira { .. } => None,
-        };
+    // Fetch root page to get its title
+    eprintln!("Fetching root page {id}...");
+    let root = api.get_content(id).await?;
+    let root_slug = slugify(&root.title);
+    let root_dir = output_dir.join(format!("{}-{}", root.id, root_slug));
 
-        let mut queue: VecDeque<PageTask> = VecDeque::new();
-        queue.push_back(PageTask {
-            id: root.id.clone(),
-            title: root.title.clone(),
-            dir: root_dir,
-            depth: 0,
-            parent_id: root_parent,
-        });
+    let root_parent = match &root.metadata {
+        crate::atlassian::api::ContentMetadata::Confluence { parent_id, .. } => parent_id.clone(),
+        crate::atlassian::api::ContentMetadata::Jira { .. } => None,
+    };
 
-        let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut queue: VecDeque<PageTask> = VecDeque::new();
+    queue.push_back(PageTask {
+        id: root.id.clone(),
+        title: root.title.clone(),
+        dir: root_dir,
+        depth: 0,
+        parent_id: root_parent,
+    });
 
-        while let Some(task) = queue.pop_front() {
-            let relative_path = task
-                .dir
-                .strip_prefix(&self.output_dir)
-                .unwrap_or(&task.dir)
-                .join(format!("index.{}", config.ext))
-                .to_string_lossy()
-                .to_string();
+    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-            // Resume: check manifest for ID-based skip
-            if self.resume {
-                if let Some(entry) = old_manifest.get(&task.id) {
-                    if entry.path == relative_path {
-                        // Same path — skip
-                        stats.skipped.fetch_add(1, Ordering::Relaxed);
-                        eprintln!("  Skipped (resume): {} - {}", task.id, task.title);
-                        log_entries.lock().await.push(LogEntry {
-                            action: "skipped".to_string(),
-                            id: task.id.clone(),
-                            path: relative_path.clone(),
-                            detail: "resume".to_string(),
-                        });
-                        // Still record in new manifest
-                        manifest_entries.lock().await.insert(
-                            task.id.clone(),
-                            ManifestEntry {
-                                title: task.title.clone(),
-                                path: relative_path,
-                                parent_id: task.parent_id.clone(),
-                            },
-                        );
-                        // Still need to discover children
-                    } else {
-                        // Page moved — download to new path (old path becomes orphan)
-                        eprintln!(
-                            "  Moved: {} - {} (was: {})",
-                            task.id, task.title, entry.path
-                        );
-                        log_entries.lock().await.push(LogEntry {
-                            action: "moved".to_string(),
-                            id: task.id.clone(),
-                            path: relative_path.clone(),
-                            detail: format!("was: {}", entry.path),
-                        });
-                        // Fall through to download
-                        spawn_download(
-                            &mut handles,
-                            &api,
-                            &semaphore,
-                            &stats,
-                            &config,
-                            &log_entries,
-                            &manifest_entries,
-                            &task,
-                            &relative_path,
-                        );
-                    }
+    while let Some(task) = queue.pop_front() {
+        let relative_path = task
+            .dir
+            .strip_prefix(output_dir)
+            .unwrap_or(&task.dir)
+            .join(format!("index.{}", config.ext))
+            .to_string_lossy()
+            .to_string();
+
+        // Resume: check manifest for ID-based skip
+        if resume {
+            if let Some(entry) = old_manifest.get(&task.id) {
+                if entry.path == relative_path {
+                    // Same path — skip
+                    stats.skipped.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("  Skipped (resume): {} - {}", task.id, task.title);
+                    log_entries.lock().await.push(LogEntry {
+                        action: "skipped".to_string(),
+                        id: task.id.clone(),
+                        path: relative_path.clone(),
+                        detail: "resume".to_string(),
+                    });
+                    // Still record in new manifest
+                    manifest_entries.lock().await.insert(
+                        task.id.clone(),
+                        ManifestEntry {
+                            title: task.title.clone(),
+                            path: relative_path,
+                            parent_id: task.parent_id.clone(),
+                        },
+                    );
+                    // Still need to discover children
                 } else {
-                    // Not in manifest — new page, download
+                    // Page moved — download to new path (old path becomes orphan)
+                    eprintln!(
+                        "  Moved: {} - {} (was: {})",
+                        task.id, task.title, entry.path
+                    );
+                    log_entries.lock().await.push(LogEntry {
+                        action: "moved".to_string(),
+                        id: task.id.clone(),
+                        path: relative_path.clone(),
+                        detail: format!("was: {}", entry.path),
+                    });
+                    // Fall through to download
                     spawn_download(
                         &mut handles,
-                        &api,
+                        api,
                         &semaphore,
                         &stats,
                         &config,
@@ -250,9 +262,10 @@ impl DownloadCommand {
                     );
                 }
             } else {
+                // Not in manifest — new page, download
                 spawn_download(
                     &mut handles,
-                    &api,
+                    api,
                     &semaphore,
                     &stats,
                     &config,
@@ -262,64 +275,76 @@ impl DownloadCommand {
                     &relative_path,
                 );
             }
-
-            // Fetch children and enqueue (unless at max depth)
-            if self.max_depth > 0 && task.depth >= self.max_depth {
-                continue;
-            }
-
-            match api.get_children(&task.id).await {
-                Ok(children) => {
-                    for child in children {
-                        let child_slug = slugify(&child.title);
-                        let child_dir = task.dir.join(format!("{}-{}", child.id, child_slug));
-                        queue.push_back(PageTask {
-                            id: child.id,
-                            title: child.title,
-                            dir: child_dir,
-                            depth: task.depth + 1,
-                            parent_id: Some(task.id.clone()),
-                        });
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "WARNING: Failed to fetch children of {} ({}): {}",
-                        task.id, task.title, e
-                    );
-                }
-            }
+        } else {
+            spawn_download(
+                &mut handles,
+                api,
+                &semaphore,
+                &stats,
+                &config,
+                &log_entries,
+                &manifest_entries,
+                &task,
+                &relative_path,
+            );
         }
 
-        // Await all download tasks
-        for handle in handles {
-            let _ = handle.await;
+        // Fetch children and enqueue (unless at max depth)
+        if max_depth > 0 && task.depth >= max_depth {
+            continue;
         }
 
-        // Write manifest
-        let manifest = manifest_entries.lock().await;
-        write_manifest(&self.output_dir, &manifest);
+        match api.get_children(&task.id).await {
+            Ok(children) => {
+                for child in children {
+                    let child_slug = slugify(&child.title);
+                    let child_dir = task.dir.join(format!("{}-{}", child.id, child_slug));
+                    queue.push_back(PageTask {
+                        id: child.id,
+                        title: child.title,
+                        dir: child_dir,
+                        depth: task.depth + 1,
+                        parent_id: Some(task.id.clone()),
+                    });
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "WARNING: Failed to fetch children of {} ({}): {}",
+                    task.id, task.title, e
+                );
+            }
+        }
+    }
 
-        // Write log
-        let entries = log_entries.lock().await;
-        write_log(&self.output_dir, &timestamp, &entries, &stats);
+    // Await all download tasks
+    for handle in handles {
+        let _ = handle.await;
+    }
 
-        // Summary
-        let downloaded = stats.downloaded.load(Ordering::Relaxed);
-        let skipped = stats.skipped.load(Ordering::Relaxed);
-        let clobbered = stats.clobbered.load(Ordering::Relaxed);
-        let failed = stats.failed.load(Ordering::Relaxed);
+    // Write manifest
+    let manifest = manifest_entries.lock().await;
+    write_manifest(output_dir, &manifest);
 
-        eprintln!(
+    // Write log
+    let entries = log_entries.lock().await;
+    write_log(output_dir, &timestamp, &entries, &stats);
+
+    // Summary
+    let downloaded = stats.downloaded.load(Ordering::Relaxed);
+    let skipped = stats.skipped.load(Ordering::Relaxed);
+    let clobbered = stats.clobbered.load(Ordering::Relaxed);
+    let failed = stats.failed.load(Ordering::Relaxed);
+
+    eprintln!(
             "\nDone. Downloaded: {downloaded}, Clobbered: {clobbered}, Skipped: {skipped}, Failed: {failed}"
         );
 
-        if failed > 0 {
-            anyhow::bail!("{failed} page(s) failed to download");
-        }
-
-        Ok(())
+    if failed > 0 {
+        anyhow::bail!("{failed} page(s) failed to download");
     }
+
+    Ok(())
 }
 
 /// Spawns a download task for a page.
