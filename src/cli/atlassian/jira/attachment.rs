@@ -6,7 +6,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use crate::atlassian::client::JiraAttachment;
+use crate::atlassian::client::{AtlassianClient, JiraAttachment};
 use crate::cli::atlassian::helpers::create_client;
 
 /// Image MIME types for filtering.
@@ -64,27 +64,33 @@ impl DownloadCommand {
     /// Fetches attachment metadata and downloads matching files.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        let attachments = client.get_attachments(&self.key).await?;
-        let filtered = filter_attachments(&attachments, self.filter.as_deref());
-
-        if filtered.is_empty() {
-            println!("No attachments found.");
-            return Ok(());
-        }
-
-        ensure_dir(&self.output_dir)?;
-
-        for attachment in &filtered {
-            download_file(&client, attachment, &self.output_dir).await?;
-        }
-
-        println!(
-            "Downloaded {} file(s) to {}.",
-            filtered.len(),
-            self.output_dir
-        );
-        Ok(())
+        run_download(&client, &self.key, &self.output_dir, self.filter.as_deref()).await
     }
+}
+
+/// Fetches, filters, and downloads attachments for an issue.
+async fn run_download(
+    client: &AtlassianClient,
+    key: &str,
+    output_dir: &str,
+    filter: Option<&str>,
+) -> Result<()> {
+    let attachments = client.get_attachments(key).await?;
+    let filtered = filter_attachments(&attachments, filter);
+
+    if filtered.is_empty() {
+        println!("No attachments found.");
+        return Ok(());
+    }
+
+    ensure_dir(output_dir)?;
+
+    for attachment in &filtered {
+        download_file(client, attachment, output_dir).await?;
+    }
+
+    println!("Downloaded {} file(s) to {output_dir}.", filtered.len());
+    Ok(())
 }
 
 /// Downloads only image attachments for an issue.
@@ -102,27 +108,28 @@ impl ImagesCommand {
     /// Fetches attachment metadata and downloads image files.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        let attachments = client.get_attachments(&self.key).await?;
-        let images = filter_images(&attachments);
-
-        if images.is_empty() {
-            println!("No image attachments found.");
-            return Ok(());
-        }
-
-        ensure_dir(&self.output_dir)?;
-
-        for attachment in &images {
-            download_file(&client, attachment, &self.output_dir).await?;
-        }
-
-        println!(
-            "Downloaded {} image(s) to {}.",
-            images.len(),
-            self.output_dir
-        );
-        Ok(())
+        run_images(&client, &self.key, &self.output_dir).await
     }
+}
+
+/// Fetches and downloads image attachments for an issue.
+async fn run_images(client: &AtlassianClient, key: &str, output_dir: &str) -> Result<()> {
+    let attachments = client.get_attachments(key).await?;
+    let images = filter_images(&attachments);
+
+    if images.is_empty() {
+        println!("No image attachments found.");
+        return Ok(());
+    }
+
+    ensure_dir(output_dir)?;
+
+    for attachment in &images {
+        download_file(client, attachment, output_dir).await?;
+    }
+
+    println!("Downloaded {} image(s) to {output_dir}.", images.len());
+    Ok(())
 }
 
 /// Filters attachments by a case-insensitive substring match on filename.
@@ -294,6 +301,153 @@ mod tests {
     fn ensure_dir_existing_is_ok() {
         let temp = tempfile::tempdir().unwrap();
         ensure_dir(temp.path().to_str().unwrap()).unwrap();
+    }
+
+    // ── run_download (wiremock) ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_download_success() {
+        let server = wiremock::MockServer::start().await;
+        let content_url = format!("{}/attachment/1", server.uri());
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "fields": {
+                        "attachment": [{
+                            "id": "1",
+                            "filename": "test.txt",
+                            "mimeType": "text/plain",
+                            "size": 5,
+                            "content": content_url
+                        }]
+                    }
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/attachment/1"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"hello".as_slice()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "u@t.com", "tok")
+                .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let result = run_download(&client, "PROJ-1", temp.path().to_str().unwrap(), None).await;
+        assert!(result.is_ok());
+        assert!(temp.path().join("test.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn run_download_empty() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"fields": {"attachment": []}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "u@t.com", "tok")
+                .unwrap();
+        let result = run_download(&client, "PROJ-1", ".", None).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_download_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/NOPE-1"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "u@t.com", "tok")
+                .unwrap();
+        let err = run_download(&client, "NOPE-1", ".", None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    // ── run_images (wiremock) ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_images_success() {
+        let server = wiremock::MockServer::start().await;
+        let content_url = format!("{}/attachment/1", server.uri());
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({
+                    "fields": {
+                        "attachment": [
+                            {"id": "1", "filename": "photo.png", "mimeType": "image/png", "size": 100, "content": content_url},
+                            {"id": "2", "filename": "doc.pdf", "mimeType": "application/pdf", "size": 200, "content": "https://example.com/2"}
+                        ]
+                    }
+                }),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/attachment/1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_bytes(b"\x89PNG".as_slice()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "u@t.com", "tok")
+                .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let result = run_images(&client, "PROJ-1", temp.path().to_str().unwrap()).await;
+        assert!(result.is_ok());
+        assert!(temp.path().join("photo.png").exists());
+    }
+
+    #[tokio::test]
+    async fn run_images_no_images() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({
+                    "fields": {
+                        "attachment": [
+                            {"id": "1", "filename": "doc.pdf", "mimeType": "application/pdf", "size": 200, "content": "https://example.com/1"}
+                        ]
+                    }
+                }),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "u@t.com", "tok")
+                .unwrap();
+        let result = run_images(&client, "PROJ-1", ".").await;
+        assert!(result.is_ok());
     }
 
     // ── dispatch ───────────────────────────────────────────────────

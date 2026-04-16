@@ -69,9 +69,7 @@ pub(crate) struct BatchPlan {
 #[must_use]
 fn estimate_commit_tokens(commit: &CommitInfo) -> usize {
     let diff_byte_len = if commit.analysis.file_diffs.is_empty() {
-        std::fs::metadata(&commit.analysis.diff_file)
-            .map(|m| m.len() as usize)
-            .unwrap_or(0)
+        std::fs::metadata(&commit.analysis.diff_file).map_or(0, |m| m.len() as usize)
     } else {
         commit.analysis.file_diffs.iter().map(|f| f.byte_len).sum()
     };
@@ -111,7 +109,7 @@ pub(crate) fn plan_batches(
         .collect();
 
     // Sort descending by token estimate (first-fit-decreasing)
-    indexed_estimates.sort_by(|a, b| b.1.cmp(&a.1));
+    indexed_estimates.sort_by_key(|b| std::cmp::Reverse(b.1));
 
     let mut batches: Vec<CommitBatch> = Vec::new();
 

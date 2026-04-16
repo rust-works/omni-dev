@@ -5,7 +5,7 @@ use clap::Parser;
 
 use serde::Serialize;
 
-use crate::atlassian::client::{JiraChangelogEntry, JiraChangelogItem};
+use crate::atlassian::client::{AtlassianClient, JiraChangelogEntry, JiraChangelogItem};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -33,29 +33,38 @@ impl ChangelogCommand {
         }
 
         let (client, _instance_url) = create_client()?;
-
-        let mut all_changelogs: Vec<IssueChangelog> = Vec::new();
-        for key in &keys {
-            let entries = client.get_changelog(key, self.limit).await?;
-            all_changelogs.push(IssueChangelog {
-                key: key.clone(),
-                entries,
-            });
-        }
-
-        if output_as(&all_changelogs, &self.output)? {
-            return Ok(());
-        }
-
-        for (i, changelog) in all_changelogs.iter().enumerate() {
-            if i > 0 {
-                println!();
-            }
-            print_changelog(&changelog.key, &changelog.entries);
-        }
-
-        Ok(())
+        run_changelog(&client, &keys, self.limit, &self.output).await
     }
+}
+
+/// Fetches and displays changelogs for the given issue keys.
+async fn run_changelog(
+    client: &AtlassianClient,
+    keys: &[String],
+    limit: u32,
+    output: &OutputFormat,
+) -> Result<()> {
+    let mut all_changelogs: Vec<IssueChangelog> = Vec::new();
+    for key in keys {
+        let entries = client.get_changelog(key, limit).await?;
+        all_changelogs.push(IssueChangelog {
+            key: key.clone(),
+            entries,
+        });
+    }
+
+    if output_as(&all_changelogs, output)? {
+        return Ok(());
+    }
+
+    for (i, changelog) in all_changelogs.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        print_changelog(&changelog.key, &changelog.entries);
+    }
+
+    Ok(())
 }
 
 /// Collected changelog for a single issue, used for json/yaml serialization.
@@ -236,6 +245,89 @@ mod tests {
     fn print_changelog_no_items() {
         let entries = vec![sample_entry("100", "System", vec![])];
         print_changelog("PROJ-1", &entries);
+    }
+
+    // ── run_changelog (wiremock) ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_changelog_single_key() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/changelog",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "values": [{
+                        "id": "100",
+                        "author": {"displayName": "Alice"},
+                        "created": "2026-04-01T10:00:00.000+0000",
+                        "items": [{"field": "status", "fromString": "Open", "toString": "Done"}]
+                    }],
+                    "isLast": true
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "u@t.com", "tok")
+                .unwrap();
+        let keys = vec!["PROJ-1".to_string()];
+        assert!(run_changelog(&client, &keys, 50, &OutputFormat::Table)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_changelog_multiple_keys() {
+        let server = wiremock::MockServer::start().await;
+        for key in &["PROJ-1", "PROJ-2"] {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(format!(
+                    "/rest/api/3/issue/{key}/changelog"
+                )))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
+                        "values": [],
+                        "isLast": true
+                    }),
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "u@t.com", "tok")
+                .unwrap();
+        let keys = vec!["PROJ-1".to_string(), "PROJ-2".to_string()];
+        assert!(run_changelog(&client, &keys, 50, &OutputFormat::Table)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_changelog_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/NOPE-1/changelog",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "u@t.com", "tok")
+                .unwrap();
+        let keys = vec!["NOPE-1".to_string()];
+        let err = run_changelog(&client, &keys, 50, &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
     }
 
     // ── dispatch ───────────────────────────────────────────────────

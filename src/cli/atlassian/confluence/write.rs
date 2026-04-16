@@ -5,7 +5,7 @@ use clap::Parser;
 
 use crate::atlassian::confluence_api::ConfluenceApi;
 use crate::cli::atlassian::format::ContentFormat;
-use crate::cli::atlassian::helpers::{create_client, execute_write, prepare_write};
+use crate::cli::atlassian::helpers::{create_client, prepare_write, run_write};
 
 /// Pushes content to a Confluence page.
 #[derive(Parser)]
@@ -41,7 +41,7 @@ impl WriteCommand {
         let (client, _instance_url) = create_client()?;
         let api = ConfluenceApi::new(client);
 
-        execute_write(&self.id, &adf, &title, self.force, &api).await
+        run_write(&self.id, &adf, &title, self.force, &api).await
     }
 }
 
