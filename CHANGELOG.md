@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-04-17
+
+### Added
+- **Confluence Label Commands**: Label management commands for adding, removing, and listing page labels
+- **Confluence User Search**: Search for Confluence users by query
+- **Confluence Page Comments**: List and add comments on Confluence pages
+- **JIRA Watcher Commands**: List, add, and remove watchers on JIRA issues
+- **JIRA Worklog Commands**: Time tracking with worklog list and add commands
+- **JIRA Sprint Management**: Create and update sprint commands
+- **JIRA Dev Status**: Dev status command for viewing development information on issues
+- **PR Auto-Push**: `--no-push` flag to skip branch push on PR creation
+- **ADF Node Support**: Added `mediaInline`, `placeholder`, `table caption`, `mediaSingle caption`, and `expand localId/parameters` node support
+- **ADF Annotation Marks**: Full annotation mark support for ADF/markdown conversion
+- **ADF localId Round-Trip**: Comprehensive `localId` round-trip support with `--strip-local-ids` option
+- **ADF Border Mark**: Border mark support for media and table cell/header nodes
+- **ADF Breakout Width**: Optional width parameter for breakout marks
+
+### Fixed
+- **ADF Round-Trip Fidelity** (50+ fixes): Extensive improvements to ADF/markdown round-trip conversion:
+  - Preserve mark ordering (link, annotation, strong/em/strike, code) across conversions
+  - Prevent consecutive paragraphs from merging in blockquotes, list items, and task items
+  - Preserve `localId` on caption, listItem/mediaSingle, layout columns, media, table, and paragraph nodes
+  - Handle nested taskList, taskItem, and ordered list nodes correctly
+  - Preserve hardBreak nodes in paragraphs, headings, list items, and table cells
+  - Preserve trailing/leading whitespace in headings, list items, table cells, and text nodes
+  - Escape backticks, backslashes, asterisks, and underscores in plain text to prevent misinterpretation
+  - Preserve NBSP content in list item paragraphs and NBSP-only paragraphs
+  - Preserve empty language attrs in codeBlock, empty attrs on tableCell, and integer colwidth values
+  - Handle parentheses in link/image URLs and bracket-link ambiguity
+  - Prevent bare URLs and URL link text from becoming inlineCard nodes
+  - Preserve emoji shortName with/without colons, date timestamps, and mention localId attribution
+  - Preserve parameters block in bodiedExtension and extension layout/localId attrs
+  - Preserve multiple annotation marks, table cell attrs, embedCard attrs, and mediaSingle mode
+  - Preserve content after directive table blocks and whitespace-only text after hardBreak
+  - Reject pipe syntax for tableCell-only first rows and intraword underscores as emphasis
+  - Escape trailing double-spaces to prevent hardBreak misinterpretation
+  - Ensure blank lines between consecutive block nodes in table cells
+- **Deterministic AI Scopes**: Make AI-generated commit scopes deterministic by post-processing with file-pattern logic
+- **CI Scope Guidance**: Improve CI scope guidance in type selection rules
+
+### Changed
+- **Function Naming**: Rename `execute_*` helper functions to `run_*` across Atlassian CLI commands
+- **Function Extraction**: Extract `run_download`, `run_images`, `run_transition` into standalone functions
+
+### Documentation
+- **ADR-0020**: Add ADR for JFM markdown dialect for ADF interchange
+- **JFM Spec**: Expand JFM spec with table, media, localId, escaping, and annotation mark sections
+- **Style Guide**: Update style guide to clarify `run_*` function extraction rules and add testing style rules
+
+### CI/CD
+- Bump `EmbarkStudios/cargo-deny-action` to 2.0.17
+- Bump `codecov/codecov-action` from 5 to 6
+- Bump `cachix/cachix-action` from 16 to 17
+- Bump Rust minor patch dependencies
+
+### Security
+- Update `rustls-webpki` to 0.103.12 for RUSTSEC-2026-0098
+
 ## [0.20.0] - 2026-04-12
 
 ### Added
@@ -716,7 +774,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation and community files (README, CONTRIBUTING, CODE_OF_CONDUCT)
 - BSD 3-Clause license
 
-[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/rust-works/omni-dev/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/rust-works/omni-dev/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/rust-works/omni-dev/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/rust-works/omni-dev/compare/v0.17.0...v0.18.0
