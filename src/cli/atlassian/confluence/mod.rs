@@ -1,5 +1,6 @@
 //! Confluence CLI subcommands.
 
+pub(crate) mod comment;
 pub(crate) mod create;
 pub(crate) mod delete;
 pub(crate) mod download;
@@ -22,6 +23,8 @@ pub struct ConfluenceCommand {
 /// Confluence subcommands.
 #[derive(Subcommand)]
 pub enum ConfluenceSubcommands {
+    /// Manages comments on a Confluence page.
+    Comment(comment::CommentCommand),
     /// Fetches a Confluence page and outputs it as JFM markdown or ADF JSON.
     Read(read::ReadCommand),
     /// Pushes content to a Confluence page.
@@ -42,6 +45,7 @@ impl ConfluenceCommand {
     /// Executes the Confluence command.
     pub async fn execute(self) -> Result<()> {
         match self.command {
+            ConfluenceSubcommands::Comment(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Read(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Write(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Edit(cmd) => cmd.execute().await,
@@ -57,6 +61,20 @@ impl ConfluenceCommand {
 mod tests {
     use super::*;
     use crate::cli::atlassian::format::{ContentFormat, OutputFormat};
+
+    #[test]
+    fn confluence_subcommands_comment_variant() {
+        let cmd = ConfluenceCommand {
+            command: ConfluenceSubcommands::Comment(comment::CommentCommand {
+                command: comment::CommentSubcommands::List(comment::ListCommand {
+                    id: "12345".to_string(),
+                    limit: 25,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        assert!(matches!(cmd.command, ConfluenceSubcommands::Comment(_)));
+    }
 
     #[test]
     fn confluence_subcommands_read_variant() {
