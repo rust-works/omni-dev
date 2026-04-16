@@ -50,31 +50,31 @@ Page body content here.
 
 ### JIRA Frontmatter Fields
 
-| Field        | Required | Description                              |
-|--------------|----------|------------------------------------------|
-| `type`       | Yes      | Always `"jira"`                          |
-| `instance`   | Yes      | Atlassian Cloud instance URL             |
-| `key`        | No       | JIRA issue key (e.g., `PROJ-123`). Absent when creating a new issue. |
+| Field        | Required | Description                                                               |
+|--------------|----------|---------------------------------------------------------------------------|
+| `type`       | Yes      | Always `"jira"`                                                           |
+| `instance`   | Yes      | Atlassian Cloud instance URL                                              |
+| `key`        | No       | JIRA issue key (e.g., `PROJ-123`). Absent when creating a new issue.      |
 | `project`    | No       | Project key (e.g., `PROJ`). Used for issue creation when `key` is absent. |
-| `summary`    | Yes      | Issue title/summary                      |
-| `status`     | No       | Issue status (read-only from JIRA)       |
-| `issue_type` | No       | Issue type (Bug, Story, Task, etc.)      |
-| `assignee`   | No       | Assigned user display name               |
-| `priority`   | No       | Issue priority level                     |
-| `labels`     | No       | List of issue labels                     |
+| `summary`    | Yes      | Issue title/summary                                                       |
+| `status`     | No       | Issue status (read-only from JIRA)                                        |
+| `issue_type` | No       | Issue type (Bug, Story, Task, etc.)                                       |
+| `assignee`   | No       | Assigned user display name                                                |
+| `priority`   | No       | Issue priority level                                                      |
+| `labels`     | No       | List of issue labels                                                      |
 
 ### Confluence Frontmatter Fields
 
-| Field        | Required | Description                              |
-|--------------|----------|------------------------------------------|
-| `type`       | Yes      | Always `"confluence"`                    |
-| `instance`   | Yes      | Atlassian Cloud instance URL             |
+| Field        | Required | Description                                          |
+|--------------|----------|------------------------------------------------------|
+| `type`       | Yes      | Always `"confluence"`                                |
+| `instance`   | Yes      | Atlassian Cloud instance URL                         |
 | `page_id`    | No       | Confluence page ID. Absent when creating a new page. |
-| `title`      | Yes      | Page title                               |
-| `space_key`  | Yes      | Space key (e.g., `ENG`)                  |
-| `status`     | No       | Page status (`"current"` or `"draft"`)   |
-| `version`    | No       | Page version number (for optimistic locking) |
-| `parent_id`  | No       | Parent page ID                           |
+| `title`      | Yes      | Page title                                           |
+| `space_key`  | Yes      | Space key (e.g., `ENG`)                              |
+| `status`     | No       | Page status (`"current"` or `"draft"`)               |
+| `version`    | No       | Page version number (for optimistic locking)         |
+| `parent_id`  | No       | Parent page ID                                       |
 
 ### Issue Key Validation
 
@@ -119,42 +119,62 @@ ADF v1.
 
 ### Supported Block Nodes
 
-| ADF Node Type     | Markdown Equivalent                         |
-|-------------------|---------------------------------------------|
-| `heading`         | `# H1` through `###### H6`                 |
-| `paragraph`       | Plain text                                  |
-| `codeBlock`       | Fenced code blocks (`` ``` ``)              |
-| `bulletList`      | `- item` or `* item`                        |
-| `orderedList`     | `1. item`                                   |
-| `taskList`        | `- [ ] todo` / `- [x] done`                |
-| `blockquote`      | `> text`                                    |
-| `rule`            | `---`, `***`, or `___`                      |
-| `table`           | Pipe-delimited tables with `\|---\|` separator |
-| `mediaSingle`     | `![alt](url)`                               |
-| `panel`           | `:::panel{type=info}` container directive   |
-| `expand`          | `:::expand{title=...}` container directive  |
-| `layoutSection`   | `:::layout` with `:::column` children       |
-| `decisionList`    | Container with decision items               |
-| `extension`       | Leaf or bodied extension blocks             |
+| ADF Node Type     | Markdown Equivalent                                      |
+|-------------------|----------------------------------------------------------|
+| `heading`         | `# H1` through `###### H6`                               |
+| `paragraph`       | Plain text                                               |
+| `codeBlock`       | Fenced code blocks (`` ``` ``)                           |
+| `bulletList`      | `- item` or `* item`                                     |
+| `orderedList`     | `1. item`                                                |
+| `taskList`        | `- [ ] todo` / `- [x] done`                              |
+| `blockquote`      | `> text`                                                 |
+| `rule`            | `---`, `***`, or `___`                                   |
+| `table`           | Pipe tables or `::::table` directive (see below)         |
+| `mediaSingle`     | `![alt](url){attrs}` with optional `:::caption` block    |
+| `mediaInline`     | `:media-inline[]{attrs}` inline directive                |
+| `blockCard`       | `::card[url]{attrs}` leaf directive                      |
+| `embedCard`       | `::embed[url]{attrs}` leaf directive                     |
+| `panel`           | `:::panel{type=info}` container directive                |
+| `expand`          | `:::expand{title=...}` container directive               |
+| `nestedExpand`    | `:::nested-expand{title=...}` container directive        |
+| `layoutSection`   | `::::layout` with `:::column` children                   |
+| `decisionList`    | `:::decisions` with `- <> item` children                 |
+| `extension`       | `::extension{attrs}` leaf directive                      |
+| `bodiedExtension` | `:::extension{attrs}` container directive                |
 
-### Supported Inline Nodes and Marks
+### Supported Inline Nodes
 
-| ADF Type      | Markdown Equivalent                         |
-|---------------|---------------------------------------------|
-| `strong`      | `**bold**`                                  |
-| `em`          | `*italic*`                                  |
-| `code`        | `` `code` ``                                |
-| `strike`      | `~~strikethrough~~`                         |
-| `link`        | `[text](url)`                               |
-| `emoji`       | `:shortcode:` (e.g., `:smile:`)             |
-| `status`      | `:status[text]{color=...}`                  |
-| `date`        | `:date[2026-04-15]`                         |
-| `mention`     | `:mention[Name]{id=...}`                    |
-| `hardBreak`   | Literal newline                             |
-| `underline`   | Bracketed span: `[text]{underline}`         |
-| `textColor`   | Bracketed span: `[text]{color=#hex}`        |
-| `subsup`      | Mark for subscript/superscript              |
-| `annotation`  | Bracketed span: `[text]{annotation-id=... annotation-type=...}` |
+| ADF Type          | Markdown Equivalent                                  |
+|-------------------|------------------------------------------------------|
+| `text`            | Plain text (with marks applied)                      |
+| `hardBreak`       | `\` + newline                                        |
+| `emoji`           | `:name:{shortName=... id=... text=...}`              |
+| `status`          | `:status[text]{color=... style=... localId=...}`     |
+| `date`            | `:date[YYYY-MM-DD]{timestamp=EPOCHMS}`               |
+| `mention`         | `:mention[Name]{id=... userType=... accessLevel=...}`|
+| `inlineCard`      | `:card[url]{localId=...}`                            |
+| `placeholder`     | `:placeholder[text]`                                 |
+| `mediaInline`     | `:media-inline[]{type=... id=... collection=...}`    |
+| `inlineExtension` | `:extension[fallback]{type=... key=...}`             |
+
+### Supported Marks
+
+| Mark Type         | Markdown Equivalent                                     |
+|-------------------|---------------------------------------------------------|
+| `strong`          | `**bold**`                                              |
+| `em`              | `*italic*`                                              |
+| `code`            | `` `code` ``                                            |
+| `strike`          | `~~strikethrough~~`                                     |
+| `link`            | `[text](url)`                                           |
+| `underline`       | `[text]{underline}`                                     |
+| `textColor`       | `:span[text]{color=#rrggbb}`                            |
+| `backgroundColor` | `:span[text]{bg=#rrggbb}`                               |
+| `subsup`          | `:span[text]{sub}` or `:span[text]{sup}`                |
+| `annotation`      | `[text]{annotation-id=... annotation-type=...}`         |
+| `alignment`       | Trailing block attr: `{align=center}`                   |
+| `indentation`     | Trailing block attr: `{indent=N}`                       |
+| `breakout`        | Trailing block attr: `{breakout=wide breakoutWidth=N}`  |
+| `border`          | On media/table cells: `border-color=#hex border-size=N` |
 
 ### Unsupported Node Handling
 
@@ -188,6 +208,10 @@ The status is :status[In Progress]{color=blue} and assigned to
 :mention[Alice]{id=abc123}.
 
 The deadline is :date[2026-04-15].
+
+Click the :placeholder[Type something...] field to begin.
+
+See :media-inline[]{type=file id=UUID collection=NAME} for details.
 ```
 
 - Content in `[...]` is **required**
@@ -309,6 +333,176 @@ comment system. JFM preserves these marks for round-trip fidelity:
 - Annotations can coexist with other marks (bold, italic, etc.):
   `[**bold comment**]{annotation-id="abc123" annotation-type=inlineComment}`
 
+## Table Rendering Modes
+
+Tables use one of two rendering modes depending on cell complexity:
+
+### Pipe Tables (GFM)
+
+Used when all cells contain simple inline content (single paragraph, no hard
+breaks, no cell-level marks, no paragraph localIds) and the first row has at
+least one `tableHeader`:
+
+```markdown
+| Header 1 | Header 2 |
+| --- | --- |
+| cell | cell |
+```
+
+### Directive Tables
+
+Used when any cell contains complex content (multiple paragraphs, hard breaks,
+code blocks, nested lists, border marks, or paragraph-level localIds):
+
+```markdown
+::::table{layout=default}
+:::tr
+:::th{colspan=2}
+Header spanning two columns
+:::
+:::
+:::tr
+:::td{border-color=#091e42 border-size=2}
+Cell with border mark
+:::
+:::td
+Simple cell
+:::
+:::
+::::
+```
+
+Table-level attributes include `layout`, `width`, `numbered`/`numbered=false`,
+and `isNumberColumnEnabled`.
+
+## Media Nodes
+
+### `mediaSingle` with Image
+
+File-hosted media:
+
+```markdown
+![alt](){type=file id=UUID collection=NAME width=N height=N}
+```
+
+External media:
+
+```markdown
+![alt](https://example.com/image.png){layout=center width=600}
+```
+
+### `mediaSingle` with Caption
+
+A `:::caption` block immediately following the image line attaches a caption
+to the `mediaSingle` node:
+
+```markdown
+![alt](){type=file id=UUID collection=NAME}
+:::caption{localId=abc123}
+Caption text with **formatting**
+:::
+```
+
+The caption's `localId` is optional.
+
+### `mediaInline`
+
+Inline media uses the `:media-inline` directive:
+
+```markdown
+Text with :media-inline[]{type=file id=UUID collection=NAME} embedded.
+```
+
+For external inline media:
+
+```markdown
+Text with :media-inline[]{type=external url=https://example.com/file.pdf alt=document} here.
+```
+
+### Border Mark on Media
+
+The `border` mark on a media node is expressed as additional attributes on the
+image:
+
+```markdown
+![alt](){type=file id=UUID collection=NAME border-color=#091e4224 border-size=2}
+```
+
+When parsing, `border-color` defaults to `#000000` and `border-size` defaults
+to `1` when only one is present.
+
+## `localId` Preservation
+
+Many ADF nodes carry a `localId` attribute used by JIRA and Confluence for
+task item state tracking, inline comment anchoring, and other stateful
+features. JFM preserves these for round-trip fidelity.
+
+### Syntax
+
+For directive-based nodes, `localId` appears as an attribute:
+
+```markdown
+:::expand{title="Details" localId=abc-123}
+Content here
+:::
+```
+
+For standard markdown nodes (headings, paragraphs), `localId` appears on a
+trailing block-attributes line:
+
+```markdown
+# Section Title
+{localId=abc-123}
+```
+
+For list items, `localId` is appended inline to avoid misattribution to the
+parent list node:
+
+```markdown
+- Item text {localId=item-id paraLocalId=para-id}
+```
+
+The `paraLocalId` attribute preserves the localId of a `paragraph` wrapper
+inside a `taskItem` when the original ADF used paragraph children rather than
+direct inline content.
+
+### Suppression
+
+- Null UUIDs (`00000000-0000-0000-0000-000000000000`) and empty strings are
+  suppressed during rendering.
+- The `strip_local_ids` render option omits all localIds for clean display
+  output where round-trip fidelity is not needed.
+
+### Special Cases
+
+- `expand` and `nestedExpand` store `localId` as a top-level ADF field
+  (`node.local_id`) rather than inside `attrs`. JFM renders it in the
+  directive attributes alongside `title` and `params`.
+- `listItem` nodes with a `mediaSingle` first child preserve their `localId`
+  in the trailing inline attributes.
+
+## Text Escaping for Round-Trip Safety
+
+Plain text that would be reinterpreted by the markdown parser on the return
+trip is escaped during ADF-to-markdown rendering. Each escape targets a
+specific ambiguity:
+
+| Pattern                | Escape                    | Prevents                                  |
+|------------------------|---------------------------|-------------------------------------------|
+| `*` in text            | `\*`                      | Spurious bold/italic                      |
+| `` ` `` in text        | `` \` ``                  | Spurious code spans                       |
+| `[` `]` in link text   | `\[` `\]`                 | Link syntax ambiguity                     |
+| `http://` `https://`   | `\http://`                | Auto-link / inlineCard detection          |
+| `:name:` in text       | `\:name:`                 | Emoji shortcode parsing                   |
+| Trailing double-spaces | `\ ` (escaped last space) | `hardBreak` misinterpretation             |
+| `\` in text            | `\\`                      | Silent backslash consumption              |
+| Literal newline in text| `\n` (two characters)     | Paragraph splitting                       |
+| `N. ` at line start    | `N\. `                    | Ordered list re-parsing (in continuations)|
+| `- ` at line start     | `\- `                     | Bullet list re-parsing (in continuations) |
+
+Escaping is applied only outside code spans and fenced code blocks, where the
+markdown parser would otherwise reinterpret the content.
+
 ## Authentication
 
 - **Method**: HTTP Basic Auth (base64-encoded `email:api_token`)
@@ -323,9 +517,9 @@ comment system. JFM preserves these marks for round-trip fidelity:
 
 ## Error Types
 
-| Error                  | Cause                                        |
-|------------------------|----------------------------------------------|
-| `CredentialsNotFound`  | No credentials configured                    |
-| `ApiRequestFailed`     | HTTP error from API (includes status + body) |
-| `InvalidDocument`      | JFM parse error (bad YAML, missing delimiters)|
-| `ConversionError`      | ADF conversion failure                       |
+| Error                  | Cause                                          |
+|------------------------|------------------------------------------------|
+| `CredentialsNotFound`  | No credentials configured                      |
+| `ApiRequestFailed`     | HTTP error from API (includes status + body)   |
+| `InvalidDocument`      | JFM parse error (bad YAML, missing delimiters) |
+| `ConversionError`      | ADF conversion failure                         |
