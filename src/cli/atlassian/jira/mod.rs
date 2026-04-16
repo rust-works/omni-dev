@@ -15,6 +15,7 @@ pub(crate) mod read;
 pub(crate) mod search;
 pub(crate) mod sprint;
 pub(crate) mod transition;
+pub(crate) mod worklog;
 pub(crate) mod write;
 
 use anyhow::Result;
@@ -63,6 +64,8 @@ pub enum JiraSubcommands {
     Changelog(changelog::ChangelogCommand),
     /// Downloads JIRA issue attachments.
     Attachment(attachment::AttachmentCommand),
+    /// Manages worklogs (time tracking) on a JIRA issue.
+    Worklog(worklog::WorklogCommand),
 }
 
 impl JiraCommand {
@@ -85,6 +88,7 @@ impl JiraCommand {
             JiraSubcommands::Link(cmd) => cmd.execute().await,
             JiraSubcommands::Changelog(cmd) => cmd.execute().await,
             JiraSubcommands::Attachment(cmd) => cmd.execute().await,
+            JiraSubcommands::Worklog(cmd) => cmd.execute().await,
         }
     }
 }
@@ -303,5 +307,19 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Attachment(_)));
+    }
+
+    #[test]
+    fn jira_subcommands_worklog_variant() {
+        let cmd = JiraCommand {
+            command: JiraSubcommands::Worklog(worklog::WorklogCommand {
+                command: worklog::WorklogSubcommands::List(worklog::ListCommand {
+                    key: "PROJ-1".to_string(),
+                    limit: 50,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        assert!(matches!(cmd.command, JiraSubcommands::Worklog(_)));
     }
 }
