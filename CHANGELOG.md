@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Confluence Bulk Space Download**: `confluence download` now accepts `--space <KEY>` to recursively download every page in a Confluence space, plus `--title-filter` to download only pages whose title contains a substring (case-insensitive)
 - **JIRA Comment Pagination** ([#543](https://github.com/rust-works/omni-dev/issues/543)): `jira comment list` now auto-paginates the JIRA comments REST API (previously only the first page was returned) and accepts a `--limit` flag to cap the total number of comments (use `0` for unlimited)
+- **YAML Stream Output** ([#546](https://github.com/rust-works/omni-dev/issues/546)): New `-o yamls` output format emits results as `---`-separated YAML documents (YAML multi-document streams). For sequence results, each item becomes its own document; other values emit as a single `---`-prefixed document. Streams parse with standard YAML tooling (`yaml.safe_load_all()`, `yq`) and enable future per-page streaming for auto-paginated commands.
 
 ### Changed
 - **CI Coverage**: Switched coverage tooling from `cargo-tarpaulin` to `cargo-llvm-cov` to eliminate `.await?` false negatives and improve accuracy for async code, macros, and generics
