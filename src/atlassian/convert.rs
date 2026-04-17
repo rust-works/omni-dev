@@ -1320,34 +1320,75 @@ fn is_list_start(line: &str) -> bool {
         || parse_ordered_list_marker(trimmed).is_some()
 }
 
-/// Escapes asterisk sequences in text that would otherwise be parsed as
-/// CommonMark emphasis (`*…*`) or strong emphasis (`**…**`).
+/// Escapes asterisk and underscore sequences in text that would otherwise be
+/// parsed as CommonMark emphasis (`*…*`, `_…_`) or strong emphasis (`**…**`,
+/// `__…__`).
 ///
-/// Only sequences that could round-trip as emphasis are escaped: a `*` or
-/// `**` that is followed (at the opening position) or preceded (at the
-/// closing position) by a non-space character.  Lone asterisks that cannot
-/// form a delimiter pair are left untouched.
+/// Asterisks are always escaped (they're rare in prose and the JFM parser
+/// will gladly match them across node boundaries). Underscores are escaped
+/// per the intraword rule: a `_` is left as-is only when it's clearly
+/// intraword *within this text node* (alphanumeric on both sides). At the
+/// node boundary or next to non-alphanumeric characters we escape, since
+/// adjacent text nodes can supply the other side of an emphasis pair (issue
+/// #554: `"_ "` followed by colored `"_Action…"` produced `_ :span[_…` which
+/// parsed as italic and destroyed the span directive).
 fn escape_emphasis_markers(text: &str) -> String {
     escape_emphasis_with(text, false)
 }
 
-/// Variant of [`escape_emphasis_markers`] that also escapes underscores.
+/// Variant of [`escape_emphasis_markers`] that escapes ALL underscores (even
+/// intraword), not just boundary ones.
 ///
-/// Must be used whenever the rendered markdown wraps this text in an `_...._`
-/// em delimiter, because an unescaped `_` in the content would otherwise close
-/// the delimiter prematurely (e.g. `_foo _bar_ baz_` parses as em("foo ") + "bar"
-/// + em("baz"), not em("foo _bar_ baz") as intended).
+/// Must be used whenever the rendered markdown wraps this text in an `_..._`
+/// em delimiter, because an unescaped `_` anywhere in the content would
+/// otherwise close the delimiter prematurely (e.g. `_foo_bar_baz_` parses as
+/// em("foo") + "bar" + em("baz"), not em("foo_bar_baz")).
 fn escape_emphasis_markers_with_underscore(text: &str) -> String {
     escape_emphasis_with(text, true)
 }
 
-fn escape_emphasis_with(text: &str, escape_underscore: bool) -> String {
+/// Internal: escapes `*` always, and escapes `_` per the CommonMark intraword
+/// rule by default — boundary or punctuation-adjacent runs are escaped, fully
+/// intraword runs are left as-is.  When `escape_underscore_always` is true,
+/// every `_` is escaped regardless (used when the surrounding context is an
+/// `_..._` em delimiter that any inner `_` would close prematurely).
+fn escape_emphasis_with(text: &str, escape_underscore_always: bool) -> String {
+    let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        if ch == '*' || (escape_underscore && ch == '_') {
+    let mut idx = 0;
+    while idx < chars.len() {
+        let ch = chars[idx];
+        if ch == '*' {
             out.push('\\');
+            out.push(ch);
+            idx += 1;
+        } else if ch == '_' {
+            // Find the extent of this run of underscores. CommonMark treats
+            // consecutive `_` as a single delimiter run, so the intraword
+            // check applies to the whole run, not individual characters.
+            let run_start = idx;
+            let mut run_end = idx;
+            while run_end < chars.len() && chars[run_end] == '_' {
+                run_end += 1;
+            }
+            let escape_run = if escape_underscore_always {
+                true
+            } else {
+                let before_alnum = run_start > 0 && chars[run_start - 1].is_alphanumeric();
+                let after_alnum = chars.get(run_end).is_some_and(|c| c.is_alphanumeric());
+                !(before_alnum && after_alnum)
+            };
+            for _ in run_start..run_end {
+                if escape_run {
+                    out.push('\\');
+                }
+                out.push('_');
+            }
+            idx = run_end;
+        } else {
+            out.push(ch);
+            idx += 1;
         }
-        out.push(ch);
     }
     out
 }
@@ -4322,15 +4363,14 @@ fn render_marked_text(text: &str, marks: &[AdfMark], output: &mut String) {
 }
 
 /// Renders a text node with a `code` mark.  Code content is emitted verbatim
-/// inside backticks, optionally wrapped by a link and/or bracketed-span
-/// carrying annotation marks — no other inline formatting marks are applied
-/// because markdown code spans do not support nested emphasis.
+/// inside backticks, optionally wrapped by a link and/or by `:span`/bracketed-
+/// span carrying span-attr (`textColor`, `backgroundColor`, `subsup`) and
+/// bracketed-span (`underline`, `annotation`) marks.  No `em`/`strong`/`strike`
+/// formatting is applied because markdown code spans do not support nested
+/// emphasis (issue #554: previously textColor/bg/subsup/underline were
+/// silently dropped when combined with a code mark).
 fn render_code_marked_text(text: &str, marks: &[AdfMark], output: &mut String) {
     let link_mark = marks.iter().find(|m| m.mark_type == "link");
-    let annotations: Vec<&AdfMark> = marks
-        .iter()
-        .filter(|m| m.mark_type == "annotation")
-        .collect();
 
     let mut code_str = String::new();
     if let Some(link_mark) = link_mark {
@@ -4348,20 +4388,39 @@ fn render_code_marked_text(text: &str, marks: &[AdfMark], output: &mut String) {
         code_str.push('`');
     }
 
-    if annotations.is_empty() {
-        output.push_str(&code_str);
-        return;
+    // Build wrappers (outermost first) for span-attr and bracketed-span runs,
+    // walking marks in order so the round-trip preserves mark ordering.
+    let mut wrappers: Vec<(String, String)> = Vec::new();
+    let mut i = 0;
+    while i < marks.len() {
+        match marks[i].mark_type.as_str() {
+            "textColor" | "backgroundColor" | "subsup" => {
+                let start = i;
+                while i < marks.len() && is_span_attr_mark(&marks[i].mark_type) {
+                    i += 1;
+                }
+                emit_span_attr_wrappers(&marks[start..i], &mut wrappers);
+            }
+            "underline" | "annotation" => {
+                let start = i;
+                while i < marks.len() && is_bracketed_span_mark(&marks[i].mark_type) {
+                    i += 1;
+                }
+                emit_bracketed_wrappers(&marks[start..i], &mut wrappers);
+            }
+            _ => {
+                i += 1;
+            }
+        }
     }
 
-    let mut attr_parts = Vec::new();
-    for ann in &annotations {
-        collect_bracketed_attr(ann, &mut attr_parts);
+    // Apply wrappers from innermost (last) to outermost (first).
+    let mut result = code_str;
+    for (open, close) in wrappers.iter().rev() {
+        result.insert_str(0, open);
+        result.push_str(close);
     }
-    output.push('[');
-    output.push_str(&code_str);
-    output.push_str("]{");
-    output.push_str(&attr_parts.join(" "));
-    output.push('}');
+    output.push_str(&result);
 }
 
 /// Collects `:span` attribute fragments (color, bg, sub/sup) for a single mark.
@@ -6524,6 +6583,38 @@ mod tests {
         assert_eq!(escape_emphasis_markers("no stars"), "no stars");
         assert_eq!(escape_emphasis_markers("a * b"), r"a \* b");
         assert_eq!(escape_emphasis_markers(""), "");
+    }
+
+    #[test]
+    fn escape_emphasis_markers_underscore_intraword() {
+        // Intraword underscores (alnum on both sides within the node) are
+        // left as-is — the JFM parser will reject them as emphasis.
+        assert_eq!(escape_emphasis_markers("foo_bar"), "foo_bar");
+        assert_eq!(escape_emphasis_markers("a_b_c"), "a_b_c");
+        assert_eq!(escape_emphasis_markers("foo__bar"), "foo__bar");
+        assert_eq!(
+            escape_emphasis_markers("call do_something_useful"),
+            "call do_something_useful"
+        );
+    }
+
+    #[test]
+    fn escape_emphasis_markers_underscore_at_boundary() {
+        // Leading and trailing underscores get escaped — adjacent text nodes
+        // could supply the alphanumeric needed to close emphasis (issue #554).
+        assert_eq!(escape_emphasis_markers("_Action"), r"\_Action");
+        assert_eq!(escape_emphasis_markers("Action_"), r"Action\_");
+        assert_eq!(escape_emphasis_markers("_ "), r"\_ ");
+        assert_eq!(escape_emphasis_markers(" _"), r" \_");
+        assert_eq!(escape_emphasis_markers("_"), r"\_");
+    }
+
+    #[test]
+    fn escape_emphasis_markers_underscore_with_punctuation() {
+        // Underscores adjacent to punctuation (not alphanumeric) get escaped.
+        assert_eq!(escape_emphasis_markers("foo _bar"), r"foo \_bar");
+        assert_eq!(escape_emphasis_markers("foo_ bar"), r"foo\_ bar");
+        assert_eq!(escape_emphasis_markers("(_x_)"), r"(\_x\_)");
     }
 
     #[test]
@@ -19461,5 +19552,453 @@ C
             .as_deref()
             .unwrap();
         assert_eq!(text, "solo");
+    }
+
+    // ── Issue #554: marks combined with `code` or with each other ──────
+
+    /// Helper: roundtrip an ADF document and assert the marks on the first
+    /// text node match `expected_marks` (in order).
+    fn assert_roundtrip_marks(adf_json: &str, expected_marks: &[&str]) {
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let node = &rt.content[0].content.as_ref().unwrap()[0];
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_ref()
+            .expect("should have marks")
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(
+            mark_types, expected_marks,
+            "mark order mismatch for md={md}"
+        );
+    }
+
+    #[test]
+    fn issue_554_code_and_text_color_preserved() {
+        let adf_json = r##"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"x","marks":[
+            {"type":"textColor","attrs":{"color":"#008000"}},
+            {"type":"code"}
+          ]}
+        ]}]}"##;
+        assert_roundtrip_marks(adf_json, &["textColor", "code"]);
+    }
+
+    #[test]
+    fn issue_554_code_and_bg_color_preserved() {
+        let adf_json = r##"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"x","marks":[
+            {"type":"backgroundColor","attrs":{"color":"#FF0000"}},
+            {"type":"code"}
+          ]}
+        ]}]}"##;
+        assert_roundtrip_marks(adf_json, &["backgroundColor", "code"]);
+    }
+
+    #[test]
+    fn issue_554_code_and_subsup_preserved() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"x","marks":[
+            {"type":"subsup","attrs":{"type":"sub"}},
+            {"type":"code"}
+          ]}
+        ]}]}"#;
+        assert_roundtrip_marks(adf_json, &["subsup", "code"]);
+    }
+
+    #[test]
+    fn issue_554_code_and_underline_preserved() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"x","marks":[
+            {"type":"underline"},
+            {"type":"code"}
+          ]}
+        ]}]}"#;
+        assert_roundtrip_marks(adf_json, &["underline", "code"]);
+    }
+
+    #[test]
+    fn issue_554_code_textcolor_and_underline_preserved() {
+        let adf_json = r##"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"x","marks":[
+            {"type":"textColor","attrs":{"color":"#008000"}},
+            {"type":"underline"},
+            {"type":"code"}
+          ]}
+        ]}]}"##;
+        assert_roundtrip_marks(adf_json, &["textColor", "underline", "code"]);
+    }
+
+    #[test]
+    fn issue_554_textcolor_and_underline_preserved() {
+        let adf_json = r##"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"x","marks":[
+            {"type":"textColor","attrs":{"color":"#008000"}},
+            {"type":"underline"}
+          ]}
+        ]}]}"##;
+        assert_roundtrip_marks(adf_json, &["textColor", "underline"]);
+    }
+
+    #[test]
+    fn issue_554_underline_and_textcolor_preserved_order_swapped() {
+        let adf_json = r##"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"x","marks":[
+            {"type":"underline"},
+            {"type":"textColor","attrs":{"color":"#008000"}}
+          ]}
+        ]}]}"##;
+        // underline appears first, so it should be the OUTER wrapper.
+        assert_roundtrip_marks(adf_json, &["underline", "textColor"]);
+    }
+
+    #[test]
+    fn issue_554_textcolor_and_annotation_preserved() {
+        let adf_json = r##"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"x","marks":[
+            {"type":"textColor","attrs":{"color":"#008000"}},
+            {"type":"annotation","attrs":{"id":"abc-123","annotationType":"inlineComment"}}
+          ]}
+        ]}]}"##;
+        assert_roundtrip_marks(adf_json, &["textColor", "annotation"]);
+    }
+
+    #[test]
+    fn issue_554_bgcolor_and_underline_preserved() {
+        let adf_json = r##"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"x","marks":[
+            {"type":"backgroundColor","attrs":{"color":"#FF0000"}},
+            {"type":"underline"}
+          ]}
+        ]}]}"##;
+        assert_roundtrip_marks(adf_json, &["backgroundColor", "underline"]);
+    }
+
+    #[test]
+    fn issue_554_subsup_and_underline_preserved() {
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"x","marks":[
+            {"type":"subsup","attrs":{"type":"sub"}},
+            {"type":"underline"}
+          ]}
+        ]}]}"#;
+        assert_roundtrip_marks(adf_json, &["subsup", "underline"]);
+    }
+
+    #[test]
+    fn issue_554_exact_reproducer_full_match() {
+        // The exact reproducer from issue #554. The byte-for-byte ADF JSON
+        // must round-trip through `from-adf | to-adf` unchanged.
+        let adf_json = r##"{
+          "version": 1,
+          "type": "doc",
+          "content": [
+            {
+              "type": "paragraph",
+              "content": [
+                {"type":"text","text":"Status: ","marks":[{"type":"strong"}]},
+                {"type":"text","text":"Approved","marks":[
+                  {"type":"textColor","attrs":{"color":"#008000"}}
+                ]},
+                {"type":"text","text":" — ready to proceed"}
+              ]
+            }
+          ]
+        }"##;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains(":span[Approved]{color=#008000}"),
+            "JFM should contain green span: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        // Find the "Approved" text node and verify color is preserved.
+        let approved = rt.content[0]
+            .content
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|n| n.text.as_deref() == Some("Approved"))
+            .expect("Approved text node");
+        let marks = approved.marks.as_ref().expect("should have marks");
+        let color_mark = marks
+            .iter()
+            .find(|m| m.mark_type == "textColor")
+            .expect("textColor mark must be preserved");
+        assert_eq!(color_mark.attrs.as_ref().unwrap()["color"], "#008000");
+    }
+
+    #[test]
+    fn issue_554_textcolor_with_code_renders_span_around_code() {
+        // Verify the rendered JFM uses `:span[`text`]{color=...}` — the
+        // syntax suggested in the issue.
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text_with_marks(
+                "fn main",
+                vec![
+                    AdfMark::text_color("#008000"),
+                    AdfMark {
+                        mark_type: "code".to_string(),
+                        attrs: None,
+                    },
+                ],
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains(":span[`fn main`]{color=#008000}"),
+            "expected span-wrapped code, got: {md}"
+        );
+    }
+
+    #[test]
+    fn issue_554_underline_with_code_renders_bracketed_around_code() {
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text_with_marks(
+                "fn main",
+                vec![
+                    AdfMark::underline(),
+                    AdfMark {
+                        mark_type: "code".to_string(),
+                        attrs: None,
+                    },
+                ],
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("[`fn main`]{underline}"),
+            "expected bracketed-span around code, got: {md}"
+        );
+    }
+
+    // ── Issue #554 (re-opened): boundary-underscore destroys span directives ──
+
+    #[test]
+    fn issue_554_underscore_adjacent_to_textcolor_span_roundtrip() {
+        // Reproducer from the re-opened issue: a `_ ` plain-text node followed
+        // by a textColor span whose text starts with `_` produced JFM that the
+        // parser saw as an italic delimiter pair, destroying the span and
+        // losing the textColor mark entirely.
+        let adf_json = r##"{
+          "version": 1,
+          "type": "doc",
+          "content": [
+            {
+              "type": "paragraph",
+              "content": [
+                {"type":"text","text":"_ "},
+                {"type":"text","text":"_Action:*","marks":[
+                  {"type":"textColor","attrs":{"color":"#008000"}}
+                ]},
+                {"type":"text","text":" Complete the setup process."}
+              ]
+            }
+          ]
+        }"##;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        // The leading `_` chars must be backslash-escaped so the parser
+        // doesn't form a false italic pair across the span boundary.
+        assert!(
+            md.contains(r"\_ ") && md.contains(r":span[\_Action"),
+            "underscores at node boundaries should be escaped: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let para_content = rt.content[0].content.as_ref().unwrap();
+        // Find the textColor-marked node.
+        let colored = para_content
+            .iter()
+            .find(|n| {
+                n.marks
+                    .as_deref()
+                    .is_some_and(|ms| ms.iter().any(|m| m.mark_type == "textColor"))
+            })
+            .expect("textColor node must be preserved");
+        assert_eq!(colored.text.as_deref(), Some("_Action:*"));
+        let color_mark = colored
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.mark_type == "textColor")
+            .unwrap();
+        assert_eq!(color_mark.attrs.as_ref().unwrap()["color"], "#008000");
+        // Verify no spurious em mark crept in.
+        for n in para_content {
+            if let Some(ms) = n.marks.as_deref() {
+                assert!(
+                    !ms.iter().any(|m| m.mark_type == "em"),
+                    "no em mark should appear, got marks {:?}",
+                    ms.iter().map(|m| &m.mark_type).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn issue_554_underscore_intraword_left_unescaped() {
+        // Sanity check: ordinary intraword underscores like `do_something_useful`
+        // should NOT be escaped — escaping would still round-trip correctly,
+        // but produces noisy backslashes in the JFM output.
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text(
+                "call do_something_useful now",
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("do_something_useful") && !md.contains(r"do\_something\_useful"),
+            "intraword underscores should not be escaped: {md}"
+        );
+    }
+
+    #[test]
+    fn issue_554_code_underline_then_textcolor_bracketed_outer() {
+        // Mark order [underline, textColor, code] — bracketed-span outer,
+        // span inner. Exercises wrap_with_attrs (true, true) !span_before.
+        let adf_json = r##"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"x","marks":[
+            {"type":"underline"},
+            {"type":"textColor","attrs":{"color":"#008000"}},
+            {"type":"code"}
+          ]}
+        ]}]}"##;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        // Bracketed-span should be the outermost wrapper.
+        assert!(
+            md.starts_with('[') && md.contains("underline}"),
+            "bracketed-span should wrap the span, got: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let node = &rt.content[0].content.as_ref().unwrap()[0];
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(mark_types, vec!["underline", "textColor", "code"]);
+    }
+
+    #[test]
+    fn issue_554_textcolor_underline_link_all_preserved() {
+        // Mark order [textColor, underline, link] — span outer, bracketed
+        // wraps the link inside. Exercises the span-wraps-link-with-bracketed
+        // branch.
+        let adf_json = r##"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"linked","marks":[
+            {"type":"textColor","attrs":{"color":"#008000"}},
+            {"type":"underline"},
+            {"type":"link","attrs":{"href":"https://example.com"}}
+          ]}
+        ]}]}"##;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let node = &rt.content[0].content.as_ref().unwrap()[0];
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(mark_types, vec!["textColor", "underline", "link"]);
+    }
+
+    #[test]
+    fn issue_554_underline_textcolor_link_bracketed_outer_link_last() {
+        // Mark order [underline, textColor, link] — bracketed-span outer of
+        // both span and link. Exercises the bracketed-wraps-everything branch.
+        let adf_json = r##"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"linked","marks":[
+            {"type":"underline"},
+            {"type":"textColor","attrs":{"color":"#008000"}},
+            {"type":"link","attrs":{"href":"https://example.com"}}
+          ]}
+        ]}]}"##;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let node = &rt.content[0].content.as_ref().unwrap()[0];
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(mark_types, vec!["underline", "textColor", "link"]);
+    }
+
+    #[test]
+    fn issue_554_link_underline_textcolor_link_outer() {
+        // Mark order [link, underline, textColor] — link outermost, wraps a
+        // bracketed-span that wraps the span. Exercises the link-wraps-
+        // bracketed-wraps-span branch.
+        let adf_json = r##"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"linked","marks":[
+            {"type":"link","attrs":{"href":"https://example.com"}},
+            {"type":"underline"},
+            {"type":"textColor","attrs":{"color":"#008000"}}
+          ]}
+        ]}]}"##;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.starts_with('[') && md.contains("](https://example.com)"),
+            "link should be outermost, got: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let node = &rt.content[0].content.as_ref().unwrap()[0];
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(mark_types, vec!["link", "underline", "textColor"]);
+    }
+
+    #[test]
+    fn issue_554_trailing_underscore_then_leading_underscore_round_trip() {
+        // Two adjacent text nodes where the first ends with `_` and the
+        // second starts with `_` — without escaping, the JFM parser sees
+        // an `_..._` pair spanning the boundary.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"end_"},
+          {"type":"text","text":"_start"}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        // Reassemble all text in the paragraph.
+        let combined: String = rt.content[0]
+            .content
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n.text.as_deref())
+            .collect();
+        assert_eq!(combined, "end__start");
+        // No node should have an em mark.
+        for n in rt.content[0].content.as_ref().unwrap() {
+            if let Some(ms) = n.marks.as_deref() {
+                assert!(!ms.iter().any(|m| m.mark_type == "em"));
+            }
+        }
     }
 }
