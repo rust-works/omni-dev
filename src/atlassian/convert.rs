@@ -424,7 +424,8 @@ impl<'a> MarkdownParser<'a> {
         if items.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(AdfNode::ordered_list(items, Some(start))))
+            let order = if start == 1 { None } else { Some(start) };
+            Ok(Some(AdfNode::ordered_list(items, order)))
         }
     }
 
@@ -459,7 +460,14 @@ impl<'a> MarkdownParser<'a> {
         // Parse localId from block attrs
         let local_id = attrs.get("localId").map(str::to_string);
 
-        let has_attrs = !marks.is_empty() || local_id.is_some();
+        // Parse explicit order for orderedList nodes (issue #547).
+        let order = if node.node_type == "orderedList" {
+            attrs.get("order").and_then(|v| v.parse::<u32>().ok())
+        } else {
+            None
+        };
+
+        let has_attrs = !marks.is_empty() || local_id.is_some() || order.is_some();
         if has_attrs {
             if !marks.is_empty() {
                 let existing = node.marks.get_or_insert_with(Vec::new);
@@ -468,6 +476,10 @@ impl<'a> MarkdownParser<'a> {
             if let Some(id) = local_id {
                 let node_attrs = node.attrs.get_or_insert_with(|| serde_json::json!({}));
                 node_attrs["localId"] = serde_json::Value::String(id);
+            }
+            if let Some(n) = order {
+                let node_attrs = node.attrs.get_or_insert_with(|| serde_json::json!({}));
+                node_attrs["order"] = serde_json::json!(n);
             }
             self.advance(); // consume the attrs line
         }
@@ -3195,6 +3207,17 @@ fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) 
     if !matches!(node.node_type.as_str(), "expand" | "nestedExpand") && !para_used_directive {
         if let Some(ref attrs) = node.attrs {
             maybe_push_local_id(attrs, &mut parts, opts);
+        }
+    }
+    // orderedList with explicit `attrs.order=1` needs a trailing `{order=1}`
+    // signal so the round-trip can distinguish explicit default from omitted
+    // attrs (issue #547). Values other than 1 are already encoded by the
+    // list marker, so no signal is needed.
+    if node.node_type == "orderedList" {
+        if let Some(ref attrs) = node.attrs {
+            if attrs.get("order").and_then(serde_json::Value::as_u64) == Some(1) {
+                parts.push("order=1".to_string());
+            }
         }
     }
     if !parts.is_empty() {
@@ -6192,12 +6215,19 @@ mod tests {
     }
 
     #[test]
-    fn ordered_list_start_at_one_has_order_attr() {
+    fn ordered_list_start_at_one_omits_order_attr() {
+        // Issue #547: order=1 is the default and must be omitted from attrs
+        // so that ADF→JFM→ADF round-trip is byte-identical for the common
+        // case where the source ADF has no attrs object on orderedList.
         let md = "1. First\n2. Second";
         let doc = markdown_to_adf(md).unwrap();
         let node = &doc.content[0];
         assert_eq!(node.node_type, "orderedList");
-        assert_eq!(node.attrs.as_ref().unwrap()["order"], 1);
+        assert!(
+            node.attrs.is_none(),
+            "attrs should be omitted when order=1, got: {:?}",
+            node.attrs
+        );
     }
 
     #[test]
@@ -13425,7 +13455,11 @@ mod tests {
         // Outer list should have 2 items
         let outer = &round_tripped.content[0];
         assert_eq!(outer.node_type, "orderedList");
-        assert_eq!(outer.attrs.as_ref().unwrap()["order"], 1);
+        assert_eq!(
+            outer.attrs.as_ref().unwrap()["order"],
+            1,
+            "explicit order=1 must be preserved via trailing {{order=1}} (issue #547)"
+        );
         let outer_items = outer.content.as_ref().unwrap();
         assert_eq!(
             outer_items.len(),
@@ -13490,18 +13524,229 @@ mod tests {
     }
 
     #[test]
-    fn ordered_list_order_attr_always_preserved() {
-        // order=1 should be preserved, not elided
+    fn ordered_list_order_attr_one_is_elided() {
+        // Issue #547: order=1 is the default and must be elided from attrs
+        // for round-trip fidelity with ADF documents that omit the attrs
+        // object on orderedList.
         let md = "1. A\n2. B\n";
         let doc = markdown_to_adf(md).unwrap();
-        let attrs = doc.content[0].attrs.as_ref().unwrap();
-        assert_eq!(attrs["order"], 1, "order=1 should be explicitly present");
+        assert!(
+            doc.content[0].attrs.is_none(),
+            "attrs should be elided when order=1"
+        );
 
-        // Round-trip should preserve it
+        // Round-trip should preserve the elision
         let md2 = adf_to_markdown(&doc).unwrap();
         let doc2 = markdown_to_adf(&md2).unwrap();
-        let attrs2 = doc2.content[0].attrs.as_ref().unwrap();
-        assert_eq!(attrs2["order"], 1);
+        assert!(
+            doc2.content[0].attrs.is_none(),
+            "attrs should remain elided after round-trip"
+        );
+    }
+
+    #[test]
+    fn issue_547_ordered_list_no_attrs_roundtrip_byte_identical() {
+        // Issue #547: ADF orderedList without an attrs field must round-trip
+        // (ADF → JFM → ADF) without gaining a spurious {"order": 1} attrs.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"orderedList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"First item"}]}]},{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"Second item"}]}]}]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        assert!(
+            rt.content[0].attrs.is_none(),
+            "round-tripped orderedList should not have attrs, got: {:?}",
+            rt.content[0].attrs
+        );
+
+        // Serialized JSON must also omit attrs entirely for byte fidelity.
+        let rt_json = serde_json::to_string(&rt).unwrap();
+        assert!(
+            !rt_json.contains("\"order\""),
+            "round-tripped JSON should not contain \"order\", got: {rt_json}"
+        );
+    }
+
+    // ── Issue #547: orderedList byte-identical roundtrip coverage ───────
+
+    /// Assert that ADF → JFM → ADF produces a document whose serialized JSON
+    /// (as a sorted-key canonical form) matches the source JSON. Mirrors the
+    /// `jq --sort-keys` comparison used in the issue's reproducer.
+    fn assert_roundtrip_byte_identical(adf_json: &str) {
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+
+        let canonical_src: serde_json::Value = serde_json::from_str(adf_json).unwrap();
+        let canonical_rt: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&rt).unwrap()).unwrap();
+        assert_eq!(
+            canonical_src, canonical_rt,
+            "round-trip diverged\n  src: {canonical_src}\n   rt: {canonical_rt}\n   md: {md:?}"
+        );
+    }
+
+    #[test]
+    fn issue_547_single_item_no_attrs_roundtrip() {
+        assert_roundtrip_byte_identical(
+            r#"{"version":1,"type":"doc","content":[{"type":"orderedList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"only"}]}]}]}]}"#,
+        );
+    }
+
+    #[test]
+    fn issue_547_many_items_no_attrs_roundtrip() {
+        assert_roundtrip_byte_identical(
+            r#"{"version":1,"type":"doc","content":[{"type":"orderedList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"A"}]}]},{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"B"}]}]},{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"C"}]}]},{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"D"}]}]},{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"E"}]}]}]}]}"#,
+        );
+    }
+
+    #[test]
+    fn issue_547_non_default_order_preserved() {
+        // When order != 1, attrs must still be serialized (fix must not
+        // over-eagerly drop attrs).
+        assert_roundtrip_byte_identical(
+            r#"{"version":1,"type":"doc","content":[{"type":"orderedList","attrs":{"order":5},"content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"fifth"}]}]}]}]}"#,
+        );
+    }
+
+    #[test]
+    fn issue_547_nested_ordered_in_ordered_no_attrs_roundtrip() {
+        // Outer and inner both omit attrs; fix must apply at every level.
+        assert_roundtrip_byte_identical(
+            r#"{"version":1,"type":"doc","content":[{"type":"orderedList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"outer"}]},{"type":"orderedList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"inner"}]}]}]}]}]}]}"#,
+        );
+    }
+
+    #[test]
+    fn issue_547_ordered_nested_in_bullet_no_attrs_roundtrip() {
+        assert_roundtrip_byte_identical(
+            r#"{"version":1,"type":"doc","content":[{"type":"bulletList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"bullet"}]},{"type":"orderedList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"nested"}]}]}]}]}]}]}"#,
+        );
+    }
+
+    #[test]
+    fn issue_547_bullet_nested_in_ordered_no_attrs_roundtrip() {
+        assert_roundtrip_byte_identical(
+            r#"{"version":1,"type":"doc","content":[{"type":"orderedList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"outer"}]},{"type":"bulletList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"nested"}]}]}]}]}]}]}"#,
+        );
+    }
+
+    #[test]
+    fn issue_547_ordered_list_between_paragraphs_roundtrip() {
+        assert_roundtrip_byte_identical(
+            r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"intro"}]},{"type":"orderedList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"item"}]}]}]},{"type":"paragraph","content":[{"type":"text","text":"outro"}]}]}"#,
+        );
+    }
+
+    #[test]
+    fn issue_547_ordered_list_with_marked_text_roundtrip() {
+        assert_roundtrip_byte_identical(
+            r#"{"version":1,"type":"doc","content":[{"type":"orderedList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"bold","marks":[{"type":"strong"}]}]}]}]}]}"#,
+        );
+    }
+
+    #[test]
+    fn issue_547_ordered_list_with_link_roundtrip() {
+        assert_roundtrip_byte_identical(
+            r#"{"version":1,"type":"doc","content":[{"type":"orderedList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"site","marks":[{"type":"link","attrs":{"href":"https://example.com"}}]}]}]}]}]}"#,
+        );
+    }
+
+    #[test]
+    fn issue_547_ordered_list_with_hardbreak_roundtrip() {
+        assert_roundtrip_byte_identical(
+            r#"{"version":1,"type":"doc","content":[{"type":"orderedList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"a"},{"type":"hardBreak"},{"type":"text","text":"b"}]}]}]}]}"#,
+        );
+    }
+
+    #[test]
+    fn issue_547_triple_nested_ordered_roundtrip() {
+        assert_roundtrip_byte_identical(
+            r#"{"version":1,"type":"doc","content":[{"type":"orderedList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"L1"}]},{"type":"orderedList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"L2"}]},{"type":"orderedList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"L3"}]}]}]}]}]}]}]}]}"#,
+        );
+    }
+
+    #[test]
+    fn issue_547_ordered_list_heading_rule_mix_roundtrip() {
+        assert_roundtrip_byte_identical(
+            r#"{"version":1,"type":"doc","content":[{"type":"heading","attrs":{"level":2},"content":[{"type":"text","text":"Title"}]},{"type":"orderedList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"x"}]}]}]},{"type":"rule"}]}"#,
+        );
+    }
+
+    #[test]
+    fn issue_547_ordered_list_listitem_localid_roundtrip() {
+        // listItem attrs must coexist with the no-attrs outer orderedList.
+        assert_roundtrip_byte_identical(
+            r#"{"version":1,"type":"doc","content":[{"type":"orderedList","content":[{"type":"listItem","attrs":{"localId":"li-001"},"content":[{"type":"paragraph","content":[{"type":"text","text":"first"}]}]}]}]}"#,
+        );
+    }
+
+    #[test]
+    fn issue_547_explicit_order_one_preserved_roundtrip() {
+        // Inverse regression (see PR #562 comment 4266630848): when the source
+        // ADF has an explicit `"attrs": {"order": 1}` the round-trip must
+        // preserve it, not strip it. A trailing `{order=1}` signal on the
+        // rendered markdown distinguishes explicit-default from omitted attrs.
+        assert_roundtrip_byte_identical(
+            r#"{"version":1,"type":"doc","content":[{"type":"orderedList","attrs":{"order":1},"content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"First item"}]}]}]}]}"#,
+        );
+    }
+
+    #[test]
+    fn issue_547_explicit_order_one_nested_preserved_roundtrip() {
+        // Both outer and inner orderedList have explicit `order: 1`; both must
+        // be preserved across the round-trip independently.
+        assert_roundtrip_byte_identical(
+            r#"{"version":1,"type":"doc","content":[{"type":"orderedList","attrs":{"order":1},"content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"outer"}]},{"type":"orderedList","attrs":{"order":1},"content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"inner"}]}]}]}]}]}]}"#,
+        );
+    }
+
+    #[test]
+    fn issue_547_mixed_explicit_and_implicit_order_roundtrip() {
+        // Sibling orderedLists with different attrs presence must round-trip
+        // independently: first has explicit `order: 1`, second omits attrs.
+        assert_roundtrip_byte_identical(
+            r#"{"version":1,"type":"doc","content":[{"type":"orderedList","attrs":{"order":1},"content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"a"}]}]}]},{"type":"orderedList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"b"}]}]}]}]}"#,
+        );
+    }
+
+    #[test]
+    fn issue_547_explicit_order_one_with_listitem_localid_roundtrip() {
+        // Explicit `order: 1` outer, plus a listItem `localId` inside — the
+        // trailing `{order=1}` line must not swallow or collide with listItem
+        // attrs.
+        assert_roundtrip_byte_identical(
+            r#"{"version":1,"type":"doc","content":[{"type":"orderedList","attrs":{"order":1},"content":[{"type":"listItem","attrs":{"localId":"li-1"},"content":[{"type":"paragraph","content":[{"type":"text","text":"first"}]}]}]}]}"#,
+        );
+    }
+
+    #[test]
+    fn issue_547_order_attr_signal_appears_only_for_explicit_one() {
+        // Render-layer guard: `{order=1}` appears in markdown only when the
+        // source ADF has explicit `attrs.order=1`. No signal for attrs=None,
+        // no signal for attrs.order>1 (marker already encodes the value).
+        let no_attrs = r#"{"version":1,"type":"doc","content":[{"type":"orderedList","content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"x"}]}]}]}]}"#;
+        let explicit_one = r#"{"version":1,"type":"doc","content":[{"type":"orderedList","attrs":{"order":1},"content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"x"}]}]}]}]}"#;
+        let order_five = r#"{"version":1,"type":"doc","content":[{"type":"orderedList","attrs":{"order":5},"content":[{"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"x"}]}]}]}]}"#;
+
+        let md_no =
+            adf_to_markdown(&serde_json::from_str::<AdfDocument>(no_attrs).unwrap()).unwrap();
+        let md_one =
+            adf_to_markdown(&serde_json::from_str::<AdfDocument>(explicit_one).unwrap()).unwrap();
+        let md_five =
+            adf_to_markdown(&serde_json::from_str::<AdfDocument>(order_five).unwrap()).unwrap();
+
+        assert!(
+            !md_no.contains("{order="),
+            "no-attrs source must not emit order signal, got: {md_no:?}"
+        );
+        assert!(
+            md_one.contains("{order=1}"),
+            "explicit order=1 must emit trailing signal, got: {md_one:?}"
+        );
+        assert!(
+            !md_five.contains("{order="),
+            "order=5 is already encoded by marker; must not emit signal, got: {md_five:?}"
+        );
     }
 
     // ── File media round-trip tests ─────────────────────────────────────
