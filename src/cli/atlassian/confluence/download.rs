@@ -7,13 +7,13 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use clap::{Parser, ValueEnum};
+use clap::{ArgGroup, Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 
 use crate::atlassian::api::AtlassianApi;
-use crate::atlassian::confluence_api::ConfluenceApi;
+use crate::atlassian::confluence_api::{ChildPage, ConfluenceApi};
 use crate::atlassian::document::content_item_to_document;
 use crate::cli::atlassian::format::ContentFormat;
 use crate::cli::atlassian::helpers::create_client;
@@ -31,13 +31,26 @@ pub enum OnConflict {
 }
 
 /// Recursively downloads a Confluence page tree.
+///
+/// Takes either a single root page ID (positional) or a space key
+/// (`--space`), from which every top-level page in the space becomes
+/// a separate root in the download tree.
 #[derive(Parser)]
+#[command(group(
+    ArgGroup::new("source")
+        .required(true)
+        .args(["id", "space"]),
+))]
 pub struct DownloadCommand {
     /// Root Confluence page ID to start from.
-    pub id: String,
+    pub id: Option<String>,
+
+    /// Space key — downloads every top-level page in the space.
+    #[arg(long)]
+    pub space: Option<String>,
 
     /// Output directory.
-    #[arg(long, default_value = ".")]
+    #[arg(long, alias = "output", default_value = ".")]
     pub output_dir: PathBuf,
 
     /// Output format per page.
@@ -51,6 +64,11 @@ pub struct DownloadCommand {
     /// Maximum tree depth (0 = unlimited).
     #[arg(long, default_value_t = 0)]
     pub max_depth: u32,
+
+    /// Only download pages whose title contains this substring (case-insensitive).
+    /// Children of non-matching pages are still traversed.
+    #[arg(long)]
+    pub title_filter: Option<String>,
 
     /// Use manifest for ID-aware resume (skip already-downloaded pages).
     #[arg(long)]
@@ -127,14 +145,34 @@ struct LogEntry {
 
 /// Parameters for a recursive download, decoupled from CLI parsing.
 struct DownloadParams {
-    id: String,
+    id: Option<String>,
+    space: Option<String>,
     output_dir: PathBuf,
     format: ContentFormat,
     concurrency: usize,
     max_depth: u32,
+    title_filter: Option<String>,
     resume: bool,
     on_conflict: OnConflict,
     instance_url: String,
+}
+
+impl DownloadParams {
+    /// Builds params from a CLI command and the resolved instance URL.
+    fn from_command(cmd: DownloadCommand, instance_url: String) -> Self {
+        Self {
+            id: cmd.id,
+            space: cmd.space,
+            output_dir: cmd.output_dir,
+            format: cmd.format,
+            concurrency: cmd.concurrency,
+            max_depth: cmd.max_depth,
+            title_filter: cmd.title_filter,
+            resume: cmd.resume,
+            on_conflict: cmd.on_conflict,
+            instance_url,
+        }
+    }
 }
 
 impl DownloadCommand {
@@ -142,16 +180,7 @@ impl DownloadCommand {
     pub async fn execute(self) -> Result<()> {
         let (client, instance_url) = create_client()?;
         let api = Arc::new(ConfluenceApi::new(client));
-        let params = DownloadParams {
-            id: self.id,
-            output_dir: self.output_dir,
-            format: self.format,
-            concurrency: self.concurrency,
-            max_depth: self.max_depth,
-            resume: self.resume,
-            on_conflict: self.on_conflict,
-            instance_url,
-        };
+        let params = DownloadParams::from_command(self, instance_url);
         run_download(&api, &params).await
     }
 }
@@ -166,6 +195,8 @@ async fn run_download(api: &Arc<ConfluenceApi>, params: &DownloadParams) -> Resu
 
     let timestamp = Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
     let backup_dir = params.output_dir.join(".backups").join(&timestamp);
+
+    let title_filter = params.title_filter.as_ref().map(|s| s.to_lowercase());
 
     let config = Arc::new(DownloadConfig {
         ext: file_extension(&params.format),
@@ -182,29 +213,44 @@ async fn run_download(api: &Arc<ConfluenceApi>, params: &DownloadParams) -> Resu
         BTreeMap::new()
     };
 
-    // Fetch root page to get its title
-    eprintln!("Fetching root page {}...", params.id);
-    let root = api.get_content(&params.id).await?;
-    let root_slug = slugify(&root.title);
-    let root_dir = params.output_dir.join(format!("{}-{}", root.id, root_slug));
-
-    let root_parent = match &root.metadata {
-        crate::atlassian::api::ContentMetadata::Confluence { parent_id, .. } => parent_id.clone(),
-        crate::atlassian::api::ContentMetadata::Jira { .. } => None,
-    };
-
+    // Seed the queue. Either one explicit root page or every
+    // top-level page in a space.
     let mut queue: VecDeque<PageTask> = VecDeque::new();
-    queue.push_back(PageTask {
-        id: root.id.clone(),
-        title: root.title.clone(),
-        dir: root_dir,
-        depth: 0,
-        parent_id: root_parent,
-    });
+    let roots = seed_roots(api, params.id.as_deref(), params.space.as_deref()).await?;
+    if roots.is_empty() {
+        eprintln!("No pages to download.");
+        return Ok(());
+    }
+    for root in roots {
+        let slug = slugify(&root.title);
+        let dir = params.output_dir.join(format!("{}-{}", root.id, slug));
+        queue.push_back(PageTask {
+            id: root.id,
+            title: root.title,
+            dir,
+            depth: 0,
+            parent_id: root.parent_id,
+        });
+    }
 
     let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     while let Some(task) = queue.pop_front() {
+        // Title filter: when present, non-matching pages are skipped
+        // (not downloaded) but their children are still enumerated.
+        if !title_matches(&title_filter, &task.title) {
+            stats.skipped.fetch_add(1, Ordering::Relaxed);
+            eprintln!("  Skipped (filter): {} - {}", task.id, task.title);
+            log_entries.lock().await.push(LogEntry {
+                action: "skipped".to_string(),
+                id: task.id.clone(),
+                path: String::new(),
+                detail: "title-filter".to_string(),
+            });
+            enqueue_children(api, &task, params.max_depth, &mut queue).await;
+            continue;
+        }
+
         let relative_path = task
             .dir
             .strip_prefix(&params.output_dir)
@@ -289,32 +335,7 @@ async fn run_download(api: &Arc<ConfluenceApi>, params: &DownloadParams) -> Resu
             );
         }
 
-        // Fetch children and enqueue (unless at max depth)
-        if params.max_depth > 0 && task.depth >= params.max_depth {
-            continue;
-        }
-
-        match api.get_children(&task.id).await {
-            Ok(children) => {
-                for child in children {
-                    let child_slug = slugify(&child.title);
-                    let child_dir = task.dir.join(format!("{}-{}", child.id, child_slug));
-                    queue.push_back(PageTask {
-                        id: child.id,
-                        title: child.title,
-                        dir: child_dir,
-                        depth: task.depth + 1,
-                        parent_id: Some(task.id.clone()),
-                    });
-                }
-            }
-            Err(e) => {
-                eprintln!(
-                    "WARNING: Failed to fetch children of {} ({}): {}",
-                    task.id, task.title, e
-                );
-            }
-        }
+        enqueue_children(api, &task, params.max_depth, &mut queue).await;
     }
 
     // Await all download tasks
@@ -345,6 +366,113 @@ async fn run_download(api: &Arc<ConfluenceApi>, params: &DownloadParams) -> Resu
     }
 
     Ok(())
+}
+
+/// A candidate root page for seeding the download queue.
+#[derive(Debug)]
+struct RootPage {
+    id: String,
+    title: String,
+    parent_id: Option<String>,
+}
+
+/// Resolves the starting set of pages. Either a single root page ID
+/// is given, or a space key from which every top-level page is used.
+async fn seed_roots(
+    api: &ConfluenceApi,
+    id: Option<&str>,
+    space: Option<&str>,
+) -> Result<Vec<RootPage>> {
+    if let Some(space_key) = space {
+        eprintln!("Resolving space {space_key}...");
+        let space_id = api
+            .resolve_space_id(space_key)
+            .await
+            .with_context(|| format!("Failed to resolve space key \"{space_key}\""))?;
+        eprintln!("Listing root pages in space {space_key}...");
+        let pages = api.get_space_root_pages(&space_id).await?;
+        eprintln!("Found {} root page(s) in space {space_key}.", pages.len());
+        return Ok(pages
+            .into_iter()
+            .map(|p| RootPage {
+                id: p.id,
+                title: p.title,
+                parent_id: None,
+            })
+            .collect());
+    }
+
+    let id = id.context("either a page ID or --space must be provided")?;
+    eprintln!("Fetching root page {id}...");
+    let root = api.get_content(id).await?;
+    Ok(vec![RootPage {
+        parent_id: metadata_parent_id(&root.metadata),
+        id: root.id,
+        title: root.title,
+    }])
+}
+
+/// Extracts the parent page ID from a content metadata variant.
+///
+/// Only the Confluence variant carries a parent page reference; any other
+/// variant returns `None`.
+fn metadata_parent_id(metadata: &crate::atlassian::api::ContentMetadata) -> Option<String> {
+    match metadata {
+        crate::atlassian::api::ContentMetadata::Confluence { parent_id, .. } => parent_id.clone(),
+        crate::atlassian::api::ContentMetadata::Jira { .. } => None,
+    }
+}
+
+/// Fetches a page's children and enqueues them for download.
+///
+/// Tolerates child-listing failures by logging a warning — one broken
+/// sub-tree shouldn't abort a whole-space download.
+async fn enqueue_children(
+    api: &ConfluenceApi,
+    task: &PageTask,
+    max_depth: u32,
+    queue: &mut VecDeque<PageTask>,
+) {
+    if max_depth > 0 && task.depth >= max_depth {
+        return;
+    }
+    match api.get_children(&task.id).await {
+        Ok(children) => {
+            for child in children {
+                queue.push_back(child_to_task(child, task));
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "WARNING: Failed to fetch children of {} ({}): {}",
+                task.id, task.title, e
+            );
+        }
+    }
+}
+
+/// Converts a `ChildPage` into a `PageTask` under the parent's directory.
+fn child_to_task(child: ChildPage, parent: &PageTask) -> PageTask {
+    let slug = slugify(&child.title);
+    let dir = parent.dir.join(format!("{}-{}", child.id, slug));
+    PageTask {
+        id: child.id,
+        title: child.title,
+        dir,
+        depth: parent.depth + 1,
+        parent_id: Some(parent.id.clone()),
+    }
+}
+
+/// Returns true when the page title matches the optional title filter.
+///
+/// An absent filter matches everything; a present filter does a
+/// case-insensitive substring match.
+fn title_matches(filter: &Option<String>, title: &str) -> bool {
+    match filter {
+        None => true,
+        Some(needle) => title.to_lowercase().contains(needle),
+    }
 }
 
 /// Spawns a download task for a page.
@@ -884,18 +1012,333 @@ mod tests {
     #[test]
     fn download_command_defaults() {
         let cmd = DownloadCommand {
-            id: "12345".to_string(),
+            id: Some("12345".to_string()),
+            space: None,
             output_dir: PathBuf::from("."),
             format: ContentFormat::Jfm,
             concurrency: 8,
             max_depth: 0,
+            title_filter: None,
             resume: false,
             on_conflict: OnConflict::Backup,
         };
-        assert_eq!(cmd.id, "12345");
+        assert_eq!(cmd.id.as_deref(), Some("12345"));
+        assert!(cmd.space.is_none());
         assert_eq!(cmd.concurrency, 8);
         assert!(!cmd.resume);
+        assert!(cmd.title_filter.is_none());
         assert!(matches!(cmd.on_conflict, OnConflict::Backup));
+    }
+
+    // ── metadata_parent_id ─────────────────────────────────────────
+
+    #[test]
+    fn metadata_parent_id_confluence_some() {
+        let meta = crate::atlassian::api::ContentMetadata::Confluence {
+            space_key: "ENG".to_string(),
+            status: Some("current".to_string()),
+            version: Some(1),
+            parent_id: Some("999".to_string()),
+        };
+        assert_eq!(metadata_parent_id(&meta).as_deref(), Some("999"));
+    }
+
+    #[test]
+    fn metadata_parent_id_confluence_none() {
+        let meta = crate::atlassian::api::ContentMetadata::Confluence {
+            space_key: "ENG".to_string(),
+            status: None,
+            version: None,
+            parent_id: None,
+        };
+        assert!(metadata_parent_id(&meta).is_none());
+    }
+
+    #[test]
+    fn metadata_parent_id_jira() {
+        let meta = crate::atlassian::api::ContentMetadata::Jira {
+            status: None,
+            issue_type: None,
+            assignee: None,
+            priority: None,
+            labels: Vec::new(),
+        };
+        assert!(metadata_parent_id(&meta).is_none());
+    }
+
+    // ── DownloadParams::from_command ───────────────────────────────
+
+    #[test]
+    fn from_command_copies_all_fields() {
+        let cmd = DownloadCommand {
+            id: Some("42".to_string()),
+            space: Some("ENG".to_string()),
+            output_dir: PathBuf::from("/tmp/out"),
+            format: ContentFormat::Adf,
+            concurrency: 4,
+            max_depth: 7,
+            title_filter: Some("needle".to_string()),
+            resume: true,
+            on_conflict: OnConflict::Overwrite,
+        };
+        let params = DownloadParams::from_command(cmd, "https://org.atlassian.net".to_string());
+
+        assert_eq!(params.id.as_deref(), Some("42"));
+        assert_eq!(params.space.as_deref(), Some("ENG"));
+        assert_eq!(params.output_dir, PathBuf::from("/tmp/out"));
+        assert_eq!(params.concurrency, 4);
+        assert_eq!(params.max_depth, 7);
+        assert_eq!(params.title_filter.as_deref(), Some("needle"));
+        assert!(params.resume);
+        assert!(matches!(params.format, ContentFormat::Adf));
+        assert!(matches!(params.on_conflict, OnConflict::Overwrite));
+        assert_eq!(params.instance_url, "https://org.atlassian.net");
+    }
+
+    // ── DownloadCommand::execute ───────────────────────────────────
+    //
+    // `execute` is a thin shim over `create_client()` + `run_download`
+    // (see STYLE-0025), but its body still participates in patch
+    // coverage. To cover it we point credentials at a wiremock server
+    // that returns 404, then assert the expected error bubbles up.
+    //
+    // Env vars are process-global, so serialise this test behind a
+    // mutex — the same pattern used in `src/atlassian/auth.rs` tests.
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn execute_runs_with_env_credentials() {
+        use std::sync::Mutex;
+        static ENV_MUTEX: Mutex<()> = Mutex::new(());
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/99999"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        std::env::set_var(crate::atlassian::auth::ATLASSIAN_INSTANCE_URL, server.uri());
+        std::env::set_var(crate::atlassian::auth::ATLASSIAN_EMAIL, "user@test.com");
+        std::env::set_var(crate::atlassian::auth::ATLASSIAN_API_TOKEN, "t");
+
+        let temp = tempfile::tempdir().unwrap();
+        let cmd = DownloadCommand {
+            id: Some("99999".to_string()),
+            space: None,
+            output_dir: temp.path().to_path_buf(),
+            format: ContentFormat::Jfm,
+            concurrency: 1,
+            max_depth: 0,
+            title_filter: None,
+            resume: false,
+            on_conflict: OnConflict::Overwrite,
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+
+        // Clean up — leaves the process in a known state for any other
+        // test that inspects these env vars (all guarded by ENV_MUTEX).
+        std::env::remove_var(crate::atlassian::auth::ATLASSIAN_INSTANCE_URL);
+        std::env::remove_var(crate::atlassian::auth::ATLASSIAN_EMAIL);
+        std::env::remove_var(crate::atlassian::auth::ATLASSIAN_API_TOKEN);
+    }
+
+    // ── title_matches ──────────────────────────────────────────────
+
+    #[test]
+    fn title_matches_absent_filter_accepts_all() {
+        assert!(title_matches(&None, "anything"));
+        assert!(title_matches(&None, ""));
+    }
+
+    #[test]
+    fn title_matches_exact_substring() {
+        let filter = Some("architecture".to_string());
+        assert!(title_matches(&filter, "System architecture overview"));
+    }
+
+    #[test]
+    fn title_matches_case_insensitive() {
+        let filter = Some("retro".to_string());
+        assert!(title_matches(&filter, "Q1 2026 RETRO Summary"));
+    }
+
+    #[test]
+    fn title_matches_no_match() {
+        let filter = Some("auth".to_string());
+        assert!(!title_matches(&filter, "Deployment Guide"));
+    }
+
+    #[test]
+    fn title_matches_empty_filter_matches_all() {
+        let filter = Some(String::new());
+        assert!(title_matches(&filter, "anything"));
+    }
+
+    // ── child_to_task ──────────────────────────────────────────────
+
+    #[test]
+    fn child_to_task_builds_nested_dir() {
+        let parent = PageTask {
+            id: "100".to_string(),
+            title: "Parent".to_string(),
+            dir: PathBuf::from("out/100-parent"),
+            depth: 1,
+            parent_id: None,
+        };
+        let child = ChildPage {
+            id: "200".to_string(),
+            title: "Child Page".to_string(),
+            status: String::new(),
+            parent_id: Some("100".to_string()),
+            space_key: None,
+        };
+        let task = child_to_task(child, &parent);
+
+        assert_eq!(task.id, "200");
+        assert_eq!(task.depth, 2);
+        assert_eq!(task.parent_id.as_deref(), Some("100"));
+        assert_eq!(task.dir, PathBuf::from("out/100-parent/200-child-page"));
+    }
+
+    // ── seed_roots ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn seed_roots_from_page_id() {
+        let server = wiremock::MockServer::start().await;
+        mock_leaf_page(&server, "12345").await;
+
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "user@test.com", "token")
+                .unwrap();
+        let api = ConfluenceApi::new(client);
+        let roots = seed_roots(&api, Some("12345"), None).await.unwrap();
+
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].id, "12345");
+    }
+
+    #[tokio::test]
+    async fn seed_roots_from_space_key() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces"))
+            .and(wiremock::matchers::query_param("keys", "AD"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": [{"id": "98765"}]})),
+            )
+            .mount(&server)
+            .await;
+
+        // The v2 `depth=root` endpoint returns only root pages, so the
+        // fixture here mirrors that — the API, not our code, does the
+        // filtering.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/98765/pages"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {"id": "111", "title": "Overview"},
+                        {"id": "333", "title": "Orphan Root"}
+                    ]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "user@test.com", "token")
+                .unwrap();
+        let api = ConfluenceApi::new(client);
+        let roots = seed_roots(&api, None, Some("AD")).await.unwrap();
+
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0].id, "111");
+        assert_eq!(roots[1].id, "333");
+    }
+
+    #[tokio::test]
+    async fn seed_roots_unknown_space_errors() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "user@test.com", "token")
+                .unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = seed_roots(&api, None, Some("NOPE")).await.unwrap_err();
+        assert!(err.to_string().contains("NOPE"));
+    }
+
+    #[tokio::test]
+    async fn seed_roots_neither_id_nor_space() {
+        let server = wiremock::MockServer::start().await;
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "user@test.com", "token")
+                .unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = seed_roots(&api, None, None).await.unwrap_err();
+        assert!(err.to_string().contains("page ID or --space"));
+    }
+
+    // ── enqueue_children ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn enqueue_children_respects_max_depth() {
+        let server = wiremock::MockServer::start().await;
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "user@test.com", "token")
+                .unwrap();
+        let api = ConfluenceApi::new(client);
+        let task = PageTask {
+            id: "100".to_string(),
+            title: "Leaf".to_string(),
+            dir: PathBuf::from("out/100-leaf"),
+            depth: 3,
+            parent_id: None,
+        };
+        let mut queue: VecDeque<PageTask> = VecDeque::new();
+        enqueue_children(&api, &task, 3, &mut queue).await;
+        assert!(queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn enqueue_children_swallows_errors() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/100/child/page",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("oops"))
+            .mount(&server)
+            .await;
+
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "user@test.com", "token")
+                .unwrap();
+        let api = ConfluenceApi::new(client);
+        let parent = PageTask {
+            id: "100".to_string(),
+            title: "Parent".to_string(),
+            dir: PathBuf::from("out/100-parent"),
+            depth: 0,
+            parent_id: None,
+        };
+        let mut queue: VecDeque<PageTask> = VecDeque::new();
+        enqueue_children(&api, &parent, 0, &mut queue).await;
+        assert!(queue.is_empty());
     }
 
     // ── DownloadStats ──────────────────────────────────────────────
@@ -953,27 +1396,37 @@ mod tests {
             .await;
     }
 
+    /// Default parameters for tests — override the fields you care about.
+    fn base_params(output_dir: &Path, instance_url: String) -> DownloadParams {
+        DownloadParams {
+            id: Some("12345".to_string()),
+            space: None,
+            output_dir: output_dir.to_path_buf(),
+            format: ContentFormat::Jfm,
+            concurrency: 2,
+            max_depth: 0,
+            title_filter: None,
+            resume: false,
+            on_conflict: OnConflict::Overwrite,
+            instance_url,
+        }
+    }
+
+    fn build_arc_api(server: &wiremock::MockServer) -> Arc<ConfluenceApi> {
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "user@test.com", "token")
+                .unwrap();
+        Arc::new(ConfluenceApi::new(client))
+    }
+
     #[tokio::test]
     async fn run_download_leaf_page_jfm() {
         let server = wiremock::MockServer::start().await;
         mock_leaf_page(&server, "12345").await;
 
-        let client =
-            crate::atlassian::client::AtlassianClient::new(&server.uri(), "user@test.com", "token")
-                .unwrap();
-        let api = Arc::new(ConfluenceApi::new(client));
+        let api = build_arc_api(&server);
         let temp = tempfile::tempdir().unwrap();
-
-        let params = DownloadParams {
-            id: "12345".to_string(),
-            output_dir: temp.path().to_path_buf(),
-            format: ContentFormat::Jfm,
-            concurrency: 2,
-            max_depth: 0,
-            resume: false,
-            on_conflict: OnConflict::Overwrite,
-            instance_url: server.uri(),
-        };
+        let params = base_params(temp.path(), server.uri());
 
         assert!(run_download(&api, &params).await.is_ok());
         assert!(temp.path().join("manifest.json").exists());
@@ -984,22 +1437,12 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         mock_leaf_page(&server, "12345").await;
 
-        let client =
-            crate::atlassian::client::AtlassianClient::new(&server.uri(), "user@test.com", "token")
-                .unwrap();
-        let api = Arc::new(ConfluenceApi::new(client));
+        let api = build_arc_api(&server);
         let temp = tempfile::tempdir().unwrap();
-
-        let params = DownloadParams {
-            id: "12345".to_string(),
-            output_dir: temp.path().to_path_buf(),
-            format: ContentFormat::Adf,
-            concurrency: 2,
-            max_depth: 1,
-            resume: false,
-            on_conflict: OnConflict::Skip,
-            instance_url: server.uri(),
-        };
+        let mut params = base_params(temp.path(), server.uri());
+        params.format = ContentFormat::Adf;
+        params.max_depth = 1;
+        params.on_conflict = OnConflict::Skip;
 
         assert!(run_download(&api, &params).await.is_ok());
     }
@@ -1009,10 +1452,7 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         mock_leaf_page(&server, "12345").await;
 
-        let client =
-            crate::atlassian::client::AtlassianClient::new(&server.uri(), "user@test.com", "token")
-                .unwrap();
-        let api = Arc::new(ConfluenceApi::new(client));
+        let api = build_arc_api(&server);
         let temp = tempfile::tempdir().unwrap();
 
         // Seed an existing manifest so resume takes the skip path.
@@ -1028,18 +1468,58 @@ mod tests {
         let manifest_path = temp.path().join("manifest.json");
         std::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap()).unwrap();
 
-        let params = DownloadParams {
-            id: "12345".to_string(),
-            output_dir: temp.path().to_path_buf(),
-            format: ContentFormat::Jfm,
-            concurrency: 2,
-            max_depth: 0,
-            resume: true,
-            on_conflict: OnConflict::Overwrite,
-            instance_url: server.uri(),
-        };
+        let mut params = base_params(temp.path(), server.uri());
+        params.resume = true;
 
         assert!(run_download(&api, &params).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_download_resume_moved_path_downloads() {
+        let server = wiremock::MockServer::start().await;
+        mock_leaf_page(&server, "12345").await;
+
+        let api = build_arc_api(&server);
+        let temp = tempfile::tempdir().unwrap();
+        // Pre-existing manifest has a different path for the same ID.
+        let manifest = serde_json::json!({
+            "12345": {"title": "Old Name", "path": "12345-old-name/index.md"}
+        });
+        std::fs::write(
+            temp.path().join("manifest.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let mut params = base_params(temp.path(), server.uri());
+        params.resume = true;
+        assert!(run_download(&api, &params).await.is_ok());
+
+        assert!(temp.path().join("12345-root-page/index.md").exists());
+    }
+
+    #[tokio::test]
+    async fn run_download_resume_new_page_downloads() {
+        let server = wiremock::MockServer::start().await;
+        mock_leaf_page(&server, "12345").await;
+
+        let api = build_arc_api(&server);
+        let temp = tempfile::tempdir().unwrap();
+        // Manifest exists but does not mention page "12345".
+        let manifest = serde_json::json!({
+            "999": {"title": "Other", "path": "999-other/index.md"}
+        });
+        std::fs::write(
+            temp.path().join("manifest.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let mut params = base_params(temp.path(), server.uri());
+        params.resume = true;
+        assert!(run_download(&api, &params).await.is_ok());
+
+        assert!(temp.path().join("12345-root-page/index.md").exists());
     }
 
     #[tokio::test]
@@ -1051,24 +1531,250 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client =
-            crate::atlassian::client::AtlassianClient::new(&server.uri(), "user@test.com", "token")
-                .unwrap();
-        let api = Arc::new(ConfluenceApi::new(client));
+        let api = build_arc_api(&server);
         let temp = tempfile::tempdir().unwrap();
-
-        let params = DownloadParams {
-            id: "99999".to_string(),
-            output_dir: temp.path().to_path_buf(),
-            format: ContentFormat::Jfm,
-            concurrency: 2,
-            max_depth: 0,
-            resume: false,
-            on_conflict: OnConflict::Overwrite,
-            instance_url: server.uri(),
-        };
+        let mut params = base_params(temp.path(), server.uri());
+        params.id = Some("99999".to_string());
 
         let err = run_download(&api, &params).await.unwrap_err();
         assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn run_download_child_fetch_failure_bails() {
+        let server = wiremock::MockServer::start().await;
+        // Page "100" — seeds successfully.
+        let page_json = serde_json::json!({
+            "id": "100",
+            "title": "Root",
+            "status": "current",
+            "spaceId": "98765",
+            "version": {"number": 1},
+            "body": {
+                "atlas_doc_format": {
+                    "value": "{\"version\":1,\"type\":\"doc\",\"content\":[]}"
+                }
+            }
+        });
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/100"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&page_json))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/98765"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"key": "ENG"})),
+            )
+            .mount(&server)
+            .await;
+        // Children of "100" returns a child whose get_content fails with 500.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/100/child/page",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{"id": "500", "title": "Broken"}]
+                })),
+            )
+            .mount(&server)
+            .await;
+        // Child's get_content returns 500 — download_page fails.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/500"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("nope"))
+            .mount(&server)
+            .await;
+        // Child's child listing returns empty so the loop terminates.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/500/child/page",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let api = build_arc_api(&server);
+        let temp = tempfile::tempdir().unwrap();
+        let mut params = base_params(temp.path(), server.uri());
+        params.id = Some("100".to_string());
+
+        let err = run_download(&api, &params).await.unwrap_err();
+        assert!(err.to_string().contains("failed to download"));
+    }
+
+    #[tokio::test]
+    async fn run_download_from_space() {
+        let server = wiremock::MockServer::start().await;
+
+        // resolve_space_id
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces"))
+            .and(wiremock::matchers::query_param("keys", "ENG"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": [{"id": "98765"}]})),
+            )
+            .mount(&server)
+            .await;
+
+        // list_space_root_pages — two roots
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/98765/pages"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {"id": "100", "title": "Alpha"},
+                        {"id": "200", "title": "Beta"}
+                    ]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        mock_leaf_page(&server, "100").await;
+        mock_leaf_page(&server, "200").await;
+
+        let api = build_arc_api(&server);
+        let temp = tempfile::tempdir().unwrap();
+        let mut params = base_params(temp.path(), server.uri());
+        params.id = None;
+        params.space = Some("ENG".to_string());
+
+        assert!(run_download(&api, &params).await.is_ok());
+        // Directory slugs come from the titles returned by
+        // list_space_root_pages (Alpha/Beta), not the get_content title.
+        assert!(temp.path().join("100-alpha/index.md").exists());
+        assert!(temp.path().join("200-beta/index.md").exists());
+    }
+
+    #[tokio::test]
+    async fn run_download_empty_space_early_return() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": [{"id": "98765"}]})),
+            )
+            .mount(&server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/98765/pages"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let api = build_arc_api(&server);
+        let temp = tempfile::tempdir().unwrap();
+        let mut params = base_params(temp.path(), server.uri());
+        params.id = None;
+        params.space = Some("EMPTY".to_string());
+
+        assert!(run_download(&api, &params).await.is_ok());
+        // No manifest written because we return before writing.
+        assert!(!temp.path().join("manifest.json").exists());
+    }
+
+    #[tokio::test]
+    async fn run_download_title_filter_skips_non_matching() {
+        let server = wiremock::MockServer::start().await;
+
+        // space → one root called "Welcome" with a child called "Architecture".
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": [{"id": "98765"}]})),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/98765/pages"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{"id": "100", "title": "Welcome"}]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        // children("100") = [{id: "200", title: "Architecture"}]
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/100/child/page",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{"id": "200", "title": "Architecture"}]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        // Mock the "Architecture" page so the download succeeds.
+        let page_json = serde_json::json!({
+            "id": "200",
+            "title": "Architecture",
+            "status": "current",
+            "spaceId": "98765",
+            "version": {"number": 1},
+            "parentId": "100",
+            "body": {
+                "atlas_doc_format": {
+                    "value": "{\"version\":1,\"type\":\"doc\",\"content\":[]}"
+                }
+            }
+        });
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/200"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&page_json))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/98765"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"key": "ENG"})),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/200/child/page",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let api = build_arc_api(&server);
+        let temp = tempfile::tempdir().unwrap();
+        let mut params = base_params(temp.path(), server.uri());
+        params.id = None;
+        params.space = Some("ENG".to_string());
+        params.title_filter = Some("architecture".to_string());
+
+        assert!(run_download(&api, &params).await.is_ok());
+
+        // Filtered-out root wrote no index.md.
+        assert!(!temp.path().join("100-welcome/index.md").exists());
+        // Matching child was downloaded under the filtered-out parent's dir.
+        assert!(temp
+            .path()
+            .join("100-welcome/200-architecture/index.md")
+            .exists());
     }
 }
