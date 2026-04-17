@@ -69,19 +69,36 @@ impl<'a> MarkdownParser<'a> {
     /// into `hardBreak` nodes.
     fn collect_hardbreak_continuations(&mut self, full_text: &mut String) {
         while has_trailing_hard_break(full_text) && !self.at_end() {
-            let next = self.current_line();
-            // Skip indented mediaSingle lines (`![`) — they are block-level
-            // siblings, not paragraph continuations (issue #490).
-            if let Some(stripped) = next
-                .strip_prefix("  ")
-                .filter(|s| !s.trim_start().starts_with("!["))
-            {
+            if !self.try_append_hardbreak_continuation(full_text) {
+                break;
+            }
+        }
+    }
+
+    /// If the current line is a valid hardBreak continuation (2-space indented
+    /// and not a block-level sibling marker), append it to `full_text` and
+    /// advance the parser.  Returns `true` on success, `false` otherwise.
+    ///
+    /// Split out from `collect_hardbreak_continuations` so the body appears
+    /// as its own function in coverage reports (issue #552 PR coverage gap).
+    fn try_append_hardbreak_continuation(&mut self, full_text: &mut String) -> bool {
+        // Skip indented block-level siblings — mediaSingle (`![` — issue
+        // #490), fenced code blocks (```` ``` ```` — issue #552), and
+        // container directives (`:::`).  They must stay available for their
+        // dedicated block handlers instead of being merged into paragraph
+        // text.
+        match self
+            .current_line()
+            .strip_prefix("  ")
+            .filter(|s| !is_block_level_continuation_marker(s.trim_start()))
+        {
+            Some(stripped) => {
                 full_text.push('\n');
                 full_text.push_str(stripped);
                 self.advance();
-                continue;
+                true
             }
-            break;
+            None => false,
         }
     }
 
@@ -1319,6 +1336,17 @@ fn has_trailing_hard_break(line: &str) -> bool {
     line.ends_with('\\') || line.ends_with("  ")
 }
 
+/// Returns true if the already-trimmed continuation line starts with a
+/// block-level marker that must not be swallowed as a paragraph continuation
+/// in `collect_hardbreak_continuations`.
+///
+/// Covers mediaSingle (`![` — issue #490), fenced code blocks (```` ``` ````
+/// — issue #552), and container directives (`:::`).  The caller is expected
+/// to have already stripped leading whitespace.
+fn is_block_level_continuation_marker(trimmed: &str) -> bool {
+    trimmed.starts_with("![") || trimmed.starts_with("```") || trimmed.starts_with(":::")
+}
+
 /// Checks if a line starts a list item.
 fn is_list_start(line: &str) -> bool {
     let trimmed = line.trim_start();
@@ -1483,16 +1511,23 @@ fn url_safe_in_bracket_content(s: &str) -> bool {
 /// parsed as emoji nodes during round-trip.  Only the leading colon is
 /// backslash-escaped, which is enough to prevent the parser from matching the
 /// pattern while the existing backslash-escape handler restores it on re-parse.
+///
+/// The character class for the name segment must match `try_parse_emoji_shortcode`
+/// exactly (Unicode `is_alphanumeric` plus `_`, `+`, `-`).  An ASCII-only escape
+/// would leave Unicode patterns like `:Café:` or `:ZBC::Zendesk::配置:` un-escaped
+/// while still being detected as emoji on re-parse, splitting the text node
+/// (issue #552).
 fn escape_emoji_shortcodes(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
 
     for (i, ch) in text.char_indices() {
         if ch == ':' {
-            // Check if this is a `:name:` pattern where name matches [a-zA-Z0-9_+-]+
+            // Check if this is a `:name:` pattern where name matches the
+            // same character class accepted by `try_parse_emoji_shortcode`.
             let after = i + 1;
             if after < text.len() {
                 let name_end = text[after..]
-                    .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '+' && c != '-')
+                    .find(|c: char| !c.is_alphanumeric() && c != '_' && c != '+' && c != '-')
                     .map_or(text[after..].len(), |pos| pos);
                 if name_end > 0
                     && after + name_end < text.len()
@@ -7675,6 +7710,391 @@ mod tests {
         assert_eq!(content[0].attrs.as_ref().unwrap()["shortName"], ":wave:");
         assert_eq!(content[1].node_type, "text");
         assert_eq!(content[1].text.as_deref().unwrap(), " says :hello: to you");
+    }
+
+    #[test]
+    fn code_block_with_shortcode_pattern_round_trips() {
+        // Issue #552: Code block content containing `::Name::` patterns must not
+        // be re-parsed as emoji shortcodes.
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"codeBlock","attrs":{"language":"ruby"},"content":[
+            {"type":"text","text":"module Foo::Bar::Baz\n  def hello\n    puts 'world'\n  end\nend"}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+
+        assert_eq!(
+            round_tripped.content.len(),
+            1,
+            "should be a single codeBlock"
+        );
+        let cb = &round_tripped.content[0];
+        assert_eq!(cb.node_type, "codeBlock");
+        let content = cb.content.as_ref().expect("codeBlock content");
+        assert_eq!(
+            content.len(),
+            1,
+            "should be a single text node: {content:?}"
+        );
+        assert_eq!(content[0].node_type, "text");
+        assert_eq!(
+            content[0].text.as_deref().unwrap(),
+            "module Foo::Bar::Baz\n  def hello\n    puts 'world'\n  end\nend"
+        );
+        assert!(
+            content.iter().all(|n| n.node_type != "emoji"),
+            "no emoji nodes should be present, got: {content:?}"
+        );
+    }
+
+    #[test]
+    fn code_block_with_exact_zendesk_shortcode_pattern_round_trips() {
+        // Issue #552: Use the exact pattern from the bug report.
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"codeBlock","attrs":{"language":"ruby"},"content":[
+            {"type":"text","text":"class ZBC::Zendesk::PlanType::Professional < Base"}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+
+        let cb = &round_tripped.content[0];
+        assert_eq!(cb.node_type, "codeBlock");
+        let content = cb.content.as_ref().expect("codeBlock content");
+        assert_eq!(content.len(), 1, "should be a single text node");
+        assert_eq!(
+            content[0].text.as_deref().unwrap(),
+            "class ZBC::Zendesk::PlanType::Professional < Base"
+        );
+    }
+
+    #[test]
+    fn code_block_with_literal_shortcode_round_trips() {
+        // Issue #552: Content that is exactly a shortcode (`:fire:`) inside a
+        // code block should survive the round-trip as literal text, not emoji.
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"codeBlock","attrs":{"language":"text"},"content":[
+            {"type":"text","text":":fire: :wave: :thumbsup:"}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+
+        let cb = &round_tripped.content[0];
+        assert_eq!(cb.node_type, "codeBlock");
+        let content = cb.content.as_ref().expect("codeBlock content");
+        assert_eq!(
+            content.len(),
+            1,
+            "should be a single text node: {content:?}"
+        );
+        assert_eq!(content[0].node_type, "text");
+        assert_eq!(
+            content[0].text.as_deref().unwrap(),
+            ":fire: :wave: :thumbsup:"
+        );
+    }
+
+    #[test]
+    fn inline_code_with_shortcode_pattern_round_trips() {
+        // Issue #552: Inline code containing `::Name::` patterns must not be
+        // re-parsed as emoji shortcodes.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"See "},
+          {"type":"text","text":"Foo::Bar::Baz","marks":[{"type":"code"}]},
+          {"type":"text","text":" for details"}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let content = round_tripped.content[0].content.as_ref().unwrap();
+
+        assert_eq!(content.len(), 3, "should have 3 text nodes: {content:?}");
+        assert_eq!(content[0].text.as_deref(), Some("See "));
+        assert_eq!(content[1].text.as_deref(), Some("Foo::Bar::Baz"));
+        assert!(content[1]
+            .marks
+            .as_ref()
+            .is_some_and(|m| m.iter().any(|mk| mk.mark_type == "code")));
+        assert_eq!(content[2].text.as_deref(), Some(" for details"));
+        assert!(
+            content.iter().all(|n| n.node_type != "emoji"),
+            "no emoji nodes should be present"
+        );
+    }
+
+    #[test]
+    fn inline_code_with_literal_shortcode_round_trips() {
+        // Issue #552: Inline code whose content is exactly a shortcode must be
+        // preserved as code, not converted to an emoji.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":":fire:","marks":[{"type":"code"}]}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let content = round_tripped.content[0].content.as_ref().unwrap();
+
+        assert_eq!(
+            content.len(),
+            1,
+            "should be a single code node: {content:?}"
+        );
+        assert_eq!(content[0].node_type, "text");
+        assert_eq!(content[0].text.as_deref(), Some(":fire:"));
+        assert!(content[0]
+            .marks
+            .as_ref()
+            .is_some_and(|m| m.iter().any(|mk| mk.mark_type == "code")));
+    }
+
+    #[test]
+    fn code_block_in_list_with_shortcode_pattern_round_trips() {
+        // Issue #552: A code block containing shortcode-like patterns nested in
+        // a list should still survive round-trip without emoji corruption.
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"bulletList","content":[
+            {"type":"listItem","content":[
+              {"type":"codeBlock","attrs":{"language":"ruby"},"content":[
+                {"type":"text","text":"Foo::Bar::Baz"}
+              ]}
+            ]}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+
+        let list = &round_tripped.content[0];
+        assert_eq!(list.node_type, "bulletList");
+        let item = &list.content.as_ref().unwrap()[0];
+        assert_eq!(item.node_type, "listItem");
+        let cb = &item.content.as_ref().unwrap()[0];
+        assert_eq!(cb.node_type, "codeBlock");
+        let cb_content = cb.content.as_ref().unwrap();
+        assert_eq!(cb_content[0].text.as_deref(), Some("Foo::Bar::Baz"));
+        assert_eq!(cb_content[0].node_type, "text");
+    }
+
+    #[test]
+    fn code_block_with_unicode_shortcode_pattern_round_trips() {
+        // Issue #552: Code block content with non-ASCII colon-delimited words
+        // (e.g. CJK or accented characters) must round-trip without splitting
+        // or emoji corruption.
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"codeBlock","attrs":{"language":"ruby"},"content":[
+            {"type":"text","text":"class ZBC::配置::Production < Base"}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+
+        let cb = &round_tripped.content[0];
+        assert_eq!(cb.node_type, "codeBlock");
+        let content = cb.content.as_ref().expect("codeBlock content");
+        assert_eq!(content.len(), 1);
+        assert_eq!(
+            content[0].text.as_deref().unwrap(),
+            "class ZBC::配置::Production < Base"
+        );
+    }
+
+    #[test]
+    fn list_item_hardbreak_then_code_block_round_trips() {
+        // Issue #552: A list item whose first paragraph ends with a hardBreak
+        // followed by a codeBlock must round-trip correctly.  Previously, the
+        // hardBreak's `\` continuation swallowed the 2-space-indented code
+        // fence line, turning the whole block into a paragraph where `::Bar::`
+        // was re-parsed as an emoji.
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"bulletList","content":[
+            {"type":"listItem","content":[
+              {"type":"paragraph","content":[
+                {"type":"text","text":"Consider removing this check."},
+                {"type":"hardBreak"}
+              ]},
+              {"type":"codeBlock","content":[
+                {"type":"text","text":"x = Foo::Bar::Baz.new"}
+              ]}
+            ]}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+
+        let list = &round_tripped.content[0];
+        assert_eq!(list.node_type, "bulletList");
+        let item = &list.content.as_ref().unwrap()[0];
+        assert_eq!(item.node_type, "listItem");
+        let item_content = item.content.as_ref().unwrap();
+        assert_eq!(
+            item_content.len(),
+            2,
+            "listItem should have paragraph + codeBlock, got: {item_content:?}"
+        );
+        assert_eq!(item_content[0].node_type, "paragraph");
+        assert_eq!(item_content[1].node_type, "codeBlock");
+
+        // The code block text must survive verbatim — no emoji splitting.
+        let cb_content = item_content[1].content.as_ref().unwrap();
+        assert_eq!(cb_content[0].node_type, "text");
+        assert_eq!(
+            cb_content[0].text.as_deref().unwrap(),
+            "x = Foo::Bar::Baz.new"
+        );
+
+        // And there should be no emoji node anywhere in the tree.
+        assert!(
+            item_content
+                .iter()
+                .flat_map(|n| n.content.iter().flat_map(|c| c.iter()))
+                .all(|n| n.node_type != "emoji"),
+            "no emoji nodes should be present, got: {item_content:?}"
+        );
+    }
+
+    #[test]
+    fn list_item_hardbreak_then_nested_list_still_works() {
+        // Ensure the hardBreak continuation fix doesn't break nested list
+        // handling — an indented `- item` line after a hardBreak is still a
+        // nested list, not a code fence.
+        let md = "- first\\\n  continuation text\\\n  - nested item\n";
+        let doc = markdown_to_adf(md).unwrap();
+        let list = &doc.content[0];
+        assert_eq!(list.node_type, "bulletList");
+        let item = &list.content.as_ref().unwrap()[0];
+        // First paragraph should contain the continuation text joined via hardBreaks
+        let item_content = item.content.as_ref().unwrap();
+        let para = &item_content[0];
+        assert_eq!(para.node_type, "paragraph");
+        let para_nodes = para.content.as_ref().unwrap();
+        assert!(
+            para_nodes
+                .iter()
+                .any(|n| n.text.as_deref() == Some("continuation text")),
+            "continuation text should survive: {para_nodes:?}"
+        );
+    }
+
+    #[test]
+    fn list_item_hardbreak_then_image_still_works() {
+        // Regression check for issue #490: the image-skip behaviour in
+        // collect_hardbreak_continuations must still hold after the code-fence
+        // fix.  The `![](url)` line must remain a block-level mediaSingle, not
+        // be swallowed into the paragraph.
+        let md = "- first\\\n  ![](https://example.com/x.png){type=file id=x}\n";
+        let doc = markdown_to_adf(md).unwrap();
+        let list = &doc.content[0];
+        let item = &list.content.as_ref().unwrap()[0];
+        let item_content = item.content.as_ref().unwrap();
+        // The image should be a sibling block, not part of the first paragraph.
+        assert!(
+            item_content.iter().any(|n| n.node_type == "mediaSingle"),
+            "mediaSingle should still be a block-level sibling, got: {item_content:?}"
+        );
+    }
+
+    #[test]
+    fn list_item_hardbreak_then_container_directive_round_trips() {
+        // Issue #552: Same hardBreak-swallows-block-siblings bug class — a
+        // container directive (`:::panel`) after a hardBreak must also not be
+        // consumed as a continuation line.
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"bulletList","content":[
+            {"type":"listItem","content":[
+              {"type":"paragraph","content":[
+                {"type":"text","text":"intro"},
+                {"type":"hardBreak"}
+              ]},
+              {"type":"panel","attrs":{"panelType":"info"},"content":[
+                {"type":"paragraph","content":[
+                  {"type":"text","text":"panel body"}
+                ]}
+              ]}
+            ]}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+
+        let item = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let item_content = item.content.as_ref().unwrap();
+        assert!(
+            item_content.iter().any(|n| n.node_type == "panel"),
+            "panel should survive as block-level sibling, got: {item_content:?}"
+        );
+    }
+
+    #[test]
+    fn inline_code_with_unicode_shortcode_pattern_round_trips() {
+        // Issue #552: Inline code containing non-ASCII colon-delimited words
+        // must round-trip without emoji corruption.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"See "},
+          {"type":"text","text":"ZBC::配置::Production","marks":[{"type":"code"}]},
+          {"type":"text","text":" for prod"}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let content = round_tripped.content[0].content.as_ref().unwrap();
+
+        assert_eq!(content.len(), 3, "should have 3 nodes: {content:?}");
+        assert_eq!(content[1].text.as_deref(), Some("ZBC::配置::Production"));
+        assert!(content[1]
+            .marks
+            .as_ref()
+            .is_some_and(|m| m.iter().any(|mk| mk.mark_type == "code")));
+    }
+
+    #[test]
+    fn code_block_followed_by_shortcode_text_round_trips() {
+        // Issue #552: A code block with colon-delimited content followed by a
+        // paragraph containing emoji-like text should not confuse parsing.
+        let adf_json = r#"{"version":1,"type":"doc","content":[
+          {"type":"codeBlock","attrs":{"language":"ruby"},"content":[
+            {"type":"text","text":"Foo::Bar::Baz"}
+          ]},
+          {"type":"paragraph","content":[
+            {"type":"text","text":"Status::Active::Running"}
+          ]}
+        ]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+
+        assert_eq!(round_tripped.content.len(), 2);
+        let cb = &round_tripped.content[0];
+        assert_eq!(cb.node_type, "codeBlock");
+        let cb_content = cb.content.as_ref().unwrap();
+        assert_eq!(cb_content[0].text.as_deref(), Some("Foo::Bar::Baz"));
+
+        let para = &round_tripped.content[1];
+        assert_eq!(para.node_type, "paragraph");
+        let para_content = para.content.as_ref().unwrap();
+        assert_eq!(para_content.len(), 1);
+        assert_eq!(para_content[0].node_type, "text");
+        assert_eq!(
+            para_content[0].text.as_deref(),
+            Some("Status::Active::Running")
+        );
     }
 
     #[test]
@@ -17370,6 +17790,94 @@ C
     }
 
     #[test]
+    fn escape_emoji_shortcodes_unicode() {
+        // Issue #552: Unicode alphanumeric chars must be escaped to match
+        // `try_parse_emoji_shortcode`, which uses `is_alphanumeric` (not the
+        // ASCII-only variant).  Without this, `:Café:` rendered un-escaped
+        // would be re-parsed as an emoji on round-trip.
+        assert_eq!(escape_emoji_shortcodes(":Café:"), r"\:Café:");
+        assert_eq!(escape_emoji_shortcodes(":über:"), r"\:über:");
+        assert_eq!(escape_emoji_shortcodes(":配置:"), r"\:配置:");
+        assert_eq!(
+            escape_emoji_shortcodes("ZBC::配置::Production"),
+            r"ZBC:\:配置::Production"
+        );
+    }
+
+    #[test]
+    fn escape_emoji_shortcodes_mixed_script_name() {
+        // Issue #552: A name that mixes ASCII and Unicode alphanumerics is
+        // still a single valid shortcode under `is_alphanumeric`.
+        assert_eq!(escape_emoji_shortcodes(":abc配置:"), r"\:abc配置:");
+        assert_eq!(escape_emoji_shortcodes(":配置abc:"), r"\:配置abc:");
+    }
+
+    #[test]
+    fn escape_emoji_shortcodes_unicode_followed_by_non_colon() {
+        // `:Café world:` — `Café` is alphanumeric but the terminator is a
+        // space, not `:`, so the `after + name_end < text.len()` path is
+        // exercised but the final `== b':'` check bails out and nothing
+        // gets escaped.  Guards the negative branch of the predicate.
+        assert_eq!(escape_emoji_shortcodes(":Café world:"), ":Café world:");
+    }
+
+    #[test]
+    fn escape_emoji_shortcodes_name_runs_to_end() {
+        // Colon followed by alphanumerics to end of string: `.find(...)` returns
+        // `None`, so `name_end` falls back to the full remaining length via
+        // `map_or`.  The `after + name_end < text.len()` check then fails and
+        // nothing is escaped.  Exercises the `map_or` default branch for both
+        // ASCII and Unicode names.
+        assert_eq!(escape_emoji_shortcodes(":abc"), ":abc");
+        assert_eq!(escape_emoji_shortcodes(":配置"), ":配置");
+    }
+
+    #[test]
+    fn unicode_shortcode_pattern_text_round_trips_as_text() {
+        // Issue #552: A text node containing `:Café:` must round-trip as text,
+        // not be split into text + emoji nodes.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"Visit :Café: today"}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let content = round_tripped.content[0].content.as_ref().unwrap();
+
+        assert_eq!(
+            content.len(),
+            1,
+            "should be a single text node, got: {content:?}"
+        );
+        assert_eq!(content[0].node_type, "text");
+        assert_eq!(content[0].text.as_deref().unwrap(), "Visit :Café: today");
+    }
+
+    #[test]
+    fn unicode_double_colon_pattern_text_round_trips() {
+        // Issue #552: `ZBC::配置::Production` should round-trip without splitting.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"Use ZBC::配置::Production for prod"}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let content = round_tripped.content[0].content.as_ref().unwrap();
+
+        assert_eq!(
+            content.len(),
+            1,
+            "should be a single text node, got: {content:?}"
+        );
+        assert_eq!(
+            content[0].text.as_deref().unwrap(),
+            "Use ZBC::配置::Production for prod"
+        );
+    }
+
+    #[test]
     fn merge_adjacent_text_nodes() {
         let mut nodes = vec![AdfNode::text("a"), AdfNode::text("b"), AdfNode::text("c")];
         merge_adjacent_text(&mut nodes);
@@ -18055,6 +18563,72 @@ C
         // Parser should still be on the image line (not past it).
         assert!(!parser.at_end());
         assert!(parser.current_line().contains("![](url)"));
+    }
+
+    #[test]
+    fn is_block_level_continuation_marker_positive_cases() {
+        // Each marker that forces `collect_hardbreak_continuations` to stop.
+        assert!(is_block_level_continuation_marker("![](url)"));
+        assert!(is_block_level_continuation_marker("```ruby"));
+        assert!(is_block_level_continuation_marker(":::panel{type=info}"));
+    }
+
+    #[test]
+    fn is_block_level_continuation_marker_negative_cases() {
+        // Plain continuation text must NOT look like a block-level marker.
+        assert!(!is_block_level_continuation_marker("plain text"));
+        assert!(!is_block_level_continuation_marker("- nested item"));
+        assert!(!is_block_level_continuation_marker("continuation\\"));
+        assert!(!is_block_level_continuation_marker(""));
+        // Double-colon `::` is not a container directive.
+        assert!(!is_block_level_continuation_marker("::partial"));
+        // Single backticks are inline code, not a fence.
+        assert!(!is_block_level_continuation_marker("`inline`"));
+    }
+
+    #[test]
+    fn collect_hardbreak_continuations_stops_before_code_fence() {
+        // Issue #552: An indented continuation that opens a fenced code block
+        // must NOT be swallowed as a paragraph continuation — it has to stay
+        // available for `try_code_block` on the next parse iteration.
+        let input = "text\\\n  ```ruby\n  Foo::Bar::Baz\n  ```\n";
+        let mut parser = MarkdownParser::new(input);
+        parser.advance();
+        let mut text = "text\\".to_string();
+        parser.collect_hardbreak_continuations(&mut text);
+        assert_eq!(text, "text\\");
+        assert!(!parser.at_end());
+        assert!(parser.current_line().starts_with("  ```"));
+    }
+
+    #[test]
+    fn collect_hardbreak_continuations_stops_before_container_directive() {
+        // Issue #552: An indented continuation that opens a `:::` container
+        // directive (panel, expand, etc.) must also stay available for the
+        // directive parser.
+        let input = "text\\\n  :::panel{type=info}\n  body\n  :::\n";
+        let mut parser = MarkdownParser::new(input);
+        parser.advance();
+        let mut text = "text\\".to_string();
+        parser.collect_hardbreak_continuations(&mut text);
+        assert_eq!(text, "text\\");
+        assert!(!parser.at_end());
+        assert!(parser.current_line().contains(":::panel"));
+    }
+
+    #[test]
+    fn collect_hardbreak_continuations_stops_before_indented_code_fence() {
+        // Variant: extra leading whitespace on the code-fence line (so the
+        // stripped tail is `  ```` rather than a bare ` ``` `) must still be
+        // recognised by the `trim_start().starts_with("```")` check.
+        let input = "text\\\n     ```text\n     :fire:\n     ```\n";
+        let mut parser = MarkdownParser::new(input);
+        parser.advance();
+        let mut text = "text\\".to_string();
+        parser.collect_hardbreak_continuations(&mut text);
+        assert_eq!(text, "text\\");
+        assert!(!parser.at_end());
+        assert!(parser.current_line().contains("```text"));
     }
 
     #[test]
