@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Confluence Bulk Space Download**: `confluence download` now accepts `--space <KEY>` to recursively download every page in a Confluence space, plus `--title-filter` to download only pages whose title contains a substring (case-insensitive)
 
+### Changed
+- **CI Coverage**: Switched coverage tooling from `cargo-tarpaulin` to `cargo-llvm-cov` to eliminate `.await?` false negatives and improve accuracy for async code, macros, and generics
+
 ### Fixed
 - **Empty Task Checkboxes**: Recognise `- [ ]` and `- [x]` markdown task markers
   even when the checkbox is not followed by a trailing space. Fixes ADF
