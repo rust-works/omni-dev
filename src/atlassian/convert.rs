@@ -9,7 +9,7 @@ use chrono::NaiveDate;
 use tracing::{debug, warn};
 
 use crate::atlassian::adf::{AdfDocument, AdfMark, AdfNode};
-use crate::atlassian::attrs::parse_attrs;
+use crate::atlassian::attrs::{format_kv, parse_attrs};
 use crate::atlassian::directive::{
     is_container_close, try_parse_container_open, try_parse_inline_directive,
     try_parse_leaf_directive,
@@ -1503,6 +1503,10 @@ fn try_parse_media_single_from_line(line: &str) -> Option<AdfNode> {
                 if let Some(collection) = attrs.get("collection") {
                     media_attrs["collection"] = serde_json::Value::String(collection.to_string());
                 }
+                if let Some(occurrence_key) = attrs.get("occurrenceKey") {
+                    media_attrs["occurrenceKey"] =
+                        serde_json::Value::String(occurrence_key.to_string());
+                }
                 if let Some(height) = attrs.get("height") {
                     if let Some(h) = parse_numeric_attr(height) {
                         media_attrs["height"] = h;
@@ -2587,7 +2591,7 @@ fn maybe_push_local_id(attrs: &serde_json::Value, parts: &mut Vec<String>, opts:
     }
     if let Some(local_id) = attrs.get("localId").and_then(serde_json::Value::as_str) {
         if !local_id.is_empty() && local_id != "00000000-0000-0000-0000-000000000000" {
-            parts.push(format!("localId={local_id}"));
+            parts.push(format_kv("localId", local_id));
         }
     }
 }
@@ -3775,10 +3779,16 @@ fn render_media(
             output.push_str(&format!("![{alt}]()"));
             let mut parts = vec!["type=file".to_string()];
             if let Some(id) = attrs.get("id").and_then(serde_json::Value::as_str) {
-                parts.push(format!("id={id}"));
+                parts.push(format_kv("id", id));
             }
             if let Some(collection) = attrs.get("collection").and_then(serde_json::Value::as_str) {
-                parts.push(format!("collection={collection}"));
+                parts.push(format_kv("collection", collection));
+            }
+            if let Some(occurrence_key) = attrs
+                .get("occurrenceKey")
+                .and_then(serde_json::Value::as_str)
+            {
+                parts.push(format_kv("occurrenceKey", occurrence_key));
             }
             if let Some(height_str) = attrs.get("height").and_then(fmt_numeric_attr) {
                 parts.push(format!("height={height_str}"));
@@ -4080,21 +4090,21 @@ fn render_non_text_inline_body(
             if let Some(ref attrs) = node.attrs {
                 let mut attr_parts = Vec::new();
                 if let Some(media_type) = attrs.get("type").and_then(serde_json::Value::as_str) {
-                    attr_parts.push(format!("type={media_type}"));
+                    attr_parts.push(format_kv("type", media_type));
                 }
                 if let Some(id) = attrs.get("id").and_then(serde_json::Value::as_str) {
-                    attr_parts.push(format!("id={id}"));
+                    attr_parts.push(format_kv("id", id));
                 }
                 if let Some(collection) =
                     attrs.get("collection").and_then(serde_json::Value::as_str)
                 {
-                    attr_parts.push(format!("collection={collection}"));
+                    attr_parts.push(format_kv("collection", collection));
                 }
                 if let Some(url) = attrs.get("url").and_then(serde_json::Value::as_str) {
-                    attr_parts.push(format!("url={url}"));
+                    attr_parts.push(format_kv("url", url));
                 }
                 if let Some(alt) = attrs.get("alt").and_then(serde_json::Value::as_str) {
-                    attr_parts.push(format!("alt={alt}"));
+                    attr_parts.push(format_kv("alt", alt));
                 }
                 if let Some(width) = attrs.get("width").and_then(serde_json::Value::as_u64) {
                     attr_parts.push(format!("width={width}"));
@@ -12916,6 +12926,262 @@ mod tests {
         assert_eq!(attrs["height"], 56);
         assert_eq!(attrs["width"], 312);
         assert_eq!(attrs["alt"], "Screenshot.png");
+    }
+
+    /// Issue #550: roundtrip of mediaSingle with file-type media preserves all
+    /// file attributes (type, id, collection, width, height). Regression guard
+    /// for the exact reproducer in the issue body.
+    #[test]
+    fn file_media_roundtrip_issue_550_reproducer() {
+        let adf_json = r#"{
+          "version": 1,
+          "type": "doc",
+          "content": [
+            {
+              "type": "mediaSingle",
+              "attrs": {"layout": "center"},
+              "content": [
+                {
+                  "type": "media",
+                  "attrs": {
+                    "type": "file",
+                    "id": "abc-123-def-456",
+                    "collection": "my-collection",
+                    "width": 941,
+                    "height": 655
+                  }
+                }
+              ]
+            }
+          ]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(adf_json).unwrap();
+        let actual = serde_json::to_value(&rt).unwrap();
+        assert_eq!(
+            actual, expected,
+            "roundtrip should preserve file media attrs; md was:\n{md}"
+        );
+    }
+
+    /// Issue #550 (updated reproducer): roundtrip of a file-media `id`
+    /// containing spaces must not truncate the value. Before the fix, the
+    /// JFM renderer emitted `id=abc 123 def 456` unquoted and the parser
+    /// treated the first space as a value terminator, so the `id` became
+    /// `"abc"` after round-trip.
+    #[test]
+    fn file_media_roundtrip_id_with_spaces() {
+        let adf_json = r#"{
+          "version": 1,
+          "type": "doc",
+          "content": [
+            {
+              "type": "mediaSingle",
+              "attrs": {"layout": "center"},
+              "content": [
+                {
+                  "type": "media",
+                  "attrs": {
+                    "type": "file",
+                    "id": "abc 123 def 456",
+                    "collection": "my-collection",
+                    "width": 800,
+                    "height": 600
+                  }
+                }
+              ]
+            }
+          ]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains(r#"id="abc 123 def 456""#),
+            "id with spaces should be quoted in JFM, got:\n{md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(adf_json).unwrap();
+        let actual = serde_json::to_value(&rt).unwrap();
+        assert_eq!(
+            actual, expected,
+            "space-containing id must round-trip; md was:\n{md}"
+        );
+    }
+
+    /// Space-containing `collection` values must round-trip.
+    #[test]
+    fn file_media_roundtrip_collection_with_spaces() {
+        let adf_json = r#"{
+          "version": 1,
+          "type": "doc",
+          "content": [
+            {
+              "type": "mediaSingle",
+              "attrs": {"layout": "center"},
+              "content": [
+                {
+                  "type": "media",
+                  "attrs": {
+                    "type": "file",
+                    "id": "abc-123",
+                    "collection": "my collection with spaces"
+                  }
+                }
+              ]
+            }
+          ]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let media = &rt.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(
+            media.attrs.as_ref().unwrap()["collection"],
+            "my collection with spaces"
+        );
+    }
+
+    /// Space-containing `occurrenceKey` values must round-trip.
+    #[test]
+    fn file_media_roundtrip_occurrence_key_with_spaces() {
+        let adf_json = r#"{
+          "version": 1,
+          "type": "doc",
+          "content": [
+            {
+              "type": "mediaSingle",
+              "attrs": {"layout": "center"},
+              "content": [
+                {
+                  "type": "media",
+                  "attrs": {
+                    "type": "file",
+                    "id": "x",
+                    "collection": "y",
+                    "occurrenceKey": "key with spaces"
+                  }
+                }
+              ]
+            }
+          ]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let media = &rt.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(
+            media.attrs.as_ref().unwrap()["occurrenceKey"],
+            "key with spaces"
+        );
+    }
+
+    /// Values with embedded `"` must be escape-quoted and round-trip.
+    #[test]
+    fn file_media_roundtrip_id_with_quote_char() {
+        let adf_json = r#"{
+          "version": 1,
+          "type": "doc",
+          "content": [
+            {
+              "type": "mediaSingle",
+              "attrs": {"layout": "center"},
+              "content": [
+                {
+                  "type": "media",
+                  "attrs": {
+                    "type": "file",
+                    "id": "a\"b\"c",
+                    "collection": "col"
+                  }
+                }
+              ]
+            }
+          ]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let media = &rt.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(media.attrs.as_ref().unwrap()["id"], "a\"b\"c");
+    }
+
+    /// `mediaInline` string attrs with spaces must round-trip (parallel fix
+    /// for the inline-directive rendering path).
+    #[test]
+    fn media_inline_roundtrip_id_with_spaces() {
+        let adf_json = r#"{
+          "version": 1,
+          "type": "doc",
+          "content": [
+            {
+              "type": "paragraph",
+              "content": [
+                {"type": "text", "text": "before "},
+                {
+                  "type": "mediaInline",
+                  "attrs": {
+                    "type": "file",
+                    "id": "a b c",
+                    "collection": "my col"
+                  }
+                },
+                {"type": "text", "text": " after"}
+              ]
+            }
+          ]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let inline = &rt.content[0].content.as_ref().unwrap()[1];
+        assert_eq!(inline.node_type, "mediaInline");
+        let attrs = inline.attrs.as_ref().unwrap();
+        assert_eq!(attrs["id"], "a b c");
+        assert_eq!(attrs["collection"], "my col");
+    }
+
+    /// Issue #550: `occurrenceKey` attribute is a standard ADF media attr and
+    /// must be preserved through ADF→JFM→ADF roundtrip.
+    #[test]
+    fn file_media_roundtrip_preserves_occurrence_key() {
+        let adf_json = r#"{
+          "version": 1,
+          "type": "doc",
+          "content": [
+            {
+              "type": "mediaSingle",
+              "attrs": {"layout": "center"},
+              "content": [
+                {
+                  "type": "media",
+                  "attrs": {
+                    "type": "file",
+                    "id": "abc-123",
+                    "collection": "my-collection",
+                    "occurrenceKey": "unique-key-xyz",
+                    "width": 200,
+                    "height": 100
+                  }
+                }
+              ]
+            }
+          ]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("occurrenceKey=unique-key-xyz"),
+            "expected occurrenceKey in markdown, got: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let media = &rt.content[0].content.as_ref().unwrap()[0];
+        let attrs = media.attrs.as_ref().unwrap();
+        assert_eq!(attrs["occurrenceKey"], "unique-key-xyz");
+        assert_eq!(attrs["type"], "file");
+        assert_eq!(attrs["id"], "abc-123");
+        assert_eq!(attrs["collection"], "my-collection");
     }
 
     // ── mediaSingle caption tests (issue #470) ──────────────────────────

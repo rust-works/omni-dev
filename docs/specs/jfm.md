@@ -385,6 +385,13 @@ File-hosted media:
 ![alt](){type=file id=UUID collection=NAME width=N height=N}
 ```
 
+The `occurrenceKey` attribute is preserved when present on the ADF `media`
+node:
+
+```markdown
+![alt](){type=file id=UUID collection=NAME occurrenceKey=KEY width=N height=N}
+```
+
 External media:
 
 ```markdown
