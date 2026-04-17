@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::atlassian::client::{JiraIssueLink, JiraLinkType};
+use crate::atlassian::client::{AtlassianClient, JiraIssueLink, JiraLinkType};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -58,12 +58,7 @@ impl ListLinksCommand {
     /// Fetches and displays issue links.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        let links = client.get_issue_links(&self.key).await?;
-        if output_as(&links, &self.output)? {
-            return Ok(());
-        }
-        print_issue_links(&self.key, &links);
-        Ok(())
+        run_list_links(&client, &self.key, &self.output).await
     }
 }
 
@@ -79,12 +74,7 @@ impl TypesCommand {
     /// Fetches and displays link types.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        let types = client.get_link_types().await?;
-        if output_as(&types, &self.output)? {
-            return Ok(());
-        }
-        print_link_types(&types);
-        Ok(())
+        run_link_types(&client, &self.output).await
     }
 }
 
@@ -108,17 +98,7 @@ impl CreateLinkCommand {
     /// Creates the issue link.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        client
-            .create_issue_link(&self.r#type, &self.inward, &self.outward)
-            .await?;
-        println!(
-            "Linked {} {} {} (type: {}).",
-            self.inward,
-            format_link_direction(&self.r#type),
-            self.outward,
-            self.r#type
-        );
-        Ok(())
+        run_create_link(&client, &self.r#type, &self.inward, &self.outward).await
     }
 }
 
@@ -134,9 +114,7 @@ impl RemoveLinkCommand {
     /// Removes the issue link.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        client.remove_issue_link(&self.link_id).await?;
-        println!("Removed link {}.", self.link_id);
-        Ok(())
+        run_remove_link(&client, &self.link_id).await
     }
 }
 
@@ -156,10 +134,60 @@ impl EpicLinkCommand {
     /// Sets the epic as the parent of the issue.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        client.link_to_epic(&self.epic, &self.issue).await?;
-        println!("Linked {} to epic {}.", self.issue, self.epic);
-        Ok(())
+        run_epic_link(&client, &self.epic, &self.issue).await
     }
+}
+
+/// Fetches and displays issue links.
+async fn run_list_links(client: &AtlassianClient, key: &str, output: &OutputFormat) -> Result<()> {
+    let links = client.get_issue_links(key).await?;
+    if output_as(&links, output)? {
+        return Ok(());
+    }
+    print_issue_links(key, &links);
+    Ok(())
+}
+
+/// Fetches and displays link types.
+async fn run_link_types(client: &AtlassianClient, output: &OutputFormat) -> Result<()> {
+    let types = client.get_link_types().await?;
+    if output_as(&types, output)? {
+        return Ok(());
+    }
+    print_link_types(&types);
+    Ok(())
+}
+
+/// Creates a link between two issues.
+async fn run_create_link(
+    client: &AtlassianClient,
+    link_type: &str,
+    inward: &str,
+    outward: &str,
+) -> Result<()> {
+    client.create_issue_link(link_type, inward, outward).await?;
+    println!(
+        "Linked {} {} {} (type: {}).",
+        inward,
+        format_link_direction(link_type),
+        outward,
+        link_type
+    );
+    Ok(())
+}
+
+/// Removes an issue link by ID.
+async fn run_remove_link(client: &AtlassianClient, link_id: &str) -> Result<()> {
+    client.remove_issue_link(link_id).await?;
+    println!("Removed link {link_id}.");
+    Ok(())
+}
+
+/// Links an issue to an epic.
+async fn run_epic_link(client: &AtlassianClient, epic: &str, issue: &str) -> Result<()> {
+    client.link_to_epic(epic, issue).await?;
+    println!("Linked {issue} to epic {epic}.");
+    Ok(())
 }
 
 /// Formats a link direction arrow for display.
@@ -415,5 +443,172 @@ mod tests {
         };
         assert_eq!(cmd.epic, "EPIC-1");
         assert_eq!(cmd.issue, "STORY-1");
+    }
+
+    // ── run_* link functions ───────────────────────────────────────
+
+    fn mock_client(base_url: &str) -> AtlassianClient {
+        AtlassianClient::new(base_url, "user@test.com", "token").unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_list_links_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "key": "PROJ-1",
+                    "fields": {
+                        "summary": "Issue",
+                        "issuelinks": []
+                    }
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(run_list_links(&client, "PROJ-1", &OutputFormat::Table)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_list_links_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/NOPE-1"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_list_links(&client, "NOPE-1", &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn run_link_types_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issueLinkType"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issueLinkTypes": [
+                        {"id": "1", "name": "Blocks", "inward": "is blocked by", "outward": "blocks"}
+                    ]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(run_link_types(&client, &OutputFormat::Table).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_link_types_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issueLinkType"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_link_types(&client, &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn run_create_link_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/issueLink"))
+            .respond_with(wiremock::ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(run_create_link(&client, "Blocks", "PROJ-1", "PROJ-2")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_create_link_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/issueLink"))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("Bad"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_create_link(&client, "Bad", "PROJ-1", "PROJ-2")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("400"));
+    }
+
+    #[tokio::test]
+    async fn run_remove_link_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/api/3/issueLink/12345"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(run_remove_link(&client, "12345").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_remove_link_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/api/3/issueLink/99999"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_remove_link(&client, "99999").await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn run_epic_link_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-2"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(run_epic_link(&client, "EPIC-1", "PROJ-2").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_epic_link_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-2"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_epic_link(&client, "EPIC-1", "PROJ-2")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("403"));
     }
 }

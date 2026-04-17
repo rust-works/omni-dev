@@ -57,18 +57,7 @@ impl CreateCommand {
 
         let (client, _instance_url) = create_client()?;
         let api = ConfluenceApi::new(client);
-
-        let page_id = api
-            .create_page(
-                &params.space,
-                &params.title,
-                &params.adf,
-                params.parent_id.as_deref(),
-            )
-            .await?;
-
-        println!("{page_id}");
-        Ok(())
+        run_create(&api, &params).await
     }
 
     /// Resolves creation parameters from input file and CLI flags.
@@ -137,6 +126,21 @@ impl CreateCommand {
             adf,
         })
     }
+}
+
+/// Creates a Confluence page from resolved parameters.
+async fn run_create(api: &ConfluenceApi, params: &CreateParams) -> Result<()> {
+    let page_id = api
+        .create_page(
+            &params.space,
+            &params.title,
+            &params.adf,
+            params.parent_id.as_deref(),
+        )
+        .await?;
+
+    println!("{page_id}");
+    Ok(())
 }
 
 /// Prints a dry-run summary for page creation.
@@ -388,5 +392,68 @@ mod tests {
         assert!(cmd.file.is_none());
         assert!(cmd.space.is_none());
         assert!(!cmd.dry_run);
+    }
+
+    // ── run_create ─────────────────────────────────────────────────
+
+    fn sample_params() -> CreateParams {
+        CreateParams {
+            space: "ENG".to_string(),
+            title: "New Page".to_string(),
+            parent_id: None,
+            adf: AdfDocument::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_create_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": [{"id": "98765"}]})),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "54321"})),
+            )
+            .mount(&server)
+            .await;
+
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "user@test.com", "token")
+                .unwrap();
+        let api = ConfluenceApi::new(client);
+        assert!(run_create(&api, &sample_params()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_create_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": [{"id": "98765"}]})),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages"))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("Bad"))
+            .mount(&server)
+            .await;
+
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "user@test.com", "token")
+                .unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = run_create(&api, &sample_params()).await.unwrap_err();
+        assert!(err.to_string().contains("400"));
     }
 }

@@ -125,121 +125,133 @@ struct LogEntry {
     detail: String,
 }
 
+/// Parameters for a recursive download, decoupled from CLI parsing.
+struct DownloadParams {
+    id: String,
+    output_dir: PathBuf,
+    format: ContentFormat,
+    concurrency: usize,
+    max_depth: u32,
+    resume: bool,
+    on_conflict: OnConflict,
+    instance_url: String,
+}
+
 impl DownloadCommand {
     /// Executes the recursive download.
     pub async fn execute(self) -> Result<()> {
         let (client, instance_url) = create_client()?;
         let api = Arc::new(ConfluenceApi::new(client));
-        let semaphore = Arc::new(Semaphore::new(self.concurrency));
-        let stats = Arc::new(DownloadStats::new());
-        let log_entries: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
-        let manifest_entries: Arc<Mutex<BTreeMap<String, ManifestEntry>>> =
-            Arc::new(Mutex::new(BTreeMap::new()));
-
-        let timestamp = Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
-        let backup_dir = self.output_dir.join(".backups").join(&timestamp);
-
-        let config = Arc::new(DownloadConfig {
-            ext: file_extension(&self.format),
+        let params = DownloadParams {
+            id: self.id,
+            output_dir: self.output_dir,
             format: self.format,
-            instance_url,
+            concurrency: self.concurrency,
+            max_depth: self.max_depth,
+            resume: self.resume,
             on_conflict: self.on_conflict,
-            backup_dir,
-        });
-
-        // Load existing manifest for resume
-        let old_manifest = if self.resume {
-            load_manifest(&self.output_dir)
-        } else {
-            BTreeMap::new()
+            instance_url,
         };
+        run_download(&api, &params).await
+    }
+}
 
-        // Fetch root page to get its title
-        eprintln!("Fetching root page {}...", self.id);
-        let root = api.get_content(&self.id).await?;
-        let root_slug = slugify(&root.title);
-        let root_dir = self.output_dir.join(format!("{}-{}", root.id, root_slug));
+/// Recursively downloads a Confluence page tree.
+async fn run_download(api: &Arc<ConfluenceApi>, params: &DownloadParams) -> Result<()> {
+    let semaphore = Arc::new(Semaphore::new(params.concurrency));
+    let stats = Arc::new(DownloadStats::new());
+    let log_entries: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let manifest_entries: Arc<Mutex<BTreeMap<String, ManifestEntry>>> =
+        Arc::new(Mutex::new(BTreeMap::new()));
 
-        let root_parent = match &root.metadata {
-            crate::atlassian::api::ContentMetadata::Confluence { parent_id, .. } => {
-                parent_id.clone()
-            }
-            crate::atlassian::api::ContentMetadata::Jira { .. } => None,
-        };
+    let timestamp = Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
+    let backup_dir = params.output_dir.join(".backups").join(&timestamp);
 
-        let mut queue: VecDeque<PageTask> = VecDeque::new();
-        queue.push_back(PageTask {
-            id: root.id.clone(),
-            title: root.title.clone(),
-            dir: root_dir,
-            depth: 0,
-            parent_id: root_parent,
-        });
+    let config = Arc::new(DownloadConfig {
+        ext: file_extension(&params.format),
+        format: params.format.clone(),
+        instance_url: params.instance_url.clone(),
+        on_conflict: params.on_conflict.clone(),
+        backup_dir,
+    });
 
-        let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    // Load existing manifest for resume
+    let old_manifest = if params.resume {
+        load_manifest(&params.output_dir)
+    } else {
+        BTreeMap::new()
+    };
 
-        while let Some(task) = queue.pop_front() {
-            let relative_path = task
-                .dir
-                .strip_prefix(&self.output_dir)
-                .unwrap_or(&task.dir)
-                .join(format!("index.{}", config.ext))
-                .to_string_lossy()
-                .to_string();
+    // Fetch root page to get its title
+    eprintln!("Fetching root page {}...", params.id);
+    let root = api.get_content(&params.id).await?;
+    let root_slug = slugify(&root.title);
+    let root_dir = params.output_dir.join(format!("{}-{}", root.id, root_slug));
 
-            // Resume: check manifest for ID-based skip
-            if self.resume {
-                if let Some(entry) = old_manifest.get(&task.id) {
-                    if entry.path == relative_path {
-                        // Same path — skip
-                        stats.skipped.fetch_add(1, Ordering::Relaxed);
-                        eprintln!("  Skipped (resume): {} - {}", task.id, task.title);
-                        log_entries.lock().await.push(LogEntry {
-                            action: "skipped".to_string(),
-                            id: task.id.clone(),
-                            path: relative_path.clone(),
-                            detail: "resume".to_string(),
-                        });
-                        // Still record in new manifest
-                        manifest_entries.lock().await.insert(
-                            task.id.clone(),
-                            ManifestEntry {
-                                title: task.title.clone(),
-                                path: relative_path,
-                                parent_id: task.parent_id.clone(),
-                            },
-                        );
-                        // Still need to discover children
-                    } else {
-                        // Page moved — download to new path (old path becomes orphan)
-                        eprintln!(
-                            "  Moved: {} - {} (was: {})",
-                            task.id, task.title, entry.path
-                        );
-                        log_entries.lock().await.push(LogEntry {
-                            action: "moved".to_string(),
-                            id: task.id.clone(),
-                            path: relative_path.clone(),
-                            detail: format!("was: {}", entry.path),
-                        });
-                        // Fall through to download
-                        spawn_download(
-                            &mut handles,
-                            &api,
-                            &semaphore,
-                            &stats,
-                            &config,
-                            &log_entries,
-                            &manifest_entries,
-                            &task,
-                            &relative_path,
-                        );
-                    }
+    let root_parent = match &root.metadata {
+        crate::atlassian::api::ContentMetadata::Confluence { parent_id, .. } => parent_id.clone(),
+        crate::atlassian::api::ContentMetadata::Jira { .. } => None,
+    };
+
+    let mut queue: VecDeque<PageTask> = VecDeque::new();
+    queue.push_back(PageTask {
+        id: root.id.clone(),
+        title: root.title.clone(),
+        dir: root_dir,
+        depth: 0,
+        parent_id: root_parent,
+    });
+
+    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    while let Some(task) = queue.pop_front() {
+        let relative_path = task
+            .dir
+            .strip_prefix(&params.output_dir)
+            .unwrap_or(&task.dir)
+            .join(format!("index.{}", config.ext))
+            .to_string_lossy()
+            .to_string();
+
+        // Resume: check manifest for ID-based skip
+        if params.resume {
+            if let Some(entry) = old_manifest.get(&task.id) {
+                if entry.path == relative_path {
+                    // Same path — skip
+                    stats.skipped.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("  Skipped (resume): {} - {}", task.id, task.title);
+                    log_entries.lock().await.push(LogEntry {
+                        action: "skipped".to_string(),
+                        id: task.id.clone(),
+                        path: relative_path.clone(),
+                        detail: "resume".to_string(),
+                    });
+                    // Still record in new manifest
+                    manifest_entries.lock().await.insert(
+                        task.id.clone(),
+                        ManifestEntry {
+                            title: task.title.clone(),
+                            path: relative_path,
+                            parent_id: task.parent_id.clone(),
+                        },
+                    );
+                    // Still need to discover children
                 } else {
-                    // Not in manifest — new page, download
+                    // Page moved — download to new path (old path becomes orphan)
+                    eprintln!(
+                        "  Moved: {} - {} (was: {})",
+                        task.id, task.title, entry.path
+                    );
+                    log_entries.lock().await.push(LogEntry {
+                        action: "moved".to_string(),
+                        id: task.id.clone(),
+                        path: relative_path.clone(),
+                        detail: format!("was: {}", entry.path),
+                    });
+                    // Fall through to download
                     spawn_download(
                         &mut handles,
-                        &api,
+                        api,
                         &semaphore,
                         &stats,
                         &config,
@@ -250,9 +262,10 @@ impl DownloadCommand {
                     );
                 }
             } else {
+                // Not in manifest — new page, download
                 spawn_download(
                     &mut handles,
-                    &api,
+                    api,
                     &semaphore,
                     &stats,
                     &config,
@@ -262,64 +275,76 @@ impl DownloadCommand {
                     &relative_path,
                 );
             }
-
-            // Fetch children and enqueue (unless at max depth)
-            if self.max_depth > 0 && task.depth >= self.max_depth {
-                continue;
-            }
-
-            match api.get_children(&task.id).await {
-                Ok(children) => {
-                    for child in children {
-                        let child_slug = slugify(&child.title);
-                        let child_dir = task.dir.join(format!("{}-{}", child.id, child_slug));
-                        queue.push_back(PageTask {
-                            id: child.id,
-                            title: child.title,
-                            dir: child_dir,
-                            depth: task.depth + 1,
-                            parent_id: Some(task.id.clone()),
-                        });
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "WARNING: Failed to fetch children of {} ({}): {}",
-                        task.id, task.title, e
-                    );
-                }
-            }
+        } else {
+            spawn_download(
+                &mut handles,
+                api,
+                &semaphore,
+                &stats,
+                &config,
+                &log_entries,
+                &manifest_entries,
+                &task,
+                &relative_path,
+            );
         }
 
-        // Await all download tasks
-        for handle in handles {
-            let _ = handle.await;
+        // Fetch children and enqueue (unless at max depth)
+        if params.max_depth > 0 && task.depth >= params.max_depth {
+            continue;
         }
 
-        // Write manifest
-        let manifest = manifest_entries.lock().await;
-        write_manifest(&self.output_dir, &manifest);
+        match api.get_children(&task.id).await {
+            Ok(children) => {
+                for child in children {
+                    let child_slug = slugify(&child.title);
+                    let child_dir = task.dir.join(format!("{}-{}", child.id, child_slug));
+                    queue.push_back(PageTask {
+                        id: child.id,
+                        title: child.title,
+                        dir: child_dir,
+                        depth: task.depth + 1,
+                        parent_id: Some(task.id.clone()),
+                    });
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "WARNING: Failed to fetch children of {} ({}): {}",
+                    task.id, task.title, e
+                );
+            }
+        }
+    }
 
-        // Write log
-        let entries = log_entries.lock().await;
-        write_log(&self.output_dir, &timestamp, &entries, &stats);
+    // Await all download tasks
+    for handle in handles {
+        let _ = handle.await;
+    }
 
-        // Summary
-        let downloaded = stats.downloaded.load(Ordering::Relaxed);
-        let skipped = stats.skipped.load(Ordering::Relaxed);
-        let clobbered = stats.clobbered.load(Ordering::Relaxed);
-        let failed = stats.failed.load(Ordering::Relaxed);
+    // Write manifest
+    let manifest = manifest_entries.lock().await;
+    write_manifest(&params.output_dir, &manifest);
 
-        eprintln!(
+    // Write log
+    let entries = log_entries.lock().await;
+    write_log(&params.output_dir, &timestamp, &entries, &stats);
+
+    // Summary
+    let downloaded = stats.downloaded.load(Ordering::Relaxed);
+    let skipped = stats.skipped.load(Ordering::Relaxed);
+    let clobbered = stats.clobbered.load(Ordering::Relaxed);
+    let failed = stats.failed.load(Ordering::Relaxed);
+
+    eprintln!(
             "\nDone. Downloaded: {downloaded}, Clobbered: {clobbered}, Skipped: {skipped}, Failed: {failed}"
         );
 
-        if failed > 0 {
-            anyhow::bail!("{failed} page(s) failed to download");
-        }
-
-        Ok(())
+    if failed > 0 {
+        anyhow::bail!("{failed} page(s) failed to download");
     }
+
+    Ok(())
 }
 
 /// Spawns a download task for a page.
@@ -882,5 +907,168 @@ mod tests {
         assert_eq!(stats.skipped.load(Ordering::Relaxed), 0);
         assert_eq!(stats.clobbered.load(Ordering::Relaxed), 0);
         assert_eq!(stats.failed.load(Ordering::Relaxed), 0);
+    }
+
+    // ── run_download ───────────────────────────────────────────────
+
+    /// Mocks the page + space endpoints for a leaf page with no children.
+    async fn mock_leaf_page(server: &wiremock::MockServer, id: &str) {
+        let page_json = serde_json::json!({
+            "id": id,
+            "title": "Root Page",
+            "status": "current",
+            "spaceId": "98765",
+            "version": {"number": 1},
+            "body": {
+                "atlas_doc_format": {
+                    "value": "{\"version\":1,\"type\":\"doc\",\"content\":[]}"
+                }
+            }
+        });
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/wiki/api/v2/pages/{id}")))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&page_json))
+            .mount(server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/98765"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"key": "ENG"})),
+            )
+            .mount(server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!(
+                "/wiki/rest/api/content/{id}/child/page"
+            )))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": [], "_links": {}})),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn run_download_leaf_page_jfm() {
+        let server = wiremock::MockServer::start().await;
+        mock_leaf_page(&server, "12345").await;
+
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "user@test.com", "token")
+                .unwrap();
+        let api = Arc::new(ConfluenceApi::new(client));
+        let temp = tempfile::tempdir().unwrap();
+
+        let params = DownloadParams {
+            id: "12345".to_string(),
+            output_dir: temp.path().to_path_buf(),
+            format: ContentFormat::Jfm,
+            concurrency: 2,
+            max_depth: 0,
+            resume: false,
+            on_conflict: OnConflict::Overwrite,
+            instance_url: server.uri(),
+        };
+
+        assert!(run_download(&api, &params).await.is_ok());
+        assert!(temp.path().join("manifest.json").exists());
+    }
+
+    #[tokio::test]
+    async fn run_download_leaf_page_adf() {
+        let server = wiremock::MockServer::start().await;
+        mock_leaf_page(&server, "12345").await;
+
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "user@test.com", "token")
+                .unwrap();
+        let api = Arc::new(ConfluenceApi::new(client));
+        let temp = tempfile::tempdir().unwrap();
+
+        let params = DownloadParams {
+            id: "12345".to_string(),
+            output_dir: temp.path().to_path_buf(),
+            format: ContentFormat::Adf,
+            concurrency: 2,
+            max_depth: 1,
+            resume: false,
+            on_conflict: OnConflict::Skip,
+            instance_url: server.uri(),
+        };
+
+        assert!(run_download(&api, &params).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_download_resume_skip() {
+        let server = wiremock::MockServer::start().await;
+        mock_leaf_page(&server, "12345").await;
+
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "user@test.com", "token")
+                .unwrap();
+        let api = Arc::new(ConfluenceApi::new(client));
+        let temp = tempfile::tempdir().unwrap();
+
+        // Seed an existing manifest so resume takes the skip path.
+        let mut manifest = BTreeMap::new();
+        manifest.insert(
+            "12345".to_string(),
+            ManifestEntry {
+                title: "Root Page".to_string(),
+                path: "12345-root-page/index.md".to_string(),
+                parent_id: None,
+            },
+        );
+        let manifest_path = temp.path().join("manifest.json");
+        std::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap()).unwrap();
+
+        let params = DownloadParams {
+            id: "12345".to_string(),
+            output_dir: temp.path().to_path_buf(),
+            format: ContentFormat::Jfm,
+            concurrency: 2,
+            max_depth: 0,
+            resume: true,
+            on_conflict: OnConflict::Overwrite,
+            instance_url: server.uri(),
+        };
+
+        assert!(run_download(&api, &params).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_download_root_page_fetch_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/99999"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "user@test.com", "token")
+                .unwrap();
+        let api = Arc::new(ConfluenceApi::new(client));
+        let temp = tempfile::tempdir().unwrap();
+
+        let params = DownloadParams {
+            id: "99999".to_string(),
+            output_dir: temp.path().to_path_buf(),
+            format: ContentFormat::Jfm,
+            concurrency: 2,
+            max_depth: 0,
+            resume: false,
+            on_conflict: OnConflict::Overwrite,
+            instance_url: server.uri(),
+        };
+
+        let err = run_download(&api, &params).await.unwrap_err();
+        assert!(err.to_string().contains("404"));
     }
 }

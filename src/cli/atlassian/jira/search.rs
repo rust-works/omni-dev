@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::Parser;
 
-use crate::atlassian::client::JiraSearchResult;
+use crate::atlassian::client::{AtlassianClient, JiraSearchResult};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -40,14 +40,7 @@ impl SearchCommand {
     pub async fn execute(self) -> Result<()> {
         let jql = self.build_jql()?;
         let (client, _instance_url) = create_client()?;
-
-        let result = client.search_issues(&jql, self.limit).await?;
-        if output_as(&result, &self.output)? {
-            return Ok(());
-        }
-        print_search_results(&result);
-
-        Ok(())
+        run_search(&client, &jql, self.limit, &self.output).await
     }
 
     /// Builds a JQL query from the provided flags, or returns the raw `--jql` value.
@@ -76,6 +69,21 @@ impl SearchCommand {
 
         Ok(clauses.join(" AND "))
     }
+}
+
+/// Searches issues by JQL and displays results.
+async fn run_search(
+    client: &AtlassianClient,
+    jql: &str,
+    limit: u32,
+    output: &OutputFormat,
+) -> Result<()> {
+    let result = client.search_issues(jql, limit).await?;
+    if output_as(&result, output)? {
+        return Ok(());
+    }
+    print_search_results(&result);
+    Ok(())
 }
 
 /// Prints search results: empty message, table, or table with pagination note.
@@ -284,5 +292,72 @@ mod tests {
         };
         // Should use "-" for missing status/assignee
         print_search_results(&result);
+    }
+
+    // ── run_search ─────────────────────────────────────────────────
+
+    fn mock_client(base_url: &str) -> AtlassianClient {
+        AtlassianClient::new(base_url, "user@test.com", "token").unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_search_table_output() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/search/jql"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issues": [{
+                        "key": "PROJ-1",
+                        "fields": {"summary": "Test issue"}
+                    }],
+                    "total": 1
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(
+            run_search(&client, "project = PROJ", 50, &OutputFormat::Table)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_search_json_output() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/search/jql"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"issues": [], "total": 0})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(
+            run_search(&client, "project = PROJ", 50, &OutputFormat::Json)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_search_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/search/jql"))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("Bad JQL"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_search(&client, "invalid", 50, &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("400"));
     }
 }

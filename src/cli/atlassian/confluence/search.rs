@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::Parser;
 
-use crate::atlassian::client::ConfluenceSearchResults;
+use crate::atlassian::client::{AtlassianClient, ConfluenceSearchResults};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -36,14 +36,7 @@ impl SearchCommand {
     pub async fn execute(self) -> Result<()> {
         let cql = self.build_cql()?;
         let (client, _instance_url) = create_client()?;
-
-        let result = client.search_confluence(&cql, self.limit).await?;
-        if output_as(&result, &self.output)? {
-            return Ok(());
-        }
-        print_search_results(&result);
-
-        Ok(())
+        run_confluence_search(&client, &cql, self.limit, &self.output).await
     }
 
     /// Builds a CQL query from the provided flags, or returns the raw `--cql` value.
@@ -69,6 +62,21 @@ impl SearchCommand {
 
         Ok(clauses.join(" AND "))
     }
+}
+
+/// Searches Confluence pages and displays results.
+async fn run_confluence_search(
+    client: &AtlassianClient,
+    cql: &str,
+    limit: u32,
+    output: &OutputFormat,
+) -> Result<()> {
+    let result = client.search_confluence(cql, limit).await?;
+    if output_as(&result, output)? {
+        return Ok(());
+    }
+    print_search_results(&result);
+    Ok(())
 }
 
 /// Prints search results as a formatted table.
@@ -270,5 +278,73 @@ mod tests {
         };
         assert!(cmd.cql.is_none());
         assert_eq!(cmd.limit, 25);
+    }
+
+    // ── run_confluence_search ──────────────────────────────────────
+
+    fn mock_client(base_url: &str) -> AtlassianClient {
+        AtlassianClient::new(base_url, "user@test.com", "token").unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_confluence_search_table_output() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/content/search"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{
+                        "id": "12345",
+                        "title": "Page",
+                        "space": {"key": "ENG"}
+                    }],
+                    "totalSize": 1
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(
+            run_confluence_search(&client, "type = page", 25, &OutputFormat::Table)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_confluence_search_json_output() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/content/search"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": [], "totalSize": 0})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(
+            run_confluence_search(&client, "type = page", 25, &OutputFormat::Json)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_confluence_search_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/content/search"))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("Bad CQL"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_confluence_search(&client, "bad", 25, &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("400"));
     }
 }

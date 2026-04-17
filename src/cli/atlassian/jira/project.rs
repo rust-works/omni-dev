@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::atlassian::client::JiraProjectList;
+use crate::atlassian::client::{AtlassianClient, JiraProjectList};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -47,13 +47,22 @@ impl ListCommand {
     /// Fetches and displays projects.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        let result = client.get_projects(self.limit).await?;
-        if output_as(&result, &self.output)? {
-            return Ok(());
-        }
-        print_projects(&result);
-        Ok(())
+        run_list_projects(&client, self.limit, &self.output).await
     }
+}
+
+/// Fetches and displays projects.
+async fn run_list_projects(
+    client: &AtlassianClient,
+    limit: u32,
+    output: &OutputFormat,
+) -> Result<()> {
+    let result = client.get_projects(limit).await?;
+    if output_as(&result, output)? {
+        return Ok(());
+    }
+    print_projects(&result);
+    Ok(())
 }
 
 /// Prints projects as a formatted table.
@@ -180,6 +189,66 @@ mod tests {
             total: 1,
         };
         print_projects(&result);
+    }
+
+    // ── run_list_projects ──────────────────────────────────────────
+
+    fn mock_client(base_url: &str) -> AtlassianClient {
+        AtlassianClient::new(base_url, "user@test.com", "token").unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_list_projects_table_output() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/project/search"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "values": [{"id": "1", "key": "PROJ", "name": "Project", "projectTypeKey": "software"}],
+                    "total": 1
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(run_list_projects(&client, 50, &OutputFormat::Table)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_list_projects_json_output() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/project/search"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"values": [], "total": 0})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(run_list_projects(&client, 50, &OutputFormat::Json)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_list_projects_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/project/search"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_list_projects(&client, 50, &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("403"));
     }
 
     // ── dispatch ───────────────────────────────────────────────────
