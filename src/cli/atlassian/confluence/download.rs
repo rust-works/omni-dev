@@ -908,4 +908,167 @@ mod tests {
         assert_eq!(stats.clobbered.load(Ordering::Relaxed), 0);
         assert_eq!(stats.failed.load(Ordering::Relaxed), 0);
     }
+
+    // ── run_download ───────────────────────────────────────────────
+
+    /// Mocks the page + space endpoints for a leaf page with no children.
+    async fn mock_leaf_page(server: &wiremock::MockServer, id: &str) {
+        let page_json = serde_json::json!({
+            "id": id,
+            "title": "Root Page",
+            "status": "current",
+            "spaceId": "98765",
+            "version": {"number": 1},
+            "body": {
+                "atlas_doc_format": {
+                    "value": "{\"version\":1,\"type\":\"doc\",\"content\":[]}"
+                }
+            }
+        });
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/wiki/api/v2/pages/{id}")))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&page_json))
+            .mount(server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/98765"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"key": "ENG"})),
+            )
+            .mount(server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!(
+                "/wiki/rest/api/content/{id}/child/page"
+            )))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": [], "_links": {}})),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn run_download_leaf_page_jfm() {
+        let server = wiremock::MockServer::start().await;
+        mock_leaf_page(&server, "12345").await;
+
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "user@test.com", "token")
+                .unwrap();
+        let api = Arc::new(ConfluenceApi::new(client));
+        let temp = tempfile::tempdir().unwrap();
+
+        let params = DownloadParams {
+            id: "12345".to_string(),
+            output_dir: temp.path().to_path_buf(),
+            format: ContentFormat::Jfm,
+            concurrency: 2,
+            max_depth: 0,
+            resume: false,
+            on_conflict: OnConflict::Overwrite,
+            instance_url: server.uri(),
+        };
+
+        assert!(run_download(&api, &params).await.is_ok());
+        assert!(temp.path().join("manifest.json").exists());
+    }
+
+    #[tokio::test]
+    async fn run_download_leaf_page_adf() {
+        let server = wiremock::MockServer::start().await;
+        mock_leaf_page(&server, "12345").await;
+
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "user@test.com", "token")
+                .unwrap();
+        let api = Arc::new(ConfluenceApi::new(client));
+        let temp = tempfile::tempdir().unwrap();
+
+        let params = DownloadParams {
+            id: "12345".to_string(),
+            output_dir: temp.path().to_path_buf(),
+            format: ContentFormat::Adf,
+            concurrency: 2,
+            max_depth: 1,
+            resume: false,
+            on_conflict: OnConflict::Skip,
+            instance_url: server.uri(),
+        };
+
+        assert!(run_download(&api, &params).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_download_resume_skip() {
+        let server = wiremock::MockServer::start().await;
+        mock_leaf_page(&server, "12345").await;
+
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "user@test.com", "token")
+                .unwrap();
+        let api = Arc::new(ConfluenceApi::new(client));
+        let temp = tempfile::tempdir().unwrap();
+
+        // Seed an existing manifest so resume takes the skip path.
+        let mut manifest = BTreeMap::new();
+        manifest.insert(
+            "12345".to_string(),
+            ManifestEntry {
+                title: "Root Page".to_string(),
+                path: "12345-root-page/index.md".to_string(),
+                parent_id: None,
+            },
+        );
+        let manifest_path = temp.path().join("manifest.json");
+        std::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap()).unwrap();
+
+        let params = DownloadParams {
+            id: "12345".to_string(),
+            output_dir: temp.path().to_path_buf(),
+            format: ContentFormat::Jfm,
+            concurrency: 2,
+            max_depth: 0,
+            resume: true,
+            on_conflict: OnConflict::Overwrite,
+            instance_url: server.uri(),
+        };
+
+        assert!(run_download(&api, &params).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_download_root_page_fetch_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/99999"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "user@test.com", "token")
+                .unwrap();
+        let api = Arc::new(ConfluenceApi::new(client));
+        let temp = tempfile::tempdir().unwrap();
+
+        let params = DownloadParams {
+            id: "99999".to_string(),
+            output_dir: temp.path().to_path_buf(),
+            format: ContentFormat::Jfm,
+            concurrency: 2,
+            max_depth: 0,
+            resume: false,
+            on_conflict: OnConflict::Overwrite,
+            instance_url: server.uri(),
+        };
+
+        let err = run_download(&api, &params).await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
 }

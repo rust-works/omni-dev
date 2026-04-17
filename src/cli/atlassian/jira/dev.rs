@@ -546,4 +546,116 @@ mod tests {
         assert_eq!(repo.commits.len(), 1);
         assert_eq!(repo.commits[0].display_id, "abc123d");
     }
+
+    // ── run_dev_status ─────────────────────────────────────────────
+
+    fn mock_client(base_url: &str) -> AtlassianClient {
+        AtlassianClient::new(base_url, "user@test.com", "token").unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_dev_status_summary_mode() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"id": "10001", "key": "PROJ-1", "fields": {}}),
+                ),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/dev-status/1.0/issue/summary",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "summary": {
+                        "pullrequest": {"overall": {"count": 0}, "byInstanceType": {}},
+                        "branch": {"overall": {"count": 0}, "byInstanceType": {}},
+                        "repository": {"overall": {"count": 0}, "byInstanceType": {}}
+                    }
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(
+            run_dev_status(&client, "PROJ-1", None, None, true, &OutputFormat::Table)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_dev_status_detail_mode() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"id": "10001", "key": "PROJ-1", "fields": {}}),
+                ),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/dev-status/1.0/issue/summary",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "summary": {
+                        "pullrequest": {
+                            "overall": {"count": 0},
+                            "byInstanceType": {"GitHub": {"count": 0, "name": "GitHub"}}
+                        },
+                        "branch": {"overall": {"count": 0}, "byInstanceType": {}},
+                        "repository": {"overall": {"count": 0}, "byInstanceType": {}}
+                    }
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/dev-status/1.0/issue/detail",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "detail": [{
+                        "pullRequests": [],
+                        "branches": [],
+                        "repositories": []
+                    }]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(
+            run_dev_status(&client, "PROJ-1", None, None, false, &OutputFormat::Table)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_dev_status_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/NOPE-1"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_dev_status(&client, "NOPE-1", None, None, true, &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
 }
