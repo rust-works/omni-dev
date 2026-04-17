@@ -664,11 +664,15 @@ impl AdfNode {
     }
 
     /// Creates a layout column node.
+    ///
+    /// `width` accepts any value convertible into a JSON number (integer or
+    /// float). The original numeric type is preserved on the `width` attribute
+    /// so that round-tripping doesn't coerce integer widths to floats.
     #[must_use]
-    pub fn layout_column(width: f64, content: Vec<Self>) -> Self {
+    pub fn layout_column<V: Into<serde_json::Value>>(width: V, content: Vec<Self>) -> Self {
         Self {
             node_type: "layoutColumn".to_string(),
-            attrs: Some(serde_json::json!({"width": width})),
+            attrs: Some(serde_json::json!({"width": width.into()})),
             content: Some(content),
             text: None,
             marks: None,
