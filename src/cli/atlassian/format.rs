@@ -30,8 +30,10 @@ pub enum OutputFormat {
     Table,
     /// JSON.
     Json,
-    /// YAML.
+    /// YAML (single document).
     Yaml,
+    /// YAML stream (`---`-separated multi-document).
+    Yamls,
     /// JSON Lines: one compact JSON object per line, streaming-friendly.
     Jsonl,
 }
@@ -133,8 +135,8 @@ impl JsonlSerialize for JiraDevStatusSummary {
 }
 
 /// Serializes data in the requested output format.
-/// Returns `Ok(true)` if data was printed (json/yaml/jsonl), `Ok(false)` if
-/// the caller should handle table output.
+/// Returns `Ok(true)` if data was printed (json/yaml/yamls/jsonl), `Ok(false)`
+/// if the caller should handle table output.
 pub fn output_as<T: Serialize + JsonlSerialize>(data: &T, format: &OutputFormat) -> Result<bool> {
     match format {
         OutputFormat::Table => Ok(false),
@@ -152,12 +154,34 @@ pub fn output_as<T: Serialize + JsonlSerialize>(data: &T, format: &OutputFormat)
             );
             Ok(true)
         }
+        OutputFormat::Yamls => {
+            print!("{}", format_yaml_stream(data)?);
+            Ok(true)
+        }
         OutputFormat::Jsonl => {
             let stdout = std::io::stdout();
             let mut handle = stdout.lock();
             data.write_jsonl(&mut handle)?;
             Ok(true)
         }
+    }
+}
+
+/// Serializes a single YAML value as one `---`-prefixed document.
+fn yaml_stream_doc(value: &serde_yaml::Value) -> Result<String> {
+    let s = serde_yaml::to_string(value).context("Failed to serialize YAML stream item")?;
+    Ok(format!("---\n{s}"))
+}
+
+/// Serializes data as a YAML multi-document stream.
+///
+/// If the serialized value is a sequence, each element is emitted as its own
+/// `---`-prefixed YAML document. Otherwise the whole value is emitted as a
+/// single `---`-prefixed document. The result always ends with a newline.
+fn format_yaml_stream<T: Serialize>(data: &T) -> Result<String> {
+    match serde_yaml::to_value(data).context("Failed to serialize as YAML stream")? {
+        serde_yaml::Value::Sequence(items) => items.iter().map(yaml_stream_doc).collect(),
+        other => yaml_stream_doc(&other),
     }
 }
 
@@ -221,6 +245,11 @@ mod tests {
     }
 
     #[test]
+    fn output_yamls_variant() {
+        assert!(matches!(OutputFormat::Yamls, OutputFormat::Yamls));
+    }
+
+    #[test]
     fn output_jsonl_variant() {
         assert!(matches!(OutputFormat::Jsonl, OutputFormat::Jsonl));
     }
@@ -255,6 +284,12 @@ mod tests {
     fn output_as_yaml_returns_true() {
         let data = vec![1, 2, 3];
         assert!(output_as(&data, &OutputFormat::Yaml).unwrap());
+    }
+
+    #[test]
+    fn output_as_yamls_returns_true() {
+        let data = vec![1, 2, 3];
+        assert!(output_as(&data, &OutputFormat::Yamls).unwrap());
     }
 
     #[test]
@@ -404,7 +439,7 @@ mod tests {
 
     fn sample_confluence_user(id: &str) -> ConfluenceUserSearchResult {
         ConfluenceUserSearchResult {
-            account_id: id.to_string(),
+            account_id: Some(id.to_string()),
             display_name: "Name".to_string(),
             email: None,
         }
@@ -571,5 +606,99 @@ mod tests {
             total: 1,
         };
         assert!(output_as(&list, &OutputFormat::Jsonl).unwrap());
+    }
+
+    // ── format_yaml_stream ─────────────────────────────────────────
+
+    #[derive(serde::Serialize)]
+    struct Issue {
+        key: &'static str,
+        summary: &'static str,
+    }
+
+    #[test]
+    fn yaml_stream_emits_one_doc_per_sequence_item() {
+        let data = vec![
+            Issue {
+                key: "PROJ-1",
+                summary: "Fix login",
+            },
+            Issue {
+                key: "PROJ-2",
+                summary: "Add feature",
+            },
+        ];
+        let out = format_yaml_stream(&data).unwrap();
+        assert_eq!(
+            out,
+            "---\nkey: PROJ-1\nsummary: Fix login\n---\nkey: PROJ-2\nsummary: Add feature\n"
+        );
+    }
+
+    #[test]
+    fn yaml_stream_empty_sequence_emits_nothing() {
+        let data: Vec<Issue> = vec![];
+        let out = format_yaml_stream(&data).unwrap();
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn yaml_stream_single_item_sequence() {
+        let data = vec![Issue {
+            key: "PROJ-1",
+            summary: "Fix login",
+        }];
+        let out = format_yaml_stream(&data).unwrap();
+        assert_eq!(out, "---\nkey: PROJ-1\nsummary: Fix login\n");
+    }
+
+    #[test]
+    fn yaml_stream_non_sequence_emits_single_doc() {
+        let data = Issue {
+            key: "PROJ-1",
+            summary: "Fix login",
+        };
+        let out = format_yaml_stream(&data).unwrap();
+        assert_eq!(out, "---\nkey: PROJ-1\nsummary: Fix login\n");
+    }
+
+    #[test]
+    fn yaml_stream_scalar_emits_single_doc() {
+        let data: i32 = 42;
+        let out = format_yaml_stream(&data).unwrap();
+        assert_eq!(out, "---\n42\n");
+    }
+
+    #[test]
+    fn yaml_stream_nested_sequences_treat_outer_only() {
+        let data = vec![vec![1, 2], vec![3, 4]];
+        let out = format_yaml_stream(&data).unwrap();
+        assert_eq!(out, "---\n- 1\n- 2\n---\n- 3\n- 4\n");
+    }
+
+    #[test]
+    fn yaml_stream_round_trips_via_safe_load_all() {
+        use serde::Deserialize;
+
+        let data = vec![
+            Issue {
+                key: "PROJ-1",
+                summary: "Fix login",
+            },
+            Issue {
+                key: "PROJ-2",
+                summary: "Add feature",
+            },
+        ];
+        let out = format_yaml_stream(&data).unwrap();
+
+        let docs: Vec<serde_yaml::Value> = serde_yaml::Deserializer::from_str(&out)
+            .map(serde_yaml::Value::deserialize)
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0]["key"], serde_yaml::Value::from("PROJ-1"));
+        assert_eq!(docs[1]["key"], serde_yaml::Value::from("PROJ-2"));
     }
 }
