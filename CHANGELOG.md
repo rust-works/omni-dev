@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that looks like a task checkbox marker (`[ ]`, `[x]`, or `[X]` followed by
   space, newline, or end). Prevents `to-adf` from falsely promoting these
   bullet items to `taskList`/`taskItem` on round-trip (issue #548).
+- **ADF Round-Trip URL Brackets** (#551): Preserve square brackets in URLs
+  embedded in link-marked text so ADF→JFM→ADF round-trips no longer leak
+  `\[`/`\]` escapes or split the text into corrupted `inlineCard` nodes.
 
 ## [0.21.0] - 2026-04-17
 
