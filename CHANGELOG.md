@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Confluence Bulk Space Download**: `confluence download` now accepts `--space <KEY>` to recursively download every page in a Confluence space, plus `--title-filter` to download only pages whose title contains a substring (case-insensitive)
+
 ### Fixed
 - **Empty Task Checkboxes**: Recognise `- [ ]` and `- [x]` markdown task markers
   even when the checkbox is not followed by a trailing space. Fixes ADF

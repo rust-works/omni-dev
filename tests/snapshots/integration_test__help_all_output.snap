@@ -311,19 +311,21 @@ omni-dev atlassian confluence download - Recursively downloads a Confluence page
 
 Recursively downloads a Confluence page tree
 
-Usage: download [OPTIONS] <ID>
+Usage: download [OPTIONS] <ID|--space <SPACE>>
 
 Arguments:
-  <ID>  Root Confluence page ID to start from
+  [ID]  Root Confluence page ID to start from
 
 Options:
-      --output-dir <OUTPUT_DIR>    Output directory [default: .]
-      --format <FORMAT>            Output format per page [default: jfm] [possible values: jfm, adf]
-      --concurrency <CONCURRENCY>  Maximum concurrent downloads [default: 8]
-      --max-depth <MAX_DEPTH>      Maximum tree depth (0 = unlimited) [default: 0]
-      --resume                     Use manifest for ID-aware resume (skip already-downloaded pages)
-      --on-conflict <ON_CONFLICT>  What to do when a file already exists [default: backup] [possible values: backup, skip, overwrite]
-  -h, --help                       Print help (see more with '--help')
+      --space <SPACE>                Space key — downloads every top-level page in the space
+      --output-dir <OUTPUT_DIR>      Output directory [default: .]
+      --format <FORMAT>              Output format per page [default: jfm] [possible values: jfm, adf]
+      --concurrency <CONCURRENCY>    Maximum concurrent downloads [default: 8]
+      --max-depth <MAX_DEPTH>        Maximum tree depth (0 = unlimited) [default: 0]
+      --title-filter <TITLE_FILTER>  Only download pages whose title contains this substring (case-insensitive). Children of non-matching pages are still traversed
+      --resume                       Use manifest for ID-aware resume (skip already-downloaded pages)
+      --on-conflict <ON_CONFLICT>    What to do when a file already exists [default: backup] [possible values: backup, skip, overwrite]
+  -h, --help                         Print help (see more with '--help')
 
 
 ================================================================================
