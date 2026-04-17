@@ -4252,10 +4252,18 @@ fn render_marked_text(text: &str, marks: &[AdfMark], output: &mut String) {
     };
     let escaped = escape_emoji_shortcodes(&escaped);
     let escaped = escape_backticks(&escaped);
+    // Always escape bare URLs so they are not re-parsed as `inlineCard`
+    // nodes on round-trip.  When the text carries a link mark, also escape
+    // `[` and `]` so they do not terminate the enclosing `[…]` link syntax
+    // (issue #493).  Escaping bare URLs inside link text additionally
+    // prevents `\[`/`\]` escapes from leaking through the URL-as-link-text
+    // fast path and from corrupting an auto-detected bare URL inside the
+    // link display text (issue #551).
+    let escaped = escape_bare_urls(&escaped);
     let escaped = if has_link {
         escape_link_brackets(&escaped)
     } else {
-        escape_bare_urls(&escaped)
+        escaped
     };
 
     // Collect (open, close) wrappers in mark order, outermost first.  Consecutive
@@ -8731,9 +8739,10 @@ mod tests {
     }
 
     #[test]
-    fn linked_url_text_not_double_escaped() {
-        // A text node with a link mark should render as [text](url),
-        // not escape the URL in the link text.
+    fn linked_url_text_round_trips() {
+        // A text node that is exactly a URL with a link mark pointing to the
+        // same URL must round-trip as a single text node with a link mark
+        // (no inlineCard, no lost/split content).
         let adf_json = r#"{
             "version": 1,
             "type": "doc",
@@ -8748,17 +8757,14 @@ mod tests {
         }"#;
         let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
         let jfm = adf_to_markdown(&adf).unwrap();
-        // Should render as a self-link, not as escaped text
-        assert!(!jfm.contains(r"\https"));
-        // Round-trip should preserve the link mark
         let roundtripped = markdown_to_adf(&jfm).unwrap();
         let content = roundtripped.content[0].content.as_ref().unwrap();
-        let has_link = content.iter().any(|n| {
-            n.marks
-                .as_ref()
-                .is_some_and(|m| m.iter().any(|mk| mk.mark_type == "link"))
-        });
-        assert!(has_link, "link mark should be preserved");
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].node_type, "text");
+        assert_eq!(content[0].text.as_deref(), Some("https://example.com"));
+        let mark = &content[0].marks.as_ref().unwrap()[0];
+        assert_eq!(mark.mark_type, "link");
+        assert_eq!(mark.attrs.as_ref().unwrap()["href"], "https://example.com");
     }
 
     // ── Issue #493: bracket-link ambiguity ─────────────────────────────
@@ -8928,6 +8934,181 @@ mod tests {
         };
         let md = adf_to_markdown(&doc).unwrap();
         assert_eq!(md.trim(), "[click here](https://example.com)");
+    }
+
+    // ── Issue #551: URL brackets in link-marked text round-trip ────────
+
+    #[test]
+    fn url_with_brackets_as_link_text_round_trips() {
+        // Issue #551: a text node whose content is a URL containing square
+        // brackets and which carries a link mark must round-trip verbatim.
+        // Previously the URL-as-link-text fast path preserved `\[` and `\]`
+        // escapes in the emitted text, corrupting the text content.
+        let href = "https://example.com/dashboard?filter[0]=active&filter[1]=pending";
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text_with_marks(
+                href,
+                vec![AdfMark::link(href)],
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let content = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].node_type, "text");
+        assert_eq!(content[0].text.as_deref(), Some(href));
+        let mark = &content[0].marks.as_ref().unwrap()[0];
+        assert_eq!(mark.mark_type, "link");
+        assert_eq!(mark.attrs.as_ref().unwrap()["href"], href);
+    }
+
+    #[test]
+    fn url_with_brackets_embedded_in_link_text_round_trips() {
+        // Issue #551 updated reproducer: a link-marked text node containing
+        // both prose and an embedded URL with brackets must round-trip
+        // without the embedded URL being detected as a bare-URL inlineCard
+        // or the brackets terminating the link syntax early.  This mirrors
+        // the comment reproducer which uses an ellipsis character between
+        // the brackets and a distinct href value.
+        let href = "https://example.com/logs?query=service%20environment%20data&from=100&to=200";
+        let text =
+            "See the logs: https://example.com/logs?query=service[\u{2026}]data&from=100&to=200";
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text_with_marks(
+                text,
+                vec![AdfMark::link(href)],
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let content = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1, "content split unexpectedly: {content:?}");
+        assert_eq!(content[0].node_type, "text");
+        assert_eq!(content[0].text.as_deref(), Some(text));
+        let mark = &content[0].marks.as_ref().unwrap()[0];
+        assert_eq!(mark.mark_type, "link");
+        assert_eq!(mark.attrs.as_ref().unwrap()["href"], href);
+    }
+
+    #[test]
+    fn url_with_brackets_plain_text_round_trips() {
+        // Issue #551 original reproducer: plain text with an embedded URL
+        // that contains square brackets must round-trip verbatim.
+        let text =
+            "See the dashboard: https://example.com/dashboard?filter[0]=active&filter[1]=pending";
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text(text)])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let content = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].node_type, "text");
+        assert_eq!(content[0].text.as_deref(), Some(text));
+        assert!(content[0].marks.is_none());
+    }
+
+    #[test]
+    fn url_with_link_mark_embedded_no_brackets_round_trips() {
+        // Regression guard: embedding a bare URL inside link-marked text
+        // (no brackets) must not create an inlineCard on round-trip.
+        let href = "https://example.com/";
+        let text = "See https://example.com/ for more";
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text_with_marks(
+                text,
+                vec![AdfMark::link(href)],
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let content = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].node_type, "text");
+        assert_eq!(content[0].text.as_deref(), Some(text));
+        let mark = &content[0].marks.as_ref().unwrap()[0];
+        assert_eq!(mark.mark_type, "link");
+        assert_eq!(mark.attrs.as_ref().unwrap()["href"], href);
+    }
+
+    #[test]
+    fn nested_brackets_in_link_text_round_trip() {
+        // Regression guard: nested brackets in link-marked text must
+        // round-trip without corrupting the content.
+        let href = "https://x.com";
+        let text = "foo [a[b]c] bar";
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text_with_marks(
+                text,
+                vec![AdfMark::link(href)],
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let content = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].node_type, "text");
+        assert_eq!(content[0].text.as_deref(), Some(text));
+    }
+
+    #[test]
+    fn bracket_url_bracket_in_link_text_round_trips() {
+        // Regression guard: a link-marked text containing brackets on both
+        // sides of an embedded URL (with brackets of its own) must
+        // round-trip intact.  This exercises interaction between the
+        // URL-as-link-text fast path, bare-URL detection, and bracket
+        // escape handling.
+        let href = "https://y.com";
+        let text = "[see https://x.com/a[0]=1 here]";
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text_with_marks(
+                text,
+                vec![AdfMark::link(href)],
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let content = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].node_type, "text");
+        assert_eq!(content[0].text.as_deref(), Some(text));
+        let mark = &content[0].marks.as_ref().unwrap()[0];
+        assert_eq!(mark.mark_type, "link");
+        assert_eq!(mark.attrs.as_ref().unwrap()["href"], href);
+    }
+
+    #[test]
+    fn escape_bare_urls_applied_inside_link_text() {
+        // White-box: when a text node carries a link mark, bare URLs in the
+        // text must still be escaped with `\h` so the parser does not
+        // auto-link them into an inlineCard inside the link.  Without this,
+        // round-trip of link-marked prose containing an embedded URL
+        // silently corrupts on re-parse (issue #551).
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text_with_marks(
+                "See https://example.com/",
+                vec![AdfMark::link("https://target.example.com/")],
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains(r"\https://example.com/"),
+            "bare URL inside link text must be escaped, got: {md}"
+        );
     }
 
     #[test]
