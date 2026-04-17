@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::atlassian::adf::AdfDocument;
-use crate::atlassian::client::JiraComment;
+use crate::atlassian::client::{AtlassianClient, JiraComment};
 use crate::atlassian::convert::{adf_to_markdown, markdown_to_adf};
 use crate::atlassian::document::JfmDocument;
 use crate::cli::atlassian::format::{output_as, ContentFormat, OutputFormat};
@@ -52,12 +52,7 @@ impl ListCommand {
     /// Fetches and displays comments.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        let comments = client.get_comments(&self.key).await?;
-        if output_as(&comments, &self.output)? {
-            return Ok(());
-        }
-        print_comments(&comments);
-        Ok(())
+        run_list_comments(&client, &self.key, &self.output).await
     }
 }
 
@@ -81,10 +76,7 @@ impl AddCommand {
         let adf = self.parse_input()?;
 
         let (client, _instance_url) = create_client()?;
-        client.add_comment(&self.key, &adf).await?;
-
-        println!("Comment added to {}.", self.key);
-        Ok(())
+        run_add_comment(&client, &self.key, &adf).await
     }
 
     /// Parses the input file into an ADF document.
@@ -107,6 +99,27 @@ impl AddCommand {
             }
         }
     }
+}
+
+/// Fetches and displays comments for an issue.
+async fn run_list_comments(
+    client: &AtlassianClient,
+    key: &str,
+    output: &OutputFormat,
+) -> Result<()> {
+    let comments = client.get_comments(key).await?;
+    if output_as(&comments, output)? {
+        return Ok(());
+    }
+    print_comments(&comments);
+    Ok(())
+}
+
+/// Posts a comment to an issue.
+async fn run_add_comment(client: &AtlassianClient, key: &str, adf: &AdfDocument) -> Result<()> {
+    client.add_comment(key, adf).await?;
+    println!("Comment added to {key}.");
+    Ok(())
 }
 
 /// Prints comments in a readable format.
@@ -365,5 +378,101 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, CommentSubcommands::Add(_)));
+    }
+
+    // ── run_list_comments / run_add_comment ────────────────────────
+
+    fn mock_client(base_url: &str) -> AtlassianClient {
+        AtlassianClient::new(base_url, "user@test.com", "token").unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_list_comments_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1/comment"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "comments": [{
+                        "id": "1",
+                        "author": {"displayName": "Alice"},
+                        "created": "2026-04-01T10:00:00.000+0000",
+                        "body": null
+                    }]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(run_list_comments(&client, "PROJ-1", &OutputFormat::Table)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_list_comments_json_output() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1/comment"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"comments": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(run_list_comments(&client, "PROJ-1", &OutputFormat::Json)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_list_comments_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/NOPE-1/comment"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_list_comments(&client, "NOPE-1", &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn run_add_comment_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1/comment"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({"id": "100"})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let adf = AdfDocument::new();
+        assert!(run_add_comment(&client, "PROJ-1", &adf).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_add_comment_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1/comment"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let adf = AdfDocument::new();
+        let err = run_add_comment(&client, "PROJ-1", &adf).await.unwrap_err();
+        assert!(err.to_string().contains("403"));
     }
 }

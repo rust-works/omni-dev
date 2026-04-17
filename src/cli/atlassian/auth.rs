@@ -83,21 +83,25 @@ impl StatusCommand {
     /// Verifies credentials by calling the JIRA API.
     pub async fn execute(self) -> Result<()> {
         let credentials = auth::load_credentials()?;
-
-        println!("Checking authentication to {}...", credentials.instance_url);
-
         let client = AtlassianClient::from_credentials(&credentials)?;
-        let user = client.get_myself().await?;
-
-        println!("Authenticated as: {}", user.display_name);
-        if let Some(ref email) = user.email_address {
-            println!("Email: {email}");
-        }
-        println!("Account ID: {}", user.account_id);
-        println!("Instance: {}", credentials.instance_url);
-
-        Ok(())
+        run_auth_status(&client, &credentials.instance_url).await
     }
+}
+
+/// Verifies authentication and displays the current user.
+async fn run_auth_status(client: &AtlassianClient, instance_url: &str) -> Result<()> {
+    println!("Checking authentication to {instance_url}...");
+
+    let user = client.get_myself().await?;
+
+    println!("Authenticated as: {}", user.display_name);
+    if let Some(ref email) = user.email_address {
+        println!("Email: {email}");
+    }
+    println!("Account ID: {}", user.account_id);
+    println!("Instance: {instance_url}");
+
+    Ok(())
 }
 
 /// Prompts the user for input on a single line.
@@ -132,5 +136,62 @@ mod tests {
             command: AuthSubcommands::Status(StatusCommand),
         };
         assert!(matches!(cmd.command, AuthSubcommands::Status(_)));
+    }
+
+    // ── run_auth_status ────────────────────────────────────────────
+
+    fn mock_client(base_url: &str) -> AtlassianClient {
+        AtlassianClient::new(base_url, "user@test.com", "token").unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_auth_status_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/myself"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "accountId": "abc123",
+                    "displayName": "Alice",
+                    "emailAddress": "alice@test.com"
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(run_auth_status(&client, &server.uri()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_auth_status_no_email() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/myself"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "accountId": "abc123",
+                    "displayName": "Alice"
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(run_auth_status(&client, &server.uri()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_auth_status_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/myself"))
+            .respond_with(wiremock::ResponseTemplate::new(401).set_body_string("Unauthorized"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_auth_status(&client, &server.uri()).await.unwrap_err();
+        assert!(err.to_string().contains("401"));
     }
 }

@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::atlassian::client::{AgileSprintList, JiraSearchResult};
+use crate::atlassian::client::{AgileSprintList, AtlassianClient, JiraSearchResult};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -67,14 +67,14 @@ impl ListCommand {
     /// Fetches and displays sprints.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        let result = client
-            .get_sprints(self.board_id, self.state.as_deref(), self.limit)
-            .await?;
-        if output_as(&result, &self.output)? {
-            return Ok(());
-        }
-        print_sprints(&result);
-        Ok(())
+        run_list_sprints(
+            &client,
+            self.board_id,
+            self.state.as_deref(),
+            self.limit,
+            &self.output,
+        )
+        .await
     }
 }
 
@@ -102,14 +102,14 @@ impl IssuesCommand {
     /// Fetches and displays sprint issues.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        let result = client
-            .get_sprint_issues(self.sprint_id, self.jql.as_deref(), self.limit)
-            .await?;
-        if output_as(&result, &self.output)? {
-            return Ok(());
-        }
-        print_sprint_issues(&result);
-        Ok(())
+        run_sprint_issues(
+            &client,
+            self.sprint_id,
+            self.jql.as_deref(),
+            self.limit,
+            &self.output,
+        )
+        .await
     }
 }
 
@@ -134,17 +134,7 @@ impl AddCommand {
         }
 
         let (client, _instance_url) = create_client()?;
-        let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-        client
-            .add_issues_to_sprint(self.sprint_id, &key_refs)
-            .await?;
-
-        println!(
-            "Added {} issue(s) to sprint {}.",
-            keys.len(),
-            self.sprint_id
-        );
-        Ok(())
+        run_add_to_sprint(&client, self.sprint_id, &keys).await
     }
 }
 
@@ -176,18 +166,15 @@ impl CreateCommand {
     /// Creates the sprint.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        let sprint = client
-            .create_sprint(
-                self.board_id,
-                &self.name,
-                self.start_date.as_deref(),
-                self.end_date.as_deref(),
-                self.goal.as_deref(),
-            )
-            .await?;
-
-        println!("Created sprint {} (id: {}).", sprint.name, sprint.id);
-        Ok(())
+        run_create_sprint(
+            &client,
+            self.board_id,
+            &self.name,
+            self.start_date.as_deref(),
+            self.end_date.as_deref(),
+            self.goal.as_deref(),
+        )
+        .await
     }
 }
 
@@ -223,20 +210,94 @@ impl UpdateCommand {
     /// Updates the sprint.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        client
-            .update_sprint(
-                self.sprint_id,
-                self.name.as_deref(),
-                self.state.as_deref(),
-                self.start_date.as_deref(),
-                self.end_date.as_deref(),
-                self.goal.as_deref(),
-            )
-            .await?;
-
-        println!("Updated sprint {}.", self.sprint_id);
-        Ok(())
+        run_update_sprint(
+            &client,
+            self.sprint_id,
+            self.name.as_deref(),
+            self.state.as_deref(),
+            self.start_date.as_deref(),
+            self.end_date.as_deref(),
+            self.goal.as_deref(),
+        )
+        .await
     }
+}
+
+/// Fetches and displays sprints for a board.
+async fn run_list_sprints(
+    client: &AtlassianClient,
+    board_id: u64,
+    state: Option<&str>,
+    limit: u32,
+    output: &OutputFormat,
+) -> Result<()> {
+    let result = client.get_sprints(board_id, state, limit).await?;
+    if output_as(&result, output)? {
+        return Ok(());
+    }
+    print_sprints(&result);
+    Ok(())
+}
+
+/// Fetches and displays issues in a sprint.
+async fn run_sprint_issues(
+    client: &AtlassianClient,
+    sprint_id: u64,
+    jql: Option<&str>,
+    limit: u32,
+    output: &OutputFormat,
+) -> Result<()> {
+    let result = client.get_sprint_issues(sprint_id, jql, limit).await?;
+    if output_as(&result, output)? {
+        return Ok(());
+    }
+    print_sprint_issues(&result);
+    Ok(())
+}
+
+/// Adds issues to a sprint.
+async fn run_add_to_sprint(
+    client: &AtlassianClient,
+    sprint_id: u64,
+    keys: &[String],
+) -> Result<()> {
+    let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+    client.add_issues_to_sprint(sprint_id, &key_refs).await?;
+    println!("Added {} issue(s) to sprint {sprint_id}.", keys.len());
+    Ok(())
+}
+
+/// Creates a new sprint on a board.
+async fn run_create_sprint(
+    client: &AtlassianClient,
+    board_id: u64,
+    name: &str,
+    start_date: Option<&str>,
+    end_date: Option<&str>,
+    goal: Option<&str>,
+) -> Result<()> {
+    let sprint = client
+        .create_sprint(board_id, name, start_date, end_date, goal)
+        .await?;
+    println!("Created sprint {} (id: {}).", sprint.name, sprint.id);
+    Ok(())
+}
+
+/// Updates an existing sprint.
+async fn run_update_sprint(
+    client: &AtlassianClient,
+    sprint_id: u64,
+    name: Option<&str>,
+    state: Option<&str>,
+    start_date: Option<&str>,
+    end_date: Option<&str>,
+    goal: Option<&str>,
+) -> Result<()> {
+    client
+        .update_sprint(sprint_id, name, state, start_date, end_date, goal)
+        .await?;
+    println!("Updated sprint {sprint_id}.");
+    Ok(())
 }
 
 /// Parses a comma-separated list of issue keys.
@@ -641,5 +702,170 @@ mod tests {
         assert_eq!(cmd.sprint_id, 42);
         assert!(cmd.name.is_none());
         assert_eq!(cmd.state.as_deref(), Some("active"));
+    }
+
+    // ── run_* sprint functions ──────────────────────────────────────
+
+    fn mock_client(base_url: &str) -> AtlassianClient {
+        AtlassianClient::new(base_url, "user@test.com", "token").unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_list_sprints_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/board/1/sprint"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "values": [{"id": 10, "name": "Sprint 1", "state": "active"}],
+                    "isLast": true
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(run_list_sprints(&client, 1, None, 50, &OutputFormat::Table)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_list_sprints_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/board/999/sprint"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_list_sprints(&client, 999, None, 50, &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn run_sprint_issues_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint/10/issue"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issues": [],
+                    "total": 0
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(
+            run_sprint_issues(&client, 10, None, 50, &OutputFormat::Table)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_add_to_sprint_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint/10/issue"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let keys = vec!["PROJ-1".to_string(), "PROJ-2".to_string()];
+        assert!(run_add_to_sprint(&client, 10, &keys).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_add_to_sprint_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint/999/issue"))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("Bad Request"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let keys = vec!["PROJ-1".to_string()];
+        let err = run_add_to_sprint(&client, 999, &keys).await.unwrap_err();
+        assert!(err.to_string().contains("400"));
+    }
+
+    #[tokio::test]
+    async fn run_create_sprint_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "id": 100, "name": "Sprint 5", "state": "future"
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(run_create_sprint(&client, 1, "Sprint 5", None, None, None)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_create_sprint_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint"))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("Bad"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_create_sprint(&client, 1, "Sprint", None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("400"));
+    }
+
+    #[tokio::test]
+    async fn run_update_sprint_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint/42"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": 42, "name": "Updated", "state": "active"
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(
+            run_update_sprint(&client, 42, Some("Updated"), None, None, None, None)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_update_sprint_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint/999"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_update_sprint(&client, 999, Some("X"), None, None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
     }
 }

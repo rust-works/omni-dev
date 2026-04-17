@@ -4,8 +4,8 @@ use anyhow::Result;
 use clap::{Parser, ValueEnum};
 
 use crate::atlassian::client::{
-    JiraDevBranch, JiraDevCommit, JiraDevPullRequest, JiraDevRepository, JiraDevStatus,
-    JiraDevStatusSummary,
+    AtlassianClient, JiraDevBranch, JiraDevCommit, JiraDevPullRequest, JiraDevRepository,
+    JiraDevStatus, JiraDevStatusSummary,
 };
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
@@ -60,29 +60,43 @@ impl DevCommand {
     /// Executes the dev-status command.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-
-        if self.summary {
-            let summary = client.get_dev_status_summary(&self.key).await?;
-            if output_as(&summary, &self.output)? {
-                return Ok(());
-            }
-            print_summary(&self.key, &summary);
-            return Ok(());
-        }
-
         let data_type = self.r#type.as_ref().map(DevDataType::as_api_str);
-        let app_type = self.app.as_deref();
-        let status = client
-            .get_dev_status(&self.key, data_type, app_type)
-            .await?;
+        run_dev_status(
+            &client,
+            &self.key,
+            data_type,
+            self.app.as_deref(),
+            self.summary,
+            &self.output,
+        )
+        .await
+    }
+}
 
-        if output_as(&status, &self.output)? {
+/// Fetches and displays development status for an issue.
+async fn run_dev_status(
+    client: &AtlassianClient,
+    key: &str,
+    data_type: Option<&str>,
+    app_type: Option<&str>,
+    summary: bool,
+    output: &OutputFormat,
+) -> Result<()> {
+    if summary {
+        let summary_data = client.get_dev_status_summary(key).await?;
+        if output_as(&summary_data, output)? {
             return Ok(());
         }
-
-        print_dev_status(&self.key, &status);
-        Ok(())
+        print_summary(key, &summary_data);
+        return Ok(());
     }
+
+    let status = client.get_dev_status(key, data_type, app_type).await?;
+    if output_as(&status, output)? {
+        return Ok(());
+    }
+    print_dev_status(key, &status);
+    Ok(())
 }
 
 /// Prints a development status summary as a formatted table.
@@ -531,5 +545,117 @@ mod tests {
         let repo = sample_repo();
         assert_eq!(repo.commits.len(), 1);
         assert_eq!(repo.commits[0].display_id, "abc123d");
+    }
+
+    // ── run_dev_status ─────────────────────────────────────────────
+
+    fn mock_client(base_url: &str) -> AtlassianClient {
+        AtlassianClient::new(base_url, "user@test.com", "token").unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_dev_status_summary_mode() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"id": "10001", "key": "PROJ-1", "fields": {}}),
+                ),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/dev-status/1.0/issue/summary",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "summary": {
+                        "pullrequest": {"overall": {"count": 0}, "byInstanceType": {}},
+                        "branch": {"overall": {"count": 0}, "byInstanceType": {}},
+                        "repository": {"overall": {"count": 0}, "byInstanceType": {}}
+                    }
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(
+            run_dev_status(&client, "PROJ-1", None, None, true, &OutputFormat::Table)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_dev_status_detail_mode() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"id": "10001", "key": "PROJ-1", "fields": {}}),
+                ),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/dev-status/1.0/issue/summary",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "summary": {
+                        "pullrequest": {
+                            "overall": {"count": 0},
+                            "byInstanceType": {"GitHub": {"count": 0, "name": "GitHub"}}
+                        },
+                        "branch": {"overall": {"count": 0}, "byInstanceType": {}},
+                        "repository": {"overall": {"count": 0}, "byInstanceType": {}}
+                    }
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/dev-status/1.0/issue/detail",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "detail": [{
+                        "pullRequests": [],
+                        "branches": [],
+                        "repositories": []
+                    }]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(
+            run_dev_status(&client, "PROJ-1", None, None, false, &OutputFormat::Table)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_dev_status_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/NOPE-1"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_dev_status(&client, "NOPE-1", None, None, true, &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
     }
 }

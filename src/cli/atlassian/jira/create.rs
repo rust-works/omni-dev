@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use crate::atlassian::adf::AdfDocument;
+use crate::atlassian::client::AtlassianClient;
 use crate::atlassian::convert::markdown_to_adf;
 use crate::atlassian::document::{JfmDocument, JfmFrontmatter};
 use crate::cli::atlassian::format::ContentFormat;
@@ -62,18 +63,7 @@ impl CreateCommand {
         }
 
         let (client, _instance_url) = create_client()?;
-        let result = client
-            .create_issue(
-                &params.project,
-                &params.issue_type,
-                &params.summary,
-                Some(&params.adf),
-                &params.labels,
-            )
-            .await?;
-
-        println!("{}", result.key);
-        Ok(())
+        run_create(&client, &params).await
     }
 
     /// Resolves creation parameters from input file and CLI flags.
@@ -161,6 +151,22 @@ impl CreateCommand {
             adf,
         })
     }
+}
+
+/// Creates a JIRA issue from resolved parameters.
+async fn run_create(client: &AtlassianClient, params: &CreateParams) -> Result<()> {
+    let result = client
+        .create_issue(
+            &params.project,
+            &params.issue_type,
+            &params.summary,
+            Some(&params.adf),
+            &params.labels,
+        )
+        .await?;
+
+    println!("{}", result.key);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -411,5 +417,52 @@ mod tests {
 
         let err = cmd.resolve_params().unwrap_err();
         assert!(err.to_string().contains("Confluence"));
+    }
+
+    // ── run_create ─────────────────────────────────────────────────
+
+    fn mock_client(base_url: &str) -> AtlassianClient {
+        AtlassianClient::new(base_url, "user@test.com", "token").unwrap()
+    }
+
+    fn sample_params() -> CreateParams {
+        CreateParams {
+            project: "PROJ".to_string(),
+            issue_type: "Task".to_string(),
+            summary: "Test issue".to_string(),
+            labels: vec![],
+            adf: AdfDocument::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_create_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/issue"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "id": "100", "key": "PROJ-100", "self": "https://org.atlassian.net/rest/api/3/issue/100"
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(run_create(&client, &sample_params()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_create_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/issue"))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("Bad Request"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_create(&client, &sample_params()).await.unwrap_err();
+        assert!(err.to_string().contains("400"));
     }
 }

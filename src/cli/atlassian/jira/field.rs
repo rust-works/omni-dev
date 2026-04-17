@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::atlassian::client::{JiraField, JiraFieldOption};
+use crate::atlassian::client::{AtlassianClient, JiraField, JiraFieldOption};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -50,13 +50,7 @@ impl ListCommand {
     /// Fetches and displays field definitions.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        let fields = client.get_fields().await?;
-        let filtered = filter_fields(&fields, self.search.as_deref());
-        if output_as(&filtered, &self.output)? {
-            return Ok(());
-        }
-        print_fields(&filtered);
-        Ok(())
+        run_list_fields(&client, self.search.as_deref(), &self.output).await
     }
 }
 
@@ -80,15 +74,44 @@ impl OptionsCommand {
     /// Fetches and displays field options.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        let options = client
-            .get_field_options(&self.field_id, self.context_id.as_deref())
-            .await?;
-        if output_as(&options, &self.output)? {
-            return Ok(());
-        }
-        print_options(&options);
-        Ok(())
+        run_field_options(
+            &client,
+            &self.field_id,
+            self.context_id.as_deref(),
+            &self.output,
+        )
+        .await
     }
+}
+
+/// Fetches, filters, and displays field definitions.
+async fn run_list_fields(
+    client: &AtlassianClient,
+    search: Option<&str>,
+    output: &OutputFormat,
+) -> Result<()> {
+    let fields = client.get_fields().await?;
+    let filtered = filter_fields(&fields, search);
+    if output_as(&filtered, output)? {
+        return Ok(());
+    }
+    print_fields(&filtered);
+    Ok(())
+}
+
+/// Fetches and displays options for a custom field.
+async fn run_field_options(
+    client: &AtlassianClient,
+    field_id: &str,
+    context_id: Option<&str>,
+    output: &OutputFormat,
+) -> Result<()> {
+    let options = client.get_field_options(field_id, context_id).await?;
+    if output_as(&options, output)? {
+        return Ok(());
+    }
+    print_options(&options);
+    Ok(())
 }
 
 /// Filters fields by a case-insensitive substring match on the name.
@@ -295,5 +318,125 @@ mod tests {
             output: OutputFormat::Table,
         };
         assert_eq!(cmd.context_id.as_deref(), Some("12345"));
+    }
+
+    // ── run_list_fields / run_field_options ────────────────────────
+
+    fn mock_client(base_url: &str) -> AtlassianClient {
+        AtlassianClient::new(base_url, "user@test.com", "token").unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_list_fields_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/field"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"id": "summary", "name": "Summary", "custom": false}
+                ])),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(run_list_fields(&client, None, &OutputFormat::Table)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_list_fields_with_filter() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/field"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"id": "summary", "name": "Summary", "custom": false},
+                    {"id": "customfield_1", "name": "Story Points", "custom": true}
+                ])),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(run_list_fields(&client, Some("story"), &OutputFormat::Json)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_list_fields_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/field"))
+            .respond_with(wiremock::ResponseTemplate::new(401).set_body_string("Unauthorized"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_list_fields(&client, None, &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("401"));
+    }
+
+    #[tokio::test]
+    async fn run_field_options_with_context_id() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/field/customfield_10001/context/12345/option",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "values": [{"id": "1", "value": "Option A"}]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(run_field_options(
+            &client,
+            "customfield_10001",
+            Some("12345"),
+            &OutputFormat::Table
+        )
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_field_options_auto_discovery() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/field/customfield_10001/context",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "values": [{"id": "12345", "name": "Default"}]
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/field/customfield_10001/context/12345/option",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"values": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(
+            run_field_options(&client, "customfield_10001", None, &OutputFormat::Json)
+                .await
+                .is_ok()
+        );
     }
 }

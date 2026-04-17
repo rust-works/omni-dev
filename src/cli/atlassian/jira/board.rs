@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::atlassian::client::{AgileBoardList, JiraSearchResult};
+use crate::atlassian::client::{AgileBoardList, AtlassianClient, JiraSearchResult};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -58,14 +58,14 @@ impl ListCommand {
     /// Fetches and displays boards.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        let result = client
-            .get_boards(self.project.as_deref(), self.r#type.as_deref(), self.limit)
-            .await?;
-        if output_as(&result, &self.output)? {
-            return Ok(());
-        }
-        print_boards(&result);
-        Ok(())
+        run_list_boards(
+            &client,
+            self.project.as_deref(),
+            self.r#type.as_deref(),
+            self.limit,
+            &self.output,
+        )
+        .await
     }
 }
 
@@ -93,15 +93,47 @@ impl IssuesCommand {
     /// Fetches and displays board issues.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        let result = client
-            .get_board_issues(self.board_id, self.jql.as_deref(), self.limit)
-            .await?;
-        if output_as(&result, &self.output)? {
-            return Ok(());
-        }
-        print_board_issues(&result);
-        Ok(())
+        run_board_issues(
+            &client,
+            self.board_id,
+            self.jql.as_deref(),
+            self.limit,
+            &self.output,
+        )
+        .await
     }
+}
+
+/// Fetches and displays boards.
+async fn run_list_boards(
+    client: &AtlassianClient,
+    project: Option<&str>,
+    board_type: Option<&str>,
+    limit: u32,
+    output: &OutputFormat,
+) -> Result<()> {
+    let result = client.get_boards(project, board_type, limit).await?;
+    if output_as(&result, output)? {
+        return Ok(());
+    }
+    print_boards(&result);
+    Ok(())
+}
+
+/// Fetches and displays issues on a board.
+async fn run_board_issues(
+    client: &AtlassianClient,
+    board_id: u64,
+    jql: Option<&str>,
+    limit: u32,
+    output: &OutputFormat,
+) -> Result<()> {
+    let result = client.get_board_issues(board_id, jql, limit).await?;
+    if output_as(&result, output)? {
+        return Ok(());
+    }
+    print_board_issues(&result);
+    Ok(())
 }
 
 /// Prints boards as a formatted table.
@@ -368,5 +400,112 @@ mod tests {
         };
         assert_eq!(cmd.board_id, 42);
         assert_eq!(cmd.jql.as_deref(), Some("status = Open"));
+    }
+
+    // ── run_list_boards / run_board_issues ─────────────────────────
+
+    fn mock_client(base_url: &str) -> AtlassianClient {
+        AtlassianClient::new(base_url, "user@test.com", "token").unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_list_boards_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/board"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "values": [{
+                        "id": 1, "name": "Board", "type": "scrum",
+                        "location": {"projectKey": "PROJ"}
+                    }],
+                    "total": 1, "isLast": true
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(
+            run_list_boards(&client, None, None, 50, &OutputFormat::Table)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_list_boards_json_output() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/board"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"values": [], "total": 0, "isLast": true})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(run_list_boards(
+            &client,
+            Some("PROJ"),
+            Some("scrum"),
+            50,
+            &OutputFormat::Json
+        )
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_list_boards_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/board"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_list_boards(&client, None, None, 50, &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn run_board_issues_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/board/1/issue"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issues": [],
+                    "total": 0
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(run_board_issues(&client, 1, None, 50, &OutputFormat::Table)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_board_issues_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/board/999/issue"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_board_issues(&client, 999, None, 50, &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
     }
 }

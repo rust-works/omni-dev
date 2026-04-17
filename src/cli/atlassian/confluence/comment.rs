@@ -57,13 +57,7 @@ impl ListCommand {
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
         let api = ConfluenceApi::new(client);
-        let mut comments = api.get_page_comments(&self.id).await?;
-        comments.truncate(self.limit);
-        if output_as(&comments, &self.output)? {
-            return Ok(());
-        }
-        print_comments(&comments);
-        Ok(())
+        run_list_comments(&api, &self.id, self.limit, &self.output).await
     }
 }
 
@@ -88,10 +82,7 @@ impl AddCommand {
 
         let (client, _instance_url) = create_client()?;
         let api = ConfluenceApi::new(client);
-        api.add_page_comment(&self.id, &adf).await?;
-
-        println!("Comment added to page {}.", self.id);
-        Ok(())
+        run_add_comment(&api, &self.id, &adf).await
     }
 
     /// Parses the input file into an ADF document.
@@ -114,6 +105,29 @@ impl AddCommand {
             }
         }
     }
+}
+
+/// Fetches and displays comments for a page.
+async fn run_list_comments(
+    api: &ConfluenceApi,
+    id: &str,
+    limit: usize,
+    output: &OutputFormat,
+) -> Result<()> {
+    let mut comments = api.get_page_comments(id).await?;
+    comments.truncate(limit);
+    if output_as(&comments, output)? {
+        return Ok(());
+    }
+    print_comments(&comments);
+    Ok(())
+}
+
+/// Posts a comment to a page.
+async fn run_add_comment(api: &ConfluenceApi, id: &str, adf: &AdfDocument) -> Result<()> {
+    api.add_page_comment(id, adf).await?;
+    println!("Comment added to page {id}.");
+    Ok(())
 }
 
 /// Prints comments in a readable format.
@@ -377,5 +391,104 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, CommentSubcommands::Add(_)));
+    }
+
+    // ── run_list_comments / run_add_comment ────────────────────────
+
+    fn mock_api(server: &wiremock::MockServer) -> ConfluenceApi {
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "user@test.com", "token")
+                .unwrap();
+        ConfluenceApi::new(client)
+    }
+
+    #[tokio::test]
+    async fn run_list_comments_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/footer-comments",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let api = mock_api(&server);
+        assert!(run_list_comments(&api, "12345", 25, &OutputFormat::Table)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_list_comments_json_output() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/footer-comments",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let api = mock_api(&server);
+        assert!(run_list_comments(&api, "12345", 25, &OutputFormat::Json)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_list_comments_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/99999/footer-comments",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let api = mock_api(&server);
+        let err = run_list_comments(&api, "99999", 25, &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn run_add_comment_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/wiki/api/v2/footer-comments"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "200"})),
+            )
+            .mount(&server)
+            .await;
+
+        let api = mock_api(&server);
+        let adf = AdfDocument::new();
+        assert!(run_add_comment(&api, "12345", &adf).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_add_comment_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/wiki/api/v2/footer-comments"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        let api = mock_api(&server);
+        let adf = AdfDocument::new();
+        let err = run_add_comment(&api, "12345", &adf).await.unwrap_err();
+        assert!(err.to_string().contains("403"));
     }
 }
