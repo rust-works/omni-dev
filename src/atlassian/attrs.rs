@@ -52,11 +52,11 @@ impl Attrs {
     pub fn render(&self) -> String {
         let mut parts = Vec::new();
         for (k, v) in &self.map {
-            Self::push_kv(&mut parts, k, v);
+            parts.push(format_kv(k, v));
         }
         for (k, values) in &self.multi {
             for v in values {
-                Self::push_kv(&mut parts, k, v);
+                parts.push(format_kv(k, v));
             }
         }
         for f in &self.flags {
@@ -64,14 +64,23 @@ impl Attrs {
         }
         format!("{{{}}}", parts.join(" "))
     }
+}
 
-    fn push_kv(parts: &mut Vec<String>, k: &str, v: &str) {
-        if v.contains(' ') || v.contains('"') {
-            let escaped = v.replace('"', "\\\"");
-            parts.push(format!("{k}=\"{escaped}\""));
-        } else {
-            parts.push(format!("{k}={v}"));
-        }
+/// Formats a `key=value` pair for a JFM `{...}` attribute block, quoting the
+/// value if it contains whitespace, a closing brace, quote, or backslash.
+///
+/// The parser treats whitespace and `}` as value terminators for unquoted
+/// values, so values containing these characters must be quoted and escaped
+/// to round-trip correctly.
+pub fn format_kv(k: &str, v: &str) -> String {
+    let needs_quoting = v
+        .chars()
+        .any(|c| c.is_whitespace() || matches!(c, '}' | '"' | '\\'));
+    if needs_quoting {
+        let escaped = v.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("{k}=\"{escaped}\"")
+    } else {
+        format!("{k}={v}")
     }
 }
 
@@ -385,6 +394,61 @@ mod tests {
         let (_, attrs) = parse_attrs("{type=info}", 0).unwrap();
         assert_eq!(attrs.get_all("type"), vec!["info"]);
         assert!(attrs.get_all("missing").is_empty());
+    }
+
+    #[test]
+    fn format_kv_plain() {
+        assert_eq!(format_kv("k", "v"), "k=v");
+        assert_eq!(format_kv("id", "abc-123"), "id=abc-123");
+    }
+
+    #[test]
+    fn format_kv_with_space_quoted() {
+        assert_eq!(format_kv("id", "a b c"), "id=\"a b c\"");
+    }
+
+    #[test]
+    fn format_kv_with_tab_quoted() {
+        assert_eq!(format_kv("id", "a\tb"), "id=\"a\tb\"");
+    }
+
+    #[test]
+    fn format_kv_with_closing_brace_quoted() {
+        assert_eq!(format_kv("id", "a}b"), "id=\"a}b\"");
+    }
+
+    #[test]
+    fn format_kv_with_quote_escaped() {
+        assert_eq!(format_kv("k", "a\"b"), r#"k="a\"b""#);
+    }
+
+    #[test]
+    fn format_kv_with_backslash_escaped() {
+        assert_eq!(format_kv("k", "a\\b"), r#"k="a\\b""#);
+    }
+
+    #[test]
+    fn format_kv_empty_value_unquoted() {
+        assert_eq!(format_kv("k", ""), "k=");
+    }
+
+    /// Issue #550: values containing spaces must round-trip through
+    /// render → parse_attrs without corruption.
+    #[test]
+    fn format_kv_round_trip_with_spaces() {
+        let rendered = format!("{{{}}}", format_kv("id", "abc 123 def 456"));
+        let (_, attrs) = parse_attrs(&rendered, 0).unwrap();
+        assert_eq!(attrs.get("id"), Some("abc 123 def 456"));
+    }
+
+    /// A value that contains an escaped-quote-and-backslash combination must
+    /// also round-trip correctly.
+    #[test]
+    fn format_kv_round_trip_with_quote_and_backslash() {
+        let original = "he said \\\"hi\\\"";
+        let rendered = format!("{{{}}}", format_kv("msg", original));
+        let (_, attrs) = parse_attrs(&rendered, 0).unwrap();
+        assert_eq!(attrs.get("msg"), Some(original));
     }
 
     #[test]
