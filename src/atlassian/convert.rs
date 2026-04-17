@@ -1232,19 +1232,53 @@ fn parse_decision_items(text: &str) -> Vec<AdfNode> {
     items
 }
 
-/// Tries to parse a task list marker `[ ] ` or `[x] ` at the start of text.
+/// Tries to parse a task list marker `[ ]`, `[x]`, or `[X]` at the start of text.
 /// Returns `("TODO"|"DONE", remaining_text)` on success.
+///
+/// The marker must be followed by a space or the end of the text, so that
+/// empty task items (`- [ ]` with no body) are still recognised as tasks
+/// rather than being treated as bullet items containing literal `[ ]` text
+/// (issue #548).
 fn try_parse_task_marker(text: &str) -> Option<(&str, &str)> {
-    if let Some(rest) = text.strip_prefix("[ ] ") {
+    if let Some(rest) = strip_task_checkbox(text, "[ ]") {
         Some(("TODO", rest))
-    } else if let Some(rest) = text
-        .strip_prefix("[x] ")
-        .or_else(|| text.strip_prefix("[X] "))
+    } else if let Some(rest) =
+        strip_task_checkbox(text, "[x]").or_else(|| strip_task_checkbox(text, "[X]"))
     {
         Some(("DONE", rest))
     } else {
         None
     }
+}
+
+/// Strips a checkbox prefix from `text` if the character after the checkbox
+/// is a space or the text ends there.  Returns the remaining text (with the
+/// separating space consumed, if any).
+fn strip_task_checkbox<'a>(text: &'a str, checkbox: &str) -> Option<&'a str> {
+    let rest = text.strip_prefix(checkbox)?;
+    if rest.is_empty() {
+        Some(rest)
+    } else {
+        rest.strip_prefix(' ')
+    }
+}
+
+/// Returns true if `s` begins with a sequence the bullet-list parser would
+/// interpret as a task checkbox marker (`[ ]`, `[x]`, or `[X]` followed by
+/// a space, newline, or end-of-input).
+///
+/// Used by the `bulletList` renderer to decide whether to escape the leading
+/// `[` of an item whose literal text starts with a checkbox-shaped prefix
+/// (issue #548).
+fn starts_with_task_marker(s: &str) -> bool {
+    let after = if let Some(rest) = s.strip_prefix("[ ]") {
+        rest
+    } else if let Some(rest) = s.strip_prefix("[x]").or_else(|| s.strip_prefix("[X]")) {
+        rest
+    } else {
+        return false;
+    };
+    after.is_empty() || after.starts_with(' ') || after.starts_with('\n')
 }
 
 /// Parses an ordered list marker like "1. " and returns (number, rest_of_line).
@@ -2785,7 +2819,16 @@ fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) 
             if let Some(ref items) = node.content {
                 for item in items {
                     output.push_str("- ");
+                    let content_start = output.len();
                     render_list_item_content(item, output, opts);
+                    // If the rendered content begins with a sequence the
+                    // bullet-list parser would interpret as a task checkbox
+                    // marker, escape the leading `[` so the round-trip
+                    // preserves this as a `bulletList` rather than promoting
+                    // it to a `taskList` (issue #548).
+                    if starts_with_task_marker(&output[content_start..]) {
+                        output.insert(content_start, '\\');
+                    }
                 }
             }
         }
@@ -4548,6 +4591,266 @@ mod tests {
         assert_eq!(doc.content[0].node_type, "taskList");
         let item = &doc.content[0].content.as_ref().unwrap()[0];
         assert_eq!(item.attrs.as_ref().unwrap()["state"], "DONE");
+    }
+
+    /// Issue #548: an empty task marker (no trailing space) must still be
+    /// parsed as a `taskList` rather than a `bulletList` with `[ ]` text.
+    #[test]
+    fn task_list_empty_todo_no_trailing_space() {
+        let md = "- [ ]";
+        let doc = markdown_to_adf(md).unwrap();
+        assert_eq!(doc.content[0].node_type, "taskList");
+        let items = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].node_type, "taskItem");
+        assert_eq!(items[0].attrs.as_ref().unwrap()["state"], "TODO");
+        assert!(items[0].content.is_none());
+    }
+
+    /// Issue #548: likewise for a done checkbox with no body.
+    #[test]
+    fn task_list_empty_done_no_trailing_space() {
+        let md = "- [x]\n- [X]";
+        let doc = markdown_to_adf(md).unwrap();
+        assert_eq!(doc.content[0].node_type, "taskList");
+        let items = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].attrs.as_ref().unwrap()["state"], "DONE");
+        assert_eq!(items[1].attrs.as_ref().unwrap()["state"], "DONE");
+    }
+
+    /// Issue #548: the body of `- [ ] text` must not have a spurious leading
+    /// space introduced by relaxing the trailing-space requirement.
+    #[test]
+    fn task_list_body_has_no_leading_space() {
+        let md = "- [ ] Buy groceries";
+        let doc = markdown_to_adf(md).unwrap();
+        let item = &doc.content[0].content.as_ref().unwrap()[0];
+        let text = item.content.as_ref().unwrap()[0].text.as_deref().unwrap();
+        assert_eq!(text, "Buy groceries");
+    }
+
+    /// Issue #548: round-trip from ADF with empty taskItems should preserve
+    /// the `taskList` structure even if trailing spaces are stripped from the
+    /// intermediate markdown (as many editors do).
+    #[test]
+    fn round_trip_empty_task_items_stripped_trailing_spaces() {
+        let json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "taskList",
+                "attrs": {"localId": "abc"},
+                "content": [
+                    {"type": "taskItem", "attrs": {"localId": "def", "state": "TODO"}},
+                    {"type": "taskItem", "attrs": {"localId": "ghi", "state": "DONE"}}
+                ]
+            }]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let stripped: String = md
+            .lines()
+            .map(|l| l.trim_end())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed = markdown_to_adf(&stripped).unwrap();
+        assert_eq!(parsed.content[0].node_type, "taskList");
+        let items = parsed.content[0].content.as_ref().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].node_type, "taskItem");
+        assert_eq!(items[0].attrs.as_ref().unwrap()["state"], "TODO");
+        assert_eq!(items[1].node_type, "taskItem");
+        assert_eq!(items[1].attrs.as_ref().unwrap()["state"], "DONE");
+    }
+
+    #[test]
+    fn try_parse_task_marker_accepts_bare_checkbox() {
+        assert_eq!(try_parse_task_marker("[ ]"), Some(("TODO", "")));
+        assert_eq!(try_parse_task_marker("[x]"), Some(("DONE", "")));
+        assert_eq!(try_parse_task_marker("[X]"), Some(("DONE", "")));
+        assert_eq!(try_parse_task_marker("[ ] foo"), Some(("TODO", "foo")));
+        assert_eq!(try_parse_task_marker("[x] foo"), Some(("DONE", "foo")));
+        assert_eq!(try_parse_task_marker("[ ]foo"), None);
+        assert_eq!(try_parse_task_marker("[x]foo"), None);
+        assert_eq!(try_parse_task_marker("[y] foo"), None);
+    }
+
+    #[test]
+    fn starts_with_task_marker_matches_parser() {
+        // Anything `try_parse_task_marker` recognises must also be flagged
+        // here so the renderer escapes it.
+        assert!(starts_with_task_marker("[ ]"));
+        assert!(starts_with_task_marker("[x]"));
+        assert!(starts_with_task_marker("[X]"));
+        assert!(starts_with_task_marker("[ ] foo"));
+        assert!(starts_with_task_marker("[x] foo\n"));
+        assert!(starts_with_task_marker("[ ]\n"));
+        // No collision when the bracket is followed by non-whitespace.
+        assert!(!starts_with_task_marker("[ ]foo"));
+        assert!(!starts_with_task_marker("[y] foo"));
+        assert!(!starts_with_task_marker("foo [ ] bar"));
+        assert!(!starts_with_task_marker(""));
+    }
+
+    /// Issue #548: a `bulletList` whose item starts with literal `[ ]` text
+    /// must round-trip through markdown without being promoted to a
+    /// `taskList`.
+    #[test]
+    fn round_trip_bullet_list_with_literal_checkbox_text() {
+        let json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "bulletList",
+                "content": [{
+                    "type": "listItem",
+                    "content": [{
+                        "type": "paragraph",
+                        "content": [
+                            {"type": "text", "text": "[ ] Review the "},
+                            {"type": "text", "text": "config.yaml", "marks": [{"type": "code"}]},
+                            {"type": "text", "text": " file"}
+                        ]
+                    }]
+                }]
+            }]
+        }"#;
+        let original: AdfDocument = serde_json::from_str(json).unwrap();
+        let md = adf_to_markdown(&original).unwrap();
+        // Renderer must escape the leading bracket.
+        assert!(
+            md.contains(r"- \[ ] Review the "),
+            "rendered markdown: {md:?}"
+        );
+        let parsed = markdown_to_adf(&md).unwrap();
+        assert_eq!(parsed.content[0].node_type, "bulletList");
+        let item = &parsed.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(item.node_type, "listItem");
+        let para = &item.content.as_ref().unwrap()[0];
+        assert_eq!(para.node_type, "paragraph");
+        let text_nodes = para.content.as_ref().unwrap();
+        assert_eq!(text_nodes[0].text.as_deref().unwrap(), "[ ] Review the ");
+        assert_eq!(text_nodes[1].text.as_deref().unwrap(), "config.yaml");
+        assert_eq!(text_nodes[2].text.as_deref().unwrap(), " file");
+    }
+
+    /// Issue #548: the same problem with a `[x]` marker.
+    #[test]
+    fn round_trip_bullet_list_with_literal_done_checkbox_text() {
+        let json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "bulletList",
+                "content": [{
+                    "type": "listItem",
+                    "content": [{
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": "[x] not actually done"}]
+                    }]
+                }]
+            }]
+        }"#;
+        let original: AdfDocument = serde_json::from_str(json).unwrap();
+        let md = adf_to_markdown(&original).unwrap();
+        assert!(md.contains(r"- \[x] "), "rendered markdown: {md:?}");
+        let parsed = markdown_to_adf(&md).unwrap();
+        assert_eq!(parsed.content[0].node_type, "bulletList");
+        let item = &parsed.content[0].content.as_ref().unwrap()[0];
+        let para = &item.content.as_ref().unwrap()[0];
+        let text = para.content.as_ref().unwrap()[0].text.as_deref().unwrap();
+        assert_eq!(text, "[x] not actually done");
+    }
+
+    /// Issue #548: `bulletList` item whose entire content is literal `[ ]`.
+    #[test]
+    fn round_trip_bullet_list_with_bare_literal_checkbox() {
+        let json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "bulletList",
+                "content": [{
+                    "type": "listItem",
+                    "content": [{
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": "[ ]"}]
+                    }]
+                }]
+            }]
+        }"#;
+        let original: AdfDocument = serde_json::from_str(json).unwrap();
+        let md = adf_to_markdown(&original).unwrap();
+        let parsed = markdown_to_adf(&md).unwrap();
+        assert_eq!(parsed.content[0].node_type, "bulletList");
+        let item = &parsed.content[0].content.as_ref().unwrap()[0];
+        let para = &item.content.as_ref().unwrap()[0];
+        let text = para.content.as_ref().unwrap()[0].text.as_deref().unwrap();
+        assert_eq!(text, "[ ]");
+    }
+
+    /// Issue #548: a `bulletList` with a non-task `[?]` prefix should not be
+    /// escaped — that would just produce noise.
+    #[test]
+    fn bullet_list_non_task_bracket_text_not_escaped() {
+        let json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "bulletList",
+                "content": [{
+                    "type": "listItem",
+                    "content": [{
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": "[?] unsure"}]
+                    }]
+                }]
+            }]
+        }"#;
+        let original: AdfDocument = serde_json::from_str(json).unwrap();
+        let md = adf_to_markdown(&original).unwrap();
+        assert!(!md.contains(r"\["), "should not escape: {md:?}");
+        assert!(md.contains("- [?] unsure"), "rendered: {md:?}");
+    }
+
+    /// Issue #548: nested `bulletList` items inside another `bulletList`
+    /// must also have their literal `[ ]` text escaped.
+    #[test]
+    fn round_trip_nested_bullet_list_with_literal_checkbox_text() {
+        let json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "bulletList",
+                "content": [{
+                    "type": "listItem",
+                    "content": [
+                        {"type": "paragraph", "content": [{"type": "text", "text": "outer"}]},
+                        {"type": "bulletList", "content": [{
+                            "type": "listItem",
+                            "content": [{
+                                "type": "paragraph",
+                                "content": [{"type": "text", "text": "[ ] inner literal"}]
+                            }]
+                        }]}
+                    ]
+                }]
+            }]
+        }"#;
+        let original: AdfDocument = serde_json::from_str(json).unwrap();
+        let md = adf_to_markdown(&original).unwrap();
+        let parsed = markdown_to_adf(&md).unwrap();
+        let outer = &parsed.content[0];
+        assert_eq!(outer.node_type, "bulletList");
+        let outer_item = &outer.content.as_ref().unwrap()[0];
+        let inner_list = &outer_item.content.as_ref().unwrap()[1];
+        assert_eq!(inner_list.node_type, "bulletList");
+        let inner_item = &inner_list.content.as_ref().unwrap()[0];
+        assert_eq!(inner_item.node_type, "listItem");
+        let para = &inner_item.content.as_ref().unwrap()[0];
+        let text = para.content.as_ref().unwrap()[0].text.as_deref().unwrap();
+        assert_eq!(text, "[ ] inner literal");
     }
 
     #[test]
