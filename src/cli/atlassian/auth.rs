@@ -137,4 +137,61 @@ mod tests {
         };
         assert!(matches!(cmd.command, AuthSubcommands::Status(_)));
     }
+
+    // ── run_auth_status ────────────────────────────────────────────
+
+    fn mock_client(base_url: &str) -> AtlassianClient {
+        AtlassianClient::new(base_url, "user@test.com", "token").unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_auth_status_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/myself"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "accountId": "abc123",
+                    "displayName": "Alice",
+                    "emailAddress": "alice@test.com"
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(run_auth_status(&client, &server.uri()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_auth_status_no_email() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/myself"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "accountId": "abc123",
+                    "displayName": "Alice"
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(run_auth_status(&client, &server.uri()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_auth_status_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/myself"))
+            .respond_with(wiremock::ResponseTemplate::new(401).set_body_string("Unauthorized"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_auth_status(&client, &server.uri()).await.unwrap_err();
+        assert!(err.to_string().contains("401"));
+    }
 }

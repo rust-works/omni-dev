@@ -279,4 +279,72 @@ mod tests {
         assert!(cmd.cql.is_none());
         assert_eq!(cmd.limit, 25);
     }
+
+    // ── run_confluence_search ──────────────────────────────────────
+
+    fn mock_client(base_url: &str) -> AtlassianClient {
+        AtlassianClient::new(base_url, "user@test.com", "token").unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_confluence_search_table_output() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/content/search"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{
+                        "id": "12345",
+                        "title": "Page",
+                        "space": {"key": "ENG"}
+                    }],
+                    "totalSize": 1
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(
+            run_confluence_search(&client, "type = page", 25, &OutputFormat::Table)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_confluence_search_json_output() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/content/search"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": [], "totalSize": 0})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(
+            run_confluence_search(&client, "type = page", 25, &OutputFormat::Json)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_confluence_search_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/content/search"))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("Bad CQL"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_confluence_search(&client, "bad", 25, &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("400"));
+    }
 }

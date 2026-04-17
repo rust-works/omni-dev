@@ -703,4 +703,169 @@ mod tests {
         assert!(cmd.name.is_none());
         assert_eq!(cmd.state.as_deref(), Some("active"));
     }
+
+    // ── run_* sprint functions ──────────────────────────────────────
+
+    fn mock_client(base_url: &str) -> AtlassianClient {
+        AtlassianClient::new(base_url, "user@test.com", "token").unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_list_sprints_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/board/1/sprint"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "values": [{"id": 10, "name": "Sprint 1", "state": "active"}],
+                    "isLast": true
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(run_list_sprints(&client, 1, None, 50, &OutputFormat::Table)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_list_sprints_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/board/999/sprint"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_list_sprints(&client, 999, None, 50, &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn run_sprint_issues_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint/10/issue"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issues": [],
+                    "total": 0
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(
+            run_sprint_issues(&client, 10, None, 50, &OutputFormat::Table)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_add_to_sprint_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint/10/issue"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let keys = vec!["PROJ-1".to_string(), "PROJ-2".to_string()];
+        assert!(run_add_to_sprint(&client, 10, &keys).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_add_to_sprint_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint/999/issue"))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("Bad Request"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let keys = vec!["PROJ-1".to_string()];
+        let err = run_add_to_sprint(&client, 999, &keys).await.unwrap_err();
+        assert!(err.to_string().contains("400"));
+    }
+
+    #[tokio::test]
+    async fn run_create_sprint_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "id": 100, "name": "Sprint 5", "state": "future"
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(run_create_sprint(&client, 1, "Sprint 5", None, None, None)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_create_sprint_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint"))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("Bad"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_create_sprint(&client, 1, "Sprint", None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("400"));
+    }
+
+    #[tokio::test]
+    async fn run_update_sprint_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint/42"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": 42, "name": "Updated", "state": "active"
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(
+            run_update_sprint(&client, 42, Some("Updated"), None, None, None, None)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_update_sprint_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/agile/1.0/sprint/999"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_update_sprint(&client, 999, Some("X"), None, None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
 }

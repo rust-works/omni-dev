@@ -319,4 +319,124 @@ mod tests {
         };
         assert_eq!(cmd.context_id.as_deref(), Some("12345"));
     }
+
+    // ── run_list_fields / run_field_options ────────────────────────
+
+    fn mock_client(base_url: &str) -> AtlassianClient {
+        AtlassianClient::new(base_url, "user@test.com", "token").unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_list_fields_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/field"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"id": "summary", "name": "Summary", "custom": false}
+                ])),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(run_list_fields(&client, None, &OutputFormat::Table)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_list_fields_with_filter() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/field"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"id": "summary", "name": "Summary", "custom": false},
+                    {"id": "customfield_1", "name": "Story Points", "custom": true}
+                ])),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(run_list_fields(&client, Some("story"), &OutputFormat::Json)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_list_fields_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/field"))
+            .respond_with(wiremock::ResponseTemplate::new(401).set_body_string("Unauthorized"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_list_fields(&client, None, &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("401"));
+    }
+
+    #[tokio::test]
+    async fn run_field_options_with_context_id() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/field/customfield_10001/context/12345/option",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "values": [{"id": "1", "value": "Option A"}]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(run_field_options(
+            &client,
+            "customfield_10001",
+            Some("12345"),
+            &OutputFormat::Table
+        )
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_field_options_auto_discovery() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/field/customfield_10001/context",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "values": [{"id": "12345", "name": "Default"}]
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/field/customfield_10001/context/12345/option",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"values": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(
+            run_field_options(&client, "customfield_10001", None, &OutputFormat::Json)
+                .await
+                .is_ok()
+        );
+    }
 }
