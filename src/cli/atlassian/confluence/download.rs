@@ -125,68 +125,68 @@ struct LogEntry {
     detail: String,
 }
 
+/// Parameters for a recursive download, decoupled from CLI parsing.
+struct DownloadParams {
+    id: String,
+    output_dir: PathBuf,
+    format: ContentFormat,
+    concurrency: usize,
+    max_depth: u32,
+    resume: bool,
+    on_conflict: OnConflict,
+    instance_url: String,
+}
+
 impl DownloadCommand {
     /// Executes the recursive download.
     pub async fn execute(self) -> Result<()> {
         let (client, instance_url) = create_client()?;
         let api = Arc::new(ConfluenceApi::new(client));
-        run_download(
-            &api,
-            &instance_url,
-            &self.id,
-            &self.output_dir,
-            &self.format,
-            self.concurrency,
-            self.max_depth,
-            self.resume,
-            &self.on_conflict,
-        )
-        .await
+        let params = DownloadParams {
+            id: self.id,
+            output_dir: self.output_dir,
+            format: self.format,
+            concurrency: self.concurrency,
+            max_depth: self.max_depth,
+            resume: self.resume,
+            on_conflict: self.on_conflict,
+            instance_url,
+        };
+        run_download(&api, &params).await
     }
 }
 
 /// Recursively downloads a Confluence page tree.
-#[allow(clippy::too_many_arguments)]
-async fn run_download(
-    api: &Arc<ConfluenceApi>,
-    instance_url: &str,
-    id: &str,
-    output_dir: &Path,
-    format: &ContentFormat,
-    concurrency: usize,
-    max_depth: u32,
-    resume: bool,
-    on_conflict: &OnConflict,
-) -> Result<()> {
-    let semaphore = Arc::new(Semaphore::new(concurrency));
+async fn run_download(api: &Arc<ConfluenceApi>, params: &DownloadParams) -> Result<()> {
+    let semaphore = Arc::new(Semaphore::new(params.concurrency));
     let stats = Arc::new(DownloadStats::new());
     let log_entries: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let manifest_entries: Arc<Mutex<BTreeMap<String, ManifestEntry>>> =
         Arc::new(Mutex::new(BTreeMap::new()));
 
     let timestamp = Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
-    let backup_dir = output_dir.join(".backups").join(&timestamp);
+    let backup_dir = params.output_dir.join(".backups").join(&timestamp);
 
     let config = Arc::new(DownloadConfig {
-        ext: file_extension(format),
-        format: format.clone(),
-        instance_url: instance_url.to_string(),
-        on_conflict: on_conflict.clone(),
+        ext: file_extension(&params.format),
+        format: params.format.clone(),
+        instance_url: params.instance_url.clone(),
+        on_conflict: params.on_conflict.clone(),
         backup_dir,
     });
 
     // Load existing manifest for resume
-    let old_manifest = if resume {
-        load_manifest(output_dir)
+    let old_manifest = if params.resume {
+        load_manifest(&params.output_dir)
     } else {
         BTreeMap::new()
     };
 
     // Fetch root page to get its title
-    eprintln!("Fetching root page {id}...");
-    let root = api.get_content(id).await?;
+    eprintln!("Fetching root page {}...", params.id);
+    let root = api.get_content(&params.id).await?;
     let root_slug = slugify(&root.title);
-    let root_dir = output_dir.join(format!("{}-{}", root.id, root_slug));
+    let root_dir = params.output_dir.join(format!("{}-{}", root.id, root_slug));
 
     let root_parent = match &root.metadata {
         crate::atlassian::api::ContentMetadata::Confluence { parent_id, .. } => parent_id.clone(),
@@ -207,14 +207,14 @@ async fn run_download(
     while let Some(task) = queue.pop_front() {
         let relative_path = task
             .dir
-            .strip_prefix(output_dir)
+            .strip_prefix(&params.output_dir)
             .unwrap_or(&task.dir)
             .join(format!("index.{}", config.ext))
             .to_string_lossy()
             .to_string();
 
         // Resume: check manifest for ID-based skip
-        if resume {
+        if params.resume {
             if let Some(entry) = old_manifest.get(&task.id) {
                 if entry.path == relative_path {
                     // Same path — skip
@@ -290,7 +290,7 @@ async fn run_download(
         }
 
         // Fetch children and enqueue (unless at max depth)
-        if max_depth > 0 && task.depth >= max_depth {
+        if params.max_depth > 0 && task.depth >= params.max_depth {
             continue;
         }
 
@@ -324,11 +324,11 @@ async fn run_download(
 
     // Write manifest
     let manifest = manifest_entries.lock().await;
-    write_manifest(output_dir, &manifest);
+    write_manifest(&params.output_dir, &manifest);
 
     // Write log
     let entries = log_entries.lock().await;
-    write_log(output_dir, &timestamp, &entries, &stats);
+    write_log(&params.output_dir, &timestamp, &entries, &stats);
 
     // Summary
     let downloaded = stats.downloaded.load(Ordering::Relaxed);

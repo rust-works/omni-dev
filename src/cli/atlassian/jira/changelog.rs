@@ -74,36 +74,6 @@ struct IssueChangelog {
     entries: Vec<JiraChangelogEntry>,
 }
 
-/// Fetches and displays changelogs for the specified issues.
-async fn run_changelog(
-    client: &AtlassianClient,
-    keys: &[String],
-    limit: u32,
-    output: &OutputFormat,
-) -> Result<()> {
-    let mut all_changelogs: Vec<IssueChangelog> = Vec::new();
-    for key in keys {
-        let entries = client.get_changelog(key, limit).await?;
-        all_changelogs.push(IssueChangelog {
-            key: key.clone(),
-            entries,
-        });
-    }
-
-    if output_as(&all_changelogs, output)? {
-        return Ok(());
-    }
-
-    for (i, changelog) in all_changelogs.iter().enumerate() {
-        if i > 0 {
-            println!();
-        }
-        print_changelog(&changelog.key, &changelog.entries);
-    }
-
-    Ok(())
-}
-
 /// Parses a comma-separated list of issue keys.
 fn parse_keys(input: &str) -> Vec<String> {
     input
