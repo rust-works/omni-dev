@@ -1445,6 +1445,23 @@ fn escape_backticks(text: &str) -> String {
     out
 }
 
+/// Escapes pipe characters in text that appears inside a GFM pipe table cell.
+///
+/// Without this, a literal `|` in cell content (including inside inline code
+/// spans) is interpreted as a column separator on round-trip, splitting the
+/// cell and corrupting its content (see issue #579).  Each `|` is prefixed
+/// with a backslash so the table-row parser treats it as literal.
+fn escape_pipes_in_cell(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch == '|' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Escapes square brackets (`[` and `]`) in text that will appear inside a
 /// markdown link's `[…]` delimiters.  Without this, a text node containing a
 /// literal `[` or `]` can create ambiguous markdown link syntax on round-trip
@@ -1587,19 +1604,39 @@ fn is_table_separator(line: &str) -> bool {
 }
 
 /// Parses a GFM table row into cell contents.
+///
+/// Splits on unescaped `|` characters; a preceding backslash (`\|`) is
+/// interpreted as a literal pipe and unescaped in the emitted cell content
+/// (see issue #579).  This allows code spans and other inline content that
+/// contain literal `|` to survive round-trip through a pipe table.
 fn parse_table_row(line: &str) -> Vec<String> {
     let trimmed = line.trim();
     let trimmed = trimmed.strip_prefix('|').unwrap_or(trimmed);
     let trimmed = trimmed.strip_suffix('|').unwrap_or(trimmed);
 
-    trimmed
-        .split('|')
+    let mut cells: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut chars = trimmed.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' && chars.peek() == Some(&'|') {
+            current.push('|');
+            chars.next();
+        } else if ch == '|' {
+            cells.push(std::mem::take(&mut current));
+        } else {
+            current.push(ch);
+        }
+    }
+    cells.push(current);
+
+    cells
+        .iter()
         .map(|s| {
             // Strip exactly one leading and one trailing space (pipe table padding).
             // Preserve any additional whitespace as significant content.
-            let s = s.strip_prefix(' ').unwrap_or(s);
-            let s = s.strip_suffix(' ').unwrap_or(s);
-            s.to_string()
+            let stripped = s.strip_prefix(' ').unwrap_or(s.as_str());
+            let stripped = stripped.strip_suffix(' ').unwrap_or(stripped);
+            stripped.to_string()
         })
         .collect()
 }
@@ -3683,8 +3720,10 @@ fn render_pipe_table(node: &AdfNode, rows: &[AdfNode], output: &mut String, opts
         output.push('|');
         for cell in cells {
             output.push(' ');
-            render_cell_attrs_prefix(cell, output);
-            render_inline_content_from_first_paragraph(cell, output, opts);
+            let mut cell_buf = String::new();
+            render_cell_attrs_prefix(cell, &mut cell_buf);
+            render_inline_content_from_first_paragraph(cell, &mut cell_buf, opts);
+            output.push_str(&escape_pipes_in_cell(&cell_buf));
             output.push_str(" |");
         }
         output.push('\n');
@@ -6856,6 +6895,19 @@ mod tests {
         });
         assert!(em_node.is_some(), "should have an em-marked node");
         assert_eq!(em_node.unwrap().text.as_deref(), Some("use `cfg`"));
+    }
+
+    #[test]
+    fn escape_pipes_in_cell_unit() {
+        assert_eq!(escape_pipes_in_cell("hello"), "hello");
+        assert_eq!(escape_pipes_in_cell("a|b"), r"a\|b");
+        assert_eq!(escape_pipes_in_cell("|"), r"\|");
+        assert_eq!(escape_pipes_in_cell("|a|b|"), r"\|a\|b\|");
+        assert_eq!(escape_pipes_in_cell(""), "");
+        assert_eq!(
+            escape_pipes_in_cell("`parser.decode[T|json]`"),
+            r"`parser.decode[T\|json]`"
+        );
     }
 
     #[test]
@@ -13391,6 +13443,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_table_row_escaped_pipe_in_cell() {
+        // Issue #579: `\|` inside a cell is a literal pipe, not a column separator.
+        let cells = parse_table_row(r"| a\|b | c |");
+        assert_eq!(cells, vec!["a|b", "c"]);
+    }
+
+    #[test]
+    fn parse_table_row_escaped_pipe_in_code_span() {
+        // Issue #579: `\|` inside an inline code span is unescaped at the row level.
+        let cells = parse_table_row(r"| `parser.decode[T\|json]` | other |");
+        assert_eq!(cells, vec!["`parser.decode[T|json]`", "other"]);
+    }
+
+    #[test]
+    fn parse_table_row_preserves_other_backslashes() {
+        // Only `\|` is special at the row-splitting level; other backslashes pass through.
+        let cells = parse_table_row(r"| a\\b | c\*d |");
+        assert_eq!(cells, vec![r"a\\b", r"c\*d"]);
+    }
+
+    #[test]
     fn parse_image_syntax_valid() {
         let result = parse_image_syntax("![alt](url)");
         assert_eq!(result, Some(("alt", "url")));
@@ -16373,6 +16446,160 @@ mod tests {
             "Table with header first row should use pipe syntax, got:\n{md}"
         );
         assert!(!md.contains("::::table"), "should not use directive syntax");
+    }
+
+    // ── Issue #579: pipes in pipe-table cells ─────────────────────
+
+    #[test]
+    fn render_pipe_table_escapes_pipe_in_code_span_cell() {
+        // A code-marked text node with a literal `|` in a pipe-table cell
+        // must emit `\|` so the column separator is unambiguous.
+        let adf = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::table(vec![
+                AdfNode::table_row(vec![AdfNode::table_header(vec![AdfNode::paragraph(vec![
+                    AdfNode::text("Header"),
+                ])])]),
+                AdfNode::table_row(vec![AdfNode::table_cell(vec![AdfNode::paragraph(vec![
+                    AdfNode::text_with_marks("a|b", vec![AdfMark::code()]),
+                ])])]),
+            ])],
+        };
+        let md = adf_to_markdown(&adf).unwrap();
+        assert!(
+            md.contains(r"`a\|b`"),
+            "Pipe inside code span must be escaped, got:\n{md}"
+        );
+    }
+
+    #[test]
+    fn render_pipe_table_escapes_pipe_in_plain_text_cell() {
+        let adf = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::table(vec![
+                AdfNode::table_row(vec![AdfNode::table_header(vec![AdfNode::paragraph(vec![
+                    AdfNode::text("Header"),
+                ])])]),
+                AdfNode::table_row(vec![AdfNode::table_cell(vec![AdfNode::paragraph(vec![
+                    AdfNode::text("x|y"),
+                ])])]),
+            ])],
+        };
+        let md = adf_to_markdown(&adf).unwrap();
+        assert!(
+            md.contains(r"x\|y"),
+            "Pipe inside plain-text cell must be escaped, got:\n{md}"
+        );
+    }
+
+    #[test]
+    fn code_span_with_pipe_in_table_cell_roundtrips() {
+        // Issue #579 reproducer: code span containing `|` in a pipe-table cell.
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "table",
+                "attrs": {"isNumberColumnEnabled": false, "layout": "default", "localId": "abc-789"},
+                "content": [
+                    {"type": "tableRow", "content": [
+                        {"type": "tableHeader", "attrs": {}, "content": [
+                            {"type": "paragraph", "content": [{"type": "text", "text": "Before"}]}
+                        ]},
+                        {"type": "tableHeader", "attrs": {}, "content": [
+                            {"type": "paragraph", "content": [{"type": "text", "text": "After"}]}
+                        ]}
+                    ]},
+                    {"type": "tableRow", "content": [
+                        {"type": "tableCell", "attrs": {}, "content": [
+                            {"type": "paragraph", "content": [
+                                {"type": "text", "text": "parse(json).extract[T]", "marks": [{"type": "code"}]}
+                            ]}
+                        ]},
+                        {"type": "tableCell", "attrs": {}, "content": [
+                            {"type": "paragraph", "content": [
+                                {"type": "text", "text": "parser.decode[T|json]", "marks": [{"type": "code"}]}
+                            ]}
+                        ]}
+                    ]}
+                ]
+            }]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+
+        let rows = round_tripped.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "Table should have 2 rows, got: {}",
+            rows.len()
+        );
+
+        let body_row = rows[1].content.as_ref().unwrap();
+        assert_eq!(
+            body_row.len(),
+            2,
+            "Body row should have 2 cells (not split by the pipe), got: {}",
+            body_row.len()
+        );
+
+        let second_cell = &body_row[1];
+        let para = second_cell.content.as_ref().unwrap().first().unwrap();
+        let inlines = para.content.as_ref().unwrap();
+        assert_eq!(inlines.len(), 1, "Cell should have a single text node");
+        assert_eq!(
+            inlines[0].text.as_deref(),
+            Some("parser.decode[T|json]"),
+            "Code-span text must be preserved with literal pipe"
+        );
+        let marks = inlines[0]
+            .marks
+            .as_ref()
+            .expect("code mark must be preserved");
+        assert!(
+            marks.iter().any(|m| m.mark_type == "code"),
+            "text node should carry the code mark"
+        );
+    }
+
+    #[test]
+    fn plain_text_pipe_in_table_cell_roundtrips() {
+        // Plain text with `|` in a pipe-table cell should also survive.
+        let adf = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::table(vec![
+                AdfNode::table_row(vec![
+                    AdfNode::table_header(vec![AdfNode::paragraph(vec![AdfNode::text("H1")])]),
+                    AdfNode::table_header(vec![AdfNode::paragraph(vec![AdfNode::text("H2")])]),
+                ]),
+                AdfNode::table_row(vec![
+                    AdfNode::table_cell(vec![AdfNode::paragraph(vec![AdfNode::text("a|b")])]),
+                    AdfNode::table_cell(vec![AdfNode::paragraph(vec![AdfNode::text("c")])]),
+                ]),
+            ])],
+        };
+        let md = adf_to_markdown(&adf).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let rows = round_tripped.content[0].content.as_ref().unwrap();
+        let body_row = rows[1].content.as_ref().unwrap();
+        assert_eq!(
+            body_row.len(),
+            2,
+            "Body row should keep 2 cells, got: {}",
+            body_row.len()
+        );
+        let first_cell_text = body_row[0].content.as_ref().unwrap()[0]
+            .content
+            .as_ref()
+            .unwrap()[0]
+            .text
+            .as_deref();
+        assert_eq!(first_cell_text, Some("a|b"));
     }
 
     #[test]
