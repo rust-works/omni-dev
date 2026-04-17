@@ -88,6 +88,8 @@ struct ConfluenceChildrenResponse {
 struct ConfluenceChildEntry {
     id: String,
     title: String,
+    #[serde(default)]
+    status: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -95,13 +97,40 @@ struct ConfluenceChildrenLinks {
     next: Option<String>,
 }
 
+// V2 space-pages response (for `depth=root`).
+#[derive(Deserialize)]
+struct ConfluenceSpacePagesResponse {
+    results: Vec<ConfluenceSpacePageEntry>,
+    #[serde(rename = "_links", default)]
+    links: Option<ConfluenceChildrenLinks>,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceSpacePageEntry {
+    id: String,
+    title: String,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(rename = "parentId", default)]
+    parent_id: Option<String>,
+}
+
 /// A child page returned from the children API.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ChildPage {
     /// Page ID.
     pub id: String,
     /// Page title.
     pub title: String,
+    /// Page status (e.g. "current", "draft"). Empty if not provided by the API.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
+    /// Parent page ID, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    /// Space key, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_key: Option<String>,
 }
 
 // ── Comment types ─────────────────────────────────────────────────
@@ -519,6 +548,9 @@ impl ConfluenceApi {
                 all_children.push(ChildPage {
                     id: child.id,
                     title: child.title,
+                    status: child.status.unwrap_or_default(),
+                    parent_id: Some(page_id.to_string()),
+                    space_key: None,
                 });
             }
 
@@ -531,6 +563,57 @@ impl ConfluenceApi {
         }
 
         Ok(all_children)
+    }
+
+    /// Fetches top-level pages in a space (pages with no parent), handling pagination.
+    ///
+    /// Uses the v2 API endpoint `/wiki/api/v2/spaces/{space-id}/pages?depth=root`.
+    pub async fn get_space_root_pages(&self, space_id: &str) -> Result<Vec<ChildPage>> {
+        let mut all_pages = Vec::new();
+        let mut url = format!(
+            "{}/wiki/api/v2/spaces/{}/pages?depth=root&limit=50",
+            self.client.instance_url(),
+            space_id
+        );
+
+        loop {
+            let response = self
+                .client
+                .get_json(&url)
+                .await
+                .context("Failed to fetch space root pages")?;
+
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+            }
+
+            let resp: ConfluenceSpacePagesResponse = response
+                .json()
+                .await
+                .context("Failed to parse space pages response")?;
+
+            let page_count = resp.results.len();
+            for entry in resp.results {
+                all_pages.push(ChildPage {
+                    id: entry.id,
+                    title: entry.title,
+                    status: entry.status.unwrap_or_default(),
+                    parent_id: entry.parent_id,
+                    space_key: None,
+                });
+            }
+
+            match resp.links.and_then(|l| l.next) {
+                Some(next_path) if page_count > 0 => {
+                    url = format!("{}{}", self.client.instance_url(), next_path);
+                }
+                _ => break,
+            }
+        }
+
+        Ok(all_pages)
     }
 
     /// Lists footer comments on a Confluence page.
@@ -1290,6 +1373,153 @@ mod tests {
         let api = ConfluenceApi::new(client);
         let children = api.get_children("12345").await.unwrap();
         assert!(children.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_children_pagination() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/child/page",
+            ))
+            .and(wiremock::matchers::query_param_is_missing("start"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{"id": "111", "title": "First", "status": "current"}],
+                    "_links": {
+                        "next": "/wiki/rest/api/content/12345/child/page?limit=50&start=50"
+                    }
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/child/page",
+            ))
+            .and(wiremock::matchers::query_param("start", "50"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{"id": "222", "title": "Second", "status": "current"}]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let children = api.get_children("12345").await.unwrap();
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].status, "current");
+        assert_eq!(children[0].parent_id.as_deref(), Some("12345"));
+    }
+
+    #[tokio::test]
+    async fn get_space_root_pages_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/98765/pages"))
+            .and(wiremock::matchers::query_param("depth", "root"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {"id": "111", "title": "Top One", "status": "current"},
+                        {"id": "222", "title": "Top Two", "status": "draft", "parentId": null}
+                    ]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let pages = api.get_space_root_pages("98765").await.unwrap();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].id, "111");
+        assert_eq!(pages[0].status, "current");
+        assert_eq!(pages[1].status, "draft");
+    }
+
+    #[tokio::test]
+    async fn get_space_root_pages_empty() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/98765/pages"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": []})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let pages = api.get_space_root_pages("98765").await.unwrap();
+        assert!(pages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_space_root_pages_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/99999/pages"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = api.get_space_root_pages("99999").await.unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn get_space_root_pages_pagination() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/98765/pages"))
+            .and(wiremock::matchers::query_param_is_missing("cursor"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{"id": "111", "title": "A", "status": "current"}],
+                    "_links": {
+                        "next": "/wiki/api/v2/spaces/98765/pages?depth=root&cursor=page2"
+                    }
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/98765/pages"))
+            .and(wiremock::matchers::query_param("cursor", "page2"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{"id": "222", "title": "B", "status": "current"}]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let pages = api.get_space_root_pages("98765").await.unwrap();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].id, "111");
+        assert_eq!(pages[1].id, "222");
     }
 
     #[tokio::test]
