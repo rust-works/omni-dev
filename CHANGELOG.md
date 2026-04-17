@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Empty Task Checkboxes**: Recognise `- [ ]` and `- [x]` markdown task markers
+  even when the checkbox is not followed by a trailing space. Fixes ADF
+  round-trip drift where empty `taskItem` nodes were parsed as `listItem`
+  nodes containing literal `[ ]` text (issue #548).
+- **Literal Checkbox Text in Bullet Lists**: Escape the leading `[` when
+  rendering a `bulletList` item whose literal text begins with a sequence
+  that looks like a task checkbox marker (`[ ]`, `[x]`, or `[X]` followed by
+  space, newline, or end). Prevents `to-adf` from falsely promoting these
+  bullet items to `taskList`/`taskItem` on round-trip (issue #548).
+
 ## [0.21.0] - 2026-04-17
 
 ### Added
