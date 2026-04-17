@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ADF Round-Trip URL Brackets** (#551): Preserve square brackets in URLs
   embedded in link-marked text so ADF→JFM→ADF round-trips no longer leak
   `\[`/`\]` escapes or split the text into corrupted `inlineCard` nodes.
+- **ADF Mark Combinations** ([#554](https://github.com/rust-works/omni-dev/issues/554)): `textColor`, `backgroundColor`, `subsup`, `underline`, and `annotation` marks were silently dropped when combined with a `code` mark or with each other. Marks are now preserved by nesting `:span[…]{…}` and `[…]{…}` wrappers based on the original mark order.
+- **Underscore boundary in span directives** ([#554](https://github.com/rust-works/omni-dev/issues/554)): `from-adf` now escapes underscores at text-node boundaries (per the CommonMark intraword rule). Previously, a plain text node ending with `_ ` followed by a textColor span whose text started with `_` produced JFM that the parser saw as italic, destroying the span directive and losing the textColor mark.
 
 ## [0.21.0] - 2026-04-17
 
