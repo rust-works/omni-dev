@@ -182,7 +182,7 @@ impl<'a> MarkdownParser<'a> {
 
     fn try_code_block(&mut self) -> Result<Option<AdfNode>> {
         let line = self.current_line();
-        if !line.starts_with("```") {
+        if !is_code_fence_opener(line) {
             return Ok(None);
         }
 
@@ -1109,7 +1109,7 @@ impl<'a> MarkdownParser<'a> {
                 && !lines
                     .last()
                     .is_some_and(|prev| has_trailing_hard_break(prev)))
-                || line.starts_with("```")
+                || is_code_fence_opener(line)
                 || (is_horizontal_rule(line) && !lines.is_empty())
             {
                 break;
@@ -1436,6 +1436,55 @@ fn escape_backticks(text: &str) -> String {
     out
 }
 
+/// Chooses a backtick delimiter length and padding flag for rendering `text`
+/// as a CommonMark inline code span.
+///
+/// Per CommonMark: the delimiter must be a run of backticks not equal in
+/// length to any run inside the content, and if both ends of the content
+/// would start/end with a space (or with a backtick), a single space of
+/// padding is added so the span survives the spec's space-stripping rule.
+fn inline_code_delimiter(text: &str) -> (usize, bool) {
+    let mut max_run = 0usize;
+    let mut current = 0usize;
+    for ch in text.chars() {
+        if ch == '`' {
+            current += 1;
+            if current > max_run {
+                max_run = current;
+            }
+        } else {
+            current = 0;
+        }
+    }
+    let n = max_run + 1;
+    let starts_bt = text.starts_with('`');
+    let ends_bt = text.ends_with('`');
+    let starts_sp = text.starts_with(' ');
+    let ends_sp = text.ends_with(' ');
+    let all_sp = !text.is_empty() && text.chars().all(|c| c == ' ');
+    let needs_pad = starts_bt || ends_bt || (starts_sp && ends_sp && !all_sp);
+    (n, needs_pad)
+}
+
+/// Appends `text` to `output` wrapped in a CommonMark inline code span whose
+/// delimiter length allows any embedded backticks to round-trip unambiguously.
+fn render_inline_code(text: &str, output: &mut String) {
+    let (n, pad) = inline_code_delimiter(text);
+    for _ in 0..n {
+        output.push('`');
+    }
+    if pad {
+        output.push(' ');
+    }
+    output.push_str(text);
+    if pad {
+        output.push(' ');
+    }
+    for _ in 0..n {
+        output.push('`');
+    }
+}
+
 /// Escapes pipe characters in text that appears inside a GFM pipe table cell.
 ///
 /// Without this, a literal `|` in cell content (including inside inline code
@@ -1574,6 +1623,19 @@ fn escape_list_marker(line: &str) -> String {
         }
     }
     line.to_string()
+}
+
+/// Checks if a line is a valid fenced code block opener.
+///
+/// Per CommonMark: the opener is a sequence of three or more backticks
+/// followed by an info string that must not contain any backtick
+/// character, otherwise some inline code spans would be misinterpreted
+/// as the beginning of a fenced code block.
+fn is_code_fence_opener(line: &str) -> bool {
+    if !line.starts_with("```") {
+        return false;
+    }
+    !line[3..].contains('`')
 }
 
 /// Checks if a line is a horizontal rule.
@@ -1908,7 +1970,11 @@ fn parse_inline_impl(text: &str, auto_inline_card: bool) -> Vec<AdfNode> {
                     plain_start = end;
                     continue;
                 }
-                chars.next();
+                // No code span starting here; skip past the entire backtick
+                // run so a longer opening run isn't retried as a shorter one.
+                while chars.peek().is_some_and(|&(_, c)| c == '`') {
+                    chars.next();
+                }
             }
             '[' => {
                 if let Some((end, link_text, href)) = try_parse_link(text, i) {
@@ -2272,16 +2338,56 @@ fn try_parse_strikethrough(text: &str, i: usize) -> Option<(usize, &str)> {
     Some((i + 2 + close + 2, content))
 }
 
-/// Tries to parse `inline code` starting at position `i`.
+/// Tries to parse a CommonMark inline code span starting at position `i`.
+///
+/// Supports multi-backtick delimiters: the opening run of N backticks must
+/// be matched by a closing run of exactly N backticks.  If both ends of the
+/// enclosed content begin and end with a space and the content is not all
+/// spaces, one space is stripped from each side per the CommonMark spec.
 fn try_parse_inline_code(text: &str, i: usize) -> Option<(usize, &str)> {
     let rest = &text[i..];
-    if !rest.starts_with('`') {
+    let bytes = rest.as_bytes();
+    if bytes.is_empty() || bytes[0] != b'`' {
         return None;
     }
-    let after = &rest[1..];
-    let close = after.find('`')?;
-    let content = &after[..close];
-    Some((i + 1 + close + 1, content))
+    let mut opening = 0usize;
+    while opening < bytes.len() && bytes[opening] == b'`' {
+        opening += 1;
+    }
+
+    let mut j = opening;
+    while j < bytes.len() {
+        if bytes[j] == b'`' {
+            let run_start = j;
+            while j < bytes.len() && bytes[j] == b'`' {
+                j += 1;
+            }
+            if j - run_start == opening {
+                let content = &rest[opening..run_start];
+                let content = strip_code_span_padding(content);
+                return Some((i + j, content));
+            }
+        } else {
+            j += 1;
+        }
+    }
+    None
+}
+
+/// Implements the CommonMark code-span space-stripping rule: if the content
+/// both begins and ends with a space character and is not composed entirely
+/// of spaces, one space character is removed from each side.
+fn strip_code_span_padding(content: &str) -> &str {
+    let bytes = content.as_bytes();
+    if bytes.len() >= 2
+        && bytes[0] == b' '
+        && bytes[bytes.len() - 1] == b' '
+        && content.bytes().any(|b| b != b' ')
+    {
+        &content[1..content.len() - 1]
+    } else {
+        content
+    }
 }
 
 /// Tries to parse a bracketed span `[text]{attrs}` starting at position `i`.
@@ -4536,16 +4642,12 @@ fn render_code_marked_text(text: &str, marks: &[AdfMark], output: &mut String) {
     if let Some(link_mark) = link_mark {
         let href = link_href(link_mark);
         code_str.push('[');
-        code_str.push('`');
-        code_str.push_str(text);
-        code_str.push('`');
+        render_inline_code(text, &mut code_str);
         code_str.push_str("](");
         code_str.push_str(href);
         code_str.push(')');
     } else {
-        code_str.push('`');
-        code_str.push_str(text);
-        code_str.push('`');
+        render_inline_code(text, &mut code_str);
     }
 
     // Build wrappers (outermost first) for span-attr and bracketed-span runs,
@@ -6158,6 +6260,281 @@ mod tests {
         assert_eq!(code_node.text.as_deref(), Some("code"));
         let marks = code_node.marks.as_ref().unwrap();
         assert_eq!(marks[0].mark_type, "code");
+    }
+
+    /// Issue #578: a code-marked text with an internal backtick must be
+    /// emitted using double-backtick delimiters so it round-trips as a
+    /// single node rather than being split on the inner backtick.
+    #[test]
+    fn inline_code_with_backtick_emitted_with_double_delimiters() {
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![
+                AdfNode::text("Run "),
+                AdfNode::text_with_marks(
+                    "ADD `custom_threshold` TEXT NOT NULL",
+                    vec![AdfMark::code()],
+                ),
+                AdfNode::text(" to update the schema."),
+            ])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("``ADD `custom_threshold` TEXT NOT NULL``"),
+            "expected double-backtick delimiters, got: {md}"
+        );
+    }
+
+    /// Issue #578: double-backtick delimited code spans parse as a single
+    /// code-marked text node that preserves the embedded single backticks.
+    #[test]
+    fn inline_code_double_backtick_delimiters_parse() {
+        let doc = markdown_to_adf("Run ``ADD `custom_threshold` TEXT NOT NULL`` now").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 3, "content: {content:?}");
+        let code_node = &content[1];
+        assert_eq!(
+            code_node.text.as_deref(),
+            Some("ADD `custom_threshold` TEXT NOT NULL")
+        );
+        let marks = code_node.marks.as_ref().unwrap();
+        assert_eq!(marks[0].mark_type, "code");
+    }
+
+    /// Issue #578: the full reproducer — a code-marked text with inner
+    /// backticks survives ADF → JFM → ADF round-trip intact.
+    #[test]
+    fn inline_code_with_backtick_roundtrip() {
+        let json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "paragraph",
+                "content": [
+                    {"type": "text", "text": "Run "},
+                    {
+                        "type": "text",
+                        "text": "ADD `custom_threshold` TEXT NOT NULL",
+                        "marks": [{"type": "code"}]
+                    },
+                    {"type": "text", "text": " to update the schema."}
+                ]
+            }]
+        }"#;
+        let original: AdfDocument = serde_json::from_str(json).unwrap();
+        let md = adf_to_markdown(&original).unwrap();
+        let roundtripped = markdown_to_adf(&md).unwrap();
+        let para = &roundtripped.content[0];
+        let children = para.content.as_ref().unwrap();
+        assert_eq!(children.len(), 3, "expected 3 children, got: {children:?}");
+        assert_eq!(children[0].text.as_deref(), Some("Run "));
+        assert_eq!(
+            children[1].text.as_deref(),
+            Some("ADD `custom_threshold` TEXT NOT NULL")
+        );
+        let marks = children[1].marks.as_ref().unwrap();
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].mark_type, "code");
+        assert_eq!(children[2].text.as_deref(), Some(" to update the schema."));
+    }
+
+    /// A code-marked text containing a run of two backticks should be
+    /// emitted with triple-backtick delimiters and round-trip intact —
+    /// the first line of the paragraph also starts with the fence so this
+    /// exercises the info-string-with-backtick fence-opener rejection.
+    #[test]
+    fn inline_code_with_double_backtick_roundtrip() {
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text_with_marks(
+                "x `` y",
+                vec![AdfMark::code()],
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        let roundtripped = markdown_to_adf(&md).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].text.as_deref(), Some("x `` y"));
+        let marks = content[0].marks.as_ref().unwrap();
+        assert_eq!(marks[0].mark_type, "code");
+    }
+
+    /// A code-marked text that begins with a backtick must be padded on
+    /// both sides so the CommonMark space-stripping rule reconstructs it.
+    #[test]
+    fn inline_code_leading_backtick_roundtrip() {
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text_with_marks(
+                "`start",
+                vec![AdfMark::code()],
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        let roundtripped = markdown_to_adf(&md).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(content[0].text.as_deref(), Some("`start"));
+        assert_eq!(content[0].marks.as_ref().unwrap()[0].mark_type, "code");
+    }
+
+    /// A code-marked text that ends with a backtick must also survive.
+    #[test]
+    fn inline_code_trailing_backtick_roundtrip() {
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text_with_marks(
+                "end`",
+                vec![AdfMark::code()],
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        let roundtripped = markdown_to_adf(&md).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(content[0].text.as_deref(), Some("end`"));
+    }
+
+    /// Content that both begins and ends with a space (but is not all
+    /// spaces) needs padding so the stripping rule leaves it intact.
+    #[test]
+    fn inline_code_space_padded_content_roundtrip() {
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text_with_marks(
+                " foo ",
+                vec![AdfMark::code()],
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        let roundtripped = markdown_to_adf(&md).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(content[0].text.as_deref(), Some(" foo "));
+    }
+
+    /// All-space content must round-trip without the stripping rule
+    /// kicking in (per CommonMark: all-space content is not stripped).
+    #[test]
+    fn inline_code_all_spaces_roundtrip() {
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text_with_marks(
+                "   ",
+                vec![AdfMark::code()],
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        let roundtripped = markdown_to_adf(&md).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(content[0].text.as_deref(), Some("   "));
+    }
+
+    /// A code+link mark where the code text contains a backtick must also
+    /// round-trip — verifies the link branch of code-span rendering.
+    #[test]
+    fn inline_code_with_link_and_backtick_roundtrip() {
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text_with_marks(
+                "fn `inner`",
+                vec![AdfMark::code(), AdfMark::link("https://example.com")],
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("`` fn `inner` ``"),
+            "expected padded double-backtick delimiters inside link, got: {md}"
+        );
+        let roundtripped = markdown_to_adf(&md).unwrap();
+        let content = roundtripped.content[0].content.as_ref().unwrap();
+        assert_eq!(content[0].text.as_deref(), Some("fn `inner`"));
+        let mark_types: Vec<&str> = content[0]
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert!(mark_types.contains(&"code"));
+        assert!(mark_types.contains(&"link"));
+    }
+
+    /// Unmatched opening backticks must not be parsed as a code span.
+    #[test]
+    fn inline_code_unmatched_run_is_plain_text() {
+        let doc = markdown_to_adf("foo ``bar baz").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].text.as_deref(), Some("foo ``bar baz"));
+        assert!(content[0].marks.is_none());
+    }
+
+    /// Mismatched delimiter lengths must not form a code span.  Per
+    /// CommonMark the opening 2-backtick run and the trailing 1-backtick
+    /// run never form a valid code span and the characters stay literal.
+    #[test]
+    fn inline_code_mismatched_delimiters_is_plain_text() {
+        let doc = markdown_to_adf("``foo` bar").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].text.as_deref(), Some("``foo` bar"));
+        assert!(content[0].marks.is_none());
+    }
+
+    #[test]
+    fn inline_code_delimiter_chooses_correct_length() {
+        assert_eq!(inline_code_delimiter("no ticks"), (1, false));
+        assert_eq!(inline_code_delimiter("one ` here"), (2, false));
+        assert_eq!(inline_code_delimiter("two `` here"), (3, false));
+        assert_eq!(inline_code_delimiter("three ``` here"), (4, false));
+        assert_eq!(inline_code_delimiter("`leading"), (2, true));
+        assert_eq!(inline_code_delimiter("trailing`"), (2, true));
+        assert_eq!(inline_code_delimiter(" foo "), (1, true));
+        assert_eq!(inline_code_delimiter(" "), (1, false));
+        assert_eq!(inline_code_delimiter("   "), (1, false));
+        assert_eq!(inline_code_delimiter(" foo"), (1, false));
+    }
+
+    #[test]
+    fn try_parse_inline_code_strips_paired_spaces() {
+        let (end, content) = try_parse_inline_code("`` `foo` ``", 0).unwrap();
+        assert_eq!(end, 11);
+        assert_eq!(content, "`foo`");
+    }
+
+    #[test]
+    fn try_parse_inline_code_all_space_content_is_preserved() {
+        let (_end, content) = try_parse_inline_code("`   `", 0).unwrap();
+        assert_eq!(content, "   ");
+    }
+
+    #[test]
+    fn try_parse_inline_code_single_run_matches_first_close() {
+        let (end, content) = try_parse_inline_code("`foo` tail", 0).unwrap();
+        assert_eq!(end, 5);
+        assert_eq!(content, "foo");
+    }
+
+    #[test]
+    fn try_parse_inline_code_no_match_returns_none() {
+        assert!(try_parse_inline_code("``unmatched", 0).is_none());
+        assert!(try_parse_inline_code("plain text", 0).is_none());
+    }
+
+    #[test]
+    fn is_code_fence_opener_rejects_info_with_backtick() {
+        assert!(is_code_fence_opener("```"));
+        assert!(is_code_fence_opener("```rust"));
+        assert!(is_code_fence_opener("```\"\""));
+        assert!(!is_code_fence_opener("```x `` y```"));
+        assert!(!is_code_fence_opener("``not-enough"));
+        assert!(!is_code_fence_opener("no fence"));
     }
 
     #[test]
