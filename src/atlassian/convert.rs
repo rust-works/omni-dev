@@ -8989,7 +8989,7 @@ mod tests {
         let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
           {"type":"text","text":"HANGUL-8","marks":[
             {"type":"annotation","attrs":{"annotationType":"inlineComment","id":"5ca7425e-34cd-48d3-b4eb-9873ac8b20e0"}},
-            {"type":"link","attrs":{"href":"https://zendesk.atlassian.net/browse/HANGUL-8"}}
+            {"type":"link","attrs":{"href":"https://zd.atlassian.net/browse/HANG-8"}}
           ]}
         ]}]}"#;
         let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
