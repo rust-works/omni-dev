@@ -187,44 +187,42 @@ enum LinkOutcome {
 }
 
 fn link_skill(link_path: &Path, source_skill: &Path, dry_run: bool) -> Result<LinkOutcome> {
-    match fs::symlink_metadata(link_path) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                if !dry_run {
-                    fs::remove_file(link_path).with_context(|| {
-                        format!("Failed to remove existing symlink {}", link_path.display())
-                    })?;
-                    create_symlink(source_skill, link_path).with_context(|| {
-                        format!(
-                            "Failed to create symlink {} -> {}",
-                            link_path.display(),
-                            source_skill.display()
-                        )
-                    })?;
-                }
-                Ok(LinkOutcome::Replaced)
-            } else {
-                Ok(LinkOutcome::Blocked(format!(
-                    "real {} already exists at {}",
-                    if meta.is_dir() { "directory" } else { "file" },
-                    link_path.display()
-                )))
-            }
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+    let outcome = match fs::symlink_metadata(link_path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
             if !dry_run {
-                create_symlink(source_skill, link_path).with_context(|| {
-                    format!(
-                        "Failed to create symlink {} -> {}",
-                        link_path.display(),
-                        source_skill.display()
-                    )
-                })?;
+                fs::remove_file(link_path).with_context(|| ctx_remove_symlink(link_path))?;
             }
-            Ok(LinkOutcome::Created)
+            LinkOutcome::Replaced
         }
-        Err(err) => Err(err).with_context(|| format!("Failed to inspect {}", link_path.display())),
+        Ok(meta) => {
+            return Ok(LinkOutcome::Blocked(format!(
+                "real {} already exists at {}",
+                if meta.is_dir() { "directory" } else { "file" },
+                link_path.display()
+            )));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => LinkOutcome::Created,
+        Err(err) => {
+            return Err(err).with_context(|| format!("Failed to inspect {}", link_path.display()));
+        }
+    };
+    if !dry_run {
+        create_symlink(source_skill, link_path)
+            .with_context(|| ctx_create_symlink(link_path, source_skill))?;
     }
+    Ok(outcome)
+}
+
+fn ctx_remove_symlink(link: &Path) -> String {
+    format!("Failed to remove existing symlink {}", link.display())
+}
+
+fn ctx_create_symlink(link: &Path, source: &Path) -> String {
+    format!(
+        "Failed to create symlink {} -> {}",
+        link.display(),
+        source.display()
+    )
 }
 
 #[cfg(unix)]
