@@ -39,15 +39,11 @@ impl DeleteCommand {
             }
         }
 
-        run_delete(&api, &self.id, self.purge, &instance_url).await
-    }
-}
+        api.delete_page(&self.id, self.purge).await?;
+        println!("Deleted page {} from {}.", self.id, instance_url);
 
-/// Deletes a Confluence page.
-async fn run_delete(api: &ConfluenceApi, id: &str, purge: bool, instance_url: &str) -> Result<()> {
-    api.delete_page(id, purge).await?;
-    println!("Deleted page {id} from {instance_url}.");
-    Ok(())
+        Ok(())
+    }
 }
 
 /// Formats the deletion confirmation prompt.
