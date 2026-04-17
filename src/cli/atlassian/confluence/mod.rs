@@ -236,11 +236,31 @@ mod tests {
     fn confluence_subcommands_download_variant() {
         let cmd = ConfluenceCommand {
             command: ConfluenceSubcommands::Download(download::DownloadCommand {
-                id: "12345".to_string(),
+                id: Some("12345".to_string()),
+                space: None,
                 output_dir: std::path::PathBuf::from("."),
                 format: ContentFormat::Jfm,
                 concurrency: 8,
                 max_depth: 0,
+                title_filter: None,
+                resume: false,
+                on_conflict: download::OnConflict::Backup,
+            }),
+        };
+        assert!(matches!(cmd.command, ConfluenceSubcommands::Download(_)));
+    }
+
+    #[test]
+    fn confluence_subcommands_download_space_variant() {
+        let cmd = ConfluenceCommand {
+            command: ConfluenceSubcommands::Download(download::DownloadCommand {
+                id: None,
+                space: Some("AD".to_string()),
+                output_dir: std::path::PathBuf::from("./AD"),
+                format: ContentFormat::Jfm,
+                concurrency: 8,
+                max_depth: 0,
+                title_filter: Some("architecture".to_string()),
                 resume: false,
                 on_conflict: download::OnConflict::Backup,
             }),
