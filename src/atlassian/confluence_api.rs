@@ -151,6 +151,13 @@ pub struct ConfluenceComment {
 #[derive(Deserialize)]
 struct ConfluenceCommentsResponse {
     results: Vec<ConfluenceCommentEntry>,
+    #[serde(rename = "_links", default)]
+    links: Option<ConfluenceCommentsLinks>,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceCommentsLinks {
+    next: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -616,35 +623,35 @@ impl ConfluenceApi {
         Ok(all_pages)
     }
 
-    /// Lists footer comments on a Confluence page.
+    /// Lists footer comments on a Confluence page, handling pagination.
     pub async fn get_page_comments(&self, page_id: &str) -> Result<Vec<ConfluenceComment>> {
-        let url = format!(
+        let mut all_comments = Vec::new();
+        let mut url = format!(
             "{}/wiki/api/v2/pages/{}/footer-comments?body-format=atlas_doc_format",
             self.client.instance_url(),
             page_id
         );
 
-        let response = self
-            .client
-            .get_json(&url)
-            .await
-            .context("Failed to fetch Confluence page comments")?;
+        loop {
+            let response = self
+                .client
+                .get_json(&url)
+                .await
+                .context("Failed to fetch Confluence page comments")?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+            }
 
-        let resp: ConfluenceCommentsResponse = response
-            .json()
-            .await
-            .context("Failed to parse Confluence comments response")?;
+            let resp: ConfluenceCommentsResponse = response
+                .json()
+                .await
+                .context("Failed to parse Confluence comments response")?;
 
-        Ok(resp
-            .results
-            .into_iter()
-            .map(|c| {
+            let page_count = resp.results.len();
+            for c in resp.results {
                 let body_adf = c.body.and_then(|b| {
                     b.atlas_doc_format
                         .and_then(|a| serde_json::from_str(&a.value).ok())
@@ -655,14 +662,23 @@ impl ConfluenceApi {
                     .and_then(|v| v.author_id.clone())
                     .unwrap_or_default();
                 let created = c.version.and_then(|v| v.created_at).unwrap_or_default();
-                ConfluenceComment {
+                all_comments.push(ConfluenceComment {
                     id: c.id,
                     author,
                     body_adf,
                     created,
+                });
+            }
+
+            match resp.links.and_then(|l| l.next) {
+                Some(next_path) if page_count > 0 => {
+                    url = format!("{}{}", self.client.instance_url(), next_path);
                 }
-            })
-            .collect())
+                _ => break,
+            }
+        }
+
+        Ok(all_comments)
     }
 
     /// Adds a footer comment to a Confluence page.
@@ -1719,6 +1735,104 @@ mod tests {
         let api = ConfluenceApi::new(client);
         let err = api.get_page_comments("99999").await.unwrap_err();
         assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn get_page_comments_with_pagination() {
+        let server = wiremock::MockServer::start().await;
+
+        // First page returns one comment with a next link.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/footer-comments",
+            ))
+            .and(wiremock::matchers::query_param_is_missing("cursor"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {
+                            "id": "100",
+                            "version": {
+                                "authorId": "user-abc",
+                                "createdAt": "2026-04-01T10:00:00.000Z"
+                            },
+                            "body": {
+                                "atlas_doc_format": {
+                                    "value": "{\"version\":1,\"type\":\"doc\",\"content\":[]}"
+                                }
+                            }
+                        }
+                    ],
+                    "_links": {
+                        "next": "/wiki/api/v2/pages/12345/footer-comments?body-format=atlas_doc_format&cursor=page2"
+                    }
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Second page returns another comment with no next link.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/footer-comments",
+            ))
+            .and(wiremock::matchers::query_param("cursor", "page2"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {
+                            "id": "101",
+                            "version": {
+                                "authorId": "user-def",
+                                "createdAt": "2026-04-02T14:00:00.000Z"
+                            }
+                        }
+                    ]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let comments = api.get_page_comments("12345").await.unwrap();
+
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].id, "100");
+        assert_eq!(comments[0].author, "user-abc");
+        assert!(comments[0].body_adf.is_some());
+        assert_eq!(comments[1].id, "101");
+        assert_eq!(comments[1].author, "user-def");
+    }
+
+    #[tokio::test]
+    async fn get_page_comments_pagination_stops_on_empty_page() {
+        let server = wiremock::MockServer::start().await;
+
+        // Response advertises a next link but returns no results; loop must stop
+        // to avoid infinite pagination.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/footer-comments",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [],
+                    "_links": {
+                        "next": "/wiki/api/v2/pages/12345/footer-comments?cursor=loop"
+                    }
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let comments = api.get_page_comments("12345").await.unwrap();
+        assert!(comments.is_empty());
     }
 
     // ── add_page_comment ──────────────────────────────────────────
