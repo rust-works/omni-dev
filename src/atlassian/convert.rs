@@ -586,8 +586,8 @@ impl<'a> MarkdownParser<'a> {
                         table_attrs["isNumberColumnEnabled"] = serde_json::json!(false);
                     }
                     if let Some(tw) = attrs.get("width") {
-                        if let Ok(w) = tw.parse::<f64>() {
-                            table_attrs["width"] = serde_json::json!(w);
+                        if let Some(w) = parse_numeric_attr(tw) {
+                            table_attrs["width"] = w;
                         }
                     }
                     if let Some(local_id) = attrs.get("localId") {
@@ -1074,8 +1074,8 @@ impl<'a> MarkdownParser<'a> {
                         table_attrs["isNumberColumnEnabled"] = serde_json::json!(false);
                     }
                     if let Some(tw) = attrs.get("width") {
-                        if let Ok(w) = tw.parse::<f64>() {
-                            table_attrs["width"] = serde_json::json!(w);
+                        if let Some(w) = parse_numeric_attr(tw) {
+                            table_attrs["width"] = w;
                         }
                     }
                     if let Some(local_id) = attrs.get("localId") {
@@ -1165,16 +1165,7 @@ fn build_cell_attrs(attrs: &crate::atlassian::attrs::Attrs) -> serde_json::Value
     if let Some(colwidth) = attrs.get("colwidth") {
         let widths: Vec<serde_json::Value> = colwidth
             .split(',')
-            .filter_map(|s| {
-                let s = s.trim();
-                // Preserve the original number type: values without a decimal point
-                // are emitted as integers, values with a decimal point as floats.
-                if s.contains('.') {
-                    s.parse::<f64>().ok().map(|n| serde_json::json!(n))
-                } else {
-                    s.parse::<u64>().ok().map(|n| serde_json::json!(n))
-                }
-            })
+            .filter_map(|s| parse_numeric_attr(s.trim()))
             .collect();
         if !widths.is_empty() {
             adf["colwidth"] = serde_json::Value::Array(widths);
@@ -3995,12 +3986,7 @@ fn render_table_level_attrs(node: &AdfNode, output: &mut String, opts: &RenderOp
                 parts.push("numbered=false".to_string());
             }
         }
-        if let Some(tw) = attrs.get("width").and_then(serde_json::Value::as_f64) {
-            let tw_str = if tw.fract() == 0.0 {
-                (tw as u64).to_string()
-            } else {
-                tw.to_string()
-            };
+        if let Some(tw_str) = attrs.get("width").and_then(fmt_numeric_attr) {
             parts.push(format!("width={tw_str}"));
         }
         maybe_push_local_id(attrs, &mut parts, opts);
@@ -15690,8 +15676,8 @@ mod tests {
         let doc: crate::atlassian::adf::AdfDocument = serde_json::from_value(adf_doc).unwrap();
         let md = adf_to_markdown(&doc).unwrap();
         assert!(
-            md.contains("width=760"),
-            "expected width=760 in markdown, got: {md}"
+            md.contains("width=760.0"),
+            "expected width=760.0 in markdown (float preserved), got: {md}"
         );
         // Round-trip back to ADF
         let doc2 = markdown_to_adf(&md).unwrap();
@@ -15699,6 +15685,119 @@ mod tests {
         assert_eq!(table.node_type, "table");
         let table_attrs = table.attrs.as_ref().unwrap();
         assert_eq!(table_attrs["width"], 760.0);
+        assert!(
+            table_attrs["width"].is_f64(),
+            "expected float width to be preserved as f64, got: {:?}",
+            table_attrs["width"]
+        );
+    }
+
+    #[test]
+    fn table_integer_width_roundtrip_preserves_integer() {
+        // Issue #577: Integer width in ADF must survive roundtrip without being
+        // coerced to a float.
+        let adf_doc = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [{
+                "type": "table",
+                "attrs": {
+                    "isNumberColumnEnabled": false,
+                    "layout": "center",
+                    "localId": "abc-123",
+                    "width": 1420
+                },
+                "content": [{
+                    "type": "tableRow",
+                    "content": [{
+                        "type": "tableCell",
+                        "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Cell"}]}]
+                    }]
+                }]
+            }]
+        });
+        let doc: crate::atlassian::adf::AdfDocument =
+            serde_json::from_value(adf_doc.clone()).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("width=1420"),
+            "expected width=1420 in markdown, got: {md}"
+        );
+        assert!(
+            !md.contains("width=1420.0"),
+            "integer width should not be rendered with decimal: {md}"
+        );
+
+        let doc2 = markdown_to_adf(&md).unwrap();
+        let table = &doc2.content[0];
+        assert_eq!(table.node_type, "table");
+        let table_attrs = table.attrs.as_ref().unwrap();
+        assert_eq!(table_attrs["width"], 1420);
+        assert!(
+            table_attrs["width"].is_u64() || table_attrs["width"].is_i64(),
+            "width should remain an integer, got: {:?}",
+            table_attrs["width"]
+        );
+        assert!(
+            !table_attrs["width"].is_f64(),
+            "width should not be a float, got: {:?}",
+            table_attrs["width"]
+        );
+
+        // Full byte-fidelity: re-serialized ADF should match original JSON.
+        let roundtripped = serde_json::to_value(&doc2).unwrap();
+        let orig_width = &adf_doc["content"][0]["attrs"]["width"];
+        let rt_width = &roundtripped["content"][0]["attrs"]["width"];
+        assert_eq!(
+            orig_width, rt_width,
+            "width value must roundtrip byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn table_fractional_width_roundtrip() {
+        // Fractional float widths should also roundtrip faithfully.
+        let adf_doc = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [{
+                "type": "table",
+                "attrs": {"layout": "default", "width": 760.5},
+                "content": [{
+                    "type": "tableRow",
+                    "content": [{
+                        "type": "tableHeader",
+                        "content": [{"type": "paragraph", "content": [{"type": "text", "text": "H"}]}]
+                    }]
+                }]
+            }]
+        });
+        let doc: crate::atlassian::adf::AdfDocument = serde_json::from_value(adf_doc).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("width=760.5"),
+            "expected width=760.5 in markdown, got: {md}"
+        );
+        let doc2 = markdown_to_adf(&md).unwrap();
+        let table_attrs = doc2.content[0].attrs.as_ref().unwrap();
+        assert_eq!(table_attrs["width"], 760.5);
+        assert!(table_attrs["width"].is_f64());
+    }
+
+    #[test]
+    fn pipe_table_integer_width_roundtrip() {
+        // Exercises the try_table() attrs-on-next-line parsing path.
+        let md = "| A | B |\n|---|---|\n| 1 | 2 |\n{layout=default width=1420}\n";
+        let doc = markdown_to_adf(md).unwrap();
+        let table = &doc.content[0];
+        assert_eq!(table.node_type, "table");
+        let attrs = table.attrs.as_ref().unwrap();
+        assert_eq!(attrs["width"], 1420);
+        assert!(
+            attrs["width"].is_u64() || attrs["width"].is_i64(),
+            "pipe-table width must stay integer, got: {:?}",
+            attrs["width"]
+        );
     }
 
     #[test]
