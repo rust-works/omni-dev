@@ -851,7 +851,15 @@ impl<'a> MarkdownParser<'a> {
 
         let node = match d.name.as_str() {
             "card" => {
-                let url = d.content.as_deref().unwrap_or("");
+                let content = d.content.as_deref().unwrap_or("");
+                // Prefer the `url` attribute when present; fall back to the
+                // bracketed content.  The attribute form is used when the URL
+                // contains characters that would otherwise break
+                // `::card[URL]` parsing.
+                let url = match d.attrs.as_ref().and_then(|a| a.get("url")) {
+                    Some(u) => u,
+                    None => content,
+                };
                 let mut node = AdfNode::block_card(url);
                 // Pass through layout/width attrs
                 if let Some(ref attrs) = d.attrs {
@@ -1443,6 +1451,34 @@ fn escape_bare_urls(text: &str) -> String {
     result
 }
 
+/// Returns `true` if the string can be embedded in a `:card[...]` (or similar
+/// bracketed inline directive) without breaking the depth-based bracket matcher
+/// used by [`try_parse_inline_directive`].
+///
+/// The parser scans the content enclosed in `[...]` treating `[` as +1 and `]`
+/// as −1 on depth, closing when depth returns to zero.  A value is safe if
+/// every prefix has `count('[') >= count(']') − 1` (i.e., the running depth
+/// never dips below zero before the end) and it contains no newline.
+fn url_safe_in_bracket_content(s: &str) -> bool {
+    if s.contains('\n') {
+        return false;
+    }
+    let mut depth: i32 = 1;
+    for ch in s.chars() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
 /// Escapes emoji shortcode patterns (`:name:`) in plain text so they are not
 /// parsed as emoji nodes during round-trip.  Only the leading colon is
 /// backslash-escaped, which is enough to prevent the parser from matching the
@@ -1722,7 +1758,29 @@ fn parse_image_syntax(line: &str) -> Option<(&str, &str)> {
 // ── Inline Parsing ──────────────────────────────────────────────────
 
 /// Parses inline markdown content into ADF inline nodes.
+///
+/// Detects bare URLs (e.g., `https://example.com`) and promotes them to
+/// `inlineCard` nodes. Call this at the top level (paragraph, heading, cell,
+/// list item) where a bare URL represents a smart link.
 fn parse_inline(text: &str) -> Vec<AdfNode> {
+    parse_inline_impl(text, true)
+}
+
+/// Parses inline markdown content without promoting bare URLs to `inlineCard`.
+///
+/// Used when recursing into mark-wrapping constructs such as emphasis, strike,
+/// bracketed spans, or links.  In those contexts, the enclosing syntax already
+/// declares the semantic role of the content — a URL inside `[url]{underline}`
+/// or `**url**` is the user's text, not a smart link (issue #553).
+fn parse_inline_no_auto_cards(text: &str) -> Vec<AdfNode> {
+    parse_inline_impl(text, false)
+}
+
+/// Implementation backing [`parse_inline`] and [`parse_inline_no_auto_cards`].
+///
+/// When `auto_inline_card` is `false`, bare `http://`/`https://` URLs are
+/// treated as plain text instead of being promoted to `inlineCard` nodes.
+fn parse_inline_impl(text: &str, auto_inline_card: bool) -> Vec<AdfNode> {
     let mut nodes = Vec::new();
     let mut chars = text.char_indices().peekable();
     let mut plain_start = 0;
@@ -1737,7 +1795,7 @@ fn parse_inline(text: &str) -> Vec<AdfNode> {
                     } else {
                         AdfMark::em()
                     };
-                    let inner = parse_inline(content);
+                    let inner = parse_inline_no_auto_cards(content);
                     for mut node in inner {
                         prepend_mark(&mut node, mark.clone());
                         nodes.push(node);
@@ -1764,7 +1822,7 @@ fn parse_inline(text: &str) -> Vec<AdfNode> {
             '~' => {
                 if let Some((end, content)) = try_parse_strikethrough(text, i) {
                     flush_plain(text, plain_start, i, &mut nodes);
-                    let inner = parse_inline(content);
+                    let inner = parse_inline_no_auto_cards(content);
                     for mut node in inner {
                         prepend_mark(&mut node, AdfMark::strike());
                         nodes.push(node);
@@ -1802,7 +1860,7 @@ fn parse_inline(text: &str) -> Vec<AdfNode> {
                             vec![AdfMark::link(href)],
                         ));
                     } else {
-                        let inner = parse_inline(link_text);
+                        let inner = parse_inline_no_auto_cards(link_text);
                         for mut node in inner {
                             prepend_mark(&mut node, AdfMark::link(href));
                             nodes.push(node);
@@ -1872,7 +1930,9 @@ fn parse_inline(text: &str) -> Vec<AdfNode> {
                 // degrade to link text in ADF since inline media is complex)
                 chars.next();
             }
-            'h' if text[i..].starts_with("http://") || text[i..].starts_with("https://") => {
+            'h' if auto_inline_card
+                && (text[i..].starts_with("http://") || text[i..].starts_with("https://")) =>
+            {
                 if let Some((end, url)) = try_parse_bare_url(text, i) {
                     flush_plain(text, plain_start, i, &mut nodes);
                     nodes.push(AdfNode::inline_card(url));
@@ -2216,7 +2276,7 @@ fn try_parse_bracketed_span(text: &str, i: usize) -> Option<(usize, Vec<AdfNode>
         return None; // no recognized marks
     }
 
-    let inner = parse_inline(span_text);
+    let inner = parse_inline_no_auto_cards(span_text);
     let result: Vec<AdfNode> = inner
         .into_iter()
         .map(|mut node| {
@@ -2242,7 +2302,16 @@ fn try_dispatch_inline_directive(text: &str, pos: usize) -> Option<(AdfNode, usi
 
     let node = match d.name.as_str() {
         "card" => {
-            let mut node = AdfNode::inline_card(content);
+            // Prefer the `url` attribute when present; fall back to the
+            // bracketed content.  The attribute form is used when the URL
+            // contains characters (such as `]` or `\n`) that would otherwise
+            // break `:card[URL]` parsing.
+            let url = d
+                .attrs
+                .as_ref()
+                .and_then(|a| a.get("url"))
+                .unwrap_or(content);
+            let mut node = AdfNode::inline_card(url);
             pass_through_local_id(&d.attrs, &mut node);
             node
         }
@@ -2317,7 +2386,7 @@ fn try_dispatch_inline_directive(text: &str, pos: usize) -> Option<(AdfNode, usi
             } else {
                 // Parse inner content to handle nested syntax (e.g., links).
                 // Prepend span marks before inner marks to preserve ordering.
-                let inner = parse_inline(content);
+                let inner = parse_inline_no_auto_cards(content);
                 let mut nodes: Vec<AdfNode> = inner
                     .into_iter()
                     .map(|mut node| {
@@ -2986,8 +3055,15 @@ fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) 
                     .get("url")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("");
-                output.push_str(&format!("::card[{url}]"));
                 let mut attr_parts = Vec::new();
+                if url_safe_in_bracket_content(url) {
+                    output.push_str(&format!("::card[{url}]"));
+                } else {
+                    // URL would break `::card[URL]` parsing; use quoted attr form.
+                    output.push_str("::card[]");
+                    let escaped = url.replace('\\', "\\\\").replace('"', "\\\"");
+                    attr_parts.push(format!("url=\"{escaped}\""));
+                }
                 if let Some(layout) = attrs.get("layout").and_then(serde_json::Value::as_str) {
                     attr_parts.push(format!("layout={layout}"));
                 }
@@ -4091,10 +4167,19 @@ fn render_non_text_inline_body(
         "inlineCard" => {
             if let Some(ref attrs) = node.attrs {
                 if let Some(url) = attrs.get("url").and_then(serde_json::Value::as_str) {
-                    output.push_str(":card[");
-                    output.push_str(url);
-                    output.push(']');
                     let mut attr_parts = Vec::new();
+                    if url_safe_in_bracket_content(url) {
+                        output.push_str(":card[");
+                        output.push_str(url);
+                        output.push(']');
+                    } else {
+                        // URL would break `:card[URL]` parsing (e.g. contains an
+                        // unbalanced `]` or a newline).  Fall back to quoted
+                        // attribute form so the URL round-trips losslessly.
+                        output.push_str(":card[]");
+                        let escaped = url.replace('\\', "\\\\").replace('"', "\\\"");
+                        attr_parts.push(format!("url=\"{escaped}\""));
+                    }
                     maybe_push_local_id(attrs, &mut attr_parts, opts);
                     if !attr_parts.is_empty() {
                         output.push('{');
@@ -9226,6 +9311,375 @@ mod tests {
             content[0].attrs.as_ref().unwrap()["url"],
             "https://example.com/page"
         );
+    }
+
+    // ── Issue #553: inlineCard round-trip with problematic URLs ───────
+
+    #[test]
+    fn url_safe_in_bracket_content_balanced() {
+        // Balanced brackets — depth never returns to zero mid-string.
+        assert!(url_safe_in_bracket_content("https://example.com"));
+        assert!(url_safe_in_bracket_content("https://example.com/[id]"));
+        assert!(url_safe_in_bracket_content("a[b[c]d]e"));
+        assert!(url_safe_in_bracket_content(""));
+    }
+
+    #[test]
+    fn url_safe_in_bracket_content_unbalanced() {
+        // A `]` with no prior `[` would close `:card[...]` early.
+        assert!(!url_safe_in_bracket_content("a]b"));
+        assert!(!url_safe_in_bracket_content("https://example.com/path]end"));
+        // Embedded newline breaks inline directive parsing.
+        assert!(!url_safe_in_bracket_content("a\nb"));
+    }
+
+    #[test]
+    fn inline_card_url_with_closing_bracket_round_trip() {
+        // Issue #553 defensive fix: a URL that contains `]` (unbalanced) must
+        // round-trip without truncation.  The renderer must switch to the
+        // quoted attribute form `:card[]{url="..."}` so the parser's
+        // depth-based bracket matcher does not terminate the directive early.
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "paragraph",
+                "content": [
+                    {"type": "text", "text": "See: "},
+                    {"type": "inlineCard", "attrs": {"url": "https://example.com/path]end/?q=1"}}
+                ]
+            }]
+        }"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        assert!(
+            jfm.contains(r#":card[]{url="https://example.com/path]end/?q=1"}"#),
+            "expected attr-form for URL with `]`, got: {jfm}"
+        );
+        let rt = markdown_to_adf(&jfm).unwrap();
+        let content = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 2, "expected 2 inline nodes, got {content:?}");
+        assert_eq!(content[0].node_type, "text");
+        assert_eq!(content[0].text.as_deref(), Some("See: "));
+        assert_eq!(content[1].node_type, "inlineCard");
+        assert_eq!(
+            content[1].attrs.as_ref().unwrap()["url"],
+            "https://example.com/path]end/?q=1"
+        );
+    }
+
+    #[test]
+    fn inline_card_url_with_closing_bracket_preserves_local_id() {
+        // Attr-form `:card[]{url=... localId=...}` must preserve localId too.
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "paragraph",
+                "content": [
+                    {"type": "inlineCard", "attrs": {
+                        "url": "https://example.com/a]b",
+                        "localId": "c-77"
+                    }}
+                ]
+            }]
+        }"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        assert!(
+            jfm.contains(r#"url="https://example.com/a]b""#),
+            "jfm: {jfm}"
+        );
+        assert!(jfm.contains("localId=c-77"), "jfm: {jfm}");
+        let rt = markdown_to_adf(&jfm).unwrap();
+        let card = &rt.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(card.node_type, "inlineCard");
+        assert_eq!(
+            card.attrs.as_ref().unwrap()["url"],
+            "https://example.com/a]b"
+        );
+        assert_eq!(card.attrs.as_ref().unwrap()["localId"], "c-77");
+    }
+
+    #[test]
+    fn block_card_url_with_closing_bracket_round_trip() {
+        // Same defensive fix applied to the leaf directive `::card`.
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [
+                {"type": "blockCard", "attrs": {"url": "https://example.com/path]end"}}
+            ]
+        }"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        assert!(
+            jfm.contains(r#"::card[]{url="https://example.com/path]end"}"#),
+            "expected attr-form for blockCard with `]`, got: {jfm}"
+        );
+        let rt = markdown_to_adf(&jfm).unwrap();
+        assert_eq!(rt.content[0].node_type, "blockCard");
+        assert_eq!(
+            rt.content[0].attrs.as_ref().unwrap()["url"],
+            "https://example.com/path]end"
+        );
+    }
+
+    #[test]
+    fn block_card_attr_form_parses_without_renderer() {
+        // Directly parsing `::card[]{url="..."}` exercises the attr-URL
+        // fallback in the leaf-directive dispatcher (covers the `url` lookup
+        // path independently of the ADF→JFM renderer).
+        let doc = markdown_to_adf(r#"::card[]{url="https://example.com/a"}"#).unwrap();
+        assert_eq!(doc.content[0].node_type, "blockCard");
+        assert_eq!(
+            doc.content[0].attrs.as_ref().unwrap()["url"],
+            "https://example.com/a"
+        );
+    }
+
+    #[test]
+    fn block_card_attr_form_url_overrides_content() {
+        // When both bracket-content and `url=` attribute are present on
+        // `::card`, the attribute wins.  Mirrors the inline-directive
+        // behaviour and keeps hand-edited JFM forgiving.
+        let doc =
+            markdown_to_adf(r#"::card[https://old.example.com]{url="https://new.example.com"}"#)
+                .unwrap();
+        assert_eq!(doc.content[0].node_type, "blockCard");
+        assert_eq!(
+            doc.content[0].attrs.as_ref().unwrap()["url"],
+            "https://new.example.com"
+        );
+    }
+
+    #[test]
+    fn block_card_attr_form_with_layout_and_width() {
+        // Attr-URL form combined with layout/width attrs — ensures all
+        // sibling attrs still pass through after the URL lookup.
+        let doc =
+            markdown_to_adf(r#"::card[]{url="https://example.com/a]b" layout=wide width=80}"#)
+                .unwrap();
+        let attrs = doc.content[0].attrs.as_ref().unwrap();
+        assert_eq!(attrs["url"], "https://example.com/a]b");
+        assert_eq!(attrs["layout"], "wide");
+        assert_eq!(attrs["width"], 80);
+    }
+
+    #[test]
+    fn inline_card_issue_553_reproducer() {
+        // Verbatim reproducer from issue #553: an inlineCard in a paragraph
+        // with preceding text must round-trip as an inlineCard, not degrade to
+        // a text node with a link mark.
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "paragraph",
+                "content": [
+                    {"type": "text", "text": "See the related page: "},
+                    {"type": "inlineCard", "attrs": {
+                        "url": "https://example.atlassian.net/wiki/spaces/ENG/pages/12345678"
+                    }}
+                ]
+            }]
+        }"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        let rt = markdown_to_adf(&jfm).unwrap();
+        let content = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0].node_type, "text");
+        assert_eq!(content[1].node_type, "inlineCard");
+        assert_eq!(
+            content[1].attrs.as_ref().unwrap()["url"],
+            "https://example.atlassian.net/wiki/spaces/ENG/pages/12345678"
+        );
+    }
+
+    #[test]
+    fn inline_card_attr_form_parses_even_without_renderer() {
+        // Directly parsing `:card[]{url="..."}` should yield an inlineCard.
+        let doc = markdown_to_adf(r#":card[]{url="https://example.com/a"}"#).unwrap();
+        let node = &doc.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(node.node_type, "inlineCard");
+        assert_eq!(node.attrs.as_ref().unwrap()["url"], "https://example.com/a");
+    }
+
+    #[test]
+    fn inline_card_attr_form_url_overrides_content() {
+        // When both bracket-content and `url=` attr are present, attr wins.
+        // This keeps the parser forgiving of hand-edited JFM where a user
+        // copied an old bracket form but added attrs.
+        let doc =
+            markdown_to_adf(r#":card[https://old.example.com]{url="https://new.example.com"}"#)
+                .unwrap();
+        let node = &doc.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(node.node_type, "inlineCard");
+        assert_eq!(
+            node.attrs.as_ref().unwrap()["url"],
+            "https://new.example.com"
+        );
+    }
+
+    // ── Issue #553 (updated): mark-wrapped URL must not become inlineCard ──
+
+    #[test]
+    fn url_with_link_and_underline_marks_round_trip() {
+        // Issue #553 (updated reproducer): a `text` node whose content is a
+        // URL and that carries both `link` and `underline` marks must round-
+        // trip as text+marks, not be promoted to an `inlineCard`.
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "paragraph",
+                "content": [
+                    {"type": "text", "text": "See results at: "},
+                    {"type": "text",
+                     "text": "https://example.com/projects/abc123/analytics",
+                     "marks": [
+                        {"type": "link", "attrs": {"href": "https://example.com/projects/abc123/analytics"}},
+                        {"type": "underline"}
+                     ]},
+                    {"type": "text", "text": " for details."}
+                ]
+            }]
+        }"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        let rt = markdown_to_adf(&jfm).unwrap();
+        let content = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(
+            content.len(),
+            3,
+            "expected 3 inline nodes, got: {content:?}"
+        );
+        assert_eq!(content[0].node_type, "text");
+        assert_eq!(
+            content[1].node_type, "text",
+            "must stay text, not inlineCard"
+        );
+        assert_eq!(
+            content[1].text.as_deref(),
+            Some("https://example.com/projects/abc123/analytics")
+        );
+        let mark_types: Vec<&str> = content[1]
+            .marks
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(mark_types, vec!["link", "underline"], "marks lost");
+        assert_eq!(content[2].node_type, "text");
+    }
+
+    #[test]
+    fn url_inside_bracketed_span_stays_text() {
+        // `[URL]{underline}` in JFM means "underline this URL text", not
+        // "create a smart link that's underlined".  The nested parse_inline
+        // call must not auto-promote the bare URL to an inlineCard.
+        let doc = markdown_to_adf("[https://example.com]{underline}").unwrap();
+        let node = &doc.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(node.node_type, "text");
+        assert_eq!(node.text.as_deref(), Some("https://example.com"));
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(mark_types, vec!["underline"]);
+    }
+
+    #[test]
+    fn url_inside_emphasis_stays_text() {
+        // Bold, italic, and strike-wrapped URLs should remain as text nodes,
+        // not get promoted to inlineCards by the nested inline parser.
+        for (md, mark) in [
+            ("**https://example.com**", "strong"),
+            ("*https://example.com*", "em"),
+            ("~~https://example.com~~", "strike"),
+        ] {
+            let doc = markdown_to_adf(md).unwrap();
+            let node = &doc.content[0].content.as_ref().unwrap()[0];
+            assert_eq!(node.node_type, "text", "md={md}: must be text");
+            assert_eq!(node.text.as_deref(), Some("https://example.com"));
+            let mark_types: Vec<&str> = node
+                .marks
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(|m| m.mark_type.as_str())
+                .collect();
+            assert_eq!(mark_types, vec![mark], "md={md}: wrong marks");
+        }
+    }
+
+    #[test]
+    fn url_inside_span_directive_stays_text() {
+        // `:span[URL]{color=red}` should not promote the URL to an inlineCard.
+        let doc = markdown_to_adf(":span[https://example.com]{color=red}").unwrap();
+        let node = &doc.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(node.node_type, "text");
+        assert_eq!(node.text.as_deref(), Some("https://example.com"));
+        let mark = &node.marks.as_ref().unwrap()[0];
+        assert_eq!(mark.mark_type, "textColor");
+    }
+
+    #[test]
+    fn url_as_link_text_with_underline_after_link_mark_order() {
+        // Reverse mark order — underline appears BEFORE link in the ADF array.
+        // The JFM form is `[[text](url)]{underline}`; the nested parser must
+        // still keep the URL as plain text.
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "paragraph",
+                "content": [
+                    {"type": "text",
+                     "text": "https://example.com",
+                     "marks": [
+                        {"type": "underline"},
+                        {"type": "link", "attrs": {"href": "https://example.com"}}
+                     ]}
+                ]
+            }]
+        }"#;
+        let adf: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let jfm = adf_to_markdown(&adf).unwrap();
+        let rt = markdown_to_adf(&jfm).unwrap();
+        let node = &rt.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(node.node_type, "text", "must stay text, got: {node:?}");
+        assert_eq!(node.text.as_deref(), Some("https://example.com"));
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(mark_types, vec!["underline", "link"]);
+    }
+
+    #[test]
+    fn bare_url_at_top_level_still_becomes_inline_card() {
+        // Regression guard: the suppression only applies inside mark-wrapping
+        // constructs.  A bare URL in ordinary paragraph text must still be
+        // detected and promoted to an inlineCard.
+        let doc = markdown_to_adf("Visit https://example.com today").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0].node_type, "text");
+        assert_eq!(content[1].node_type, "inlineCard");
+        assert_eq!(
+            content[1].attrs.as_ref().unwrap()["url"],
+            "https://example.com"
+        );
+        assert_eq!(content[2].node_type, "text");
     }
 
     // ── Block-level attribute marks (Tier 5/6) ───────────────────────
