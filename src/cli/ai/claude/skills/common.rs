@@ -18,12 +18,7 @@ pub(super) fn resolve_toplevel(path: &Path) -> Result<PathBuf> {
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(path)
         .output()
-        .with_context(|| {
-            format!(
-                "Failed to run git rev-parse --show-toplevel in {}",
-                path.display()
-            )
-        })?;
+        .with_context(|| ctx_spawn_failure("git rev-parse --show-toplevel", path))?;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
         anyhow::bail!(
@@ -33,11 +28,7 @@ pub(super) fn resolve_toplevel(path: &Path) -> Result<PathBuf> {
     }
     let stdout = String::from_utf8(output.stdout)
         .context("git rev-parse --show-toplevel output was not UTF-8")?;
-    let trimmed = stdout.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("git rev-parse --show-toplevel returned empty path");
-    }
-    Ok(PathBuf::from(trimmed))
+    Ok(PathBuf::from(stdout.trim()))
 }
 
 /// Runs `git rev-parse --git-common-dir` from `path` and returns an absolute path.
@@ -49,12 +40,7 @@ pub(super) fn resolve_git_common_dir(path: &Path) -> Result<PathBuf> {
         .args(["rev-parse", "--git-common-dir"])
         .current_dir(path)
         .output()
-        .with_context(|| {
-            format!(
-                "Failed to run git rev-parse --git-common-dir in {}",
-                path.display()
-            )
-        })?;
+        .with_context(|| ctx_spawn_failure("git rev-parse --git-common-dir", path))?;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
         anyhow::bail!(
@@ -107,13 +93,10 @@ pub(super) fn enumerate_skills(source_skills_dir: &Path) -> Result<Vec<(String, 
     }
     let entries = fs::read_dir(source_skills_dir)
         .with_context(|| format!("Failed to read {}", source_skills_dir.display()))?;
+    let dir_label = source_skills_dir.display();
     for entry in entries {
-        let entry = entry.with_context(|| {
-            format!(
-                "Failed to read directory entry in {}",
-                source_skills_dir.display()
-            )
-        })?;
+        let entry =
+            entry.with_context(|| format!("Failed to read directory entry in {dir_label}"))?;
         let path = entry.path();
         if !path.is_dir() {
             continue;
@@ -213,6 +196,10 @@ pub(super) fn remove_exclude_entries(
     fs::write(exclude_file, new_content)
         .with_context(|| format!("Failed to write {}", exclude_file.display()))?;
     Ok(removed)
+}
+
+fn ctx_spawn_failure(command: &str, path: &Path) -> String {
+    format!("Failed to run {command} in {}", path.display())
 }
 
 fn read_exclude_lines(exclude_file: &Path) -> Result<Vec<String>> {
