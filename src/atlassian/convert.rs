@@ -1145,17 +1145,6 @@ impl<'a> MarkdownParser<'a> {
     }
 }
 
-/// Parses a numeric JFM attribute string, preserving integer-vs-float type.
-/// Strings without a decimal point are emitted as JSON integers; strings with a
-/// decimal point are emitted as JSON floats.
-fn parse_numeric_attr(s: &str) -> Option<serde_json::Value> {
-    if s.contains('.') {
-        s.parse::<f64>().ok().map(|n| serde_json::json!(n))
-    } else {
-        s.parse::<u64>().ok().map(|n| serde_json::json!(n))
-    }
-}
-
 /// Builds ADF cell attributes from JFM directive attrs.
 /// Maps: `bg` → `background`, `colspan` → number, `rowspan` → number, `colwidth` → array.
 fn build_cell_attrs(attrs: &crate::atlassian::attrs::Attrs) -> serde_json::Value {
@@ -3997,24 +3986,8 @@ fn render_table_level_attrs(node: &AdfNode, output: &mut String, opts: &RenderOp
                 parts.push("numbered=false".to_string());
             }
         }
-        if let Some(tw_val) = attrs.get("width") {
-            let tw_str = if tw_val.is_f64() {
-                tw_val.as_f64().map(|f| {
-                    if f.fract() == 0.0 && f.is_finite() {
-                        format!("{f:.1}")
-                    } else {
-                        f.to_string()
-                    }
-                })
-            } else {
-                tw_val
-                    .as_u64()
-                    .map(|n| n.to_string())
-                    .or_else(|| tw_val.as_i64().map(|n| n.to_string()))
-            };
-            if let Some(tw_str) = tw_str {
-                parts.push(format!("width={tw_str}"));
-            }
+        if let Some(tw_str) = attrs.get("width").and_then(fmt_numeric_attr) {
+            parts.push(format!("width={tw_str}"));
         }
         maybe_push_local_id(attrs, &mut parts, opts);
         if !parts.is_empty() {
@@ -15809,33 +15782,6 @@ mod tests {
         let table_attrs = doc2.content[0].attrs.as_ref().unwrap();
         assert_eq!(table_attrs["width"], 760.5);
         assert!(table_attrs["width"].is_f64());
-    }
-
-    #[test]
-    fn parse_numeric_attr_integer() {
-        let v = parse_numeric_attr("1420").unwrap();
-        assert!(v.is_u64(), "expected integer, got: {v:?}");
-        assert_eq!(v, serde_json::json!(1420u64));
-    }
-
-    #[test]
-    fn parse_numeric_attr_float_with_decimal() {
-        let v = parse_numeric_attr("1420.0").unwrap();
-        assert!(v.is_f64(), "expected float, got: {v:?}");
-        assert_eq!(v, serde_json::json!(1420.0));
-    }
-
-    #[test]
-    fn parse_numeric_attr_fractional() {
-        let v = parse_numeric_attr("760.5").unwrap();
-        assert!(v.is_f64());
-        assert_eq!(v, serde_json::json!(760.5));
-    }
-
-    #[test]
-    fn parse_numeric_attr_invalid() {
-        assert!(parse_numeric_attr("not-a-number").is_none());
-        assert!(parse_numeric_attr("").is_none());
     }
 
     #[test]
