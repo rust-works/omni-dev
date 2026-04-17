@@ -9,7 +9,7 @@ use chrono::NaiveDate;
 use tracing::{debug, warn};
 
 use crate::atlassian::adf::{AdfDocument, AdfMark, AdfNode};
-use crate::atlassian::attrs::{format_kv, parse_attrs};
+use crate::atlassian::attrs::{format_kv, parse_attrs, Attrs};
 use crate::atlassian::directive::{
     is_container_close, try_parse_container_open, try_parse_inline_directive,
     try_parse_leaf_directive,
@@ -2557,36 +2557,51 @@ fn try_parse_emoji_shortcode(text: &str, i: usize) -> Option<(usize, &str)> {
 /// Parses an emoji shortcode that has already been matched, then checks for
 /// trailing `{id="..." text="..."}` attributes to preserve round-trip fidelity.
 fn parse_emoji_with_attrs(text: &str, shortcode_end: usize, short_name: &str) -> (usize, AdfNode) {
+    // Issue #576: An emoji with a combined shortName like `:slightly_smiling_face::bow:`
+    // is emitted as `:slightly_smiling_face::bow:{shortName="..." ...}`. Extend the
+    // match through any adjacent `:name:` shortcodes so that a trailing directive
+    // attaches to the whole chain as a single emoji, using the directive's shortName.
+    let mut chain_end = shortcode_end;
+    while let Some((next_end, _)) = try_parse_emoji_shortcode(text, chain_end) {
+        chain_end = next_end;
+    }
+    if chain_end > shortcode_end {
+        if let Some((attr_end, attrs)) = parse_attrs(text, chain_end) {
+            return (attr_end, build_emoji_node(&attrs, short_name));
+        }
+    }
+
     if let Some((attr_end, attrs)) = parse_attrs(text, shortcode_end) {
-        // Use the explicit shortName attr if provided (preserves original form),
-        // otherwise fall back to colon-wrapped name.
-        let resolved_name = attrs
-            .get("shortName")
-            .map_or_else(|| format!(":{short_name}:"), str::to_string);
-        let mut emoji_attrs = serde_json::json!({"shortName": resolved_name});
-        if let Some(id) = attrs.get("id") {
-            emoji_attrs["id"] = serde_json::Value::String(id.to_string());
-        }
-        if let Some(t) = attrs.get("text") {
-            emoji_attrs["text"] = serde_json::Value::String(t.to_string());
-        }
-        if let Some(lid) = attrs.get("localId") {
-            emoji_attrs["localId"] = serde_json::Value::String(lid.to_string());
-        }
-        (
-            attr_end,
-            AdfNode {
-                node_type: "emoji".to_string(),
-                attrs: Some(emoji_attrs),
-                content: None,
-                text: None,
-                marks: None,
-                local_id: None,
-                parameters: None,
-            },
-        )
+        (attr_end, build_emoji_node(&attrs, short_name))
     } else {
         (shortcode_end, AdfNode::emoji(&format!(":{short_name}:")))
+    }
+}
+
+/// Builds an emoji `AdfNode` from parsed directive attrs, falling back to
+/// the matched shortcode name when `shortName` is absent from the directive.
+fn build_emoji_node(attrs: &Attrs, short_name: &str) -> AdfNode {
+    let resolved_name = attrs
+        .get("shortName")
+        .map_or_else(|| format!(":{short_name}:"), str::to_string);
+    let mut emoji_attrs = serde_json::json!({ "shortName": resolved_name });
+    if let Some(id) = attrs.get("id") {
+        emoji_attrs["id"] = serde_json::Value::String(id.to_string());
+    }
+    if let Some(t) = attrs.get("text") {
+        emoji_attrs["text"] = serde_json::Value::String(t.to_string());
+    }
+    if let Some(lid) = attrs.get("localId") {
+        emoji_attrs["localId"] = serde_json::Value::String(lid.to_string());
+    }
+    AdfNode {
+        node_type: "emoji".to_string(),
+        attrs: Some(emoji_attrs),
+        content: None,
+        text: None,
+        marks: None,
+        local_id: None,
+        parameters: None,
     }
 }
 
@@ -7713,6 +7728,105 @@ mod tests {
         assert_eq!(content[1].node_type, "emoji");
         assert_eq!(content[1].attrs.as_ref().unwrap()["shortName"], ":fire:");
         assert_eq!(content[2].text.as_deref(), Some(" world"));
+    }
+
+    #[test]
+    fn combined_emoji_shortname_round_trips_as_single_node() {
+        // Issue #576: an emoji node whose shortName is a combination of two
+        // shortcodes (e.g. ":slightly_smiling_face::bow:") must survive the
+        // ADF → markdown → ADF round-trip as a single emoji node rather than
+        // being split into two.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"text","text":"Thanks for the help "},
+          {"type":"emoji","attrs":{"shortName":":slightly_smiling_face::bow:","id":"","text":""}}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let content = round_tripped.content[0].content.as_ref().unwrap();
+
+        assert_eq!(
+            content.len(),
+            2,
+            "should have text + single combined emoji: {content:?}"
+        );
+        assert_eq!(content[0].text.as_deref(), Some("Thanks for the help "));
+        assert_eq!(content[1].node_type, "emoji");
+        let attrs = content[1].attrs.as_ref().unwrap();
+        assert_eq!(attrs["shortName"], ":slightly_smiling_face::bow:");
+        assert_eq!(attrs["id"], "");
+        assert_eq!(attrs["text"], "");
+    }
+
+    #[test]
+    fn triple_combined_emoji_shortname_round_trips_as_single_node() {
+        // Three-part combined shortName must also survive round-trip.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"emoji","attrs":{"shortName":":a::b::c:","id":"x","text":""}}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let content = round_tripped.content[0].content.as_ref().unwrap();
+
+        assert_eq!(content.len(), 1, "should be single emoji: {content:?}");
+        assert_eq!(content[0].node_type, "emoji");
+        let attrs = content[0].attrs.as_ref().unwrap();
+        assert_eq!(attrs["shortName"], ":a::b::c:");
+        assert_eq!(attrs["id"], "x");
+    }
+
+    #[test]
+    fn consecutive_emojis_remain_separate_nodes() {
+        // Two independent emoji nodes (each with their own directive) must
+        // remain two separate nodes — the combined-chain logic must not
+        // swallow the second emoji.
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
+          {"type":"emoji","attrs":{"shortName":":fire:","id":"1f525","text":"🔥"}},
+          {"type":"emoji","attrs":{"shortName":":water:","id":"1f4a7","text":"💧"}}
+        ]}]}"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let content = round_tripped.content[0].content.as_ref().unwrap();
+
+        assert_eq!(content.len(), 2, "should be two emoji nodes: {content:?}");
+        assert_eq!(content[0].node_type, "emoji");
+        assert_eq!(content[0].attrs.as_ref().unwrap()["shortName"], ":fire:");
+        assert_eq!(content[1].node_type, "emoji");
+        assert_eq!(content[1].attrs.as_ref().unwrap()["shortName"], ":water:");
+    }
+
+    #[test]
+    fn adjacent_shortcodes_without_directive_parse_as_two_emojis() {
+        // Raw markdown with two adjacent shortcodes and no directive should
+        // still parse as two separate emoji nodes.
+        let md = ":fire::water:";
+        let doc = markdown_to_adf(md).unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+
+        assert_eq!(content.len(), 2, "should be two emojis: {content:?}");
+        assert_eq!(content[0].attrs.as_ref().unwrap()["shortName"], ":fire:");
+        assert_eq!(content[1].attrs.as_ref().unwrap()["shortName"], ":water:");
+    }
+
+    #[test]
+    fn combined_emoji_shortname_preserves_local_id() {
+        // The directive's localId should be preserved when the chain is
+        // collapsed into a single emoji node.
+        let md = r#":a::b:{shortName=":a::b:" id="x" text="y" localId="abc"}"#;
+        let doc = markdown_to_adf(md).unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+
+        assert_eq!(content.len(), 1, "should be single emoji: {content:?}");
+        let attrs = content[0].attrs.as_ref().unwrap();
+        assert_eq!(attrs["shortName"], ":a::b:");
+        assert_eq!(attrs["id"], "x");
+        assert_eq!(attrs["text"], "y");
+        assert_eq!(attrs["localId"], "abc");
     }
 
     #[test]
