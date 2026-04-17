@@ -1316,9 +1316,23 @@ fn is_list_start(line: &str) -> bool {
 /// closing position) by a non-space character.  Lone asterisks that cannot
 /// form a delimiter pair are left untouched.
 fn escape_emphasis_markers(text: &str) -> String {
+    escape_emphasis_with(text, false)
+}
+
+/// Variant of [`escape_emphasis_markers`] that also escapes underscores.
+///
+/// Must be used whenever the rendered markdown wraps this text in an `_...._`
+/// em delimiter, because an unescaped `_` in the content would otherwise close
+/// the delimiter prematurely (e.g. `_foo _bar_ baz_` parses as em("foo ") + "bar"
+/// + em("baz"), not em("foo _bar_ baz") as intended).
+fn escape_emphasis_markers_with_underscore(text: &str) -> String {
+    escape_emphasis_with(text, true)
+}
+
+fn escape_emphasis_with(text: &str, escape_underscore: bool) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
-        if ch == '*' {
+        if ch == '*' || (escape_underscore && ch == '_') {
             out.push('\\');
         }
         out.push(ch);
@@ -4167,310 +4181,305 @@ fn render_non_text_inline_body(
 
 /// Renders text with ADF marks applied as markdown syntax.
 ///
-/// Mark ordering is preserved by checking the position of the `link` mark
-/// relative to formatting marks. Formatting marks that appear before `link`
-/// in the marks array are rendered as outer wrappers (e.g., `**[text](url)**`),
-/// while those after `link` are rendered inside the link (e.g., `[**text**](url)`).
+/// Mark ordering is preserved by walking the marks array in order and emitting
+/// one wrapper per mark (outermost first, innermost last).  The resulting
+/// markdown round-trips back to the original mark sequence because the parser
+/// reconstructs marks outside-in from the nested delimiter structure.
+///
+/// When both `strong` and `em` are present, em is rendered with `_` instead of
+/// `*` to avoid ambiguity (e.g., `_**text**_` rather than `***text***`).  The
+/// single exception is `[strong, em]` (exactly those two marks in that order),
+/// which is rendered as `***text***` to preserve the familiar compact form;
+/// the parser's triple-delimiter rule round-trips it back to `[strong, em]`.
 fn render_marked_text(text: &str, marks: &[AdfMark], output: &mut String) {
-    let link_pos = marks.iter().position(|m| m.mark_type == "link");
-    let has_link = link_pos.map(|lp| &marks[lp]);
-    let has_strong = marks.iter().any(|m| m.mark_type == "strong");
-    let has_em = marks.iter().any(|m| m.mark_type == "em");
-    let has_code = marks.iter().any(|m| m.mark_type == "code");
-    let has_strike = marks.iter().any(|m| m.mark_type == "strike");
-
-    if has_code {
-        // Code marks override other formatting in markdown.
-        // However, annotation marks must still be preserved via bracketed-span syntax.
-        let annotations: Vec<&AdfMark> = marks
-            .iter()
-            .filter(|m| m.mark_type == "annotation")
-            .collect();
-
-        let mut code_str = String::new();
-        if let Some(link_mark) = has_link {
-            let href = link_href(link_mark);
-            code_str.push('[');
-            code_str.push('`');
-            code_str.push_str(text);
-            code_str.push('`');
-            code_str.push_str("](");
-            code_str.push_str(href);
-            code_str.push(')');
-        } else {
-            code_str.push('`');
-            code_str.push_str(text);
-            code_str.push('`');
-        }
-
-        if annotations.is_empty() {
-            output.push_str(&code_str);
-        } else {
-            let mut attr_parts = Vec::new();
-            for ann in &annotations {
-                if let Some(ref attrs) = ann.attrs {
-                    if let Some(id) = attrs.get("id").and_then(serde_json::Value::as_str) {
-                        let escaped = id.replace('\\', "\\\\").replace('"', "\\\"");
-                        attr_parts.push(format!("annotation-id=\"{escaped}\""));
-                    }
-                    if let Some(at) = attrs
-                        .get("annotationType")
-                        .and_then(serde_json::Value::as_str)
-                    {
-                        attr_parts.push(format!("annotation-type={at}"));
-                    }
-                }
-            }
-            output.push('[');
-            output.push_str(&code_str);
-            output.push_str("]{");
-            output.push_str(&attr_parts.join(" "));
-            output.push('}');
-        }
+    if marks.iter().any(|m| m.mark_type == "code") {
+        render_code_marked_text(text, marks, output);
         return;
     }
 
-    // Helper: check if a formatting mark appears before the link mark.
-    let is_before_link = |mark_type: &str| -> bool {
-        if let Some(lp) = link_pos {
-            marks[..lp].iter().any(|m| m.mark_type == mark_type)
-        } else {
-            false
-        }
+    let has_link = marks.iter().any(|m| m.mark_type == "link");
+    let has_strong = marks.iter().any(|m| m.mark_type == "strong");
+    let has_em = marks.iter().any(|m| m.mark_type == "em");
+
+    // Compact form for the common [strong, em] case: ***text***.  em is
+    // rendered with `*` here (as part of the `***` triple delimiter), so
+    // underscores in the content don't need escaping.
+    if marks.len() == 2 && marks[0].mark_type == "strong" && marks[1].mark_type == "em" {
+        let escaped = escape_emphasis_markers(text);
+        let escaped = escape_emoji_shortcodes(&escaped);
+        let escaped = escape_backticks(&escaped);
+        let escaped = escape_bare_urls(&escaped);
+        output.push_str("***");
+        output.push_str(&escaped);
+        output.push_str("***");
+        return;
+    }
+
+    // When both strong and em are present (in any order), em uses `_` instead
+    // of `*` to avoid the `***` triple-delimiter ambiguity.  Otherwise em uses
+    // `*`, which sidesteps intraword-underscore pitfalls for plain em text.
+    let em_delim = if has_strong && has_em { "_" } else { "*" };
+
+    // Text must also escape `_` when em renders as `_..._` — otherwise any
+    // underscore in the content would close the emphasis span early.
+    let escaped = if em_delim == "_" {
+        escape_emphasis_markers_with_underscore(text)
+    } else {
+        escape_emphasis_markers(text)
     };
-
-    // Partition formatting marks into outer (before link) and inner (after link / no link).
-    let mut outer_strike = has_strike && is_before_link("strike");
-    let mut outer_strong = has_strong && is_before_link("strong");
-    let mut outer_em = has_em && is_before_link("em");
-    let inner_strike = has_strike && !outer_strike;
-    let inner_strong = has_strong && !outer_strong;
-    let inner_em = has_em && !outer_em;
-
-    // Build the innermost formatted text.
-    let mut inner = String::new();
-    if inner_strike {
-        inner.push_str("~~");
-    }
-    if inner_strong {
-        inner.push_str("**");
-    }
-    if inner_em {
-        inner.push('*');
-    }
-    let escaped = escape_emphasis_markers(text);
     let escaped = escape_emoji_shortcodes(&escaped);
     let escaped = escape_backticks(&escaped);
-    let escaped = if has_link.is_some() {
+    let escaped = if has_link {
         escape_link_brackets(&escaped)
     } else {
         escape_bare_urls(&escaped)
     };
-    inner.push_str(&escaped);
-    if inner_em {
-        inner.push('*');
-    }
-    if inner_strong {
-        inner.push_str("**");
-    }
-    if inner_strike {
-        inner.push_str("~~");
+
+    // Collect (open, close) wrappers in mark order, outermost first.  Consecutive
+    // span-attr or bracketed-span marks that happen to be in the parser's
+    // canonical order (so the merged wrapper parses back to the same mark
+    // sequence) are merged into a single wrapper; otherwise each mark gets its
+    // own nested wrapper so that the mark ordering survives the round-trip.
+    let mut wrappers: Vec<(String, String)> = Vec::new();
+    let mut i = 0;
+    while i < marks.len() {
+        match marks[i].mark_type.as_str() {
+            "em" => {
+                wrappers.push((em_delim.to_string(), em_delim.to_string()));
+                i += 1;
+            }
+            "strong" => {
+                wrappers.push(("**".to_string(), "**".to_string()));
+                i += 1;
+            }
+            "strike" => {
+                wrappers.push(("~~".to_string(), "~~".to_string()));
+                i += 1;
+            }
+            "link" => {
+                let href = link_href(&marks[i]);
+                wrappers.push(("[".to_string(), format!("]({href})")));
+                i += 1;
+            }
+            "textColor" | "backgroundColor" | "subsup" => {
+                let start = i;
+                while i < marks.len() && is_span_attr_mark(&marks[i].mark_type) {
+                    i += 1;
+                }
+                emit_span_attr_wrappers(&marks[start..i], &mut wrappers);
+            }
+            "underline" | "annotation" => {
+                let start = i;
+                while i < marks.len() && is_bracketed_span_mark(&marks[i].mark_type) {
+                    i += 1;
+                }
+                emit_bracketed_wrappers(&marks[start..i], &mut wrappers);
+            }
+            _ => {
+                i += 1;
+            }
+        }
     }
 
-    // Check for span-style marks (textColor, backgroundColor, subsup)
-    let text_color = marks.iter().find(|m| m.mark_type == "textColor");
-    let bg_color = marks.iter().find(|m| m.mark_type == "backgroundColor");
-    let subsup = marks.iter().find(|m| m.mark_type == "subsup");
-    let has_underline = marks.iter().any(|m| m.mark_type == "underline");
+    // Apply wrappers from innermost (last) to outermost (first).
+    let mut result = escaped;
+    for (open, close) in wrappers.iter().rev() {
+        result.insert_str(0, open);
+        result.push_str(close);
+    }
+    output.push_str(&result);
+}
+
+/// Renders a text node with a `code` mark.  Code content is emitted verbatim
+/// inside backticks, optionally wrapped by a link and/or bracketed-span
+/// carrying annotation marks — no other inline formatting marks are applied
+/// because markdown code spans do not support nested emphasis.
+fn render_code_marked_text(text: &str, marks: &[AdfMark], output: &mut String) {
+    let link_mark = marks.iter().find(|m| m.mark_type == "link");
     let annotations: Vec<&AdfMark> = marks
         .iter()
         .filter(|m| m.mark_type == "annotation")
         .collect();
 
-    let needs_span = text_color.is_some() || bg_color.is_some() || subsup.is_some();
+    let mut code_str = String::new();
+    if let Some(link_mark) = link_mark {
+        let href = link_href(link_mark);
+        code_str.push('[');
+        code_str.push('`');
+        code_str.push_str(text);
+        code_str.push('`');
+        code_str.push_str("](");
+        code_str.push_str(href);
+        code_str.push(')');
+    } else {
+        code_str.push('`');
+        code_str.push_str(text);
+        code_str.push('`');
+    }
 
-    // Build the core content (with span/bracketed/link wrapping).
-    let mut core = String::new();
-    if needs_span {
-        // Wrap in :span[text]{attrs} syntax
-        let mut attr_parts = Vec::new();
-        if let Some(m) = text_color {
-            if let Some(c) = m
+    if annotations.is_empty() {
+        output.push_str(&code_str);
+        return;
+    }
+
+    let mut attr_parts = Vec::new();
+    for ann in &annotations {
+        collect_bracketed_attr(ann, &mut attr_parts);
+    }
+    output.push('[');
+    output.push_str(&code_str);
+    output.push_str("]{");
+    output.push_str(&attr_parts.join(" "));
+    output.push('}');
+}
+
+/// Collects `:span` attribute fragments (color, bg, sub/sup) for a single mark.
+fn collect_span_attr(mark: &AdfMark, attrs: &mut Vec<String>) {
+    match mark.mark_type.as_str() {
+        "textColor" => {
+            if let Some(c) = mark
                 .attrs
                 .as_ref()
                 .and_then(|a| a.get("color"))
                 .and_then(serde_json::Value::as_str)
             {
-                attr_parts.push(format!("color={c}"));
+                attrs.push(format!("color={c}"));
             }
         }
-        if let Some(m) = bg_color {
-            if let Some(c) = m
+        "backgroundColor" => {
+            if let Some(c) = mark
                 .attrs
                 .as_ref()
                 .and_then(|a| a.get("color"))
                 .and_then(serde_json::Value::as_str)
             {
-                attr_parts.push(format!("bg={c}"));
+                attrs.push(format!("bg={c}"));
             }
         }
-        if let Some(m) = subsup {
-            if let Some(kind) = m
+        "subsup" => {
+            if let Some(kind) = mark
                 .attrs
                 .as_ref()
                 .and_then(|a| a.get("type"))
                 .and_then(serde_json::Value::as_str)
             {
-                attr_parts.push(kind.to_string());
+                attrs.push(kind.to_string());
             }
         }
-        let span = format!(":span[{inner}]{{{}}}", attr_parts.join(" "));
-        if let Some(link_mark) = has_link {
-            let href = link_href(link_mark);
-            if is_before_link("textColor")
-                || is_before_link("backgroundColor")
-                || is_before_link("subsup")
-            {
-                // Span wraps the link: :span[[text](url)]{attrs}
-                let link_part = format!("[{inner}]({href})");
-                core = format!(":span[{link_part}]{{{}}}", attr_parts.join(" "));
-            } else {
-                // Link wraps the span: [:span[text]{attrs}](url)
-                core.push('[');
-                core.push_str(&span);
-                core.push_str("](");
-                core.push_str(href);
-                core.push(')');
-            }
-        } else {
-            core.push_str(&span);
-        }
-    } else if has_underline || !annotations.is_empty() {
-        let mut attr_parts = Vec::new();
-        if has_underline {
-            attr_parts.push("underline".to_string());
-        }
-        for ann in &annotations {
-            if let Some(ref attrs) = ann.attrs {
-                if let Some(id) = attrs.get("id").and_then(serde_json::Value::as_str) {
+        _ => {}
+    }
+}
+
+/// Collects bracketed-span attribute fragments for an `underline` or `annotation` mark.
+fn collect_bracketed_attr(mark: &AdfMark, attrs: &mut Vec<String>) {
+    match mark.mark_type.as_str() {
+        "underline" => attrs.push("underline".to_string()),
+        "annotation" => {
+            if let Some(ref a) = mark.attrs {
+                if let Some(id) = a.get("id").and_then(serde_json::Value::as_str) {
                     let escaped = id.replace('\\', "\\\\").replace('"', "\\\"");
-                    attr_parts.push(format!("annotation-id=\"{escaped}\""));
+                    attrs.push(format!("annotation-id=\"{escaped}\""));
                 }
-                if let Some(at) = attrs
-                    .get("annotationType")
-                    .and_then(serde_json::Value::as_str)
-                {
-                    attr_parts.push(format!("annotation-type={at}"));
+                if let Some(at) = a.get("annotationType").and_then(serde_json::Value::as_str) {
+                    attrs.push(format!("annotation-type={at}"));
                 }
             }
         }
-        let bracketed = format!("[{inner}]{{{}}}", attr_parts.join(" "));
-        if let Some(link_mark) = has_link {
-            let href = link_href(link_mark);
-            if is_before_link("underline")
-                || link_pos
-                    .is_some_and(|lp| marks[..lp].iter().any(|m| m.mark_type == "annotation"))
-            {
-                // Bracketed span wraps the link: [[text](url)]{underline}
-                // Outer formatting marks that appear after underline in the
-                // original mark array must go inside the brackets so that
-                // round-trip parsing restores the original mark order.
-                let underline_pos = marks.iter().position(|m| m.mark_type == "underline");
-                let bracket_inner_strike = outer_strike
-                    && underline_pos.is_some_and(|up| {
-                        marks
-                            .iter()
-                            .position(|m| m.mark_type == "strike")
-                            .is_some_and(|sp| sp > up)
-                    });
-                let bracket_inner_strong = outer_strong
-                    && underline_pos.is_some_and(|up| {
-                        marks
-                            .iter()
-                            .position(|m| m.mark_type == "strong")
-                            .is_some_and(|sp| sp > up)
-                    });
-                let bracket_inner_em = outer_em
-                    && underline_pos.is_some_and(|up| {
-                        marks
-                            .iter()
-                            .position(|m| m.mark_type == "em")
-                            .is_some_and(|sp| sp > up)
-                    });
+        _ => {}
+    }
+}
 
-                let mut bracket_content = String::new();
-                if bracket_inner_strike {
-                    bracket_content.push_str("~~");
-                }
-                if bracket_inner_strong {
-                    bracket_content.push_str("**");
-                }
-                if bracket_inner_em {
-                    bracket_content.push('*');
-                }
-                bracket_content.push_str(&format!("[{inner}]({href})"));
-                if bracket_inner_em {
-                    bracket_content.push('*');
-                }
-                if bracket_inner_strong {
-                    bracket_content.push_str("**");
-                }
-                if bracket_inner_strike {
-                    bracket_content.push_str("~~");
-                }
+fn is_span_attr_mark(mark_type: &str) -> bool {
+    matches!(mark_type, "textColor" | "backgroundColor" | "subsup")
+}
 
-                if bracket_inner_strike {
-                    outer_strike = false;
-                }
-                if bracket_inner_strong {
-                    outer_strong = false;
-                }
-                if bracket_inner_em {
-                    outer_em = false;
-                }
+fn is_bracketed_span_mark(mark_type: &str) -> bool {
+    matches!(mark_type, "underline" | "annotation")
+}
 
-                core = format!("[{bracket_content}]{{{}}}", attr_parts.join(" "));
-            } else {
-                // Link wraps the bracketed span: [[text]{underline}](url)
-                core.push('[');
-                core.push_str(&bracketed);
-                core.push_str("](");
-                core.push_str(href);
-                core.push(')');
-            }
-        } else {
-            core.push_str(&bracketed);
+/// Canonical ordering for span-attr marks, matching the order in which the
+/// `:span` directive parser reads attributes (`color`, then `bg`, then
+/// `sub`/`sup`).
+fn span_attr_order(mark_type: &str) -> u8 {
+    match mark_type {
+        "textColor" => 0,
+        "backgroundColor" => 1,
+        "subsup" => 2,
+        _ => u8::MAX,
+    }
+}
+
+/// Returns `true` if the run of span-attr marks is in the canonical order the
+/// `:span` parser would produce.  A canonical run can be merged into one
+/// `:span[...]{...}` wrapper; a non-canonical run must be split into one
+/// nested wrapper per mark so the ordering survives the round-trip.
+fn span_run_is_canonical(run: &[AdfMark]) -> bool {
+    let mut prev = 0;
+    for m in run {
+        let order = span_attr_order(&m.mark_type);
+        if order == u8::MAX || order < prev {
+            return false;
         }
-    } else if let Some(link_mark) = has_link {
-        let href = link_href(link_mark);
-        core.push('[');
-        core.push_str(&inner);
-        core.push_str("](");
-        core.push_str(href);
-        core.push(')');
-    } else {
-        core.push_str(&inner);
+        prev = order;
     }
+    true
+}
 
-    // Apply outer formatting wrappers (marks that appeared before link).
-    if outer_strike {
-        output.push_str("~~");
+/// Returns `true` if the run of `underline`/`annotation` marks is in the
+/// canonical order the bracketed-span parser produces (`underline` first,
+/// followed by annotations).  A canonical run can be merged into one
+/// `[...]{underline annotation-id=...}` wrapper.
+fn bracketed_run_is_canonical(run: &[AdfMark]) -> bool {
+    let mut seen_annotation = false;
+    for m in run {
+        match m.mark_type.as_str() {
+            "underline" => {
+                if seen_annotation {
+                    return false;
+                }
+            }
+            "annotation" => seen_annotation = true,
+            _ => return false,
+        }
     }
-    if outer_strong {
-        output.push_str("**");
+    true
+}
+
+/// Emits one or more `:span[...]{...}` wrappers for a run of span-attr marks.
+/// Canonical-order runs collapse into a single wrapper; non-canonical runs
+/// emit one wrapper per mark so the order round-trips.
+fn emit_span_attr_wrappers(run: &[AdfMark], wrappers: &mut Vec<(String, String)>) {
+    if span_run_is_canonical(run) {
+        let mut attrs = Vec::new();
+        for m in run {
+            collect_span_attr(m, &mut attrs);
+        }
+        wrappers.push((":span[".to_string(), format!("]{{{}}}", attrs.join(" "))));
+        return;
     }
-    if outer_em {
-        output.push('*');
+    for m in run {
+        let mut attrs = Vec::new();
+        collect_span_attr(m, &mut attrs);
+        wrappers.push((":span[".to_string(), format!("]{{{}}}", attrs.join(" "))));
     }
-    output.push_str(&core);
-    if outer_em {
-        output.push('*');
+}
+
+/// Emits one or more `[...]{...}` wrappers for a run of `underline`/`annotation`
+/// marks.  Canonical-order runs collapse into a single wrapper; non-canonical
+/// runs emit one wrapper per mark so the order round-trips.
+fn emit_bracketed_wrappers(run: &[AdfMark], wrappers: &mut Vec<(String, String)>) {
+    if bracketed_run_is_canonical(run) {
+        let mut attrs = Vec::new();
+        for m in run {
+            collect_bracketed_attr(m, &mut attrs);
+        }
+        wrappers.push(("[".to_string(), format!("]{{{}}}", attrs.join(" "))));
+        return;
     }
-    if outer_strong {
-        output.push_str("**");
-    }
-    if outer_strike {
-        output.push_str("~~");
+    for m in run {
+        let mut attrs = Vec::new();
+        collect_bracketed_attr(m, &mut attrs);
+        wrappers.push(("[".to_string(), format!("]{{{}}}", attrs.join(" "))));
     }
 }
 
@@ -9585,7 +9594,7 @@ mod tests {
 
     #[test]
     fn em_strong_round_trip_em_first() {
-        // Issue #401: em+strong with em listed first
+        // Issue #549: [em, strong] mark order must be preserved on round-trip.
         let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[
           {"type":"text","text":"italic and bold","marks":[{"type":"em"},{"type":"strong"}]}
         ]}]}"#;
@@ -9601,10 +9610,327 @@ mod tests {
             .iter()
             .map(|m| m.mark_type.as_str())
             .collect();
-        assert!(
-            mark_types.contains(&"strong") && mark_types.contains(&"em"),
-            "both strong and em marks should be present, got: {mark_types:?}"
+        assert_eq!(
+            mark_types,
+            vec!["em", "strong"],
+            "mark order [em, strong] should be preserved, got: {mark_types:?}"
         );
+    }
+
+    /// Round-trips an inline text node with the given marks through ADF → JFM → ADF
+    /// and asserts the resulting mark types match `expected`.
+    fn assert_mark_order_round_trip(marks: Vec<AdfMark>, expected: &[&str]) {
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text_with_marks(
+                "text", marks,
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_ref()
+            .expect("round-tripped node should have marks")
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(
+            mark_types, expected,
+            "marks should round-trip in order via {md:?}"
+        );
+    }
+
+    #[test]
+    fn round_trip_em_strong_mark_order() {
+        // Issue #549: em + strong in either order must round-trip.
+        assert_mark_order_round_trip(vec![AdfMark::em(), AdfMark::strong()], &["em", "strong"]);
+        assert_mark_order_round_trip(vec![AdfMark::strong(), AdfMark::em()], &["strong", "em"]);
+    }
+
+    #[test]
+    fn round_trip_strong_underline_mark_order() {
+        // Issue #549: strong + underline in either order must round-trip.
+        assert_mark_order_round_trip(
+            vec![AdfMark::strong(), AdfMark::underline()],
+            &["strong", "underline"],
+        );
+        assert_mark_order_round_trip(
+            vec![AdfMark::underline(), AdfMark::strong()],
+            &["underline", "strong"],
+        );
+    }
+
+    #[test]
+    fn round_trip_em_underline_mark_order() {
+        assert_mark_order_round_trip(
+            vec![AdfMark::em(), AdfMark::underline()],
+            &["em", "underline"],
+        );
+        assert_mark_order_round_trip(
+            vec![AdfMark::underline(), AdfMark::em()],
+            &["underline", "em"],
+        );
+    }
+
+    #[test]
+    fn round_trip_strike_strong_em_permutations() {
+        // Each permutation of {strike, strong, em} must round-trip the mark order
+        // exactly, because the Atlassian ADF spec does not define a canonical mark
+        // ordering and we preserve whatever ordering Jira delivered.
+        assert_mark_order_round_trip(
+            vec![AdfMark::strike(), AdfMark::strong(), AdfMark::em()],
+            &["strike", "strong", "em"],
+        );
+        assert_mark_order_round_trip(
+            vec![AdfMark::strike(), AdfMark::em(), AdfMark::strong()],
+            &["strike", "em", "strong"],
+        );
+        assert_mark_order_round_trip(
+            vec![AdfMark::strong(), AdfMark::strike(), AdfMark::em()],
+            &["strong", "strike", "em"],
+        );
+        assert_mark_order_round_trip(
+            vec![AdfMark::strong(), AdfMark::em(), AdfMark::strike()],
+            &["strong", "em", "strike"],
+        );
+        assert_mark_order_round_trip(
+            vec![AdfMark::em(), AdfMark::strike(), AdfMark::strong()],
+            &["em", "strike", "strong"],
+        );
+        assert_mark_order_round_trip(
+            vec![AdfMark::em(), AdfMark::strong(), AdfMark::strike()],
+            &["em", "strong", "strike"],
+        );
+    }
+
+    #[test]
+    fn round_trip_underline_nested_with_strong_em() {
+        // Underline may sit outside, between, or inside strong/em — each position
+        // must round-trip.
+        assert_mark_order_round_trip(
+            vec![AdfMark::underline(), AdfMark::strong(), AdfMark::em()],
+            &["underline", "strong", "em"],
+        );
+        assert_mark_order_round_trip(
+            vec![AdfMark::strong(), AdfMark::underline(), AdfMark::em()],
+            &["strong", "underline", "em"],
+        );
+        assert_mark_order_round_trip(
+            vec![AdfMark::strong(), AdfMark::em(), AdfMark::underline()],
+            &["strong", "em", "underline"],
+        );
+    }
+
+    #[test]
+    fn round_trip_span_attr_order_preserved() {
+        // Issue #549: the `:span` directive always parses color/bg/subsup
+        // attrs in a fixed order, so non-canonical orderings must be emitted
+        // as nested :span wrappers rather than a single merged wrapper.
+        assert_mark_order_round_trip(
+            vec![
+                AdfMark::background_color("#ffff00"),
+                AdfMark::text_color("#ff0000"),
+            ],
+            &["backgroundColor", "textColor"],
+        );
+        assert_mark_order_round_trip(
+            vec![AdfMark::subsup("sub"), AdfMark::text_color("#ff0000")],
+            &["subsup", "textColor"],
+        );
+        assert_mark_order_round_trip(
+            vec![
+                AdfMark::text_color("#ff0000"),
+                AdfMark::background_color("#ffff00"),
+            ],
+            &["textColor", "backgroundColor"],
+        );
+    }
+
+    #[test]
+    fn round_trip_annotation_before_underline() {
+        // Issue #549: the bracketed-span parser reads `underline` before any
+        // annotation-ids, so `[annotation, underline]` must be emitted as
+        // nested wrappers rather than one merged `[text]{underline annotation-id=X}`.
+        assert_mark_order_round_trip(
+            vec![
+                AdfMark::annotation("ann-1", "inlineComment"),
+                AdfMark::underline(),
+            ],
+            &["annotation", "underline"],
+        );
+        assert_mark_order_round_trip(
+            vec![
+                AdfMark::annotation("ann-1", "inlineComment"),
+                AdfMark::underline(),
+                AdfMark::annotation("ann-2", "inlineComment"),
+            ],
+            &["annotation", "underline", "annotation"],
+        );
+    }
+
+    #[test]
+    fn round_trip_em_content_with_underscores() {
+        // When em renders as `_..._` (to disambiguate from strong), any literal
+        // underscores in the text must be escaped so they don't close the
+        // emphasis span early.  Text like "foo_bar_baz" with [em, strong] must
+        // survive round-trip with the underscores intact.
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text_with_marks(
+                "foo _bar_ baz",
+                vec![AdfMark::em(), AdfMark::strong()],
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        let round_tripped = markdown_to_adf(&md).unwrap();
+        let node = &round_tripped.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(node.text.as_deref(), Some("foo _bar_ baz"));
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(mark_types, vec!["em", "strong"]);
+    }
+
+    #[test]
+    fn round_trip_link_nested_with_formatting_marks() {
+        // Link may sit at any position in the marks array relative to em,
+        // strong, strike, and underline — each position must round-trip.
+        assert_mark_order_round_trip(
+            vec![
+                AdfMark::link("https://example.com"),
+                AdfMark::strong(),
+                AdfMark::em(),
+            ],
+            &["link", "strong", "em"],
+        );
+        assert_mark_order_round_trip(
+            vec![
+                AdfMark::em(),
+                AdfMark::strong(),
+                AdfMark::link("https://example.com"),
+            ],
+            &["em", "strong", "link"],
+        );
+        assert_mark_order_round_trip(
+            vec![
+                AdfMark::underline(),
+                AdfMark::link("https://example.com"),
+                AdfMark::strong(),
+            ],
+            &["underline", "link", "strong"],
+        );
+    }
+
+    /// Builds an `AdfMark` with the given type and no attrs, bypassing the
+    /// usual constructors so we can exercise the defensive branches in the
+    /// render helpers (the constructors always populate `attrs`).
+    fn bare_mark(mark_type: &str) -> AdfMark {
+        AdfMark {
+            mark_type: mark_type.to_string(),
+            attrs: None,
+        }
+    }
+
+    #[test]
+    fn collect_span_attr_handles_missing_attrs() {
+        // `textColor`/`backgroundColor`/`subsup` marks without the expected
+        // `color`/`type` attr must not emit a fragment (the `if let` falls
+        // through without pushing).  This exercises the inner-None branches
+        // that the typed-constructor tests otherwise skip.
+        let mut attrs = Vec::new();
+        collect_span_attr(&bare_mark("textColor"), &mut attrs);
+        collect_span_attr(&bare_mark("backgroundColor"), &mut attrs);
+        collect_span_attr(&bare_mark("subsup"), &mut attrs);
+        collect_span_attr(&bare_mark("link"), &mut attrs);
+        assert!(attrs.is_empty(), "got: {attrs:?}");
+    }
+
+    #[test]
+    fn collect_bracketed_attr_handles_missing_attrs() {
+        // An annotation mark with no attrs map at all must silently produce
+        // no fragments — this covers the outer `if let Some(ref a)` None arm.
+        let mut attrs = Vec::new();
+        collect_bracketed_attr(&bare_mark("annotation"), &mut attrs);
+        collect_bracketed_attr(&bare_mark("strong"), &mut attrs);
+        assert!(attrs.is_empty(), "got: {attrs:?}");
+    }
+
+    #[test]
+    fn collect_bracketed_attr_handles_annotation_without_id() {
+        // An annotation mark with attrs present but missing `id` and
+        // `annotationType` keys still emits nothing — exercises the inner
+        // None branches of each `if let` in the annotation arm.
+        let mark = AdfMark {
+            mark_type: "annotation".to_string(),
+            attrs: Some(serde_json::json!({})),
+        };
+        let mut attrs = Vec::new();
+        collect_bracketed_attr(&mark, &mut attrs);
+        assert!(attrs.is_empty(), "got: {attrs:?}");
+    }
+
+    #[test]
+    fn span_attr_order_rejects_unknown_types() {
+        // `span_attr_order` must classify unknown mark types as the sentinel
+        // value, and `span_run_is_canonical` must reject a run that contains
+        // any such unknown type.
+        assert_eq!(span_attr_order("textColor"), 0);
+        assert_eq!(span_attr_order("backgroundColor"), 1);
+        assert_eq!(span_attr_order("subsup"), 2);
+        assert_eq!(span_attr_order("strong"), u8::MAX);
+        assert!(!span_run_is_canonical(&[bare_mark("strong")]));
+    }
+
+    #[test]
+    fn bracketed_run_rejects_unknown_types() {
+        // `bracketed_run_is_canonical` only accepts `underline` and
+        // `annotation`; any other mark type in the run short-circuits to
+        // `false` so the caller emits nested wrappers.
+        assert!(bracketed_run_is_canonical(&[
+            AdfMark::underline(),
+            AdfMark::annotation("x", "inlineComment")
+        ]));
+        assert!(!bracketed_run_is_canonical(&[
+            AdfMark::annotation("x", "inlineComment"),
+            AdfMark::underline()
+        ]));
+        assert!(!bracketed_run_is_canonical(&[bare_mark("strong")]));
+    }
+
+    #[test]
+    fn render_marked_text_ignores_unknown_mark_types() {
+        // Unknown mark types fall through `render_marked_text`'s `_ =>`
+        // arm and are dropped; the rendered JFM must still produce the
+        // underlying text (and round-trip back to an unmarked text node).
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode::paragraph(vec![AdfNode::text_with_marks(
+                "hello",
+                vec![bare_mark("futureMark"), AdfMark::strong()],
+            )])],
+        };
+        let md = adf_to_markdown(&doc).unwrap();
+        assert_eq!(md.trim(), "**hello**");
+        let rt = markdown_to_adf(&md).unwrap();
+        let node = &rt.content[0].content.as_ref().unwrap()[0];
+        assert_eq!(node.text.as_deref(), Some("hello"));
+        let mark_types: Vec<&str> = node
+            .marks
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mark_type.as_str())
+            .collect();
+        assert_eq!(mark_types, vec!["strong"]);
     }
 
     #[test]
