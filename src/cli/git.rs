@@ -13,7 +13,7 @@ pub use check::CheckCommand;
 pub use create_pr::{CreatePrCommand, PrContent};
 pub use info::InfoCommand;
 pub use twiddle::TwiddleCommand;
-pub use view::ViewCommand;
+pub use view::{run_view, ViewCommand};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
