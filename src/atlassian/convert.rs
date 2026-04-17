@@ -603,7 +603,7 @@ impl<'a> MarkdownParser<'a> {
     fn parse_layout_columns(&self, inner_text: &str) -> Result<Vec<AdfNode>> {
         let mut columns = Vec::new();
         let mut current_column_lines: Vec<String> = Vec::new();
-        let mut current_width: f64 = 50.0;
+        let mut current_width: serde_json::Value = serde_json::json!(50);
         let mut current_dir_attrs: Option<crate::atlassian::attrs::Attrs> = None;
         let mut in_column = false;
         let mut depth: usize = 0;
@@ -619,7 +619,7 @@ impl<'a> MarkdownParser<'a> {
                     if in_column && !current_column_lines.is_empty() {
                         let col_text = current_column_lines.join("\n");
                         let blocks = MarkdownParser::new(&col_text).parse_blocks()?;
-                        let mut col = AdfNode::layout_column(current_width, blocks);
+                        let mut col = AdfNode::layout_column(current_width.clone(), blocks);
                         pass_through_local_id(&current_dir_attrs, &mut col);
                         columns.push(col);
                         current_column_lines.clear();
@@ -628,8 +628,8 @@ impl<'a> MarkdownParser<'a> {
                         .attrs
                         .as_ref()
                         .and_then(|a| a.get("width"))
-                        .and_then(|w| w.parse::<f64>().ok())
-                        .unwrap_or(50.0);
+                        .and_then(parse_numeric_attr)
+                        .unwrap_or_else(|| serde_json::json!(50));
                     current_dir_attrs = col_d.attrs;
                     in_column = true;
                     i += 1;
@@ -649,7 +649,7 @@ impl<'a> MarkdownParser<'a> {
                 // End of column
                 let col_text = current_column_lines.join("\n");
                 let blocks = MarkdownParser::new(&col_text).parse_blocks()?;
-                let mut col = AdfNode::layout_column(current_width, blocks);
+                let mut col = AdfNode::layout_column(current_width.clone(), blocks);
                 pass_through_local_id(&current_dir_attrs, &mut col);
                 columns.push(col);
                 current_column_lines.clear();
@@ -1504,13 +1504,13 @@ fn try_parse_media_single_from_line(line: &str) -> Option<AdfNode> {
                     media_attrs["collection"] = serde_json::Value::String(collection.to_string());
                 }
                 if let Some(height) = attrs.get("height") {
-                    if let Ok(h) = height.parse::<u64>() {
-                        media_attrs["height"] = serde_json::json!(h);
+                    if let Some(h) = parse_numeric_attr(height) {
+                        media_attrs["height"] = h;
                     }
                 }
                 if let Some(width) = attrs.get("width") {
-                    if let Ok(w) = width.parse::<u64>() {
-                        media_attrs["width"] = serde_json::json!(w);
+                    if let Some(w) = parse_numeric_attr(width) {
+                        media_attrs["width"] = w;
                     }
                 }
                 if let Some(alt_text) = alt_opt {
@@ -1524,8 +1524,8 @@ fn try_parse_media_single_from_line(line: &str) -> Option<AdfNode> {
                     ms_attrs["layout"] = serde_json::Value::String(layout.to_string());
                 }
                 if let Some(ms_width) = attrs.get("mediaWidth") {
-                    if let Ok(w) = ms_width.parse::<u64>() {
-                        ms_attrs["width"] = serde_json::json!(w);
+                    if let Some(w) = parse_numeric_attr(ms_width) {
+                        ms_attrs["width"] = w;
                     }
                 }
                 if let Some(wt) = attrs.get("widthType") {
@@ -1566,8 +1566,8 @@ fn try_parse_media_single_from_line(line: &str) -> Option<AdfNode> {
                     node_attrs["layout"] = serde_json::Value::String(layout.to_string());
                 }
                 if let Some(width) = attrs.get("width") {
-                    if let Ok(w) = width.parse::<u64>() {
-                        node_attrs["width"] = serde_json::json!(w);
+                    if let Some(w) = parse_numeric_attr(width) {
+                        node_attrs["width"] = w;
                     }
                 }
                 if let Some(wt) = attrs.get("widthType") {
@@ -2612,6 +2612,43 @@ fn fmt_f64_attr(v: f64) -> String {
     }
 }
 
+/// Parses a numeric attribute value string into a JSON number value that
+/// preserves the original integer/float distinction. Returns `None` if the
+/// string cannot be parsed as a number.
+///
+/// Strings without a `.` or exponent are parsed as integers (so `"800"` stays
+/// `800`, not `800.0`); strings with a decimal point are parsed as floats.
+fn parse_numeric_attr(s: &str) -> Option<serde_json::Value> {
+    if s.contains('.') || s.contains('e') || s.contains('E') {
+        s.parse::<f64>().ok().map(serde_json::Value::from)
+    } else {
+        s.parse::<i64>().ok().map(serde_json::Value::from)
+    }
+}
+
+/// Formats a JSON numeric value as a markdown attribute string, preserving
+/// whether the source was stored as an integer or a float.
+///
+/// Returns `None` if `v` is not a number. Integer values emit as `800`;
+/// floating-point values emit as `800.0` (or `66.66` for non-integer floats),
+/// so that a subsequent [`parse_numeric_attr`] round-trip recovers the same
+/// JSON type.
+fn fmt_numeric_attr(v: &serde_json::Value) -> Option<String> {
+    if let Some(n) = v.as_i64() {
+        return Some(n.to_string());
+    }
+    if let Some(n) = v.as_u64() {
+        return Some(n.to_string());
+    }
+    if let Some(n) = v.as_f64() {
+        if n.fract() == 0.0 && n.is_finite() {
+            return Some(format!("{n:.1}"));
+        }
+        return Some(n.to_string());
+    }
+    None
+}
+
 /// Renders a block-level ADF node to markdown.
 fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) {
     match node.node_type.as_str() {
@@ -2967,13 +3004,13 @@ fn render_block_node(node: &AdfNode, output: &mut String, opts: &RenderOptions) 
             if let Some(ref content) = node.content {
                 for child in content {
                     if child.node_type == "layoutColumn" {
-                        let width = child
+                        let width_str = child
                             .attrs
                             .as_ref()
                             .and_then(|a| a.get("width"))
-                            .and_then(serde_json::Value::as_f64)
-                            .unwrap_or(50.0);
-                        let mut parts = vec![format!("width={width}")];
+                            .and_then(fmt_numeric_attr)
+                            .unwrap_or_else(|| "50".to_string());
+                        let mut parts = vec![format!("width={width_str}")];
                         if let Some(ref attrs) = child.attrs {
                             maybe_push_local_id(attrs, &mut parts, opts);
                         }
@@ -3743,11 +3780,11 @@ fn render_media(
             if let Some(collection) = attrs.get("collection").and_then(serde_json::Value::as_str) {
                 parts.push(format!("collection={collection}"));
             }
-            if let Some(height) = attrs.get("height").and_then(serde_json::Value::as_u64) {
-                parts.push(format!("height={height}"));
+            if let Some(height_str) = attrs.get("height").and_then(fmt_numeric_attr) {
+                parts.push(format!("height={height_str}"));
             }
-            if let Some(width) = attrs.get("width").and_then(serde_json::Value::as_u64) {
-                parts.push(format!("width={width}"));
+            if let Some(width_str) = attrs.get("width").and_then(fmt_numeric_attr) {
+                parts.push(format!("width={width_str}"));
             }
             maybe_push_local_id(attrs, &mut parts, opts);
             // Encode mediaSingle layout/width/widthType if non-default
@@ -3757,8 +3794,8 @@ fn render_media(
                         parts.push(format!("layout={layout}"));
                     }
                 }
-                if let Some(ms_width) = p_attrs.get("width").and_then(serde_json::Value::as_u64) {
-                    parts.push(format!("mediaWidth={ms_width}"));
+                if let Some(ms_width_str) = p_attrs.get("width").and_then(fmt_numeric_attr) {
+                    parts.push(format!("mediaWidth={ms_width_str}"));
                 }
                 if let Some(wt) = p_attrs.get("widthType").and_then(serde_json::Value::as_str) {
                     parts.push(format!("widthType={wt}"));
@@ -3782,14 +3819,14 @@ fn render_media(
                 let mut parts = Vec::new();
                 if let Some(p_attrs) = parent_attrs {
                     let layout = p_attrs.get("layout").and_then(serde_json::Value::as_str);
-                    let width = p_attrs.get("width").and_then(serde_json::Value::as_u64);
+                    let width_str = p_attrs.get("width").and_then(fmt_numeric_attr);
                     let width_type = p_attrs.get("widthType").and_then(serde_json::Value::as_str);
                     if let Some(l) = layout {
                         if l != "center" {
                             parts.push(format!("layout={l}"));
                         }
                     }
-                    if let Some(w) = width {
+                    if let Some(w) = width_str {
                         parts.push(format!("width={w}"));
                     }
                     if let Some(wt) = width_type {
@@ -7382,14 +7419,8 @@ mod tests {
             version: 1,
             doc_type: "doc".to_string(),
             content: vec![AdfNode::layout_section(vec![
-                AdfNode::layout_column(
-                    50.0,
-                    vec![AdfNode::paragraph(vec![AdfNode::text("Left.")])],
-                ),
-                AdfNode::layout_column(
-                    50.0,
-                    vec![AdfNode::paragraph(vec![AdfNode::text("Right.")])],
-                ),
+                AdfNode::layout_column(50, vec![AdfNode::paragraph(vec![AdfNode::text("Left.")])]),
+                AdfNode::layout_column(50, vec![AdfNode::paragraph(vec![AdfNode::text("Right.")])]),
             ])],
         };
         let md = adf_to_markdown(&doc).unwrap();
@@ -7513,6 +7544,391 @@ mod tests {
             "aabb112233cc",
             "flush-last column should preserve localId"
         );
+    }
+
+    /// Issue #555: `layoutColumn` fractional `width` must round-trip byte-for-byte.
+    #[test]
+    fn issue_555_layout_column_fractional_width_roundtrip() {
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "layoutSection",
+                "content": [
+                    {
+                        "type": "layoutColumn",
+                        "attrs": {"width": 66.66},
+                        "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Wide"}]}]
+                    },
+                    {
+                        "type": "layoutColumn",
+                        "attrs": {"width": 33.34},
+                        "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Narrow"}]}]
+                    }
+                ]
+            }]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("width=66.66"), "fractional width in md: {md}");
+        assert!(md.contains("width=33.34"), "fractional width in md: {md}");
+        let rt = markdown_to_adf(&md).unwrap();
+        let cols = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(cols[0].attrs.as_ref().unwrap()["width"], 66.66);
+        assert_eq!(cols[1].attrs.as_ref().unwrap()["width"], 33.34);
+    }
+
+    /// Issue #555: `layoutColumn` 5/6 widths (`83.33`) round-trip without precision loss.
+    #[test]
+    fn issue_555_layout_column_five_sixths_width_roundtrip() {
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "layoutSection",
+                "content": [
+                    {
+                        "type": "layoutColumn",
+                        "attrs": {"width": 83.33},
+                        "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Wide"}]}]
+                    },
+                    {
+                        "type": "layoutColumn",
+                        "attrs": {"width": 16.67},
+                        "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Narrow"}]}]
+                    }
+                ]
+            }]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let cols = rt.content[0].content.as_ref().unwrap();
+        assert_eq!(cols[0].attrs.as_ref().unwrap()["width"], 83.33);
+        assert_eq!(cols[1].attrs.as_ref().unwrap()["width"], 16.67);
+    }
+
+    /// Issue #555: `layoutColumn` integer widths must NOT be coerced to floats on round-trip.
+    #[test]
+    fn issue_555_layout_column_integer_width_preserved() {
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "layoutSection",
+                "content": [
+                    {
+                        "type": "layoutColumn",
+                        "attrs": {"width": 50},
+                        "content": [{"type": "paragraph", "content": [{"type": "text", "text": "A"}]}]
+                    },
+                    {
+                        "type": "layoutColumn",
+                        "attrs": {"width": 50},
+                        "content": [{"type": "paragraph", "content": [{"type": "text", "text": "B"}]}]
+                    }
+                ]
+            }]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("width=50") && !md.contains("width=50."),
+            "integer width should render without decimal: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let cols = rt.content[0].content.as_ref().unwrap();
+        let w0 = &cols[0].attrs.as_ref().unwrap()["width"];
+        assert!(
+            w0.is_i64() || w0.is_u64(),
+            "width should remain a JSON integer, got: {w0}"
+        );
+        assert_eq!(w0.as_i64(), Some(50));
+    }
+
+    /// Issue #555: `mediaSingle` integer `width` must NOT be coerced to a float on round-trip.
+    #[test]
+    fn issue_555_media_single_integer_width_preserved() {
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "mediaSingle",
+                "attrs": {"layout": "center", "width": 800},
+                "content": [
+                    {"type": "media", "attrs": {"type": "external", "url": "https://example.com/image.png"}}
+                ]
+            }]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("width=800") && !md.contains("width=800."),
+            "integer width should render without decimal: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let ms_attrs = rt.content[0].attrs.as_ref().unwrap();
+        let w = &ms_attrs["width"];
+        assert!(
+            w.is_i64() || w.is_u64(),
+            "mediaSingle width should remain JSON integer, got: {w}"
+        );
+        assert_eq!(w.as_i64(), Some(800));
+    }
+
+    /// Issue #555 (follow-up): fractional `mediaSingle` width (e.g. `66.5`, a
+    /// percentage-based size common in Jira layouts) must survive `from-adf`
+    /// instead of being silently dropped.
+    #[test]
+    fn issue_555_media_single_fractional_width_preserved() {
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "mediaSingle",
+                "attrs": {"layout": "center", "width": 66.5},
+                "content": [
+                    {"type": "media", "attrs": {"type": "external", "url": "https://example.com/diagram.png"}}
+                ]
+            }]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("width=66.5"),
+            "fractional width must appear in JFM: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let ms_attrs = rt.content[0].attrs.as_ref().unwrap();
+        assert_eq!(ms_attrs["width"], 66.5);
+    }
+
+    /// Issue #555: `mediaSingle` float `width` must not be dropped during ADF→JFM→ADF.
+    #[test]
+    fn issue_555_media_single_float_width_preserved() {
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "mediaSingle",
+                "attrs": {"layout": "center", "width": 800.0},
+                "content": [
+                    {"type": "media", "attrs": {"type": "external", "url": "https://example.com/image.png"}}
+                ]
+            }]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(
+            md.contains("width=800.0"),
+            "float width should render with decimal: {md}"
+        );
+        let rt = markdown_to_adf(&md).unwrap();
+        let ms_attrs = rt.content[0].attrs.as_ref().unwrap();
+        let w = &ms_attrs["width"];
+        assert!(
+            w.is_f64(),
+            "mediaSingle float width should stay a JSON float, got: {w}"
+        );
+        assert_eq!(w.as_f64(), Some(800.0));
+    }
+
+    /// Issue #555: `mediaSingle` with `layout=wide` and integer width must round-trip.
+    #[test]
+    fn issue_555_media_single_wide_layout_integer_width_roundtrip() {
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "mediaSingle",
+                "attrs": {"layout": "wide", "width": 1420},
+                "content": [
+                    {"type": "media", "attrs": {"type": "external", "url": "https://ex.com/x.png"}}
+                ]
+            }]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let ms_attrs = rt.content[0].attrs.as_ref().unwrap();
+        assert_eq!(ms_attrs["layout"], "wide");
+        let w = &ms_attrs["width"];
+        assert!(
+            w.is_i64() || w.is_u64(),
+            "mediaSingle width should remain JSON integer, got: {w}"
+        );
+        assert_eq!(w.as_i64(), Some(1420));
+    }
+
+    /// Issue #555: Confluence file-attachment `mediaSingle` with integer `mediaWidth`
+    /// must round-trip without float coercion.
+    #[test]
+    fn issue_555_file_media_single_integer_width_preserved() {
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "mediaSingle",
+                "attrs": {"layout": "wide", "width": 1420},
+                "content": [
+                    {"type": "media", "attrs": {"id": "abc-123", "type": "file", "collection": "col-1", "width": 1200, "height": 800}}
+                ]
+            }]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        let rt = markdown_to_adf(&md).unwrap();
+        let ms_attrs = rt.content[0].attrs.as_ref().unwrap();
+        let ms_w = &ms_attrs["width"];
+        assert!(ms_w.is_i64() || ms_w.is_u64(), "ms width: {ms_w}");
+        assert_eq!(ms_w.as_i64(), Some(1420));
+        let media = &rt.content[0].content.as_ref().unwrap()[0];
+        let media_attrs = media.attrs.as_ref().unwrap();
+        let mw = &media_attrs["width"];
+        assert!(mw.is_i64() || mw.is_u64(), "media width: {mw}");
+        assert_eq!(mw.as_i64(), Some(1200));
+        let mh = &media_attrs["height"];
+        assert!(mh.is_i64() || mh.is_u64(), "media height: {mh}");
+        assert_eq!(mh.as_i64(), Some(800));
+    }
+
+    /// Issue #555: `fmt_numeric_attr` preserves the original integer/float JSON type.
+    #[test]
+    fn issue_555_fmt_numeric_attr_preserves_type() {
+        assert_eq!(
+            fmt_numeric_attr(&serde_json::json!(50)).as_deref(),
+            Some("50")
+        );
+        assert_eq!(
+            fmt_numeric_attr(&serde_json::json!(50.0)).as_deref(),
+            Some("50.0")
+        );
+        assert_eq!(
+            fmt_numeric_attr(&serde_json::json!(66.66)).as_deref(),
+            Some("66.66")
+        );
+        assert_eq!(
+            fmt_numeric_attr(&serde_json::json!(-5)).as_deref(),
+            Some("-5")
+        );
+        assert_eq!(fmt_numeric_attr(&serde_json::json!("not a number")), None);
+        // u64 values above i64::MAX exercise the u64-only branch.
+        let big = serde_json::Value::Number(serde_json::Number::from(u64::MAX));
+        assert_eq!(
+            fmt_numeric_attr(&big).as_deref(),
+            Some("18446744073709551615")
+        );
+        // Null is not a number.
+        assert_eq!(fmt_numeric_attr(&serde_json::Value::Null), None);
+    }
+
+    /// Issue #555: `parse_numeric_attr` distinguishes integer vs float strings.
+    #[test]
+    fn issue_555_parse_numeric_attr_detects_type() {
+        let v = parse_numeric_attr("800").unwrap();
+        assert!(v.is_i64() || v.is_u64(), "'800' should parse as integer");
+        assert_eq!(v.as_i64(), Some(800));
+
+        let v = parse_numeric_attr("800.0").unwrap();
+        assert!(v.is_f64(), "'800.0' should parse as float");
+        assert_eq!(v.as_f64(), Some(800.0));
+
+        let v = parse_numeric_attr("66.66").unwrap();
+        assert!(v.is_f64());
+        assert_eq!(v.as_f64(), Some(66.66));
+
+        // Scientific notation is treated as float (matches JSON semantics).
+        let v = parse_numeric_attr("1e2").unwrap();
+        assert!(v.is_f64());
+        assert_eq!(v.as_f64(), Some(100.0));
+        let v = parse_numeric_attr("1E2").unwrap();
+        assert!(v.is_f64());
+        assert_eq!(v.as_f64(), Some(100.0));
+
+        // Negative integer.
+        let v = parse_numeric_attr("-42").unwrap();
+        assert!(v.is_i64());
+        assert_eq!(v.as_i64(), Some(-42));
+
+        assert!(parse_numeric_attr("not-a-number").is_none());
+        assert!(parse_numeric_attr("").is_none());
+        assert!(parse_numeric_attr("1.2.3").is_none());
+    }
+
+    /// Issue #555: fractional `mediaSingle` width with non-default `layout=wide`
+    /// must preserve both the layout and the fractional width through round-trip.
+    #[test]
+    fn issue_555_media_single_wide_layout_fractional_width_roundtrip() {
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "mediaSingle",
+                "attrs": {"layout": "wide", "width": 83.33},
+                "content": [
+                    {"type": "media", "attrs": {"type": "external", "url": "https://ex.com/x.png"}}
+                ]
+            }]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("layout=wide"), "layout must appear in md: {md}");
+        assert!(md.contains("width=83.33"), "width must appear in md: {md}");
+        let rt = markdown_to_adf(&md).unwrap();
+        let ms_attrs = rt.content[0].attrs.as_ref().unwrap();
+        assert_eq!(ms_attrs["layout"], "wide");
+        assert_eq!(ms_attrs["width"], 83.33);
+    }
+
+    /// Issue #555: fractional `mediaWidth` on a Confluence file-attachment
+    /// `mediaSingle` must round-trip (exercises the file-branch `mediaWidth`
+    /// render path, which previously used `as_u64` and silently dropped floats).
+    #[test]
+    fn issue_555_file_media_single_fractional_media_width_preserved() {
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "mediaSingle",
+                "attrs": {"layout": "wide", "width": 66.5},
+                "content": [
+                    {"type": "media", "attrs": {"id": "abc", "type": "file", "collection": "c"}}
+                ]
+            }]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("mediaWidth=66.5"), "mediaWidth in md: {md}");
+        let rt = markdown_to_adf(&md).unwrap();
+        let ms_attrs = rt.content[0].attrs.as_ref().unwrap();
+        assert_eq!(ms_attrs["width"], 66.5);
+    }
+
+    /// Issue #555: fractional inner `media` width/height on a file attachment
+    /// must round-trip (exercises the file-branch inner `width`/`height` render
+    /// path, which previously used `as_u64` and silently dropped floats).
+    #[test]
+    fn issue_555_file_media_fractional_inner_dimensions_preserved() {
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "mediaSingle",
+                "attrs": {"layout": "center"},
+                "content": [
+                    {"type": "media", "attrs": {"id": "abc", "type": "file", "collection": "c", "width": 1200.5, "height": 800.25}}
+                ]
+            }]
+        }"#;
+        let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
+        let md = adf_to_markdown(&doc).unwrap();
+        assert!(md.contains("width=1200.5"), "width in md: {md}");
+        assert!(md.contains("height=800.25"), "height in md: {md}");
+        let rt = markdown_to_adf(&md).unwrap();
+        let media = &rt.content[0].content.as_ref().unwrap()[0];
+        let attrs = media.attrs.as_ref().unwrap();
+        assert_eq!(attrs["width"], 1200.5);
+        assert_eq!(attrs["height"], 800.25);
     }
 
     #[test]
