@@ -133,11 +133,14 @@ pub struct ConfluenceSearchResults {
 /// A Confluence user in search results.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfluenceUserSearchResult {
-    /// Account ID (unique identifier).
-    pub account_id: String,
+    /// Account ID (unique identifier). Absent for some user types such as
+    /// app users or deactivated users.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
     /// Display name.
     pub display_name: String,
     /// Email address.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
 }
 
@@ -615,12 +618,20 @@ struct ConfluenceUserSearchResponse {
 
 #[derive(Deserialize)]
 struct ConfluenceUserSearchEntry {
-    #[serde(rename = "accountId")]
-    account_id: String,
-    #[serde(rename = "displayName")]
-    display_name: String,
+    #[serde(default)]
+    user: Option<ConfluenceSearchUser>,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceSearchUser {
+    #[serde(rename = "accountId", default)]
+    account_id: Option<String>,
+    #[serde(rename = "displayName", default)]
+    display_name: Option<String>,
     #[serde(default)]
     email: Option<String>,
+    #[serde(rename = "publicName", default)]
+    public_name: Option<String>,
 }
 
 // ── Agile API response structs ─────────────────────────────────────
@@ -2086,14 +2097,20 @@ mod tests {
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "results": [
                         {
-                            "accountId": "abc123",
-                            "displayName": "Alice Smith",
-                            "email": "alice@example.com"
+                            "user": {
+                                "accountId": "abc123",
+                                "displayName": "Alice Smith",
+                                "email": "alice@example.com"
+                            },
+                            "entityType": "user"
                         },
                         {
-                            "accountId": "def456",
-                            "displayName": "Bob Jones",
-                            "email": "bob@example.com"
+                            "user": {
+                                "accountId": "def456",
+                                "displayName": "Bob Jones",
+                                "email": "bob@example.com"
+                            },
+                            "entityType": "user"
                         }
                     ]
                 })),
@@ -2107,10 +2124,10 @@ mod tests {
 
         assert_eq!(result.total, 2);
         assert_eq!(result.users.len(), 2);
-        assert_eq!(result.users[0].account_id, "abc123");
+        assert_eq!(result.users[0].account_id.as_deref(), Some("abc123"));
         assert_eq!(result.users[0].display_name, "Alice Smith");
         assert_eq!(result.users[0].email.as_deref(), Some("alice@example.com"));
-        assert_eq!(result.users[1].account_id, "def456");
+        assert_eq!(result.users[1].account_id.as_deref(), Some("def456"));
         assert_eq!(result.users[1].display_name, "Bob Jones");
     }
 
@@ -2166,8 +2183,10 @@ mod tests {
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "results": [
                         {
-                            "accountId": "xyz789",
-                            "displayName": "No Email User"
+                            "user": {
+                                "accountId": "xyz789",
+                                "displayName": "No Email User"
+                            }
                         }
                     ]
                 })),
@@ -2187,6 +2206,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_confluence_users_missing_account_id() {
+        // Regression for rust-works/omni-dev#542: some user records (e.g. app
+        // users, deactivated users) return no `accountId`. Such entries must
+        // not fail deserialization.
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/search/user"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {
+                            "user": {
+                                "accountId": "abc123",
+                                "displayName": "Alice Smith",
+                                "email": "alice@example.com"
+                            }
+                        },
+                        {
+                            "user": {
+                                "displayName": "App Bot",
+                                "accountType": "app"
+                            }
+                        }
+                    ]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.search_confluence_users("any", 25).await.unwrap();
+        assert_eq!(result.users.len(), 2);
+        assert_eq!(result.users[0].account_id.as_deref(), Some("abc123"));
+        assert!(result.users[1].account_id.is_none());
+        assert_eq!(result.users[1].display_name, "App Bot");
+    }
+
+    #[tokio::test]
+    async fn search_confluence_users_uses_public_name_when_no_display_name() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/search/user"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {
+                            "user": {
+                                "accountId": "abc123",
+                                "publicName": "alice.smith"
+                            }
+                        }
+                    ]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.search_confluence_users("alice", 25).await.unwrap();
+        assert_eq!(result.users.len(), 1);
+        assert_eq!(result.users[0].display_name, "alice.smith");
+    }
+
+    #[tokio::test]
+    async fn search_confluence_users_skips_entries_without_user() {
+        // Defensive: the search endpoint may return non-user entries if filters
+        // are relaxed server-side; skip them rather than failing.
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/search/user"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {"title": "Not a user", "entityType": "content"},
+                        {
+                            "user": {
+                                "accountId": "abc123",
+                                "displayName": "Alice Smith"
+                            }
+                        }
+                    ]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.search_confluence_users("alice", 25).await.unwrap();
+        assert_eq!(result.users.len(), 1);
+        assert_eq!(result.users[0].account_id.as_deref(), Some("abc123"));
+    }
+
+    #[tokio::test]
     async fn search_confluence_users_pagination() {
         let server = wiremock::MockServer::start().await;
 
@@ -2198,8 +2316,10 @@ mod tests {
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "results": [
                         {
-                            "accountId": "page1",
-                            "displayName": "User One"
+                            "user": {
+                                "accountId": "page1",
+                                "displayName": "User One"
+                            }
                         }
                     ],
                     "_links": {"next": "/wiki/rest/api/search/user?start=1"}
@@ -2217,8 +2337,10 @@ mod tests {
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "results": [
                         {
-                            "accountId": "page2",
-                            "displayName": "User Two"
+                            "user": {
+                                "accountId": "page2",
+                                "displayName": "User Two"
+                            }
                         }
                     ]
                 })),
@@ -2231,8 +2353,8 @@ mod tests {
         let result = client.search_confluence_users("user", 0).await.unwrap();
 
         assert_eq!(result.total, 2);
-        assert_eq!(result.users[0].account_id, "page1");
-        assert_eq!(result.users[1].account_id, "page2");
+        assert_eq!(result.users[0].account_id.as_deref(), Some("page1"));
+        assert_eq!(result.users[1].account_id.as_deref(), Some("page2"));
     }
 
     #[tokio::test]
@@ -5255,10 +5377,14 @@ impl AtlassianClient {
 
             let page_count = resp.results.len() as u32;
             for r in resp.results {
+                let Some(user) = r.user else {
+                    continue;
+                };
+                let display_name = user.display_name.or(user.public_name).unwrap_or_default();
                 all_results.push(ConfluenceUserSearchResult {
-                    account_id: r.account_id,
-                    display_name: r.display_name,
-                    email: r.email,
+                    account_id: user.account_id,
+                    display_name,
+                    email: user.email,
                 });
             }
 

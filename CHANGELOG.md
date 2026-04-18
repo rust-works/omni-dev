@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CI Coverage**: Switched coverage tooling from `cargo-tarpaulin` to `cargo-llvm-cov` to eliminate `.await?` false negatives and improve accuracy for async code, macros, and generics
 
 ### Fixed
+- **Confluence User Search** ([#542](https://github.com/rust-works/omni-dev/issues/542)): `confluence user search` no longer fails with `missing field 'accountId'` deserialization errors. The response parser now reads the nested `user` object returned by `/wiki/rest/api/search/user` and tolerates user records (such as app users or deactivated users) that omit `accountId`.
 - **Empty Task Checkboxes**: Recognise `- [ ]` and `- [x]` markdown task markers
   even when the checkbox is not followed by a trailing space. Fixes ADF
   round-trip drift where empty `taskItem` nodes were parsed as `listItem`

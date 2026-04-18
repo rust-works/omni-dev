@@ -81,7 +81,7 @@ fn print_user_results(result: &ConfluenceUserSearchResults) {
     let id_width = result
         .users
         .iter()
-        .map(|u| u.account_id.len())
+        .map(|u| u.account_id.as_deref().unwrap_or("-").len())
         .max()
         .unwrap_or(10)
         .max(10);
@@ -108,9 +108,10 @@ fn print_user_results(result: &ConfluenceUserSearchResults) {
     // Rows
     for user in &result.users {
         let email = user.email.as_deref().unwrap_or("-");
+        let account_id = user.account_id.as_deref().unwrap_or("-");
         println!(
             "{:<id_width$}  {:<name_width$}  {email}",
-            user.account_id, user.display_name
+            account_id, user.display_name
         );
     }
 
@@ -135,12 +136,12 @@ mod tests {
     }
 
     fn sample_user(
-        account_id: &str,
+        account_id: Option<&str>,
         display_name: &str,
         email: Option<&str>,
     ) -> ConfluenceUserSearchResult {
         ConfluenceUserSearchResult {
-            account_id: account_id.to_string(),
+            account_id: account_id.map(String::from),
             display_name: display_name.to_string(),
             email: email.map(String::from),
         }
@@ -161,8 +162,8 @@ mod tests {
     fn print_results_with_users() {
         let result = ConfluenceUserSearchResults {
             users: vec![
-                sample_user("abc123", "Alice Smith", Some("alice@example.com")),
-                sample_user("def456", "Bob Jones", Some("bob@example.com")),
+                sample_user(Some("abc123"), "Alice Smith", Some("alice@example.com")),
+                sample_user(Some("def456"), "Bob Jones", Some("bob@example.com")),
             ],
             total: 2,
         };
@@ -172,7 +173,16 @@ mod tests {
     #[test]
     fn print_results_with_missing_email() {
         let result = ConfluenceUserSearchResults {
-            users: vec![sample_user("abc123", "Alice Smith", None)],
+            users: vec![sample_user(Some("abc123"), "Alice Smith", None)],
+            total: 1,
+        };
+        print_user_results(&result);
+    }
+
+    #[test]
+    fn print_results_with_missing_account_id() {
+        let result = ConfluenceUserSearchResults {
+            users: vec![sample_user(None, "App User", None)],
             total: 1,
         };
         print_user_results(&result);
@@ -182,7 +192,7 @@ mod tests {
     fn print_results_with_pagination() {
         let result = ConfluenceUserSearchResults {
             users: vec![sample_user(
-                "abc123",
+                Some("abc123"),
                 "Alice Smith",
                 Some("alice@example.com"),
             )],
@@ -216,9 +226,11 @@ mod tests {
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "results": [
                         {
-                            "accountId": "abc123",
-                            "displayName": "Alice Smith",
-                            "email": "alice@example.com"
+                            "user": {
+                                "accountId": "abc123",
+                                "displayName": "Alice Smith",
+                                "email": "alice@example.com"
+                            }
                         }
                     ]
                 })),
@@ -242,8 +254,10 @@ mod tests {
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "results": [
                         {
-                            "accountId": "abc123",
-                            "displayName": "Alice Smith"
+                            "user": {
+                                "accountId": "abc123",
+                                "displayName": "Alice Smith"
+                            }
                         }
                     ]
                 })),
