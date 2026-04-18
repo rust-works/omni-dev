@@ -531,7 +531,15 @@ struct JiraTransitionEntry {
 
 #[derive(Deserialize)]
 struct JiraCommentsResponse {
+    #[serde(default)]
     comments: Vec<JiraCommentEntry>,
+    #[serde(default)]
+    total: u32,
+    #[serde(rename = "startAt", default)]
+    start_at: u32,
+    #[serde(rename = "maxResults", default)]
+    #[allow(dead_code)]
+    max_results: u32,
 }
 
 #[derive(Deserialize)]
@@ -1671,6 +1679,9 @@ mod tests {
             .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1/comment"))
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "startAt": 0,
+                    "maxResults": 100,
+                    "total": 2,
                     "comments": [
                         {
                             "id": "100",
@@ -1692,7 +1703,7 @@ mod tests {
             .await;
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
-        let comments = client.get_comments("PROJ-1").await.unwrap();
+        let comments = client.get_comments("PROJ-1", 0).await.unwrap();
 
         assert_eq!(comments.len(), 2);
         assert_eq!(comments[0].id, "100");
@@ -1710,16 +1721,15 @@ mod tests {
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1/comment"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"comments": []})),
-            )
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"startAt": 0, "maxResults": 100, "total": 0, "comments": []}),
+            ))
             .expect(1)
             .mount(&server)
             .await;
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
-        let comments = client.get_comments("PROJ-1").await.unwrap();
+        let comments = client.get_comments("PROJ-1", 0).await.unwrap();
         assert!(comments.is_empty());
     }
 
@@ -1735,8 +1745,86 @@ mod tests {
             .await;
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
-        let err = client.get_comments("NOPE-1").await.unwrap_err();
+        let err = client.get_comments("NOPE-1", 0).await.unwrap_err();
         assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn get_comments_paginates_with_offset() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1/comment"))
+            .and(wiremock::matchers::query_param("startAt", "0"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "startAt": 0,
+                    "maxResults": 2,
+                    "total": 3,
+                    "comments": [
+                        {"id": "1", "author": {"displayName": "A"}, "body": null, "created": "2026-04-01T10:00:00.000+0000"},
+                        {"id": "2", "author": {"displayName": "B"}, "body": null, "created": "2026-04-02T10:00:00.000+0000"}
+                    ]
+                })),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1/comment"))
+            .and(wiremock::matchers::query_param("startAt", "2"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "startAt": 2,
+                    "maxResults": 2,
+                    "total": 3,
+                    "comments": [
+                        {"id": "3", "author": {"displayName": "C"}, "body": null, "created": "2026-04-03T10:00:00.000+0000"}
+                    ]
+                })),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let comments = client.get_comments("PROJ-1", 0).await.unwrap();
+
+        assert_eq!(comments.len(), 3);
+        assert_eq!(comments[0].id, "1");
+        assert_eq!(comments[1].id, "2");
+        assert_eq!(comments[2].id, "3");
+    }
+
+    #[tokio::test]
+    async fn get_comments_respects_limit_single_page() {
+        let server = wiremock::MockServer::start().await;
+
+        // Only one page should be fetched because limit (2) < total (5)
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1/comment"))
+            .and(wiremock::matchers::query_param("maxResults", "2"))
+            .and(wiremock::matchers::query_param("startAt", "0"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "startAt": 0,
+                    "maxResults": 2,
+                    "total": 5,
+                    "comments": [
+                        {"id": "1", "author": {"displayName": "A"}, "body": null, "created": "2026-04-01T10:00:00.000+0000"},
+                        {"id": "2", "author": {"displayName": "B"}, "body": null, "created": "2026-04-02T10:00:00.000+0000"}
+                    ]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let comments = client.get_comments("PROJ-1", 2).await.unwrap();
+
+        assert_eq!(comments.len(), 2);
     }
 
     #[tokio::test]
@@ -4762,36 +4850,62 @@ impl AtlassianClient {
         })
     }
 
-    /// Lists comments on a JIRA issue.
-    pub async fn get_comments(&self, key: &str) -> Result<Vec<JiraComment>> {
-        let url = format!(
-            "{}/rest/api/3/issue/{}/comment?orderBy=created",
-            self.instance_url, key
-        );
+    /// Lists comments on a JIRA issue with auto-pagination.
+    ///
+    /// `limit` caps the total number of comments returned. Pass `0` for unlimited.
+    pub async fn get_comments(&self, key: &str, limit: u32) -> Result<Vec<JiraComment>> {
+        let effective_limit = if limit == 0 { u32::MAX } else { limit };
+        let mut all_comments = Vec::new();
+        let mut start_at: u32 = 0;
 
-        let response = self.get_json(&url).await?;
+        loop {
+            let remaining = effective_limit.saturating_sub(all_comments.len() as u32);
+            if remaining == 0 {
+                break;
+            }
+            let page_size = remaining.min(PAGE_SIZE);
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+            let url = format!(
+                "{}/rest/api/3/issue/{}/comment?orderBy=created&maxResults={}&startAt={}",
+                self.instance_url, key, page_size, start_at
+            );
+
+            let response = self.get_json(&url).await?;
+
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+            }
+
+            let resp: JiraCommentsResponse = response
+                .json()
+                .await
+                .context("Failed to parse comments response")?;
+
+            let page_count = resp.comments.len() as u32;
+            for c in resp.comments {
+                all_comments.push(JiraComment {
+                    id: c.id,
+                    author: c.author.and_then(|a| a.display_name).unwrap_or_default(),
+                    body_adf: c.body,
+                    created: c.created.unwrap_or_default(),
+                });
+            }
+
+            if page_count == 0 {
+                break;
+            }
+
+            let fetched = resp.start_at.saturating_add(page_count);
+            if fetched >= resp.total {
+                break;
+            }
+
+            start_at += page_count;
         }
 
-        let resp: JiraCommentsResponse = response
-            .json()
-            .await
-            .context("Failed to parse comments response")?;
-
-        Ok(resp
-            .comments
-            .into_iter()
-            .map(|c| JiraComment {
-                id: c.id,
-                author: c.author.and_then(|a| a.display_name).unwrap_or_default(),
-                body_adf: c.body,
-                created: c.created.unwrap_or_default(),
-            })
-            .collect())
+        Ok(all_comments)
     }
 
     /// Adds a comment to a JIRA issue.

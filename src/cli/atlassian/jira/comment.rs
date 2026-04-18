@@ -46,13 +46,17 @@ pub struct ListCommand {
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
+
+    /// Maximum number of comments to return. Use 0 for unlimited.
+    #[arg(long, default_value_t = 0)]
+    pub limit: u32,
 }
 
 impl ListCommand {
     /// Fetches and displays comments.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        run_list_comments(&client, &self.key, &self.output).await
+        run_list_comments(&client, &self.key, self.limit, &self.output).await
     }
 }
 
@@ -105,9 +109,10 @@ impl AddCommand {
 async fn run_list_comments(
     client: &AtlassianClient,
     key: &str,
+    limit: u32,
     output: &OutputFormat,
 ) -> Result<()> {
-    let comments = client.get_comments(key).await?;
+    let comments = client.get_comments(key, limit).await?;
     if output_as(&comments, output)? {
         return Ok(());
     }
@@ -363,6 +368,7 @@ mod tests {
             command: CommentSubcommands::List(ListCommand {
                 key: "PROJ-1".to_string(),
                 output: OutputFormat::Table,
+                limit: 0,
             }),
         };
         assert!(matches!(cmd.command, CommentSubcommands::List(_)));
@@ -393,6 +399,9 @@ mod tests {
             .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1/comment"))
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "startAt": 0,
+                    "maxResults": 100,
+                    "total": 1,
                     "comments": [{
                         "id": "1",
                         "author": {"displayName": "Alice"},
@@ -405,9 +414,11 @@ mod tests {
             .await;
 
         let client = mock_client(&server.uri());
-        assert!(run_list_comments(&client, "PROJ-1", &OutputFormat::Table)
-            .await
-            .is_ok());
+        assert!(
+            run_list_comments(&client, "PROJ-1", 0, &OutputFormat::Table)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -415,15 +426,14 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1/comment"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"comments": []})),
-            )
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"startAt": 0, "maxResults": 100, "total": 0, "comments": []}),
+            ))
             .mount(&server)
             .await;
 
         let client = mock_client(&server.uri());
-        assert!(run_list_comments(&client, "PROJ-1", &OutputFormat::Json)
+        assert!(run_list_comments(&client, "PROJ-1", 0, &OutputFormat::Json)
             .await
             .is_ok());
     }
@@ -438,10 +448,39 @@ mod tests {
             .await;
 
         let client = mock_client(&server.uri());
-        let err = run_list_comments(&client, "NOPE-1", &OutputFormat::Table)
+        let err = run_list_comments(&client, "NOPE-1", 0, &OutputFormat::Table)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn run_list_comments_respects_limit() {
+        let server = wiremock::MockServer::start().await;
+        // Only a single page request is expected when limit=2
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1/comment"))
+            .and(wiremock::matchers::query_param("maxResults", "2"))
+            .and(wiremock::matchers::query_param("startAt", "0"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "startAt": 0,
+                    "maxResults": 2,
+                    "total": 10,
+                    "comments": [
+                        {"id": "1", "author": {"displayName": "A"}, "body": null, "created": "2026-04-01T10:00:00.000+0000"},
+                        {"id": "2", "author": {"displayName": "B"}, "body": null, "created": "2026-04-02T10:00:00.000+0000"}
+                    ]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(run_list_comments(&client, "PROJ-1", 2, &OutputFormat::Json)
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

@@ -188,6 +188,7 @@ mod tests {
                 command: comment::CommentSubcommands::List(comment::ListCommand {
                     key: "PROJ-1".to_string(),
                     output: OutputFormat::Table,
+                    limit: 0,
                 }),
             }),
         };
