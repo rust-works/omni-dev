@@ -837,4 +837,42 @@ mod tests {
         let mut writer = FailingWriter;
         assert!(write_output(&status, &OutputFormat::Jsonl, &mut writer).is_err());
     }
+
+    struct FailingSerialize;
+
+    impl Serialize for FailingSerialize {
+        fn serialize<S>(&self, _serializer: S) -> std::result::Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom("serialize failed"))
+        }
+    }
+
+    impl JsonlSerialize for FailingSerialize {
+        fn write_jsonl(&self, _out: &mut dyn Write) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_output_propagates_json_serialize_errors() {
+        let mut buf = Vec::new();
+        let err = write_output(&FailingSerialize, &OutputFormat::Json, &mut buf).unwrap_err();
+        assert!(err.to_string().contains("Failed to serialize as JSON"));
+    }
+
+    #[test]
+    fn write_output_propagates_yaml_serialize_errors() {
+        let mut buf = Vec::new();
+        let err = write_output(&FailingSerialize, &OutputFormat::Yaml, &mut buf).unwrap_err();
+        assert!(err.to_string().contains("Failed to serialize as YAML"));
+    }
+
+    #[test]
+    fn failing_serialize_jsonl_impl_is_a_noop() {
+        let mut buf = Vec::new();
+        FailingSerialize.write_jsonl(&mut buf).unwrap();
+        assert!(buf.is_empty());
+    }
 }
