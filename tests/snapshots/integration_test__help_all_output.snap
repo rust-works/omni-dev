@@ -262,7 +262,7 @@ Options:
       --space <SPACE>          List top-level pages in this space (mutually exclusive with `id`)
       --recursive              Recursively fetch descendants
       --max-depth <MAX_DEPTH>  Maximum tree depth when `--recursive` is set (0 = unlimited) [default: 0]
-  -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, jsonl]
+  -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                   Print help (see more with '--help')
 
 
@@ -313,7 +313,7 @@ Arguments:
 
 Options:
       --limit <LIMIT>    Maximum number of comments to display [default: 25]
-  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, jsonl]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
 
@@ -438,7 +438,7 @@ Arguments:
   <ID>  Confluence page ID (e.g., 12345678)
 
 Options:
-  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, jsonl]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
 
@@ -488,7 +488,7 @@ Options:
       --space <SPACE>    Filter by space key
       --title <TITLE>    Filter by title (substring match)
       --limit <LIMIT>    Maximum number of results, 0 for unlimited (default: 25) [default: 25]
-  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, jsonl]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
 
@@ -519,7 +519,7 @@ Usage: search [OPTIONS] --query <QUERY>
 Options:
       --query <QUERY>    Search text (matches display name or email)
       --limit <LIMIT>    Maximum number of results, 0 for unlimited (default: 25) [default: 25]
-  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, jsonl]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
 
@@ -703,7 +703,7 @@ Options:
       --board-id <BOARD_ID>  Board ID
       --jql <JQL>            JQL filter for issues
       --limit <LIMIT>        Maximum number of results, 0 for unlimited (default: 50) [default: 50]
-  -o, --output <OUTPUT>      Output format [default: table] [possible values: table, json, yaml, jsonl]
+  -o, --output <OUTPUT>      Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                 Print help (see more with '--help')
 
 
@@ -719,7 +719,7 @@ Options:
       --project <PROJECT>  Filter by project key
       --type <TYPE>        Filter by board type (scrum or kanban)
       --limit <LIMIT>      Maximum number of results, 0 for unlimited (default: 50) [default: 50]
-  -o, --output <OUTPUT>    Output format [default: table] [possible values: table, json, yaml, jsonl]
+  -o, --output <OUTPUT>    Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help               Print help (see more with '--help')
 
 
@@ -736,7 +736,7 @@ Arguments:
 
 Options:
       --limit <LIMIT>    Maximum number of changelog entries per issue (default: 50) [default: 50]
-  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, jsonl]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
 
@@ -786,7 +786,7 @@ Arguments:
   <KEY>  JIRA issue key (e.g., PROJ-123)
 
 Options:
-  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, jsonl]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
       --limit <LIMIT>    Maximum number of comments to return. Use 0 for unlimited [default: 0]
   -h, --help             Print help (see more with '--help')
 
@@ -842,7 +842,7 @@ Options:
       --type <TYPE>      Data type filter [possible values: pullrequest, branch, repository]
       --app <APP>        Application type filter (e.g., GitHub, bitbucket, stash). If omitted, queries all available integrations
       --summary          Show summary counts instead of full details
-  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, jsonl]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
 
@@ -888,7 +888,7 @@ Usage: list [OPTIONS]
 
 Options:
       --search <SEARCH>  Filter fields by name (case-insensitive substring match)
-  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, jsonl]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
 
@@ -903,7 +903,7 @@ Usage: options [OPTIONS] --field-id <FIELD_ID>
 Options:
       --field-id <FIELD_ID>      Field ID (e.g., "customfield_10001")
       --context-id <CONTEXT_ID>  Context ID (auto-discovered if omitted)
-  -o, --output <OUTPUT>          Output format [default: table] [possible values: table, json, yaml, jsonl]
+  -o, --output <OUTPUT>          Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                     Print help (see more with '--help')
 
 
@@ -968,7 +968,7 @@ Arguments:
   <KEY>  JIRA issue key (e.g., PROJ-123)
 
 Options:
-  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, jsonl]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
 
@@ -994,7 +994,7 @@ Lists available issue link types
 Usage: types [OPTIONS]
 
 Options:
-  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, jsonl]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
 
@@ -1024,7 +1024,7 @@ Usage: list [OPTIONS]
 
 Options:
       --limit <LIMIT>    Maximum number of results, 0 for unlimited (default: 50) [default: 50]
-  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, jsonl]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
 
@@ -1059,7 +1059,7 @@ Options:
       --assignee <ASSIGNEE>  Filter by assignee (display name or email)
       --status <STATUS>      Filter by status name
       --limit <LIMIT>        Maximum number of results, 0 for unlimited (default: 50) [default: 50]
-  -o, --output <OUTPUT>      Output format [default: table] [possible values: table, json, yaml, jsonl]
+  -o, --output <OUTPUT>      Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                 Print help (see more with '--help')
 
 
@@ -1126,7 +1126,7 @@ Options:
       --sprint-id <SPRINT_ID>  Sprint ID
       --jql <JQL>              JQL filter for issues
       --limit <LIMIT>          Maximum number of results, 0 for unlimited (default: 50) [default: 50]
-  -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, jsonl]
+  -o, --output <OUTPUT>        Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                   Print help (see more with '--help')
 
 
@@ -1142,7 +1142,7 @@ Options:
       --board-id <BOARD_ID>  Board ID
       --state <STATE>        Filter by sprint state (active, future, closed)
       --limit <LIMIT>        Maximum number of results, 0 for unlimited (default: 50) [default: 50]
-  -o, --output <OUTPUT>      Output format [default: table] [possible values: table, json, yaml, jsonl]
+  -o, --output <OUTPUT>      Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help                 Print help (see more with '--help')
 
 
@@ -1178,7 +1178,7 @@ Arguments:
 
 Options:
       --list             Lists available transitions (same as omitting the transition argument)
-  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, jsonl]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
 
@@ -1228,7 +1228,7 @@ Arguments:
   <KEY>  Issue key (e.g., "PROJ-123")
 
 Options:
-  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, jsonl]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
 
@@ -1296,7 +1296,7 @@ Arguments:
 
 Options:
       --limit <LIMIT>    Maximum number of results, 0 for unlimited (default: 50) [default: 50]
-  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, jsonl]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
 
