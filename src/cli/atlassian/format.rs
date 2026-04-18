@@ -134,34 +134,35 @@ impl JsonlSerialize for JiraDevStatusSummary {
     }
 }
 
-/// Serializes data in the requested output format.
-/// Returns `Ok(true)` if data was printed (json/yaml/yamls/jsonl), `Ok(false)`
-/// if the caller should handle table output.
-pub fn output_as<T: Serialize + JsonlSerialize>(data: &T, format: &OutputFormat) -> Result<bool> {
+/// Writes `data` to `out` in the requested format.
+///
+/// Returns `Ok(true)` when `data` was written (json/yaml/yamls/jsonl), `Ok(false)`
+/// when `format` is `Table` (the caller is expected to render its own table).
+pub fn write_output<T: Serialize + JsonlSerialize>(
+    data: &T,
+    format: &OutputFormat,
+    out: &mut dyn Write,
+) -> Result<bool> {
     match format {
         OutputFormat::Table => Ok(false),
         OutputFormat::Json => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(data).context("Failed to serialize as JSON")?
-            );
+            let rendered =
+                serde_json::to_string_pretty(data).context("Failed to serialize as JSON")?;
+            writeln!(out, "{rendered}").context("Failed to write JSON output")?;
             Ok(true)
         }
         OutputFormat::Yaml => {
-            print!(
-                "{}",
-                serde_yaml::to_string(data).context("Failed to serialize as YAML")?
-            );
+            let rendered = serde_yaml::to_string(data).context("Failed to serialize as YAML")?;
+            write!(out, "{rendered}").context("Failed to write YAML output")?;
             Ok(true)
         }
         OutputFormat::Yamls => {
-            print!("{}", format_yaml_stream(data)?);
+            let rendered = format_yaml_stream(data)?;
+            write!(out, "{rendered}").context("Failed to write YAML stream output")?;
             Ok(true)
         }
         OutputFormat::Jsonl => {
-            let stdout = std::io::stdout();
-            let mut handle = stdout.lock();
-            data.write_jsonl(&mut handle)?;
+            data.write_jsonl(out)?;
             Ok(true)
         }
     }
@@ -183,6 +184,15 @@ fn format_yaml_stream<T: Serialize>(data: &T) -> Result<String> {
         serde_yaml::Value::Sequence(items) => items.iter().map(yaml_stream_doc).collect(),
         other => yaml_stream_doc(&other),
     }
+}
+
+/// Serializes data in the requested output format to stdout.
+/// Returns `Ok(true)` if data was printed (json/yaml/yamls/jsonl), `Ok(false)`
+/// if the caller should handle table output.
+pub fn output_as<T: Serialize + JsonlSerialize>(data: &T, format: &OutputFormat) -> Result<bool> {
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    write_output(data, format, &mut handle)
 }
 
 #[cfg(test)]
@@ -700,5 +710,169 @@ mod tests {
         assert_eq!(docs.len(), 2);
         assert_eq!(docs[0]["key"], serde_yaml::Value::from("PROJ-1"));
         assert_eq!(docs[1]["key"], serde_yaml::Value::from("PROJ-2"));
+    }
+
+    // ── write_output ───────────────────────────────────────────────
+
+    #[test]
+    fn write_output_table_returns_false_and_writes_nothing() {
+        let data = vec![1_i32, 2];
+        let mut buf = Vec::new();
+        let wrote = write_output(&data, &OutputFormat::Table, &mut buf).unwrap();
+        assert!(!wrote);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn write_output_json_emits_pretty_array() {
+        let data = vec![1_i32, 2, 3];
+        let mut buf = Vec::new();
+        let wrote = write_output(&data, &OutputFormat::Json, &mut buf).unwrap();
+        assert!(wrote);
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.starts_with('['));
+        assert!(out.contains("  1,\n"));
+        assert!(out.ends_with("]\n"));
+    }
+
+    #[test]
+    fn write_output_yaml_emits_list() {
+        let data = vec![1_i32, 2];
+        let mut buf = Vec::new();
+        let wrote = write_output(&data, &OutputFormat::Yaml, &mut buf).unwrap();
+        assert!(wrote);
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out, "- 1\n- 2\n");
+    }
+
+    #[test]
+    fn write_output_yamls_emits_yaml_stream() {
+        let data = vec![1_i32, 2];
+        let mut buf = Vec::new();
+        let wrote = write_output(&data, &OutputFormat::Yamls, &mut buf).unwrap();
+        assert!(wrote);
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out, "---\n1\n---\n2\n");
+    }
+
+    #[test]
+    fn write_output_jsonl_emits_one_line_per_item() {
+        let data = vec![1_i32, 2, 3];
+        let mut buf = Vec::new();
+        let wrote = write_output(&data, &OutputFormat::Jsonl, &mut buf).unwrap();
+        assert!(wrote);
+        assert_eq!(String::from_utf8(buf).unwrap(), "1\n2\n3\n");
+    }
+
+    #[test]
+    fn write_output_jsonl_wrapper() {
+        let list = AgileBoardList {
+            boards: vec![sample_board(1, "b1"), sample_board(2, "b2")],
+            total: 2,
+        };
+        let mut buf = Vec::new();
+        let wrote = write_output(&list, &OutputFormat::Jsonl, &mut buf).unwrap();
+        assert!(wrote);
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out.lines().count(), 2);
+        assert!(out.contains("\"id\":1"));
+        assert!(out.contains("\"id\":2"));
+    }
+
+    #[test]
+    fn write_output_json_wrapper_includes_total_field() {
+        let list = AgileBoardList {
+            boards: vec![sample_board(1, "b1")],
+            total: 42,
+        };
+        let mut buf = Vec::new();
+        write_output(&list, &OutputFormat::Json, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("\"total\": 42"));
+    }
+
+    #[test]
+    fn write_output_yaml_wrapper_includes_total_field() {
+        let list = AgileBoardList {
+            boards: vec![],
+            total: 0,
+        };
+        let mut buf = Vec::new();
+        write_output(&list, &OutputFormat::Yaml, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("total: 0"));
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("boom"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("boom"))
+        }
+    }
+
+    #[test]
+    fn write_output_propagates_write_errors() {
+        let data = vec![1_i32];
+        let mut writer = FailingWriter;
+
+        assert!(write_output(&data, &OutputFormat::Json, &mut writer).is_err());
+        assert!(write_output(&data, &OutputFormat::Yaml, &mut writer).is_err());
+        assert!(write_output(&data, &OutputFormat::Yamls, &mut writer).is_err());
+        assert!(write_output(&data, &OutputFormat::Jsonl, &mut writer).is_err());
+        assert!(writer.write(b"x").is_err());
+        assert!(writer.flush().is_err());
+    }
+
+    #[test]
+    fn write_scalar_jsonl_propagates_write_errors() {
+        let status = JiraDevStatus {
+            pull_requests: vec![],
+            branches: vec![],
+            repositories: vec![],
+        };
+        let mut writer = FailingWriter;
+        assert!(write_output(&status, &OutputFormat::Jsonl, &mut writer).is_err());
+    }
+
+    struct FailingSerialize;
+
+    impl Serialize for FailingSerialize {
+        fn serialize<S>(&self, _serializer: S) -> std::result::Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom("serialize failed"))
+        }
+    }
+
+    impl JsonlSerialize for FailingSerialize {
+        fn write_jsonl(&self, _out: &mut dyn Write) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_output_propagates_json_serialize_errors() {
+        let mut buf = Vec::new();
+        let err = write_output(&FailingSerialize, &OutputFormat::Json, &mut buf).unwrap_err();
+        assert!(err.to_string().contains("Failed to serialize as JSON"));
+    }
+
+    #[test]
+    fn write_output_propagates_yaml_serialize_errors() {
+        let mut buf = Vec::new();
+        let err = write_output(&FailingSerialize, &OutputFormat::Yaml, &mut buf).unwrap_err();
+        assert!(err.to_string().contains("Failed to serialize as YAML"));
+    }
+
+    #[test]
+    fn failing_serialize_jsonl_impl_is_a_noop() {
+        let mut buf = Vec::new();
+        FailingSerialize.write_jsonl(&mut buf).unwrap();
+        assert!(buf.is_empty());
     }
 }
