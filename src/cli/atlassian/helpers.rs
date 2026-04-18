@@ -57,8 +57,7 @@ pub fn prepare_write(file: Option<&str>, format: &ContentFormat) -> Result<(AdfD
             Ok((adf, title))
         }
         ContentFormat::Adf => {
-            let adf: AdfDocument =
-                serde_json::from_str(&input).context("Failed to parse ADF JSON input")?;
+            let adf = AdfDocument::from_json_str(&input)?;
             Ok((adf, String::new()))
         }
     }
@@ -510,6 +509,19 @@ mod tests {
 
         let result = prepare_write(Some(file_path.to_str().unwrap()), &ContentFormat::Adf);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn prepare_write_null_adf_input_yields_empty_doc() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("null.json");
+        fs::write(&file_path, "null").unwrap();
+
+        let (adf, title) =
+            prepare_write(Some(file_path.to_str().unwrap()), &ContentFormat::Adf).unwrap();
+
+        assert_eq!(adf, AdfDocument::default());
+        assert!(title.is_empty());
     }
 
     #[test]

@@ -29,6 +29,23 @@ impl AdfDocument {
             content: Vec::new(),
         }
     }
+
+    /// Parses ADF JSON, treating a top-level `null` as an empty document.
+    ///
+    /// The Jira REST API returns `description: null` for issues with no
+    /// description. This helper accepts that as equivalent to the canonical
+    /// empty ADF document so that `jira read --format adf` output can be piped
+    /// into `convert from-adf` without a pre-filter.
+    pub fn from_json_str(input: &str) -> anyhow::Result<Self> {
+        use anyhow::Context;
+
+        let value: serde_json::Value =
+            serde_json::from_str(input).context("Failed to parse ADF JSON input")?;
+        if value.is_null() {
+            return Ok(Self::default());
+        }
+        serde_json::from_value(value).context("Failed to parse ADF JSON input")
+    }
 }
 
 impl Default for AdfDocument {
@@ -1501,5 +1518,41 @@ mod tests {
         assert_eq!(deserialized.mark_type, "border");
         assert_eq!(deserialized.attrs.as_ref().unwrap()["color"], "#ff000033");
         assert_eq!(deserialized.attrs.as_ref().unwrap()["size"], 2);
+    }
+
+    #[test]
+    fn from_json_str_null_yields_empty_document() {
+        let doc = AdfDocument::from_json_str("null").unwrap();
+        assert_eq!(doc, AdfDocument::default());
+    }
+
+    #[test]
+    fn from_json_str_whitespace_null_yields_empty_document() {
+        let doc = AdfDocument::from_json_str("  null\n").unwrap();
+        assert_eq!(doc, AdfDocument::default());
+    }
+
+    #[test]
+    fn from_json_str_empty_doc_roundtrips() {
+        let doc = AdfDocument::from_json_str(r#"{"version":1,"type":"doc","content":[]}"#).unwrap();
+        assert_eq!(doc, AdfDocument::default());
+    }
+
+    #[test]
+    fn from_json_str_populated_doc() {
+        let input = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"hi"}]}]}"#;
+        let doc = AdfDocument::from_json_str(input).unwrap();
+        assert_eq!(doc.content.len(), 1);
+        assert_eq!(doc.content[0].node_type, "paragraph");
+    }
+
+    #[test]
+    fn from_json_str_invalid_json_errors() {
+        assert!(AdfDocument::from_json_str("not json").is_err());
+    }
+
+    #[test]
+    fn from_json_str_wrong_shape_errors() {
+        assert!(AdfDocument::from_json_str(r#"{"foo":"bar"}"#).is_err());
     }
 }
