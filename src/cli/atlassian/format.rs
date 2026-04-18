@@ -803,18 +803,19 @@ mod tests {
         assert!(out.contains("total: 0"));
     }
 
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("boom"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("boom"))
+        }
+    }
+
     #[test]
     fn write_output_propagates_write_errors() {
-        struct FailingWriter;
-        impl Write for FailingWriter {
-            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::other("boom"))
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
         let data = vec![1_i32];
         let mut writer = FailingWriter;
 
@@ -822,20 +823,12 @@ mod tests {
         assert!(write_output(&data, &OutputFormat::Yaml, &mut writer).is_err());
         assert!(write_output(&data, &OutputFormat::Yamls, &mut writer).is_err());
         assert!(write_output(&data, &OutputFormat::Jsonl, &mut writer).is_err());
+        assert!(writer.write(b"x").is_err());
+        assert!(writer.flush().is_err());
     }
 
     #[test]
     fn write_scalar_jsonl_propagates_write_errors() {
-        struct FailingWriter;
-        impl Write for FailingWriter {
-            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::other("boom"))
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
         let status = JiraDevStatus {
             pull_requests: vec![],
             branches: vec![],
