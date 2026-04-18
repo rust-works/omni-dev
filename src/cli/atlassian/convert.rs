@@ -83,8 +83,7 @@ impl FromAdfCommand {
         use crate::atlassian::convert::{adf_to_markdown_with_options, RenderOptions};
 
         let input = read_input(self.file.as_deref())?;
-        let doc: AdfDocument =
-            serde_json::from_str(&input).context("Failed to parse ADF JSON input")?;
+        let doc = AdfDocument::from_json_str(&input)?;
 
         let opts = RenderOptions {
             strip_local_ids: self.strip_local_ids,
@@ -184,6 +183,19 @@ mod tests {
             strip_local_ids: false,
         };
         assert!(cmd.execute().is_err());
+    }
+
+    #[test]
+    fn from_adf_null_input_succeeds() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("null.json");
+        fs::write(&file_path, "null").unwrap();
+
+        let cmd = FromAdfCommand {
+            file: Some(file_path.to_str().unwrap().to_string()),
+            strip_local_ids: false,
+        };
+        assert!(cmd.execute().is_ok());
     }
 
     #[test]
