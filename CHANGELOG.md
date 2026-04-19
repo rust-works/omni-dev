@@ -7,30 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-04-19
+
 ### Added
-- **Confluence Bulk Space Download**: `confluence download` now accepts `--space <KEY>` to recursively download every page in a Confluence space, plus `--title-filter` to download only pages whose title contains a substring (case-insensitive)
+- **Confluence Bulk Space Download** ([#556](https://github.com/rust-works/omni-dev/issues/556)): `confluence download` now accepts `--space <KEY>` to recursively download every page in a Confluence space, plus `--title-filter` to download only pages whose title contains a substring (case-insensitive)
+- **Confluence Children Command** ([#557](https://github.com/rust-works/omni-dev/issues/557)): New `confluence children` command for traversing page hierarchies, with `--space` and `--recursive` options for whole-space and recursive subtree listing
 - **JIRA Comment Pagination** ([#543](https://github.com/rust-works/omni-dev/issues/543)): `jira comment list` now auto-paginates the JIRA comments REST API (previously only the first page was returned) and accepts a `--limit` flag to cap the total number of comments (use `0` for unlimited)
+- **Confluence Comment Pagination** ([#544](https://github.com/rust-works/omni-dev/issues/544)): `confluence comment list` now auto-paginates the underlying API, returning every comment rather than just the first page
 - **YAML Stream Output** ([#546](https://github.com/rust-works/omni-dev/issues/546)): New `-o yamls` output format emits results as `---`-separated YAML documents (YAML multi-document streams). For sequence results, each item becomes its own document; other values emit as a single `---`-prefixed document. Streams parse with standard YAML tooling (`yaml.safe_load_all()`, `yq`) and enable future per-page streaming for auto-paginated commands.
+- **JSONL Output Format** ([#545](https://github.com/rust-works/omni-dev/issues/545)): New `-o jsonl` output format emits results as newline-delimited JSON (one JSON value per line), suitable for streaming consumption by `jq`, `fx`, and other line-oriented JSON tools
+- **Claude Skills Sync/Clean** ([#558](https://github.com/rust-works/omni-dev/issues/558)): New `claude skills sync` and `claude skills clean` subcommands for worktree-aware skill distribution, allowing skills to be propagated consistently across multiple git worktrees of the same project
 
 ### Changed
-- **CI Coverage**: Switched coverage tooling from `cargo-tarpaulin` to `cargo-llvm-cov` to eliminate `.await?` false negatives and improve accuracy for async code, macros, and generics
+- **CI Coverage**: Switched coverage tooling from `cargo-tarpaulin` to `cargo-llvm-cov` ([#589](https://github.com/rust-works/omni-dev/issues/589)) to eliminate `.await?` false negatives and improve accuracy for async code, macros, and generics
+- **Atlassian Command Refactor** ([#281](https://github.com/rust-works/omni-dev/issues/281)): Extract `run_*` handler functions from the `execute` methods across Atlassian CLI commands, consolidating parameter structs (`DownloadParams`) and expanding wiremock coverage for every handler
 
 ### Fixed
+- **Null ADF Input** ([#591](https://github.com/rust-works/omni-dev/issues/591)): `convert from-adf` no longer errors on `null` JSON input (empty Jira descriptions); null is now interpreted as an empty ADF document
+- **CommonMark Code Span Handling** ([#578](https://github.com/rust-works/omni-dev/issues/578)): `convert to-adf` no longer splits code-marked text containing backtick characters. Code-span rendering now picks the minimum backtick delimiter length that avoids collisions and applies the CommonMark space-padding rule; the parser matches multi-backtick delimiters with exact-length matching and strips padding spaces symmetrically
+- **Integer vs Float Table Width** ([#577](https://github.com/rust-works/omni-dev/issues/577)): ADF→JFM→ADF round-trips no longer coerce integer table width values to floats. A shared `parse_numeric_attr`/`fmt_numeric_attr` helper pair preserves integer-vs-float JSON type based on whether the source had a decimal point
+- **Integer/Float in Numeric Attributes** ([#555](https://github.com/rust-works/omni-dev/issues/555)): `layoutColumn`, `mediaSingle`, and file-attachment `media` width/height/`mediaWidth` attributes now preserve the original integer-vs-float JSON number type on round-trip, preventing byte-level JSON inequalities and potential schema validation failures
+- **Combined Emoji ShortNames** ([#576](https://github.com/rust-works/omni-dev/issues/576)): Emoji nodes with combined shortNames like `:slightly_smiling_face::bow:` are no longer split into multiple nodes during ADF→JFM→ADF round-trips. The inline parser now extends the match through adjacent `:name:` shortcodes before checking for a trailing attribute directive
+- **Pipe Characters in Table Cells** ([#579](https://github.com/rust-works/omni-dev/issues/579)): Literal `|` characters inside pipe-table cell content (including inside inline code spans) are now escaped as `\|` on render and parsed as literal pipes on input, preventing table cells from being split at non-separator pipes
+- **Code-Block & Unicode Emoji Shortcodes** ([#552](https://github.com/rust-works/omni-dev/issues/552)): Two ADF↔Markdown round-trip bugs fixed: hardBreak continuation no longer consumes 2-space-indented fenced code blocks or `:::` container directives as continuation lines, and emoji shortcode escaping now uses Unicode `is_alphanumeric` (matching the parser) rather than ASCII-only, so patterns like `:Café:` and `:配置:` are escaped and survive round-trips intact
+- **Card URL Brackets** ([#553](https://github.com/rust-works/omni-dev/issues/553)): `::card[...]` / `:card[...]` directives now round-trip correctly even when the URL contains unbalanced `]` or newline characters. URLs that cannot be safely embedded in bracket content are emitted using the quoted `url` attribute form. Additionally, bare URLs inside emphasis, strikethrough, link labels, bracketed spans, or span directives are no longer incorrectly promoted to `inlineCard` nodes (which was silently dropping the enclosing marks)
+- **Spurious order=1 on orderedList** ([#547](https://github.com/rust-works/omni-dev/issues/547)): Converting an ADF `orderedList` with no attrs through JFM and back no longer adds a spurious `{"order": 1}` attrs field to the node
+- **ADF Mark Ordering** ([#549](https://github.com/rust-works/omni-dev/issues/549)): Inline mark ordering is now preserved across ADF→JFM→ADF round-trips. Markdown wrappers are emitted in mark-array order (outermost first) rather than a fixed priority, so every permutation of `em`, `strong`, `strike`, `underline`, `link`, `annotation`, `textColor`, `backgroundColor`, and `subsup` survives with its original ordering intact
+- **Media `occurrenceKey` & Attribute Quoting** ([#550](https://github.com/rust-works/omni-dev/issues/550)): The `occurrenceKey` attribute on `mediaSingle` and `mediaInline` nodes is now preserved on round-trip. Attribute values containing spaces, quotes, closing braces, or backslashes are now quoted and escaped correctly, so arbitrary `id`, `collection`, `url`, `alt`, `localId`, and `occurrenceKey` values round-trip losslessly
+- **Annotation-Link Round-Trip Test URL** ([#574](https://github.com/rust-works/omni-dev/pull/574)): Correct the URL used in the annotation-link round-trip test (typo fix)
 - **Confluence User Search** ([#542](https://github.com/rust-works/omni-dev/issues/542)): `confluence user search` no longer fails with `missing field 'accountId'` deserialization errors. The response parser now reads the nested `user` object returned by `/wiki/rest/api/search/user` and tolerates user records (such as app users or deactivated users) that omit `accountId`.
-- **Empty Task Checkboxes**: Recognise `- [ ]` and `- [x]` markdown task markers
-  even when the checkbox is not followed by a trailing space. Fixes ADF
-  round-trip drift where empty `taskItem` nodes were parsed as `listItem`
-  nodes containing literal `[ ]` text (issue #548).
-- **Literal Checkbox Text in Bullet Lists**: Escape the leading `[` when
-  rendering a `bulletList` item whose literal text begins with a sequence
-  that looks like a task checkbox marker (`[ ]`, `[x]`, or `[X]` followed by
-  space, newline, or end). Prevents `to-adf` from falsely promoting these
-  bullet items to `taskList`/`taskItem` on round-trip (issue #548).
-- **ADF Round-Trip URL Brackets** (#551): Preserve square brackets in URLs
-  embedded in link-marked text so ADF→JFM→ADF round-trips no longer leak
-  `\[`/`\]` escapes or split the text into corrupted `inlineCard` nodes.
-- **ADF Mark Combinations** ([#554](https://github.com/rust-works/omni-dev/issues/554)): `textColor`, `backgroundColor`, `subsup`, `underline`, and `annotation` marks were silently dropped when combined with a `code` mark or with each other. Marks are now preserved by nesting `:span[…]{…}` and `[…]{…}` wrappers based on the original mark order.
-- **Underscore boundary in span directives** ([#554](https://github.com/rust-works/omni-dev/issues/554)): `from-adf` now escapes underscores at text-node boundaries (per the CommonMark intraword rule). Previously, a plain text node ending with `_ ` followed by a textColor span whose text started with `_` produced JFM that the parser saw as italic, destroying the span directive and losing the textColor mark.
+- **Empty Task Checkboxes** ([#548](https://github.com/rust-works/omni-dev/issues/548)): Recognise `- [ ]` and `- [x]` markdown task markers even when the checkbox is not followed by a trailing space. Fixes ADF round-trip drift where empty `taskItem` nodes were parsed as `listItem` nodes containing literal `[ ]` text
+- **Literal Checkbox Text in Bullet Lists** ([#548](https://github.com/rust-works/omni-dev/issues/548)): Escape the leading `[` when rendering a `bulletList` item whose literal text begins with a sequence that looks like a task checkbox marker (`[ ]`, `[x]`, or `[X]` followed by space, newline, or end), preventing `to-adf` from falsely promoting these bullet items to `taskList`/`taskItem` on round-trip
+- **ADF Round-Trip URL Brackets** ([#551](https://github.com/rust-works/omni-dev/issues/551)): Preserve square brackets in URLs embedded in link-marked text so ADF→JFM→ADF round-trips no longer leak `\[`/`\]` escapes or split the text into corrupted `inlineCard` nodes
+- **ADF Mark Combinations** ([#554](https://github.com/rust-works/omni-dev/issues/554)): `textColor`, `backgroundColor`, `subsup`, `underline`, and `annotation` marks were silently dropped when combined with a `code` mark or with each other. Marks are now preserved by nesting `:span[…]{…}` and `[…]{…}` wrappers based on the original mark order
+- **Underscore boundary in span directives** ([#554](https://github.com/rust-works/omni-dev/issues/554)): `from-adf` now escapes underscores at text-node boundaries (per the CommonMark intraword rule). Previously, a plain text node ending with `_ ` followed by a textColor span whose text started with `_` produced JFM that the parser saw as italic, destroying the span directive and losing the textColor mark
 
 ## [0.21.0] - 2026-04-17
 
@@ -799,7 +809,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation and community files (README, CONTRIBUTING, CODE_OF_CONDUCT)
 - BSD 3-Clause license
 
-[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.21.0...HEAD
+[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/rust-works/omni-dev/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/rust-works/omni-dev/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/rust-works/omni-dev/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/rust-works/omni-dev/compare/v0.18.0...v0.19.0
