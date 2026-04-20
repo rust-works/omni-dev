@@ -1,16 +1,37 @@
-//! Shared helpers for skills sync and clean commands.
+//! Shared helpers for skills sync, clean, and status commands.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
+use clap::ValueEnum;
+use serde::Serialize;
 
 /// Skills directory name relative to a repository or worktree root.
 pub(super) const SKILLS_SUBPATH: &str = ".claude/skills";
 
 /// Prefix used for entries written to `.git/info/exclude`.
 pub(super) const EXCLUDE_PREFIX: &str = ".claude/skills/";
+
+/// Opening marker for the managed block inside `.git/info/exclude`. Changing
+/// this string would orphan blocks written by prior versions — forward
+/// compatibility commitment.
+pub(super) const BLOCK_BEGIN: &str = "# BEGIN omni-dev-skills (managed — do not edit)";
+
+/// Closing marker for the managed block inside `.git/info/exclude`.
+pub(super) const BLOCK_END: &str = "# END omni-dev-skills";
+
+/// Output format shared by `sync`, `clean`, and `status`.
+#[derive(ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum OutputFormat {
+    /// Human-readable lines, one per action.
+    #[default]
+    Text,
+    /// Machine-readable YAML document.
+    Yaml,
+}
 
 /// Runs `git rev-parse --show-toplevel` from `path` and returns the absolute root.
 pub(super) fn resolve_toplevel(path: &Path) -> Result<PathBuf> {
@@ -121,94 +142,148 @@ pub(super) fn exclude_entry_for(skill_name: &str) -> String {
     format!("{EXCLUDE_PREFIX}{skill_name}/")
 }
 
-/// Appends missing entries to `exclude_file`, returning the list of added entries.
+/// Upserts the managed skills block inside `.git/info/exclude`.
 ///
-/// If `dry_run` is true the file is not modified but the would-be additions are
-/// still reported.
-pub(super) fn add_exclude_entries(
+/// Foreign lines outside the block are preserved verbatim. Hand-edits inside
+/// the block are not preserved — the block is rewritten with the union of its
+/// existing entries and `entries`. Returns the entries newly added.
+pub(super) fn upsert_skills_block(
     exclude_file: &Path,
     entries: &[String],
     dry_run: bool,
 ) -> Result<Vec<String>> {
-    let existing = read_exclude_lines(exclude_file)?;
-    let mut additions = Vec::new();
+    let content = read_existing_content(exclude_file)?;
+    let lines: Vec<&str> = content.lines().collect();
+    let block = find_block(&lines);
+
+    let existing: Vec<String> = match &block {
+        Some(b) => lines[b.begin + 1..b.end]
+            .iter()
+            .filter(|l| **l != BLOCK_BEGIN && **l != BLOCK_END)
+            .map(|&s| s.to_string())
+            .collect(),
+        None => Vec::new(),
+    };
+
+    let mut additions: Vec<String> = Vec::new();
     for entry in entries {
-        if !existing.iter().any(|line| line == entry) {
+        if !existing.iter().any(|e| e == entry) && !additions.iter().any(|e| e == entry) {
             additions.push(entry.clone());
         }
     }
+
     if additions.is_empty() || dry_run {
         return Ok(additions);
     }
+
+    let mut out_lines: Vec<String> = Vec::new();
+    if let Some(b) = block {
+        out_lines.extend(lines[..b.begin].iter().map(|&s| s.to_string()));
+        out_lines.push(BLOCK_BEGIN.to_string());
+        out_lines.extend(existing.iter().cloned());
+        out_lines.extend(additions.iter().cloned());
+        out_lines.push(BLOCK_END.to_string());
+        out_lines.extend(lines[b.end + 1..].iter().map(|&s| s.to_string()));
+    } else {
+        out_lines.extend(lines.iter().map(|&s| s.to_string()));
+        out_lines.push(BLOCK_BEGIN.to_string());
+        out_lines.extend(additions.iter().cloned());
+        out_lines.push(BLOCK_END.to_string());
+    }
+
+    write_exclude_file(exclude_file, &out_lines)?;
+    Ok(additions)
+}
+
+/// Removes the managed skills block from `.git/info/exclude` entirely.
+///
+/// Returns every line that was inside the block. Foreign lines outside the
+/// block are preserved. No-op (returning empty) if the file or block is absent.
+pub(super) fn remove_skills_block(exclude_file: &Path, dry_run: bool) -> Result<Vec<String>> {
+    if !exclude_file.exists() {
+        return Ok(Vec::new());
+    }
+    let content = fs::read_to_string(exclude_file)
+        .with_context(|| format!("Failed to read {}", exclude_file.display()))?;
+    let lines: Vec<&str> = content.lines().collect();
+    let Some(block) = find_block(&lines) else {
+        return Ok(Vec::new());
+    };
+    let removed: Vec<String> = lines[block.begin + 1..block.end]
+        .iter()
+        .map(|&s| s.to_string())
+        .collect();
+
+    if dry_run {
+        return Ok(removed);
+    }
+
+    let mut out_lines: Vec<String> = Vec::new();
+    out_lines.extend(lines[..block.begin].iter().map(|&s| s.to_string()));
+    out_lines.extend(lines[block.end + 1..].iter().map(|&s| s.to_string()));
+
+    write_exclude_file(exclude_file, &out_lines)?;
+    Ok(removed)
+}
+
+/// Reads the entries currently inside the managed skills block, if any.
+pub(super) fn read_skills_block_entries(exclude_file: &Path) -> Result<Vec<String>> {
+    if !exclude_file.exists() {
+        return Ok(Vec::new());
+    }
+    let content = fs::read_to_string(exclude_file)
+        .with_context(|| format!("Failed to read {}", exclude_file.display()))?;
+    let lines: Vec<&str> = content.lines().collect();
+    let Some(block) = find_block(&lines) else {
+        return Ok(Vec::new());
+    };
+    Ok(lines[block.begin + 1..block.end]
+        .iter()
+        .map(|&s| s.to_string())
+        .collect())
+}
+
+struct BlockBounds {
+    begin: usize,
+    end: usize,
+}
+
+fn find_block(lines: &[&str]) -> Option<BlockBounds> {
+    let begin = lines.iter().position(|l| *l == BLOCK_BEGIN)?;
+    let end_offset = lines[begin + 1..].iter().position(|l| *l == BLOCK_END)?;
+    Some(BlockBounds {
+        begin,
+        end: begin + 1 + end_offset,
+    })
+}
+
+fn read_existing_content(exclude_file: &Path) -> Result<String> {
+    if exclude_file.exists() {
+        fs::read_to_string(exclude_file)
+            .with_context(|| format!("Failed to read {}", exclude_file.display()))
+    } else {
+        Ok(String::new())
+    }
+}
+
+fn write_exclude_file(exclude_file: &Path, lines: &[String]) -> Result<()> {
     if let Some(parent) = exclude_file.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
-    let mut content = if exclude_file.exists() {
-        fs::read_to_string(exclude_file)
-            .with_context(|| format!("Failed to read {}", exclude_file.display()))?
-    } else {
+    let output = if lines.is_empty() {
         String::new()
+    } else {
+        let mut s = lines.join("\n");
+        s.push('\n');
+        s
     };
-    if !content.is_empty() && !content.ends_with('\n') {
-        content.push('\n');
-    }
-    for entry in &additions {
-        content.push_str(entry);
-        content.push('\n');
-    }
-    fs::write(exclude_file, content)
-        .with_context(|| format!("Failed to write {}", exclude_file.display()))?;
-    Ok(additions)
-}
-
-/// Removes matching entries from `exclude_file`, returning the list removed.
-///
-/// Entries are matched by exact line content. If `dry_run` is true the file is
-/// not modified.
-pub(super) fn remove_exclude_entries(
-    exclude_file: &Path,
-    entries: &[String],
-    dry_run: bool,
-) -> Result<Vec<String>> {
-    if !exclude_file.exists() {
-        return Ok(Vec::new());
-    }
-    let content = fs::read_to_string(exclude_file)
-        .with_context(|| format!("Failed to read {}", exclude_file.display()))?;
-    let trailing_newline = content.ends_with('\n');
-    let mut removed = Vec::new();
-    let mut kept = Vec::new();
-    for line in content.lines() {
-        if entries.iter().any(|e| e == line) {
-            removed.push(line.to_string());
-        } else {
-            kept.push(line.to_string());
-        }
-    }
-    if removed.is_empty() || dry_run {
-        return Ok(removed);
-    }
-    let mut new_content = kept.join("\n");
-    if trailing_newline && !new_content.is_empty() {
-        new_content.push('\n');
-    }
-    fs::write(exclude_file, new_content)
-        .with_context(|| format!("Failed to write {}", exclude_file.display()))?;
-    Ok(removed)
+    fs::write(exclude_file, output)
+        .with_context(|| format!("Failed to write {}", exclude_file.display()))
 }
 
 fn ctx_spawn_failure(command: &str, path: &Path) -> String {
     format!("Failed to run {command} in {}", path.display())
-}
-
-fn read_exclude_lines(exclude_file: &Path) -> Result<Vec<String>> {
-    if !exclude_file.exists() {
-        return Ok(Vec::new());
-    }
-    let content = fs::read_to_string(exclude_file)
-        .with_context(|| format!("Failed to read {}", exclude_file.display()))?;
-    Ok(content.lines().map(ToString::to_string).collect())
 }
 
 #[cfg(test)]
@@ -264,8 +339,6 @@ mod tests {
     fn resolve_toplevel_returns_repo_root() {
         let dir = tempdir();
         init_repo(dir.path());
-        // Canonicalize because macOS /var -> /private/var, while `git init` returns
-        // the canonical form.
         let expected = fs::canonicalize(dir.path()).unwrap();
         let result = resolve_toplevel(dir.path()).unwrap();
         assert_eq!(fs::canonicalize(result).unwrap(), expected);
@@ -284,8 +357,6 @@ mod tests {
 
     #[test]
     fn resolve_toplevel_outside_repo_fails() {
-        // Use the system temp dir (not the in-repo `tmp/`) so git cannot find a
-        // parent repository from this path.
         let dir = TempDir::new().unwrap();
         let err = resolve_toplevel(dir.path()).unwrap_err().to_string();
         assert!(
@@ -299,9 +370,7 @@ mod tests {
         let dir = tempdir();
         init_repo(dir.path());
         let common = resolve_git_common_dir(dir.path()).unwrap();
-        // Path should end in `.git` and point into the repo.
         assert!(common.ends_with(".git"), "got {}", common.display());
-        assert!(common.join("info").exists() || !common.join("info").exists());
     }
 
     #[test]
@@ -319,7 +388,6 @@ mod tests {
         assert!(status.status.success(), "git worktree add: {status:?}");
 
         let common = resolve_git_common_dir(&linked).unwrap();
-        // The common dir of the linked worktree should be the main repo's `.git`.
         let main_git = fs::canonicalize(main.path().join(".git")).unwrap();
         assert_eq!(fs::canonicalize(&common).unwrap(), main_git);
     }
@@ -374,8 +442,6 @@ mod tests {
         );
     }
 
-    // APFS rejects non-UTF-8 filenames, so this test is Linux-only. CI's
-    // tarpaulin job runs on Linux and exercises the to_str()-returns-None branch.
     #[cfg(target_os = "linux")]
     #[test]
     fn enumerate_skills_skips_directory_with_non_utf8_name() {
@@ -385,9 +451,7 @@ mod tests {
         let dir = tempdir();
         let skills = dir.path().join("skills");
         fs::create_dir_all(&skills).unwrap();
-        // Valid UTF-8 entry that should be returned.
         fs::create_dir_all(skills.join("alpha")).unwrap();
-        // Invalid UTF-8 byte sequence — exercises the `to_str()` None branch.
         let bad = OsStr::from_bytes(b"bad\xffname");
         fs::create_dir_all(skills.join(bad)).unwrap();
 
@@ -449,7 +513,6 @@ mod tests {
         fs::create_dir_all(skills_dir.join("charlie")).unwrap();
         fs::create_dir_all(skills_dir.join("alpha")).unwrap();
         fs::create_dir_all(skills_dir.join("bravo")).unwrap();
-        // A stray file should be ignored.
         fs::write(skills_dir.join("README.md"), "hi").unwrap();
         let result = enumerate_skills(&skills_dir).unwrap();
         let names: Vec<_> = result.iter().map(|(n, _)| n.clone()).collect();
@@ -457,59 +520,298 @@ mod tests {
     }
 
     #[test]
-    fn add_exclude_entries_creates_file_and_appends() {
+    fn upsert_skills_block_creates_block_when_absent() {
         let dir = tempdir();
         let exclude = dir.path().join("info").join("exclude");
-        let added = add_exclude_entries(
+        let added = upsert_skills_block(
             &exclude,
             &[exclude_entry_for("review"), exclude_entry_for("init")],
             false,
         )
         .unwrap();
-        assert_eq!(added.len(), 2);
+        assert_eq!(
+            added,
+            vec![
+                ".claude/skills/review/".to_string(),
+                ".claude/skills/init/".to_string()
+            ]
+        );
         let content = fs::read_to_string(&exclude).unwrap();
-        assert!(content.contains(".claude/skills/review/"));
-        assert!(content.contains(".claude/skills/init/"));
+        let expected =
+            format!("{BLOCK_BEGIN}\n.claude/skills/review/\n.claude/skills/init/\n{BLOCK_END}\n");
+        assert_eq!(content, expected);
     }
 
     #[test]
-    fn add_exclude_entries_does_not_duplicate() {
+    fn upsert_skills_block_appends_to_existing_block() {
         let dir = tempdir();
         let exclude = dir.path().join("info").join("exclude");
-        let first = add_exclude_entries(&exclude, &[exclude_entry_for("review")], false).unwrap();
-        assert_eq!(first, vec![".claude/skills/review/".to_string()]);
-        let second = add_exclude_entries(&exclude, &[exclude_entry_for("review")], false).unwrap();
-        assert!(second.is_empty());
+        upsert_skills_block(&exclude, &[exclude_entry_for("review")], false).unwrap();
+        let added = upsert_skills_block(&exclude, &[exclude_entry_for("init")], false).unwrap();
+        assert_eq!(added, vec![".claude/skills/init/".to_string()]);
+        let content = fs::read_to_string(&exclude).unwrap();
+        assert!(content.contains(".claude/skills/review/"));
+        assert!(content.contains(".claude/skills/init/"));
+        assert_eq!(content.matches(BLOCK_BEGIN).count(), 1);
+        assert_eq!(content.matches(BLOCK_END).count(), 1);
+    }
+
+    #[test]
+    fn upsert_skills_block_does_not_duplicate() {
+        let dir = tempdir();
+        let exclude = dir.path().join("info").join("exclude");
+        upsert_skills_block(&exclude, &[exclude_entry_for("review")], false).unwrap();
+        let added = upsert_skills_block(&exclude, &[exclude_entry_for("review")], false).unwrap();
+        assert!(added.is_empty());
         let content = fs::read_to_string(&exclude).unwrap();
         assert_eq!(content.matches(".claude/skills/review/").count(), 1);
     }
 
     #[test]
-    fn add_exclude_entries_dry_run_does_not_write() {
+    fn upsert_skills_block_dry_run_does_not_write() {
         let dir = tempdir();
         let exclude = dir.path().join("info").join("exclude");
-        let added = add_exclude_entries(&exclude, &[exclude_entry_for("review")], true).unwrap();
-        assert_eq!(added.len(), 1);
+        let added = upsert_skills_block(&exclude, &[exclude_entry_for("review")], true).unwrap();
+        assert_eq!(added, vec![".claude/skills/review/".to_string()]);
         assert!(!exclude.exists());
     }
 
     #[test]
-    fn add_exclude_entries_preserves_existing_content() {
+    fn upsert_skills_block_preserves_foreign_lines_before_and_after() {
         let dir = tempdir();
         let exclude = dir.path().join("info").join("exclude");
         fs::create_dir_all(exclude.parent().unwrap()).unwrap();
-        fs::write(&exclude, "# comments\n*.tmp\n").unwrap();
-        add_exclude_entries(&exclude, &[exclude_entry_for("review")], false).unwrap();
+        let original = format!(
+            "# user comment\n*.tmp\n{BLOCK_BEGIN}\n.claude/skills/review/\n{BLOCK_END}\n*.log\n"
+        );
+        fs::write(&exclude, &original).unwrap();
+        upsert_skills_block(&exclude, &[exclude_entry_for("init")], false).unwrap();
         let content = fs::read_to_string(&exclude).unwrap();
-        assert!(content.contains("# comments"));
-        assert!(content.contains("*.tmp"));
+        assert!(content.starts_with("# user comment\n*.tmp\n"));
+        assert!(content.ends_with("*.log\n"));
         assert!(content.contains(".claude/skills/review/"));
+        assert!(content.contains(".claude/skills/init/"));
+    }
+
+    #[test]
+    fn upsert_skills_block_returns_empty_when_input_empty() {
+        let dir = tempdir();
+        let exclude = dir.path().join("info").join("exclude");
+        let added = upsert_skills_block(&exclude, &[], false).unwrap();
+        assert!(added.is_empty());
+        assert!(!exclude.exists());
+    }
+
+    #[test]
+    fn upsert_skills_block_dedupes_within_input() {
+        let dir = tempdir();
+        let exclude = dir.path().join("info").join("exclude");
+        let added = upsert_skills_block(
+            &exclude,
+            &[exclude_entry_for("review"), exclude_entry_for("review")],
+            false,
+        )
+        .unwrap();
+        assert_eq!(added.len(), 1);
+        let content = fs::read_to_string(&exclude).unwrap();
+        assert_eq!(content.matches(".claude/skills/review/").count(), 1);
+    }
+
+    #[test]
+    fn upsert_skills_block_appends_after_foreign_lines_in_new_file() {
+        let dir = tempdir();
+        let exclude = dir.path().join("info").join("exclude");
+        fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        fs::write(&exclude, "*.log\n").unwrap();
+        upsert_skills_block(&exclude, &[exclude_entry_for("review")], false).unwrap();
+        let content = fs::read_to_string(&exclude).unwrap();
+        assert!(content.starts_with("*.log\n"));
+        assert!(content.contains(BLOCK_BEGIN));
+        assert!(content.ends_with(&format!("{BLOCK_END}\n")));
+    }
+
+    #[test]
+    fn upsert_skills_block_propagates_create_dir_all_failure() {
+        let dir = tempdir();
+        let parent_path = dir.path().join("info");
+        fs::write(&parent_path, "block").unwrap();
+        let exclude = parent_path.join("exclude");
+        let err = upsert_skills_block(&exclude, &[exclude_entry_for("a")], false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Failed to create"), "unexpected error: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upsert_skills_block_propagates_write_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir();
+        let info = dir.path().join("info");
+        fs::create_dir_all(&info).unwrap();
+        let exclude = info.join("exclude");
+        let mut perms = fs::metadata(&info).unwrap().permissions();
+        perms.set_mode(0o500);
+        fs::set_permissions(&info, perms).unwrap();
+
+        let result = upsert_skills_block(&exclude, &[exclude_entry_for("a")], false);
+
+        let mut perms = fs::metadata(&info).unwrap().permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&info, perms).unwrap();
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Failed to write"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn remove_skills_block_removes_block_and_reports_entries() {
+        let dir = tempdir();
+        let exclude = dir.path().join("info").join("exclude");
+        fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        let content = format!(
+            "# comment\n*.tmp\n{BLOCK_BEGIN}\n.claude/skills/review/\n.claude/skills/init/\n{BLOCK_END}\n"
+        );
+        fs::write(&exclude, &content).unwrap();
+
+        let removed = remove_skills_block(&exclude, false).unwrap();
+        assert_eq!(
+            removed,
+            vec![
+                ".claude/skills/review/".to_string(),
+                ".claude/skills/init/".to_string()
+            ]
+        );
+        let new_content = fs::read_to_string(&exclude).unwrap();
+        assert_eq!(new_content, "# comment\n*.tmp\n");
+    }
+
+    #[test]
+    fn remove_skills_block_missing_file_is_noop() {
+        let dir = tempdir();
+        let exclude = dir.path().join("info").join("exclude");
+        let removed = remove_skills_block(&exclude, false).unwrap();
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn remove_skills_block_missing_block_is_noop() {
+        let dir = tempdir();
+        let exclude = dir.path().join("info").join("exclude");
+        fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        fs::write(&exclude, "# comment\n*.tmp\n").unwrap();
+        let removed = remove_skills_block(&exclude, false).unwrap();
+        assert!(removed.is_empty());
+        let content = fs::read_to_string(&exclude).unwrap();
+        assert_eq!(content, "# comment\n*.tmp\n");
+    }
+
+    #[test]
+    fn remove_skills_block_dry_run_does_not_modify() {
+        let dir = tempdir();
+        let exclude = dir.path().join("info").join("exclude");
+        fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        let content = format!("{BLOCK_BEGIN}\n.claude/skills/review/\n{BLOCK_END}\n");
+        fs::write(&exclude, &content).unwrap();
+        let removed = remove_skills_block(&exclude, true).unwrap();
+        assert_eq!(removed, vec![".claude/skills/review/".to_string()]);
+        assert_eq!(fs::read_to_string(&exclude).unwrap(), content);
+    }
+
+    #[test]
+    fn remove_skills_block_empties_file_when_only_block_present() {
+        let dir = tempdir();
+        let exclude = dir.path().join("info").join("exclude");
+        fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        let content = format!("{BLOCK_BEGIN}\n.claude/skills/review/\n{BLOCK_END}\n");
+        fs::write(&exclude, &content).unwrap();
+        remove_skills_block(&exclude, false).unwrap();
+        let new_content = fs::read_to_string(&exclude).unwrap();
+        assert_eq!(new_content, "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_skills_block_propagates_write_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir();
+        let info = dir.path().join("info");
+        fs::create_dir_all(&info).unwrap();
+        let exclude = info.join("exclude");
+        fs::write(
+            &exclude,
+            format!("{BLOCK_BEGIN}\n.claude/skills/a/\n{BLOCK_END}\n"),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&exclude).unwrap().permissions();
+        perms.set_mode(0o400);
+        fs::set_permissions(&exclude, perms).unwrap();
+
+        let result = remove_skills_block(&exclude, false);
+
+        let mut perms = fs::metadata(&exclude).unwrap().permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&exclude, perms).unwrap();
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Failed to write"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn read_skills_block_entries_returns_entries() {
+        let dir = tempdir();
+        let exclude = dir.path().join("info").join("exclude");
+        fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        let content = format!(
+            "# comment\n{BLOCK_BEGIN}\n.claude/skills/alpha/\n.claude/skills/bravo/\n{BLOCK_END}\n"
+        );
+        fs::write(&exclude, content).unwrap();
+        let entries = read_skills_block_entries(&exclude).unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                ".claude/skills/alpha/".to_string(),
+                ".claude/skills/bravo/".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn read_skills_block_entries_missing_file_returns_empty() {
+        let dir = tempdir();
+        let exclude = dir.path().join("info").join("exclude");
+        let entries = read_skills_block_entries(&exclude).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn read_skills_block_entries_missing_block_returns_empty() {
+        let dir = tempdir();
+        let exclude = dir.path().join("info").join("exclude");
+        fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        fs::write(&exclude, "*.log\n").unwrap();
+        let entries = read_skills_block_entries(&exclude).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn find_block_requires_both_markers() {
+        let only_begin = vec![BLOCK_BEGIN, ".claude/skills/a/"];
+        assert!(find_block(&only_begin).is_none());
+        let only_end = vec!["foo", BLOCK_END];
+        assert!(find_block(&only_end).is_none());
+    }
+
+    #[test]
+    fn find_block_returns_none_for_reversed_markers() {
+        let reversed = vec![BLOCK_END, "middle", BLOCK_BEGIN];
+        assert!(find_block(&reversed).is_none());
     }
 
     #[test]
     fn resolve_toplevel_propagates_spawn_failure() {
-        // current_dir() pointing at a non-existent path causes Command::spawn
-        // itself to fail (chdir-before-exec), exercising the with_context arm.
         let err = resolve_toplevel(Path::new("/this/path/should/not/exist/skills_test_spawn"))
             .unwrap_err()
             .to_string();
@@ -529,127 +831,5 @@ mod tests {
             err.contains("Failed to run git rev-parse --git-common-dir"),
             "unexpected error: {err}"
         );
-    }
-
-    #[test]
-    fn add_exclude_entries_propagates_create_dir_all_failure() {
-        // Place a regular file where the exclude file's parent should be — so
-        // create_dir_all on the parent path fails.
-        let dir = tempdir();
-        let parent_path = dir.path().join("info");
-        fs::write(&parent_path, "block").unwrap();
-        let exclude = parent_path.join("exclude");
-
-        let err = add_exclude_entries(&exclude, &[exclude_entry_for("a")], false)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("Failed to create"), "unexpected error: {err}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn add_exclude_entries_propagates_write_failure() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempdir();
-        let info = dir.path().join("info");
-        fs::create_dir_all(&info).unwrap();
-        let exclude = info.join("exclude");
-        // Read-only parent — fs::write fails with EACCES.
-        let mut perms = fs::metadata(&info).unwrap().permissions();
-        perms.set_mode(0o500);
-        fs::set_permissions(&info, perms).unwrap();
-
-        let result = add_exclude_entries(&exclude, &[exclude_entry_for("a")], false);
-
-        let mut perms = fs::metadata(&info).unwrap().permissions();
-        perms.set_mode(0o700);
-        fs::set_permissions(&info, perms).unwrap();
-
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("Failed to write"), "unexpected error: {err}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn remove_exclude_entries_propagates_write_failure() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempdir();
-        let info = dir.path().join("info");
-        fs::create_dir_all(&info).unwrap();
-        let exclude = info.join("exclude");
-        fs::write(&exclude, ".claude/skills/a/\n").unwrap();
-        // Make the file itself read-only so fs::write to overwrite it fails.
-        let mut perms = fs::metadata(&exclude).unwrap().permissions();
-        perms.set_mode(0o400);
-        fs::set_permissions(&exclude, perms).unwrap();
-
-        let result = remove_exclude_entries(&exclude, &[exclude_entry_for("a")], false);
-
-        let mut perms = fs::metadata(&exclude).unwrap().permissions();
-        perms.set_mode(0o600);
-        fs::set_permissions(&exclude, perms).unwrap();
-
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("Failed to write"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn add_exclude_entries_appends_newline_when_existing_lacks_one() {
-        // Existing content has no trailing newline — exercises the
-        // `content.push('\n')` branch.
-        let dir = tempdir();
-        let exclude = dir.path().join("info").join("exclude");
-        fs::create_dir_all(exclude.parent().unwrap()).unwrap();
-        fs::write(&exclude, "*.log").unwrap();
-        add_exclude_entries(&exclude, &[exclude_entry_for("review")], false).unwrap();
-        let content = fs::read_to_string(&exclude).unwrap();
-        assert_eq!(content, "*.log\n.claude/skills/review/\n");
-    }
-
-    #[test]
-    fn remove_exclude_entries_removes_matching_lines() {
-        let dir = tempdir();
-        let exclude = dir.path().join("info").join("exclude");
-        fs::create_dir_all(exclude.parent().unwrap()).unwrap();
-        fs::write(
-            &exclude,
-            "# comments\n*.tmp\n.claude/skills/review/\n.claude/skills/init/\n",
-        )
-        .unwrap();
-        let removed = remove_exclude_entries(
-            &exclude,
-            &[exclude_entry_for("review"), exclude_entry_for("init")],
-            false,
-        )
-        .unwrap();
-        assert_eq!(removed.len(), 2);
-        let content = fs::read_to_string(&exclude).unwrap();
-        assert!(content.contains("# comments"));
-        assert!(content.contains("*.tmp"));
-        assert!(!content.contains(".claude/skills/"));
-    }
-
-    #[test]
-    fn remove_exclude_entries_missing_file_is_noop() {
-        let dir = tempdir();
-        let exclude = dir.path().join("info").join("exclude");
-        let removed =
-            remove_exclude_entries(&exclude, &[exclude_entry_for("review")], false).unwrap();
-        assert!(removed.is_empty());
-    }
-
-    #[test]
-    fn remove_exclude_entries_dry_run_does_not_modify() {
-        let dir = tempdir();
-        let exclude = dir.path().join("info").join("exclude");
-        fs::create_dir_all(exclude.parent().unwrap()).unwrap();
-        fs::write(&exclude, ".claude/skills/review/\n").unwrap();
-        let removed =
-            remove_exclude_entries(&exclude, &[exclude_entry_for("review")], true).unwrap();
-        assert_eq!(removed.len(), 1);
-        let content = fs::read_to_string(&exclude).unwrap();
-        assert!(content.contains(".claude/skills/review/"));
     }
 }

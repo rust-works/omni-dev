@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Claude Skills Status** ([#558](https://github.com/rust-works/omni-dev/issues/558)): New `ai claude skills status` subcommand reports the symlinks and managed exclude-block entries left behind by prior `sync` runs, with `--worktrees` to aggregate across every worktree and `--format {text,yaml}` for machine-readable output
+- **Claude Skills YAML Output** ([#558](https://github.com/rust-works/omni-dev/issues/558)): `ai claude skills sync` and `ai claude skills clean` now accept `--format {text,yaml}` (default `text`), producing a structured YAML report when invoked with `--format yaml`
+
+### Changed
+- **Claude Skills Exclude File Format** ([#558](https://github.com/rust-works/omni-dev/issues/558)): Entries in `.git/info/exclude` written by `sync` are now wrapped in a managed `# BEGIN omni-dev-skills (managed — do not edit)` / `# END omni-dev-skills` block so that `clean` can reverse the operation precisely. Clean break: bare `.claude/skills/*/` lines written by earlier builds are not recognised by the new `clean` and must be removed manually
+
 ## [0.22.0] - 2026-04-19
 
 ### Added

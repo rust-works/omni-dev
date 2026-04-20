@@ -5,10 +5,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use serde::Serialize;
 
 use super::common::{
-    add_exclude_entries, enumerate_skills, exclude_entry_for, exclude_file_for, list_worktrees,
-    resolve_toplevel, SKILLS_SUBPATH,
+    enumerate_skills, exclude_entry_for, exclude_file_for, list_worktrees, resolve_toplevel,
+    upsert_skills_block, OutputFormat, SKILLS_SUBPATH,
 };
 
 /// Syncs Claude skills from a source repository into one or more target worktrees.
@@ -30,6 +31,10 @@ pub struct SyncCommand {
     /// Preview the changes without creating symlinks or modifying the exclude file.
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub(super) format: OutputFormat,
 }
 
 impl SyncCommand {
@@ -52,7 +57,7 @@ impl SyncCommand {
         }
 
         let report = run_sync(&source_root, &targets, self.dry_run)?;
-        print_report(&report, self.dry_run);
+        print_report(&report, self.dry_run, self.format)?;
 
         if !report.errors.is_empty() {
             anyhow::bail!(
@@ -65,14 +70,15 @@ impl SyncCommand {
 }
 
 /// Outcome of running a sync operation.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize)]
 pub(super) struct SyncReport {
     pub actions: Vec<SyncAction>,
     pub errors: Vec<SyncError>,
 }
 
 /// Individual action produced by the sync operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub(super) enum SyncAction {
     Linked {
         link: PathBuf,
@@ -93,7 +99,7 @@ pub(super) enum SyncAction {
 
 /// Error describing a skill that could not be synced because a real file or directory
 /// already exists at the target path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(super) struct SyncError {
     pub target: PathBuf,
     pub reason: String,
@@ -167,7 +173,7 @@ fn sync_to_target(
 
     if !exclude_entries.is_empty() {
         let exclude_file = exclude_file_for(target_root)?;
-        let added = add_exclude_entries(&exclude_file, &exclude_entries, dry_run)?;
+        let added = upsert_skills_block(&exclude_file, &exclude_entries, dry_run)?;
         for entry in added {
             report.actions.push(SyncAction::Excluded {
                 exclude_file: exclude_file.clone(),
@@ -242,7 +248,34 @@ fn paths_equal(a: &Path, b: &Path) -> bool {
         .map_or_else(|| a == b, |(a, b)| a == b)
 }
 
-fn print_report(report: &SyncReport, dry_run: bool) {
+#[derive(Serialize)]
+struct SyncOutput<'a> {
+    dry_run: bool,
+    actions: &'a [SyncAction],
+    errors: &'a [SyncError],
+}
+
+fn print_report(report: &SyncReport, dry_run: bool, format: OutputFormat) -> Result<()> {
+    match format {
+        OutputFormat::Text => {
+            print_report_text(report, dry_run);
+            Ok(())
+        }
+        OutputFormat::Yaml => {
+            let output = SyncOutput {
+                dry_run,
+                actions: &report.actions,
+                errors: &report.errors,
+            };
+            let yaml = serde_yaml::to_string(&output)
+                .context("Failed to serialize sync report as YAML")?;
+            print!("{yaml}");
+            Ok(())
+        }
+    }
+}
+
+fn print_report_text(report: &SyncReport, dry_run: bool) {
     let prefix = if dry_run { "[dry-run] " } else { "" };
     for action in &report.actions {
         match action {
@@ -284,6 +317,8 @@ fn print_report(report: &SyncReport, dry_run: bool) {
 mod tests {
     use super::*;
 
+    use super::super::common::{BLOCK_BEGIN, BLOCK_END};
+
     use tempfile::TempDir;
 
     fn tempdir() -> TempDir {
@@ -301,8 +336,6 @@ mod tests {
         }
     }
 
-    /// Initialises a real git repository at `dir` so commands like
-    /// `git rev-parse --git-common-dir` work as expected.
     fn init_repo(dir: &Path) {
         let status = std::process::Command::new("git")
             .arg("init")
@@ -317,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn run_sync_creates_symlinks_and_exclude_entries() {
+    fn run_sync_creates_symlinks_and_exclude_block() {
         let src_tmp = tempdir();
         let tgt_tmp = tempdir();
         make_source_skills(src_tmp.path(), &["alpha", "bravo"]);
@@ -336,6 +369,8 @@ mod tests {
         }
 
         let exclude = fs::read_to_string(tgt_tmp.path().join(".git/info/exclude")).unwrap();
+        assert!(exclude.contains(BLOCK_BEGIN));
+        assert!(exclude.contains(BLOCK_END));
         assert!(exclude.contains(".claude/skills/alpha/"));
         assert!(exclude.contains(".claude/skills/bravo/"));
     }
@@ -349,7 +384,6 @@ mod tests {
         make_source_skills(other_tmp.path(), &["alpha"]);
         make_fake_repo(tgt_tmp.path());
 
-        // Pre-create a symlink pointing to the "other" source.
         let target_skills_dir = tgt_tmp.path().join(SKILLS_SUBPATH);
         fs::create_dir_all(&target_skills_dir).unwrap();
         create_symlink(
@@ -378,7 +412,6 @@ mod tests {
         make_source_skills(src_tmp.path(), &["alpha", "bravo"]);
         make_fake_repo(tgt_tmp.path());
 
-        // Place a real directory at the target of "alpha".
         let target_skills_dir = tgt_tmp.path().join(SKILLS_SUBPATH);
         fs::create_dir_all(target_skills_dir.join("alpha")).unwrap();
         fs::write(target_skills_dir.join("alpha").join("keep.txt"), "keep").unwrap();
@@ -386,12 +419,10 @@ mod tests {
         let report = run_sync(src_tmp.path(), &[tgt_tmp.path().to_path_buf()], false).unwrap();
         assert_eq!(report.errors.len(), 1);
         assert!(report.errors[0].target.ends_with(".claude/skills/alpha"));
-        // bravo should still have been linked
         assert!(fs::symlink_metadata(target_skills_dir.join("bravo"))
             .unwrap()
             .file_type()
             .is_symlink());
-        // alpha's real file should still exist
         assert!(target_skills_dir.join("alpha").join("keep.txt").exists());
     }
 
@@ -425,6 +456,7 @@ mod tests {
 
         let exclude = fs::read_to_string(tgt_tmp.path().join(".git/info/exclude")).unwrap();
         assert_eq!(exclude.matches(".claude/skills/alpha/").count(), 1);
+        assert_eq!(exclude.matches(BLOCK_BEGIN).count(), 1);
     }
 
     #[test]
@@ -441,7 +473,6 @@ mod tests {
             .iter()
             .any(|a| matches!(a, SyncAction::SkippedSameTarget { .. })));
 
-        // Original skill directory must not have been touched or replaced.
         let skill = src_tmp.path().join(SKILLS_SUBPATH).join("alpha");
         let meta = fs::symlink_metadata(&skill).unwrap();
         assert!(meta.is_dir() && !meta.file_type().is_symlink());
@@ -478,8 +509,6 @@ mod tests {
 
     #[test]
     fn paths_equal_falls_back_to_literal_comparison_when_canonicalize_fails() {
-        // Neither path exists so canonicalize returns Err — exercises the
-        // fallback `|| a == b` branch.
         assert!(paths_equal(
             Path::new("/nonexistent/skills/a"),
             Path::new("/nonexistent/skills/a")
@@ -503,6 +532,7 @@ mod tests {
             target: Some(tgt_tmp.path().to_path_buf()),
             worktrees: false,
             dry_run: false,
+            format: OutputFormat::Text,
         };
         cmd.execute().unwrap();
 
@@ -520,7 +550,6 @@ mod tests {
         init_repo(src_tmp.path());
         init_repo(tgt_tmp.path());
         make_source_skills(src_tmp.path(), &["alpha", "bravo"]);
-        // Pre-create a symlink so "alpha" is reported as Relinked.
         let target_skills_dir = tgt_tmp.path().join(SKILLS_SUBPATH);
         fs::create_dir_all(&target_skills_dir).unwrap();
         create_symlink(
@@ -534,6 +563,7 @@ mod tests {
             target: Some(tgt_tmp.path().to_path_buf()),
             worktrees: false,
             dry_run: true,
+            format: OutputFormat::Text,
         };
         cmd.execute().unwrap();
     }
@@ -545,7 +575,6 @@ mod tests {
         init_repo(src_tmp.path());
         init_repo(tgt_tmp.path());
         make_source_skills(src_tmp.path(), &["alpha"]);
-        // Place a real dir so the sync is blocked.
         fs::create_dir_all(tgt_tmp.path().join(SKILLS_SUBPATH).join("alpha")).unwrap();
 
         let cmd = SyncCommand {
@@ -553,6 +582,7 @@ mod tests {
             target: Some(tgt_tmp.path().to_path_buf()),
             worktrees: false,
             dry_run: false,
+            format: OutputFormat::Text,
         };
         let err = cmd.execute().unwrap_err().to_string();
         assert!(err.contains("blocked by existing files"));
@@ -560,7 +590,6 @@ mod tests {
 
     #[test]
     fn execute_skipped_same_target_covers_print_branch() {
-        // Exercises the SkippedSameTarget print path via execute.
         let src_tmp = tempdir();
         init_repo(src_tmp.path());
         make_source_skills(src_tmp.path(), &["alpha"]);
@@ -570,11 +599,11 @@ mod tests {
             target: Some(src_tmp.path().to_path_buf()),
             worktrees: false,
             dry_run: false,
+            format: OutputFormat::Text,
         };
         cmd.execute().unwrap();
     }
 
-    /// Initialise a repo with one commit so linked worktrees can be created from it.
     fn init_repo_with_commit(dir: &Path) {
         init_repo(dir);
         fs::write(dir.join("README.md"), "readme").unwrap();
@@ -603,8 +632,6 @@ mod tests {
 
     #[test]
     fn execute_source_defaults_to_cwd() {
-        // Covers the `source.unwrap_or_else(|| cwd.clone())` branch. Uses
-        // dry_run so no filesystem writes occur on the inferred source repo.
         let tgt = tempdir();
         init_repo(tgt.path());
         let cmd = SyncCommand {
@@ -612,15 +639,13 @@ mod tests {
             target: Some(tgt.path().to_path_buf()),
             worktrees: false,
             dry_run: true,
+            format: OutputFormat::Text,
         };
         cmd.execute().unwrap();
     }
 
     #[test]
     fn execute_target_defaults_to_source() {
-        // Covers the `target.unwrap_or_else(|| source_root.clone())` branch.
-        // With target == source the run skips with SkippedSameTarget, so no
-        // filesystem writes occur even though dry_run is false.
         let src = tempdir();
         init_repo(src.path());
         make_source_skills(src.path(), &["alpha"]);
@@ -630,9 +655,9 @@ mod tests {
             target: None,
             worktrees: false,
             dry_run: false,
+            format: OutputFormat::Text,
         };
         cmd.execute().unwrap();
-        // Source directory must remain a real directory.
         let skill = src.path().join(SKILLS_SUBPATH).join("alpha");
         let meta = fs::symlink_metadata(&skill).unwrap();
         assert!(meta.is_dir() && !meta.file_type().is_symlink());
@@ -651,8 +676,6 @@ mod tests {
 
         let target_skills = tgt.path().join(SKILLS_SUBPATH);
         fs::create_dir_all(&target_skills).unwrap();
-        // Removing search permission causes lstat on a path inside this dir to
-        // return EACCES (not NotFound), exercising the catch-all error arm.
         let mut perms = fs::metadata(&target_skills).unwrap().permissions();
         perms.set_mode(0o000);
         fs::set_permissions(&target_skills, perms).unwrap();
@@ -683,8 +706,6 @@ mod tests {
         make_source_skills(src.path(), &["alpha"]);
         make_source_skills(other.path(), &["alpha"]);
 
-        // Pre-create a symlink at the target then make the parent read-only so
-        // the subsequent remove_file/create_symlink fails.
         let target_skills = tgt.path().join(SKILLS_SUBPATH);
         fs::create_dir_all(&target_skills).unwrap();
         create_symlink(
@@ -723,14 +744,12 @@ mod tests {
 
         let target_skills = tgt.path().join(SKILLS_SUBPATH);
         fs::create_dir_all(&target_skills).unwrap();
-        // Make the skills directory read-only so create_symlink within it fails.
         let mut perms = fs::metadata(&target_skills).unwrap().permissions();
         perms.set_mode(0o500);
         fs::set_permissions(&target_skills, perms).unwrap();
 
         let result = run_sync(src.path(), &[tgt.path().to_path_buf()], false);
 
-        // Restore writable perms so TempDir cleanup succeeds.
         let mut perms = fs::metadata(&target_skills).unwrap().permissions();
         perms.set_mode(0o700);
         fs::set_permissions(&target_skills, perms).unwrap();
@@ -744,8 +763,6 @@ mod tests {
 
     #[test]
     fn run_sync_propagates_create_dir_all_failure() {
-        // Place a regular file at `<target>/.claude` so that creating
-        // `<target>/.claude/skills` fails with a context-wrapped error.
         let src = tempdir();
         let tgt = tempdir();
         init_repo(src.path());
@@ -783,6 +800,7 @@ mod tests {
             target: Some(tgt_main.path().to_path_buf()),
             worktrees: true,
             dry_run: false,
+            format: OutputFormat::Text,
         };
         cmd.execute().unwrap();
 
@@ -796,5 +814,91 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+
+    #[test]
+    fn execute_yaml_format_serializes_report() {
+        let src = tempdir();
+        let tgt = tempdir();
+        init_repo(src.path());
+        init_repo(tgt.path());
+        make_source_skills(src.path(), &["alpha"]);
+
+        let cmd = SyncCommand {
+            source: Some(src.path().to_path_buf()),
+            target: Some(tgt.path().to_path_buf()),
+            worktrees: false,
+            dry_run: false,
+            format: OutputFormat::Yaml,
+        };
+        cmd.execute().unwrap();
+    }
+
+    #[test]
+    fn print_report_text_covers_all_action_variants_and_both_prefixes() {
+        let report = SyncReport {
+            actions: vec![
+                SyncAction::Linked {
+                    link: PathBuf::from("/a"),
+                    points_to: PathBuf::from("/b"),
+                },
+                SyncAction::Relinked {
+                    link: PathBuf::from("/c"),
+                    points_to: PathBuf::from("/d"),
+                },
+                SyncAction::Excluded {
+                    exclude_file: PathBuf::from("/e"),
+                    entry: ".claude/skills/x/".to_string(),
+                },
+                SyncAction::SkippedSameTarget {
+                    target: PathBuf::from("/f"),
+                },
+            ],
+            errors: vec![SyncError {
+                target: PathBuf::from("/g"),
+                reason: "blocked".to_string(),
+            }],
+        };
+        print_report_text(&report, false);
+        print_report_text(&report, true);
+    }
+
+    #[test]
+    fn print_report_yaml_serializes_all_action_variants() {
+        let report = SyncReport {
+            actions: vec![
+                SyncAction::Linked {
+                    link: PathBuf::from("/a"),
+                    points_to: PathBuf::from("/b"),
+                },
+                SyncAction::Relinked {
+                    link: PathBuf::from("/c"),
+                    points_to: PathBuf::from("/d"),
+                },
+                SyncAction::Excluded {
+                    exclude_file: PathBuf::from("/e"),
+                    entry: ".claude/skills/x/".to_string(),
+                },
+                SyncAction::SkippedSameTarget {
+                    target: PathBuf::from("/f"),
+                },
+            ],
+            errors: vec![SyncError {
+                target: PathBuf::from("/g"),
+                reason: "blocked".to_string(),
+            }],
+        };
+        let output = SyncOutput {
+            dry_run: true,
+            actions: &report.actions,
+            errors: &report.errors,
+        };
+        let yaml = serde_yaml::to_string(&output).unwrap();
+        assert!(yaml.contains("dry_run: true"));
+        assert!(yaml.contains("type: linked"));
+        assert!(yaml.contains("type: relinked"));
+        assert!(yaml.contains("type: excluded"));
+        assert!(yaml.contains("type: skipped_same_target"));
+        assert!(yaml.contains("blocked"));
     }
 }
