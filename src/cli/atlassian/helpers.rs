@@ -173,6 +173,75 @@ pub async fn run_write(
     Ok(())
 }
 
+/// Confirms and pushes content (description, title, and custom fields) to
+/// a JIRA issue via [`AtlassianClient::update_issue_with_custom_fields`].
+///
+/// Used by the JIRA write path when custom fields are present. Goes direct
+/// to the client rather than through [`AtlassianApi`] since the trait does
+/// not model custom fields.
+pub async fn run_write_jira_with_resolved_fields(
+    key: &str,
+    adf: &AdfDocument,
+    title: &str,
+    force: bool,
+    custom_fields: &std::collections::BTreeMap<String, serde_json::Value>,
+    client: &AtlassianClient,
+) -> Result<()> {
+    if !force {
+        println!("About to update {key}:");
+        if !title.is_empty() {
+            println!("  Title: {title}");
+        }
+        if !custom_fields.is_empty() {
+            println!("  Custom fields: {}", custom_fields.len());
+        }
+        print!("\nApply changes? [y/N] ");
+        io::stdout().flush()?;
+
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        if !answer.trim().eq_ignore_ascii_case("y") {
+            println!("Cancelled.");
+            return Ok(());
+        }
+    }
+
+    let title_ref = if title.is_empty() { None } else { Some(title) };
+
+    client
+        .update_issue_with_custom_fields(key, adf, title_ref, custom_fields)
+        .await?;
+    println!("Updated {key} successfully.");
+
+    Ok(())
+}
+
+/// Prints a dry-run summary including the resolved custom fields payload.
+pub fn print_jira_dry_run_with_custom_fields(
+    key: &str,
+    adf: &AdfDocument,
+    title: &str,
+    scalars: &std::collections::BTreeMap<String, serde_yaml::Value>,
+    sections: &[crate::atlassian::document::CustomFieldSection],
+) -> Result<()> {
+    print_dry_run(key, adf, title)?;
+    if !scalars.is_empty() {
+        println!("\nCustom field scalars (frontmatter):");
+        for (name, value) in scalars {
+            let rendered =
+                serde_yaml::to_string(value).context("Failed to serialize scalar as YAML")?;
+            println!("  {name}: {}", rendered.trim());
+        }
+    }
+    if !sections.is_empty() {
+        println!("\nCustom field sections (body):");
+        for section in sections {
+            println!("  - {} ({})", section.name, section.id);
+        }
+    }
+    Ok(())
+}
+
 /// Interactive fetch-edit-push cycle.
 pub async fn run_edit(id: &str, api: &dyn AtlassianApi, instance_url: &str) -> Result<()> {
     use tracing::debug;
@@ -872,6 +941,94 @@ mod tests {
             &instance_url,
         )
         .await;
+        assert!(result.is_ok());
+    }
+
+    // ── run_write_jira_with_resolved_fields ────────────────────────
+
+    #[tokio::test]
+    async fn run_write_jira_with_resolved_fields_force_applies_payload() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/ACCS-1"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "fields": {
+                    "description": {"version": 1, "type": "doc", "content": []},
+                    "summary": "New",
+                    "customfield_10001": {"value": "Unplanned"}
+                }
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let adf = AdfDocument::new();
+        let mut custom = std::collections::BTreeMap::new();
+        custom.insert(
+            "customfield_10001".to_string(),
+            serde_json::json!({"value": "Unplanned"}),
+        );
+
+        let result =
+            run_write_jira_with_resolved_fields("ACCS-1", &adf, "New", true, &custom, &client)
+                .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_write_jira_with_resolved_fields_empty_title_sends_no_summary() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/ACCS-1"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "fields": {
+                    "description": {"version": 1, "type": "doc", "content": []},
+                    "customfield_10001": 42
+                }
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let adf = AdfDocument::new();
+        let mut custom = std::collections::BTreeMap::new();
+        custom.insert("customfield_10001".to_string(), serde_json::json!(42));
+
+        run_write_jira_with_resolved_fields("ACCS-1", &adf, "", true, &custom, &client)
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn print_jira_dry_run_with_scalars_and_sections() {
+        use crate::atlassian::document::CustomFieldSection;
+        let adf = AdfDocument::new();
+        let mut scalars = std::collections::BTreeMap::new();
+        scalars.insert(
+            "Planned / Unplanned Work".to_string(),
+            serde_yaml::Value::String("Unplanned".to_string()),
+        );
+        let sections = [CustomFieldSection {
+            name: "Acceptance Criteria".to_string(),
+            id: "customfield_19300".to_string(),
+            body: "- item".to_string(),
+        }];
+        let result =
+            print_jira_dry_run_with_custom_fields("ACCS-1", &adf, "T", &scalars, &sections);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn print_jira_dry_run_without_extras_still_prints_description() {
+        let adf = AdfDocument::new();
+        let scalars = std::collections::BTreeMap::new();
+        let result = print_jira_dry_run_with_custom_fields("ACCS-1", &adf, "", &scalars, &[]);
         assert!(result.is_ok());
     }
 

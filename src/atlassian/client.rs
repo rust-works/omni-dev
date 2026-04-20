@@ -100,6 +100,48 @@ pub struct JiraCustomField {
     pub value: serde_json::Value,
 }
 
+/// Metadata returned by `GET /rest/api/3/issue/{key}/editmeta`.
+///
+/// Scoped to fields on the issue's screen, so names are unambiguous for a
+/// given issue even when multiple custom fields share a display name
+/// globally.
+#[derive(Debug, Clone, Default)]
+pub struct EditMeta {
+    /// Field metadata keyed by field ID (e.g., `customfield_19300`).
+    pub fields: std::collections::BTreeMap<String, EditMetaField>,
+}
+
+/// A single field descriptor from the editmeta response.
+#[derive(Debug, Clone)]
+pub struct EditMetaField {
+    /// Human-readable field name.
+    pub name: String,
+
+    /// Schema describing the field's wire type.
+    pub schema: EditMetaSchema,
+}
+
+/// Schema type information for an editable field.
+#[derive(Debug, Clone)]
+pub struct EditMetaSchema {
+    /// Base type: `string`, `number`, `option`, `array`, `user`, `date`, etc.
+    pub kind: String,
+
+    /// For custom fields: the plugin type URI, e.g.
+    /// `com.atlassian.jira.plugin.system.customfieldtypes:textarea`.
+    pub custom: Option<String>,
+}
+
+impl EditMetaField {
+    /// Returns `true` when the field is a rich-text (ADF) custom field.
+    pub fn is_adf_rich_text(&self) -> bool {
+        matches!(
+            self.schema.custom.as_deref(),
+            Some("com.atlassian.jira.plugin.system.customfieldtypes:textarea")
+        )
+    }
+}
+
 /// Response from the JIRA `/myself` endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JiraUser {
@@ -596,6 +638,28 @@ fn extract_display_name(value: Option<serde_json::Value>) -> Option<String> {
     value
         .and_then(|v| v.get("displayName").cloned())
         .and_then(|n| n.as_str().map(str::to_string))
+}
+
+#[derive(Deserialize)]
+struct JiraEditMetaResponse {
+    #[serde(default)]
+    fields: std::collections::BTreeMap<String, JiraEditMetaField>,
+}
+
+#[derive(Deserialize)]
+struct JiraEditMetaField {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    schema: Option<JiraEditMetaSchemaRaw>,
+}
+
+#[derive(Deserialize)]
+struct JiraEditMetaSchemaRaw {
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    #[serde(default)]
+    custom: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1675,6 +1739,130 @@ mod tests {
             .collect();
         assert!(names.contains(&"Planned / Unplanned Work"));
         assert!(names.contains(&"Story points"));
+    }
+
+    #[tokio::test]
+    async fn get_editmeta_parses_field_schema() {
+        let server = wiremock::MockServer::start().await;
+
+        let editmeta_json = serde_json::json!({
+            "fields": {
+                "customfield_19300": {
+                    "name": "Acceptance Criteria",
+                    "schema": {
+                        "type": "string",
+                        "custom": "com.atlassian.jira.plugin.system.customfieldtypes:textarea",
+                        "customId": 19300
+                    }
+                },
+                "customfield_10001": {
+                    "name": "Planned / Unplanned Work",
+                    "schema": {
+                        "type": "option",
+                        "custom": "com.atlassian.jira.plugin.system.customfieldtypes:select",
+                        "customId": 10001
+                    }
+                }
+            }
+        });
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/ACCS-1/editmeta",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&editmeta_json))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let meta = client.get_editmeta("ACCS-1").await.unwrap();
+
+        assert_eq!(meta.fields.len(), 2);
+        let ac = meta.fields.get("customfield_19300").unwrap();
+        assert_eq!(ac.name, "Acceptance Criteria");
+        assert!(ac.is_adf_rich_text());
+        let opt = meta.fields.get("customfield_10001").unwrap();
+        assert_eq!(opt.schema.kind, "option");
+        assert!(!opt.is_adf_rich_text());
+    }
+
+    #[tokio::test]
+    async fn get_editmeta_api_error_surfaces_status() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/NOPE-1/editmeta",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.get_editmeta("NOPE-1").await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn update_issue_with_custom_fields_merges_into_payload() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/ACCS-1"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "fields": {
+                    "description": {"version": 1, "type": "doc", "content": []},
+                    "summary": "New title",
+                    "customfield_10001": {"value": "Unplanned"},
+                    "customfield_19300": {
+                        "type": "doc",
+                        "version": 1,
+                        "content": [{"type": "paragraph"}]
+                    }
+                }
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let adf = AdfDocument::new();
+        let mut custom = std::collections::BTreeMap::new();
+        custom.insert(
+            "customfield_10001".to_string(),
+            serde_json::json!({"value": "Unplanned"}),
+        );
+        custom.insert(
+            "customfield_19300".to_string(),
+            serde_json::json!({"type": "doc", "version": 1, "content": [{"type": "paragraph"}]}),
+        );
+        let result = client
+            .update_issue_with_custom_fields("ACCS-1", &adf, Some("New title"), &custom)
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn update_issue_shim_sends_no_custom_fields() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/ACCS-1"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "fields": {
+                    "description": {"version": 1, "type": "doc", "content": []}
+                }
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let adf = AdfDocument::new();
+        client.update_issue("ACCS-1", &adf, None).await.unwrap();
     }
 
     #[tokio::test]
@@ -5180,11 +5368,32 @@ impl AtlassianClient {
     }
 
     /// Updates a JIRA issue's description and optionally its summary.
+    ///
+    /// Thin shim over [`Self::update_issue_with_custom_fields`] that sends no
+    /// custom field changes.
     pub async fn update_issue(
         &self,
         key: &str,
         description_adf: &AdfDocument,
         summary: Option<&str>,
+    ) -> Result<()> {
+        self.update_issue_with_custom_fields(
+            key,
+            description_adf,
+            summary,
+            &std::collections::BTreeMap::new(),
+        )
+        .await
+    }
+
+    /// Updates a JIRA issue's description, optionally its summary, and any
+    /// custom fields keyed by stable ID (e.g., `customfield_19300`).
+    pub async fn update_issue_with_custom_fields(
+        &self,
+        key: &str,
+        description_adf: &AdfDocument,
+        summary: Option<&str>,
+        custom_fields: &std::collections::BTreeMap<String, serde_json::Value>,
     ) -> Result<()> {
         let url = format!("{}/rest/api/3/issue/{}", self.instance_url, key);
 
@@ -5198,6 +5407,9 @@ impl AtlassianClient {
                 "summary".to_string(),
                 serde_json::Value::String(summary_text.to_string()),
             );
+        }
+        for (id, value) in custom_fields {
+            fields.insert(id.clone(), value.clone());
         }
 
         let body = serde_json::json!({ "fields": fields });
@@ -5219,6 +5431,60 @@ impl AtlassianClient {
         }
 
         Ok(())
+    }
+
+    /// Fetches editable field metadata scoped to an issue's edit screen.
+    ///
+    /// `GET /rest/api/3/issue/{key}/editmeta` returns only fields on the
+    /// issue's screen, so field names are unambiguous even when multiple
+    /// custom fields share a display name globally.
+    pub async fn get_editmeta(&self, key: &str) -> Result<EditMeta> {
+        let url = format!("{}/rest/api/3/issue/{}/editmeta", self.instance_url, key);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("Authorization", &self.auth_header)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .context("Failed to send editmeta request to JIRA API")?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let raw: JiraEditMetaResponse = response
+            .json()
+            .await
+            .context("Failed to parse JIRA editmeta response")?;
+
+        let fields = raw
+            .fields
+            .into_iter()
+            .map(|(id, field)| {
+                let schema = field.schema.map_or_else(
+                    || EditMetaSchema {
+                        kind: String::new(),
+                        custom: None,
+                    },
+                    |s| EditMetaSchema {
+                        kind: s.kind.unwrap_or_default(),
+                        custom: s.custom,
+                    },
+                );
+                (
+                    id,
+                    EditMetaField {
+                        name: field.name.unwrap_or_default(),
+                        schema,
+                    },
+                )
+            })
+            .collect();
+        Ok(EditMeta { fields })
     }
 
     /// Creates a new JIRA issue.

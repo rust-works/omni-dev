@@ -155,6 +155,15 @@ impl JfmFrontmatter {
             Self::Confluence(_) => "confluence",
         }
     }
+
+    /// Returns the JIRA custom field scalar map, or `None` when the
+    /// frontmatter is not a JIRA variant.
+    pub fn jira_custom_fields(&self) -> Option<&BTreeMap<String, serde_yaml::Value>> {
+        match self {
+            Self::Jira(fm) => Some(&fm.custom_fields),
+            Self::Confluence(_) => None,
+        }
+    }
 }
 
 /// Validates that a string looks like a JIRA issue key (e.g., "PROJ-123").
@@ -240,6 +249,122 @@ fn append_custom_section(body: &mut String, field: &JiraCustomField, section_md:
     if !body.ends_with('\n') {
         body.push('\n');
     }
+}
+
+/// A single rich-text custom field section parsed out of a JFM body.
+///
+/// Emitted by [`issue_to_jfm_document`] via [`append_custom_section`] and
+/// recovered by [`JfmDocument::split_custom_sections`] so the write path
+/// can round-trip a field through `markdown_to_adf` for upload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomFieldSection {
+    /// Human-readable field name captured from the `<!-- field: Name (id) -->` tag.
+    pub name: String,
+
+    /// Stable field ID captured from the tag (e.g., `customfield_19300`).
+    pub id: String,
+
+    /// Markdown body of the section (no trailing newline guarantees).
+    pub body: String,
+}
+
+/// Splits a JFM body into the primary body and any trailing custom-field
+/// sections.
+///
+/// Recognizes the separator emitted by [`append_custom_section`]: a line
+/// containing only `---` followed by a line matching
+/// `<!-- field: <name> (<id>) -->`. Everything before the first such
+/// separator is the primary body; each subsequent separator starts a new
+/// section whose content runs up to the next separator (or end of input).
+pub(crate) fn split_custom_sections(body: &str) -> (String, Vec<CustomFieldSection>) {
+    // (marker_start, content_start, name, id)
+    let mut markers: Vec<(usize, usize, String, String)> = Vec::new();
+    let mut cursor = 0;
+
+    while cursor < body.len() {
+        let Some(marker_start) = find_next_marker(body, cursor) else {
+            break;
+        };
+
+        // Require exactly "---" on its own line, followed by "\n" (or "\r\n").
+        let after_dashes = marker_start + 3;
+        let after_nl = if body[after_dashes..].starts_with("\r\n") {
+            after_dashes + 2
+        } else if body[after_dashes..].starts_with('\n') {
+            after_dashes + 1
+        } else {
+            cursor = after_dashes;
+            continue;
+        };
+
+        if let Some((name, id, content_start)) = parse_field_tag_line(body, after_nl) {
+            markers.push((marker_start, content_start, name, id));
+            cursor = content_start;
+        } else {
+            cursor = after_nl;
+        }
+    }
+
+    if markers.is_empty() {
+        return (body.to_string(), Vec::new());
+    }
+
+    let first_marker = markers[0].0;
+    let main_body = body[..first_marker].trim_end_matches('\n').to_string();
+
+    let mut sections = Vec::with_capacity(markers.len());
+    for i in 0..markers.len() {
+        let (_marker, content_start, name, id) = &markers[i];
+        let content_end = markers.get(i + 1).map_or(body.len(), |next| next.0);
+        let raw = &body[*content_start..content_end];
+        let trimmed = raw.trim_matches('\n').to_string();
+        sections.push(CustomFieldSection {
+            name: name.clone(),
+            id: id.clone(),
+            body: trimmed,
+        });
+    }
+
+    (main_body, sections)
+}
+
+/// Finds the next line-anchored `---` at or after `from`. A marker is
+/// either at the very start of `body` or preceded by a newline.
+fn find_next_marker(body: &str, from: usize) -> Option<usize> {
+    if from == 0 && body.starts_with("---") {
+        return Some(0);
+    }
+    body[from..]
+        .find("\n---")
+        .map(|rel| from + rel + 1)
+        .filter(|p| *p + 3 <= body.len())
+}
+
+/// Parses an HTML-comment field tag at `start` and returns
+/// `(name, id, content_start)` where `content_start` is the byte offset
+/// immediately after the comment line's newline.
+fn parse_field_tag_line(body: &str, start: usize) -> Option<(String, String, usize)> {
+    let rest = body.get(start..)?;
+    let line_end = rest.find('\n').unwrap_or(rest.len());
+    let line = rest[..line_end].trim_end_matches('\r');
+
+    let after_open = line.strip_prefix("<!--")?.trim_start();
+    let after_field = after_open.strip_prefix("field:")?.trim_start();
+    let close_idx = after_field.rfind("-->")?;
+    let inner = after_field[..close_idx].trim_end();
+
+    let paren_open = inner.rfind('(')?;
+    let name = inner[..paren_open].trim().to_string();
+    let rest_part = inner.get(paren_open + 1..)?;
+    let paren_close = rest_part.rfind(')')?;
+    let id = rest_part[..paren_close].trim().to_string();
+
+    if name.is_empty() || id.is_empty() {
+        return None;
+    }
+
+    let next_line_start = (start + line_end + 1).min(body.len());
+    Some((name, id, next_line_start))
 }
 
 /// Returns `true` if `value` has the shape of an Atlassian Document Format
@@ -404,6 +529,15 @@ impl JfmDocument {
         }
 
         Ok(output)
+    }
+
+    /// Splits the body into the primary markdown and any trailing custom-field
+    /// sections emitted by the custom-field-aware read path.
+    ///
+    /// Non-destructive — returns owned strings and leaves `self.body`
+    /// unchanged so `render()` continues to produce a lossless round-trip.
+    pub fn split_custom_sections(&self) -> (String, Vec<CustomFieldSection>) {
+        split_custom_sections(&self.body)
     }
 }
 
@@ -834,6 +968,84 @@ mod tests {
         assert!(rendered.contains("Main"));
         assert!(rendered.contains("<!-- field: Acceptance Criteria"));
         assert!(rendered.contains("AC body"));
+    }
+
+    // ── split_custom_sections ──────────────────────────────────────
+
+    #[test]
+    fn split_custom_sections_no_sections_returns_body_unchanged() {
+        let (body, sections) = split_custom_sections("Hello world\n\nMore text\n");
+        assert_eq!(body, "Hello world\n\nMore text\n");
+        assert!(sections.is_empty());
+    }
+
+    #[test]
+    fn split_custom_sections_extracts_single_section() {
+        let input = "Main body\n\n---\n<!-- field: Acceptance Criteria (customfield_19300) -->\n\n- Item 1\n- Item 2\n";
+        let (body, sections) = split_custom_sections(input);
+        assert_eq!(body, "Main body");
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].name, "Acceptance Criteria");
+        assert_eq!(sections[0].id, "customfield_19300");
+        assert_eq!(sections[0].body, "- Item 1\n- Item 2");
+    }
+
+    #[test]
+    fn split_custom_sections_extracts_multiple_sections() {
+        let input = "Main\n\n---\n<!-- field: AC (customfield_1) -->\n\nAC body\n\n---\n<!-- field: Notes (customfield_2) -->\n\nNotes body\n";
+        let (body, sections) = split_custom_sections(input);
+        assert_eq!(body, "Main");
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].id, "customfield_1");
+        assert_eq!(sections[0].body, "AC body");
+        assert_eq!(sections[1].id, "customfield_2");
+        assert_eq!(sections[1].body, "Notes body");
+    }
+
+    #[test]
+    fn split_custom_sections_preserves_triple_dashes_inside_body() {
+        // A `---` without the follow-up comment tag is just content, not a
+        // section separator.
+        let input =
+            "Before\n\n---\n\nStill body\n\n---\n<!-- field: AC (customfield_1) -->\n\nSection\n";
+        let (body, sections) = split_custom_sections(input);
+        assert!(body.contains("Still body"));
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].body, "Section");
+    }
+
+    #[test]
+    fn split_custom_sections_roundtrips_through_render() {
+        let issue = JiraIssue {
+            key: "TEST-1".to_string(),
+            summary: "S".to_string(),
+            description_adf: Some(serde_json::json!({
+                "type": "doc", "version": 1,
+                "content": [{"type":"paragraph","content":[{"type":"text","text":"Main"}]}]
+            })),
+            status: None,
+            issue_type: None,
+            assignee: None,
+            priority: None,
+            labels: vec![],
+            custom_fields: vec![JiraCustomField {
+                id: "customfield_19300".to_string(),
+                name: "Acceptance Criteria".to_string(),
+                value: serde_json::json!({
+                    "type": "doc", "version": 1,
+                    "content": [{"type":"paragraph","content":[{"type":"text","text":"AC line"}]}]
+                }),
+            }],
+        };
+        let doc = issue_to_jfm_document(&issue, "https://org.atlassian.net").unwrap();
+        let rendered = doc.render().unwrap();
+        let reparsed = JfmDocument::parse(&rendered).unwrap();
+        let (body, sections) = reparsed.split_custom_sections();
+        assert!(body.contains("Main"));
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].id, "customfield_19300");
+        assert_eq!(sections[0].name, "Acceptance Criteria");
+        assert!(sections[0].body.contains("AC line"));
     }
 
     #[test]
