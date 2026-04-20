@@ -3,9 +3,15 @@
 use anyhow::Result;
 use clap::Parser;
 
+use crate::atlassian::convert::markdown_to_adf;
+use crate::atlassian::custom_fields::resolve_custom_fields;
+use crate::atlassian::document::JfmDocument;
 use crate::atlassian::jira_api::JiraApi;
 use crate::cli::atlassian::format::ContentFormat;
-use crate::cli::atlassian::helpers::{create_client, prepare_write, run_write};
+use crate::cli::atlassian::helpers::{
+    create_client, prepare_write, print_dry_run, print_jira_dry_run_with_custom_fields, read_input,
+    run_write, run_write_jira_with_resolved_fields,
+};
 
 /// Pushes content to a JIRA issue.
 #[derive(Parser)]
@@ -32,16 +38,48 @@ pub struct WriteCommand {
 impl WriteCommand {
     /// Reads input and pushes to the JIRA issue.
     pub async fn execute(self) -> Result<()> {
-        let (adf, title) = prepare_write(self.file.as_deref(), &self.format)?;
+        if matches!(self.format, ContentFormat::Adf) {
+            let (adf, title) = prepare_write(self.file.as_deref(), &self.format)?;
+            if self.dry_run {
+                return print_dry_run(&self.key, &adf, &title);
+            }
+            let (client, _instance_url) = create_client()?;
+            let api = JiraApi::new(client);
+            return run_write(&self.key, &adf, &title, self.force, &api).await;
+        }
+
+        // JFM path: may carry custom fields in frontmatter or body sections.
+        let input = read_input(self.file.as_deref())?;
+        let doc = JfmDocument::parse(&input)?;
+        let (body_md, sections) = doc.split_custom_sections();
+        let scalars = doc
+            .frontmatter
+            .jira_custom_fields()
+            .cloned()
+            .unwrap_or_default();
+        let body_adf = markdown_to_adf(&body_md)?;
+        let title = doc.frontmatter.title().to_string();
 
         if self.dry_run {
-            return crate::cli::atlassian::helpers::print_dry_run(&self.key, &adf, &title);
+            return print_jira_dry_run_with_custom_fields(
+                &self.key, &body_adf, &title, &scalars, &sections,
+            );
         }
 
         let (client, _instance_url) = create_client()?;
-        let api = JiraApi::new(client);
 
-        run_write(&self.key, &adf, &title, self.force, &api).await
+        if scalars.is_empty() && sections.is_empty() {
+            let api = JiraApi::new(client);
+            return run_write(&self.key, &body_adf, &title, self.force, &api).await;
+        }
+
+        let editmeta = client.get_editmeta(&self.key).await?;
+        let resolved = resolve_custom_fields(&scalars, &sections, &editmeta)?;
+
+        run_write_jira_with_resolved_fields(
+            &self.key, &body_adf, &title, self.force, &resolved, &client,
+        )
+        .await
     }
 }
 
