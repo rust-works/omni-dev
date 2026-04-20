@@ -663,6 +663,24 @@ struct JiraEditMetaSchemaRaw {
 }
 
 #[derive(Deserialize)]
+struct JiraCreateMetaResponse {
+    #[serde(default)]
+    projects: Vec<JiraCreateMetaProject>,
+}
+
+#[derive(Deserialize)]
+struct JiraCreateMetaProject {
+    #[serde(default)]
+    issuetypes: Vec<JiraCreateMetaIssueType>,
+}
+
+#[derive(Deserialize)]
+struct JiraCreateMetaIssueType {
+    #[serde(default)]
+    fields: std::collections::BTreeMap<String, JiraEditMetaField>,
+}
+
+#[derive(Deserialize)]
 struct JiraIssueFields {
     summary: Option<String>,
     description: Option<serde_json::Value>,
@@ -2148,6 +2166,153 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("400"));
+    }
+
+    #[tokio::test]
+    async fn create_issue_with_custom_fields_merges_into_payload() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/issue"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "fields": {
+                    "project": {"key": "PROJ"},
+                    "issuetype": {"name": "Task"},
+                    "summary": "Test",
+                    "customfield_10001": {"value": "Unplanned"}
+                }
+            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "id": "100",
+                    "key": "PROJ-100",
+                    "self": "https://org.atlassian.net/rest/api/3/issue/100"
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let mut custom = std::collections::BTreeMap::new();
+        custom.insert(
+            "customfield_10001".to_string(),
+            serde_json::json!({"value": "Unplanned"}),
+        );
+        let result = client
+            .create_issue_with_custom_fields("PROJ", "Task", "Test", None, &[], &custom)
+            .await
+            .unwrap();
+        assert_eq!(result.key, "PROJ-100");
+    }
+
+    #[tokio::test]
+    async fn create_issue_shim_sends_no_custom_fields() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/issue"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "fields": {
+                    "project": {"key": "PROJ"},
+                    "issuetype": {"name": "Task"},
+                    "summary": "Test"
+                }
+            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "id": "100",
+                    "key": "PROJ-100",
+                    "self": "https://org.atlassian.net/rest/api/3/issue/100"
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        client
+            .create_issue("PROJ", "Task", "Test", None, &[])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_createmeta_parses_nested_fields() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/createmeta"))
+            .and(wiremock::matchers::query_param("projectKeys", "PROJ"))
+            .and(wiremock::matchers::query_param("issuetypeNames", "Task"))
+            .and(wiremock::matchers::query_param(
+                "expand",
+                "projects.issuetypes.fields",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "projects": [{
+                        "key": "PROJ",
+                        "issuetypes": [{
+                            "name": "Task",
+                            "fields": {
+                                "customfield_10001": {
+                                    "name": "Planned / Unplanned Work",
+                                    "schema": {
+                                        "type": "option",
+                                        "custom": "com.atlassian.jira.plugin.system.customfieldtypes:select",
+                                        "customId": 10001
+                                    }
+                                }
+                            }
+                        }]
+                    }]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let meta = client.get_createmeta("PROJ", "Task").await.unwrap();
+        assert_eq!(meta.fields.len(), 1);
+        let field = meta.fields.get("customfield_10001").unwrap();
+        assert_eq!(field.name, "Planned / Unplanned Work");
+        assert_eq!(field.schema.kind, "option");
+    }
+
+    #[tokio::test]
+    async fn get_createmeta_empty_projects_returns_empty_meta() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/createmeta"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "projects": []
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let meta = client.get_createmeta("PROJ", "Task").await.unwrap();
+        assert!(meta.fields.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_createmeta_api_error_surfaces_status() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/createmeta"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not found"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.get_createmeta("NOPE", "Task").await.unwrap_err();
+        assert!(err.to_string().contains("404"));
     }
 
     #[tokio::test]
@@ -5488,6 +5653,9 @@ impl AtlassianClient {
     }
 
     /// Creates a new JIRA issue.
+    ///
+    /// Thin shim over [`Self::create_issue_with_custom_fields`] that sends no
+    /// custom field values.
     pub async fn create_issue(
         &self,
         project_key: &str,
@@ -5495,6 +5663,28 @@ impl AtlassianClient {
         summary: &str,
         description_adf: Option<&AdfDocument>,
         labels: &[String],
+    ) -> Result<JiraCreatedIssue> {
+        self.create_issue_with_custom_fields(
+            project_key,
+            issue_type,
+            summary,
+            description_adf,
+            labels,
+            &std::collections::BTreeMap::new(),
+        )
+        .await
+    }
+
+    /// Creates a new JIRA issue with standard fields and any custom fields
+    /// keyed by stable ID (e.g., `customfield_19300`).
+    pub async fn create_issue_with_custom_fields(
+        &self,
+        project_key: &str,
+        issue_type: &str,
+        summary: &str,
+        description_adf: Option<&AdfDocument>,
+        labels: &[String],
+        custom_fields: &std::collections::BTreeMap<String, serde_json::Value>,
     ) -> Result<JiraCreatedIssue> {
         let url = format!("{}/rest/api/3/issue", self.instance_url);
 
@@ -5520,6 +5710,9 @@ impl AtlassianClient {
         if !labels.is_empty() {
             fields.insert("labels".to_string(), serde_json::to_value(labels)?);
         }
+        for (id, value) in custom_fields {
+            fields.insert(id.clone(), value.clone());
+        }
 
         let body = serde_json::json!({ "fields": fields });
 
@@ -5544,6 +5737,77 @@ impl AtlassianClient {
             id: create_response.id,
             self_url: create_response.self_url,
         })
+    }
+
+    /// Fetches field metadata for creating a JIRA issue of a given project
+    /// and issue type.
+    ///
+    /// `GET /rest/api/3/issue/createmeta?projectKeys={p}&issuetypeNames={t}&expand=projects.issuetypes.fields`
+    /// returns fields on the create screen, which is the write-time source
+    /// of truth for custom-field resolution prior to issue creation.
+    pub async fn get_createmeta(&self, project_key: &str, issue_type: &str) -> Result<EditMeta> {
+        let base = format!("{}/rest/api/3/issue/createmeta", self.instance_url);
+        let url = reqwest::Url::parse_with_params(
+            &base,
+            &[
+                ("projectKeys", project_key),
+                ("issuetypeNames", issue_type),
+                ("expand", "projects.issuetypes.fields"),
+            ],
+        )
+        .context("Failed to build JIRA createmeta URL")?;
+
+        let response = self
+            .client
+            .get(url)
+            .header("Authorization", &self.auth_header)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .context("Failed to send createmeta request to JIRA API")?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let raw: JiraCreateMetaResponse = response
+            .json()
+            .await
+            .context("Failed to parse JIRA createmeta response")?;
+
+        let Some(project) = raw.projects.into_iter().next() else {
+            return Ok(EditMeta::default());
+        };
+        let Some(issuetype) = project.issuetypes.into_iter().next() else {
+            return Ok(EditMeta::default());
+        };
+
+        let fields = issuetype
+            .fields
+            .into_iter()
+            .map(|(id, field)| {
+                let schema = field.schema.map_or_else(
+                    || EditMetaSchema {
+                        kind: String::new(),
+                        custom: None,
+                    },
+                    |s| EditMetaSchema {
+                        kind: s.kind.unwrap_or_default(),
+                        custom: s.custom,
+                    },
+                );
+                (
+                    id,
+                    EditMetaField {
+                        name: field.name.unwrap_or_default(),
+                        schema,
+                    },
+                )
+            })
+            .collect();
+        Ok(EditMeta { fields })
     }
 
     /// Lists comments on a JIRA issue with auto-pagination.

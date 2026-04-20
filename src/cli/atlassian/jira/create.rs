@@ -1,12 +1,17 @@
 //! CLI command for creating JIRA issues.
 
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 
 use crate::atlassian::adf::AdfDocument;
 use crate::atlassian::client::AtlassianClient;
 use crate::atlassian::convert::markdown_to_adf;
-use crate::atlassian::document::{JfmDocument, JfmFrontmatter};
+use crate::atlassian::custom_fields::{
+    merge_set_field_overrides, parse_set_field, resolve_custom_fields,
+};
+use crate::atlassian::document::{CustomFieldSection, JfmDocument, JfmFrontmatter};
 use crate::cli::atlassian::format::ContentFormat;
 use crate::cli::atlassian::helpers::{create_client, print_create_dry_run, read_input};
 
@@ -32,6 +37,13 @@ pub struct CreateCommand {
     #[arg(long)]
     pub summary: Option<String>,
 
+    /// Set a custom field inline: `--set-field "NAME=VALUE"`. Can be used
+    /// multiple times. Values are parsed as YAML scalars (numbers, bools)
+    /// when possible, falling back to strings. Overrides values from the
+    /// frontmatter `custom_fields:` map for the same name.
+    #[arg(long = "set-field", value_name = "NAME=VALUE")]
+    pub set_fields: Vec<String>,
+
     /// Shows what would be sent without creating.
     #[arg(long)]
     pub dry_run: bool,
@@ -45,6 +57,8 @@ struct CreateParams {
     summary: String,
     labels: Vec<String>,
     adf: AdfDocument,
+    custom_scalars: BTreeMap<String, serde_yaml::Value>,
+    custom_sections: Vec<CustomFieldSection>,
 }
 
 impl CreateCommand {
@@ -68,19 +82,36 @@ impl CreateCommand {
 
     /// Resolves creation parameters from input file and CLI flags.
     fn resolve_params(&self) -> Result<CreateParams> {
+        let overrides = self
+            .set_fields
+            .iter()
+            .map(|s| parse_set_field(s))
+            .collect::<Result<Vec<_>>>()?;
         match self.format {
-            ContentFormat::Jfm => self.resolve_from_jfm(),
-            ContentFormat::Adf => self.resolve_from_adf(),
+            ContentFormat::Jfm => self.resolve_from_jfm(overrides),
+            ContentFormat::Adf => {
+                if !overrides.is_empty() {
+                    anyhow::bail!(
+                        "--set-field is only supported with --format jfm; ADF input takes a raw payload"
+                    );
+                }
+                self.resolve_from_adf()
+            }
         }
     }
 
     /// Resolves parameters from JFM input, with CLI flags as overrides.
-    fn resolve_from_jfm(&self) -> Result<CreateParams> {
+    fn resolve_from_jfm(
+        &self,
+        overrides: Vec<(String, serde_yaml::Value)>,
+    ) -> Result<CreateParams> {
         let input = read_input(self.file.as_deref())?;
         let doc = JfmDocument::parse(&input)?;
-        let adf = markdown_to_adf(&doc.body)?;
+        let (body_md, custom_sections) = doc.split_custom_sections();
+        let adf = markdown_to_adf(&body_md)?;
 
-        let (fm_project, fm_issue_type, fm_summary, fm_labels) = match &doc.frontmatter {
+        let (fm_project, fm_issue_type, fm_summary, fm_labels, fm_scalars) = match &doc.frontmatter
+        {
             JfmFrontmatter::Jira(fm) => {
                 // Derive project from key if project field is absent
                 let project = fm.project.clone().or_else(|| {
@@ -95,6 +126,7 @@ impl CreateCommand {
                     fm.issue_type.clone(),
                     Some(fm.summary.clone()),
                     fm.labels.clone(),
+                    fm.custom_fields.clone(),
                 )
             }
             JfmFrontmatter::Confluence(_) => {
@@ -116,12 +148,16 @@ impl CreateCommand {
             anyhow::anyhow!("Summary is required (use --summary or set in frontmatter)")
         })?;
 
+        let custom_scalars = merge_set_field_overrides(fm_scalars, overrides);
+
         Ok(CreateParams {
             project,
             issue_type,
             summary,
             labels: fm_labels,
             adf,
+            custom_scalars,
+            custom_sections,
         })
     }
 
@@ -149,19 +185,35 @@ impl CreateCommand {
             summary,
             labels: vec![],
             adf,
+            custom_scalars: BTreeMap::new(),
+            custom_sections: Vec::new(),
         })
     }
 }
 
 /// Creates a JIRA issue from resolved parameters.
+///
+/// Fast path when no custom fields are requested: one POST to
+/// `/rest/api/3/issue`. With custom fields, fetches `createmeta` to resolve
+/// human names to IDs and dispatch values by schema before sending.
 async fn run_create(client: &AtlassianClient, params: &CreateParams) -> Result<()> {
+    let custom_fields = if params.custom_scalars.is_empty() && params.custom_sections.is_empty() {
+        BTreeMap::new()
+    } else {
+        let createmeta = client
+            .get_createmeta(&params.project, &params.issue_type)
+            .await?;
+        resolve_custom_fields(&params.custom_scalars, &params.custom_sections, &createmeta)?
+    };
+
     let result = client
-        .create_issue(
+        .create_issue_with_custom_fields(
             &params.project,
             &params.issue_type,
             &params.summary,
             Some(&params.adf),
             &params.labels,
+            &custom_fields,
         )
         .await?;
 
@@ -183,6 +235,7 @@ mod tests {
             project: None,
             r#type: None,
             summary: None,
+            set_fields: vec![],
             dry_run: false,
         };
         assert!(cmd.file.is_none());
@@ -203,6 +256,7 @@ mod tests {
             project: None,
             r#type: None,
             summary: None,
+            set_fields: vec![],
             dry_run: false,
         };
 
@@ -226,6 +280,7 @@ mod tests {
             project: None,
             r#type: None,
             summary: None,
+            set_fields: vec![],
             dry_run: false,
         };
 
@@ -246,6 +301,7 @@ mod tests {
             project: Some("NEW".to_string()),
             r#type: Some("Story".to_string()),
             summary: Some("New Title".to_string()),
+            set_fields: vec![],
             dry_run: false,
         };
 
@@ -268,6 +324,7 @@ mod tests {
             project: None,
             r#type: None,
             summary: None,
+            set_fields: vec![],
             dry_run: false,
         };
 
@@ -288,6 +345,7 @@ mod tests {
             project: Some("PROJ".to_string()),
             r#type: Some("Bug".to_string()),
             summary: Some("Fix it".to_string()),
+            set_fields: vec![],
             dry_run: false,
         };
 
@@ -310,6 +368,7 @@ mod tests {
             project: None,
             r#type: None,
             summary: Some("Title".to_string()),
+            set_fields: vec![],
             dry_run: false,
         };
 
@@ -330,6 +389,7 @@ mod tests {
             project: Some("PROJ".to_string()),
             r#type: None,
             summary: None,
+            set_fields: vec![],
             dry_run: false,
         };
 
@@ -350,6 +410,7 @@ mod tests {
             project: None,
             r#type: None,
             summary: None,
+            set_fields: vec![],
             dry_run: false,
         };
 
@@ -370,6 +431,7 @@ mod tests {
             project: None,
             r#type: None,
             summary: None,
+            set_fields: vec![],
             dry_run: true,
         };
 
@@ -391,6 +453,7 @@ mod tests {
             project: Some("PROJ".to_string()),
             r#type: None,
             summary: Some("Test".to_string()),
+            set_fields: vec![],
             dry_run: true,
         };
 
@@ -412,6 +475,7 @@ mod tests {
             project: None,
             r#type: None,
             summary: None,
+            set_fields: vec![],
             dry_run: false,
         };
 
@@ -432,6 +496,8 @@ mod tests {
             summary: "Test issue".to_string(),
             labels: vec![],
             adf: AdfDocument::new(),
+            custom_scalars: BTreeMap::new(),
+            custom_sections: Vec::new(),
         }
     }
 
@@ -464,5 +530,154 @@ mod tests {
         let client = mock_client(&server.uri());
         let err = run_create(&client, &sample_params()).await.unwrap_err();
         assert!(err.to_string().contains("400"));
+    }
+
+    #[tokio::test]
+    async fn run_create_with_custom_scalar_fetches_createmeta_and_merges_payload() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/createmeta"))
+            .and(wiremock::matchers::query_param("projectKeys", "PROJ"))
+            .and(wiremock::matchers::query_param("issuetypeNames", "Task"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "projects": [{
+                    "issuetypes": [{
+                        "fields": {
+                            "customfield_10001": {
+                                "name": "Planned / Unplanned Work",
+                                "schema": {
+                                    "type": "option",
+                                    "custom": "com.atlassian.jira.plugin.system.customfieldtypes:select"
+                                }
+                            }
+                        }
+                    }]
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/issue"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "fields": {
+                    "project": {"key": "PROJ"},
+                    "issuetype": {"name": "Task"},
+                    "summary": "Test issue",
+                    "description": {"version": 1, "type": "doc", "content": []},
+                    "customfield_10001": {"value": "Unplanned"}
+                }
+            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "id": "100",
+                    "key": "PROJ-100",
+                    "self": "https://org.atlassian.net/rest/api/3/issue/100"
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let mut params = sample_params();
+        params.custom_scalars.insert(
+            "Planned / Unplanned Work".to_string(),
+            serde_yaml::Value::String("Unplanned".to_string()),
+        );
+        run_create(&client, &params).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_create_without_custom_fields_skips_createmeta_call() {
+        // If no custom fields are requested, create must not hit
+        // /rest/api/3/issue/createmeta — only the POST to /issue.
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/issue"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "id": "100",
+                    "key": "PROJ-100",
+                    "self": "https://org.atlassian.net/rest/api/3/issue/100"
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // createmeta mock expects exactly 0 hits — wiremock will fail the
+        // test if any unmatched GET lands.
+        let client = mock_client(&server.uri());
+        run_create(&client, &sample_params()).await.unwrap();
+    }
+
+    #[test]
+    fn resolve_from_jfm_with_set_field_overrides_frontmatter() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("issue.md");
+        let content = "---\ntype: jira\ninstance: https://org.atlassian.net\nproject: PROJ\nsummary: T\ncustom_fields:\n  Priority: Low\n---\n\nBody\n";
+        fs::write(&file_path, content).unwrap();
+
+        let cmd = CreateCommand {
+            file: Some(file_path.to_str().unwrap().to_string()),
+            format: ContentFormat::Jfm,
+            project: None,
+            r#type: None,
+            summary: None,
+            set_fields: vec!["Priority=High".to_string()],
+            dry_run: false,
+        };
+
+        let params = cmd.resolve_params().unwrap();
+        assert_eq!(
+            params.custom_scalars.get("Priority"),
+            Some(&serde_yaml::Value::String("High".to_string()))
+        );
+    }
+
+    #[test]
+    fn invalid_set_field_syntax_errors_during_resolve() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("issue.md");
+        let content = "---\ntype: jira\ninstance: https://org.atlassian.net\nproject: PROJ\nsummary: T\n---\n\nBody\n";
+        fs::write(&file_path, content).unwrap();
+
+        let cmd = CreateCommand {
+            file: Some(file_path.to_str().unwrap().to_string()),
+            format: ContentFormat::Jfm,
+            project: None,
+            r#type: None,
+            summary: None,
+            set_fields: vec!["no-equals".to_string()],
+            dry_run: false,
+        };
+
+        let err = cmd.resolve_params().unwrap_err();
+        assert!(err.to_string().contains("expected --set-field"));
+    }
+
+    #[test]
+    fn resolve_from_adf_rejects_set_field() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("body.json");
+        let adf_json = r#"{"version":1,"type":"doc","content":[]}"#;
+        fs::write(&file_path, adf_json).unwrap();
+
+        let cmd = CreateCommand {
+            file: Some(file_path.to_str().unwrap().to_string()),
+            format: ContentFormat::Adf,
+            project: Some("PROJ".to_string()),
+            r#type: None,
+            summary: Some("T".to_string()),
+            set_fields: vec!["Priority=High".to_string()],
+            dry_run: false,
+        };
+
+        let err = cmd.resolve_params().unwrap_err();
+        assert!(err.to_string().contains("--set-field is only supported"));
     }
 }
