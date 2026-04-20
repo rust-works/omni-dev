@@ -123,6 +123,7 @@ mod tests {
                 key: "PROJ-1".to_string(),
                 file: None,
                 format: ContentFormat::Jfm,
+                set_fields: vec![],
                 force: false,
                 dry_run: false,
             }),
@@ -149,6 +150,7 @@ mod tests {
                 project: Some("PROJ".to_string()),
                 r#type: None,
                 summary: Some("Test".to_string()),
+                set_fields: vec![],
                 dry_run: false,
             }),
         };
