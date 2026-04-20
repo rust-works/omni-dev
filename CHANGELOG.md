@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **MCP Server (Foundation)** ([#575](https://github.com/rust-works/omni-dev/issues/575)): New `omni-dev-mcp` binary exposes omni-dev's git analysis as MCP tools for AI assistants (Claude Desktop, Claude Code). Gated behind the `mcp` Cargo feature so default builds are unaffected. Initial tool: `git_view_commits`. See [ADR-0021](docs/adrs/adr-0021.md) for the architectural rationale.
 - **Claude Skills Status** ([#558](https://github.com/rust-works/omni-dev/issues/558)): New `ai claude skills status` subcommand reports the symlinks and managed exclude-block entries left behind by prior `sync` runs, with `--worktrees` to aggregate across every worktree and `--format {text,yaml}` for machine-readable output
 - **Claude Skills YAML Output** ([#558](https://github.com/rust-works/omni-dev/issues/558)): `ai claude skills sync` and `ai claude skills clean` now accept `--format {text,yaml}` (default `text`), producing a structured YAML report when invoked with `--format yaml`
 
