@@ -23,6 +23,8 @@ pub mod claude;
 pub mod cli;
 pub mod data;
 pub mod git;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod utils;
 
 pub use crate::cli::Cli;
