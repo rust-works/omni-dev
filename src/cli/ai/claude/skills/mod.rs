@@ -2,6 +2,7 @@
 
 mod clean;
 mod common;
+mod status;
 mod sync;
 
 use anyhow::Result;
@@ -20,8 +21,10 @@ pub struct SkillsCommand {
 pub enum SkillsSubcommands {
     /// Syncs skills from a source repository into one or more targets.
     Sync(sync::SyncCommand),
-    /// Removes skill symlinks previously created by `sync`.
+    /// Removes skill symlinks and managed exclude block previously created by `sync`.
     Clean(clean::CleanCommand),
+    /// Reports residue left by `sync` — symlinks and managed exclude-block entries.
+    Status(status::StatusCommand),
 }
 
 impl SkillsCommand {
@@ -30,6 +33,7 @@ impl SkillsCommand {
         match self.command {
             SkillsSubcommands::Sync(cmd) => cmd.execute(),
             SkillsSubcommands::Clean(cmd) => cmd.execute(),
+            SkillsSubcommands::Status(cmd) => cmd.execute(),
         }
     }
 }
@@ -44,6 +48,8 @@ mod tests {
     use std::process::Command;
 
     use tempfile::TempDir;
+
+    use common::OutputFormat;
 
     fn tempdir() -> TempDir {
         fs::create_dir_all("tmp").ok();
@@ -71,6 +77,7 @@ mod tests {
                 target: Some(tgt.path().to_path_buf()),
                 worktrees: false,
                 dry_run: false,
+                format: OutputFormat::Text,
             }),
         };
         cmd.execute().unwrap();
@@ -87,6 +94,22 @@ mod tests {
                 target: Some(tgt.path().to_path_buf()),
                 worktrees: false,
                 dry_run: false,
+                format: OutputFormat::Text,
+            }),
+        };
+        cmd.execute().unwrap();
+    }
+
+    #[test]
+    fn dispatch_status() {
+        let tgt = tempdir();
+        init_repo(tgt.path());
+
+        let cmd = SkillsCommand {
+            command: SkillsSubcommands::Status(status::StatusCommand {
+                target: Some(tgt.path().to_path_buf()),
+                worktrees: false,
+                format: OutputFormat::Text,
             }),
         };
         cmd.execute().unwrap();

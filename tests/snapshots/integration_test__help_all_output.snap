@@ -122,9 +122,10 @@ Manages Claude Code skills across repositories and worktrees
 Usage: skills <COMMAND>
 
 Commands:
-  sync   Syncs skills from a source repository into one or more targets
-  clean  Removes skill symlinks previously created by `sync`
-  help   Print this message or the help of the given subcommand(s)
+  sync    Syncs skills from a source repository into one or more targets
+  clean   Removes skill symlinks and managed exclude block previously created by `sync`
+  status  Reports residue left by `sync` — symlinks and managed exclude-block entries
+  help    Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
@@ -132,17 +133,33 @@ Options:
 
 ================================================================================
 
-omni-dev ai claude skills clean - Removes skill symlinks previously created by `sync`
+omni-dev ai claude skills clean - Removes skill symlinks and managed exclude block previously created by `sync`
 
-Removes skill symlinks previously created by `sync`
+Removes skill symlinks and managed exclude block previously created by `sync`
 
 Usage: clean [OPTIONS]
 
 Options:
-      --target <PATH>  Target repository or worktree to clean. Defaults to the current working directory
-      --worktrees      Also clean every worktree belonging to the target repository
-      --dry-run        Preview the changes without deleting symlinks or modifying the exclude file
-  -h, --help           Print help
+      --target <PATH>    Target repository or worktree to clean. Defaults to the current working directory
+      --worktrees        Also clean every worktree belonging to the target repository
+      --dry-run          Preview the changes without deleting symlinks or modifying the exclude file
+      --format <FORMAT>  Output format [default: text] [possible values: text, yaml]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev ai claude skills status - Reports residue left by `sync` — symlinks and managed exclude-block entries
+
+Reports residue left by `sync` — symlinks and managed exclude-block entries
+
+Usage: status [OPTIONS]
+
+Options:
+      --target <PATH>    Target repository or worktree to inspect. Defaults to the current working directory
+      --worktrees        Also inspect every worktree belonging to the target repository
+      --format <FORMAT>  Output format [default: text] [possible values: text, yaml]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================
@@ -154,11 +171,12 @@ Syncs skills from a source repository into one or more targets
 Usage: sync [OPTIONS]
 
 Options:
-      --source <PATH>  Source repository or worktree containing the canonical `.claude/skills/`. Defaults to the current working directory
-      --target <PATH>  Target repository or worktree to sync into. Defaults to the source repository
-      --worktrees      Also sync to every worktree belonging to the target repository
-      --dry-run        Preview the changes without creating symlinks or modifying the exclude file
-  -h, --help           Print help
+      --source <PATH>    Source repository or worktree containing the canonical `.claude/skills/`. Defaults to the current working directory
+      --target <PATH>    Target repository or worktree to sync into. Defaults to the source repository
+      --worktrees        Also sync to every worktree belonging to the target repository
+      --dry-run          Preview the changes without creating symlinks or modifying the exclude file
+      --format <FORMAT>  Output format [default: text] [possible values: text, yaml]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================
