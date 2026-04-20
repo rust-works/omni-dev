@@ -407,6 +407,7 @@ mod tests {
             assignee: None,
             priority: None,
             labels: vec![],
+            custom_fields: vec![],
         }
     }
 

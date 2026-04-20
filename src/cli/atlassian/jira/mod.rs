@@ -109,6 +109,8 @@ mod tests {
                 key: "PROJ-1".to_string(),
                 output: None,
                 format: ContentFormat::Jfm,
+                fields: vec![],
+                all_fields: false,
             }),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Read(_)));

@@ -8,9 +8,9 @@ use anyhow::{Context, Result};
 use crate::atlassian::adf::AdfDocument;
 use crate::atlassian::api::AtlassianApi;
 use crate::atlassian::auth;
-use crate::atlassian::client::AtlassianClient;
+use crate::atlassian::client::{AtlassianClient, FieldSelection};
 use crate::atlassian::convert::markdown_to_adf;
-use crate::atlassian::document::{content_item_to_document, JfmDocument};
+use crate::atlassian::document::{content_item_to_document, issue_to_jfm_document, JfmDocument};
 
 use super::format::ContentFormat;
 
@@ -33,6 +33,49 @@ pub async fn run_read(
         }
         ContentFormat::Jfm => {
             let doc = content_item_to_document(&item, instance_url)?;
+            let rendered = doc.render()?;
+            output_text(&rendered, output)?;
+
+            if let Some(path) = output {
+                eprintln!("Saved to: {path}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Fetches a JIRA issue with the given field selection and outputs it.
+///
+/// JIRA-specific path used when `--fields` or `--all-fields` is set. Calls
+/// [`AtlassianClient::get_issue_with_fields`] directly rather than the
+/// generic [`AtlassianApi`] trait, since `ContentItem` does not carry
+/// custom field data.
+pub async fn run_read_jira_with_fields(
+    key: &str,
+    output: Option<&str>,
+    format: &ContentFormat,
+    selection: FieldSelection,
+    client: &AtlassianClient,
+    instance_url: &str,
+) -> Result<()> {
+    let issue = client.get_issue_with_fields(key, selection).await?;
+
+    match format {
+        ContentFormat::Adf => {
+            let mut fields = serde_json::Map::new();
+            if let Some(desc) = &issue.description_adf {
+                fields.insert("description".to_string(), desc.clone());
+            }
+            for cf in &issue.custom_fields {
+                fields.insert(cf.id.clone(), cf.value.clone());
+            }
+            let json = serde_json::to_string_pretty(&serde_json::Value::Object(fields))
+                .context("Failed to serialize fields as JSON")?;
+            output_text(&json, output)?;
+        }
+        ContentFormat::Jfm => {
+            let doc = issue_to_jfm_document(&issue, instance_url)?;
             let rendered = doc.render()?;
             output_text(&rendered, output)?;
 
@@ -710,5 +753,150 @@ mod tests {
         let adf = AdfDocument::new();
         let result = print_create_dry_run("PROJ", "Task", "Add feature", &adf, &[]);
         assert!(result.is_ok());
+    }
+
+    // ── run_read_jira_with_fields ──────────────────────────────────
+
+    async fn setup_jira_fields_mock() -> (wiremock::MockServer, AtlassianClient) {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/ACCS-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "key": "ACCS-1",
+                    "fields": {
+                        "summary": "Custom field issue",
+                        "description": {
+                            "type": "doc",
+                            "version": 1,
+                            "content": [{
+                                "type": "paragraph",
+                                "content": [{"type": "text", "text": "Main description"}]
+                            }]
+                        },
+                        "status": {"name": "Open"},
+                        "issuetype": {"name": "Bug"},
+                        "assignee": null,
+                        "priority": null,
+                        "labels": [],
+                        "customfield_19300": {
+                            "type": "doc",
+                            "version": 1,
+                            "content": [{
+                                "type": "paragraph",
+                                "content": [{"type": "text", "text": "Criterion body"}]
+                            }]
+                        },
+                        "customfield_10001": {"value": "Unplanned"}
+                    },
+                    "names": {
+                        "customfield_19300": "Acceptance Criteria",
+                        "customfield_10001": "Planned / Unplanned Work"
+                    }
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        (server, client)
+    }
+
+    #[tokio::test]
+    async fn run_read_jira_with_fields_jfm_emits_scalars_and_sections() {
+        let (_server, client) = setup_jira_fields_mock().await;
+        let instance_url = client.instance_url().to_string();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let out_path = temp_dir.path().join("issue.md");
+
+        run_read_jira_with_fields(
+            "ACCS-1",
+            Some(out_path.to_str().unwrap()),
+            &ContentFormat::Jfm,
+            FieldSelection::All,
+            &client,
+            &instance_url,
+        )
+        .await
+        .unwrap();
+
+        let rendered = fs::read_to_string(&out_path).unwrap();
+        assert!(rendered.contains("key: ACCS-1"));
+        assert!(rendered.contains("custom_fields:"));
+        assert!(rendered.contains("Planned / Unplanned Work"));
+        assert!(rendered.contains("Unplanned"));
+        assert!(rendered.contains("Main description"));
+        assert!(rendered.contains("<!-- field: Acceptance Criteria (customfield_19300) -->"));
+        assert!(rendered.contains("Criterion body"));
+    }
+
+    #[tokio::test]
+    async fn run_read_jira_with_fields_adf_emits_field_map_json() {
+        let (_server, client) = setup_jira_fields_mock().await;
+        let instance_url = client.instance_url().to_string();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let out_path = temp_dir.path().join("issue.json");
+
+        run_read_jira_with_fields(
+            "ACCS-1",
+            Some(out_path.to_str().unwrap()),
+            &ContentFormat::Adf,
+            FieldSelection::All,
+            &client,
+            &instance_url,
+        )
+        .await
+        .unwrap();
+
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&out_path).unwrap()).unwrap();
+        assert_eq!(json["description"]["type"], "doc");
+        assert_eq!(json["customfield_19300"]["type"], "doc");
+        assert_eq!(json["customfield_10001"]["value"], "Unplanned");
+    }
+
+    #[tokio::test]
+    async fn run_read_jira_with_fields_jfm_to_stdout() {
+        let (_server, client) = setup_jira_fields_mock().await;
+        let instance_url = client.instance_url().to_string();
+
+        let result = run_read_jira_with_fields(
+            "ACCS-1",
+            None,
+            &ContentFormat::Jfm,
+            FieldSelection::Named(vec!["Acceptance Criteria".to_string()]),
+            &client,
+            &instance_url,
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_read_jira_with_fields_propagates_client_errors() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/NOPE-1"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let instance_url = client.instance_url().to_string();
+
+        let err = run_read_jira_with_fields(
+            "NOPE-1",
+            None,
+            &ContentFormat::Jfm,
+            FieldSelection::All,
+            &client,
+            &instance_url,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("404"));
     }
 }

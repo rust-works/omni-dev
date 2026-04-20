@@ -11,12 +11,15 @@
 //! Markdown body content here.
 //! ```
 
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::atlassian::adf::AdfDocument;
 use crate::atlassian::api::{ContentItem, ContentMetadata};
-use crate::atlassian::client::JiraIssue;
+use crate::atlassian::client::{JiraCustomField, JiraIssue};
 use crate::atlassian::convert::adf_to_markdown;
 use crate::atlassian::error::AtlassianError;
 
@@ -81,6 +84,14 @@ pub struct JiraFrontmatter {
     /// Labels applied to the issue.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
+
+    /// Scalar custom field values keyed by human-readable field name.
+    ///
+    /// Populated when the issue was fetched with `--fields` or
+    /// `--all-fields`. Rich-text (ADF) custom fields are rendered into the
+    /// document body as extra sections instead.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub custom_fields: BTreeMap<String, serde_yaml::Value>,
 }
 
 /// Confluence-specific frontmatter fields.
@@ -157,14 +168,25 @@ pub fn validate_issue_key(key: &str) -> Result<()> {
 }
 
 /// Converts a [`JiraIssue`] into a [`JfmDocument`] with YAML frontmatter.
+///
+/// Custom fields present on the issue are partitioned: rich-text (ADF)
+/// fields become additional JFM sections appended to the body (prefixed
+/// with an HTML-comment tag so the `write` round-trip can identify them),
+/// while scalar fields are serialized into the frontmatter's
+/// `custom_fields` map keyed by human-readable name.
 pub fn issue_to_jfm_document(issue: &JiraIssue, instance_url: &str) -> Result<JfmDocument> {
-    let body = if let Some(ref adf_value) = issue.description_adf {
+    let mut body = if let Some(ref adf_value) = issue.description_adf {
         let adf_doc: AdfDocument =
             serde_json::from_value(adf_value.clone()).context("Failed to parse ADF description")?;
         adf_to_markdown(&adf_doc)?
     } else {
         String::new()
     };
+
+    let mut custom_scalars: BTreeMap<String, serde_yaml::Value> = BTreeMap::new();
+    for field in &issue.custom_fields {
+        render_custom_field(field, &mut body, &mut custom_scalars)?;
+    }
 
     Ok(JfmDocument {
         frontmatter: JfmFrontmatter::Jira(JiraFrontmatter {
@@ -177,9 +199,100 @@ pub fn issue_to_jfm_document(issue: &JiraIssue, instance_url: &str) -> Result<Jf
             assignee: issue.assignee.clone(),
             priority: issue.priority.clone(),
             labels: issue.labels.clone(),
+            custom_fields: custom_scalars,
         }),
         body,
     })
+}
+
+/// Renders a single custom field into either the body (rich text) or the
+/// frontmatter scalar map.
+fn render_custom_field(
+    field: &JiraCustomField,
+    body: &mut String,
+    scalars: &mut BTreeMap<String, serde_yaml::Value>,
+) -> Result<()> {
+    if is_adf_document(&field.value) {
+        let adf_doc: AdfDocument = serde_json::from_value(field.value.clone())
+            .with_context(|| format!("Failed to parse ADF value for {}", field.id))?;
+        let section_md = adf_to_markdown(&adf_doc)?;
+        append_custom_section(body, field, &section_md);
+    } else if let Some(scalar) = extract_custom_field_scalar(&field.value) {
+        scalars.insert(field.name.clone(), scalar);
+    }
+    // Otherwise the field is null or an unrecognized shape — omit it.
+    Ok(())
+}
+
+/// Appends a rich-text custom field to the body as a tagged section.
+fn append_custom_section(body: &mut String, field: &JiraCustomField, section_md: &str) {
+    if !body.is_empty() && !body.ends_with('\n') {
+        body.push('\n');
+    }
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    let _ = write!(
+        body,
+        "---\n<!-- field: {} ({}) -->\n\n{}",
+        field.name, field.id, section_md
+    );
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+}
+
+/// Returns `true` if `value` has the shape of an Atlassian Document Format
+/// document (`{"type":"doc","version":_,"content":[...]}`).
+fn is_adf_document(value: &serde_json::Value) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    obj.get("type").and_then(|t| t.as_str()) == Some("doc")
+        && obj.contains_key("version")
+        && obj.contains_key("content")
+}
+
+/// Converts a custom field's raw JSON value into a scalar YAML
+/// representation suitable for frontmatter serialization.
+///
+/// - Option/select objects (`{self, value, id}`) collapse to their
+///   `value` string.
+/// - User-picker objects collapse to their `displayName`.
+/// - Arrays recurse per element, dropping null/unknown entries.
+/// - Primitives (bool/number/string) pass through unchanged.
+/// - Unknown objects pass through as a structured YAML mapping.
+/// - Null returns `None`.
+fn extract_custom_field_scalar(value: &serde_json::Value) -> Option<serde_yaml::Value> {
+    use serde_json::Value as J;
+    match value {
+        J::Null => None,
+        J::Bool(_) | J::Number(_) | J::String(_) => json_to_yaml(value),
+        J::Array(items) => {
+            let extracted: Vec<_> = items
+                .iter()
+                .filter_map(extract_custom_field_scalar)
+                .collect();
+            if extracted.is_empty() {
+                None
+            } else {
+                Some(serde_yaml::Value::Sequence(extracted))
+            }
+        }
+        J::Object(map) => {
+            if let Some(v) = map.get("value").and_then(|v| v.as_str()) {
+                Some(serde_yaml::Value::String(v.to_string()))
+            } else if let Some(name) = map.get("displayName").and_then(|v| v.as_str()) {
+                Some(serde_yaml::Value::String(name.to_string()))
+            } else {
+                json_to_yaml(value)
+            }
+        }
+    }
+}
+
+fn json_to_yaml(value: &serde_json::Value) -> Option<serde_yaml::Value> {
+    serde_yaml::to_value(value).ok()
 }
 
 /// Converts a [`ContentItem`] into a [`JfmDocument`] with YAML frontmatter.
@@ -212,6 +325,7 @@ pub fn content_item_to_document(item: &ContentItem, instance_url: &str) -> Resul
             assignee: assignee.clone(),
             priority: priority.clone(),
             labels: labels.clone(),
+            custom_fields: BTreeMap::new(),
         }),
         ContentMetadata::Confluence {
             space_key,
@@ -365,6 +479,7 @@ mod tests {
                 assignee: None,
                 priority: None,
                 labels: vec![],
+                custom_fields: BTreeMap::new(),
             }),
             body: "Description here.".to_string(),
         };
@@ -389,6 +504,7 @@ mod tests {
                 assignee: None,
                 priority: None,
                 labels: vec!["test".to_string()],
+                custom_fields: BTreeMap::new(),
             }),
             body: "# Heading\n\nSome text.\n".to_string(),
         };
@@ -445,6 +561,7 @@ mod tests {
             assignee: Some("Alice".to_string()),
             priority: Some("High".to_string()),
             labels: vec!["backend".to_string()],
+            custom_fields: Vec::new(),
         }
     }
 
@@ -483,6 +600,7 @@ mod tests {
             assignee: None,
             priority: None,
             labels: vec![],
+            custom_fields: Vec::new(),
         };
         let doc = issue_to_jfm_document(&issue, "https://test.atlassian.net").unwrap();
         assert_eq!(doc.frontmatter.instance(), "https://test.atlassian.net");
@@ -518,6 +636,7 @@ mod tests {
                 assignee: None,
                 priority: None,
                 labels: vec![],
+                custom_fields: BTreeMap::new(),
             }),
             body: String::new(),
         };
@@ -526,6 +645,218 @@ mod tests {
         assert!(!output.contains("status:"));
         assert!(!output.contains("issue_type:"));
         assert!(!output.contains("labels:"));
+    }
+
+    // ── Custom field helpers ────────────────────────────────────────
+
+    #[test]
+    fn is_adf_document_detects_doc_shape() {
+        let adf = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [{"type": "paragraph", "content": []}]
+        });
+        assert!(is_adf_document(&adf));
+    }
+
+    #[test]
+    fn is_adf_document_rejects_scalar_and_other_objects() {
+        assert!(!is_adf_document(&serde_json::json!("string")));
+        assert!(!is_adf_document(&serde_json::json!(42)));
+        assert!(!is_adf_document(&serde_json::json!({"type": "option"})));
+        assert!(!is_adf_document(&serde_json::json!({
+            "type": "doc", "version": 1
+        })));
+    }
+
+    #[test]
+    fn extract_scalar_passes_through_primitives() {
+        assert_eq!(
+            extract_custom_field_scalar(&serde_json::json!(7)),
+            Some(serde_yaml::Value::from(7_i64))
+        );
+        assert_eq!(
+            extract_custom_field_scalar(&serde_json::json!("hello")),
+            Some(serde_yaml::Value::String("hello".to_string()))
+        );
+        assert_eq!(
+            extract_custom_field_scalar(&serde_json::json!(true)),
+            Some(serde_yaml::Value::Bool(true))
+        );
+        assert_eq!(extract_custom_field_scalar(&serde_json::Value::Null), None);
+    }
+
+    #[test]
+    fn extract_scalar_collapses_option_object_to_value_string() {
+        let value = serde_json::json!({
+            "self": "https://example.atlassian.net/rest/api/3/customFieldOption/12345",
+            "value": "Unplanned",
+            "id": "12345"
+        });
+        assert_eq!(
+            extract_custom_field_scalar(&value),
+            Some(serde_yaml::Value::String("Unplanned".to_string()))
+        );
+    }
+
+    #[test]
+    fn extract_scalar_collapses_user_object_to_display_name() {
+        let value = serde_json::json!({
+            "accountId": "abc123",
+            "displayName": "Alice",
+            "emailAddress": "alice@example.com"
+        });
+        assert_eq!(
+            extract_custom_field_scalar(&value),
+            Some(serde_yaml::Value::String("Alice".to_string()))
+        );
+    }
+
+    #[test]
+    fn extract_scalar_recurses_into_arrays_and_drops_nulls() {
+        let value = serde_json::json!([
+            {"value": "A"},
+            null,
+            {"displayName": "Bob"},
+            42
+        ]);
+        let extracted = extract_custom_field_scalar(&value).unwrap();
+        assert_eq!(
+            extracted,
+            serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String("A".to_string()),
+                serde_yaml::Value::String("Bob".to_string()),
+                serde_yaml::Value::from(42_i64),
+            ])
+        );
+    }
+
+    #[test]
+    fn extract_scalar_empty_array_returns_none() {
+        let value = serde_json::json!([null, null]);
+        assert_eq!(extract_custom_field_scalar(&value), None);
+    }
+
+    #[test]
+    fn issue_with_scalar_custom_field_goes_to_frontmatter() {
+        let issue = JiraIssue {
+            key: "ACCS-1".to_string(),
+            summary: "S".to_string(),
+            description_adf: None,
+            status: None,
+            issue_type: None,
+            assignee: None,
+            priority: None,
+            labels: vec![],
+            custom_fields: vec![JiraCustomField {
+                id: "customfield_10001".to_string(),
+                name: "Planned / Unplanned Work".to_string(),
+                value: serde_json::json!({"value": "Unplanned", "id": "42"}),
+            }],
+        };
+        let doc = issue_to_jfm_document(&issue, "https://org.atlassian.net").unwrap();
+        let rendered = doc.render().unwrap();
+        assert!(rendered.contains("custom_fields:"));
+        assert!(rendered.contains("Planned / Unplanned Work"));
+        assert!(rendered.contains("Unplanned"));
+        assert!(!rendered.contains("<!-- field:"));
+    }
+
+    #[test]
+    fn issue_with_adf_custom_field_becomes_body_section() {
+        let adf_value = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [{
+                "type": "paragraph",
+                "content": [{"type": "text", "text": "Criterion one"}]
+            }]
+        });
+        let issue = JiraIssue {
+            key: "ACCS-1".to_string(),
+            summary: "S".to_string(),
+            description_adf: None,
+            status: None,
+            issue_type: None,
+            assignee: None,
+            priority: None,
+            labels: vec![],
+            custom_fields: vec![JiraCustomField {
+                id: "customfield_19300".to_string(),
+                name: "Acceptance Criteria".to_string(),
+                value: adf_value,
+            }],
+        };
+        let doc = issue_to_jfm_document(&issue, "https://org.atlassian.net").unwrap();
+        let rendered = doc.render().unwrap();
+        assert!(rendered.contains("<!-- field: Acceptance Criteria (customfield_19300) -->"));
+        assert!(rendered.contains("Criterion one"));
+        assert!(!rendered.contains("custom_fields:"));
+    }
+
+    #[test]
+    fn issue_with_mixed_custom_fields() {
+        let adf_value = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [{"type": "paragraph", "content": [{"type": "text", "text": "AC body"}]}]
+        });
+        let issue = JiraIssue {
+            key: "ACCS-1".to_string(),
+            summary: "S".to_string(),
+            description_adf: Some(serde_json::json!({
+                "type": "doc",
+                "version": 1,
+                "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Main"}]}]
+            })),
+            status: None,
+            issue_type: None,
+            assignee: None,
+            priority: None,
+            labels: vec![],
+            custom_fields: vec![
+                JiraCustomField {
+                    id: "customfield_19300".to_string(),
+                    name: "Acceptance Criteria".to_string(),
+                    value: adf_value,
+                },
+                JiraCustomField {
+                    id: "customfield_10001".to_string(),
+                    name: "Sprint Label".to_string(),
+                    value: serde_json::json!("Q1"),
+                },
+            ],
+        };
+        let doc = issue_to_jfm_document(&issue, "https://org.atlassian.net").unwrap();
+        let rendered = doc.render().unwrap();
+        assert!(rendered.contains("custom_fields:"));
+        assert!(rendered.contains("Sprint Label: Q1"));
+        assert!(rendered.contains("Main"));
+        assert!(rendered.contains("<!-- field: Acceptance Criteria"));
+        assert!(rendered.contains("AC body"));
+    }
+
+    #[test]
+    fn issue_with_null_custom_field_is_omitted() {
+        let issue = JiraIssue {
+            key: "ACCS-1".to_string(),
+            summary: "S".to_string(),
+            description_adf: None,
+            status: None,
+            issue_type: None,
+            assignee: None,
+            priority: None,
+            labels: vec![],
+            custom_fields: vec![JiraCustomField {
+                id: "customfield_99".to_string(),
+                name: "Empty Field".to_string(),
+                value: serde_json::Value::Null,
+            }],
+        };
+        let doc = issue_to_jfm_document(&issue, "https://org.atlassian.net").unwrap();
+        let rendered = doc.render().unwrap();
+        assert!(!rendered.contains("custom_fields:"));
+        assert!(!rendered.contains("Empty Field"));
     }
 
     // ── Confluence frontmatter tests ───���─────────────────────────────
