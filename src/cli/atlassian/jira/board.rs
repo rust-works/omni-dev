@@ -283,6 +283,7 @@ mod tests {
             assignee: assignee.map(String::from),
             priority: None,
             labels: vec![],
+            custom_fields: vec![],
         }
     }
 
