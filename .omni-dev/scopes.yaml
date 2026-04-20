@@ -19,6 +19,10 @@ scopes:
     description: "Git operations and repository analysis"
     examples: ["git: enhance commit parsing", "git: add branch analysis"]
     file_patterns: ["src/git/**"]
+  - name: "mcp"
+    description: "MCP server implementation and tool handlers"
+    examples: ["mcp: add git_view_commits tool", "mcp: wire up stdio transport"]
+    file_patterns: ["src/mcp/**", "src/mcp.rs", "src/mcp_server.rs"]
   - name: "data"
     description: "Data structures and serialization"
     examples: ["data: add context structures", "data: improve YAML output"]
