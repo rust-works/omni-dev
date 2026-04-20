@@ -192,6 +192,37 @@ fn yaml_to_json(value: &serde_yaml::Value) -> Result<serde_json::Value> {
         .context("Failed to convert YAML value to JSON")
 }
 
+/// Parses a `--set-field NAME=VALUE` argument into a `(name, value)` pair.
+///
+/// The value is parsed as YAML when possible so `--set-field "Points=8"`
+/// becomes a number and `--set-field "Enabled=true"` becomes a bool.
+/// Values that fail to parse as YAML fall back to plain strings.
+pub fn parse_set_field(input: &str) -> Result<(String, serde_yaml::Value)> {
+    let (name, value) = input
+        .split_once('=')
+        .ok_or_else(|| anyhow!("expected --set-field \"NAME=VALUE\", got '{input}'"))?;
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        bail!("--set-field requires a non-empty name before '='");
+    }
+    let yaml_value = serde_yaml::from_str::<serde_yaml::Value>(value)
+        .unwrap_or_else(|_| serde_yaml::Value::String(value.to_string()));
+    Ok((name, yaml_value))
+}
+
+/// Merges CLI `--set-field` overrides into a frontmatter scalar map,
+/// with CLI overriding frontmatter on name conflicts.
+pub fn merge_set_field_overrides(
+    frontmatter: BTreeMap<String, serde_yaml::Value>,
+    overrides: Vec<(String, serde_yaml::Value)>,
+) -> BTreeMap<String, serde_yaml::Value> {
+    let mut merged = frontmatter;
+    for (name, value) in overrides {
+        merged.insert(name, value);
+    }
+    merged
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -499,6 +530,92 @@ mod tests {
         scalars.insert("customfield_999".to_string(), serde_yaml::Value::from("x"));
         let err = resolve_custom_fields(&scalars, &[], &editmeta).unwrap_err();
         assert!(err.to_string().contains("Unknown custom field"));
+    }
+
+    // ── parse_set_field / merge_set_field_overrides ─────────────────
+
+    #[test]
+    fn parse_set_field_bare_string_value() {
+        let (name, value) = parse_set_field("Status=Open").unwrap();
+        assert_eq!(name, "Status");
+        assert_eq!(value, serde_yaml::Value::String("Open".to_string()));
+    }
+
+    #[test]
+    fn parse_set_field_numeric_value_becomes_number() {
+        let (_name, value) = parse_set_field("Points=8").unwrap();
+        assert_eq!(value, serde_yaml::Value::Number(8.into()));
+    }
+
+    #[test]
+    fn parse_set_field_bool_value_becomes_bool() {
+        let (_name, value) = parse_set_field("Enabled=true").unwrap();
+        assert_eq!(value, serde_yaml::Value::Bool(true));
+    }
+
+    #[test]
+    fn parse_set_field_preserves_spaces_in_name() {
+        let (name, value) = parse_set_field("Planned / Unplanned Work=Unplanned").unwrap();
+        assert_eq!(name, "Planned / Unplanned Work");
+        assert_eq!(value, serde_yaml::Value::String("Unplanned".to_string()));
+    }
+
+    #[test]
+    fn parse_set_field_equals_in_value_preserved() {
+        // Only the FIRST `=` splits name from value.
+        let (name, value) = parse_set_field("Formula=a=b+c").unwrap();
+        assert_eq!(name, "Formula");
+        assert_eq!(value, serde_yaml::Value::String("a=b+c".to_string()));
+    }
+
+    #[test]
+    fn parse_set_field_requires_equals() {
+        let err = parse_set_field("just-a-name").unwrap_err();
+        assert!(err.to_string().contains("expected --set-field"));
+    }
+
+    #[test]
+    fn parse_set_field_empty_name_errors() {
+        let err = parse_set_field("=value").unwrap_err();
+        assert!(err.to_string().contains("non-empty name"));
+    }
+
+    #[test]
+    fn merge_set_field_overrides_cli_wins() {
+        let mut frontmatter = BTreeMap::new();
+        frontmatter.insert(
+            "Priority".to_string(),
+            serde_yaml::Value::String("Low".to_string()),
+        );
+        frontmatter.insert(
+            "Keep".to_string(),
+            serde_yaml::Value::String("from-fm".to_string()),
+        );
+        let overrides = vec![(
+            "Priority".to_string(),
+            serde_yaml::Value::String("High".to_string()),
+        )];
+        let merged = merge_set_field_overrides(frontmatter, overrides);
+        assert_eq!(
+            merged.get("Priority"),
+            Some(&serde_yaml::Value::String("High".to_string()))
+        );
+        assert_eq!(
+            merged.get("Keep"),
+            Some(&serde_yaml::Value::String("from-fm".to_string()))
+        );
+    }
+
+    #[test]
+    fn merge_set_field_overrides_with_empty_overrides_preserves_frontmatter() {
+        let mut frontmatter = BTreeMap::new();
+        frontmatter.insert("K".to_string(), serde_yaml::Value::from("v"));
+        let merged = merge_set_field_overrides(frontmatter, vec![]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged.get("K"),
+            Some(&serde_yaml::Value::String("v".to_string()))
+        );
     }
 
     #[test]
