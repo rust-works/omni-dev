@@ -1042,6 +1042,8 @@ Arguments:
 Options:
   -o, --output <OUTPUT>  Output file (writes to stdout if omitted)
       --format <FORMAT>  Output format [default: jfm] [possible values: jfm, adf]
+      --fields <FIELDS>  Custom fields to include (comma-separated). Each entry may be a field ID (e.g. `customfield_19300`) or a human name (e.g. `"Acceptance Criteria"`)
+      --all-fields       Include every custom field populated on the issue
   -h, --help             Print help (see more with '--help')
 
 

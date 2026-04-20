@@ -61,6 +61,43 @@ pub struct JiraIssue {
 
     /// Labels.
     pub labels: Vec<String>,
+
+    /// Custom fields populated on the issue. Non-empty only when the fetch
+    /// was made with [`FieldSelection::Named`] or [`FieldSelection::All`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub custom_fields: Vec<JiraCustomField>,
+}
+
+/// Selector for which fields to request when fetching a JIRA issue.
+#[derive(Debug, Clone, Default)]
+pub enum FieldSelection {
+    /// Only the standard fields omni-dev tracks (summary, description,
+    /// status, issuetype, assignee, priority, labels).
+    #[default]
+    Standard,
+
+    /// Standard fields plus the named custom fields. Each entry may be a
+    /// field ID (e.g., `customfield_19300`) or a human name (e.g.,
+    /// `Acceptance Criteria`); the REST API accepts either.
+    Named(Vec<String>),
+
+    /// Every field populated on the issue, including all custom fields.
+    All,
+}
+
+/// A JIRA custom field value keyed by both its stable ID and human name.
+#[derive(Debug, Clone, Serialize)]
+pub struct JiraCustomField {
+    /// Field ID (e.g., "customfield_19300"). Stable across renames.
+    pub id: String,
+
+    /// Human-readable field name (e.g., "Acceptance Criteria"). Falls back
+    /// to `id` when the API did not return `expand=names`.
+    pub name: String,
+
+    /// Raw field value as returned by the API (ADF JSON, option object,
+    /// scalar, etc.).
+    pub value: serde_json::Value,
 }
 
 /// Response from the JIRA `/myself` endpoint.
@@ -486,6 +523,79 @@ pub struct JiraWorklogList {
 struct JiraIssueResponse {
     key: String,
     fields: JiraIssueFields,
+}
+
+/// Flexible deserialization target for `GET /rest/api/3/issue/{key}` that
+/// retains every field value as raw JSON so custom fields can be extracted.
+#[derive(Deserialize)]
+struct JiraIssueEnvelope {
+    key: String,
+    #[serde(default)]
+    fields: std::collections::BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    names: std::collections::BTreeMap<String, String>,
+}
+
+impl JiraIssueEnvelope {
+    fn into_issue(self, selection: &FieldSelection) -> JiraIssue {
+        let Self {
+            key,
+            mut fields,
+            names,
+        } = self;
+
+        let description_adf = fields.remove("description").filter(|v| !v.is_null());
+        let summary = fields
+            .remove("summary")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let status = extract_named_field(fields.remove("status"));
+        let issue_type = extract_named_field(fields.remove("issuetype"));
+        let assignee = extract_display_name(fields.remove("assignee"));
+        let priority = extract_named_field(fields.remove("priority"));
+        let labels = fields
+            .remove("labels")
+            .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
+            .unwrap_or_default();
+
+        let collect_customs = !matches!(selection, FieldSelection::Standard);
+        let custom_fields = if collect_customs {
+            fields
+                .into_iter()
+                .filter(|(_, value)| !value.is_null())
+                .map(|(id, value)| {
+                    let name = names.get(&id).cloned().unwrap_or_else(|| id.clone());
+                    JiraCustomField { id, name, value }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        JiraIssue {
+            key,
+            summary,
+            description_adf,
+            status,
+            issue_type,
+            assignee,
+            priority,
+            labels,
+            custom_fields,
+        }
+    }
+}
+
+fn extract_named_field(value: Option<serde_json::Value>) -> Option<String> {
+    value
+        .and_then(|v| v.get("name").cloned())
+        .and_then(|n| n.as_str().map(str::to_string))
+}
+
+fn extract_display_name(value: Option<serde_json::Value>) -> Option<String> {
+    value
+        .and_then(|v| v.get("displayName").cloned())
+        .and_then(|n| n.as_str().map(str::to_string))
 }
 
 #[derive(Deserialize)]
@@ -1065,6 +1175,7 @@ mod tests {
             assignee: Some("Alice".to_string()),
             priority: Some("High".to_string()),
             labels: vec!["backend".to_string()],
+            custom_fields: Vec::new(),
         };
         assert_eq!(issue.key, "TEST-1");
         assert_eq!(issue.labels.len(), 1);
@@ -1430,6 +1541,175 @@ mod tests {
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
         let err = client.get_issue("NOPE-1").await.unwrap_err();
         assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn get_issue_with_fields_named_populates_custom_fields() {
+        let server = wiremock::MockServer::start().await;
+
+        let issue_json = serde_json::json!({
+            "key": "ACCS-1",
+            "fields": {
+                "summary": "S",
+                "description": null,
+                "status": {"name": "Open"},
+                "issuetype": {"name": "Bug"},
+                "assignee": null,
+                "priority": null,
+                "labels": [],
+                "customfield_19300": {
+                    "type": "doc",
+                    "version": 1,
+                    "content": [{"type": "paragraph", "content": [{"type": "text", "text": "AC"}]}]
+                }
+            },
+            "names": {
+                "customfield_19300": "Acceptance Criteria"
+            }
+        });
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/ACCS-1"))
+            .and(wiremock::matchers::query_param("expand", "names,schema"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&issue_json))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let issue = client
+            .get_issue_with_fields(
+                "ACCS-1",
+                FieldSelection::Named(vec!["customfield_19300".to_string()]),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(issue.key, "ACCS-1");
+        assert_eq!(issue.custom_fields.len(), 1);
+        let cf = &issue.custom_fields[0];
+        assert_eq!(cf.id, "customfield_19300");
+        assert_eq!(cf.name, "Acceptance Criteria");
+        assert_eq!(cf.value["type"], "doc");
+    }
+
+    #[tokio::test]
+    async fn get_issue_with_fields_standard_omits_custom_fields() {
+        let server = wiremock::MockServer::start().await;
+
+        let issue_json = serde_json::json!({
+            "key": "ACCS-1",
+            "fields": {
+                "summary": "S",
+                "description": null,
+                "status": null,
+                "issuetype": null,
+                "assignee": null,
+                "priority": null,
+                "labels": [],
+                "customfield_19300": {"value": "Unplanned"}
+            },
+            "names": {
+                "customfield_19300": "Planned / Unplanned Work"
+            }
+        });
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/ACCS-1"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&issue_json))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let issue = client
+            .get_issue_with_fields("ACCS-1", FieldSelection::Standard)
+            .await
+            .unwrap();
+
+        assert!(issue.custom_fields.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_issue_with_fields_all_uses_star_param() {
+        let server = wiremock::MockServer::start().await;
+
+        let issue_json = serde_json::json!({
+            "key": "ACCS-1",
+            "fields": {
+                "summary": "S",
+                "description": null,
+                "status": null,
+                "issuetype": null,
+                "assignee": null,
+                "priority": null,
+                "labels": [],
+                "customfield_10001": {"value": "Unplanned"},
+                "customfield_10002": 42
+            },
+            "names": {
+                "customfield_10001": "Planned / Unplanned Work",
+                "customfield_10002": "Story points"
+            }
+        });
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/ACCS-1"))
+            .and(wiremock::matchers::query_param("fields", "*all"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&issue_json))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let issue = client
+            .get_issue_with_fields("ACCS-1", FieldSelection::All)
+            .await
+            .unwrap();
+
+        assert_eq!(issue.custom_fields.len(), 2);
+        let names: Vec<&str> = issue
+            .custom_fields
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(names.contains(&"Planned / Unplanned Work"));
+        assert!(names.contains(&"Story points"));
+    }
+
+    #[tokio::test]
+    async fn get_issue_with_fields_falls_back_to_id_when_names_missing() {
+        let server = wiremock::MockServer::start().await;
+
+        let issue_json = serde_json::json!({
+            "key": "ACCS-1",
+            "fields": {
+                "summary": "S",
+                "description": null,
+                "status": null,
+                "issuetype": null,
+                "assignee": null,
+                "priority": null,
+                "labels": [],
+                "customfield_99999": "raw"
+            }
+        });
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/ACCS-1"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&issue_json))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let issue = client
+            .get_issue_with_fields("ACCS-1", FieldSelection::All)
+            .await
+            .unwrap();
+
+        assert_eq!(issue.custom_fields.len(), 1);
+        assert_eq!(issue.custom_fields[0].name, "customfield_99999");
     }
 
     #[tokio::test]
@@ -4832,16 +5112,53 @@ impl AtlassianClient {
         tokio::time::sleep(Duration::from_secs(delay)).await;
     }
 
-    /// Fetches a JIRA issue by key.
+    /// Fetches a JIRA issue by key with only the standard fields.
+    ///
+    /// Thin shim over [`Self::get_issue_with_fields`] with
+    /// [`FieldSelection::Standard`]. Preserved for callers that do not need
+    /// custom field data.
     pub async fn get_issue(&self, key: &str) -> Result<JiraIssue> {
-        let url = format!(
-            "{}/rest/api/3/issue/{}?fields=summary,description,status,issuetype,assignee,priority,labels",
-            self.instance_url, key
-        );
+        self.get_issue_with_fields(key, FieldSelection::Standard)
+            .await
+    }
+
+    /// Fetches a JIRA issue by key with the given field selection.
+    ///
+    /// Always requests `expand=names,schema` so human-readable field names
+    /// and type metadata are available for rendering custom fields. When
+    /// `selection` is [`FieldSelection::Standard`], `custom_fields` on the
+    /// returned issue will be empty.
+    pub async fn get_issue_with_fields(
+        &self,
+        key: &str,
+        selection: FieldSelection,
+    ) -> Result<JiraIssue> {
+        const STANDARD_FIELDS: &str =
+            "summary,description,status,issuetype,assignee,priority,labels";
+
+        let fields_param = match &selection {
+            FieldSelection::Standard => STANDARD_FIELDS.to_string(),
+            FieldSelection::Named(names) => {
+                let mut parts: Vec<&str> = STANDARD_FIELDS.split(',').collect();
+                parts.extend(names.iter().map(String::as_str));
+                parts.join(",")
+            }
+            FieldSelection::All => "*all".to_string(),
+        };
+
+        let base = format!("{}/rest/api/3/issue/{}", self.instance_url, key);
+        let url = reqwest::Url::parse_with_params(
+            &base,
+            &[
+                ("fields", fields_param.as_str()),
+                ("expand", "names,schema"),
+            ],
+        )
+        .context("Failed to build JIRA issue URL")?;
 
         let response = self
             .client
-            .get(&url)
+            .get(url)
             .header("Authorization", &self.auth_header)
             .header("Accept", "application/json")
             .send()
@@ -4854,21 +5171,12 @@ impl AtlassianClient {
             return Err(AtlassianError::ApiRequestFailed { status, body }.into());
         }
 
-        let issue_response: JiraIssueResponse = response
+        let envelope: JiraIssueEnvelope = response
             .json()
             .await
             .context("Failed to parse JIRA issue response")?;
 
-        Ok(JiraIssue {
-            key: issue_response.key,
-            summary: issue_response.fields.summary.unwrap_or_default(),
-            description_adf: issue_response.fields.description,
-            status: issue_response.fields.status.and_then(|s| s.name),
-            issue_type: issue_response.fields.issuetype.and_then(|t| t.name),
-            assignee: issue_response.fields.assignee.and_then(|a| a.display_name),
-            priority: issue_response.fields.priority.and_then(|p| p.name),
-            labels: issue_response.fields.labels,
-        })
+        Ok(envelope.into_issue(&selection))
     }
 
     /// Updates a JIRA issue's description and optionally its summary.
@@ -5246,6 +5554,7 @@ impl AtlassianClient {
                     assignee: r.fields.assignee.and_then(|a| a.display_name),
                     priority: r.fields.priority.and_then(|p| p.name),
                     labels: r.fields.labels,
+                    custom_fields: Vec::new(),
                 });
             }
 
@@ -5526,6 +5835,7 @@ impl AtlassianClient {
                     assignee: r.fields.assignee.and_then(|a| a.display_name),
                     priority: r.fields.priority.and_then(|p| p.name),
                     labels: r.fields.labels,
+                    custom_fields: Vec::new(),
                 });
             }
 
@@ -5665,6 +5975,7 @@ impl AtlassianClient {
                     assignee: r.fields.assignee.and_then(|a| a.display_name),
                     priority: r.fields.priority.and_then(|p| p.name),
                     labels: r.fields.labels,
+                    custom_fields: Vec::new(),
                 });
             }
 
