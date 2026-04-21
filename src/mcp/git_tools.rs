@@ -11,9 +11,14 @@ use rmcp::{
     schemars, tool, tool_router, ErrorData as McpError,
 };
 use serde::Deserialize;
+use serde_json::json;
+use tokio_util::sync::CancellationToken;
 
+use super::cancel::spawn_blocking_cancellable;
 use super::error::tool_error;
 use super::server::OmniDevServer;
+use super::truncate::{truncate_response, DEFAULT_MAX_RESPONSE_BYTES};
+use super::validate::{validate_range, validate_repo_path};
 
 /// Parameters for the `git_view_commits` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -22,7 +27,8 @@ pub struct GitViewCommitsParams {
     /// Defaults to `HEAD` when omitted.
     #[serde(default)]
     pub range: Option<String>,
-    /// Path to the git repository. Defaults to the current working directory.
+    /// Path to the git repository. Must be absolute when provided.
+    /// Defaults to the current working directory.
     #[serde(default)]
     pub repo_path: Option<String>,
 }
@@ -104,18 +110,27 @@ impl OmniDevServer {
     pub async fn git_view_commits(
         &self,
         Parameters(params): Parameters<GitViewCommitsParams>,
+        cancellation: CancellationToken,
     ) -> Result<CallToolResult, McpError> {
         let range = params.range.as_deref().unwrap_or("HEAD").to_string();
+        validate_range(&range)?;
         let repo_path = params.repo_path.clone();
+        repo_path.as_deref().map(validate_repo_path).transpose()?;
 
-        let yaml = tokio::task::spawn_blocking(move || {
-            crate::cli::git::run_view(&range, repo_path.as_deref())
+        tracing::debug!(
+            tool = "git_view_commits",
+            range = %range,
+            repo_path = ?repo_path,
+            "invoking tool"
+        );
+
+        let range_for_task = range.clone();
+        let yaml = spawn_blocking_cancellable(&cancellation, move || {
+            crate::cli::git::run_view(&range_for_task, repo_path.as_deref())
         })
-        .await
-        .map_err(|e| tool_error(anyhow::anyhow!("join error: {e}")))?
-        .map_err(tool_error)?;
+        .await?;
 
-        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+        Ok(build_truncated_result(yaml))
     }
 
     /// Tool: analyse branch commits and return repository info as YAML.
@@ -218,43 +233,56 @@ impl OmniDevServer {
     }
 }
 
-/// Indents a multi-line string for inclusion as a YAML block scalar value.
-fn indent_for_yaml(body: &str) -> String {
-    body.lines()
-        .map(|line| format!("  {line}"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Formats the payload returned by the `git_check_commits` tool.
-fn format_check_payload(outcome: &crate::cli::git::CheckOutcome) -> String {
-    format!(
-        "# git_check_commits outcome\nexit_code: {}\nstrict: {}\nhas_errors: {}\nhas_warnings: {}\ntotal_commits: {}\nreport: |\n{}",
-        outcome.exit_code,
-        outcome.strict,
-        outcome.has_errors,
-        outcome.has_warnings,
-        outcome.total_commits,
-        indent_for_yaml(&outcome.report_yaml),
-    )
-}
-
-/// Formats the payload returned by the `git_twiddle_commits` tool.
-fn format_twiddle_payload(outcome: &crate::cli::git::TwiddleOutcome, dry_run: bool) -> String {
-    format!(
-        "# git_twiddle_commits outcome\napplied: {}\ndry_run: {}\namendment_count: {}\namendments: |\n{}",
-        outcome.applied,
-        dry_run,
-        outcome.amendment_count,
-        indent_for_yaml(&outcome.amendments_yaml),
-    )
+/// Wraps a text result in a `CallToolResult`, applying the default response
+/// cap and emitting a second `Content::text` payload carrying a JSON
+/// `{"truncated": bool, "original_bytes": usize}` marker when truncation
+/// happened.
+///
+/// Shared by every tool that can produce large output so the truncation
+/// contract is consistent across the MCP surface.
+pub(crate) fn build_truncated_result(text: String) -> CallToolResult {
+    let original_bytes = text.len();
+    let (body, truncated) = truncate_response(text, DEFAULT_MAX_RESPONSE_BYTES);
+    if truncated {
+        let marker = json!({
+            "truncated": true,
+            "original_bytes": original_bytes,
+            "limit_bytes": DEFAULT_MAX_RESPONSE_BYTES,
+        });
+        CallToolResult::success(vec![Content::text(body), Content::text(marker.to_string())])
+    } else {
+        CallToolResult::success(vec![Content::text(body)])
+    }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::cli::git::{CheckOutcome, TwiddleOutcome};
+
+    #[test]
+    fn build_truncated_result_leaves_small_output_alone() {
+        let result = build_truncated_result("hello".to_string());
+        assert_eq!(result.content.len(), 1);
+    }
+
+    #[test]
+    fn build_truncated_result_appends_marker_when_over_cap() {
+        let big = "x".repeat(DEFAULT_MAX_RESPONSE_BYTES + 1024);
+        let result = build_truncated_result(big);
+        assert_eq!(result.content.len(), 2, "expected body + truncation marker");
+        let marker_raw = result.content[1]
+            .as_text()
+            .expect("second payload should be text")
+            .text
+            .clone();
+        let parsed: serde_json::Value = serde_json::from_str(&marker_raw).expect("marker is JSON");
+        assert_eq!(parsed["truncated"], serde_json::Value::Bool(true));
+        let original = parsed["original_bytes"].as_u64().unwrap();
+        let limit = parsed["limit_bytes"].as_u64().unwrap();
+        assert!(original > limit);
+    }
 
     #[test]
     fn indent_for_yaml_empty_string() {
@@ -407,4 +435,36 @@ mod tests {
         let err = server.git_create_pr(Parameters(params)).await.unwrap_err();
         assert!(!err.message.is_empty());
     }
+}
+
+/// Indents a multi-line string for inclusion as a YAML block scalar value.
+fn indent_for_yaml(body: &str) -> String {
+    body.lines()
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Formats the payload returned by the `git_check_commits` tool.
+fn format_check_payload(outcome: &crate::cli::git::CheckOutcome) -> String {
+    format!(
+        "# git_check_commits outcome\nexit_code: {}\nstrict: {}\nhas_errors: {}\nhas_warnings: {}\ntotal_commits: {}\nreport: |\n{}",
+        outcome.exit_code,
+        outcome.strict,
+        outcome.has_errors,
+        outcome.has_warnings,
+        outcome.total_commits,
+        indent_for_yaml(&outcome.report_yaml),
+    )
+}
+
+/// Formats the payload returned by the `git_twiddle_commits` tool.
+fn format_twiddle_payload(outcome: &crate::cli::git::TwiddleOutcome, dry_run: bool) -> String {
+    format!(
+        "# git_twiddle_commits outcome\napplied: {}\ndry_run: {}\namendment_count: {}\namendments: |\n{}",
+        outcome.applied,
+        dry_run,
+        outcome.amendment_count,
+        indent_for_yaml(&outcome.amendments_yaml),
+    )
 }

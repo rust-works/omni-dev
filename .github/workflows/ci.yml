@@ -20,6 +20,9 @@ jobs:
           - stable
           - beta
           - nightly
+        features:
+          - ""
+          - "mcp"
     steps:
     - uses: actions/checkout@v6
     - uses: dtolnay/rust-toolchain@master
@@ -27,7 +30,22 @@ jobs:
         toolchain: ${{ matrix.rust }}
     - uses: Swatinem/rust-cache@v2
     - name: Run tests
-      run: cargo test --verbose
+      run: |
+        if [ -z "${{ matrix.features }}" ]; then
+          cargo test --verbose
+        else
+          cargo test --features "${{ matrix.features }}" --verbose
+        fi
+
+  mcp-build:
+    name: MCP Release Build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+    - name: Build omni-dev-mcp (release)
+      run: cargo build --release --features mcp --bin omni-dev-mcp
 
   fmt:
     name: Rustfmt
@@ -43,6 +61,11 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features:
+          - ""
+          - "mcp"
     steps:
     - uses: actions/checkout@v6
     - uses: dtolnay/rust-toolchain@stable
@@ -50,7 +73,12 @@ jobs:
         components: clippy
     - uses: Swatinem/rust-cache@v2
     - name: Run clippy
-      run: cargo clippy -- -D warnings
+      run: |
+        if [ -z "${{ matrix.features }}" ]; then
+          cargo clippy -- -D warnings
+        else
+          cargo clippy --features "${{ matrix.features }}" -- -D warnings
+        fi
 
   docs:
     name: Docs

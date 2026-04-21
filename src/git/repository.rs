@@ -669,8 +669,9 @@ mod tests {
     #[test]
     fn open_at_temp_repo() -> Result<()> {
         let temp_dir = {
-            std::fs::create_dir_all("tmp")?;
-            tempfile::tempdir_in("tmp")?
+            let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
+            std::fs::create_dir_all(&tmp_root)?;
+            tempfile::tempdir_in(&tmp_root)?
         };
         git2::Repository::init(temp_dir.path())?;
         let repo = GitRepository::open_at(temp_dir.path())?;
@@ -681,8 +682,9 @@ mod tests {
     #[test]
     fn working_directory_clean_empty_repo() -> Result<()> {
         let temp_dir = {
-            std::fs::create_dir_all("tmp")?;
-            tempfile::tempdir_in("tmp")?
+            let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
+            std::fs::create_dir_all(&tmp_root)?;
+            tempfile::tempdir_in(&tmp_root)?
         };
         git2::Repository::init(temp_dir.path())?;
         let repo = GitRepository::open_at(temp_dir.path())?;
@@ -695,8 +697,9 @@ mod tests {
     #[test]
     fn working_directory_dirty_with_file() -> Result<()> {
         let temp_dir = {
-            std::fs::create_dir_all("tmp")?;
-            tempfile::tempdir_in("tmp")?
+            let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
+            std::fs::create_dir_all(&tmp_root)?;
+            tempfile::tempdir_in(&tmp_root)?
         };
         git2::Repository::init(temp_dir.path())?;
         std::fs::write(temp_dir.path().join("new_file.txt"), "content")?;
@@ -710,8 +713,9 @@ mod tests {
     #[test]
     fn is_working_directory_clean_delegator() -> Result<()> {
         let temp_dir = {
-            std::fs::create_dir_all("tmp")?;
-            tempfile::tempdir_in("tmp")?
+            let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
+            std::fs::create_dir_all(&tmp_root)?;
+            tempfile::tempdir_in(&tmp_root)?
         };
         git2::Repository::init(temp_dir.path())?;
         let repo = GitRepository::open_at(temp_dir.path())?;
