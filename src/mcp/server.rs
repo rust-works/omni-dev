@@ -128,6 +128,25 @@ mod tests {
     }
 
     #[test]
+    fn tool_router_registers_confluence_tools() {
+        let server = OmniDevServer::new();
+        for name in [
+            "confluence_children",
+            "confluence_comment_list",
+            "confluence_comment_add",
+            "confluence_label_list",
+            "confluence_label_add",
+            "confluence_label_remove",
+            "confluence_user_search",
+        ] {
+            assert!(
+                server.tool_router.has_route(name),
+                "expected router to register {name}"
+            );
+        }
+    }
+
+    #[test]
     fn tool_router_lists_all_registered_tools() {
         let server = OmniDevServer::new();
         let tools = server.tool_router.list_all();
@@ -138,6 +157,7 @@ mod tests {
             "git_check_commits",
             "git_twiddle_commits",
             "git_create_pr",
+            "confluence_children",
         ] {
             assert!(
                 names.contains(&expected),
@@ -200,6 +220,7 @@ mod tests {
             from_new.tool_router.list_all().len(),
         );
         assert!(from_default.tool_router.has_route("git_view_commits"));
+        assert!(from_default.tool_router.has_route("confluence_children"));
     }
 
     #[test]
