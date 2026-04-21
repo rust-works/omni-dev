@@ -1237,3 +1237,231 @@ async fn read_resource_malformed_git_uri_is_resource_not_found() -> Result<()> {
     let _ = server_handle.await;
     Ok(())
 }
+
+// ── Phase 2d: Confluence extension tools ─────────────────────────────
+
+#[tokio::test]
+async fn list_tools_includes_confluence_extensions() -> Result<()> {
+    let (client, server_handle) = spawn_server().await;
+    let tools = client.list_tools(Option::default()).await?;
+    let names: Vec<_> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
+    for expected in [
+        "confluence_children",
+        "confluence_comment_list",
+        "confluence_comment_add",
+        "confluence_label_list",
+        "confluence_label_add",
+        "confluence_label_remove",
+        "confluence_user_search",
+    ] {
+        assert!(names.contains(&expected), "missing {expected}: {names:?}");
+    }
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+fn confluence_tool_text(result: &rmcp::model::CallToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|c| match &c.raw {
+            RawContent::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Single sequential test exercising the success path of every Confluence
+/// tool handler. `AtlassianEnvGuard` holds the shared env-var lock for the
+/// whole MCP round-trip so concurrent tests cannot clobber credentials.
+///
+/// Holding the lock across `.await` is intentional — the env vars are
+/// process-global state that must remain set for the whole round-trip, so
+/// an async-aware mutex would offer no benefit.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn confluence_tools_success_paths_via_wiremock() -> Result<()> {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/wiki/rest/api/content/1/child/page"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": [{"id": "2", "title": "Child", "status": "current"}]
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/wiki/api/v2/pages/12345/footer-comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": [
+                {"id": "c1", "version": {"authorId": "alice", "createdAt": "2026-04-01T10:00:00Z"}}
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/wiki/api/v2/footer-comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "c9"})))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/wiki/api/v2/pages/12345/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": [{"id": "1", "name": "arch", "prefix": "global"}]
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/wiki/rest/api/content/12345/label"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": [{"prefix": "global", "name": "arch", "id": "1"}]
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/wiki/rest/api/content/12345/label/arch"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/wiki/rest/api/search/user"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": [
+                {"user": {"accountId": "abc", "displayName": "Alice", "email": "a@x.com"}}
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let _env = AtlassianEnvGuard::new(&server.uri(), "user@test.com", "token")?;
+    let (client, server_handle) = spawn_server().await;
+
+    let children = client
+        .call_tool(
+            CallToolRequestParams::new("confluence_children")
+                .with_arguments(serde_json::json!({"id": "1"}).as_object().unwrap().clone()),
+        )
+        .await?;
+    assert!(!children.is_error.unwrap_or(false));
+    assert!(confluence_tool_text(&children).contains("Child"));
+
+    let comments = client
+        .call_tool(
+            CallToolRequestParams::new("confluence_comment_list").with_arguments(
+                serde_json::json!({"id": "12345"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await?;
+    assert!(!comments.is_error.unwrap_or(false));
+    assert!(confluence_tool_text(&comments).contains("id: c1"));
+
+    let comment_add = client
+        .call_tool(
+            CallToolRequestParams::new("confluence_comment_add").with_arguments(
+                serde_json::json!({"id": "12345", "content": "Hello **world**"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await?;
+    assert!(!comment_add.is_error.unwrap_or(false));
+    assert!(confluence_tool_text(&comment_add).contains("Comment added"));
+
+    let labels = client
+        .call_tool(
+            CallToolRequestParams::new("confluence_label_list").with_arguments(
+                serde_json::json!({"id": "12345"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await?;
+    assert!(!labels.is_error.unwrap_or(false));
+    assert!(confluence_tool_text(&labels).contains("arch"));
+
+    let label_add = client
+        .call_tool(
+            CallToolRequestParams::new("confluence_label_add").with_arguments(
+                serde_json::json!({"id": "12345", "labels": ["arch"]})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await?;
+    assert!(!label_add.is_error.unwrap_or(false));
+    assert!(confluence_tool_text(&label_add).contains("Added 1 label"));
+
+    let label_remove = client
+        .call_tool(
+            CallToolRequestParams::new("confluence_label_remove").with_arguments(
+                serde_json::json!({"id": "12345", "labels": ["arch"]})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await?;
+    assert!(!label_remove.is_error.unwrap_or(false));
+    assert!(confluence_tool_text(&label_remove).contains("Removed 1 label"));
+
+    let users = client
+        .call_tool(
+            CallToolRequestParams::new("confluence_user_search").with_arguments(
+                serde_json::json!({"query": "alice"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await?;
+    assert!(!users.is_error.unwrap_or(false));
+    assert!(confluence_tool_text(&users).contains("Alice"));
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn confluence_children_without_credentials_returns_error() -> Result<()> {
+    let _env = AtlassianEnvGuard::empty()?;
+    let (client, server_handle) = spawn_server().await;
+    let outcome = client
+        .call_tool(
+            CallToolRequestParams::new("confluence_children").with_arguments(
+                serde_json::json!({"id": "12345"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await;
+
+    if let Ok(result) = outcome {
+        assert!(
+            result.is_error.unwrap_or(false),
+            "expected tool error without credentials"
+        );
+    }
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
