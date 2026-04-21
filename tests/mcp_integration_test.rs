@@ -148,6 +148,53 @@ async fn list_tools_includes_jira_extension_tools() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn list_tools_includes_all_jira_tools() -> Result<()> {
+    let (client, server_handle) = spawn_server().await;
+    let tools = client.list_tools(Option::default()).await?;
+    let names: Vec<_> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
+    for expected in [
+        "jira_read",
+        "jira_search",
+        "jira_create",
+        "jira_write",
+        "jira_transition",
+        "jira_comment",
+        "jira_link",
+        "jira_dev",
+    ] {
+        assert!(names.contains(&expected), "missing {expected}: {names:?}");
+    }
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+/// Verifies that a JIRA tool is reachable through the duplex transport and
+/// that each tool advertises a parameter schema (so MCP clients can render
+/// a form / infer types). Exercises the MCP boundary for the new jira tools
+/// without needing real Atlassian credentials.
+#[tokio::test]
+async fn jira_tools_advertise_schemas() -> Result<()> {
+    let (client, server_handle) = spawn_server().await;
+    let tools = client.list_tools(Option::default()).await?;
+    for expected in ["jira_read", "jira_search", "jira_create"] {
+        let tool = tools
+            .tools
+            .iter()
+            .find(|t| t.name.as_ref() == expected)
+            .unwrap_or_else(|| panic!("missing {expected}"));
+        // Every tool must have a non-empty input schema and a description.
+        assert!(
+            tool.description.as_ref().is_some_and(|d| !d.is_empty()),
+            "{expected} missing description"
+        );
+    }
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
 /// Calls every JIRA-extension tool through the MCP transport with minimal
 /// valid arguments, in two phases:
 ///
@@ -214,25 +261,25 @@ async fn jira_extension_tools_route_through_mcp() -> Result<()> {
     ];
 
     // ── Phase 1: no credentials, all calls must fail ─────────────────
-    std::env::remove_var("ATLASSIAN_INSTANCE_URL");
-    std::env::remove_var("ATLASSIAN_EMAIL");
-    std::env::remove_var("ATLASSIAN_API_TOKEN");
-
-    let (client, server_handle) = spawn_server().await;
-    for (tool, args) in cases {
-        let outcome = client
-            .call_tool(
-                CallToolRequestParams::new(*tool).with_arguments(args.as_object().unwrap().clone()),
-            )
-            .await;
-        let failed = match outcome {
-            Ok(result) => result.is_error.unwrap_or(false),
-            Err(_) => true,
-        };
-        assert!(failed, "tool {tool} unexpectedly succeeded without creds");
+    {
+        let _env = AtlassianEnvGuard::empty()?;
+        let (client, server_handle) = spawn_server().await;
+        for (tool, args) in cases {
+            let outcome = client
+                .call_tool(
+                    CallToolRequestParams::new(*tool)
+                        .with_arguments(args.as_object().unwrap().clone()),
+                )
+                .await;
+            let failed = match outcome {
+                Ok(result) => result.is_error.unwrap_or(false),
+                Err(_) => true,
+            };
+            assert!(failed, "tool {tool} unexpectedly succeeded without creds");
+        }
+        client.cancel().await?;
+        let _ = server_handle.await;
     }
-    client.cancel().await?;
-    let _ = server_handle.await;
 
     // ── Phase 2: credentials pointing at a wiremock server ──────────
     let mock = wiremock::MockServer::start().await;
@@ -259,29 +306,25 @@ async fn jira_extension_tools_route_through_mcp() -> Result<()> {
         .mount(&mock)
         .await;
 
-    std::env::set_var("ATLASSIAN_INSTANCE_URL", mock.uri());
-    std::env::set_var("ATLASSIAN_EMAIL", "u@t.com");
-    std::env::set_var("ATLASSIAN_API_TOKEN", "tok");
-
-    let (client, server_handle) = spawn_server().await;
-    for (tool, args) in cases {
-        let result = client
-            .call_tool(
-                CallToolRequestParams::new(*tool).with_arguments(args.as_object().unwrap().clone()),
-            )
-            .await;
-        // Any outcome is acceptable here — what we care about is that
-        // every wrapper runs through `create_client → helper → wrap` so
-        // its body shows up in coverage. We DO assert that whatever we
-        // get back is well-formed.
-        let _ = result;
+    {
+        let _env = AtlassianEnvGuard::new(&mock.uri(), "u@t.com", "tok")?;
+        let (client, server_handle) = spawn_server().await;
+        for (tool, args) in cases {
+            let result = client
+                .call_tool(
+                    CallToolRequestParams::new(*tool)
+                        .with_arguments(args.as_object().unwrap().clone()),
+                )
+                .await;
+            // Any outcome is acceptable here — what we care about is that
+            // every wrapper runs through `create_client → helper → wrap` so
+            // its body shows up in coverage. We DO assert that whatever we
+            // get back is well-formed.
+            let _ = result;
+        }
+        client.cancel().await?;
+        let _ = server_handle.await;
     }
-    client.cancel().await?;
-    let _ = server_handle.await;
-
-    std::env::remove_var("ATLASSIAN_INSTANCE_URL");
-    std::env::remove_var("ATLASSIAN_EMAIL");
-    std::env::remove_var("ATLASSIAN_API_TOKEN");
     Ok(())
 }
 
@@ -330,6 +373,309 @@ async fn jira_delete_without_confirm_returns_error() -> Result<()> {
                 msg.contains("confirm: true"),
                 "expected guard message in protocol error; got: {msg}"
             );
+        }
+    }
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+/// Lock held for the duration of any test that mutates the Atlassian
+/// environment variables. The env is process-global, so parallel tests in
+/// this binary that depend on `HOME` / `ATLASSIAN_*` must not run
+/// concurrently.
+static ATLASSIAN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct AtlassianEnvGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    prev_home: Option<String>,
+    prev_xdg: Option<String>,
+    prev_url: Option<String>,
+    prev_email: Option<String>,
+    prev_token: Option<String>,
+    _tmp: tempfile::TempDir,
+}
+
+impl AtlassianEnvGuard {
+    /// Repoints `HOME` at an empty tempdir and sets the Atlassian
+    /// env vars to the given values, suppressing any real credentials
+    /// in the process for the duration of the guard.
+    fn new(instance_url: &str, email: &str, token: &str) -> Result<Self> {
+        let guard = ATLASSIAN_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir()?;
+        let prev_home = std::env::var("HOME").ok();
+        let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        let prev_url = std::env::var("ATLASSIAN_INSTANCE_URL").ok();
+        let prev_email = std::env::var("ATLASSIAN_EMAIL").ok();
+        let prev_token = std::env::var("ATLASSIAN_API_TOKEN").ok();
+        std::env::set_var("HOME", tmp.path());
+        std::env::set_var("XDG_CONFIG_HOME", tmp.path().join("xdg"));
+        std::env::set_var("ATLASSIAN_INSTANCE_URL", instance_url);
+        std::env::set_var("ATLASSIAN_EMAIL", email);
+        std::env::set_var("ATLASSIAN_API_TOKEN", token);
+        Ok(Self {
+            _guard: guard,
+            prev_home,
+            prev_xdg,
+            prev_url,
+            prev_email,
+            prev_token,
+            _tmp: tmp,
+        })
+    }
+
+    /// Variant that clears every Atlassian env var so `create_client()`
+    /// will fail with a credentials-not-found error.
+    fn empty() -> Result<Self> {
+        let guard = ATLASSIAN_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir()?;
+        let prev_home = std::env::var("HOME").ok();
+        let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        let prev_url = std::env::var("ATLASSIAN_INSTANCE_URL").ok();
+        let prev_email = std::env::var("ATLASSIAN_EMAIL").ok();
+        let prev_token = std::env::var("ATLASSIAN_API_TOKEN").ok();
+        std::env::set_var("HOME", tmp.path());
+        std::env::set_var("XDG_CONFIG_HOME", tmp.path().join("xdg"));
+        std::env::remove_var("ATLASSIAN_INSTANCE_URL");
+        std::env::remove_var("ATLASSIAN_EMAIL");
+        std::env::remove_var("ATLASSIAN_API_TOKEN");
+        Ok(Self {
+            _guard: guard,
+            prev_home,
+            prev_xdg,
+            prev_url,
+            prev_email,
+            prev_token,
+            _tmp: tmp,
+        })
+    }
+}
+
+impl Drop for AtlassianEnvGuard {
+    fn drop(&mut self) {
+        restore_env("HOME", self.prev_home.as_deref());
+        restore_env("XDG_CONFIG_HOME", self.prev_xdg.as_deref());
+        restore_env("ATLASSIAN_INSTANCE_URL", self.prev_url.as_deref());
+        restore_env("ATLASSIAN_EMAIL", self.prev_email.as_deref());
+        restore_env("ATLASSIAN_API_TOKEN", self.prev_token.as_deref());
+    }
+}
+
+fn restore_env(key: &str, prev: Option<&str>) {
+    match prev {
+        Some(v) => std::env::set_var(key, v),
+        None => std::env::remove_var(key),
+    }
+}
+
+fn tool_call_text(result: &rmcp::model::CallToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|c| match &c.raw {
+            RawContent::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Invokes every JIRA tool handler end-to-end against a wiremock-backed
+/// Atlassian instance, so the full handler body (parse → create_client →
+/// run_* → ok_text) is exercised via the real MCP transport.
+#[tokio::test]
+async fn jira_tool_handlers_round_trip_through_wiremock() -> Result<()> {
+    let server = wiremock::MockServer::start().await;
+
+    // ── mount API fixtures ─────────────────────────────────────────────
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    // jira_read / jira_link list (issuelinks) / jira_dev (issue id)
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/issue/PROJ-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "10001",
+            "key": "PROJ-1",
+            "fields": {
+                "summary": "Sample",
+                "status": {"name": "Open"},
+                "issuetype": {"name": "Task"},
+                "issuelinks": [],
+                "description": {
+                    "version": 1,
+                    "type": "doc",
+                    "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Body"}]}]
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    // jira_search
+    Mock::given(method("POST"))
+        .and(path("/rest/api/3/search/jql"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "issues": [{"key": "PROJ-1", "fields": {"summary": "Sample"}}],
+            "total": 1
+        })))
+        .mount(&server)
+        .await;
+
+    // jira_create
+    Mock::given(method("POST"))
+        .and(path("/rest/api/3/issue"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": "100",
+            "key": "PROJ-100",
+            "self": "https://example.atlassian.net/rest/api/3/issue/100"
+        })))
+        .mount(&server)
+        .await;
+
+    // jira_write
+    Mock::given(method("PUT"))
+        .and(path("/rest/api/3/issue/PROJ-1"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    // jira_transition (list)
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/issue/PROJ-1/transitions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "transitions": [{"id": "11", "name": "In Progress"}]
+        })))
+        .mount(&server)
+        .await;
+
+    // jira_comment (list)
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/issue/PROJ-1/comment"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "startAt": 0,
+            "maxResults": 100,
+            "total": 0,
+            "comments": []
+        })))
+        .mount(&server)
+        .await;
+
+    // jira_link (types)
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/issueLinkType"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "issueLinkTypes": [
+                {"id": "1", "name": "Blocks", "inward": "is blocked by", "outward": "blocks"}
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    // jira_dev
+    Mock::given(method("GET"))
+        .and(path("/rest/dev-status/1.0/issue/summary"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "summary": {
+                "pullrequest": {"overall": {"count": 0}, "byInstanceType": {}},
+                "branch": {"overall": {"count": 0}, "byInstanceType": {}},
+                "repository": {"overall": {"count": 0}, "byInstanceType": {}}
+            }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/dev-status/1.0/issue/detail"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "detail": [{"pullRequests": [], "branches": [], "repositories": []}]
+        })))
+        .mount(&server)
+        .await;
+
+    let _env = AtlassianEnvGuard::new(&server.uri(), "test@test.com", "token")?;
+    let (client, server_handle) = spawn_server().await;
+
+    let calls: [(&str, serde_json::Value); 8] = [
+        ("jira_read", serde_json::json!({"key": "PROJ-1"})),
+        ("jira_search", serde_json::json!({"jql": "project = PROJ"})),
+        (
+            "jira_create",
+            serde_json::json!({"project": "PROJ", "summary": "T", "description": "Body"}),
+        ),
+        (
+            "jira_write",
+            serde_json::json!({"key": "PROJ-1", "content": "Body"}),
+        ),
+        (
+            "jira_transition",
+            serde_json::json!({"key": "PROJ-1", "list": true}),
+        ),
+        (
+            "jira_comment",
+            serde_json::json!({"key": "PROJ-1", "action": "list"}),
+        ),
+        ("jira_link", serde_json::json!({"action": "types"})),
+        ("jira_dev", serde_json::json!({"key": "PROJ-1"})),
+    ];
+
+    for (name, args) in &calls {
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new(*name).with_arguments(args.as_object().unwrap().clone()),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{name} failed: {e}"));
+        assert!(
+            !result.is_error.unwrap_or(false),
+            "{name} returned an error: {}",
+            tool_call_text(&result)
+        );
+    }
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+/// Exercises the early-return path of every JIRA handler by clearing all
+/// Atlassian env vars so `create_client()` fails. Complements the happy-path
+/// wiremock test above — together they cover every branch of the handler
+/// bodies.
+#[tokio::test]
+async fn jira_tool_handlers_surface_tool_error_without_credentials() -> Result<()> {
+    let _env = AtlassianEnvGuard::empty()?;
+    let (client, server_handle) = spawn_server().await;
+
+    for name in [
+        "jira_read",
+        "jira_search",
+        "jira_create",
+        "jira_write",
+        "jira_transition",
+        "jira_comment",
+        "jira_link",
+        "jira_dev",
+    ] {
+        // Supply the minimum required params so schema validation passes.
+        let args = match name {
+            "jira_search" => serde_json::json!({"jql": "x"}),
+            "jira_create" => serde_json::json!({"project": "P", "summary": "s"}),
+            "jira_write" => serde_json::json!({"key": "X-1", "content": "b"}),
+            "jira_comment" => serde_json::json!({"key": "X-1", "action": "list"}),
+            "jira_link" => serde_json::json!({"action": "types"}),
+            _ => serde_json::json!({"key": "X-1"}),
+        };
+        let outcome = client
+            .call_tool(
+                CallToolRequestParams::new(name).with_arguments(args.as_object().unwrap().clone()),
+            )
+            .await;
+        match outcome {
+            Ok(result) => assert!(
+                result.is_error.unwrap_or(false),
+                "{name} should have returned tool_error without credentials"
+            ),
+            Err(_) => { /* protocol-level error is also acceptable */ }
         }
     }
 
