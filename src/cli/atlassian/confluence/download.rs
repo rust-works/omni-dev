@@ -144,17 +144,27 @@ struct LogEntry {
 }
 
 /// Parameters for a recursive download, decoupled from CLI parsing.
-struct DownloadParams {
-    id: Option<String>,
-    space: Option<String>,
-    output_dir: PathBuf,
-    format: ContentFormat,
-    concurrency: usize,
-    max_depth: u32,
-    title_filter: Option<String>,
-    resume: bool,
-    on_conflict: OnConflict,
-    instance_url: String,
+pub struct DownloadParams {
+    /// Root page ID to start downloading from.
+    pub id: Option<String>,
+    /// Space key — download all top-level pages in the space.
+    pub space: Option<String>,
+    /// Target directory for downloaded files.
+    pub output_dir: PathBuf,
+    /// Per-page output format.
+    pub format: ContentFormat,
+    /// Maximum concurrent fetches.
+    pub concurrency: usize,
+    /// Maximum tree depth (0 = unlimited).
+    pub max_depth: u32,
+    /// Only download pages whose title contains this substring (case-insensitive).
+    pub title_filter: Option<String>,
+    /// Use manifest to skip already-downloaded pages.
+    pub resume: bool,
+    /// Behavior when a file already exists at the target.
+    pub on_conflict: OnConflict,
+    /// Atlassian instance URL for building JFM frontmatter links.
+    pub instance_url: String,
 }
 
 impl DownloadParams {
@@ -186,7 +196,7 @@ impl DownloadCommand {
 }
 
 /// Recursively downloads a Confluence page tree.
-async fn run_download(api: &Arc<ConfluenceApi>, params: &DownloadParams) -> Result<()> {
+pub async fn run_download(api: &Arc<ConfluenceApi>, params: &DownloadParams) -> Result<()> {
     let semaphore = Arc::new(Semaphore::new(params.concurrency));
     let stats = Arc::new(DownloadStats::new());
     let log_entries: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
