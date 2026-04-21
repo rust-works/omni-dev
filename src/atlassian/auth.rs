@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::fs;
 
 use anyhow::{Context, Result};
+use serde::Serialize;
 
 use crate::atlassian::error::AtlassianError;
 use crate::utils::settings::Settings;
@@ -59,6 +60,62 @@ pub fn load_credentials() -> Result<AtlassianCredentials> {
         email,
         api_token,
     })
+}
+
+/// Summary of a single Atlassian credential scope.
+///
+/// Reports which credential keys are present without exposing their values.
+/// Safe to serialize and return over the MCP surface.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AtlassianScopeStatus {
+    /// Scope name (currently always `"default"`; forward-compatible for
+    /// per-instance scopes).
+    pub name: String,
+    /// Whether [`ATLASSIAN_EMAIL`] is present.
+    pub has_email: bool,
+    /// Whether [`ATLASSIAN_API_TOKEN`] is present. Token value is never exposed.
+    pub has_token: bool,
+    /// Value of [`ATLASSIAN_INSTANCE_URL`] when set. The URL is considered
+    /// non-secret; returning it helps the assistant surface which instance
+    /// a scope targets without exposing credentials.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance_url: Option<String>,
+}
+
+/// Aggregate credential status across every known Atlassian scope.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AuthStatus {
+    /// One entry per scope. Currently a single default scope; kept as a list
+    /// so future multi-instance support does not require a schema change.
+    pub scopes: Vec<AtlassianScopeStatus>,
+}
+
+/// Builds an [`AuthStatus`] from the current settings / environment.
+///
+/// Reports credential presence without leaking any secret values.
+/// [`AtlassianScopeStatus::instance_url`] is returned verbatim when set —
+/// URLs are explicitly non-secret; tokens and emails are flagged as booleans
+/// only. Safe to call with no credentials configured (returns a scope with
+/// every flag `false`).
+pub fn status() -> AuthStatus {
+    let settings = Settings::load().unwrap_or(Settings {
+        env: HashMap::new(),
+    });
+
+    let instance_url = settings
+        .get_env_var(ATLASSIAN_INSTANCE_URL)
+        .map(|v| v.trim_end_matches('/').to_string());
+    let has_email = settings.get_env_var(ATLASSIAN_EMAIL).is_some();
+    let has_token = settings.get_env_var(ATLASSIAN_API_TOKEN).is_some();
+
+    AuthStatus {
+        scopes: vec![AtlassianScopeStatus {
+            name: "default".to_string(),
+            has_email,
+            has_token,
+            instance_url,
+        }],
+    }
 }
 
 /// Saves Atlassian credentials to `~/.omni-dev/settings.json`.
@@ -188,14 +245,133 @@ mod tests {
         assert!(debug.contains("AtlassianCredentials"));
     }
 
+    /// Mutex shared by every test that mutates `HOME` and the Atlassian
+    /// credential env vars. Serialises those tests against each other so
+    /// parallel execution doesn't race on process-wide env state.
+    static AUTH_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard: snapshots `HOME` + every Atlassian credential env var on
+    /// construction and restores them on drop. Concentrating the save/restore
+    /// branches into one place (here) instead of inlining them in each test
+    /// keeps coverage high — every test exercises the same guard drop path.
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        snapshot: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn take() -> Self {
+            let lock = AUTH_ENV_MUTEX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let keys = [
+                "HOME",
+                ATLASSIAN_INSTANCE_URL,
+                ATLASSIAN_EMAIL,
+                ATLASSIAN_API_TOKEN,
+            ];
+            let snapshot = keys
+                .into_iter()
+                .map(|k| (k, std::env::var(k).ok()))
+                .collect();
+            Self {
+                _lock: lock,
+                snapshot,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.snapshot {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    fn with_empty_home(_guard: &EnvGuard) -> tempfile::TempDir {
+        let dir = {
+            std::fs::create_dir_all("tmp").ok();
+            tempfile::TempDir::new_in("tmp").unwrap()
+        };
+        std::env::set_var("HOME", dir.path());
+        std::env::remove_var(ATLASSIAN_INSTANCE_URL);
+        std::env::remove_var(ATLASSIAN_EMAIL);
+        std::env::remove_var(ATLASSIAN_API_TOKEN);
+        dir
+    }
+
+    #[test]
+    fn status_reports_all_false_when_nothing_configured() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+
+        let status = status();
+        assert_eq!(status.scopes.len(), 1);
+        let scope = &status.scopes[0];
+        assert_eq!(scope.name, "default");
+        assert!(!scope.has_email);
+        assert!(!scope.has_token);
+        assert_eq!(scope.instance_url, None);
+    }
+
+    #[test]
+    fn status_reports_presence_flags_from_settings_without_leaking_secrets() {
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        let omni_dir = dir.path().join(".omni-dev");
+        fs::create_dir_all(&omni_dir).unwrap();
+        fs::write(
+            omni_dir.join("settings.json"),
+            r#"{"env":{
+                "ATLASSIAN_INSTANCE_URL":"https://status.atlassian.net/",
+                "ATLASSIAN_EMAIL":"person@example.com",
+                "ATLASSIAN_API_TOKEN":"sekret-do-not-leak"
+            }}"#,
+        )
+        .unwrap();
+
+        let status = status();
+        assert_eq!(status.scopes.len(), 1);
+        let scope = &status.scopes[0];
+        assert!(scope.has_email);
+        assert!(scope.has_token);
+        assert_eq!(
+            scope.instance_url.as_deref(),
+            Some("https://status.atlassian.net")
+        );
+
+        let yaml = serde_yaml::to_string(&status).unwrap();
+        assert!(!yaml.contains("sekret-do-not-leak"), "leaked token: {yaml}");
+        assert!(!yaml.contains("person@example.com"), "leaked email: {yaml}");
+    }
+
+    #[test]
+    fn status_returns_instance_url_from_env_without_trailing_slash() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        std::env::set_var(ATLASSIAN_INSTANCE_URL, "https://env.atlassian.net/");
+
+        let status = status();
+        let scope = &status.scopes[0];
+        assert_eq!(
+            scope.instance_url.as_deref(),
+            Some("https://env.atlassian.net")
+        );
+        assert!(!scope.has_email);
+        assert!(!scope.has_token);
+    }
+
     /// Single test for save_credentials to avoid HOME env var race conditions.
     /// Tests both fresh-file creation and merge-with-existing in sequence.
     #[test]
     fn save_credentials_creates_and_preserves() {
-        use std::sync::Mutex;
-        static HOME_MUTEX: Mutex<()> = Mutex::new(());
-        let _lock = HOME_MUTEX.lock().unwrap();
-
+        // Share the mutex with the other env-mutating tests in this module
+        // so that setting HOME here doesn't race with `status()` tests.
+        let _guard = EnvGuard::take();
         let original_home = std::env::var("HOME").ok();
 
         // ── Part 1: creates file from scratch ──────────────────────
