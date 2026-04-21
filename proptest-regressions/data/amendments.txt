@@ -2,3 +2,4 @@
 # temporary recommended to check this file in until the failing case
 # has been fixed.
 cc 284ebd1e31ca9ec01b9ac8634905e4c9e2e8c349e126b482c6e0c0d7500fafe7
+cc 2262c038dfb06d699456edeca11c1fa52d96d0f226bf8204263331dafd15e12c # shrinks to count = 3

@@ -1703,6 +1703,353 @@ impl TwiddleCommand {
     }
 }
 
+/// Structured output from [`run_twiddle`] for programmatic consumers (MCP).
+#[derive(Debug, Clone)]
+pub struct TwiddleOutcome {
+    /// YAML serialisation of the generated [`AmendmentFile`].
+    pub amendments_yaml: String,
+    /// `true` when amendments were applied to the repository; `false` for a
+    /// dry-run or when no amendments were generated.
+    pub applied: bool,
+    /// Number of amendments generated.
+    pub amendment_count: usize,
+}
+
+/// Non-interactive core for `omni-dev git commit message twiddle`.
+///
+/// Shared by the CLI (wrapped by [`TwiddleCommand::execute`] for the
+/// interactive flow) and the MCP server. The MCP tool boundary is
+/// non-interactive, so this entry point forces `--auto-apply` semantics when
+/// `dry_run` is false and never opens an editor. When `dry_run` is true,
+/// proposed amendments are returned as YAML without being applied.
+///
+/// Like [`super::run_check`], a `Some` `repo_path` pins the process CWD for
+/// the duration of the call.
+pub async fn run_twiddle(
+    range: Option<&str>,
+    model: Option<String>,
+    dry_run: bool,
+    repo_path: Option<&std::path::Path>,
+) -> Result<TwiddleOutcome> {
+    let _cwd_guard = match repo_path {
+        Some(p) => Some(super::CwdGuard::enter(p).await?),
+        None => None,
+    };
+
+    crate::utils::check_ai_command_prerequisites(model.as_deref())?;
+
+    if !dry_run {
+        crate::utils::preflight::check_working_directory_clean()?;
+    }
+
+    let claude_client = crate::claude::create_default_claude_client(model, None)?;
+    run_twiddle_with_client(range, dry_run, &claude_client).await
+}
+
+/// Non-credential-gated inner core of [`run_twiddle`] for unit tests.
+///
+/// Extracted so tests can inject a [`crate::claude::client::ClaudeClient`]
+/// backed by the in-crate mock AI client and exercise the full flow without
+/// real credentials. Callers are responsible for holding any
+/// [`super::CwdGuard`] they need and for running preflight themselves.
+pub(crate) async fn run_twiddle_with_client(
+    range: Option<&str>,
+    dry_run: bool,
+    claude_client: &crate::claude::client::ClaudeClient,
+) -> Result<TwiddleOutcome> {
+    use crate::data::{
+        AiInfo, BranchInfo, FieldExplanation, FileStatusInfo, RepositoryView, VersionInfo,
+        WorkingDirectoryInfo,
+    };
+    use crate::git::{GitRepository, RemoteInfo};
+    use crate::utils::ai_scratch;
+
+    let resolved_range = range.unwrap_or("HEAD~5..HEAD");
+
+    let repo = GitRepository::open()
+        .context("Failed to open git repository. Make sure you're in a git repository.")?;
+
+    let current_branch = repo
+        .get_current_branch()
+        .unwrap_or_else(|_| "HEAD".to_string());
+
+    let wd_status = repo.get_working_directory_status()?;
+    let working_directory = WorkingDirectoryInfo {
+        clean: wd_status.clean,
+        untracked_changes: wd_status
+            .untracked_changes
+            .into_iter()
+            .map(|fs| FileStatusInfo {
+                status: fs.status,
+                file: fs.file,
+            })
+            .collect(),
+    };
+
+    let remotes = RemoteInfo::get_all_remotes(repo.repository())?;
+    let commits = repo.get_commits_in_range(resolved_range)?;
+
+    if commits.is_empty() {
+        let empty_file = AmendmentFile { amendments: vec![] };
+        let yaml =
+            crate::data::to_yaml(&empty_file).context("Failed to serialise empty AmendmentFile")?;
+        return Ok(TwiddleOutcome {
+            amendments_yaml: yaml,
+            applied: false,
+            amendment_count: 0,
+        });
+    }
+
+    let ai_scratch_path =
+        ai_scratch::get_ai_scratch_dir().context("Failed to determine AI scratch directory")?;
+    let ai_info = AiInfo {
+        scratch: ai_scratch_path.to_string_lossy().to_string(),
+    };
+
+    let mut repo_view = RepositoryView {
+        versions: Some(VersionInfo {
+            omni_dev: env!("CARGO_PKG_VERSION").to_string(),
+        }),
+        explanation: FieldExplanation::default(),
+        working_directory,
+        remotes,
+        ai: ai_info,
+        branch_info: Some(BranchInfo {
+            branch: current_branch,
+        }),
+        pr_template: None,
+        pr_template_location: None,
+        branch_prs: None,
+        commits,
+    };
+    repo_view.update_field_presence();
+
+    let mut amendments = claude_client
+        .generate_amendments_with_options(&repo_view, true)
+        .await?;
+
+    let context_dir = crate::claude::context::resolve_context_dir(None);
+    let scope_defs =
+        crate::claude::context::load_project_scopes(&context_dir, &std::path::PathBuf::from("."));
+    refine_amendment_scopes(&mut amendments, &repo_view, &scope_defs);
+
+    let amendments_yaml =
+        crate::data::to_yaml(&amendments).context("Failed to serialise AmendmentFile")?;
+    let amendment_count = amendments.amendments.len();
+
+    if dry_run || amendment_count == 0 {
+        return Ok(TwiddleOutcome {
+            amendments_yaml,
+            applied: false,
+            amendment_count,
+        });
+    }
+
+    let temp_dir = tempfile::tempdir().context("Failed to create temp dir")?;
+    let amendments_file = temp_dir.path().join("twiddle_amendments.yaml");
+    amendments
+        .save_to_file(&amendments_file)
+        .context("Failed to save amendments")?;
+    let handler =
+        crate::git::AmendmentHandler::new().context("Failed to initialise amendment handler")?;
+    handler
+        .apply_amendments(&amendments_file.to_string_lossy())
+        .context("Failed to apply amendments")?;
+
+    Ok(TwiddleOutcome {
+        amendments_yaml,
+        applied: true,
+        amendment_count,
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod run_twiddle_tests {
+    use super::*;
+    use crate::claude::client::ClaudeClient;
+    use crate::claude::test_utils::ConfigurableMockAiClient;
+    use git2::{Repository, Signature};
+
+    #[tokio::test]
+    async fn run_twiddle_invalid_repo_path_errors_before_ai() {
+        let err = run_twiddle(
+            None,
+            None,
+            true,
+            Some(std::path::Path::new("/no/such/path/exists")),
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.to_lowercase().contains("set_current_dir")
+                || msg.to_lowercase().contains("no such")
+                || msg.to_lowercase().contains("directory"),
+            "expected cwd-related error, got: {msg}"
+        );
+    }
+
+    fn init_test_repo_with_commit() -> (tempfile::TempDir, String) {
+        let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
+        std::fs::create_dir_all(&tmp_root).unwrap();
+        let temp_dir = tempfile::tempdir_in(&tmp_root).unwrap();
+        let repo = Repository::init(temp_dir.path()).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Test").unwrap();
+            cfg.set_str("user.email", "test@example.com").unwrap();
+        }
+        let signature = Signature::now("Test", "test@example.com").unwrap();
+        std::fs::write(temp_dir.path().join("f.txt"), "c").unwrap();
+        let mut idx = repo.index().unwrap();
+        idx.add_path(std::path::Path::new("f.txt")).unwrap();
+        idx.write().unwrap();
+        let tree_id = idx.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let oid = repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "feat: original",
+                &tree,
+                &[],
+            )
+            .unwrap();
+        (temp_dir, oid.to_string())
+    }
+
+    fn amendment_yaml(hash: &str, msg: &str) -> String {
+        format!("amendments:\n  - commit: {hash}\n    message: '{msg}'\n")
+    }
+
+    #[tokio::test]
+    async fn run_twiddle_with_client_dry_run_returns_amendments() {
+        let (temp_dir, hash) = init_test_repo_with_commit();
+        let _guard = super::super::CwdGuard::enter(temp_dir.path())
+            .await
+            .unwrap();
+
+        let mock = ConfigurableMockAiClient::new(vec![Ok(amendment_yaml(
+            &hash,
+            "feat(cli): better subject",
+        ))]);
+        let client = ClaudeClient::new(Box::new(mock));
+
+        let outcome = run_twiddle_with_client(Some("HEAD"), true, &client)
+            .await
+            .unwrap();
+        assert!(!outcome.applied, "dry_run must not apply");
+        assert_eq!(outcome.amendment_count, 1);
+        assert!(outcome.amendments_yaml.contains("amendments:"));
+    }
+
+    #[tokio::test]
+    async fn run_twiddle_with_client_empty_range_returns_empty() {
+        let (temp_dir, _hash) = init_test_repo_with_commit();
+        let _guard = super::super::CwdGuard::enter(temp_dir.path())
+            .await
+            .unwrap();
+
+        let mock = ConfigurableMockAiClient::new(vec![]);
+        let client = ClaudeClient::new(Box::new(mock));
+
+        let outcome = run_twiddle_with_client(Some("HEAD..HEAD"), true, &client)
+            .await
+            .unwrap();
+        assert_eq!(outcome.amendment_count, 0);
+        assert!(!outcome.applied);
+    }
+
+    #[tokio::test]
+    async fn run_twiddle_with_client_ai_failure_errors() {
+        let (temp_dir, _hash) = init_test_repo_with_commit();
+        let _guard = super::super::CwdGuard::enter(temp_dir.path())
+            .await
+            .unwrap();
+
+        let mock = ConfigurableMockAiClient::new(vec![]);
+        let client = ClaudeClient::new(Box::new(mock));
+        let err = run_twiddle_with_client(Some("HEAD"), true, &client)
+            .await
+            .unwrap_err();
+        let _ = err;
+    }
+
+    #[tokio::test]
+    async fn run_twiddle_with_client_default_range_errors_on_sparse_repo() {
+        let (temp_dir, _hash) = init_test_repo_with_commit();
+        let _guard = super::super::CwdGuard::enter(temp_dir.path())
+            .await
+            .unwrap();
+
+        // Default range HEAD~5..HEAD cannot resolve HEAD~5 in a repo with
+        // only one commit — get_commits_in_range returns an error, which
+        // propagates. This still exercises the default-range code path.
+        let mock = ConfigurableMockAiClient::new(vec![]);
+        let client = ClaudeClient::new(Box::new(mock));
+
+        let err = run_twiddle_with_client(None, true, &client)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("HEAD~5")
+                || format!("{err:#}").to_lowercase().contains("not found"),
+            "expected HEAD~5 resolution error"
+        );
+    }
+
+    #[test]
+    fn twiddle_outcome_clone_and_debug() {
+        let outcome = TwiddleOutcome {
+            amendments_yaml: "x".to_string(),
+            applied: true,
+            amendment_count: 2,
+        };
+        let cloned = outcome.clone();
+        assert_eq!(format!("{outcome:?}"), format!("{cloned:?}"));
+    }
+
+    /// Exercises the apply-amendments path (`dry_run = false`). The amendment
+    /// targets the repo's HEAD, so `AmendmentHandler` takes the fast
+    /// `amend_head_commit` branch rather than interactive rebase.
+    #[tokio::test]
+    async fn run_twiddle_with_client_applies_head_amendment() {
+        let (temp_dir, hash) = init_test_repo_with_commit();
+        let _guard = super::super::CwdGuard::enter(temp_dir.path())
+            .await
+            .unwrap();
+
+        let mock = ConfigurableMockAiClient::new(vec![Ok(amendment_yaml(
+            &hash,
+            "feat(cli): much better subject",
+        ))]);
+        let client = ClaudeClient::new(Box::new(mock));
+
+        let outcome = run_twiddle_with_client(Some("HEAD"), false, &client)
+            .await
+            .unwrap();
+        assert!(outcome.applied, "dry_run=false must apply amendments");
+        assert_eq!(outcome.amendment_count, 1);
+
+        // Confirm the commit message was actually rewritten on HEAD.
+        let repo = git2::Repository::open(temp_dir.path()).unwrap();
+        let head_msg = repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .message()
+            .unwrap()
+            .to_string();
+        assert!(
+            head_msg.contains("much better subject"),
+            "HEAD message should be rewritten: {head_msg}"
+        );
+    }
+}
+
 // --- Extracted pure functions ---
 
 /// Formats a work pattern as a display label with emoji.
