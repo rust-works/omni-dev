@@ -4,7 +4,9 @@
 //! See [ADR-0021](../../docs/adrs/adr-0021.md) for the architectural decision
 //! behind the second-binary approach.
 
+pub mod ai_tools;
 pub mod atlassian_tools;
+pub mod config_tools;
 pub mod confluence_tools;
 pub mod error;
 pub mod git_tools;

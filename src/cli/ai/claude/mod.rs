@@ -1,7 +1,7 @@
 //! Claude Code diagnostics and inspection commands.
 
 mod cli;
-mod skills;
+pub mod skills;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

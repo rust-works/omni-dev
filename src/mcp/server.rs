@@ -37,7 +37,9 @@ impl OmniDevServer {
                 + Self::jira_tool_router()
                 + Self::jira_core_tool_router()
                 + Self::confluence_tool_router()
-                + Self::atlassian_tool_router(),
+                + Self::atlassian_tool_router()
+                + Self::ai_tool_router()
+                + Self::config_tool_router(),
         }
     }
 }
@@ -150,7 +152,7 @@ mod tests {
     fn tool_router_lists_all_registered_tools() {
         let server = OmniDevServer::new();
         let tools = server.tool_router.list_all();
-        let names: Vec<_> = tools.iter().map(|t| t.name.as_ref()).collect();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         for expected in [
             "git_view_commits",
             "git_branch_info",
@@ -158,10 +160,16 @@ mod tests {
             "git_twiddle_commits",
             "git_create_pr",
             "confluence_children",
+            "ai_chat",
+            "claude_skills_sync",
+            "claude_skills_clean",
+            "claude_skills_status",
+            "config_models_show",
+            "atlassian_auth_status",
         ] {
             assert!(
                 names.contains(&expected),
-                "missing: {expected} in {names:?}"
+                "missing tool {expected}; got {names:?}"
             );
         }
     }
@@ -208,6 +216,24 @@ mod tests {
             "atlassian_convert",
         ] {
             assert!(server.tool_router.has_route(name), "missing: {name}");
+        }
+    }
+
+    #[test]
+    fn tool_router_registers_ai_and_config_tools() {
+        let server = OmniDevServer::new();
+        for name in [
+            "ai_chat",
+            "claude_skills_sync",
+            "claude_skills_clean",
+            "claude_skills_status",
+            "config_models_show",
+            "atlassian_auth_status",
+        ] {
+            assert!(
+                server.tool_router.has_route(name),
+                "router missing route {name}"
+            );
         }
     }
 
