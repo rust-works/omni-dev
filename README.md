@@ -185,6 +185,96 @@ omni-dev atlassian convert to-adf input.md
 omni-dev git commit message amend amendments.yaml
 ```
 
+### 🔌 MCP Server
+
+omni-dev ships an optional **Model Context Protocol** server so AI assistants
+(Claude Desktop, Claude Code, the MCP Inspector, custom agents) can call
+omni-dev over stdio instead of shelling out to the CLI.
+
+Tools currently exposed:
+
+- `git_view_commits` — YAML commit analysis (mirrors `omni-dev git commit message view`)
+
+Resources exposed via URI templates:
+
+| URI template                   | Returns                   |
+|--------------------------------|---------------------------|
+| `git://repo/commits/{range}`   | YAML commit analysis      |
+| `jira://issue/{key}`           | JIRA issue as JFM         |
+| `jira://issue/{key}.adf`       | JIRA issue body as ADF    |
+| `confluence://page/{id}`       | Confluence page as JFM    |
+| `confluence://page/{id}.adf`   | Confluence page body as ADF |
+
+#### Install
+
+```bash
+cargo install omni-dev --features mcp
+```
+
+This adds a second binary, `omni-dev-mcp`, alongside the regular `omni-dev`
+CLI. The default `cargo install omni-dev` build is unchanged — no MCP
+dependencies are pulled in unless the `mcp` feature is enabled.
+
+#### Claude Desktop
+
+Edit `~/Library/Application Support/Claude/claude_desktop_config.json` on
+macOS (or `%APPDATA%\Claude\claude_desktop_config.json` on Windows):
+
+```json
+{
+  "mcpServers": {
+    "omni-dev": {
+      "command": "omni-dev-mcp"
+    }
+  }
+}
+```
+
+#### Claude Code
+
+Per-project — create `.mcp.json` at the repo root:
+
+```json
+{
+  "mcpServers": {
+    "omni-dev": {
+      "command": "omni-dev-mcp"
+    }
+  }
+}
+```
+
+Or register globally with the Claude Code CLI:
+
+```bash
+claude mcp add omni-dev omni-dev-mcp
+```
+
+#### Smoke-test with the MCP Inspector
+
+```bash
+npx @modelcontextprotocol/inspector omni-dev-mcp
+```
+
+The Inspector opens a browser UI where you can list tools and resources,
+call `git_view_commits`, and fetch `git://repo/commits/HEAD` against the
+current working directory.
+
+#### Troubleshooting
+
+- **Logs go to stderr.** MCP uses stdin/stdout for protocol framing, so
+  tracing output is routed to stderr — tail your client's MCP log pane or
+  run the binary in a terminal to see it.
+- **Verbose tracing:** `RUST_LOG=debug omni-dev-mcp` turns on debug-level
+  logs. Module-scoped filters work too, e.g.
+  `RUST_LOG=omni_dev::mcp=trace`.
+- **Permission errors:** the assistant runs `omni-dev-mcp` with its own
+  working directory. Tools that open a git repository use that directory
+  unless an explicit `repo_path` parameter (or a resource URI placing you
+  elsewhere) overrides it. If tool calls fail with "failed to open git
+  repository", confirm the assistant launched the server from inside the
+  repo you expected.
+
 ### ⚙️ Configuration Commands
 
 ```bash

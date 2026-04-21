@@ -2,9 +2,16 @@
 
 use rmcp::{
     handler::server::router::tool::ToolRouter,
-    model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo},
-    tool_handler, ServerHandler,
+    model::{
+        Implementation, ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
+        ProtocolVersion, ReadResourceRequestParams, ReadResourceResult, ServerCapabilities,
+        ServerInfo,
+    },
+    service::RequestContext,
+    tool_handler, ErrorData as McpError, RoleServer, ServerHandler,
 };
+
+use super::resources;
 
 /// The omni-dev MCP server.
 ///
@@ -38,16 +45,51 @@ impl OmniDevServer {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for OmniDevServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new(
-                "omni-dev-mcp",
-                env!("CARGO_PKG_VERSION"),
-            ))
-            .with_protocol_version(ProtocolVersion::V_2024_11_05)
-            .with_instructions(
-                "omni-dev MCP server. Provides tools for git analysis, commit \
-                 improvement, and Atlassian integration.",
-            )
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
+        )
+        .with_server_info(Implementation::new(
+            "omni-dev-mcp",
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_protocol_version(ProtocolVersion::V_2024_11_05)
+        .with_instructions(
+            "omni-dev MCP server. Provides tools for git analysis, commit \
+             improvement, and Atlassian integration. Resources expose \
+             URI-addressable content via `git://`, `jira://`, and `confluence://`.",
+        )
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        Ok(resources::list_resources_result())
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, McpError> {
+        Ok(resources::list_resource_templates_result())
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, McpError> {
+        let uri = request.uri;
+        let parsed =
+            resources::ResourceUri::parse(&uri).map_err(|err| resources::not_found(&uri, err))?;
+        resources::read_resource(&parsed, &uri)
+            .await
+            .map_err(|err| resources::not_found(&uri, err))
     }
 }
 
@@ -56,10 +98,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn server_info_advertises_tools_capability() {
+    fn server_info_advertises_tools_and_resources_capability() {
         let server = OmniDevServer::new();
         let info = server.get_info();
         assert!(info.capabilities.tools.is_some());
+        assert!(info.capabilities.resources.is_some());
         assert_eq!(info.server_info.name, "omni-dev-mcp");
         assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
     }
