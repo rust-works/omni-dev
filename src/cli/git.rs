@@ -9,14 +9,56 @@ mod twiddle;
 mod view;
 
 pub use amend::AmendCommand;
-pub use check::CheckCommand;
-pub use create_pr::{CreatePrCommand, PrContent};
-pub use info::InfoCommand;
-pub use twiddle::TwiddleCommand;
+pub use check::{run_check, CheckCommand, CheckOutcome};
+pub use create_pr::{run_create_pr, CreatePrCommand, CreatePrOutcome, PrContent};
+pub use info::{run_info, InfoCommand};
+pub use twiddle::{run_twiddle, TwiddleCommand, TwiddleOutcome};
 pub use view::{run_view, ViewCommand};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+
+/// Global async mutex serialising `CwdGuard` entries so concurrent callers do
+/// not race on the process-wide current working directory.
+///
+/// We use `tokio::sync::Mutex` rather than `std::sync::Mutex` so the guard is
+/// `Send` and can be held across `.await` points (required by the MCP
+/// async tool handlers).
+pub(crate) static CWD_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// RAII guard that temporarily changes the process current working directory
+/// and restores it on drop.
+///
+/// Shared by MCP tool handlers that accept a `repo_path` parameter: many
+/// commands (check/twiddle/create_pr) read configuration and invoke external
+/// tools relative to the current working directory, so the simplest way to
+/// "run this command at a different path" is to pin the CWD for the duration
+/// of the call. A global async mutex serialises concurrent callers.
+pub(crate) struct CwdGuard {
+    original: std::path::PathBuf,
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl CwdGuard {
+    /// Enters `path`, holding the CWD mutex for the lifetime of the guard.
+    pub(crate) async fn enter<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
+        let lock = CWD_MUTEX.lock().await;
+        let original =
+            std::env::current_dir().map_err(|e| anyhow::anyhow!("current_dir failed: {e}"))?;
+        std::env::set_current_dir(path.as_ref())
+            .map_err(|e| anyhow::anyhow!("set_current_dir failed: {e}"))?;
+        Ok(Self {
+            original,
+            _lock: lock,
+        })
+    }
+}
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.original);
+    }
+}
 
 /// Reads one line of interactive input from `reader`.
 ///
@@ -347,5 +389,15 @@ mod tests {
         let mut reader = std::io::Cursor::new(b"\n" as &[u8]);
         let result = read_interactive_line(&mut reader).unwrap();
         assert_eq!(result, Some("\n".to_string()));
+    }
+
+    #[tokio::test]
+    async fn cwd_guard_invalid_path_returns_error() {
+        // Error path doesn't mutate the shared CWD, so it is safe to run in
+        // parallel with the rest of the test suite. The happy path is covered
+        // indirectly by `run_{check,twiddle,create_pr}` error-path tests
+        // that exercise `CwdGuard::enter(valid_path)` followed by restoration.
+        let result = CwdGuard::enter("/no/such/path/exists").await;
+        assert!(result.is_err(), "expected error for nonexistent path");
     }
 }

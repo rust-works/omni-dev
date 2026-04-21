@@ -67,10 +67,36 @@ mod tests {
     }
 
     #[test]
+    fn tool_router_registers_all_phase1_git_tools() {
+        let server = OmniDevServer::new();
+        for name in [
+            "git_view_commits",
+            "git_branch_info",
+            "git_check_commits",
+            "git_twiddle_commits",
+            "git_create_pr",
+        ] {
+            assert!(server.tool_router.has_route(name), "missing route: {name}");
+        }
+    }
+
+    #[test]
     fn tool_router_lists_all_registered_tools() {
         let server = OmniDevServer::new();
         let tools = server.tool_router.list_all();
-        assert!(tools.iter().any(|t| t.name.as_ref() == "git_view_commits"));
+        let names: Vec<_> = tools.iter().map(|t| t.name.as_ref()).collect();
+        for expected in [
+            "git_view_commits",
+            "git_branch_info",
+            "git_check_commits",
+            "git_twiddle_commits",
+            "git_create_pr",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing: {expected} in {names:?}"
+            );
+        }
     }
 
     #[test]

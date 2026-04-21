@@ -1341,6 +1341,263 @@ fn format_draft_status(is_draft: bool) -> (&'static str, &'static str) {
     }
 }
 
+/// Structured output from [`run_create_pr`] for programmatic consumers (MCP).
+#[derive(Debug, Clone)]
+pub struct CreatePrOutcome {
+    /// Title as produced by the AI (or the fallback heuristic).
+    pub title: String,
+    /// Description body as produced by the AI (or the fallback heuristic).
+    pub description: String,
+    /// YAML serialisation of the [`PrContent`].
+    pub pr_yaml: String,
+}
+
+/// Non-interactive core for `omni-dev git branch create pr`.
+///
+/// Generates PR title + description via the AI but does NOT push the branch
+/// or call `gh pr create`. The MCP boundary should expose the proposed PR
+/// content so the assistant can decide what to do with it; actually pushing
+/// a branch or creating a PR is out of scope for a single tool call. This
+/// function must produce no stdout output — the MCP server uses stdout for
+/// the JSON-RPC protocol.
+pub async fn run_create_pr(
+    model: Option<String>,
+    base_branch: Option<&str>,
+    repo_path: Option<&std::path::Path>,
+) -> Result<CreatePrOutcome> {
+    let _cwd_guard = match repo_path {
+        Some(p) => Some(super::CwdGuard::enter(p).await?),
+        None => None,
+    };
+
+    crate::utils::check_pr_command_prerequisites(model.as_deref())?;
+
+    let cmd = CreatePrCommand {
+        base: base_branch.map(str::to_string),
+        model: model.clone(),
+        auto_apply: true,
+        save_only: None,
+        ready: false,
+        draft: false,
+        context_dir: None,
+        no_push: true,
+    };
+
+    let repo_view = cmd.generate_repository_view()?;
+    let context = cmd.collect_context(&repo_view).await?;
+    let claude_client = crate::claude::create_default_claude_client(model, None)?;
+    run_create_pr_with_client(&cmd, &repo_view, &context, &claude_client).await
+}
+
+/// Non-credential-gated inner core of [`run_create_pr`] for unit tests.
+///
+/// Takes an already-built [`CreatePrCommand`], [`crate::data::RepositoryView`],
+/// and [`crate::data::context::CommitContext`] so tests can construct those
+/// in-memory (avoiding the git-remote setup `generate_repository_view`
+/// requires). Callers are responsible for preflight, CWD, and context
+/// assembly.
+pub(crate) async fn run_create_pr_with_client(
+    cmd: &CreatePrCommand,
+    repo_view: &crate::data::RepositoryView,
+    context: &crate::data::context::CommitContext,
+    claude_client: &crate::claude::client::ClaudeClient,
+) -> Result<CreatePrOutcome> {
+    let pr_template = match &repo_view.pr_template {
+        Some(template) => template.clone(),
+        None => cmd.get_default_pr_template(),
+    };
+
+    let pr_content = match claude_client
+        .generate_pr_content_with_context(repo_view, &pr_template, context)
+        .await
+    {
+        Ok(content) => content,
+        Err(_e) => {
+            let mut description = pr_template;
+            cmd.enhance_description_with_commits(&mut description, repo_view)?;
+            let title = cmd.generate_title_from_commits(repo_view);
+            PrContent { title, description }
+        }
+    };
+
+    let pr_yaml = crate::data::to_yaml(&pr_content).context("Failed to serialise PrContent")?;
+
+    Ok(CreatePrOutcome {
+        title: pr_content.title,
+        description: pr_content.description,
+        pr_yaml,
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod run_create_pr_tests {
+    use super::*;
+    use crate::claude::client::ClaudeClient;
+    use crate::claude::test_utils::ConfigurableMockAiClient;
+    use crate::data::context::CommitContext;
+    use crate::data::{
+        AiInfo, BranchInfo, FieldExplanation, RepositoryView, VersionInfo, WorkingDirectoryInfo,
+    };
+    use crate::git::commit::FileChanges;
+    use crate::git::{CommitAnalysis, CommitInfo};
+
+    #[tokio::test]
+    async fn run_create_pr_invalid_repo_path_errors_before_ai() {
+        let err = run_create_pr(
+            None,
+            None,
+            Some(std::path::Path::new("/no/such/path/exists")),
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.to_lowercase().contains("set_current_dir")
+                || msg.to_lowercase().contains("no such")
+                || msg.to_lowercase().contains("directory"),
+            "expected cwd-related error, got: {msg}"
+        );
+    }
+
+    fn fresh_cmd() -> CreatePrCommand {
+        CreatePrCommand {
+            base: None,
+            model: None,
+            auto_apply: true,
+            save_only: None,
+            ready: false,
+            draft: false,
+            context_dir: None,
+            no_push: true,
+        }
+    }
+
+    fn sample_commit(hash: &str, message: &str) -> (CommitInfo, tempfile::NamedTempFile) {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let commit = CommitInfo {
+            hash: hash.to_string(),
+            author: "Test <test@test.com>".to_string(),
+            date: chrono::Utc::now().fixed_offset(),
+            original_message: message.to_string(),
+            in_main_branches: vec![],
+            analysis: CommitAnalysis {
+                detected_type: "feat".to_string(),
+                detected_scope: String::new(),
+                proposed_message: message.to_string(),
+                file_changes: FileChanges {
+                    total_files: 0,
+                    files_added: 0,
+                    files_deleted: 0,
+                    file_list: vec![],
+                },
+                diff_summary: String::new(),
+                diff_file: tmp.path().to_string_lossy().to_string(),
+                file_diffs: Vec::new(),
+            },
+        };
+        (commit, tmp)
+    }
+
+    fn sample_repo_view(commits: Vec<CommitInfo>, pr_template: Option<String>) -> RepositoryView {
+        RepositoryView {
+            versions: Some(VersionInfo {
+                omni_dev: "0.0.0".to_string(),
+            }),
+            explanation: FieldExplanation::default(),
+            working_directory: WorkingDirectoryInfo {
+                clean: true,
+                untracked_changes: vec![],
+            },
+            remotes: vec![],
+            ai: AiInfo {
+                scratch: String::new(),
+            },
+            branch_info: Some(BranchInfo {
+                branch: "feature/test".to_string(),
+            }),
+            pr_template,
+            pr_template_location: None,
+            branch_prs: None,
+            commits,
+        }
+    }
+
+    #[tokio::test]
+    async fn run_create_pr_with_client_ai_success_returns_content() {
+        let (c1, _tmp) = sample_commit("abcdef00", "feat: work");
+        let repo_view = sample_repo_view(vec![c1], None);
+        let context = CommitContext::new();
+        let cmd = fresh_cmd();
+
+        let yaml = "title: My PR\ndescription: |\n  Body text\n".to_string();
+        let mock = ConfigurableMockAiClient::new(vec![Ok(yaml)]);
+        let client = ClaudeClient::new(Box::new(mock));
+
+        let outcome = run_create_pr_with_client(&cmd, &repo_view, &context, &client)
+            .await
+            .unwrap();
+        assert_eq!(outcome.title, "My PR");
+        assert!(outcome.description.contains("Body text"));
+        assert!(outcome.pr_yaml.contains("title:"));
+    }
+
+    #[tokio::test]
+    async fn run_create_pr_with_client_ai_failure_falls_back_to_commit_summary() {
+        let (c1, _tmp) = sample_commit("abcdef00", "feat: single commit subject");
+        let repo_view = sample_repo_view(vec![c1], None);
+        let context = CommitContext::new();
+        let cmd = fresh_cmd();
+
+        // Empty mock → AI call exhausts retries → fallback path triggered.
+        let mock = ConfigurableMockAiClient::new(vec![]);
+        let client = ClaudeClient::new(Box::new(mock));
+
+        let outcome = run_create_pr_with_client(&cmd, &repo_view, &context, &client)
+            .await
+            .unwrap();
+        assert!(
+            outcome.title.contains("feat: single commit subject")
+                || outcome.title.contains("Pull Request")
+                || outcome.title.contains("feature/test"),
+            "fallback title unexpected: {}",
+            outcome.title
+        );
+    }
+
+    #[tokio::test]
+    async fn run_create_pr_with_client_uses_repo_template_when_present() {
+        let (c1, _tmp) = sample_commit("abcdef00", "feat: x");
+        let repo_view = sample_repo_view(vec![c1], Some("# Custom template\n".to_string()));
+        let context = CommitContext::new();
+        let cmd = fresh_cmd();
+
+        // AI fails → fallback uses the repo template as the description base.
+        let mock = ConfigurableMockAiClient::new(vec![]);
+        let client = ClaudeClient::new(Box::new(mock));
+
+        let outcome = run_create_pr_with_client(&cmd, &repo_view, &context, &client)
+            .await
+            .unwrap();
+        assert!(
+            outcome.description.contains("# Custom template"),
+            "fallback description should include repo template: {}",
+            outcome.description
+        );
+    }
+
+    #[test]
+    fn create_pr_outcome_clone_and_debug() {
+        let outcome = CreatePrOutcome {
+            title: "t".to_string(),
+            description: "d".to_string(),
+            pr_yaml: "y".to_string(),
+        };
+        let cloned = outcome.clone();
+        assert_eq!(format!("{outcome:?}"), format!("{cloned:?}"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

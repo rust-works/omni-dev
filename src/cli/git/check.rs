@@ -868,6 +868,370 @@ impl CheckCommand {
     }
 }
 
+/// Structured output from [`run_check`] for programmatic consumers (MCP).
+#[derive(Debug, Clone)]
+pub struct CheckOutcome {
+    /// YAML serialisation of the full [`crate::data::check::CheckReport`].
+    pub report_yaml: String,
+    /// `true` when any commit has an error-severity issue.
+    pub has_errors: bool,
+    /// `true` when any commit has a warning-severity issue.
+    pub has_warnings: bool,
+    /// Total commits in the range that were checked.
+    pub total_commits: usize,
+    /// Strict mode setting that produced `exit_code`.
+    pub strict: bool,
+    /// Exit code the CLI would use, honouring `strict`.
+    pub exit_code: i32,
+}
+
+/// Non-interactive core for `omni-dev git commit message check`.
+///
+/// Shared by the CLI (which prints the report and uses the exit code) and the
+/// MCP server (which returns the structured outcome to the caller). Always
+/// runs a single direct AI call — the MCP tool boundary never needs the
+/// map-reduce/interactive-retry flow from [`CheckCommand::execute`].
+///
+/// When `repo_path` is provided the current working directory is changed for
+/// the duration of the call (serialised by a global mutex) so CWD-dependent
+/// context-discovery and AI-scratch paths resolve relative to the target repo.
+pub async fn run_check(
+    range: &str,
+    guidelines_path: Option<&std::path::Path>,
+    repo_path: Option<&std::path::Path>,
+    strict: bool,
+    model: Option<String>,
+) -> Result<CheckOutcome> {
+    let _cwd_guard = match repo_path {
+        Some(p) => Some(super::CwdGuard::enter(p).await?),
+        None => None,
+    };
+
+    // Preflight: validate AI credentials.
+    crate::utils::check_ai_command_prerequisites(model.as_deref())?;
+
+    let claude_client = crate::claude::create_default_claude_client(model, None)?;
+    run_check_with_client(range, guidelines_path, strict, &claude_client).await
+}
+
+/// Non-credential-gated inner core of [`run_check`] for unit tests.
+///
+/// Extracted so tests can inject a [`crate::claude::client::ClaudeClient`]
+/// backed by the in-crate mock AI client and exercise the full happy path
+/// without real credentials. Callers are responsible for holding any
+/// [`super::CwdGuard`] they need and for running preflight themselves.
+pub(crate) async fn run_check_with_client(
+    range: &str,
+    guidelines_path: Option<&std::path::Path>,
+    strict: bool,
+    claude_client: &crate::claude::client::ClaudeClient,
+) -> Result<CheckOutcome> {
+    use crate::data::{
+        AiInfo, BranchInfo, FieldExplanation, FileStatusInfo, RepositoryView, VersionInfo,
+        WorkingDirectoryInfo,
+    };
+    use crate::git::{GitRepository, RemoteInfo};
+    use crate::utils::ai_scratch;
+
+    let repo = GitRepository::open()
+        .context("Failed to open git repository. Make sure you're in a git repository.")?;
+
+    let current_branch = repo
+        .get_current_branch()
+        .unwrap_or_else(|_| "HEAD".to_string());
+
+    let wd_status = repo.get_working_directory_status()?;
+    let working_directory = WorkingDirectoryInfo {
+        clean: wd_status.clean,
+        untracked_changes: wd_status
+            .untracked_changes
+            .into_iter()
+            .map(|fs| FileStatusInfo {
+                status: fs.status,
+                file: fs.file,
+            })
+            .collect(),
+    };
+
+    let remotes = RemoteInfo::get_all_remotes(repo.repository())?;
+    let commits = repo.get_commits_in_range(range)?;
+
+    if commits.is_empty() {
+        anyhow::bail!("no commits found in range: {range}");
+    }
+
+    let ai_scratch_path =
+        ai_scratch::get_ai_scratch_dir().context("Failed to determine AI scratch directory")?;
+    let ai_info = AiInfo {
+        scratch: ai_scratch_path.to_string_lossy().to_string(),
+    };
+
+    let mut repo_view = RepositoryView {
+        versions: Some(VersionInfo {
+            omni_dev: env!("CARGO_PKG_VERSION").to_string(),
+        }),
+        explanation: FieldExplanation::default(),
+        working_directory,
+        remotes,
+        ai: ai_info,
+        branch_info: Some(BranchInfo {
+            branch: current_branch,
+        }),
+        pr_template: None,
+        pr_template_location: None,
+        branch_prs: None,
+        commits,
+    };
+    repo_view.update_field_presence();
+
+    let guidelines = if let Some(path) = guidelines_path {
+        Some(
+            std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read guidelines file: {}", path.display()))?,
+        )
+    } else {
+        let context_dir = crate::claude::context::resolve_context_dir(None);
+        crate::claude::context::load_config_content(&context_dir, "commit-guidelines.md")?
+    };
+
+    let context_dir = crate::claude::context::resolve_context_dir(None);
+    let valid_scopes =
+        crate::claude::context::load_project_scopes(&context_dir, &std::path::PathBuf::from("."));
+    for commit in &mut repo_view.commits {
+        commit.analysis.refine_scope(&valid_scopes);
+    }
+
+    let report = claude_client
+        .check_commits_with_scopes(&repo_view, guidelines.as_deref(), &valid_scopes, true)
+        .await?;
+
+    let report_yaml = crate::data::to_yaml(&report).context("Failed to serialise CheckReport")?;
+    let has_errors = report.has_errors();
+    let has_warnings = report.has_warnings();
+    let exit_code = report.exit_code(strict);
+    let total_commits = report.commits.len();
+
+    Ok(CheckOutcome {
+        report_yaml,
+        has_errors,
+        has_warnings,
+        total_commits,
+        strict,
+        exit_code,
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod run_check_tests {
+    use super::*;
+    use crate::claude::client::ClaudeClient;
+    use crate::claude::test_utils::ConfigurableMockAiClient;
+    use git2::{Repository, Signature};
+
+    /// With `/no/such/path` as repo_path, `CwdGuard::enter` fails before any AI
+    /// call is attempted — no credentials needed.
+    #[tokio::test]
+    async fn run_check_invalid_repo_path_errors_before_ai() {
+        let err = run_check(
+            "HEAD",
+            None,
+            Some(std::path::Path::new("/no/such/path/exists")),
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.to_lowercase().contains("set_current_dir")
+                || msg.to_lowercase().contains("no such")
+                || msg.to_lowercase().contains("directory"),
+            "expected cwd-related error, got: {msg}"
+        );
+    }
+
+    fn init_test_repo() -> tempfile::TempDir {
+        let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
+        std::fs::create_dir_all(&tmp_root).unwrap();
+        let temp_dir = tempfile::tempdir_in(&tmp_root).unwrap();
+        let repo = Repository::init(temp_dir.path()).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Test").unwrap();
+            cfg.set_str("user.email", "test@example.com").unwrap();
+        }
+        let signature = Signature::now("Test", "test@example.com").unwrap();
+        std::fs::write(temp_dir.path().join("f.txt"), "c").unwrap();
+        let mut idx = repo.index().unwrap();
+        idx.add_path(std::path::Path::new("f.txt")).unwrap();
+        idx.write().unwrap();
+        let tree_id = idx.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "feat(cli): only",
+            &tree,
+            &[],
+        )
+        .unwrap();
+        temp_dir
+    }
+
+    fn passing_check_yaml(hash_prefix: &str) -> String {
+        format!("checks:\n  - commit: {hash_prefix}\n    passes: true\n    issues: []\n")
+    }
+
+    fn failing_check_yaml(hash_prefix: &str) -> String {
+        format!(
+            "checks:\n  - commit: {hash_prefix}\n    passes: false\n    issues:\n      - severity: error\n        section: subject\n        rule: format\n        explanation: bad\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn run_check_with_client_happy_path_passing() {
+        let temp_dir = init_test_repo();
+        let _guard = super::super::CwdGuard::enter(temp_dir.path())
+            .await
+            .unwrap();
+
+        // Use a short hash prefix that resolves in the mini repo.
+        let mock = ConfigurableMockAiClient::new(vec![Ok(passing_check_yaml("00000000"))]);
+        let client = ClaudeClient::new(Box::new(mock));
+
+        let outcome = run_check_with_client("HEAD", None, false, &client)
+            .await
+            .unwrap();
+        assert!(!outcome.has_errors);
+        assert!(!outcome.has_warnings);
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(outcome.total_commits, 1);
+        assert!(outcome.report_yaml.contains("commits:"));
+        assert!(!outcome.strict);
+    }
+
+    #[tokio::test]
+    async fn run_check_with_client_failing_commit_sets_error_exit_code() {
+        let temp_dir = init_test_repo();
+        let _guard = super::super::CwdGuard::enter(temp_dir.path())
+            .await
+            .unwrap();
+
+        let mock = ConfigurableMockAiClient::new(vec![Ok(failing_check_yaml("00000000"))]);
+        let client = ClaudeClient::new(Box::new(mock));
+
+        let outcome = run_check_with_client("HEAD", None, false, &client)
+            .await
+            .unwrap();
+        assert!(outcome.has_errors);
+        assert_eq!(outcome.exit_code, 1);
+    }
+
+    #[tokio::test]
+    async fn run_check_with_client_strict_does_not_affect_no_issues() {
+        let temp_dir = init_test_repo();
+        let _guard = super::super::CwdGuard::enter(temp_dir.path())
+            .await
+            .unwrap();
+
+        let mock = ConfigurableMockAiClient::new(vec![Ok(passing_check_yaml("00000000"))]);
+        let client = ClaudeClient::new(Box::new(mock));
+
+        let outcome = run_check_with_client("HEAD", None, true, &client)
+            .await
+            .unwrap();
+        assert_eq!(outcome.exit_code, 0);
+        assert!(outcome.strict);
+    }
+
+    #[tokio::test]
+    async fn run_check_with_client_explicit_guidelines_path() {
+        let temp_dir = init_test_repo();
+        let guidelines_path = temp_dir.path().join("guidelines.md");
+        std::fs::write(&guidelines_path, "guideline body").unwrap();
+        let _guard = super::super::CwdGuard::enter(temp_dir.path())
+            .await
+            .unwrap();
+
+        let mock = ConfigurableMockAiClient::new(vec![Ok(passing_check_yaml("00000000"))]);
+        let client = ClaudeClient::new(Box::new(mock));
+
+        let outcome = run_check_with_client("HEAD", Some(&guidelines_path), false, &client)
+            .await
+            .unwrap();
+        assert_eq!(outcome.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn run_check_with_client_guidelines_path_missing_errors() {
+        let temp_dir = init_test_repo();
+        let missing = temp_dir.path().join("no-such.md");
+        let _guard = super::super::CwdGuard::enter(temp_dir.path())
+            .await
+            .unwrap();
+
+        let mock = ConfigurableMockAiClient::new(vec![Ok(passing_check_yaml("00000000"))]);
+        let client = ClaudeClient::new(Box::new(mock));
+        let err = run_check_with_client("HEAD", Some(&missing), false, &client)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("guidelines"),
+            "expected guidelines read error"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_check_with_client_empty_range_bails() {
+        let temp_dir = init_test_repo();
+        let _guard = super::super::CwdGuard::enter(temp_dir.path())
+            .await
+            .unwrap();
+
+        let mock = ConfigurableMockAiClient::new(vec![]);
+        let client = ClaudeClient::new(Box::new(mock));
+        // A range with no commits reachable → get_commits_in_range returns empty.
+        let err = run_check_with_client("HEAD..HEAD", None, false, &client)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("no commits"));
+    }
+
+    #[tokio::test]
+    async fn run_check_with_client_ai_failure_propagates() {
+        let temp_dir = init_test_repo();
+        let _guard = super::super::CwdGuard::enter(temp_dir.path())
+            .await
+            .unwrap();
+
+        // No responses → mock returns "no more mock responses" error; this
+        // propagates after check_commits_with_scopes exhausts its retries.
+        let mock = ConfigurableMockAiClient::new(vec![]);
+        let client = ClaudeClient::new(Box::new(mock));
+        let err = run_check_with_client("HEAD", None, false, &client)
+            .await
+            .unwrap_err();
+        let _ = err; // any error is acceptable — the point is we didn't panic
+    }
+
+    #[test]
+    fn check_outcome_clone_and_debug() {
+        // Cover derived impls.
+        let outcome = CheckOutcome {
+            report_yaml: "x".to_string(),
+            has_errors: false,
+            has_warnings: true,
+            total_commits: 1,
+            strict: true,
+            exit_code: 2,
+        };
+        let cloned = outcome.clone();
+        assert_eq!(format!("{outcome:?}"), format!("{cloned:?}"));
+    }
+}
+
 // --- Extracted pure functions ---
 
 /// Returns whether a commit should be displayed based on its pass status.
