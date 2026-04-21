@@ -195,6 +195,30 @@ async fn jira_tools_advertise_schemas() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn list_tools_includes_confluence_and_atlassian_tools() -> Result<()> {
+    let (client, server_handle) = spawn_server().await;
+    let tools = client.list_tools(Option::default()).await?;
+    let names: Vec<_> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
+    for expected in [
+        "confluence_read",
+        "confluence_search",
+        "confluence_create",
+        "confluence_write",
+        "confluence_delete",
+        "confluence_download",
+        "atlassian_convert",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "expected {expected}, got {names:?}"
+        );
+    }
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
 /// Calls every JIRA-extension tool through the MCP transport with minimal
 /// valid arguments, in two phases:
 ///
@@ -679,6 +703,67 @@ async fn jira_tool_handlers_surface_tool_error_without_credentials() -> Result<(
         }
     }
 
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn atlassian_convert_to_adf_roundtrip() -> Result<()> {
+    let (client, server_handle) = spawn_server().await;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("atlassian_convert").with_arguments(
+                serde_json::json!({
+                    "content": "# Title\n\nParagraph body.",
+                    "direction": "to-adf",
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+        )
+        .await?;
+
+    assert!(!result.is_error.unwrap_or(false), "tool returned error");
+    let text: String = result
+        .content
+        .iter()
+        .filter_map(|c| match &c.raw {
+            RawContent::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(text.contains("\"type\""), "expected ADF JSON: {text}");
+    assert!(text.contains("\"doc\""));
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn atlassian_convert_invalid_direction_returns_error() -> Result<()> {
+    let (client, server_handle) = spawn_server().await;
+    let outcome = client
+        .call_tool(
+            CallToolRequestParams::new("atlassian_convert").with_arguments(
+                serde_json::json!({
+                    "content": "x",
+                    "direction": "sideways",
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+        )
+        .await;
+    if let Ok(result) = outcome {
+        assert!(
+            result.is_error.unwrap_or(false),
+            "expected tool error for invalid direction"
+        );
+    }
     client.cancel().await?;
     let _ = server_handle.await;
     Ok(())

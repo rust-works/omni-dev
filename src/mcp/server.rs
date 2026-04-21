@@ -28,7 +28,9 @@ impl OmniDevServer {
         Self {
             tool_router: Self::git_tool_router()
                 + Self::jira_tool_router()
-                + Self::jira_core_tool_router(),
+                + Self::jira_core_tool_router()
+                + Self::confluence_tool_router()
+                + Self::atlassian_tool_router(),
         }
     }
 }
@@ -127,6 +129,22 @@ mod tests {
         ];
         for name in expected {
             assert!(server.tool_router.has_route(name), "missing route: {name}");
+        }
+    }
+
+    #[test]
+    fn tool_router_registers_all_confluence_and_atlassian_tools() {
+        let server = OmniDevServer::new();
+        for name in [
+            "confluence_read",
+            "confluence_search",
+            "confluence_create",
+            "confluence_write",
+            "confluence_delete",
+            "confluence_download",
+            "atlassian_convert",
+        ] {
+            assert!(server.tool_router.has_route(name), "missing: {name}");
         }
     }
 
