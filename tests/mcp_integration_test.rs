@@ -1041,6 +1041,36 @@ async fn config_models_show_returns_yaml() -> Result<()> {
 }
 
 #[tokio::test]
+async fn git_view_commits_rejects_malformed_range() -> Result<()> {
+    let (client, server_handle) = spawn_server().await;
+    let outcome = client
+        .call_tool(
+            CallToolRequestParams::new("git_view_commits").with_arguments(
+                serde_json::json!({
+                    "range": "HEAD; rm -rf /",
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+        )
+        .await;
+
+    // Invalid params surface as a protocol-level error (not a tool-error result).
+    assert!(outcome.is_err(), "expected invalid params error");
+    let err = outcome.err().unwrap();
+    let text = format!("{err}");
+    assert!(
+        text.contains("not a well-formed git range") || text.contains("range"),
+        "expected validation message, got: {text}"
+    );
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn git_branch_info_invalid_repo_returns_error() -> Result<()> {
     let (client, server_handle) = spawn_server().await;
     let outcome = client
@@ -1227,6 +1257,74 @@ async fn claude_skills_status_returns_yaml_report() -> Result<()> {
     Ok(())
 }
 
+/// Valid absolute path that is not a git repository — passes
+/// `validate_repo_path` and exercises the `?` propagation inside the
+/// `spawn_blocking_cancellable` call where `run_view` returns an error.
+#[tokio::test]
+async fn git_view_commits_non_git_dir_returns_tool_error() -> Result<()> {
+    let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
+    fs::create_dir_all(&tmp_root)?;
+    let temp_dir = tempfile::tempdir_in(&tmp_root)?;
+    let dir_path = temp_dir.path();
+
+    let (client, server_handle) = spawn_server().await;
+    let outcome = client
+        .call_tool(
+            CallToolRequestParams::new("git_view_commits").with_arguments(
+                serde_json::json!({
+                    "range": "HEAD",
+                    "repo_path": dir_path.to_string_lossy(),
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+        )
+        .await;
+
+    // Either the protocol-level error surfaces, or the tool-error result.
+    if let Ok(result) = outcome {
+        assert!(
+            result.is_error.unwrap_or(false),
+            "expected tool error from non-git directory"
+        );
+    }
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn git_view_commits_rejects_relative_repo_path() -> Result<()> {
+    let (client, server_handle) = spawn_server().await;
+    let outcome = client
+        .call_tool(
+            CallToolRequestParams::new("git_view_commits").with_arguments(
+                serde_json::json!({
+                    "range": "HEAD",
+                    "repo_path": "relative/path",
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+        )
+        .await;
+
+    assert!(outcome.is_err(), "expected absolute-path validation error");
+    let err = outcome.err().unwrap();
+    let text = format!("{err}");
+    assert!(
+        text.contains("absolute") || text.contains("repo_path"),
+        "expected path validation message, got: {text}"
+    );
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
 /// AI-backed tools (`git_check_commits`, `git_twiddle_commits`, `git_create_pr`)
 /// fail preflight with missing credentials or a bad repo path. We don't assert
 /// a specific error code; we just check that calling them returns a tool
@@ -1243,6 +1341,101 @@ async fn call_tool_expect_error(tool_name: &'static str, args: serde_json::Value
     }
     client.cancel().await?;
     let _ = server_handle.await;
+    Ok(())
+}
+
+/// Pipes the `omni-dev-mcp` binary, drives a full `initialize` →
+/// `tools/list` exchange, and asserts that every line on stdout parses as
+/// valid JSON-RPC (no stray `println!`, progress bars, or debug prints). This
+/// is the regression guard per STYLE-0018 / STYLE-0001: stdout is the MCP
+/// frame wire and must never carry anything else.
+#[tokio::test]
+async fn mcp_binary_stdout_is_pure_json_rpc() -> Result<()> {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::process::Command;
+
+    let bin = env!("CARGO_BIN_EXE_omni-dev-mcp");
+    let mut child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let mut stdin = child.stdin.take().expect("stdin pipe");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let mut reader = BufReader::new(stdout);
+
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "stdout-test", "version": "0.0.0"}
+        }
+    });
+    let initialized_notification = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized"
+    });
+    let list_tools = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/list"
+    });
+
+    stdin
+        .write_all(format!("{initialize}\n").as_bytes())
+        .await?;
+    stdin
+        .write_all(format!("{initialized_notification}\n").as_bytes())
+        .await?;
+    stdin
+        .write_all(format!("{list_tools}\n").as_bytes())
+        .await?;
+    stdin.flush().await?;
+
+    // Collect frames until we see the tools/list response (id=2).
+    let mut frames: Vec<serde_json::Value> = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        let mut line = String::new();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read_line(&mut line),
+        )
+        .await??;
+        if read == 0 {
+            break;
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            continue;
+        }
+        let parsed: serde_json::Value = serde_json::from_str(trimmed)
+            .unwrap_or_else(|e| panic!("stdout line is not JSON: {e}: {trimmed:?}"));
+        // Every frame must be a JSON-RPC object with "jsonrpc": "2.0".
+        assert_eq!(
+            parsed.get("jsonrpc").and_then(|v| v.as_str()),
+            Some("2.0"),
+            "frame missing jsonrpc version: {parsed}",
+        );
+        let seen_id = parsed.get("id").and_then(serde_json::Value::as_i64);
+        frames.push(parsed);
+        if seen_id == Some(2) {
+            break;
+        }
+    }
+
+    drop(stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+
+    assert!(!frames.is_empty(), "server emitted no stdout frames");
     Ok(())
 }
 

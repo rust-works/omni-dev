@@ -159,14 +159,11 @@ mod tests {
         );
     }
 
-    /// Serialises `set_current_dir` mutations so tests that change CWD do not
-    /// race with each other or with the integration tests that share the same
-    /// pattern (per the comment in `tests/integration_test.rs`).
-    static CWD_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::cli::git::CWD_MUTEX;
 
     #[test]
     fn execute_uses_cwd_repo_and_succeeds() {
-        let _guard = CWD_MUTEX.lock().unwrap();
+        let _guard = CWD_MUTEX.blocking_lock();
         let (temp_dir, _commits) = init_repo_with_commits();
         let original_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(temp_dir.path()).unwrap();
@@ -182,7 +179,7 @@ mod tests {
 
     #[test]
     fn execute_default_range_uses_head() {
-        let _guard = CWD_MUTEX.lock().unwrap();
+        let _guard = CWD_MUTEX.blocking_lock();
         let (temp_dir, _commits) = init_repo_with_commits();
         let original_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(temp_dir.path()).unwrap();
