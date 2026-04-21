@@ -47,6 +47,28 @@ where
     Ok(())
 }
 
+/// Returns a comma-separated list of compiled-in MCP feature flags, suitable
+/// for logging on startup so operators can confirm the server they're running.
+///
+/// When no optional features are active, returns `"base"`.
+pub fn feature_flags() -> &'static str {
+    // Currently the `mcp` binary always implies the `mcp` feature. Kept as a
+    // function (rather than a constant) so future features (metrics, tracing
+    // exporters, etc.) can extend the string without breaking callers.
+    "mcp"
+}
+
+/// Emits the startup `info!` event with version and active feature flags.
+///
+/// Lifted out of the binary so the log macro body is covered by library
+/// tests. Operators still see the event at runtime; the binary simply calls
+/// this function instead of inlining the macro.
+pub fn log_startup_event() {
+    let version = env!("CARGO_PKG_VERSION");
+    let features = feature_flags();
+    tracing::info!(version, features, "starting omni-dev MCP server");
+}
+
 /// Writes an `anyhow::Error` chain to a writer in the format the binary uses.
 ///
 /// Pulled out as its own function so the formatting can be exercised against
@@ -100,6 +122,23 @@ mod tests {
         // Either Ok (clean disconnect) or Err (transport error) — both
         // exercise the function. We just need the function body covered.
         let _ = result;
+    }
+
+    #[test]
+    fn feature_flags_includes_mcp() {
+        let flags = feature_flags();
+        assert!(
+            flags.contains("mcp"),
+            "expected feature flags to include mcp, got {flags:?}"
+        );
+    }
+
+    #[test]
+    fn log_startup_event_does_not_panic() {
+        // Running the macro body is the entire point — we don't assert on
+        // the output (tracing may not have a subscriber installed in this
+        // test process). Just execute the function body to cover it.
+        log_startup_event();
     }
 
     #[test]

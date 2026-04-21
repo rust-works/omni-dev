@@ -14,10 +14,7 @@ use rmcp::transport::stdio;
 #[tokio::main]
 async fn main() {
     let _ = mcp::try_init_tracing();
-    tracing::info!(
-        version = env!("CARGO_PKG_VERSION"),
-        "starting omni-dev MCP server"
-    );
+    mcp::log_startup_event();
     if let Err(e) = mcp::serve_with(stdio()).await {
         let mut stderr = std::io::stderr().lock();
         let _ = mcp::write_error_chain(&mut stderr, &e);
