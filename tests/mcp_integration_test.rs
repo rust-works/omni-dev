@@ -933,6 +933,26 @@ async fn list_tools_includes_phase1_git_tools() -> Result<()> {
 }
 
 #[tokio::test]
+async fn list_tools_includes_phase_3_tools() -> Result<()> {
+    let (client, server_handle) = spawn_server().await;
+    let tools = client.list_tools(Option::default()).await?;
+    let names: Vec<_> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
+    for expected in [
+        "ai_chat",
+        "claude_skills_sync",
+        "claude_skills_clean",
+        "claude_skills_status",
+        "config_models_show",
+        "atlassian_auth_status",
+    ] {
+        assert!(names.contains(&expected), "missing {expected}: {names:?}");
+    }
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn git_branch_info_returns_yaml_for_temp_repo() -> Result<()> {
     // Initialise a repo with a `main` branch so the default base resolution
     // succeeds without requiring external state.
@@ -995,6 +1015,32 @@ async fn git_branch_info_returns_yaml_for_temp_repo() -> Result<()> {
 }
 
 #[tokio::test]
+async fn config_models_show_returns_yaml() -> Result<()> {
+    let (client, server_handle) = spawn_server().await;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("config_models_show").with_arguments(serde_json::Map::new()),
+        )
+        .await?;
+    assert!(!result.is_error.unwrap_or(false), "tool returned error");
+    let text: String = result
+        .content
+        .iter()
+        .filter_map(|c| match &c.raw {
+            RawContent::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        text.contains("models:") || text.contains("providers:") || text.contains("claude"),
+        "expected models YAML, got: {text}"
+    );
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn git_branch_info_invalid_repo_returns_error() -> Result<()> {
     let (client, server_handle) = spawn_server().await;
     let outcome = client
@@ -1013,6 +1059,169 @@ async fn git_branch_info_invalid_repo_returns_error() -> Result<()> {
             "expected tool error for bad repo path"
         );
     }
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn atlassian_auth_status_never_leaks_secrets() -> Result<()> {
+    let _lock = ATLASSIAN_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let original_home = std::env::var("HOME").ok();
+    let original_url = std::env::var("ATLASSIAN_INSTANCE_URL").ok();
+    let original_email = std::env::var("ATLASSIAN_EMAIL").ok();
+    let original_token = std::env::var("ATLASSIAN_API_TOKEN").ok();
+
+    let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
+    fs::create_dir_all(&tmp_root)?;
+    let tmp = tempfile::tempdir_in(&tmp_root)?;
+    let omni_dir = tmp.path().join(".omni-dev");
+    fs::create_dir_all(&omni_dir)?;
+    fs::write(
+        omni_dir.join("settings.json"),
+        r#"{"env":{
+            "ATLASSIAN_INSTANCE_URL":"https://leakcheck.atlassian.net",
+            "ATLASSIAN_EMAIL":"leak-email@example.com",
+            "ATLASSIAN_API_TOKEN":"leak-token-do-not-return"
+        }}"#,
+    )?;
+    std::env::set_var("HOME", tmp.path());
+    std::env::remove_var("ATLASSIAN_INSTANCE_URL");
+    std::env::remove_var("ATLASSIAN_EMAIL");
+    std::env::remove_var("ATLASSIAN_API_TOKEN");
+
+    let (client, server_handle) = spawn_server().await;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("atlassian_auth_status")
+                .with_arguments(serde_json::Map::new()),
+        )
+        .await?;
+    assert!(!result.is_error.unwrap_or(false), "tool returned error");
+    let text: String = result
+        .content
+        .iter()
+        .filter_map(|c| match &c.raw {
+            RawContent::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(text.contains("has_email: true"), "got: {text}");
+    assert!(text.contains("has_token: true"), "got: {text}");
+    assert!(
+        !text.contains("leak-token-do-not-return"),
+        "leaked token: {text}"
+    );
+    assert!(
+        !text.contains("leak-email@example.com"),
+        "leaked email: {text}"
+    );
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+
+    restore_env("HOME", original_home.as_deref());
+    restore_env("ATLASSIAN_INSTANCE_URL", original_url.as_deref());
+    restore_env("ATLASSIAN_EMAIL", original_email.as_deref());
+    restore_env("ATLASSIAN_API_TOKEN", original_token.as_deref());
+
+    Ok(())
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn ai_chat_returns_tool_error_when_credentials_missing() -> Result<()> {
+    // Share the Atlassian env lock so this test doesn't race with other
+    // env-mutating tests in the binary.
+    let _lock = ATLASSIAN_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let original_home = std::env::var("HOME").ok();
+    let snapshots: Vec<(&str, Option<String>)> = vec![
+        "USE_OPENAI",
+        "USE_OLLAMA",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BEDROCK_BASE_URL",
+        "OPENAI_API_KEY",
+        "OPENAI_AUTH_TOKEN",
+        "OLLAMA_MODEL",
+        "OLLAMA_BASE_URL",
+        "ANTHROPIC_MODEL",
+    ]
+    .into_iter()
+    .map(|k| (k, std::env::var(k).ok()))
+    .collect();
+
+    let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
+    fs::create_dir_all(&tmp_root)?;
+    let tmp = tempfile::tempdir_in(&tmp_root)?;
+    std::env::set_var("HOME", tmp.path());
+    for (k, _) in &snapshots {
+        std::env::remove_var(k);
+    }
+
+    let (client, server_handle) = spawn_server().await;
+    let outcome = client
+        .call_tool(
+            CallToolRequestParams::new("ai_chat").with_arguments(
+                serde_json::json!({"message": "hello"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await;
+
+    if let Ok(result) = outcome {
+        assert!(
+            result.is_error.unwrap_or(false),
+            "expected tool error when credentials are missing"
+        );
+    }
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+
+    restore_env("HOME", original_home.as_deref());
+    for (k, v) in snapshots {
+        restore_env(k, v.as_deref());
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn claude_skills_status_returns_yaml_report() -> Result<()> {
+    // The tool reads the server's cwd, which is the cargo manifest dir
+    // (a real git repo) during test runs. No chdir — that would race
+    // with other parallel tests that also read the cwd.
+    let (client, server_handle) = spawn_server().await;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("claude_skills_status").with_arguments(
+                serde_json::json!({"format": "yaml"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await?;
+
+    assert!(!result.is_error.unwrap_or(false), "tool returned error");
+    let text: String = result
+        .content
+        .iter()
+        .filter_map(|c| match &c.raw {
+            RawContent::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(text.contains("targets:"), "missing targets: {text}");
+
     client.cancel().await?;
     let _ = server_handle.await;
     Ok(())

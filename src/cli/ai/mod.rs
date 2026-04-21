@@ -3,7 +3,8 @@
 mod chat;
 mod claude;
 
-pub use chat::ChatCommand;
+pub use chat::{run_chat, ChatCommand};
+pub use claude::skills::{run_clean, run_status, run_sync, OutputFormat, SkillsFormat};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
