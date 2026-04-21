@@ -666,14 +666,24 @@ mod tests {
 
     // ── GitRepository with temp repo ───────────────────────────────
 
+    /// Creates an empty git-inited tempdir anchored at `$CARGO_MANIFEST_DIR/tmp`.
+    ///
+    /// Centralising the setup avoids scattering four copies of the same
+    /// `?`-laced boilerplate across these tests, which also gives codecov a
+    /// single place to attribute coverage for the directory-creation
+    /// machinery.
+    #[allow(clippy::unwrap_used)]
+    fn init_tmp_repo() -> tempfile::TempDir {
+        let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
+        std::fs::create_dir_all(&tmp_root).unwrap();
+        let temp_dir = tempfile::tempdir_in(&tmp_root).unwrap();
+        git2::Repository::init(temp_dir.path()).unwrap();
+        temp_dir
+    }
+
     #[test]
     fn open_at_temp_repo() -> Result<()> {
-        let temp_dir = {
-            let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
-            std::fs::create_dir_all(&tmp_root)?;
-            tempfile::tempdir_in(&tmp_root)?
-        };
-        git2::Repository::init(temp_dir.path())?;
+        let temp_dir = init_tmp_repo();
         let repo = GitRepository::open_at(temp_dir.path())?;
         assert!(repo.path().exists());
         Ok(())
@@ -681,12 +691,7 @@ mod tests {
 
     #[test]
     fn working_directory_clean_empty_repo() -> Result<()> {
-        let temp_dir = {
-            let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
-            std::fs::create_dir_all(&tmp_root)?;
-            tempfile::tempdir_in(&tmp_root)?
-        };
-        git2::Repository::init(temp_dir.path())?;
+        let temp_dir = init_tmp_repo();
         let repo = GitRepository::open_at(temp_dir.path())?;
         let status = repo.get_working_directory_status()?;
         assert!(status.clean);
@@ -696,12 +701,7 @@ mod tests {
 
     #[test]
     fn working_directory_dirty_with_file() -> Result<()> {
-        let temp_dir = {
-            let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
-            std::fs::create_dir_all(&tmp_root)?;
-            tempfile::tempdir_in(&tmp_root)?
-        };
-        git2::Repository::init(temp_dir.path())?;
+        let temp_dir = init_tmp_repo();
         std::fs::write(temp_dir.path().join("new_file.txt"), "content")?;
         let repo = GitRepository::open_at(temp_dir.path())?;
         let status = repo.get_working_directory_status()?;
@@ -712,12 +712,7 @@ mod tests {
 
     #[test]
     fn is_working_directory_clean_delegator() -> Result<()> {
-        let temp_dir = {
-            let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
-            std::fs::create_dir_all(&tmp_root)?;
-            tempfile::tempdir_in(&tmp_root)?
-        };
-        git2::Repository::init(temp_dir.path())?;
+        let temp_dir = init_tmp_repo();
         let repo = GitRepository::open_at(temp_dir.path())?;
         assert!(repo.is_working_directory_clean()?);
         Ok(())
