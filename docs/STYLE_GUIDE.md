@@ -26,6 +26,7 @@ which tags apply to the changes and search this file for those tags. Each rule h
 | After creating commits (before push / PR)        | `commits`                                |
 | Suppressing a lint or considering `unsafe`       | `code-style`, `unsafe`                   |
 | Writing or updating an ADR                       | `adrs`                                   |
+| Adding an MCP tool, resource, or param struct    | `api-design`, `module-organization`, `testing` |
 | Reviewing code for style compliance              | All tags relevant to the changed code    |
 
 ---
@@ -40,7 +41,7 @@ A new convention needs to be added to this style guide.
 
 ### Guidance
 
-Assign the next sequential ID (currently next is `STYLE-0024`) and include:
+Assign the next sequential ID (currently next is `STYLE-0027`) and include:
 
 1. A **Tags** line immediately after the heading — a comma-separated list of category labels
    from the tag vocabulary below.
@@ -1306,3 +1307,66 @@ a trivial pipeline adds a function boundary and a signature to maintain without 
 new test coverage beyond what STYLE-0024 client tests already provide. Reserving extraction
 for commands with real orchestration or validation keeps the codebase lean while ensuring
 the code most likely to harbour bugs is covered.
+
+## STYLE-0026: MCP tool and resource authoring conventions
+
+**Tags:** `api-design`, `module-organization`, `testing`
+
+### Situation
+
+Adding or modifying MCP tools, resources, or supporting types under `src/mcp/`.
+
+### Guidance
+
+1. **Parameter structs.** Every tool defines its input as a dedicated
+   `#[derive(Debug, Deserialize, schemars::JsonSchema)]` struct with a name
+   ending in `Params` (e.g. `GitViewCommitsParams`). All fields get a doc
+   comment — it flows through to the tool's JSON schema and is what the
+   assistant sees. Optional fields use `#[serde(default)]` and `Option<T>`;
+   never `Default::default()` in the handler body.
+
+2. **One tool router per module.** Group related tools in their own submodule
+   and expose the router via `#[tool_router(router = name_tool_router, vis = "pub")]`
+   (see [src/mcp/git_tools.rs](../src/mcp/git_tools.rs)). `OmniDevServer::new`
+   combines all routers — add a new module there rather than cramming tools
+   into an existing router.
+
+3. **Error mapping.** Inside tool handlers, bubble `anyhow::Error` out via
+   the shared [`tool_error`](../src/mcp/error.rs) helper so the full error
+   chain reaches the client. Do **not** build `McpError` values by hand with
+   bespoke messages — go through `tool_error` so the format stays consistent
+   across tools. Resource handlers use `resources::not_found(uri, err)`
+   for URI-lookup failures so the raw URI appears in the response `data`.
+
+4. **Blocking work belongs in `spawn_blocking`.** Tools that call into
+   synchronous business logic (e.g. `git2` operations) must wrap the call
+   in `tokio::task::spawn_blocking` — the MCP transport loop is async, and
+   blocking it stalls every in-flight request.
+
+5. **Output format.** YAML for repository/commit analysis (matches the CLI),
+   markdown for rendered prose (JIRA/Confluence JFM), JSON for raw
+   structured payloads (ADF). Advertise the MIME type on resources so
+   clients can route output appropriately.
+
+6. **Resource URIs.** New URI templates must round-trip through
+   [`ResourceUri::parse`](../src/mcp/resources.rs) with a dedicated unit
+   test per template *and* per malformed-input class (unknown scheme,
+   wrong path shape, empty identifier). Keep the catalogue in
+   `resource_templates()` and `resource_listing()` in sync — add a
+   `templates_include_all_*_uris` assertion when the count changes.
+
+7. **Testing.** Tools and resources both need at least:
+   - A library-level unit test covering the success path with a fabricated
+     input (temp repo, mock API, or hand-built `ContentItem`).
+   - An integration test under `tests/mcp_integration_test.rs` that spins
+     up `OmniDevServer` on an in-memory duplex and exercises the MCP
+     protocol round-trip (list + read/call).
+
+### Motivation
+
+The MCP surface is consumed by non-human clients that can only see what the
+schema and error messages tell them. Uniform parameter structs make the
+schema predictable; shared error mapping keeps diagnostics legible across
+tools; router splitting keeps modules small and testable; the paired
+unit+integration test requirement means a regression in protocol wiring is
+caught without requiring a live Claude Desktop to reproduce.

@@ -10,9 +10,11 @@ pub mod error;
 pub mod git_tools;
 pub mod jira_core_tools;
 pub mod jira_tools;
+pub mod resources;
 pub mod runtime;
 pub mod server;
 
 pub use error::tool_error;
+pub use resources::{ResourceFormat, ResourceUri, UriParseError};
 pub use runtime::{serve_with, try_init_tracing, write_error_chain};
 pub use server::OmniDevServer;
