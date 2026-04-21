@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use git2::{Repository, Signature};
 use rmcp::{
-    model::{CallToolRequestParams, RawContent},
+    model::{CallToolRequestParams, RawContent, ReadResourceRequestParams, ResourceContents},
     service::ServiceExt,
     ClientHandler, RoleClient,
 };
@@ -1102,6 +1102,137 @@ async fn git_view_commits_default_range_is_head() -> Result<()> {
         .collect();
     assert!(text.contains("feat: only commit"), "got: {text}");
 
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+// ─── Resources ──────────────────────────────────────────────────────
+
+/// Serialises CWD mutations across the resource tests in this file so they
+/// don't race with each other or with CWD-swapping unit tests elsewhere.
+static CWD_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[tokio::test]
+async fn list_resources_returns_all_five_uri_templates() -> Result<()> {
+    let (client, server_handle) = spawn_server().await;
+    let listing = client.list_resources(Option::default()).await?;
+    let uris: Vec<&str> = listing.resources.iter().map(|r| r.uri.as_str()).collect();
+    assert!(
+        uris.contains(&"git://repo/commits/{range}"),
+        "got: {uris:?}"
+    );
+    assert!(uris.contains(&"jira://issue/{key}"));
+    assert!(uris.contains(&"jira://issue/{key}.adf"));
+    assert!(uris.contains(&"confluence://page/{id}"));
+    assert!(uris.contains(&"confluence://page/{id}.adf"));
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_resource_templates_returns_descriptions() -> Result<()> {
+    let (client, server_handle) = spawn_server().await;
+    let listing = client.list_resource_templates(Option::default()).await?;
+    assert_eq!(listing.resource_templates.len(), 5);
+    for tpl in &listing.resource_templates {
+        assert!(
+            tpl.description.is_some(),
+            "missing description on {}",
+            tpl.uri_template
+        );
+        assert!(
+            tpl.mime_type.is_some(),
+            "missing mime on {}",
+            tpl.uri_template
+        );
+    }
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn read_resource_git_commits_head_returns_yaml() -> Result<()> {
+    let mut repo = TestRepo::new()?;
+    repo.add_commit("feat: first resource", "r1")?;
+
+    // The resource handler reads from CWD (no repo_path in the URI), so
+    // swap CWD for the duration of the call. Hold `CWD_MUTEX` across the
+    // await to keep other tests from racing. Safe here because the work
+    // inside `read_resource` is CPU-bound `spawn_blocking`.
+    {
+        let _guard = CWD_MUTEX.lock().unwrap();
+        let original_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(&repo.repo_path)?;
+
+        let (client, server_handle) = spawn_server().await;
+        let result = client
+            .read_resource(ReadResourceRequestParams::new("git://repo/commits/HEAD"))
+            .await;
+
+        std::env::set_current_dir(&original_cwd)?;
+
+        let result = result?;
+        assert_eq!(result.contents.len(), 1);
+        match &result.contents[0] {
+            ResourceContents::TextResourceContents {
+                text,
+                mime_type,
+                uri,
+                ..
+            } => {
+                assert!(text.contains("commits:"), "missing commits section: {text}");
+                assert!(
+                    text.contains("feat: first resource"),
+                    "missing commit subject: {text}"
+                );
+                assert_eq!(mime_type.as_deref(), Some("application/yaml"));
+                assert_eq!(uri, "git://repo/commits/HEAD");
+            }
+            other @ ResourceContents::BlobResourceContents { .. } => {
+                panic!("expected text, got: {other:?}")
+            }
+        }
+
+        client.cancel().await?;
+        let _ = server_handle.await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_resource_unknown_scheme_is_resource_not_found() -> Result<()> {
+    let (client, server_handle) = spawn_server().await;
+    let err = client
+        .read_resource(ReadResourceRequestParams::new("ftp://example.com/foo"))
+        .await
+        .expect_err("unknown scheme should error");
+    let rendered = err.to_string();
+    // Rendered error text comes through the protocol; it should name the URI.
+    assert!(
+        rendered.contains("ftp://example.com/foo"),
+        "missing uri in err: {rendered}"
+    );
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_resource_malformed_git_uri_is_resource_not_found() -> Result<()> {
+    let (client, server_handle) = spawn_server().await;
+    let err = client
+        .read_resource(ReadResourceRequestParams::new("git://repo/bogus-path"))
+        .await
+        .expect_err("malformed git uri should error");
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("git://repo/bogus-path"),
+        "missing uri in err: {rendered}"
+    );
     client.cancel().await?;
     let _ = server_handle.await;
     Ok(())
