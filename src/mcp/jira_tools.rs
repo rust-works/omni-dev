@@ -1,0 +1,1810 @@
+//! MCP tool handlers for JIRA operations (extensions: sprints, watchers,
+//! worklogs, fields, boards, attachments, projects, changelogs, delete).
+//!
+//! Each tool is a thin handler that constructs an [`AtlassianClient`] via
+//! [`create_client`] and delegates to a `*_yaml` helper. The helpers do the
+//! actual work — call the client method, serialise the result as YAML — and
+//! are the unit-tested surface (via `wiremock`).
+//!
+//! The split exists because [`create_client`] reads credentials from the
+//! filesystem; the `*_yaml` helpers accept an [`AtlassianClient`] directly so
+//! tests can wire one to a [`wiremock::MockServer`].
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{anyhow, Context, Result};
+use rmcp::{
+    handler::server::wrapper::Parameters,
+    model::{CallToolResult, Content},
+    schemars, tool, tool_router, ErrorData as McpError,
+};
+use serde::{Deserialize, Serialize};
+
+use super::error::tool_error;
+use super::server::OmniDevServer;
+use crate::atlassian::client::{AtlassianClient, JiraAttachment};
+use crate::cli::atlassian::helpers::create_client;
+
+// ─────────────────────────────────────────────────────────────────────────
+// Attachment tools
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Image MIME types recognised by [`attachment_images_yaml`].
+const IMAGE_MIME_TYPES: &[&str] = &[
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/svg+xml",
+    "image/webp",
+];
+
+/// Result of downloading one attachment to disk.
+#[derive(Debug, Clone, Serialize)]
+struct DownloadedAttachment {
+    /// JIRA attachment ID.
+    id: String,
+    /// Original filename.
+    filename: String,
+    /// MIME type (e.g., `image/png`).
+    mime_type: String,
+    /// File size in bytes.
+    size: u64,
+    /// Absolute path on disk where the attachment was written.
+    path: String,
+}
+
+/// Result returned by [`attachment_download_yaml`] / [`attachment_images_yaml`].
+#[derive(Debug, Clone, Serialize)]
+struct DownloadResult {
+    /// Output directory (absolute path) where files were written.
+    output_dir: String,
+    /// Files downloaded.
+    files: Vec<DownloadedAttachment>,
+}
+
+/// Parameters for the `jira_attachment_download` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AttachmentDownloadParams {
+    /// JIRA issue key (e.g., `PROJ-123`).
+    pub key: String,
+    /// Output directory. Defaults to a fresh temp directory whose path is
+    /// returned in the result so the assistant can read the files via its
+    /// filesystem tool.
+    #[serde(default)]
+    pub output_dir: Option<String>,
+    /// Case-insensitive filename substring filter.
+    #[serde(default)]
+    pub filter: Option<String>,
+}
+
+/// Parameters for the `jira_attachment_images` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AttachmentImagesParams {
+    /// JIRA issue key (e.g., `PROJ-123`).
+    pub key: String,
+    /// Output directory. Defaults to a fresh temp directory.
+    #[serde(default)]
+    pub output_dir: Option<String>,
+}
+
+/// Downloads matching attachments to disk and returns YAML metadata
+/// describing each downloaded file (including its on-disk path).
+pub(crate) async fn attachment_download_yaml(
+    client: &AtlassianClient,
+    key: &str,
+    output_dir: &Path,
+    filter: Option<&str>,
+) -> Result<String> {
+    let attachments = client.get_attachments(key).await?;
+    let selected = match filter {
+        Some(pattern) => {
+            let needle = pattern.to_lowercase();
+            attachments
+                .into_iter()
+                .filter(|a| a.filename.to_lowercase().contains(&needle))
+                .collect::<Vec<_>>()
+        }
+        None => attachments,
+    };
+    download_to_yaml(client, output_dir, &selected).await
+}
+
+/// Downloads only image attachments and returns YAML metadata.
+pub(crate) async fn attachment_images_yaml(
+    client: &AtlassianClient,
+    key: &str,
+    output_dir: &Path,
+) -> Result<String> {
+    let attachments = client.get_attachments(key).await?;
+    let selected: Vec<JiraAttachment> = attachments
+        .into_iter()
+        .filter(|a| IMAGE_MIME_TYPES.contains(&a.mime_type.as_str()))
+        .collect();
+    download_to_yaml(client, output_dir, &selected).await
+}
+
+async fn download_to_yaml(
+    client: &AtlassianClient,
+    output_dir: &Path,
+    attachments: &[JiraAttachment],
+) -> Result<String> {
+    fs::create_dir_all(output_dir).with_context(|| {
+        format!(
+            "Failed to create output directory: {}",
+            output_dir.display()
+        )
+    })?;
+    let mut files = Vec::with_capacity(attachments.len());
+    for a in attachments {
+        let bytes = client.get_bytes(&a.content_url).await?;
+        let path = output_dir.join(&a.filename);
+        fs::write(&path, &bytes).with_context(|| format!("Failed to write {}", path.display()))?;
+        files.push(DownloadedAttachment {
+            id: a.id.clone(),
+            filename: a.filename.clone(),
+            mime_type: a.mime_type.clone(),
+            size: a.size,
+            path: path.to_string_lossy().into_owned(),
+        });
+    }
+    let result = DownloadResult {
+        output_dir: output_dir.to_string_lossy().into_owned(),
+        files,
+    };
+    serde_yaml::to_string(&result).context("Failed to serialize download result as YAML")
+}
+
+/// Resolves [`AttachmentDownloadParams::output_dir`] / [`AttachmentImagesParams::output_dir`]
+/// to a usable [`PathBuf`], creating a fresh tempdir when the caller did not
+/// supply a path.
+fn resolve_output_dir(requested: Option<&str>) -> Result<PathBuf> {
+    if let Some(dir) = requested {
+        Ok(PathBuf::from(dir))
+    } else {
+        let tmp = tempfile::Builder::new()
+            .prefix("omni-dev-jira-attachment-")
+            .tempdir()
+            .context("Failed to create temp dir for attachment download")?;
+        Ok(tmp.keep())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Board tools
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Parameters for the `jira_board_list` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BoardListParams {
+    /// Filter by project key.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Filter by board type (e.g., `scrum`, `kanban`).
+    #[serde(default)]
+    pub board_type: Option<String>,
+    /// Maximum number of boards to return. `0` means unlimited (default 50).
+    #[serde(default = "default_limit_50")]
+    pub limit: u32,
+}
+
+/// Parameters for the `jira_board_issues` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BoardIssuesParams {
+    /// Board ID.
+    pub board_id: u64,
+    /// Optional JQL to further filter issues.
+    #[serde(default)]
+    pub jql: Option<String>,
+    /// Maximum number of issues to return. `0` means unlimited (default 50).
+    #[serde(default = "default_limit_50")]
+    pub limit: u32,
+}
+
+pub(crate) async fn board_list_yaml(
+    client: &AtlassianClient,
+    project: Option<&str>,
+    board_type: Option<&str>,
+    limit: u32,
+) -> Result<String> {
+    let result = client.get_boards(project, board_type, limit).await?;
+    serde_yaml::to_string(&result).context("Failed to serialize boards as YAML")
+}
+
+pub(crate) async fn board_issues_yaml(
+    client: &AtlassianClient,
+    board_id: u64,
+    jql: Option<&str>,
+    limit: u32,
+) -> Result<String> {
+    let result = client.get_board_issues(board_id, jql, limit).await?;
+    serde_yaml::to_string(&result).context("Failed to serialize board issues as YAML")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Sprint tools
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Parameters for the `jira_sprint_list` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SprintListParams {
+    /// Board ID.
+    pub board_id: u64,
+    /// Filter by state (`active`, `future`, `closed`).
+    #[serde(default)]
+    pub state: Option<String>,
+    /// Maximum number of sprints to return. `0` means unlimited (default 50).
+    #[serde(default = "default_limit_50")]
+    pub limit: u32,
+}
+
+/// Parameters for the `jira_sprint_issues` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SprintIssuesParams {
+    /// Sprint ID.
+    pub sprint_id: u64,
+    /// Optional JQL to further filter issues.
+    #[serde(default)]
+    pub jql: Option<String>,
+    /// Maximum number of issues to return. `0` means unlimited (default 50).
+    #[serde(default = "default_limit_50")]
+    pub limit: u32,
+}
+
+/// Parameters for the `jira_sprint_add` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SprintAddParams {
+    /// Sprint ID.
+    pub sprint_id: u64,
+    /// Issue keys to add to the sprint.
+    pub issue_keys: Vec<String>,
+}
+
+/// Parameters for the `jira_sprint_create` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SprintCreateParams {
+    /// Origin board ID.
+    pub board_id: u64,
+    /// Sprint name.
+    pub name: String,
+    /// ISO 8601 start date.
+    #[serde(default)]
+    pub start_date: Option<String>,
+    /// ISO 8601 end date.
+    #[serde(default)]
+    pub end_date: Option<String>,
+    /// Sprint goal.
+    #[serde(default)]
+    pub goal: Option<String>,
+}
+
+/// Parameters for the `jira_sprint_update` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SprintUpdateParams {
+    /// Sprint ID.
+    pub sprint_id: u64,
+    /// New sprint name.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// New sprint state (`future`, `active`, `closed`).
+    #[serde(default)]
+    pub state: Option<String>,
+    /// New start date.
+    #[serde(default)]
+    pub start_date: Option<String>,
+    /// New end date.
+    #[serde(default)]
+    pub end_date: Option<String>,
+    /// New goal.
+    #[serde(default)]
+    pub goal: Option<String>,
+}
+
+/// Status payload returned by mutating sprint tools that don't have a
+/// natural body (like add-to-sprint).
+#[derive(Debug, Serialize)]
+struct StatusOk {
+    status: &'static str,
+}
+
+const STATUS_OK: StatusOk = StatusOk { status: "ok" };
+
+pub(crate) async fn sprint_list_yaml(
+    client: &AtlassianClient,
+    board_id: u64,
+    state: Option<&str>,
+    limit: u32,
+) -> Result<String> {
+    let result = client.get_sprints(board_id, state, limit).await?;
+    serde_yaml::to_string(&result).context("Failed to serialize sprints as YAML")
+}
+
+pub(crate) async fn sprint_issues_yaml(
+    client: &AtlassianClient,
+    sprint_id: u64,
+    jql: Option<&str>,
+    limit: u32,
+) -> Result<String> {
+    let result = client.get_sprint_issues(sprint_id, jql, limit).await?;
+    serde_yaml::to_string(&result).context("Failed to serialize sprint issues as YAML")
+}
+
+pub(crate) async fn sprint_add_yaml(
+    client: &AtlassianClient,
+    sprint_id: u64,
+    issue_keys: &[String],
+) -> Result<String> {
+    let refs: Vec<&str> = issue_keys.iter().map(String::as_str).collect();
+    client.add_issues_to_sprint(sprint_id, &refs).await?;
+    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+}
+
+pub(crate) async fn sprint_create_yaml(
+    client: &AtlassianClient,
+    board_id: u64,
+    name: &str,
+    start_date: Option<&str>,
+    end_date: Option<&str>,
+    goal: Option<&str>,
+) -> Result<String> {
+    let sprint = client
+        .create_sprint(board_id, name, start_date, end_date, goal)
+        .await?;
+    serde_yaml::to_string(&sprint).context("Failed to serialize sprint as YAML")
+}
+
+pub(crate) async fn sprint_update_yaml(
+    client: &AtlassianClient,
+    sprint_id: u64,
+    name: Option<&str>,
+    state: Option<&str>,
+    start_date: Option<&str>,
+    end_date: Option<&str>,
+    goal: Option<&str>,
+) -> Result<String> {
+    client
+        .update_sprint(sprint_id, name, state, start_date, end_date, goal)
+        .await?;
+    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Watcher tools
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Parameters for the `jira_watcher_list` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WatcherListParams {
+    /// JIRA issue key (e.g., `PROJ-123`).
+    pub key: String,
+}
+
+/// Parameters for the `jira_watcher_add` / `jira_watcher_remove` tools.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WatcherMutateParams {
+    /// JIRA issue key (e.g., `PROJ-123`).
+    pub key: String,
+    /// Atlassian account ID of the user.
+    pub account_id: String,
+}
+
+pub(crate) async fn watcher_list_yaml(client: &AtlassianClient, key: &str) -> Result<String> {
+    let watchers = client.get_watchers(key).await?;
+    serde_yaml::to_string(&watchers).context("Failed to serialize watchers as YAML")
+}
+
+pub(crate) async fn watcher_add_yaml(
+    client: &AtlassianClient,
+    key: &str,
+    account_id: &str,
+) -> Result<String> {
+    client.add_watcher(key, account_id).await?;
+    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+}
+
+pub(crate) async fn watcher_remove_yaml(
+    client: &AtlassianClient,
+    key: &str,
+    account_id: &str,
+) -> Result<String> {
+    client.remove_watcher(key, account_id).await?;
+    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Worklog tools
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Parameters for the `jira_worklog_list` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorklogListParams {
+    /// JIRA issue key (e.g., `PROJ-123`).
+    pub key: String,
+    /// Maximum number of worklogs to return. `0` means unlimited (default 50).
+    #[serde(default = "default_limit_50")]
+    pub limit: u32,
+}
+
+/// Parameters for the `jira_worklog_add` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorklogAddParams {
+    /// JIRA issue key (e.g., `PROJ-123`).
+    pub key: String,
+    /// Time spent (e.g., `1h 30m`, `2d`).
+    pub time_spent: String,
+    /// ISO 8601 timestamp when the work started.
+    #[serde(default)]
+    pub started: Option<String>,
+    /// Optional plain-text comment.
+    #[serde(default)]
+    pub comment: Option<String>,
+}
+
+pub(crate) async fn worklog_list_yaml(
+    client: &AtlassianClient,
+    key: &str,
+    limit: u32,
+) -> Result<String> {
+    let result = client.get_worklogs(key, limit).await?;
+    serde_yaml::to_string(&result).context("Failed to serialize worklogs as YAML")
+}
+
+pub(crate) async fn worklog_add_yaml(
+    client: &AtlassianClient,
+    key: &str,
+    time_spent: &str,
+    started: Option<&str>,
+    comment: Option<&str>,
+) -> Result<String> {
+    client
+        .add_worklog(key, time_spent, started, comment)
+        .await?;
+    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Field tools
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Parameters for the `jira_field_list` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FieldListParams {
+    /// Filter to fields whose name contains this substring (case-insensitive).
+    #[serde(default)]
+    pub search: Option<String>,
+}
+
+/// Parameters for the `jira_field_options` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FieldOptionsParams {
+    /// Field ID (e.g., `customfield_10001`).
+    pub field_id: String,
+    /// Optional context ID. When omitted, the first context is auto-discovered.
+    #[serde(default)]
+    pub context_id: Option<String>,
+}
+
+pub(crate) async fn field_list_yaml(
+    client: &AtlassianClient,
+    search: Option<&str>,
+) -> Result<String> {
+    let mut fields = client.get_fields().await?;
+    if let Some(needle) = search {
+        let needle_lower = needle.to_lowercase();
+        fields.retain(|f| f.name.to_lowercase().contains(&needle_lower));
+    }
+    serde_yaml::to_string(&fields).context("Failed to serialize fields as YAML")
+}
+
+pub(crate) async fn field_options_yaml(
+    client: &AtlassianClient,
+    field_id: &str,
+    context_id: Option<&str>,
+) -> Result<String> {
+    let options = client.get_field_options(field_id, context_id).await?;
+    serde_yaml::to_string(&options).context("Failed to serialize field options as YAML")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Project tools
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Parameters for the `jira_project_list` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectListParams {
+    /// Maximum number of projects to return. `0` means unlimited (default 50).
+    #[serde(default = "default_limit_50")]
+    pub limit: u32,
+}
+
+pub(crate) async fn project_list_yaml(client: &AtlassianClient, limit: u32) -> Result<String> {
+    let result = client.get_projects(limit).await?;
+    serde_yaml::to_string(&result).context("Failed to serialize projects as YAML")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Changelog tool
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Parameters for the `jira_changelog` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ChangelogParams {
+    /// JIRA issue key (e.g., `PROJ-123`).
+    pub key: String,
+    /// Maximum number of entries to return. `0` means unlimited (default 50).
+    #[serde(default = "default_limit_50")]
+    pub limit: u32,
+}
+
+pub(crate) async fn changelog_yaml(
+    client: &AtlassianClient,
+    key: &str,
+    limit: u32,
+) -> Result<String> {
+    let entries = client.get_changelog(key, limit).await?;
+    serde_yaml::to_string(&entries).context("Failed to serialize changelog as YAML")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Delete tool (destructive)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Parameters for the `jira_delete` tool.
+///
+/// `confirm` must be `true` for the deletion to proceed. This is the
+/// MCP-side guard for an irreversible operation; the assistant must
+/// explicitly opt in.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DeleteParams {
+    /// JIRA issue key to delete (e.g., `PROJ-123`).
+    pub key: String,
+    /// Must be set to `true` — destructive guard.
+    pub confirm: bool,
+}
+
+pub(crate) async fn delete_yaml(
+    client: &AtlassianClient,
+    key: &str,
+    confirm: bool,
+) -> Result<String> {
+    if !confirm {
+        return Err(anyhow!(
+            "Refusing to delete {key}: pass `confirm: true` to authorise this irreversible operation."
+        ));
+    }
+    client.delete_issue(key).await?;
+    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Defaults
+// ─────────────────────────────────────────────────────────────────────────
+
+const fn default_limit_50() -> u32 {
+    50
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Tool router
+// ─────────────────────────────────────────────────────────────────────────
+
+#[allow(missing_docs)] // #[tool_router] generates a pub `jira_tool_router` fn.
+#[tool_router(router = jira_tool_router, vis = "pub")]
+impl OmniDevServer {
+    // ── attachments ────────────────────────────────────────────────
+
+    /// Tool: download all attachments on an issue (optionally filtered by
+    /// filename substring) to disk and return YAML metadata describing the
+    /// downloaded files.
+    #[tool(
+        description = "Download attachments on a JIRA issue to disk. Returns YAML metadata \
+                       (id, filename, mime_type, size, on-disk path) for each downloaded file. \
+                       If `output_dir` is omitted, files are written to a fresh temp directory \
+                       whose path is in the result; the assistant can then read them via the \
+                       filesystem tool. Mirrors `omni-dev atlassian jira attachment download`."
+    )]
+    pub async fn jira_attachment_download(
+        &self,
+        Parameters(params): Parameters<AttachmentDownloadParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            let dir = resolve_output_dir(params.output_dir.as_deref())?;
+            attachment_download_yaml(&client, &params.key, &dir, params.filter.as_deref()).await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: download only image attachments on an issue and return YAML
+    /// metadata describing the files.
+    #[tool(
+        description = "Download image attachments (PNG, JPEG, GIF, SVG, WebP) on a JIRA issue \
+                       to disk. Returns YAML metadata for each downloaded image. If \
+                       `output_dir` is omitted, files are written to a fresh temp directory. \
+                       Mirrors `omni-dev atlassian jira attachment images`."
+    )]
+    pub async fn jira_attachment_images(
+        &self,
+        Parameters(params): Parameters<AttachmentImagesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            let dir = resolve_output_dir(params.output_dir.as_deref())?;
+            attachment_images_yaml(&client, &params.key, &dir).await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    // ── boards ─────────────────────────────────────────────────────
+
+    /// Tool: list agile boards.
+    #[tool(
+        description = "List JIRA agile boards, optionally filtered by project key and/or board \
+                       type (`scrum`/`kanban`). Returns YAML. Mirrors `omni-dev atlassian jira \
+                       board list`."
+    )]
+    pub async fn jira_board_list(
+        &self,
+        Parameters(params): Parameters<BoardListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            board_list_yaml(
+                &client,
+                params.project.as_deref(),
+                params.board_type.as_deref(),
+                params.limit,
+            )
+            .await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: list issues on an agile board.
+    #[tool(
+        description = "List issues on a JIRA agile board. Accepts an optional JQL filter. \
+                       Returns YAML. Mirrors `omni-dev atlassian jira board issues`."
+    )]
+    pub async fn jira_board_issues(
+        &self,
+        Parameters(params): Parameters<BoardIssuesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            board_issues_yaml(
+                &client,
+                params.board_id,
+                params.jql.as_deref(),
+                params.limit,
+            )
+            .await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    // ── sprints ────────────────────────────────────────────────────
+
+    /// Tool: list sprints on a board.
+    #[tool(
+        description = "List sprints on an agile board, optionally filtered by state \
+                       (`active`/`future`/`closed`). Returns YAML. Mirrors `omni-dev atlassian \
+                       jira sprint list`."
+    )]
+    pub async fn jira_sprint_list(
+        &self,
+        Parameters(params): Parameters<SprintListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            sprint_list_yaml(
+                &client,
+                params.board_id,
+                params.state.as_deref(),
+                params.limit,
+            )
+            .await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: list issues in a sprint.
+    #[tool(
+        description = "List issues in a JIRA sprint. Accepts an optional JQL filter. Returns \
+                       YAML. Mirrors `omni-dev atlassian jira sprint issues`."
+    )]
+    pub async fn jira_sprint_issues(
+        &self,
+        Parameters(params): Parameters<SprintIssuesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            sprint_issues_yaml(
+                &client,
+                params.sprint_id,
+                params.jql.as_deref(),
+                params.limit,
+            )
+            .await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: add issues to a sprint.
+    #[tool(
+        description = "Add one or more issues to a JIRA sprint by issue key. Returns YAML \
+                       `{status: ok}` on success. Mirrors `omni-dev atlassian jira sprint add`."
+    )]
+    pub async fn jira_sprint_add(
+        &self,
+        Parameters(params): Parameters<SprintAddParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            sprint_add_yaml(&client, params.sprint_id, &params.issue_keys).await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: create a sprint.
+    #[tool(
+        description = "Create a new sprint on a JIRA agile board. Returns YAML for the created \
+                       sprint. Mirrors `omni-dev atlassian jira sprint create`."
+    )]
+    pub async fn jira_sprint_create(
+        &self,
+        Parameters(params): Parameters<SprintCreateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            sprint_create_yaml(
+                &client,
+                params.board_id,
+                &params.name,
+                params.start_date.as_deref(),
+                params.end_date.as_deref(),
+                params.goal.as_deref(),
+            )
+            .await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: update sprint metadata or state.
+    #[tool(
+        description = "Update sprint name, state (`future`/`active`/`closed`), dates, or goal. \
+                       Returns YAML `{status: ok}`. Mirrors `omni-dev atlassian jira sprint \
+                       update`."
+    )]
+    pub async fn jira_sprint_update(
+        &self,
+        Parameters(params): Parameters<SprintUpdateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            sprint_update_yaml(
+                &client,
+                params.sprint_id,
+                params.name.as_deref(),
+                params.state.as_deref(),
+                params.start_date.as_deref(),
+                params.end_date.as_deref(),
+                params.goal.as_deref(),
+            )
+            .await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    // ── watchers ───────────────────────────────────────────────────
+
+    /// Tool: list watchers on an issue.
+    #[tool(
+        description = "List watchers on a JIRA issue. Returns YAML with watch_count and an \
+                       array of watcher accounts. Mirrors `omni-dev atlassian jira watcher list`."
+    )]
+    pub async fn jira_watcher_list(
+        &self,
+        Parameters(params): Parameters<WatcherListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            watcher_list_yaml(&client, &params.key).await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: add a watcher to an issue.
+    #[tool(
+        description = "Add a user (by Atlassian account ID) as a watcher on a JIRA issue. \
+                       Returns YAML `{status: ok}`. Mirrors `omni-dev atlassian jira watcher add`."
+    )]
+    pub async fn jira_watcher_add(
+        &self,
+        Parameters(params): Parameters<WatcherMutateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            watcher_add_yaml(&client, &params.key, &params.account_id).await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: remove a watcher from an issue.
+    #[tool(
+        description = "Remove a user (by Atlassian account ID) from the watchers of a JIRA \
+                       issue. Returns YAML `{status: ok}`. Mirrors `omni-dev atlassian jira \
+                       watcher remove`."
+    )]
+    pub async fn jira_watcher_remove(
+        &self,
+        Parameters(params): Parameters<WatcherMutateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            watcher_remove_yaml(&client, &params.key, &params.account_id).await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    // ── worklogs ───────────────────────────────────────────────────
+
+    /// Tool: list worklog entries for an issue.
+    #[tool(
+        description = "List worklog entries on a JIRA issue. Returns YAML. Mirrors `omni-dev \
+                       atlassian jira worklog list`."
+    )]
+    pub async fn jira_worklog_list(
+        &self,
+        Parameters(params): Parameters<WorklogListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            worklog_list_yaml(&client, &params.key, params.limit).await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: log time on an issue.
+    #[tool(
+        description = "Log time on a JIRA issue. `time_spent` accepts JIRA's duration format \
+                       (e.g., `1h 30m`, `2d`). Returns YAML `{status: ok}`. Mirrors `omni-dev \
+                       atlassian jira worklog add`."
+    )]
+    pub async fn jira_worklog_add(
+        &self,
+        Parameters(params): Parameters<WorklogAddParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            worklog_add_yaml(
+                &client,
+                &params.key,
+                &params.time_spent,
+                params.started.as_deref(),
+                params.comment.as_deref(),
+            )
+            .await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    // ── fields ─────────────────────────────────────────────────────
+
+    /// Tool: list JIRA field definitions.
+    #[tool(
+        description = "List JIRA field definitions, optionally filtered by name substring. \
+                       Returns YAML. Mirrors `omni-dev atlassian jira field list`."
+    )]
+    pub async fn jira_field_list(
+        &self,
+        Parameters(params): Parameters<FieldListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            field_list_yaml(&client, params.search.as_deref()).await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: list options for a custom field.
+    #[tool(
+        description = "List allowed option values for a JIRA custom field. If `context_id` is \
+                       omitted, the first context for the field is auto-discovered. Returns \
+                       YAML. Mirrors `omni-dev atlassian jira field options`."
+    )]
+    pub async fn jira_field_options(
+        &self,
+        Parameters(params): Parameters<FieldOptionsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            field_options_yaml(&client, &params.field_id, params.context_id.as_deref()).await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    // ── projects ───────────────────────────────────────────────────
+
+    /// Tool: list JIRA projects.
+    #[tool(
+        description = "List JIRA projects. Returns YAML. Mirrors `omni-dev atlassian jira \
+                       project list`."
+    )]
+    pub async fn jira_project_list(
+        &self,
+        Parameters(params): Parameters<ProjectListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            project_list_yaml(&client, params.limit).await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    // ── changelog ──────────────────────────────────────────────────
+
+    /// Tool: get the change history for an issue.
+    #[tool(
+        description = "Get the change history for a JIRA issue. Returns YAML with one entry \
+                       per change (author, timestamp, items). Mirrors `omni-dev atlassian jira \
+                       changelog`."
+    )]
+    pub async fn jira_changelog(
+        &self,
+        Parameters(params): Parameters<ChangelogParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            changelog_yaml(&client, &params.key, params.limit).await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    // ── delete (destructive) ───────────────────────────────────────
+
+    /// Tool: delete a JIRA issue. **Irreversible** — caller must pass
+    /// `confirm: true`.
+    #[tool(
+        description = "Delete a JIRA issue. **DESTRUCTIVE AND IRREVERSIBLE.** You must \
+                       explicitly pass `confirm: true` for the deletion to proceed; otherwise \
+                       the tool returns an error without contacting the API. Returns YAML \
+                       `{status: ok}` on success. Mirrors `omni-dev atlassian jira delete`."
+    )]
+    pub async fn jira_delete(
+        &self,
+        Parameters(params): Parameters<DeleteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        // Reject before loading credentials so a missing-config environment can
+        // still see the destructive guard.
+        if !params.confirm {
+            return Err(tool_error(anyhow!(
+                "Refusing to delete {}: pass `confirm: true` to authorise this irreversible operation.",
+                params.key
+            )));
+        }
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            delete_yaml(&client, &params.key, params.confirm).await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{body_json, header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn mock_client(base_url: &str) -> AtlassianClient {
+        AtlassianClient::new(base_url, "u@t.com", "tok").unwrap()
+    }
+
+    // ── attachment helpers ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn attachment_download_yaml_success_writes_files() {
+        let server = MockServer::start().await;
+        let content_url = format!("{}/attachment/1", server.uri());
+
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "fields": {
+                    "attachment": [
+                        {"id": "1", "filename": "note.txt", "mimeType": "text/plain", "size": 5, "content": content_url}
+                    ]
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/attachment/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello".as_slice()))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = attachment_download_yaml(&client, "PROJ-1", dir.path(), None)
+            .await
+            .unwrap();
+        assert!(yaml.contains("note.txt"));
+        assert!(yaml.contains(dir.path().to_str().unwrap()));
+        assert!(dir.path().join("note.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn attachment_download_yaml_filter_excludes_non_matching() {
+        let server = MockServer::start().await;
+        let content_url = format!("{}/attachment/1", server.uri());
+
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "fields": {
+                    "attachment": [
+                        {"id": "1", "filename": "screenshot.png", "mimeType": "image/png", "size": 1, "content": content_url},
+                        {"id": "2", "filename": "report.pdf", "mimeType": "application/pdf", "size": 2, "content": "http://nowhere/2"}
+                    ]
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/attachment/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"x".as_slice()))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = attachment_download_yaml(&client, "PROJ-2", dir.path(), Some("screen"))
+            .await
+            .unwrap();
+        assert!(yaml.contains("screenshot.png"));
+        assert!(!yaml.contains("report.pdf"));
+    }
+
+    #[tokio::test]
+    async fn attachment_download_yaml_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/NOPE-1"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("nope"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let dir = tempfile::tempdir().unwrap();
+        let err = attachment_download_yaml(&client, "NOPE-1", dir.path(), None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn attachment_images_yaml_filters_to_images() {
+        let server = MockServer::start().await;
+        let img_url = format!("{}/attachment/img", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-3"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "fields": {
+                    "attachment": [
+                        {"id": "img", "filename": "photo.png", "mimeType": "image/png", "size": 4, "content": img_url},
+                        {"id": "doc", "filename": "spec.pdf", "mimeType": "application/pdf", "size": 8, "content": "http://nowhere/doc"}
+                    ]
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/attachment/img"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"\x89PNG".as_slice()))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = attachment_images_yaml(&client, "PROJ-3", dir.path())
+            .await
+            .unwrap();
+        assert!(yaml.contains("photo.png"));
+        assert!(!yaml.contains("spec.pdf"));
+        assert!(dir.path().join("photo.png").exists());
+    }
+
+    #[tokio::test]
+    async fn attachment_images_yaml_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/NOPE-2"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let dir = tempfile::tempdir().unwrap();
+        let err = attachment_images_yaml(&client, "NOPE-2", dir.path())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("500"));
+    }
+
+    #[tokio::test]
+    async fn attachment_download_yaml_create_dir_failure_includes_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "fields": {"attachment": []}
+            })))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        // A path under /dev/null cannot be created.
+        let bad = Path::new("/dev/null/does/not/exist");
+        let err = attachment_download_yaml(&client, "PROJ-1", bad, None)
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Failed to create output directory"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_output_dir_uses_supplied_path() {
+        let dir = resolve_output_dir(Some("/tmp/foo")).unwrap();
+        assert_eq!(dir, PathBuf::from("/tmp/foo"));
+    }
+
+    #[test]
+    fn resolve_output_dir_creates_tempdir_when_missing() {
+        let dir = resolve_output_dir(None).unwrap();
+        assert!(dir.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── boards ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn board_list_yaml_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/agile/1.0/board"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "values": [{"id": 1, "name": "B", "type": "scrum", "location": {"projectKey": "PROJ"}}],
+                "isLast": true
+            })))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = board_list_yaml(&client, None, None, 50).await.unwrap();
+        assert!(yaml.contains("scrum"));
+        assert!(yaml.contains("projectKey: PROJ") || yaml.contains("project_key: PROJ"));
+    }
+
+    #[tokio::test]
+    async fn board_list_yaml_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/agile/1.0/board"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = board_list_yaml(&client, None, None, 50).await.unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn board_issues_yaml_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/agile/1.0/board/7/issue"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issues": [{"key": "PROJ-7", "fields": {"summary": "Task"}}],
+                "isLast": true
+            })))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = board_issues_yaml(&client, 7, None, 50).await.unwrap();
+        assert!(yaml.contains("PROJ-7"));
+    }
+
+    #[tokio::test]
+    async fn board_issues_yaml_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/agile/1.0/board/9/issue"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("nope"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = board_issues_yaml(&client, 9, None, 50).await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    // ── sprints ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn sprint_list_yaml_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/agile/1.0/board/1/sprint"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "values": [{"id": 10, "name": "S1", "state": "active"}],
+                "isLast": true
+            })))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = sprint_list_yaml(&client, 1, None, 50).await.unwrap();
+        assert!(yaml.contains("S1"));
+        assert!(yaml.contains("active"));
+    }
+
+    #[tokio::test]
+    async fn sprint_list_yaml_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/agile/1.0/board/1/sprint"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = sprint_list_yaml(&client, 1, None, 50).await.unwrap_err();
+        assert!(err.to_string().contains("500"));
+    }
+
+    #[tokio::test]
+    async fn sprint_issues_yaml_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/agile/1.0/sprint/5/issue"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issues": [{"key": "PROJ-5", "fields": {"summary": "Sprint task"}}],
+                "isLast": true
+            })))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = sprint_issues_yaml(&client, 5, None, 50).await.unwrap();
+        assert!(yaml.contains("PROJ-5"));
+    }
+
+    #[tokio::test]
+    async fn sprint_issues_yaml_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/agile/1.0/sprint/5/issue"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("nope"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = sprint_issues_yaml(&client, 5, None, 50).await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn sprint_add_yaml_returns_status_ok() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/agile/1.0/sprint/3/issue"))
+            .and(body_json(
+                serde_json::json!({"issues": ["PROJ-1", "PROJ-2"]}),
+            ))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = sprint_add_yaml(&client, 3, &["PROJ-1".to_string(), "PROJ-2".to_string()])
+            .await
+            .unwrap();
+        assert!(yaml.contains("status"));
+        assert!(yaml.contains("ok"));
+    }
+
+    #[tokio::test]
+    async fn sprint_add_yaml_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/agile/1.0/sprint/3/issue"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("denied"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = sprint_add_yaml(&client, 3, &["PROJ-1".to_string()])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn sprint_create_yaml_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/agile/1.0/sprint"))
+            .and(body_json(serde_json::json!({
+                "originBoardId": 1, "name": "Sprint 1", "goal": "Win"
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": 99, "name": "Sprint 1", "state": "future", "goal": "Win"
+            })))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = sprint_create_yaml(&client, 1, "Sprint 1", None, None, Some("Win"))
+            .await
+            .unwrap();
+        assert!(yaml.contains("id: 99"));
+        assert!(yaml.contains("Sprint 1"));
+    }
+
+    #[tokio::test]
+    async fn sprint_create_yaml_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/agile/1.0/sprint"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = sprint_create_yaml(&client, 1, "S", None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("400"));
+    }
+
+    #[tokio::test]
+    async fn sprint_update_yaml_returns_status_ok() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/agile/1.0/sprint/99"))
+            .and(body_json(serde_json::json!({"state": "closed"})))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = sprint_update_yaml(&client, 99, None, Some("closed"), None, None, None)
+            .await
+            .unwrap();
+        assert!(yaml.contains("status: ok"));
+    }
+
+    #[tokio::test]
+    async fn sprint_update_yaml_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/agile/1.0/sprint/99"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("nope"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = sprint_update_yaml(&client, 99, Some("Renamed"), None, None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    // ── watchers ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn watcher_list_yaml_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1/watchers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "watchCount": 1,
+                "watchers": [{"accountId": "abc", "displayName": "Alice"}]
+            })))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = watcher_list_yaml(&client, "PROJ-1").await.unwrap();
+        assert!(yaml.contains("Alice"));
+        assert!(yaml.contains("watch_count"));
+    }
+
+    #[tokio::test]
+    async fn watcher_list_yaml_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/NOPE/watchers"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("missing"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = watcher_list_yaml(&client, "NOPE").await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn watcher_add_yaml_returns_status_ok() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue/PROJ-1/watchers"))
+            .and(body_json(serde_json::json!("abc")))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = watcher_add_yaml(&client, "PROJ-1", "abc").await.unwrap();
+        assert!(yaml.contains("ok"));
+    }
+
+    #[tokio::test]
+    async fn watcher_add_yaml_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue/PROJ-1/watchers"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("denied"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = watcher_add_yaml(&client, "PROJ-1", "abc")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn watcher_remove_yaml_returns_status_ok() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/issue/PROJ-1/watchers"))
+            .and(query_param("accountId", "abc"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = watcher_remove_yaml(&client, "PROJ-1", "abc").await.unwrap();
+        assert!(yaml.contains("ok"));
+    }
+
+    #[tokio::test]
+    async fn watcher_remove_yaml_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/issue/PROJ-1/watchers"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("denied"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = watcher_remove_yaml(&client, "PROJ-1", "abc")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    // ── worklogs ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn worklog_list_yaml_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1/worklog"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "total": 1,
+                "worklogs": [{
+                    "id": "w1",
+                    "author": {"displayName": "Alice"},
+                    "timeSpent": "1h",
+                    "timeSpentSeconds": 3600,
+                    "started": "2026-04-21T00:00:00.000+0000"
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = worklog_list_yaml(&client, "PROJ-1", 50).await.unwrap();
+        assert!(yaml.contains("Alice"));
+        assert!(yaml.contains("1h"));
+    }
+
+    #[tokio::test]
+    async fn worklog_list_yaml_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1/worklog"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = worklog_list_yaml(&client, "PROJ-1", 50).await.unwrap_err();
+        assert!(err.to_string().contains("500"));
+    }
+
+    #[tokio::test]
+    async fn worklog_add_yaml_returns_status_ok() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue/PROJ-1/worklog"))
+            .and(header("content-type", "application/json"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = worklog_add_yaml(&client, "PROJ-1", "1h", None, Some("did stuff"))
+            .await
+            .unwrap();
+        assert!(yaml.contains("ok"));
+    }
+
+    #[tokio::test]
+    async fn worklog_add_yaml_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue/PROJ-1/worklog"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = worklog_add_yaml(&client, "PROJ-1", "1h", None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("400"));
+    }
+
+    // ── fields ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn field_list_yaml_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/field"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "summary", "name": "Summary", "custom": false},
+                {"id": "customfield_1", "name": "Story Points", "custom": true}
+            ])))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = field_list_yaml(&client, None).await.unwrap();
+        assert!(yaml.contains("Summary"));
+        assert!(yaml.contains("Story Points"));
+    }
+
+    #[tokio::test]
+    async fn field_list_yaml_filter_narrows_results() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/field"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "summary", "name": "Summary", "custom": false},
+                {"id": "customfield_1", "name": "Story Points", "custom": true}
+            ])))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = field_list_yaml(&client, Some("story")).await.unwrap();
+        assert!(yaml.contains("Story Points"));
+        assert!(!yaml.contains("Summary"));
+    }
+
+    #[tokio::test]
+    async fn field_list_yaml_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/field"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = field_list_yaml(&client, None).await.unwrap_err();
+        assert!(err.to_string().contains("500"));
+    }
+
+    #[tokio::test]
+    async fn field_options_yaml_returns_yaml_with_explicit_context() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/field/customfield_1/context/ctx-1/option"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "values": [
+                    {"id": "1", "value": "Low"},
+                    {"id": "2", "value": "High"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = field_options_yaml(&client, "customfield_1", Some("ctx-1"))
+            .await
+            .unwrap();
+        assert!(yaml.contains("Low"));
+        assert!(yaml.contains("High"));
+    }
+
+    #[tokio::test]
+    async fn field_options_yaml_auto_discovers_context() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/field/customfield_2/context"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "values": [{"id": "ctx-7"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/field/customfield_2/context/ctx-7/option"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "values": [{"id": "1", "value": "Solo"}]
+            })))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = field_options_yaml(&client, "customfield_2", None)
+            .await
+            .unwrap();
+        assert!(yaml.contains("Solo"));
+    }
+
+    #[tokio::test]
+    async fn field_options_yaml_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/field/customfield_1/context/ctx-1/option"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = field_options_yaml(&client, "customfield_1", Some("ctx-1"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("400"));
+    }
+
+    // ── projects ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn project_list_yaml_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/project/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "values": [{"id": "10001", "key": "PROJ", "name": "Project"}],
+                "total": 1,
+                "isLast": true
+            })))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = project_list_yaml(&client, 50).await.unwrap();
+        assert!(yaml.contains("PROJ"));
+    }
+
+    #[tokio::test]
+    async fn project_list_yaml_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/project/search"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = project_list_yaml(&client, 50).await.unwrap_err();
+        assert!(err.to_string().contains("500"));
+    }
+
+    // ── changelog ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn changelog_yaml_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1/changelog"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "values": [{
+                    "id": "1",
+                    "author": {"displayName": "Alice"},
+                    "created": "2026-04-21T00:00:00.000+0000",
+                    "items": [{"field": "status", "fromString": "Open", "toString": "In Progress"}]
+                }],
+                "isLast": true
+            })))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = changelog_yaml(&client, "PROJ-1", 50).await.unwrap();
+        assert!(yaml.contains("Alice"));
+        assert!(yaml.contains("In Progress"));
+    }
+
+    #[tokio::test]
+    async fn changelog_yaml_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1/changelog"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = changelog_yaml(&client, "PROJ-1", 50).await.unwrap_err();
+        assert!(err.to_string().contains("500"));
+    }
+
+    // ── delete ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_yaml_requires_confirm_true() {
+        let client = mock_client("http://nowhere.invalid");
+        let err = delete_yaml(&client, "PROJ-1", false).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Refusing to delete"));
+        assert!(msg.contains("confirm: true"));
+    }
+
+    #[tokio::test]
+    async fn delete_yaml_with_confirm_calls_api() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = delete_yaml(&client, "PROJ-1", true).await.unwrap();
+        assert!(yaml.contains("ok"));
+    }
+
+    #[tokio::test]
+    async fn delete_yaml_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("missing"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = delete_yaml(&client, "PROJ-1", true).await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    // ── small util ─────────────────────────────────────────────────
+
+    #[test]
+    fn default_limit_is_50() {
+        assert_eq!(default_limit_50(), 50);
+    }
+}
