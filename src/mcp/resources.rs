@@ -637,20 +637,16 @@ mod tests {
         temp_dir
     }
 
-    /// Serialises CWD mutations so these tests do not race with the unit
-    /// tests in `cli::git::view`.
-    static CWD_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::cli::git::CWD_MUTEX;
 
-    // `read_resource` is async and must run with the CWD held fixed, so the
-    // `std::sync::Mutex` guard is held across `.await`. This is safe because
-    // the critical section is CPU-bound `run_view` work behind
-    // `spawn_blocking` — no cross-task yield contends for the lock — and
-    // tests are the only caller. Silence clippy's default-deny lint here
-    // rather than introducing a separate async-aware mutex just for tests.
-    #[allow(clippy::await_holding_lock)]
+    // `read_resource` is async and must run with the CWD held fixed, so we
+    // hold the guard across `.await` points. The shared
+    // `tokio::sync::Mutex` is designed for this; no clippy suppression is
+    // needed. The critical section is CPU-bound `run_view` work behind
+    // `spawn_blocking`, so no cross-task yield contends for the lock.
     #[tokio::test(flavor = "multi_thread")]
     async fn read_resource_git_commits_returns_yaml() {
-        let _guard = CWD_MUTEX.lock().unwrap();
+        let _guard = CWD_MUTEX.lock().await;
         let temp_dir = init_tmp_repo();
         let original_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(temp_dir.path()).unwrap();

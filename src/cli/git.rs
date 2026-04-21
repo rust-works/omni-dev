@@ -18,8 +18,17 @@ pub use view::{run_view, ViewCommand};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-/// Global async mutex serialising `CwdGuard` entries so concurrent callers do
-/// not race on the process-wide current working directory.
+/// Global async mutex serialising every caller that mutates the process-wide
+/// current working directory via `std::env::set_current_dir`.
+///
+/// Used by:
+/// - The production [`CwdGuard`] wrapper that MCP tool handlers acquire via
+///   `.lock().await`.
+/// - Async unit tests that call `CwdGuard::enter` directly (e.g., `check`,
+///   `twiddle`, `create_pr`).
+/// - Sync unit tests that change CWD directly; they acquire the same mutex
+///   via [`tokio::sync::Mutex::blocking_lock`] so both styles of test
+///   serialise through one instance and cannot race on the shared CWD.
 ///
 /// We use `tokio::sync::Mutex` rather than `std::sync::Mutex` so the guard is
 /// `Send` and can be held across `.await` points (required by the MCP
