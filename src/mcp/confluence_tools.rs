@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::atlassian::adf::AdfDocument;
 use crate::atlassian::api::{AtlassianApi, ContentItem};
-use crate::atlassian::confluence_api::ConfluenceApi;
+use crate::atlassian::client::AtlassianClient;
+use crate::atlassian::confluence_api::{ChildPage, ConfluenceApi};
 use crate::atlassian::convert::markdown_to_adf;
 use crate::atlassian::document::{content_item_to_document, JfmDocument, JfmFrontmatter};
 use crate::cli::atlassian::confluence::download::{
@@ -27,6 +28,7 @@ use crate::cli::atlassian::confluence::download::{
 };
 use crate::cli::atlassian::format::ContentFormat;
 use crate::cli::atlassian::helpers::create_client;
+use crate::data::yaml::to_yaml;
 
 use super::error::tool_error;
 use super::server::OmniDevServer;
@@ -123,6 +125,81 @@ pub struct ConfluenceDownloadParams {
     pub format: Option<String>,
 }
 
+/// Parameters for the `confluence_children` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceChildrenParams {
+    /// Page ID whose children should be listed. Omit when using `space`.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Space key (mutually exclusive with `id`): list top-level pages in
+    /// the space.
+    #[serde(default)]
+    pub space: Option<String>,
+    /// Recursively fetch descendants.
+    #[serde(default)]
+    pub recursive: Option<bool>,
+    /// Maximum tree depth when `recursive` is set (0 = unlimited).
+    #[serde(default)]
+    pub max_depth: Option<u32>,
+}
+
+/// Parameters for the `confluence_comment_list` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceCommentListParams {
+    /// Confluence page ID.
+    pub id: String,
+    /// Maximum number of comments to return (0 = unlimited).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Parameters for the `confluence_comment_add` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceCommentAddParams {
+    /// Confluence page ID.
+    pub id: String,
+    /// Markdown content of the comment body. Converted to ADF before posting.
+    pub content: String,
+}
+
+/// Parameters for the `confluence_label_list` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceLabelListParams {
+    /// Confluence page ID.
+    pub id: String,
+    /// Maximum number of labels to return (0 = unlimited).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Parameters for the `confluence_label_add` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceLabelAddParams {
+    /// Confluence page ID.
+    pub id: String,
+    /// Labels to add to the page.
+    pub labels: Vec<String>,
+}
+
+/// Parameters for the `confluence_label_remove` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceLabelRemoveParams {
+    /// Confluence page ID.
+    pub id: String,
+    /// Labels to remove from the page.
+    pub labels: Vec<String>,
+}
+
+/// Parameters for the `confluence_user_search` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceUserSearchParams {
+    /// Search text; matches display name or email.
+    pub query: String,
+    /// Maximum number of results (0 = unlimited). Defaults to 25.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
 // ── Output summaries ────────────────────────────────────────────────
 
 /// Manifest summary returned by `confluence_download`.
@@ -138,6 +215,56 @@ struct DownloadSummaryEntry {
     id: String,
     title: String,
     path: String,
+}
+
+/// A children-tree entry returned by `confluence_children`.
+///
+/// Mirrors the CLI output shape (see
+/// `crate::cli::atlassian::confluence::children::ChildrenEntry`) so that
+/// downstream consumers see a stable schema.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChildrenEntry {
+    /// Page ID.
+    pub id: String,
+    /// Page title.
+    pub title: String,
+    /// Page status (e.g. "current", "draft"); empty when unknown.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub status: String,
+    /// Parent page ID, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    /// Space key, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub space_key: Option<String>,
+    /// Nested children (populated when `recursive` is set).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<Self>,
+}
+
+impl From<ChildPage> for ChildrenEntry {
+    fn from(p: ChildPage) -> Self {
+        Self {
+            id: p.id,
+            title: p.title,
+            status: p.status,
+            parent_id: p.parent_id,
+            space_key: p.space_key,
+            children: Vec::new(),
+        }
+    }
+}
+
+/// Envelope for a mutation's YAML response.
+#[derive(Debug, Serialize)]
+struct MutationResult<'a> {
+    ok: bool,
+    message: String,
+    /// Page ID the mutation targeted.
+    id: &'a str,
+    /// Labels touched by the mutation (empty for comment operations).
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    labels: &'a [String],
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -255,6 +382,175 @@ fn resolve_output_dir(requested: Option<String>) -> Result<(PathBuf, Option<temp
     }
 }
 
+// ── Children / comment / label / user-search helpers ───────────────
+
+/// Builds the YAML output for the `confluence_children` tool.
+///
+/// Either `id` or `space` must be set. When `recursive` is true,
+/// descendants are fetched up to `max_depth` (0 = unlimited).
+pub async fn fetch_children_yaml(
+    api: &ConfluenceApi,
+    id: Option<&str>,
+    space: Option<&str>,
+    recursive: bool,
+    max_depth: u32,
+) -> Result<String> {
+    let space_key = space.map(ToString::to_string);
+    let top = fetch_top_level(api, id, space).await?;
+    let mut entries = to_entries(top, space_key.as_deref());
+
+    if recursive {
+        for entry in &mut entries {
+            populate_descendants(api, entry, 1, max_depth, space_key.as_deref()).await?;
+        }
+    }
+
+    to_yaml(&entries)
+}
+
+/// Fetches the top-level list for either a page id or a space key.
+///
+/// `id` takes precedence over `space`. Returns an error if neither is set.
+async fn fetch_top_level(
+    api: &ConfluenceApi,
+    id: Option<&str>,
+    space: Option<&str>,
+) -> Result<Vec<ChildPage>> {
+    if let Some(page_id) = id {
+        return api.get_children(page_id).await;
+    }
+    let space_key = space.context("Provide either `id` or `space`")?;
+    let space_id = api.resolve_space_id(space_key).await?;
+    api.get_space_root_pages(&space_id).await
+}
+
+/// Whether recursion should continue at the given depth.
+fn should_recurse(depth: u32, max_depth: u32) -> bool {
+    max_depth == 0 || depth < max_depth
+}
+
+/// Converts `ChildPage` values into `ChildrenEntry`, filling in a
+/// missing `space_key` from the provided key when present.
+fn to_entries(pages: Vec<ChildPage>, space_key: Option<&str>) -> Vec<ChildrenEntry> {
+    let mut entries = Vec::with_capacity(pages.len());
+    for mut page in pages {
+        if page.space_key.is_none() {
+            page.space_key = space_key.map(str::to_string);
+        }
+        entries.push(ChildrenEntry::from(page));
+    }
+    entries
+}
+
+/// Recursively fetches descendants and populates the `children` field.
+fn populate_descendants<'a>(
+    api: &'a ConfluenceApi,
+    entry: &'a mut ChildrenEntry,
+    depth: u32,
+    max_depth: u32,
+    space_key: Option<&'a str>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        if !should_recurse(depth, max_depth) {
+            return Ok(());
+        }
+        entry.children = to_entries(api.get_children(&entry.id).await?, space_key);
+        for child in &mut entry.children {
+            populate_descendants(api, child, depth + 1, max_depth, space_key).await?;
+        }
+        Ok(())
+    })
+}
+
+/// Builds the YAML output for the `confluence_comment_list` tool.
+///
+/// `limit` of 0 returns every comment; otherwise the list is truncated to
+/// the requested size (matching the CLI `--limit` semantics).
+pub async fn list_comments_yaml(api: &ConfluenceApi, id: &str, limit: usize) -> Result<String> {
+    let mut comments = api.get_page_comments(id).await?;
+    if limit > 0 {
+        comments.truncate(limit);
+    }
+    to_yaml(&comments)
+}
+
+/// Posts a comment to a Confluence page.
+///
+/// The markdown `content` is converted to ADF before posting.
+pub async fn add_comment_result(api: &ConfluenceApi, id: &str, content: &str) -> Result<String> {
+    let adf: AdfDocument = markdown_to_adf(content).context("Failed to convert markdown to ADF")?;
+    api.add_page_comment(id, &adf).await?;
+
+    let result = MutationResult {
+        ok: true,
+        message: format!("Comment added to page {id}."),
+        id,
+        labels: &[],
+    };
+    to_yaml(&result)
+}
+
+/// Builds the YAML output for the `confluence_label_list` tool.
+pub async fn list_labels_yaml(api: &ConfluenceApi, id: &str, limit: usize) -> Result<String> {
+    let mut labels = api.get_labels(id).await?;
+    if limit > 0 {
+        labels.truncate(limit);
+    }
+    to_yaml(&labels)
+}
+
+/// Adds labels to a Confluence page and returns a YAML confirmation.
+pub async fn add_labels_result(api: &ConfluenceApi, id: &str, labels: &[String]) -> Result<String> {
+    if labels.is_empty() {
+        anyhow::bail!("`labels` must contain at least one label");
+    }
+
+    api.add_labels(id, labels).await?;
+    let result = MutationResult {
+        ok: true,
+        message: format!("Added {} label(s) to page {id}.", labels.len()),
+        id,
+        labels,
+    };
+    to_yaml(&result)
+}
+
+/// Removes labels from a Confluence page and returns a YAML confirmation.
+pub async fn remove_labels_result(
+    api: &ConfluenceApi,
+    id: &str,
+    labels: &[String],
+) -> Result<String> {
+    if labels.is_empty() {
+        anyhow::bail!("`labels` must contain at least one label");
+    }
+
+    for label in labels {
+        api.remove_label(id, label).await?;
+    }
+
+    let result = MutationResult {
+        ok: true,
+        message: format!("Removed {} label(s) from page {id}.", labels.len()),
+        id,
+        labels,
+    };
+    to_yaml(&result)
+}
+
+/// Builds the YAML output for the `confluence_user_search` tool.
+///
+/// `limit` of `None` defaults to 25, matching the CLI. A limit of `0`
+/// requests every match.
+pub async fn search_users_yaml(
+    client: &AtlassianClient,
+    query: &str,
+    limit: u32,
+) -> Result<String> {
+    let results = client.search_confluence_users(query, limit).await?;
+    to_yaml(&results)
+}
+
 // ── Tool handlers ────────────────────────────────────────────────────
 
 #[allow(missing_docs)] // #[tool_router] generates a pub `confluence_tool_router` fn.
@@ -355,6 +651,132 @@ impl OmniDevServer {
     ) -> Result<CallToolResult, McpError> {
         let summary = run_confluence_download(params).await.map_err(tool_error)?;
         Ok(CallToolResult::success(vec![Content::text(summary)]))
+    }
+
+    /// Lists children of a Confluence page, or top-level pages in a space,
+    /// with optional recursion.
+    #[tool(
+        description = "List children of a Confluence page, or top-level pages in a space. \
+                       Supports optional recursion with a max depth. Mirrors \
+                       `omni-dev atlassian confluence children`."
+    )]
+    pub async fn confluence_children(
+        &self,
+        Parameters(params): Parameters<ConfluenceChildrenParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _url) = create_client().map_err(tool_error)?;
+        let api = ConfluenceApi::new(client);
+        let yaml = fetch_children_yaml(
+            &api,
+            params.id.as_deref(),
+            params.space.as_deref(),
+            params.recursive.unwrap_or(false),
+            params.max_depth.unwrap_or(0),
+        )
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Lists footer comments on a Confluence page.
+    #[tool(
+        description = "List footer comments on a Confluence page (auto-paginated). \
+                       `limit` of 0 returns every comment. Mirrors \
+                       `omni-dev atlassian confluence comment list`."
+    )]
+    pub async fn confluence_comment_list(
+        &self,
+        Parameters(params): Parameters<ConfluenceCommentListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _url) = create_client().map_err(tool_error)?;
+        let api = ConfluenceApi::new(client);
+        let yaml = list_comments_yaml(&api, &params.id, params.limit.unwrap_or(25))
+            .await
+            .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Posts a comment to a Confluence page.
+    #[tool(
+        description = "Post a markdown comment to a Confluence page. The content is \
+                       converted to ADF before posting. Mirrors \
+                       `omni-dev atlassian confluence comment add`."
+    )]
+    pub async fn confluence_comment_add(
+        &self,
+        Parameters(params): Parameters<ConfluenceCommentAddParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _url) = create_client().map_err(tool_error)?;
+        let api = ConfluenceApi::new(client);
+        let yaml = add_comment_result(&api, &params.id, &params.content)
+            .await
+            .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Lists labels on a Confluence page.
+    #[tool(description = "List labels on a Confluence page (auto-paginated). \
+                       `limit` of 0 returns every label. Mirrors \
+                       `omni-dev atlassian confluence label list`.")]
+    pub async fn confluence_label_list(
+        &self,
+        Parameters(params): Parameters<ConfluenceLabelListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _url) = create_client().map_err(tool_error)?;
+        let api = ConfluenceApi::new(client);
+        let yaml = list_labels_yaml(&api, &params.id, params.limit.unwrap_or(0))
+            .await
+            .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Adds labels to a Confluence page.
+    #[tool(description = "Add one or more labels to a Confluence page. Mirrors \
+                       `omni-dev atlassian confluence label add`.")]
+    pub async fn confluence_label_add(
+        &self,
+        Parameters(params): Parameters<ConfluenceLabelAddParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _url) = create_client().map_err(tool_error)?;
+        let api = ConfluenceApi::new(client);
+        let yaml = add_labels_result(&api, &params.id, &params.labels)
+            .await
+            .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Removes labels from a Confluence page.
+    #[tool(
+        description = "Remove one or more labels from a Confluence page. Mirrors \
+                       `omni-dev atlassian confluence label remove`."
+    )]
+    pub async fn confluence_label_remove(
+        &self,
+        Parameters(params): Parameters<ConfluenceLabelRemoveParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _url) = create_client().map_err(tool_error)?;
+        let api = ConfluenceApi::new(client);
+        let yaml = remove_labels_result(&api, &params.id, &params.labels)
+            .await
+            .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Searches Confluence users by display name or email.
+    #[tool(
+        description = "Search Confluence users by display name or email. `limit` of 0 \
+                       returns every match; defaults to 25. Mirrors \
+                       `omni-dev atlassian confluence user search`."
+    )]
+    pub async fn confluence_user_search(
+        &self,
+        Parameters(params): Parameters<ConfluenceUserSearchParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _url) = create_client().map_err(tool_error)?;
+        let yaml = search_users_yaml(&client, &params.query, params.limit.unwrap_or(25))
+            .await
+            .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
     }
 }
 
@@ -1438,8 +1860,623 @@ mod tests {
             "confluence_write",
             "confluence_delete",
             "confluence_download",
+            "confluence_children",
+            "confluence_comment_list",
+            "confluence_comment_add",
+            "confluence_label_list",
+            "confluence_label_add",
+            "confluence_label_remove",
+            "confluence_user_search",
         ] {
             assert!(router.has_route(name), "missing tool: {name}");
         }
+    }
+
+    // ── Phase 2d: children / comment / label / user-search tests ───
+
+    fn phase2d_mock_client(uri: &str) -> AtlassianClient {
+        AtlassianClient::new(uri, "user@test.com", "token").unwrap()
+    }
+
+    fn phase2d_mock_api(server: &wiremock::MockServer) -> ConfluenceApi {
+        ConfluenceApi::new(phase2d_mock_client(&server.uri()))
+    }
+
+    // ── ChildrenEntry::from ────────────────────────────────────────
+
+    #[test]
+    fn children_entry_from_child_page_copies_fields() {
+        let entry = ChildrenEntry::from(ChildPage {
+            id: "1".to_string(),
+            title: "Page".to_string(),
+            status: "current".to_string(),
+            parent_id: Some("100".to_string()),
+            space_key: Some("ENG".to_string()),
+        });
+        assert_eq!(entry.id, "1");
+        assert_eq!(entry.title, "Page");
+        assert_eq!(entry.status, "current");
+        assert_eq!(entry.parent_id.as_deref(), Some("100"));
+        assert_eq!(entry.space_key.as_deref(), Some("ENG"));
+        assert!(entry.children.is_empty());
+    }
+
+    #[test]
+    fn children_entry_serialize_skips_empty() {
+        let entry = ChildrenEntry {
+            id: "1".to_string(),
+            title: "P".to_string(),
+            status: String::new(),
+            parent_id: None,
+            space_key: None,
+            children: Vec::new(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains("status"));
+        assert!(!json.contains("parent_id"));
+        assert!(!json.contains("space_key"));
+        assert!(!json.contains("children"));
+    }
+
+    // ── should_recurse ─────────────────────────────────────────────
+
+    #[test]
+    fn should_recurse_unlimited_when_max_is_zero() {
+        assert!(should_recurse(1, 0));
+        assert!(should_recurse(100, 0));
+    }
+
+    #[test]
+    fn should_recurse_strictly_less_than_max() {
+        assert!(should_recurse(1, 3));
+        assert!(should_recurse(2, 3));
+        assert!(!should_recurse(3, 3));
+        assert!(!should_recurse(10, 3));
+    }
+
+    // ── to_entries ─────────────────────────────────────────────────
+
+    #[test]
+    fn to_entries_fills_missing_space_key() {
+        let pages = vec![ChildPage {
+            id: "1".to_string(),
+            title: "P".to_string(),
+            status: "current".to_string(),
+            parent_id: None,
+            space_key: None,
+        }];
+        let entries = to_entries(pages, Some("ENG"));
+        assert_eq!(entries[0].space_key.as_deref(), Some("ENG"));
+    }
+
+    #[test]
+    fn to_entries_preserves_existing_space_key() {
+        let pages = vec![ChildPage {
+            id: "1".to_string(),
+            title: "P".to_string(),
+            status: "current".to_string(),
+            parent_id: None,
+            space_key: Some("ORIG".to_string()),
+        }];
+        let entries = to_entries(pages, Some("OTHER"));
+        assert_eq!(entries[0].space_key.as_deref(), Some("ORIG"));
+    }
+
+    #[test]
+    fn to_entries_empty_input() {
+        let entries = to_entries(Vec::new(), Some("ENG"));
+        assert!(entries.is_empty());
+    }
+
+    // ── fetch_children_yaml ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn fetch_children_yaml_requires_target() {
+        let server = wiremock::MockServer::start().await;
+        let api = phase2d_mock_api(&server);
+        let err = fetch_children_yaml(&api, None, None, false, 0)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Provide either"));
+    }
+
+    #[tokio::test]
+    async fn fetch_children_yaml_by_id_non_recursive() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/100/child/page",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {"id": "1", "title": "Alpha", "status": "current"},
+                        {"id": "2", "title": "Beta", "status": "current"}
+                    ]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let yaml = fetch_children_yaml(&phase2d_mock_api(&server), Some("100"), None, false, 0)
+            .await
+            .unwrap();
+        assert!(yaml.contains("Alpha"));
+        assert!(yaml.contains("Beta"));
+    }
+
+    #[tokio::test]
+    async fn fetch_children_yaml_by_space_propagates_space_key() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": [{"id": "77"}]})),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/77/pages"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{"id": "1", "title": "Home", "status": "current"}]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let yaml = fetch_children_yaml(&phase2d_mock_api(&server), None, Some("ENG"), false, 0)
+            .await
+            .unwrap();
+        assert!(yaml.contains("space_key: ENG"));
+    }
+
+    #[tokio::test]
+    async fn fetch_children_yaml_recursive_respects_max_depth() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/1/child/page",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{"id": "2", "title": "Child", "status": "current"}]
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/2/child/page",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let yaml = fetch_children_yaml(&phase2d_mock_api(&server), Some("1"), None, true, 1)
+            .await
+            .unwrap();
+        assert!(yaml.contains("Child"));
+    }
+
+    #[tokio::test]
+    async fn fetch_children_yaml_recursive_walks_tree() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/1/child/page",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{"id": "2", "title": "Mid", "status": "current"}]
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/2/child/page",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{"id": "3", "title": "Leaf", "status": "current"}]
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/3/child/page",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let yaml = fetch_children_yaml(&phase2d_mock_api(&server), Some("1"), None, true, 0)
+            .await
+            .unwrap();
+        assert!(yaml.contains("Mid"));
+        assert!(yaml.contains("Leaf"));
+    }
+
+    #[tokio::test]
+    async fn fetch_children_yaml_api_error_propagates() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/99/child/page",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let err = fetch_children_yaml(&phase2d_mock_api(&server), Some("99"), None, false, 0)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    // ── list_comments_yaml ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_comments_yaml_returns_yaml_sequence() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/footer-comments",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {
+                            "id": "c1",
+                            "version": {"authorId": "alice", "createdAt": "2026-04-01T10:00:00Z"}
+                        }
+                    ]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let yaml = list_comments_yaml(&phase2d_mock_api(&server), "12345", 25)
+            .await
+            .unwrap();
+        assert!(yaml.contains("id: c1"));
+        assert!(yaml.contains("alice"));
+    }
+
+    #[tokio::test]
+    async fn list_comments_yaml_unlimited_when_limit_zero() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/footer-comments",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {"id": "c1", "version": {"authorId": "a", "createdAt": "t"}},
+                        {"id": "c2", "version": {"authorId": "b", "createdAt": "t"}}
+                    ]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let yaml = list_comments_yaml(&phase2d_mock_api(&server), "12345", 0)
+            .await
+            .unwrap();
+        assert!(yaml.contains("id: c1"));
+        assert!(yaml.contains("id: c2"));
+    }
+
+    #[tokio::test]
+    async fn list_comments_yaml_truncates_to_limit() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/footer-comments",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {"id": "c1", "version": {"authorId": "a", "createdAt": "t"}},
+                        {"id": "c2", "version": {"authorId": "b", "createdAt": "t"}},
+                        {"id": "c3", "version": {"authorId": "c", "createdAt": "t"}}
+                    ]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let yaml = list_comments_yaml(&phase2d_mock_api(&server), "12345", 1)
+            .await
+            .unwrap();
+        assert!(yaml.contains("id: c1"));
+        assert!(!yaml.contains("id: c2"));
+    }
+
+    #[tokio::test]
+    async fn list_comments_yaml_api_error_propagates() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/99/footer-comments",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let err = list_comments_yaml(&phase2d_mock_api(&server), "99", 25)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    // ── add_comment_result ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn add_comment_result_converts_markdown_and_posts() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/wiki/api/v2/footer-comments"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "c9"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let yaml = add_comment_result(&phase2d_mock_api(&server), "12345", "Hello **world**")
+            .await
+            .unwrap();
+        assert!(yaml.contains("ok: true"));
+        assert!(yaml.contains("id: '12345'") || yaml.contains("id: \"12345\""));
+        assert!(yaml.contains("Comment added"));
+    }
+
+    #[tokio::test]
+    async fn add_comment_result_api_error_propagates() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/wiki/api/v2/footer-comments"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        let err = add_comment_result(&phase2d_mock_api(&server), "12345", "hello")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    // ── list_labels_yaml ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_labels_yaml_returns_yaml_sequence() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12345/labels"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {"id": "1", "name": "architecture", "prefix": "global"},
+                        {"id": "2", "name": "draft", "prefix": "global"}
+                    ]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let yaml = list_labels_yaml(&phase2d_mock_api(&server), "12345", 0)
+            .await
+            .unwrap();
+        assert!(yaml.contains("architecture"));
+        assert!(yaml.contains("draft"));
+    }
+
+    #[tokio::test]
+    async fn list_labels_yaml_respects_limit() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12345/labels"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {"id": "1", "name": "architecture", "prefix": "global"},
+                        {"id": "2", "name": "draft", "prefix": "global"}
+                    ]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let yaml = list_labels_yaml(&phase2d_mock_api(&server), "12345", 1)
+            .await
+            .unwrap();
+        assert!(yaml.contains("architecture"));
+        assert!(!yaml.contains("draft"));
+    }
+
+    #[tokio::test]
+    async fn list_labels_yaml_api_error_propagates() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/404/labels"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let err = list_labels_yaml(&phase2d_mock_api(&server), "404", 0)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    // ── add_labels_result ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn add_labels_result_posts_and_returns_confirmation() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/label",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{"prefix": "global", "name": "arch", "id": "1"}]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let yaml = add_labels_result(&phase2d_mock_api(&server), "12345", &["arch".to_string()])
+            .await
+            .unwrap();
+        assert!(yaml.contains("ok: true"));
+        assert!(yaml.contains("arch"));
+        assert!(yaml.contains("Added 1 label"));
+    }
+
+    #[tokio::test]
+    async fn add_labels_result_rejects_empty_labels() {
+        let server = wiremock::MockServer::start().await;
+        let err = add_labels_result(&phase2d_mock_api(&server), "12345", &[])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("at least one label"));
+    }
+
+    #[tokio::test]
+    async fn add_labels_result_api_error_propagates() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/label",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("Bad Request"))
+            .mount(&server)
+            .await;
+
+        let err = add_labels_result(&phase2d_mock_api(&server), "12345", &["x".to_string()])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("400"));
+    }
+
+    // ── remove_labels_result ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn remove_labels_result_deletes_each_label() {
+        let server = wiremock::MockServer::start().await;
+        for label in &["draft", "old"] {
+            wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+                .and(wiremock::matchers::path(format!(
+                    "/wiki/rest/api/content/12345/label/{label}"
+                )))
+                .respond_with(wiremock::ResponseTemplate::new(204))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let yaml = remove_labels_result(
+            &phase2d_mock_api(&server),
+            "12345",
+            &["draft".to_string(), "old".to_string()],
+        )
+        .await
+        .unwrap();
+        assert!(yaml.contains("ok: true"));
+        assert!(yaml.contains("Removed 2 label"));
+    }
+
+    #[tokio::test]
+    async fn remove_labels_result_rejects_empty_labels() {
+        let server = wiremock::MockServer::start().await;
+        let err = remove_labels_result(&phase2d_mock_api(&server), "12345", &[])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("at least one label"));
+    }
+
+    #[tokio::test]
+    async fn remove_labels_result_api_error_propagates() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/label/draft",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        let err = remove_labels_result(&phase2d_mock_api(&server), "12345", &["draft".to_string()])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    // ── search_users_yaml ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn search_users_yaml_returns_users() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/search/user"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {"user": {"accountId": "abc", "displayName": "Alice", "email": "a@x.com"}}
+                    ]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let yaml = search_users_yaml(&phase2d_mock_client(&server.uri()), "alice", 25)
+            .await
+            .unwrap();
+        assert!(yaml.contains("Alice"));
+        assert!(yaml.contains("abc"));
+    }
+
+    #[tokio::test]
+    async fn search_users_yaml_empty_results() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/search/user"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let yaml = search_users_yaml(&phase2d_mock_client(&server.uri()), "nobody", 10)
+            .await
+            .unwrap();
+        assert!(yaml.contains("total: 0"));
+    }
+
+    #[tokio::test]
+    async fn search_users_yaml_api_error_propagates() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/search/user"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        let err = search_users_yaml(&phase2d_mock_client(&server.uri()), "alice", 25)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("403"));
     }
 }
