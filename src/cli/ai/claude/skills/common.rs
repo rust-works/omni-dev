@@ -25,7 +25,7 @@ pub(super) const BLOCK_END: &str = "# END omni-dev-skills";
 /// Output format shared by `sync`, `clean`, and `status`.
 #[derive(ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum OutputFormat {
+pub enum OutputFormat {
     /// Human-readable lines, one per action.
     #[default]
     Text,
