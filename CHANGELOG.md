@@ -7,8 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-04-22
+
 ### Added
 - **MCP Server (Foundation)** ([#575](https://github.com/rust-works/omni-dev/issues/575)): New `omni-dev-mcp` binary exposes omni-dev's git analysis as MCP tools for AI assistants (Claude Desktop, Claude Code). Gated behind the `mcp` Cargo feature so default builds are unaffected. Initial tool: `git_view_commits`. See [ADR-0021](docs/adrs/adr-0021.md) for the architectural rationale.
+- **MCP Resource System** ([#606](https://github.com/rust-works/omni-dev/issues/606)): Content is now addressable over MCP via three URI schemes — `git://repo/commits/{range}`, `jira://issue/{key}[.adf]`, and `confluence://page/{id}[.adf]` — so AI clients can fetch commits, JIRA issues, and Confluence pages as MCP resources without issuing tool calls. Resource templates, listings, and reads are advertised through the server's `resources` capability. JIRA and Confluence resources return JFM markdown by default or raw ADF JSON when the URI ends in `.adf`. See `STYLE-0026` in [docs/STYLE_GUIDE.md](docs/STYLE_GUIDE.md) for MCP tool/resource authoring conventions.
+- **JIRA Custom Field Read** ([#594](https://github.com/rust-works/omni-dev/issues/594)): `jira read` accepts `--fields <name>` (repeatable) and `--all-fields` to request custom fields alongside the default set. Scalar custom fields are rendered into the frontmatter `custom_fields:` map; ADF rich-text custom fields are rendered as tagged body sections (`<!-- field: Name (id) -->`) in the JFM document
+- **JIRA Custom Field Write** ([#594](https://github.com/rust-works/omni-dev/issues/594)): `jira write` and `jira create` now support writing custom fields. Frontmatter `custom_fields:` entries and body sections delimited by `<!-- field: Name (id) -->` are resolved through `/editmeta` (write) and `/createmeta` (create), dispatching by schema type (option, radio, array, textfield, number, date, and rich-text ADF). A new `--set-field NAME=VALUE` CLI flag allows inline overrides; CLI values take precedence over frontmatter scalars for the same name. Rejected when combined with `--format adf`
 - **MCP Tool: `git_branch_info`** ([#600](https://github.com/rust-works/omni-dev/issues/600)): Mirrors `omni-dev git branch info`. Returns repository information as YAML for commits between a base branch and `HEAD`.
 - **MCP Tool: `git_check_commits`** ([#600](https://github.com/rust-works/omni-dev/issues/600)): Mirrors `omni-dev git commit message check`. Returns the full check report plus pass/fail summary and exit code (honouring `strict`) as a structured payload so the assistant can act on validation failures without parsing exit codes.
 - **MCP Tool: `git_twiddle_commits`** ([#600](https://github.com/rust-works/omni-dev/issues/600)): Mirrors `omni-dev git commit message twiddle --auto-apply`. Forces non-interactive semantics — never starts an editor. Accepts a `dry_run` flag that returns the proposed amendments as YAML without applying them.
@@ -842,7 +847,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation and community files (README, CONTRIBUTING, CODE_OF_CONDUCT)
 - BSD 3-Clause license
 
-[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.23.0...HEAD
+[0.23.0]: https://github.com/rust-works/omni-dev/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/rust-works/omni-dev/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/rust-works/omni-dev/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/rust-works/omni-dev/compare/v0.19.0...v0.20.0
