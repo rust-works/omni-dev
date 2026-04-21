@@ -26,7 +26,7 @@ impl OmniDevServer {
     /// Constructs a new server with all tool routers combined.
     pub fn new() -> Self {
         Self {
-            tool_router: Self::git_tool_router(),
+            tool_router: Self::git_tool_router() + Self::jira_tool_router(),
         }
     }
 }
@@ -71,6 +71,35 @@ mod tests {
         let server = OmniDevServer::new();
         let tools = server.tool_router.list_all();
         assert!(tools.iter().any(|t| t.name.as_ref() == "git_view_commits"));
+    }
+
+    #[test]
+    fn tool_router_registers_all_jira_extension_tools() {
+        let server = OmniDevServer::new();
+        let expected = [
+            "jira_attachment_download",
+            "jira_attachment_images",
+            "jira_board_list",
+            "jira_board_issues",
+            "jira_changelog",
+            "jira_delete",
+            "jira_field_list",
+            "jira_field_options",
+            "jira_project_list",
+            "jira_sprint_list",
+            "jira_sprint_issues",
+            "jira_sprint_add",
+            "jira_sprint_create",
+            "jira_sprint_update",
+            "jira_watcher_list",
+            "jira_watcher_add",
+            "jira_watcher_remove",
+            "jira_worklog_list",
+            "jira_worklog_add",
+        ];
+        for name in expected {
+            assert!(server.tool_router.has_route(name), "missing route: {name}");
+        }
     }
 
     #[test]
