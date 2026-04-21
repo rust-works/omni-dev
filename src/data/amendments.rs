@@ -338,7 +338,8 @@ mod tests {
             fn roundtrip_save_load(
                 count in 1_usize..5,
             ) {
-                let dir = { std::fs::create_dir_all("tmp").ok(); tempfile::TempDir::new_in("tmp").unwrap() };
+                let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
+                let dir = { std::fs::create_dir_all(&tmp_root).ok(); tempfile::TempDir::new_in(&tmp_root).unwrap() };
                 let path = dir.path().join("amendments.yaml");
                 let amendments: Vec<Amendment> = (0..count)
                     .map(|i| {

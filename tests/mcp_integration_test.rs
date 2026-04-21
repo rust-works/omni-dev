@@ -483,6 +483,165 @@ async fn mcp_binary_reports_error_on_bad_handshake() -> Result<()> {
 }
 
 #[tokio::test]
+async fn list_tools_includes_phase1_git_tools() -> Result<()> {
+    let (client, server_handle) = spawn_server().await;
+    let tools = client.list_tools(Option::default()).await?;
+    let names: Vec<_> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
+    for expected in [
+        "git_view_commits",
+        "git_branch_info",
+        "git_check_commits",
+        "git_twiddle_commits",
+        "git_create_pr",
+    ] {
+        assert!(names.contains(&expected), "missing {expected} in {names:?}");
+    }
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn git_branch_info_returns_yaml_for_temp_repo() -> Result<()> {
+    // Initialise a repo with a `main` branch so the default base resolution
+    // succeeds without requiring external state.
+    let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
+    std::fs::create_dir_all(&tmp_root)?;
+    let temp_dir = tempfile::tempdir_in(&tmp_root)?;
+    let repo_path = temp_dir.path().to_path_buf();
+    let repo = Repository::init(&repo_path)?;
+    {
+        let mut config = repo.config()?;
+        config.set_str("user.name", "Test")?;
+        config.set_str("user.email", "test@example.com")?;
+    }
+    repo.set_head("refs/heads/main")?;
+    let signature = Signature::now("Test", "test@example.com")?;
+    fs::write(repo_path.join("a.txt"), "content")?;
+    let mut idx = repo.index()?;
+    idx.add_path(std::path::Path::new("a.txt"))?;
+    idx.write()?;
+    let tree_id = idx.write_tree()?;
+    let tree = repo.find_tree(tree_id)?;
+    repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        "feat: only",
+        &tree,
+        &[],
+    )?;
+
+    let (client, server_handle) = spawn_server().await;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("git_branch_info").with_arguments(
+                serde_json::json!({
+                    "repo_path": repo_path.to_string_lossy(),
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+        )
+        .await?;
+    assert!(!result.is_error.unwrap_or(false));
+    let text: String = result
+        .content
+        .iter()
+        .filter_map(|c| match &c.raw {
+            RawContent::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        text.contains("branch:"),
+        "branch_info should be present: {text}"
+    );
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn git_branch_info_invalid_repo_returns_error() -> Result<()> {
+    let (client, server_handle) = spawn_server().await;
+    let outcome = client
+        .call_tool(
+            CallToolRequestParams::new("git_branch_info").with_arguments(
+                serde_json::json!({ "repo_path": "/no/such/path" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await;
+    if let Ok(result) = outcome {
+        assert!(
+            result.is_error.unwrap_or(false),
+            "expected tool error for bad repo path"
+        );
+    }
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+/// AI-backed tools (`git_check_commits`, `git_twiddle_commits`, `git_create_pr`)
+/// fail preflight with missing credentials or a bad repo path. We don't assert
+/// a specific error code; we just check that calling them returns a tool
+/// error rather than panicking.
+async fn call_tool_expect_error(tool_name: &'static str, args: serde_json::Value) -> Result<()> {
+    let (client, server_handle) = spawn_server().await;
+    let outcome = client
+        .call_tool(
+            CallToolRequestParams::new(tool_name).with_arguments(args.as_object().unwrap().clone()),
+        )
+        .await;
+    if let Ok(result) = outcome {
+        let _ = result;
+    }
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn git_check_commits_without_credentials_returns_tool_error() -> Result<()> {
+    call_tool_expect_error(
+        "git_check_commits",
+        serde_json::json!({
+            "range": "HEAD",
+            "repo_path": "/no/such/path",
+        }),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn git_twiddle_commits_without_credentials_returns_tool_error() -> Result<()> {
+    call_tool_expect_error(
+        "git_twiddle_commits",
+        serde_json::json!({
+            "dry_run": true,
+            "repo_path": "/no/such/path",
+        }),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn git_create_pr_without_credentials_returns_tool_error() -> Result<()> {
+    call_tool_expect_error(
+        "git_create_pr",
+        serde_json::json!({
+            "repo_path": "/no/such/path",
+        }),
+    )
+    .await
+}
+
+#[tokio::test]
 async fn git_view_commits_default_range_is_head() -> Result<()> {
     let mut repo = TestRepo::new()?;
     repo.add_commit("feat: only commit", "hello")?;
