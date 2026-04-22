@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Datadog Integration — Scaffold & Auth** ([#619](https://github.com/rust-works/omni-dev/issues/619)): New `omni-dev datadog` command tree exposing read-only Datadog API access. This first slice ships the authentication surface: `datadog auth login` (interactive credential prompt), `datadog auth logout` (removes credentials from `~/.omni-dev/settings.json`), and `datadog auth status` (verifies credentials via `/api/v1/validate`). Credentials live in the shared `env` map under `DATADOG_API_KEY`, `DATADOG_APP_KEY`, and `DATADOG_SITE`; environment variables override stored settings. The underlying `DatadogClient` in `src/datadog/client.rs` handles 429 responses with `Retry-After` and Datadog-specific `X-RateLimit-Reset` awareness, and surfaces `X-RateLimit-*` headers in error output when retries are exhausted. No new crate dependencies.
+
 ## [0.23.1] - 2026-04-23
 
 ### Fixed
