@@ -127,6 +127,17 @@ The project includes a comprehensive model registry system:
 - **Configuration Commands**: Use `omni-dev config models show` to view available models
 - **Dynamic Limits**: Token limits are automatically applied based on model specifications
 
+### AI Backend Dispatch
+Backends are selected inside `src/claude/client.rs::create_default_claude_client` in this order:
+
+1. `OMNI_DEV_AI_BACKEND=claude-cli` (or `--ai-backend claude-cli`) → `ClaudeCliAiClient` in `src/claude/ai/claude_cli.rs`. Shells out to `claude -p` in a locked-down sandbox (tools disabled, MCP blocked, settings skipped, fresh temp cwd, scrubbed env). Uses JSON output format and parses the `is_error`/`api_error_status`/`result` envelope. `--beta-header` is ignored for this backend.
+2. `USE_OLLAMA=true` → `OpenAiAiClient::new_ollama`.
+3. `USE_OPENAI=true` → `OpenAiAiClient::new_openai`.
+4. `CLAUDE_CODE_USE_BEDROCK=true` → `BedrockAiClient`.
+5. Default → `ClaudeAiClient` (direct Anthropic API).
+
+Preflight (`src/utils/preflight.rs`) mirrors this switch and must change in lock-step when adding backends.
+
 ### Skill Structure
 Claude skills are organized in `.claude/skills/`, one subdirectory per skill with a `SKILL.md` file.
 

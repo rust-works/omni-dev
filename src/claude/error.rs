@@ -44,6 +44,32 @@ pub enum ClaudeError {
     /// Network connectivity error.
     #[error("Network error: {0}")]
     NetworkError(String),
+
+    /// Required subprocess binary is missing from PATH.
+    #[error("Subprocess binary not found: {0}")]
+    SubprocessBinaryMissing(String),
+
+    /// Failed to spawn a subprocess.
+    #[error("Failed to spawn subprocess: {0}")]
+    SubprocessSpawnFailed(String),
+
+    /// Subprocess exceeded the configured timeout.
+    #[error("Subprocess timed out after {secs} seconds")]
+    SubprocessTimeout {
+        /// Timeout that was exceeded, in seconds.
+        secs: u64,
+    },
+
+    /// Subprocess produced more output than the configured cap.
+    #[error("Subprocess output exceeded limit of {limit} bytes")]
+    SubprocessOutputTooLarge {
+        /// Configured stdout cap in bytes.
+        limit: usize,
+    },
+
+    /// Subprocess stdout was not valid JSON.
+    #[error("Subprocess produced invalid JSON output: {0}")]
+    SubprocessJsonParseFailed(String),
 }
 
 // Note: anyhow already has a blanket impl for thiserror::Error types
