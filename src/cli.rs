@@ -34,6 +34,19 @@ pub struct Cli {
     #[arg(long, global = true, value_enum)]
     pub ai_backend: Option<AiBackend>,
 
+    /// Weakens the `claude-cli` sandbox by allowing the nested `claude -p`
+    /// session to use its default tool set (Read/Edit/Write/Bash/Glob/Grep
+    /// and any user-level MCP servers).
+    ///
+    /// **Only use for deliberately tool-capable use cases.** By default the
+    /// nested session runs with `--tools ""` and cannot touch the
+    /// file system. This flag removes that guard. Equivalent to setting
+    /// `OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS=true`.
+    ///
+    /// Ignored when `--ai-backend` is not `claude-cli`.
+    #[arg(long, global = true)]
+    pub claude_cli_allow_tools: bool,
+
     /// The main command to execute.
     #[command(subcommand)]
     pub command: Commands,
@@ -70,6 +83,10 @@ impl Cli {
             }
         }
 
+        if self.claude_cli_allow_tools {
+            std::env::set_var("OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS", "true");
+        }
+
         match self.command {
             Commands::Ai(ai_cmd) => ai_cmd.execute().await,
             Commands::Git(git_cmd) => git_cmd.execute().await,
@@ -78,5 +95,54 @@ impl Cli {
             Commands::Config(config_cmd) => config_cmd.execute(),
             Commands::HelpAll(help_cmd) => help_cmd.execute(),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_ai_backend_claude_cli() {
+        let cli =
+            Cli::try_parse_from(["omni-dev", "--ai-backend", "claude-cli", "help-all"]).unwrap();
+        assert!(matches!(cli.ai_backend, Some(AiBackend::ClaudeCli)));
+        assert!(!cli.claude_cli_allow_tools);
+    }
+
+    #[test]
+    fn parses_ai_backend_default() {
+        let cli = Cli::try_parse_from(["omni-dev", "--ai-backend", "default", "help-all"]).unwrap();
+        assert!(matches!(cli.ai_backend, Some(AiBackend::Default)));
+    }
+
+    #[test]
+    fn parses_ai_backend_absent() {
+        let cli = Cli::try_parse_from(["omni-dev", "help-all"]).unwrap();
+        assert!(cli.ai_backend.is_none());
+        assert!(!cli.claude_cli_allow_tools);
+    }
+
+    #[test]
+    fn parses_claude_cli_allow_tools_flag() {
+        let cli =
+            Cli::try_parse_from(["omni-dev", "--claude-cli-allow-tools", "help-all"]).unwrap();
+        assert!(cli.claude_cli_allow_tools);
+    }
+
+    #[test]
+    fn global_flags_accepted_after_subcommand() {
+        // clap global = true allows the flag before or after the subcommand.
+        let cli = Cli::try_parse_from([
+            "omni-dev",
+            "help-all",
+            "--ai-backend",
+            "claude-cli",
+            "--claude-cli-allow-tools",
+        ])
+        .unwrap();
+        assert!(matches!(cli.ai_backend, Some(AiBackend::ClaudeCli)));
+        assert!(cli.claude_cli_allow_tools);
     }
 }

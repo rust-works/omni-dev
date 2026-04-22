@@ -19,6 +19,7 @@ Commands:
 
 Options:
       --ai-backend <AI_BACKEND>  Selects the AI backend used by commands that invoke an AI model [possible values: default, claude-cli]
+      --claude-cli-allow-tools   Weakens the `claude-cli` sandbox by allowing the nested `claude -p` session to use its default tool set (Read/Edit/Write/Bash/Glob/Grep and any user-level MCP servers)
   -h, --help                     Print help (see more with '--help')
   -V, --version                  Print version
 
