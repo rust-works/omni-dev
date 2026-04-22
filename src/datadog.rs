@@ -9,3 +9,6 @@ pub mod client;
 pub mod error;
 pub mod time;
 pub mod types;
+
+#[cfg(test)]
+pub(crate) mod test_support;

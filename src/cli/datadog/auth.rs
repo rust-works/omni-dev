@@ -47,37 +47,43 @@ impl LoginCommand {
     /// Prompts the user for credentials and saves them.
     pub fn execute(self) -> Result<()> {
         println!("Configure Datadog API credentials\n");
-
         let api_key = prompt("API key: ")?;
-        if api_key.is_empty() {
-            anyhow::bail!("API key is required");
-        }
-
         let app_key = prompt("Application key: ")?;
-        if app_key.is_empty() {
-            anyhow::bail!("Application key is required");
-        }
-
         let site_raw = prompt(&format!("Site [default: {DEFAULT_SITE}]: "))?;
-        let site = if site_raw.is_empty() {
-            DEFAULT_SITE.to_string()
-        } else {
-            auth::normalize_site(&site_raw)
-        };
-
-        let credentials = DatadogCredentials {
-            api_key,
-            app_key,
-            site: site.clone(),
-        };
-
-        auth::save_credentials(&credentials)?;
-        println!("\nCredentials saved to ~/.omni-dev/settings.json");
-        println!("  Site: {site}");
-        println!("\nRun `omni-dev datadog auth status` to verify.");
-
-        Ok(())
+        run_login(&api_key, &app_key, &site_raw)
     }
+}
+
+/// Validates credentials and persists them to `~/.omni-dev/settings.json`.
+///
+/// Extracted from [`LoginCommand::execute`] so the input-validation and
+/// site-normalisation branches are reachable from tests without mocking
+/// stdin.
+fn run_login(api_key: &str, app_key: &str, site_raw: &str) -> Result<()> {
+    if api_key.is_empty() {
+        anyhow::bail!("API key is required");
+    }
+    if app_key.is_empty() {
+        anyhow::bail!("Application key is required");
+    }
+    let site = if site_raw.is_empty() {
+        DEFAULT_SITE.to_string()
+    } else {
+        auth::normalize_site(site_raw)
+    };
+
+    let credentials = DatadogCredentials {
+        api_key: api_key.to_string(),
+        app_key: app_key.to_string(),
+        site: site.clone(),
+    };
+
+    auth::save_credentials(&credentials)?;
+    println!("\nCredentials saved to ~/.omni-dev/settings.json");
+    println!("  Site: {site}");
+    println!("\nRun `omni-dev datadog auth status` to verify.");
+
+    Ok(())
 }
 
 /// Removes Datadog API credentials.
@@ -161,7 +167,11 @@ fn prompt(message: &str) -> Result<String> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use std::fs;
+
     use super::*;
+    use crate::datadog::auth::{DATADOG_API_KEY, DATADOG_APP_KEY, DATADOG_SITE};
+    use crate::datadog::test_support::{with_empty_home, EnvGuard};
 
     #[test]
     fn auth_command_login_dispatch() {
@@ -191,6 +201,97 @@ mod tests {
 
     fn mock_client(base_url: &str) -> DatadogClient {
         DatadogClient::new(base_url, "api", "app").unwrap()
+    }
+
+    // ── run_login ──────────────────────────────────────────────────
+
+    #[test]
+    fn run_login_rejects_empty_api_key() {
+        let err = run_login("", "app", "").unwrap_err();
+        assert!(err.to_string().contains("API key"));
+    }
+
+    #[test]
+    fn run_login_rejects_empty_app_key() {
+        let err = run_login("api", "", "").unwrap_err();
+        assert!(err.to_string().contains("Application key"));
+    }
+
+    #[test]
+    fn run_login_defaults_site_when_blank_and_persists() {
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+
+        run_login("api-1", "app-1", "").unwrap();
+
+        let content =
+            fs::read_to_string(dir.path().join(".omni-dev").join("settings.json")).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(val["env"]["DATADOG_API_KEY"], "api-1");
+        assert_eq!(val["env"]["DATADOG_APP_KEY"], "app-1");
+        assert_eq!(val["env"]["DATADOG_SITE"], DEFAULT_SITE);
+    }
+
+    #[test]
+    fn run_login_normalises_provided_site() {
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+
+        run_login("api", "app", "https://api.us5.datadoghq.com/").unwrap();
+
+        let content =
+            fs::read_to_string(dir.path().join(".omni-dev").join("settings.json")).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(val["env"]["DATADOG_SITE"], "us5.datadoghq.com");
+    }
+
+    // ── LogoutCommand::execute ────────────────────────────────────
+
+    #[test]
+    fn logout_command_removes_credentials_when_present() {
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        let omni_dir = dir.path().join(".omni-dev");
+        fs::create_dir_all(&omni_dir).unwrap();
+        fs::write(
+            omni_dir.join("settings.json"),
+            r#"{"env": {
+                "DATADOG_API_KEY": "a",
+                "DATADOG_APP_KEY": "b",
+                "DATADOG_SITE": "datadoghq.com",
+                "OTHER": "keep"
+            }}"#,
+        )
+        .unwrap();
+
+        LogoutCommand.execute().unwrap();
+
+        let val: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(omni_dir.join("settings.json")).unwrap())
+                .unwrap();
+        assert!(val["env"].get(DATADOG_API_KEY).is_none());
+        assert!(val["env"].get(DATADOG_APP_KEY).is_none());
+        assert!(val["env"].get(DATADOG_SITE).is_none());
+        assert_eq!(val["env"]["OTHER"], "keep");
+    }
+
+    #[test]
+    fn logout_command_is_idempotent_when_no_credentials() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        LogoutCommand.execute().unwrap();
+    }
+
+    // ── AuthCommand::execute dispatch ─────────────────────────────
+
+    #[tokio::test]
+    async fn auth_command_dispatches_logout() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        let cmd = AuthCommand {
+            command: AuthSubcommands::Logout(LogoutCommand),
+        };
+        cmd.execute().await.unwrap();
     }
 
     #[tokio::test]

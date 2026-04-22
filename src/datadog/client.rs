@@ -23,6 +23,7 @@ const MAX_RETRIES: u32 = 3;
 const DEFAULT_RETRY_DELAY_SECS: u64 = 2;
 
 /// HTTP client for Datadog REST APIs.
+#[derive(Debug)]
 pub struct DatadogClient {
     client: Client,
     base_url: String,

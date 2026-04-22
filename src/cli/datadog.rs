@@ -32,8 +32,10 @@ impl DatadogCommand {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::datadog::test_support::{with_empty_home, EnvGuard};
 
     #[test]
     fn datadog_subcommands_auth_variant() {
@@ -43,5 +45,17 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, DatadogSubcommands::Auth(_)));
+    }
+
+    #[tokio::test]
+    async fn datadog_command_dispatches_auth_logout() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Auth(auth::AuthCommand {
+                command: auth::AuthSubcommands::Logout(auth::LogoutCommand),
+            }),
+        };
+        cmd.execute().await.unwrap();
     }
 }
