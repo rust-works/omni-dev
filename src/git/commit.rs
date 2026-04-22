@@ -709,7 +709,7 @@ impl CommitInfoForAI {
 
                 // Deterministic scope validity check
                 if !valid_scopes.is_empty() {
-                    let scope_parts: Vec<&str> = scope.split(',').collect();
+                    let scope_parts: Vec<&str> = scope.split(',').map(str::trim).collect();
                     let all_valid = scope_parts
                         .iter()
                         .all(|part| valid_scopes.iter().any(|s| s.name == *part));
@@ -1273,6 +1273,23 @@ mod tests {
             .pre_validated_checks
             .iter()
             .any(|c| c.contains("multi-scope")),);
+    }
+
+    #[test]
+    fn pre_validation_multi_scope_with_spaces() {
+        let scopes = vec![
+            make_scope_def("cli", &["src/cli/**"]),
+            make_scope_def("lib", &["src/lib/**"]),
+        ];
+        let mut info = make_commit_info_for_ai("feat(cli, lib): add something");
+        info.run_pre_validation_checks(&scopes);
+        assert!(
+            info.pre_validated_checks
+                .iter()
+                .any(|c| c.contains("Scope validity verified")),
+            "expected scope validity check for spaced multi-scope, got: {:?}",
+            info.pre_validated_checks
+        );
     }
 
     #[test]
