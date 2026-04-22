@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.1] - 2026-04-23
+
+### Fixed
+- **AI Issue Output Field Order** ([#627](https://github.com/rust-works/omni-dev/issues/627)): Require the `reasoning` field to appear before `severity` in AI-generated issue output. The prompt now instructs the model to write `reasoning` before `severity`, and the deserializer rejects payloads whose field order is reversed so that callers see a clear parse error rather than silently accepting malformed output
+- **Multi-Scope Whitespace Trimming** ([#626](https://github.com/rust-works/omni-dev/issues/626)): `feat(a, b): …` style multi-scope subjects are now valid. Scope validation trims whitespace around each comma-separated part before checking allowed scopes, so spaces after commas no longer cause spurious validation failures
+
+### Security
+- **RUSTSEC-2026-0104** ([#623](https://github.com/rust-works/omni-dev/pull/623)): Bump `rustls-webpki` to 0.103.13 to address RUSTSEC-2026-0104
+
+### Documentation
+- **Worktree Convention** ([#622](https://github.com/rust-works/omni-dev/pull/622)): Document the project convention that new git worktrees live under `.work/` (gitignored) so worktrees stay scoped to the project rather than scattered across sibling directories
+
 ## [0.23.0] - 2026-04-22
 
 ### Added
@@ -847,7 +859,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation and community files (README, CONTRIBUTING, CODE_OF_CONDUCT)
 - BSD 3-Clause license
 
-[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.23.0...HEAD
+[Unreleased]: https://github.com/rust-works/omni-dev/compare/v0.23.1...HEAD
+[0.23.1]: https://github.com/rust-works/omni-dev/compare/v0.23.0...v0.23.1
 [0.23.0]: https://github.com/rust-works/omni-dev/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/rust-works/omni-dev/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/rust-works/omni-dev/compare/v0.20.0...v0.21.0
