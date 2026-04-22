@@ -137,6 +137,9 @@ Common git operations in this project:
 - `git branch -r --contains <commit>` - Check remote branch containment
 - `git status --porcelain` - Get working directory status
 
+### Git Worktrees
+New git worktrees should be created in the `.work/` directory of the current project (e.g., `git worktree add .work/<branch-name> <branch-name>`). The `.work/` directory is gitignored and keeps worktrees scoped to the project rather than scattered across sibling directories.
+
 ## Testing Approach
 
 ### Test Types
