@@ -50,3 +50,6 @@ lcov.info
 
 # ASCII Cinema demo files (temporary)
 cinema/
+
+# Git worktrees
+/.work/
