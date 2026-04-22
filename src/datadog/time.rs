@@ -62,11 +62,7 @@ pub fn parse_time_range(from: &str, to: Option<&str>) -> Result<(i64, i64), Data
 /// Parses `{N}{unit}` shorthand. Returns the number of seconds it represents,
 /// or `None` if the input does not match the shorthand grammar.
 fn parse_relative(spec: &str) -> Option<u64> {
-    let bytes = spec.as_bytes();
-    if bytes.is_empty() {
-        return None;
-    }
-    let unit_byte = *bytes.last()?;
+    let unit_byte = *spec.as_bytes().last()?;
     let unit_seconds: u64 = match unit_byte {
         b's' => 1,
         b'm' => 60,

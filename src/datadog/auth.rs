@@ -318,57 +318,7 @@ mod tests {
 
     // ── Tests that mutate process-wide env ────────────────────────────
 
-    /// Mutex shared by every test that mutates `HOME` and the Datadog
-    /// credential env vars. Serialises those tests against each other so
-    /// parallel execution doesn't race on process-wide env state.
-    static AUTH_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// RAII guard: snapshots `HOME` + every Datadog credential env var on
-    /// construction and restores them on drop.
-    struct EnvGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        snapshot: Vec<(&'static str, Option<String>)>,
-    }
-
-    impl EnvGuard {
-        fn take() -> Self {
-            let lock = AUTH_ENV_MUTEX
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let keys = ["HOME", DATADOG_API_KEY, DATADOG_APP_KEY, DATADOG_SITE];
-            let snapshot = keys
-                .into_iter()
-                .map(|k| (k, std::env::var(k).ok()))
-                .collect();
-            Self {
-                _lock: lock,
-                snapshot,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (k, v) in &self.snapshot {
-                match v {
-                    Some(val) => std::env::set_var(k, val),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
-    }
-
-    fn with_empty_home(_guard: &EnvGuard) -> tempfile::TempDir {
-        let dir = {
-            std::fs::create_dir_all("tmp").ok();
-            tempfile::TempDir::new_in("tmp").unwrap()
-        };
-        std::env::set_var("HOME", dir.path());
-        std::env::remove_var(DATADOG_API_KEY);
-        std::env::remove_var(DATADOG_APP_KEY);
-        std::env::remove_var(DATADOG_SITE);
-        dir
-    }
+    use crate::datadog::test_support::{with_empty_home, EnvGuard};
 
     #[test]
     fn status_reports_all_false_when_nothing_configured() {
