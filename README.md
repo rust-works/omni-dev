@@ -475,6 +475,60 @@ We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.
   - Configure with: `omni-dev atlassian auth login`
 - **Git**: Any modern version
 
+### AI backend selection
+
+By default, `omni-dev` calls the Anthropic API (or Bedrock/OpenAI/Ollama via
+the `USE_*`/`CLAUDE_CODE_USE_BEDROCK` env vars). As an alternative, you can
+route AI calls through an already-authenticated
+[Claude Code CLI](https://github.com/anthropics/claude-code) session, avoiding
+the need for a separate API key:
+
+```bash
+# Per-invocation flag:
+omni-dev --ai-backend claude-cli git commit message twiddle <range>
+
+# Or set persistently:
+export OMNI_DEV_AI_BACKEND=claude-cli
+```
+
+The flag takes precedence over the environment variable.
+
+**Model selection** follows the precedence chain
+`--model` → `CLAUDE_MODEL` → `CLAUDE_CODE_MODEL` → `ANTHROPIC_MODEL` → registry
+default. Short aliases (`sonnet`, `opus`, `haiku`) and full identifiers
+(`claude-sonnet-4-6`) are both accepted and forwarded verbatim to
+`claude -p --model`.
+
+**Sandboxing guarantees.** The `claude -p` subprocess is locked down so it
+behaves as a pure prompt→completion service, not a nested agent with
+filesystem or shell access:
+
+- Built-in tools disabled (`--tools ""`).
+- MCP servers blocked (`--strict-mcp-config` with no config).
+- User/project/local settings ignored (`--setting-sources ""`).
+- Slash commands / skills disabled.
+- Session persistence disabled.
+- Subprocess runs in a fresh temp directory (not your repo root).
+- Environment is scrubbed of `CLAUDE_PROJECT_DIR`, `CLAUDE_CODE_*`, and
+  `CLAUDE_PROJECT_*` before spawn.
+
+**Cost baseline.** Because the `claude -p` session still loads a small system
+prompt, each invocation has a floor cost (~$0.007 Haiku, ~$0.03 Sonnet,
+~$0.15 Opus) before any user content. Back-to-back calls within one hour hit
+the prompt cache and are much cheaper. If you pay per token, compare against
+the default HTTP backend which has no such floor.
+
+**Overrides.** Optional environment variables:
+
+- `OMNI_DEV_CLAUDE_CLI_BIN` — path to the `claude` binary (default: resolved
+  from `PATH`).
+- `OMNI_DEV_CLAUDE_CLI_TIMEOUT_SECS` — subprocess timeout (default: 600).
+- `OMNI_DEV_CLAUDE_CLI_STDOUT_MAX_BYTES` — stdout cap in bytes (default:
+  4 MiB).
+
+The `--beta-header` flag is ignored with this backend (the CLI's `--betas`
+flag is API-key-user-only and has different semantics).
+
 ## 🐛 Debugging
 
 For troubleshooting and detailed logging, use the `RUST_LOG` environment variable:

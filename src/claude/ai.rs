@@ -2,6 +2,7 @@
 
 pub mod bedrock;
 pub mod claude;
+pub mod claude_cli;
 pub mod openai;
 
 use std::future::Future;
