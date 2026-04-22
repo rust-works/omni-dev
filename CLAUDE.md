@@ -138,6 +138,8 @@ Backends are selected inside `src/claude/client.rs::create_default_claude_client
 
 Preflight (`src/utils/preflight.rs`) mirrors this switch and must change in lock-step when adding backends.
 
+**Escape hatch.** `OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS=true` or `--claude-cli-allow-tools` removes the `--tools ""` flag from the subprocess argv, letting the nested session use Read/Edit/Write/Bash/Glob/Grep. Other sandbox flags (`--strict-mcp-config`, `--setting-sources ""`, `--disable-slash-commands`, `--no-session-persistence`, temp cwd, scrubbed env) still apply. A warning is logged every time the escape hatch is active. See `ClaudeCliAiClient::run` for the warn site.
+
 ### Skill Structure
 Claude skills are organized in `.claude/skills/`, one subdirectory per skill with a `SKILL.md` file.
 

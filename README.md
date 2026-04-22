@@ -525,9 +525,33 @@ the default HTTP backend which has no such floor.
 - `OMNI_DEV_CLAUDE_CLI_TIMEOUT_SECS` — subprocess timeout (default: 600).
 - `OMNI_DEV_CLAUDE_CLI_STDOUT_MAX_BYTES` — stdout cap in bytes (default:
   4 MiB).
+- `OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS` — **escape hatch** (default: disabled).
+  See below.
 
 The `--beta-header` flag is ignored with this backend (the CLI's `--betas`
 flag is API-key-user-only and has different semantics).
+
+#### Escape hatch: `--claude-cli-allow-tools`
+
+By default the nested `claude -p` session is run with `--tools ""` and
+cannot read, edit, or execute anything on your system. For deliberately
+tool-capable use cases, you can weaken the sandbox:
+
+```bash
+omni-dev --ai-backend claude-cli --claude-cli-allow-tools git branch create pr
+# or:
+export OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS=true
+```
+
+**When enabled**, the nested session uses the CLI's default tool set
+(Read / Edit / Write / Bash / Glob / Grep, plus any MCP servers configured in
+your `~/.claude/settings.json`). This means the session can access your
+repository and run commands. Only enable it when you want that behaviour.
+When active, omni-dev logs a warning on every invocation.
+
+`--strict-mcp-config` and `--setting-sources ""` still apply, so MCP servers
+won't auto-load unless you explicitly allow them via further flags in a
+future slice.
 
 ## 🐛 Debugging
 

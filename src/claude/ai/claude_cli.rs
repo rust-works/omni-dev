@@ -49,6 +49,14 @@ pub(crate) const STDOUT_CAP_ENV_VAR: &str = "OMNI_DEV_CLAUDE_CLI_STDOUT_MAX_BYTE
 /// Env var overriding [`DEFAULT_BINARY`] (value: path to the `claude` binary).
 pub(crate) const BINARY_ENV_VAR: &str = "OMNI_DEV_CLAUDE_CLI_BIN";
 
+/// Env var enabling the tool-access escape hatch.
+///
+/// When set to `true` / `1` / `yes`, the nested `claude -p` session is
+/// allowed to use its default tool set (file-system access, shell, etc.)
+/// instead of being run with `--tools ""`. **This weakens the sandbox and
+/// should only be used for deliberately tool-capable use cases.**
+pub(crate) const ALLOW_TOOLS_ENV_VAR: &str = "OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS";
+
 /// Defence-in-depth suffix appended to the caller's system prompt.
 ///
 /// Even with tools disabled at runtime, the model "knows" Claude Code tools
@@ -103,7 +111,7 @@ impl ClaudeCliAiClient {
             model,
             Self::timeout_from_env(),
             Self::stdout_cap_from_env(),
-            false,
+            Self::allow_tools_from_env(),
             Self::binary_from_env(),
         )
     }
@@ -144,6 +152,15 @@ impl ClaudeCliAiClient {
         crate::utils::settings::get_env_var(BINARY_ENV_VAR)
             .ok()
             .map_or_else(|| PathBuf::from(DEFAULT_BINARY), PathBuf::from)
+    }
+
+    /// Reads [`ALLOW_TOOLS_ENV_VAR`] and returns whether the tool-access
+    /// escape hatch is enabled. Accepts `true` / `1` / `yes` (case-insensitive);
+    /// everything else (including unset) means disabled.
+    fn allow_tools_from_env() -> bool {
+        crate::utils::settings::get_env_var(ALLOW_TOOLS_ENV_VAR)
+            .ok()
+            .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
     }
 
     /// Builds the subprocess [`Command`] without spawning.
@@ -199,9 +216,19 @@ impl ClaudeCliAiClient {
 
         let mut cmd = self.build_command(&combined_system, temp_dir.path());
 
+        if self.allow_tools {
+            warn!(
+                "claude -p sandbox weakened: tool-access escape hatch is enabled \
+                 (--claude-cli-allow-tools / OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS). \
+                 The nested session can now read, edit, and execute against the \
+                 environment it inherits."
+            );
+        }
+
         info!(
             binary = %self.binary_path.display(),
             model = %self.model,
+            allow_tools = self.allow_tools,
             timeout_secs = self.timeout.as_secs(),
             "Spawning claude -p subprocess"
         );
@@ -646,6 +673,109 @@ mod tests {
         assert!(
             !args.contains(&"--tools".to_string()),
             "allow_tools=true should not pass --tools: {args:?}"
+        );
+    }
+
+    /// Test-scoped mutex + guard to serialise env-mutating escape-hatch
+    /// tests. Separate from other modules' locks on purpose — these tests
+    /// only touch `OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS`.
+    static ALLOW_TOOLS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct AllowToolsEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Option<String>,
+    }
+
+    impl AllowToolsEnvGuard {
+        fn new() -> Self {
+            let lock = ALLOW_TOOLS_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let saved = std::env::var(ALLOW_TOOLS_ENV_VAR).ok();
+            std::env::remove_var(ALLOW_TOOLS_ENV_VAR);
+            Self { _lock: lock, saved }
+        }
+
+        fn set(&self, value: &str) {
+            std::env::set_var(ALLOW_TOOLS_ENV_VAR, value);
+        }
+    }
+
+    impl Drop for AllowToolsEnvGuard {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(v) => std::env::set_var(ALLOW_TOOLS_ENV_VAR, v),
+                None => std::env::remove_var(ALLOW_TOOLS_ENV_VAR),
+            }
+        }
+    }
+
+    #[test]
+    fn allow_tools_from_env_defaults_to_false_when_unset() {
+        let _g = AllowToolsEnvGuard::new();
+        assert!(!ClaudeCliAiClient::allow_tools_from_env());
+    }
+
+    #[test]
+    fn allow_tools_from_env_true() {
+        let g = AllowToolsEnvGuard::new();
+        g.set("true");
+        assert!(ClaudeCliAiClient::allow_tools_from_env());
+    }
+
+    #[test]
+    fn allow_tools_from_env_true_case_insensitive_and_trimmed() {
+        let g = AllowToolsEnvGuard::new();
+        g.set("  TRUE  ");
+        assert!(ClaudeCliAiClient::allow_tools_from_env());
+    }
+
+    #[test]
+    fn allow_tools_from_env_one_and_yes_accepted() {
+        let g = AllowToolsEnvGuard::new();
+        g.set("1");
+        assert!(ClaudeCliAiClient::allow_tools_from_env());
+        g.set("yes");
+        assert!(ClaudeCliAiClient::allow_tools_from_env());
+    }
+
+    #[test]
+    fn allow_tools_from_env_other_values_are_false() {
+        let g = AllowToolsEnvGuard::new();
+        for v in ["false", "0", "no", "off", "TRUE1", "YES!", ""] {
+            g.set(v);
+            assert!(
+                !ClaudeCliAiClient::allow_tools_from_env(),
+                "value {v:?} should not enable the escape hatch"
+            );
+        }
+    }
+
+    #[test]
+    fn new_picks_up_allow_tools_env_var() {
+        let g = AllowToolsEnvGuard::new();
+        g.set("true");
+        let cli = ClaudeCliAiClient::new("sonnet".to_string());
+        // Verify via build_command — allow_tools=true omits --tools.
+        let tmp = TempDir::new().unwrap();
+        let cmd = cli.build_command("sys", tmp.path());
+        let args = args_of(&cmd);
+        assert!(
+            !args.contains(&"--tools".to_string()),
+            "ALLOW_TOOLS=true should omit --tools in argv: {args:?}"
+        );
+    }
+
+    #[test]
+    fn new_defaults_to_tools_disabled_when_env_unset() {
+        let _g = AllowToolsEnvGuard::new();
+        let cli = ClaudeCliAiClient::new("sonnet".to_string());
+        let tmp = TempDir::new().unwrap();
+        let cmd = cli.build_command("sys", tmp.path());
+        let args = args_of(&cmd);
+        assert!(
+            args.contains(&"--tools".to_string()),
+            "default (no env) must include --tools \"\": {args:?}"
         );
     }
 
