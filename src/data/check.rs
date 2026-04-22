@@ -245,6 +245,12 @@ pub struct AiCommitCheck {
 /// Issue from AI response.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AiIssue {
+    /// Reasoning written before the verdict. Forces think-first ordering so
+    /// `severity` is conditioned on fully-worked-through reasoning instead of
+    /// a first guess. Not surfaced to end users — the concise `explanation`
+    /// is shown instead.
+    #[serde(default)]
+    pub reasoning: Option<String>,
     /// Severity level.
     pub severity: String,
     /// Guideline section.
@@ -456,6 +462,7 @@ mod tests {
             commit: "abc123".to_string(),
             passes: false,
             issues: vec![AiIssue {
+                reasoning: Some("Subject exceeds cap; violates Format rule.".to_string()),
                 severity: "error".to_string(),
                 section: "Format".to_string(),
                 rule: "subject-line".to_string(),
@@ -489,6 +496,40 @@ mod tests {
         let suggestion = result.suggestion.unwrap();
         assert_eq!(suggestion.message, "feat(cli): better message");
         assert_eq!(suggestion.explanation, "improved clarity");
+    }
+
+    #[test]
+    fn ai_issue_deserializes_with_reasoning_field() {
+        // Reasoning-before-severity YAML shape (the intended model output for
+        // issue #627). Parser must accept it and preserve severity correctly.
+        let yaml = r#"
+reasoning: "Scope 'lib' is in the valid scopes list; scope validity check passes. No violation."
+severity: info
+section: "Scope Appropriateness"
+rule: "scope-suggestion"
+explanation: "Consider a narrower scope."
+"#;
+        let issue: AiIssue = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(issue.severity, "info");
+        assert!(issue
+            .reasoning
+            .as_deref()
+            .unwrap()
+            .contains("valid scopes list"));
+    }
+
+    #[test]
+    fn ai_issue_deserializes_without_reasoning_field() {
+        // Older/fallback YAML shape with no reasoning field must still parse.
+        let yaml = r#"
+severity: error
+section: "Subject Line"
+rule: "subject-too-long"
+explanation: "Subject exceeds 72 characters"
+"#;
+        let issue: AiIssue = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(issue.severity, "error");
+        assert!(issue.reasoning.is_none());
     }
 
     #[test]
