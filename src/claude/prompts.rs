@@ -673,11 +673,13 @@ checks:
   - commit: "abc123..."
     passes: false
     issues:
-      - severity: error
+      - reasoning: "Subject is 85 characters, guideline caps at 72. 85 > 72, so this violates the Subject Line rule. Section 'Subject Line' maps to severity 'error'."
+        severity: error
         section: "Subject Line"
         rule: "Keep under 72 characters"
         explanation: "Subject is 85 characters"
-      - severity: warning
+      - reasoning: "Diff shows 142 lines changed. Body Guidelines requires a body for large changes. No body present. Section 'Content' maps to severity 'warning'."
+        severity: warning
         section: "Body Guidelines"
         rule: "Body required for large changes"
         explanation: "142 lines changed but no body provided"
@@ -696,6 +698,11 @@ For commits that pass all checks:
     passes: true
     issues: []
     summary: "Update CI pipeline to run tests in parallel"
+
+CRITICAL — REASONING MUST PRECEDE VERDICT:
+Every issue entry MUST begin with a `reasoning` field, written BEFORE the `severity` field, in the exact field order shown above. The `reasoning` field is where you work out whether the rule is actually violated. Walk through the evidence: what the message says, what the diff or valid-scopes list shows, and whether pre_validated_checks covers it. Only after the reasoning concludes do you commit to a `severity` value.
+
+Do NOT write the severity first and then justify it. Do NOT emit an issue whose `reasoning` concludes the message is valid — if your reasoning finds no violation, omit the issue entirely (or report it at severity `info` if it's merely a style suggestion). The `reasoning` and `severity` fields must be self-consistent; a contradictory issue (e.g., reasoning says "this is valid" but severity is `error`) is a bug in your output.
 
 IMPORTANT:
 - Include ALL commits in the response, whether they pass or fail
@@ -844,7 +851,8 @@ checks:
   - commit: "abc123..."
     passes: true/false
     issues:
-      - severity: error/warning/info
+      - reasoning: "Cross-commit analysis of why this is (or is not) an issue. Work through the evidence before committing to severity."
+        severity: error/warning/info
         section: "Section Name"
         rule: "Rule description"
         explanation: "Why this is an issue"
@@ -853,6 +861,9 @@ checks:
         refined commit message
       explanation: |
         - Reason for refinement
+
+CRITICAL — REASONING MUST PRECEDE VERDICT:
+Every issue entry MUST begin with a `reasoning` field, written BEFORE the `severity` field, in the exact field order shown above. Work through the evidence in `reasoning` first, then commit to `severity`. If your reasoning concludes the finding is valid (not a violation), omit the issue or downgrade to `info`. The `reasoning` and `severity` fields must be self-consistent.
 
 IMPORTANT:
 - Include ALL commits from the input
@@ -1461,6 +1472,50 @@ mod tests {
     fn check_system_prompt_constant_not_empty() {
         assert!(CHECK_SYSTEM_PROMPT.len() > 100);
         assert!(CHECK_SYSTEM_PROMPT.contains("commit message reviewer"));
+    }
+
+    /// Regression guard for #627: in every structural YAML example in `prompt`,
+    /// the `reasoning:` field must appear before the `severity:` field so the
+    /// verdict is conditioned on worked-through reasoning rather than a first
+    /// guess. Returns true only if both fields are present AND ordered
+    /// correctly in the first occurrence.
+    fn reasoning_precedes_severity(prompt: &str) -> bool {
+        match (prompt.find("reasoning:"), prompt.find("severity:")) {
+            (Some(r), Some(s)) => r < s,
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn check_system_prompt_puts_reasoning_before_severity() {
+        assert!(
+            reasoning_precedes_severity(CHECK_SYSTEM_PROMPT),
+            "reasoning field must appear before severity in the YAML template"
+        );
+    }
+
+    #[test]
+    fn check_coherence_prompt_puts_reasoning_before_severity() {
+        assert!(
+            reasoning_precedes_severity(CHECK_COHERENCE_SYSTEM_PROMPT),
+            "reasoning field must appear before severity in the coherence YAML template"
+        );
+    }
+
+    #[test]
+    fn reasoning_precedes_severity_helper_branches() {
+        // Positive: both fields present, correct order.
+        assert!(reasoning_precedes_severity("- reasoning: x\n  severity: y"));
+        // Negative: wrong order.
+        assert!(!reasoning_precedes_severity(
+            "- severity: y\n  reasoning: x"
+        ));
+        // Negative: missing severity.
+        assert!(!reasoning_precedes_severity("- reasoning: x"));
+        // Negative: missing reasoning.
+        assert!(!reasoning_precedes_severity("- severity: y"));
+        // Negative: neither field.
+        assert!(!reasoning_precedes_severity(""));
     }
 
     #[test]
