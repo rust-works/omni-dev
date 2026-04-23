@@ -127,6 +127,21 @@ The project includes a comprehensive model registry system:
 - **Configuration Commands**: Use `omni-dev config models show` to view available models
 - **Dynamic Limits**: Token limits are automatically applied based on model specifications
 
+### AI Backend Dispatch
+Backends are selected inside `src/claude/client.rs::create_default_claude_client` in this order:
+
+1. `OMNI_DEV_AI_BACKEND=claude-cli` (or `--ai-backend claude-cli`) → `ClaudeCliAiClient` in `src/claude/ai/claude_cli.rs`. Shells out to `claude -p` in a locked-down sandbox (tools disabled, MCP blocked, settings skipped, fresh temp cwd, scrubbed env). Uses JSON output format and parses the `is_error`/`api_error_status`/`result` envelope. `--beta-header` is ignored for this backend.
+2. `USE_OLLAMA=true` → `OpenAiAiClient::new_ollama`.
+3. `USE_OPENAI=true` → `OpenAiAiClient::new_openai`.
+4. `CLAUDE_CODE_USE_BEDROCK=true` → `BedrockAiClient`.
+5. Default → `ClaudeAiClient` (direct Anthropic API).
+
+Preflight (`src/utils/preflight.rs`) mirrors this switch and must change in lock-step when adding backends.
+
+**Escape hatch.** `OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS=true` or `--claude-cli-allow-tools` removes the `--tools ""` flag from the subprocess argv, letting the nested session use Read/Edit/Write/Bash/Glob/Grep. Other sandbox flags (`--strict-mcp-config`, `--setting-sources ""`, `--disable-slash-commands`, `--no-session-persistence`, temp cwd, scrubbed env) still apply. A warning is logged every time the escape hatch is active. See `ClaudeCliAiClient::run` for the warn site.
+
+**Spending cap.** `OMNI_DEV_CLAUDE_CLI_MAX_BUDGET_USD=<amount>` or `--claude-cli-max-budget-usd <amount>` forwards to `claude -p --max-budget-usd`, aborting the nested session if it exceeds the cap. Every invocation logs `total_cost_usd` from the JSON envelope at INFO level regardless of cap, for cost observability. Non-positive / non-finite values are silently treated as no cap. See `ClaudeCliAiClient::run` for the log site and the post-response warn when cost exceeds the configured cap.
+
 ### Skill Structure
 Claude skills are organized in `.claude/skills/`, one subdirectory per skill with a `SKILL.md` file.
 

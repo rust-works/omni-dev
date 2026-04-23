@@ -28,6 +28,8 @@ pub enum AiProvider {
     OpenAi,
     /// Local Ollama.
     Ollama,
+    /// `claude -p` subprocess (Claude Code CLI).
+    ClaudeCli,
 }
 
 impl std::fmt::Display for AiProvider {
@@ -37,6 +39,7 @@ impl std::fmt::Display for AiProvider {
             Self::Bedrock => write!(f, "AWS Bedrock"),
             Self::OpenAi => write!(f, "OpenAI API"),
             Self::Ollama => write!(f, "Ollama"),
+            Self::ClaudeCli => write!(f, "Claude Code CLI"),
         }
     }
 }
@@ -48,6 +51,45 @@ impl std::fmt::Display for AiProvider {
 /// require AI to fail fast if credentials are missing.
 pub fn check_ai_credentials(model_override: Option<&str>) -> Result<AiCredentialInfo> {
     use crate::utils::settings::{get_env_var, get_env_vars};
+
+    // The `claude -p` subprocess backend is checked first so it wins over
+    // the existing USE_* flags if multiple are set. Credentials for this
+    // backend live inside the `claude` binary's own auth state, so we just
+    // verify the binary is on PATH.
+    if let Ok(val) = get_env_var("OMNI_DEV_AI_BACKEND") {
+        if matches!(val.as_str(), "claude-cli" | "claude_cli") {
+            let binary =
+                get_env_var("OMNI_DEV_CLAUDE_CLI_BIN").unwrap_or_else(|_| "claude".to_string());
+            let probe = std::process::Command::new(&binary)
+                .arg("--version")
+                .output();
+            match probe {
+                Ok(out) if out.status.success() => {
+                    let registry = get_model_registry();
+                    let model = model_override
+                        .map(String::from)
+                        .or_else(|| get_env_var("CLAUDE_MODEL").ok())
+                        .or_else(|| get_env_var("CLAUDE_CODE_MODEL").ok())
+                        .or_else(|| get_env_var("ANTHROPIC_MODEL").ok())
+                        .unwrap_or_else(|| {
+                            registry
+                                .get_default_model("claude")
+                                .unwrap_or("claude-sonnet-4-6")
+                                .to_string()
+                        });
+                    return Ok(AiCredentialInfo {
+                        provider: AiProvider::ClaudeCli,
+                        model,
+                    });
+                }
+                _ => bail!(
+                    "Claude Code CLI not available at '{binary}'.\n\
+                     Install it from https://github.com/anthropics/claude-code \
+                     or set OMNI_DEV_CLAUDE_CLI_BIN to its path."
+                ),
+            }
+        }
+    }
 
     // Check provider selection flags
     let use_openai = get_env_var("USE_OPENAI").is_ok_and(|val| val == "true");
@@ -335,6 +377,7 @@ mod tests {
         assert_eq!(format!("{}", AiProvider::Bedrock), "AWS Bedrock");
         assert_eq!(format!("{}", AiProvider::OpenAi), "OpenAI API");
         assert_eq!(format!("{}", AiProvider::Ollama), "Ollama");
+        assert_eq!(format!("{}", AiProvider::ClaudeCli), "Claude Code CLI");
     }
 
     #[test]
@@ -422,5 +465,96 @@ mod tests {
 
         let info = check_ai_credentials(Some("claude-opus-4-6")).unwrap();
         assert_eq!(info.model, "claude-opus-4-6");
+    }
+
+    #[cfg(unix)]
+    fn make_version_shim(tmp: &tempfile::TempDir, exit_code: i32) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let shim = tmp.path().join("claude-bin-shim");
+        std::fs::write(
+            &shim,
+            format!("#!/bin/sh\necho 'fake-claude 0.0.0'\nexit {exit_code}\n"),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&shim).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&shim, perms).unwrap();
+        shim
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn claude_cli_backend_uses_version_probe() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let shim = make_version_shim(&tmp, 0);
+
+        let mut guard = EnvGuard::new();
+        guard.remove("USE_OPENAI");
+        guard.remove("USE_OLLAMA");
+        guard.remove("CLAUDE_CODE_USE_BEDROCK");
+        guard.remove("ANTHROPIC_MODEL");
+        guard.remove("CLAUDE_MODEL");
+        guard.remove("CLAUDE_CODE_MODEL");
+        guard.set("OMNI_DEV_AI_BACKEND", "claude-cli");
+        guard.set("OMNI_DEV_CLAUDE_CLI_BIN", shim.to_str().unwrap());
+
+        let info = check_ai_credentials(None).unwrap();
+        assert_eq!(info.provider, AiProvider::ClaudeCli);
+        assert_eq!(info.model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn claude_cli_backend_uses_model_from_env() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let shim = make_version_shim(&tmp, 0);
+
+        let mut guard = EnvGuard::new();
+        guard.remove("USE_OPENAI");
+        guard.remove("USE_OLLAMA");
+        guard.remove("CLAUDE_CODE_USE_BEDROCK");
+        guard.remove("ANTHROPIC_MODEL");
+        guard.remove("CLAUDE_CODE_MODEL");
+        guard.set("OMNI_DEV_AI_BACKEND", "claude-cli");
+        guard.set("OMNI_DEV_CLAUDE_CLI_BIN", shim.to_str().unwrap());
+        guard.set("CLAUDE_MODEL", "haiku");
+
+        let info = check_ai_credentials(None).unwrap();
+        assert_eq!(info.provider, AiProvider::ClaudeCli);
+        assert_eq!(info.model, "haiku");
+    }
+
+    #[test]
+    fn claude_cli_backend_missing_binary_fails_preflight() {
+        let mut guard = EnvGuard::new();
+        guard.remove("USE_OPENAI");
+        guard.remove("USE_OLLAMA");
+        guard.remove("CLAUDE_CODE_USE_BEDROCK");
+        guard.set("OMNI_DEV_AI_BACKEND", "claude-cli");
+        guard.set("OMNI_DEV_CLAUDE_CLI_BIN", "/nonexistent/claude-binary-xyz");
+
+        let err = check_ai_credentials(None).expect_err("expected missing-binary error");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("Claude Code CLI not available"),
+            "unexpected error: {chain}"
+        );
+    }
+
+    #[test]
+    fn claude_cli_backend_accepts_underscore_alias() {
+        // The factory/preflight accept both `claude-cli` and `claude_cli`.
+        // Verify the second spelling routes the same way (missing-binary
+        // path exercises the selector cheaply).
+        let mut guard = EnvGuard::new();
+        guard.remove("USE_OPENAI");
+        guard.remove("USE_OLLAMA");
+        guard.remove("CLAUDE_CODE_USE_BEDROCK");
+        guard.set("OMNI_DEV_AI_BACKEND", "claude_cli");
+        guard.set("OMNI_DEV_CLAUDE_CLI_BIN", "/nonexistent/claude-binary-xyz");
+
+        let err = check_ai_credentials(None).expect_err("expected missing-binary error");
+        let chain = format!("{err:#}");
+        assert!(chain.contains("Claude Code CLI not available"));
     }
 }

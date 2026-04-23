@@ -1,7 +1,7 @@
 //! Claude client for commit message improvement.
 
 use anyhow::{Context, Result};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::claude::token_budget::TokenBudget;
 use crate::claude::{ai::bedrock::BedrockAiClient, ai::claude::ClaudeAiClient};
@@ -1496,8 +1496,41 @@ pub fn create_default_claude_client(
     model: Option<String>,
     beta_header: Option<(String, String)>,
 ) -> Result<ClaudeClient> {
+    use crate::claude::ai::claude_cli::ClaudeCliAiClient;
     use crate::claude::ai::openai::OpenAiAiClient;
     use crate::utils::settings::{get_env_var, get_env_vars};
+
+    // `claude -p` subprocess backend takes precedence when requested — it
+    // reuses an existing Claude Code auth session and is the only backend
+    // that accepts short model aliases (sonnet/opus/haiku), so it must
+    // short-circuit before `validate_beta_header` runs below.
+    let ai_backend = get_env_var("OMNI_DEV_AI_BACKEND").ok();
+    let use_claude_cli = ai_backend
+        .as_deref()
+        .is_some_and(|v| matches!(v, "claude-cli" | "claude_cli"));
+
+    if use_claude_cli {
+        if beta_header.is_some() {
+            warn!(
+                "--beta-header is ignored when OMNI_DEV_AI_BACKEND=claude-cli \
+                 (the CLI's --betas flag has different semantics and is not forwarded)"
+            );
+        }
+        let registry = crate::claude::model_config::get_model_registry();
+        let cli_model = model
+            .or_else(|| get_env_var("CLAUDE_MODEL").ok())
+            .or_else(|| get_env_var("CLAUDE_CODE_MODEL").ok())
+            .or_else(|| get_env_var("ANTHROPIC_MODEL").ok())
+            .unwrap_or_else(|| {
+                registry
+                    .get_default_model("claude")
+                    .unwrap_or("claude-sonnet-4-6")
+                    .to_string()
+            });
+        debug!(model = %cli_model, "Creating claude -p subprocess client");
+        let ai_client = ClaudeCliAiClient::new(cli_model);
+        return Ok(ClaudeClient::new(Box::new(ai_client)));
+    }
 
     // Check if we should use OpenAI-compatible API (OpenAI or Ollama)
     let use_openai = get_env_var("USE_OPENAI").is_ok_and(|val| val == "true");
@@ -3498,5 +3531,123 @@ mod tests {
         assert_eq!(result.unwrap().amendments.len(), 1);
         assert_eq!(response_handle.remaining(), 0);
         assert_eq!(prompt_handle.request_count(), 3, "all 3 attempts used");
+    }
+
+    // ── create_default_claude_client factory ───────────────────────
+
+    /// Serialises env-mutating factory tests in this module.
+    static FACTORY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct FactoryEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl FactoryEnvGuard {
+        fn new(keys: &[&'static str]) -> Self {
+            let lock = FACTORY_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let saved = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+            for k in keys {
+                std::env::remove_var(k);
+            }
+            Self { _lock: lock, saved }
+        }
+
+        fn set(&self, key: &str, value: &str) {
+            std::env::set_var(key, value);
+        }
+    }
+
+    impl Drop for FactoryEnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in self.saved.drain(..) {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn factory_claude_cli_backend_dispatches_to_claude_cli_client() {
+        let guard = FactoryEnvGuard::new(&[
+            "OMNI_DEV_AI_BACKEND",
+            "USE_OPENAI",
+            "USE_OLLAMA",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_MODEL",
+            "CLAUDE_CODE_MODEL",
+            "ANTHROPIC_MODEL",
+        ]);
+        guard.set("OMNI_DEV_AI_BACKEND", "claude-cli");
+
+        let client = create_default_claude_client(None, None).expect("factory should succeed");
+        let metadata = client.get_ai_client_metadata();
+        assert_eq!(metadata.provider, "Claude CLI");
+        // Default model falls through to the registry's claude default.
+        assert_eq!(metadata.model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn factory_claude_cli_backend_honours_model_precedence() {
+        let guard = FactoryEnvGuard::new(&[
+            "OMNI_DEV_AI_BACKEND",
+            "USE_OPENAI",
+            "USE_OLLAMA",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_MODEL",
+            "CLAUDE_CODE_MODEL",
+            "ANTHROPIC_MODEL",
+        ]);
+        guard.set("OMNI_DEV_AI_BACKEND", "claude-cli");
+        guard.set("CLAUDE_CODE_MODEL", "opus");
+        // CLAUDE_MODEL has higher precedence than CLAUDE_CODE_MODEL.
+        guard.set("CLAUDE_MODEL", "haiku");
+
+        let client = create_default_claude_client(None, None).expect("factory should succeed");
+        let metadata = client.get_ai_client_metadata();
+        assert_eq!(metadata.provider, "Claude CLI");
+        assert_eq!(metadata.model, "haiku");
+    }
+
+    #[test]
+    fn factory_claude_cli_backend_explicit_model_wins_over_env() {
+        let guard = FactoryEnvGuard::new(&[
+            "OMNI_DEV_AI_BACKEND",
+            "USE_OPENAI",
+            "USE_OLLAMA",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_MODEL",
+            "CLAUDE_CODE_MODEL",
+            "ANTHROPIC_MODEL",
+        ]);
+        guard.set("OMNI_DEV_AI_BACKEND", "claude-cli");
+        guard.set("CLAUDE_MODEL", "haiku");
+
+        let client = create_default_claude_client(Some("opus".to_string()), None)
+            .expect("factory should succeed");
+        let metadata = client.get_ai_client_metadata();
+        assert_eq!(metadata.model, "opus");
+    }
+
+    #[test]
+    fn factory_claude_cli_backend_accepts_underscore_alias() {
+        let guard = FactoryEnvGuard::new(&[
+            "OMNI_DEV_AI_BACKEND",
+            "USE_OPENAI",
+            "USE_OLLAMA",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_MODEL",
+            "CLAUDE_CODE_MODEL",
+            "ANTHROPIC_MODEL",
+        ]);
+        guard.set("OMNI_DEV_AI_BACKEND", "claude_cli");
+
+        let client = create_default_claude_client(None, None).expect("factory should succeed");
+        let metadata = client.get_ai_client_metadata();
+        assert_eq!(metadata.provider, "Claude CLI");
     }
 }
