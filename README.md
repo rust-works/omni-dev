@@ -178,6 +178,31 @@ omni-dev atlassian confluence create page.md --space ENG --title "New Page"
 omni-dev atlassian convert to-adf input.md
 ```
 
+### 📊 Datadog Integration (read-only)
+
+Authenticate against the Datadog API. Subsequent slices add metrics, monitor,
+dashboard, and logs subcommands.
+
+```bash
+# Configure Datadog API credentials (prompts for API key, APP key, and site)
+omni-dev datadog auth login
+
+# Verify the credentials by calling /api/v1/validate
+omni-dev datadog auth status
+
+# Remove Datadog credentials from ~/.omni-dev/settings.json
+omni-dev datadog auth logout
+```
+
+`DATADOG_SITE` defaults to `datadoghq.com`. Other regions (`datadoghq.eu`,
+`us3.datadoghq.com`, `us5.datadoghq.com`, `ap1.datadoghq.com`, `ddog-gov.com`)
+are recognised without warning. Environment variables `DATADOG_API_KEY`,
+`DATADOG_APP_KEY`, `DATADOG_SITE` override the stored settings.
+
+For on-prem or proxied Datadog installs, set `DATADOG_API_URL` to the full
+API base URL (e.g. `https://datadog.corp.example`) — it overrides the
+site-derived URL entirely.
+
 ### ✏️ Manual Amendment
 
 ```bash
@@ -473,6 +498,8 @@ We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.
 - **Atlassian Credentials** (for JIRA/Confluence features): Instance URL, email, and
   [API token](https://id.atlassian.com/manage-profile/security/api-tokens)
   - Configure with: `omni-dev atlassian auth login`
+- **Datadog Credentials** (for Datadog features): API key, application key, and site
+  - Configure with: `omni-dev datadog auth login`
 - **Git**: Any modern version
 
 ### AI backend selection
