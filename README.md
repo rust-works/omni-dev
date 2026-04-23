@@ -199,6 +199,10 @@ omni-dev datadog auth logout
 are recognised without warning. Environment variables `DATADOG_API_KEY`,
 `DATADOG_APP_KEY`, `DATADOG_SITE` override the stored settings.
 
+For on-prem or proxied Datadog installs, set `DATADOG_API_URL` to the full
+API base URL (e.g. `https://datadog.corp.example`) — it overrides the
+site-derived URL entirely.
+
 ### ✏️ Manual Amendment
 
 ```bash
