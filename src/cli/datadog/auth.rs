@@ -170,7 +170,7 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::datadog::auth::{DATADOG_API_KEY, DATADOG_APP_KEY, DATADOG_SITE};
+    use crate::datadog::auth::{DATADOG_API_KEY, DATADOG_API_URL, DATADOG_APP_KEY, DATADOG_SITE};
     use crate::datadog::test_support::{with_empty_home, EnvGuard};
 
     #[test]
@@ -343,6 +343,67 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("403"));
         assert!(msg.contains("Forbidden"));
+    }
+
+    // ── StatusCommand::execute end-to-end via DATADOG_API_URL ─────
+
+    fn write_settings(dir: &std::path::Path, site: &str) {
+        let omni_dir = dir.join(".omni-dev");
+        fs::create_dir_all(&omni_dir).unwrap();
+        let json = format!(
+            r#"{{"env":{{"DATADOG_API_KEY":"api","DATADOG_APP_KEY":"app","DATADOG_SITE":"{site}"}}}}"#
+        );
+        fs::write(omni_dir.join("settings.json"), json).unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_command_execute_success_via_api_url_override() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v1/validate"))
+            .and(wiremock::matchers::header("DD-API-KEY", "api"))
+            .and(wiremock::matchers::header("DD-APPLICATION-KEY", "app"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"valid": true})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        write_settings(dir.path(), "datadoghq.com");
+        std::env::set_var(DATADOG_API_URL, server.uri());
+
+        StatusCommand.execute().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_command_execute_propagates_api_errors() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v1/validate"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        write_settings(dir.path(), "datadoghq.com");
+        std::env::set_var(DATADOG_API_URL, server.uri());
+
+        let err = StatusCommand.execute().await.unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn status_command_execute_errors_when_credentials_missing() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+
+        let err = StatusCommand.execute().await.unwrap_err();
+        assert!(err.to_string().contains("not configured"));
     }
 
     #[tokio::test]

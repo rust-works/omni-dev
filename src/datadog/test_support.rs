@@ -10,7 +10,7 @@
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use crate::datadog::auth::{DATADOG_API_KEY, DATADOG_APP_KEY, DATADOG_SITE};
+use crate::datadog::auth::{DATADOG_API_KEY, DATADOG_API_URL, DATADOG_APP_KEY, DATADOG_SITE};
 
 /// Process-wide mutex serialising tests that mutate `HOME` and the
 /// Datadog credential environment variables.
@@ -28,7 +28,13 @@ impl EnvGuard {
         let lock = DATADOG_ENV_MUTEX
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let keys = ["HOME", DATADOG_API_KEY, DATADOG_APP_KEY, DATADOG_SITE];
+        let keys = [
+            "HOME",
+            DATADOG_API_KEY,
+            DATADOG_APP_KEY,
+            DATADOG_SITE,
+            DATADOG_API_URL,
+        ];
         let snapshot = keys
             .into_iter()
             .map(|k| (k, std::env::var(k).ok()))
@@ -67,5 +73,6 @@ pub(crate) fn with_empty_home(_guard: &EnvGuard) -> tempfile::TempDir {
     std::env::remove_var(DATADOG_API_KEY);
     std::env::remove_var(DATADOG_APP_KEY);
     std::env::remove_var(DATADOG_SITE);
+    std::env::remove_var(DATADOG_API_URL);
     dir
 }

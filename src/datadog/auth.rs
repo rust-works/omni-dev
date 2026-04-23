@@ -21,6 +21,14 @@ pub const DATADOG_APP_KEY: &str = "DATADOG_APP_KEY";
 /// Environment variable / settings key for the Datadog site (e.g. `datadoghq.com`).
 pub const DATADOG_SITE: &str = "DATADOG_SITE";
 
+/// Environment variable / settings key for an explicit Datadog API base URL.
+///
+/// When set, overrides [`DATADOG_SITE`] entirely — the client uses this URL
+/// verbatim instead of deriving `https://api.{site}`. Useful for:
+/// - Tests that point at a wiremock server (e.g. `http://127.0.0.1:PORT`).
+/// - On-prem / proxied Datadog installs that don't match `api.{site}`.
+pub const DATADOG_API_URL: &str = "DATADOG_API_URL";
+
 /// Default Datadog site when none is configured (US1 region).
 pub const DEFAULT_SITE: &str = "datadoghq.com";
 

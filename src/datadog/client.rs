@@ -52,8 +52,15 @@ impl DatadogClient {
     }
 
     /// Creates a client from stored credentials.
+    ///
+    /// Respects `DATADOG_API_URL` as an optional override: when set in the
+    /// process environment it replaces the site-derived base URL. Used for
+    /// tests (wiremock) and on-prem Datadog installs.
     pub fn from_credentials(creds: &DatadogCredentials) -> Result<Self> {
-        let base_url = base_url_for_site(&creds.site);
+        let base_url = std::env::var(crate::datadog::auth::DATADOG_API_URL)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| base_url_for_site(&creds.site));
         Self::new(&base_url, &creds.api_key, &creds.app_key)
     }
 
@@ -203,6 +210,9 @@ mod tests {
 
     #[test]
     fn from_credentials_builds_base_url_from_site() {
+        // EnvGuard serialises with other tests that mutate DATADOG_API_URL.
+        let _guard = crate::datadog::test_support::EnvGuard::take();
+        std::env::remove_var(crate::datadog::auth::DATADOG_API_URL);
         let creds = DatadogCredentials {
             api_key: "api".to_string(),
             app_key: "app".to_string(),
@@ -210,6 +220,35 @@ mod tests {
         };
         let client = DatadogClient::from_credentials(&creds).unwrap();
         assert_eq!(client.base_url(), "https://api.us5.datadoghq.com");
+    }
+
+    #[test]
+    fn from_credentials_honours_api_url_override() {
+        let _guard = crate::datadog::test_support::EnvGuard::take();
+        std::env::set_var(
+            crate::datadog::auth::DATADOG_API_URL,
+            "http://proxy.example:8080",
+        );
+        let creds = DatadogCredentials {
+            api_key: "api".to_string(),
+            app_key: "app".to_string(),
+            site: "us5.datadoghq.com".to_string(),
+        };
+        let client = DatadogClient::from_credentials(&creds).unwrap();
+        assert_eq!(client.base_url(), "http://proxy.example:8080");
+    }
+
+    #[test]
+    fn from_credentials_ignores_empty_api_url_override() {
+        let _guard = crate::datadog::test_support::EnvGuard::take();
+        std::env::set_var(crate::datadog::auth::DATADOG_API_URL, "");
+        let creds = DatadogCredentials {
+            api_key: "api".to_string(),
+            app_key: "app".to_string(),
+            site: "datadoghq.com".to_string(),
+        };
+        let client = DatadogClient::from_credentials(&creds).unwrap();
+        assert_eq!(client.base_url(), "https://api.datadoghq.com");
     }
 
     #[tokio::test]
