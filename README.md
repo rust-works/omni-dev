@@ -527,6 +527,8 @@ the default HTTP backend which has no such floor.
   4 MiB).
 - `OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS` — **escape hatch** (default: disabled).
   See below.
+- `OMNI_DEV_CLAUDE_CLI_MAX_BUDGET_USD` — per-invocation spending cap in USD
+  (default: none). See below.
 
 The `--beta-header` flag is ignored with this backend (the CLI's `--betas`
 flag is API-key-user-only and has different semantics).
@@ -552,6 +554,26 @@ When active, omni-dev logs a warning on every invocation.
 `--strict-mcp-config` and `--setting-sources ""` still apply, so MCP servers
 won't auto-load unless you explicitly allow them via further flags in a
 future slice.
+
+#### Spending cap: `--claude-cli-max-budget-usd`
+
+Pass a per-invocation spending cap in USD:
+
+```bash
+omni-dev --ai-backend claude-cli --claude-cli-max-budget-usd 0.50 \
+  git commit message twiddle HEAD~3..HEAD
+# or:
+export OMNI_DEV_CLAUDE_CLI_MAX_BUDGET_USD=0.50
+```
+
+The value is forwarded to `claude -p --max-budget-usd`. If the nested
+session exceeds the cap, it aborts with an error rather than running away
+with cost. Regardless of whether a cap is set, each invocation's
+`total_cost_usd` is logged at INFO level for observability — run with
+`RUST_LOG=omni_dev=info` to see it.
+
+The cap is ignored when `--ai-backend` is not `claude-cli`. Non-positive,
+non-finite, or non-numeric values are silently treated as no cap.
 
 ## 🐛 Debugging
 
