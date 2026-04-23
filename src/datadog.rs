@@ -7,6 +7,7 @@
 pub mod auth;
 pub mod client;
 pub mod error;
+pub mod metrics_api;
 pub mod time;
 pub mod types;
 

@@ -1,9 +1,4 @@
 //! Shared helpers for Datadog CLI commands.
-//!
-//! `create_client` is unused in slice 1 (the auth status command builds its
-//! own client so it can report the site separately); it becomes live with
-//! the first endpoint subcommand.
-#![allow(dead_code)]
 
 use anyhow::Result;
 
