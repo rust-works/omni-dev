@@ -28,6 +28,9 @@ pub mod git;
 pub mod mcp;
 pub mod utils;
 
+#[cfg(test)]
+mod test_support;
+
 pub use crate::cli::Cli;
 
 /// The current version of omni-dev.

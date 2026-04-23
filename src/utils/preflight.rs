@@ -469,22 +469,18 @@ mod tests {
 
     #[cfg(unix)]
     fn make_version_shim(tmp: &tempfile::TempDir, exit_code: i32) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let shim = tmp.path().join("claude-bin-shim");
-        std::fs::write(
+        crate::test_support::shim::write_exec_script(
             &shim,
-            format!("#!/bin/sh\necho 'fake-claude 0.0.0'\nexit {exit_code}\n"),
-        )
-        .unwrap();
-        let mut perms = std::fs::metadata(&shim).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&shim, perms).unwrap();
+            &format!("#!/bin/sh\necho 'fake-claude 0.0.0'\nexit {exit_code}\n"),
+        );
         shim
     }
 
     #[test]
     #[cfg(unix)]
     fn claude_cli_backend_uses_version_probe() {
+        let _guard = crate::test_support::shim::shim_lock();
         let tmp = tempfile::TempDir::new().unwrap();
         let shim = make_version_shim(&tmp, 0);
 
@@ -506,6 +502,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn claude_cli_backend_uses_model_from_env() {
+        let _guard = crate::test_support::shim::shim_lock();
         let tmp = tempfile::TempDir::new().unwrap();
         let shim = make_version_shim(&tmp, 0);
 
