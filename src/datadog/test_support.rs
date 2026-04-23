@@ -56,11 +56,13 @@ impl Drop for EnvGuard {
 /// Returns the tempdir so the caller can populate `.omni-dev/settings.json`
 /// inside it. The guard parameter enforces ordering: callers must hold an
 /// [`EnvGuard`] before invoking this helper.
+///
+/// Uses `tempfile::tempdir()` (absolute path via `std::env::temp_dir`)
+/// rather than a CWD-relative tempdir so that concurrent tests which
+/// mutate CWD (e.g. `mcp::resources` and `cli::git::view` tests) cannot
+/// race this helper into resolving against the wrong working directory.
 pub(crate) fn with_empty_home(_guard: &EnvGuard) -> tempfile::TempDir {
-    let dir = {
-        std::fs::create_dir_all("tmp").ok();
-        tempfile::TempDir::new_in("tmp").expect("create tempdir")
-    };
+    let dir = tempfile::tempdir().expect("create tempdir");
     std::env::set_var("HOME", dir.path());
     std::env::remove_var(DATADOG_API_KEY);
     std::env::remove_var(DATADOG_APP_KEY);
