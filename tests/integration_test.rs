@@ -449,6 +449,7 @@ async fn cli_execute_dispatches_git_commit_message_view() {
     let cli = Cli {
         ai_backend: None,
         claude_cli_allow_tools: false,
+        claude_cli_max_budget_usd: None,
         command: Commands::Git(GitCommand {
             command: GitSubcommands::Commit(CommitCommand {
                 command: CommitSubcommands::Message(MessageCommand {
@@ -472,6 +473,7 @@ async fn cli_execute_dispatches_git_branch_info() {
     let cli = Cli {
         ai_backend: None,
         claude_cli_allow_tools: false,
+        claude_cli_max_budget_usd: None,
         command: Commands::Git(GitCommand {
             command: GitSubcommands::Branch(BranchCommand {
                 command: BranchSubcommands::Info(InfoCommand { base_branch: None }),
@@ -489,6 +491,7 @@ async fn cli_execute_dispatches_ai_chat() {
     let cli = Cli {
         ai_backend: None,
         claude_cli_allow_tools: false,
+        claude_cli_max_budget_usd: None,
         command: Commands::Ai(AiCommand {
             command: AiSubcommands::Chat(ChatCommand { model: None }),
         }),

@@ -47,6 +47,16 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub claude_cli_allow_tools: bool,
 
+    /// Per-invocation spending cap in USD for the `claude-cli` backend.
+    ///
+    /// Forwarded to `claude -p --max-budget-usd`. When the nested session
+    /// exceeds this budget it aborts rather than running away with cost.
+    /// Equivalent to setting `OMNI_DEV_CLAUDE_CLI_MAX_BUDGET_USD`.
+    ///
+    /// Ignored when `--ai-backend` is not `claude-cli`.
+    #[arg(long, global = true, value_name = "AMOUNT")]
+    pub claude_cli_max_budget_usd: Option<f64>,
+
     /// The main command to execute.
     #[command(subcommand)]
     pub command: Commands,
@@ -85,6 +95,10 @@ impl Cli {
 
         if self.claude_cli_allow_tools {
             std::env::set_var("OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS", "true");
+        }
+
+        if let Some(budget) = self.claude_cli_max_budget_usd {
+            std::env::set_var("OMNI_DEV_CLAUDE_CLI_MAX_BUDGET_USD", format!("{budget}"));
         }
 
         match self.command {
@@ -144,5 +158,37 @@ mod tests {
         .unwrap();
         assert!(matches!(cli.ai_backend, Some(AiBackend::ClaudeCli)));
         assert!(cli.claude_cli_allow_tools);
+    }
+
+    #[test]
+    fn parses_max_budget_usd_flag() {
+        let cli = Cli::try_parse_from([
+            "omni-dev",
+            "--claude-cli-max-budget-usd",
+            "0.50",
+            "help-all",
+        ])
+        .unwrap();
+        assert_eq!(cli.claude_cli_max_budget_usd, Some(0.50));
+    }
+
+    #[test]
+    fn max_budget_usd_absent_is_none() {
+        let cli = Cli::try_parse_from(["omni-dev", "help-all"]).unwrap();
+        assert!(cli.claude_cli_max_budget_usd.is_none());
+    }
+
+    #[test]
+    fn max_budget_usd_rejects_non_numeric() {
+        let result = Cli::try_parse_from([
+            "omni-dev",
+            "--claude-cli-max-budget-usd",
+            "cheap",
+            "help-all",
+        ]);
+        let Err(err) = result else {
+            panic!("expected parse error for non-numeric budget");
+        };
+        assert!(err.to_string().contains("invalid"));
     }
 }

@@ -57,6 +57,13 @@ pub(crate) const BINARY_ENV_VAR: &str = "OMNI_DEV_CLAUDE_CLI_BIN";
 /// should only be used for deliberately tool-capable use cases.**
 pub(crate) const ALLOW_TOOLS_ENV_VAR: &str = "OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS";
 
+/// Env var setting a per-invocation spending cap in USD.
+///
+/// Forwarded to `claude -p --max-budget-usd <amount>`. When the subprocess
+/// exceeds this budget it aborts with an error rather than running away
+/// with cost. Accepts floating-point dollar amounts (e.g. `0.50`).
+pub(crate) const MAX_BUDGET_ENV_VAR: &str = "OMNI_DEV_CLAUDE_CLI_MAX_BUDGET_USD";
+
 /// Defence-in-depth suffix appended to the caller's system prompt.
 ///
 /// Even with tools disabled at runtime, the model "knows" Claude Code tools
@@ -84,6 +91,11 @@ struct JsonOutput {
     api_error_status: Option<i64>,
     #[serde(default)]
     result: String,
+    /// Total billed cost for this invocation in USD (inclusive of cache
+    /// creation, input and output tokens). Surfaced via tracing for cost
+    /// observability regardless of budget cap.
+    #[serde(default)]
+    total_cost_usd: Option<f64>,
 }
 
 /// Claude Code CLI subprocess AI client.
@@ -100,6 +112,9 @@ pub struct ClaudeCliAiClient {
     allow_tools: bool,
     /// Path to the `claude` binary (defaults to `claude` on PATH).
     binary_path: PathBuf,
+    /// Optional per-invocation spending cap in USD (forwarded to
+    /// `claude -p --max-budget-usd`). `None` means no explicit cap.
+    max_budget_usd: Option<f64>,
 }
 
 impl ClaudeCliAiClient {
@@ -114,9 +129,14 @@ impl ClaudeCliAiClient {
             Self::allow_tools_from_env(),
             Self::binary_from_env(),
         )
+        .with_max_budget_usd(Self::max_budget_from_env())
     }
 
     /// Creates a client with explicit configuration. Primarily for tests.
+    ///
+    /// `max_budget_usd` is set separately via [`with_max_budget_usd`] so
+    /// that existing callers of this constructor do not need to update
+    /// when new optional knobs are added.
     #[must_use]
     pub fn new_with_config(
         model: String,
@@ -131,7 +151,15 @@ impl ClaudeCliAiClient {
             stdout_cap,
             allow_tools,
             binary_path,
+            max_budget_usd: None,
         }
+    }
+
+    /// Sets the per-invocation spending cap. Builder-style for ergonomics.
+    #[must_use]
+    pub fn with_max_budget_usd(mut self, budget: Option<f64>) -> Self {
+        self.max_budget_usd = budget;
+        self
     }
 
     fn timeout_from_env() -> Duration {
@@ -163,6 +191,15 @@ impl ClaudeCliAiClient {
             .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
     }
 
+    /// Reads [`MAX_BUDGET_ENV_VAR`] and returns the parsed spending cap.
+    /// Returns `None` when unset or unparseable.
+    fn max_budget_from_env() -> Option<f64> {
+        crate::utils::settings::get_env_var(MAX_BUDGET_ENV_VAR)
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+    }
+
     /// Builds the subprocess [`Command`] without spawning.
     ///
     /// Broken out so tests can inspect the argv / env / cwd via
@@ -187,6 +224,13 @@ impl ClaudeCliAiClient {
 
         if !self.allow_tools {
             cmd.arg("--tools").arg("");
+        }
+
+        if let Some(budget) = self.max_budget_usd {
+            // claude -p expects a decimal dollar amount; use a stable
+            // format that round-trips through its parser (no locale
+            // formatting, no scientific notation).
+            cmd.arg("--max-budget-usd").arg(format!("{budget}"));
         }
 
         cmd.current_dir(cwd);
@@ -348,6 +392,29 @@ impl ClaudeCliAiClient {
                 .into());
             }
         };
+
+        // Cost observability: log the total billed cost whenever the CLI
+        // reports one, regardless of success / failure. Users running at
+        // scale need this to understand spending.
+        if let Some(cost) = envelope.total_cost_usd {
+            info!(
+                total_cost_usd = cost,
+                max_budget_usd = ?self.max_budget_usd,
+                model = %self.model,
+                "claude -p invocation cost"
+            );
+            if let Some(budget) = self.max_budget_usd {
+                if cost > budget {
+                    // claude -p enforces the cap itself, but warn in case
+                    // its enforcement differs from ours.
+                    warn!(
+                        total_cost_usd = cost,
+                        max_budget_usd = budget,
+                        "claude -p reported cost above the configured budget cap"
+                    );
+                }
+            }
+        }
 
         if envelope.is_error {
             return Err(map_api_error(&envelope, &stderr_text));
@@ -777,6 +844,155 @@ mod tests {
             args.contains(&"--tools".to_string()),
             "default (no env) must include --tools \"\": {args:?}"
         );
+    }
+
+    // ── Budget cap tests (MAX_BUDGET_ENV_VAR / with_max_budget_usd) ──
+
+    static MAX_BUDGET_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct MaxBudgetEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Option<String>,
+    }
+
+    impl MaxBudgetEnvGuard {
+        fn new() -> Self {
+            let lock = MAX_BUDGET_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let saved = std::env::var(MAX_BUDGET_ENV_VAR).ok();
+            std::env::remove_var(MAX_BUDGET_ENV_VAR);
+            Self { _lock: lock, saved }
+        }
+
+        fn set(&self, value: &str) {
+            std::env::set_var(MAX_BUDGET_ENV_VAR, value);
+        }
+    }
+
+    impl Drop for MaxBudgetEnvGuard {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(v) => std::env::set_var(MAX_BUDGET_ENV_VAR, v),
+                None => std::env::remove_var(MAX_BUDGET_ENV_VAR),
+            }
+        }
+    }
+
+    #[test]
+    fn max_budget_from_env_unset_is_none() {
+        let _g = MaxBudgetEnvGuard::new();
+        assert!(ClaudeCliAiClient::max_budget_from_env().is_none());
+    }
+
+    #[test]
+    fn max_budget_from_env_parses_decimal() {
+        let g = MaxBudgetEnvGuard::new();
+        g.set("0.50");
+        assert_eq!(ClaudeCliAiClient::max_budget_from_env(), Some(0.50));
+        g.set("2.5");
+        assert_eq!(ClaudeCliAiClient::max_budget_from_env(), Some(2.5));
+    }
+
+    #[test]
+    fn max_budget_from_env_trims_whitespace() {
+        let g = MaxBudgetEnvGuard::new();
+        g.set("  1.25  ");
+        assert_eq!(ClaudeCliAiClient::max_budget_from_env(), Some(1.25));
+    }
+
+    #[test]
+    fn max_budget_from_env_rejects_non_positive() {
+        let g = MaxBudgetEnvGuard::new();
+        g.set("0");
+        assert!(ClaudeCliAiClient::max_budget_from_env().is_none());
+        g.set("-1.0");
+        assert!(ClaudeCliAiClient::max_budget_from_env().is_none());
+    }
+
+    #[test]
+    fn max_budget_from_env_rejects_non_finite() {
+        let g = MaxBudgetEnvGuard::new();
+        g.set("nan");
+        assert!(ClaudeCliAiClient::max_budget_from_env().is_none());
+        g.set("inf");
+        assert!(ClaudeCliAiClient::max_budget_from_env().is_none());
+    }
+
+    #[test]
+    fn max_budget_from_env_rejects_garbage() {
+        let g = MaxBudgetEnvGuard::new();
+        g.set("five dollars");
+        assert!(ClaudeCliAiClient::max_budget_from_env().is_none());
+        g.set("");
+        assert!(ClaudeCliAiClient::max_budget_from_env().is_none());
+    }
+
+    #[test]
+    fn build_command_omits_max_budget_when_unset() {
+        let cli = client_with_defaults("sonnet");
+        let tmp = TempDir::new().unwrap();
+        let cmd = cli.build_command("sys", tmp.path());
+        let args = args_of(&cmd);
+        assert!(
+            !args.contains(&"--max-budget-usd".to_string()),
+            "no budget → argv must omit --max-budget-usd: {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_command_includes_max_budget_when_set() {
+        let cli = client_with_defaults("sonnet").with_max_budget_usd(Some(0.50));
+        let tmp = TempDir::new().unwrap();
+        let cmd = cli.build_command("sys", tmp.path());
+        let args = args_of(&cmd);
+        let idx = args
+            .iter()
+            .position(|a| a == "--max-budget-usd")
+            .expect("argv should contain --max-budget-usd");
+        assert_eq!(args[idx + 1], "0.5");
+    }
+
+    #[test]
+    fn new_picks_up_max_budget_env_var() {
+        let g = MaxBudgetEnvGuard::new();
+        g.set("1.25");
+        let cli = ClaudeCliAiClient::new("sonnet".to_string());
+        let tmp = TempDir::new().unwrap();
+        let cmd = cli.build_command("sys", tmp.path());
+        let args = args_of(&cmd);
+        let idx = args
+            .iter()
+            .position(|a| a == "--max-budget-usd")
+            .expect("argv should contain --max-budget-usd when env set");
+        assert_eq!(args[idx + 1], "1.25");
+    }
+
+    #[test]
+    fn with_max_budget_usd_none_clears_budget() {
+        let cli = client_with_defaults("sonnet")
+            .with_max_budget_usd(Some(1.0))
+            .with_max_budget_usd(None);
+        let tmp = TempDir::new().unwrap();
+        let cmd = cli.build_command("sys", tmp.path());
+        let args = args_of(&cmd);
+        assert!(!args.contains(&"--max-budget-usd".to_string()));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn cost_is_extracted_from_json_envelope_and_run_succeeds() {
+        // Verifies the JSON envelope's total_cost_usd is parsed without
+        // error and the happy path still returns the result.
+        let tmp = TempDir::new().unwrap();
+        let shim = make_shim(
+            &tmp,
+            r#"{"is_error":false,"result":"ok","total_cost_usd":0.0123}"#,
+            0,
+        );
+        let cli = client_with_shim(shim).with_max_budget_usd(Some(1.0));
+        let out = cli.run("sys", "user").await.unwrap();
+        assert_eq!(out, "ok");
     }
 
     #[test]
