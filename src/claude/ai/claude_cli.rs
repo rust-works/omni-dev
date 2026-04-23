@@ -982,6 +982,7 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn cost_is_extracted_from_json_envelope_and_run_succeeds() {
+        let _guard = shim_lock();
         // Verifies the JSON envelope's total_cost_usd is parsed without
         // error and the happy path still returns the result.
         let tmp = TempDir::new().unwrap();
@@ -1093,17 +1094,14 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn runaway_output_yields_timeout_or_cap_error() {
-        use std::os::unix::fs::PermissionsExt;
+        let _guard = shim_lock();
 
         // GNU `yes` on Linux errors on any unknown flag (including our
         // leading `-p`), so we can't use it as a stand-in. Instead write
         // a tiny shell-script shim that ignores argv and floods stdout.
         let tmp = TempDir::new().unwrap();
         let shim = tmp.path().join("runaway-claude");
-        std::fs::write(&shim, "#!/bin/sh\nwhile true; do printf 'y\\n'; done\n").unwrap();
-        let mut perms = std::fs::metadata(&shim).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&shim, perms).unwrap();
+        write_exec_script(&shim, "#!/bin/sh\nwhile true; do printf 'y\\n'; done\n");
 
         let cli = ClaudeCliAiClient::new_with_config(
             "sonnet".to_string(),
@@ -1146,11 +1144,61 @@ mod tests {
 
     // ── End-to-end run() tests via shell-script shims ───────────────
 
+    /// Serializes every test that writes a shim script and then exec's
+    /// it. Belt-and-braces pairing with `write_exec_script`'s sync+close:
+    /// even with each test's FD fully released before exec, high
+    /// parallelism (cargo llvm-cov) could still land a fork() from one
+    /// test while another thread's writable FD was live, letting the
+    /// child inherit it and hit ETXTBSY. See issue #642.
+    #[cfg(unix)]
+    static SHIM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(unix)]
+    fn shim_lock() -> std::sync::MutexGuard<'static, ()> {
+        SHIM_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Exercises the poison-recovery branch of `shim_lock()`: panics in
+    /// a helper thread while holding the guard so the mutex becomes
+    /// poisoned, then verifies a subsequent acquisition still yields a
+    /// usable guard. The mutex remains poisoned for the rest of the
+    /// binary, which is fine because `shim_lock()` recovers via
+    /// `PoisonError::into_inner()`.
+    #[cfg(unix)]
+    #[test]
+    fn shim_lock_recovers_from_poison() {
+        let _ = std::thread::spawn(|| {
+            let _g = shim_lock();
+            panic!("intentional: poisoning SHIM_LOCK for coverage");
+        })
+        .join();
+        let _g = shim_lock();
+    }
+
+    /// Writes an executable script at `path` with the given mode, flushes
+    /// it to disk, and explicitly drops the writable FD before returning.
+    /// Setting mode via `OpenOptions` avoids a second open-for-write that
+    /// `chmod`-after-`fs::write` would cause.
+    #[cfg(unix)]
+    fn write_exec_script(path: &Path, script: &str) {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o755)
+            .open(path)
+            .unwrap();
+        file.write_all(script.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+    }
+
     /// Writes a shell-script shim that drains stdin, emits `body` on
     /// stdout, and exits with `exit_code`. Returns the shim path.
     #[cfg(unix)]
     fn make_shim(tmp: &TempDir, body: &str, exit_code: i32) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let shim = tmp.path().join("claude-shim");
         // `cat > /dev/null` drains stdin so the parent's write completes
         // cleanly rather than hitting EPIPE. `printf %s` avoids backslash
@@ -1161,10 +1209,7 @@ mod tests {
             body.replace('\'', "'\\''"),
             exit_code
         );
-        std::fs::write(&shim, script).unwrap();
-        let mut perms = std::fs::metadata(&shim).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&shim, perms).unwrap();
+        write_exec_script(&shim, &script);
         shim
     }
 
@@ -1182,6 +1227,7 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn success_returns_result_field() {
+        let _guard = shim_lock();
         let tmp = TempDir::new().unwrap();
         let shim = make_shim(&tmp, r#"{"is_error":false,"result":"hello from shim"}"#, 0);
         let out = client_with_shim(shim).run("sys", "user").await.unwrap();
@@ -1191,6 +1237,7 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn success_strips_top_level_yaml_fence() {
+        let _guard = shim_lock();
         let tmp = TempDir::new().unwrap();
         // `result` field is itself JSON-escaped; the wrapped content is
         // ```yaml\namendments: []\n```
@@ -1206,6 +1253,7 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn is_error_401_maps_to_auth_failure() {
+        let _guard = shim_lock();
         let tmp = TempDir::new().unwrap();
         let shim = make_shim(
             &tmp,
@@ -1226,6 +1274,7 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn is_error_403_maps_to_auth_failure() {
+        let _guard = shim_lock();
         let tmp = TempDir::new().unwrap();
         let shim = make_shim(
             &tmp,
@@ -1246,6 +1295,7 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn is_error_404_maps_to_unknown_model() {
+        let _guard = shim_lock();
         let tmp = TempDir::new().unwrap();
         let shim = make_shim(
             &tmp,
@@ -1263,6 +1313,7 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn is_error_429_maps_to_rate_limit() {
+        let _guard = shim_lock();
         let tmp = TempDir::new().unwrap();
         let shim = make_shim(
             &tmp,
@@ -1282,6 +1333,7 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn is_error_500_maps_to_transient() {
+        let _guard = shim_lock();
         let tmp = TempDir::new().unwrap();
         let shim = make_shim(
             &tmp,
@@ -1302,6 +1354,7 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn is_error_unknown_status_maps_to_generic() {
+        let _guard = shim_lock();
         let tmp = TempDir::new().unwrap();
         // No api_error_status → falls through to the generic arm.
         let shim = make_shim(
@@ -1323,6 +1376,7 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn non_zero_exit_with_clean_json_still_errors() {
+        let _guard = shim_lock();
         // is_error=false but process exits 1 — surfaced as a distinct
         // error so the user sees the unexpected exit status.
         let tmp = TempDir::new().unwrap();
