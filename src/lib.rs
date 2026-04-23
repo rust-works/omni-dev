@@ -22,6 +22,7 @@ pub mod atlassian;
 pub mod claude;
 pub mod cli;
 pub mod data;
+pub mod datadog;
 pub mod git;
 #[cfg(feature = "mcp")]
 pub mod mcp;

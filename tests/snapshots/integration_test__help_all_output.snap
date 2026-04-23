@@ -14,6 +14,7 @@ Commands:
   commands   Command template management
   config     Configuration and model information
   atlassian  Atlassian: JIRA and Confluence operations
+  datadog    Datadog: read-only API operations
   help-all   Displays comprehensive help for all commands
   help       Print this message or the help of the given subcommand(s)
 
@@ -1471,6 +1472,76 @@ omni-dev config models show - Shows the embedded models.yaml configuration
 Shows the embedded models.yaml configuration
 
 Usage: show
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev datadog - Datadog: read-only API operations
+
+Datadog: read-only API operations
+
+Usage: datadog <COMMAND>
+
+Commands:
+  auth  Manages Datadog API credentials
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev datadog auth - Manages Datadog API credentials
+
+Manages Datadog API credentials
+
+Usage: auth <COMMAND>
+
+Commands:
+  login   Configures Datadog API credentials interactively
+  logout  Removes Datadog API credentials from settings.json
+  status  Shows the current authentication status
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev datadog auth login - Configures Datadog API credentials interactively
+
+Configures Datadog API credentials interactively
+
+Usage: login
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev datadog auth logout - Removes Datadog API credentials from settings.json
+
+Removes Datadog API credentials from settings.json
+
+Usage: logout
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev datadog auth status - Shows the current authentication status
+
+Shows the current authentication status
+
+Usage: status
 
 Options:
   -h, --help  Print help
