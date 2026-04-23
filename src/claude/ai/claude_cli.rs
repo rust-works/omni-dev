@@ -1144,19 +1144,8 @@ mod tests {
 
     // ── End-to-end run() tests via shell-script shims ───────────────
 
-    /// Serializes every test that writes a shim script and then exec's
-    /// it. Belt-and-braces pairing with `write_exec_script`'s sync+close:
-    /// even with each test's FD fully released before exec, high
-    /// parallelism (cargo llvm-cov) could still land a fork() from one
-    /// test while another thread's writable FD was live, letting the
-    /// child inherit it and hit ETXTBSY. See issue #642.
     #[cfg(unix)]
-    static SHIM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[cfg(unix)]
-    fn shim_lock() -> std::sync::MutexGuard<'static, ()> {
-        SHIM_LOCK.lock().unwrap_or_else(|p| p.into_inner())
-    }
+    use crate::test_support::shim::{shim_lock, write_exec_script};
 
     /// Exercises the poison-recovery branch of `shim_lock()`: panics in
     /// a helper thread while holding the guard so the mutex becomes
@@ -1173,26 +1162,6 @@ mod tests {
         })
         .join();
         let _g = shim_lock();
-    }
-
-    /// Writes an executable script at `path` with the given mode, flushes
-    /// it to disk, and explicitly drops the writable FD before returning.
-    /// Setting mode via `OpenOptions` avoids a second open-for-write that
-    /// `chmod`-after-`fs::write` would cause.
-    #[cfg(unix)]
-    fn write_exec_script(path: &Path, script: &str) {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o755)
-            .open(path)
-            .unwrap();
-        file.write_all(script.as_bytes()).unwrap();
-        file.sync_all().unwrap();
-        drop(file);
     }
 
     /// Writes a shell-script shim that drains stdin, emits `body` on
