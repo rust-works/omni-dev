@@ -6,7 +6,7 @@ omni-dev - A comprehensive development toolkit
 
 A comprehensive development toolkit
 
-Usage: omni-dev <COMMAND>
+Usage: omni-dev [OPTIONS] <COMMAND>
 
 Commands:
   ai         AI operations
@@ -18,8 +18,16 @@ Commands:
   help       Print this message or the help of the given subcommand(s)
 
 Options:
-  -h, --help     Print help
-  -V, --version  Print version
+      --ai-backend <AI_BACKEND>
+          Selects the AI backend used by commands that invoke an AI model [possible values: default, claude-cli]
+      --claude-cli-allow-tools
+          Weakens the `claude-cli` sandbox by allowing the nested `claude -p` session to use its default tool set (Read/Edit/Write/Bash/Glob/Grep and any user-level MCP servers)
+      --claude-cli-max-budget-usd <AMOUNT>
+          Per-invocation spending cap in USD for the `claude-cli` backend
+  -h, --help
+          Print help (see more with '--help')
+  -V, --version
+          Print version
 
 
 ================================================================================

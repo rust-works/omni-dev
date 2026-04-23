@@ -475,6 +475,106 @@ We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.
   - Configure with: `omni-dev atlassian auth login`
 - **Git**: Any modern version
 
+### AI backend selection
+
+By default, `omni-dev` calls the Anthropic API (or Bedrock/OpenAI/Ollama via
+the `USE_*`/`CLAUDE_CODE_USE_BEDROCK` env vars). As an alternative, you can
+route AI calls through an already-authenticated
+[Claude Code CLI](https://github.com/anthropics/claude-code) session, avoiding
+the need for a separate API key:
+
+```bash
+# Per-invocation flag:
+omni-dev --ai-backend claude-cli git commit message twiddle <range>
+
+# Or set persistently:
+export OMNI_DEV_AI_BACKEND=claude-cli
+```
+
+The flag takes precedence over the environment variable.
+
+**Model selection** follows the precedence chain
+`--model` → `CLAUDE_MODEL` → `CLAUDE_CODE_MODEL` → `ANTHROPIC_MODEL` → registry
+default. Short aliases (`sonnet`, `opus`, `haiku`) and full identifiers
+(`claude-sonnet-4-6`) are both accepted and forwarded verbatim to
+`claude -p --model`.
+
+**Sandboxing guarantees.** The `claude -p` subprocess is locked down so it
+behaves as a pure prompt→completion service, not a nested agent with
+filesystem or shell access:
+
+- Built-in tools disabled (`--tools ""`).
+- MCP servers blocked (`--strict-mcp-config` with no config).
+- User/project/local settings ignored (`--setting-sources ""`).
+- Slash commands / skills disabled.
+- Session persistence disabled.
+- Subprocess runs in a fresh temp directory (not your repo root).
+- Environment is scrubbed of `CLAUDE_PROJECT_DIR`, `CLAUDE_CODE_*`, and
+  `CLAUDE_PROJECT_*` before spawn.
+
+**Cost baseline.** Because the `claude -p` session still loads a small system
+prompt, each invocation has a floor cost (~$0.007 Haiku, ~$0.03 Sonnet,
+~$0.15 Opus) before any user content. Back-to-back calls within one hour hit
+the prompt cache and are much cheaper. If you pay per token, compare against
+the default HTTP backend which has no such floor.
+
+**Overrides.** Optional environment variables:
+
+- `OMNI_DEV_CLAUDE_CLI_BIN` — path to the `claude` binary (default: resolved
+  from `PATH`).
+- `OMNI_DEV_CLAUDE_CLI_TIMEOUT_SECS` — subprocess timeout (default: 600).
+- `OMNI_DEV_CLAUDE_CLI_STDOUT_MAX_BYTES` — stdout cap in bytes (default:
+  4 MiB).
+- `OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS` — **escape hatch** (default: disabled).
+  See below.
+- `OMNI_DEV_CLAUDE_CLI_MAX_BUDGET_USD` — per-invocation spending cap in USD
+  (default: none). See below.
+
+The `--beta-header` flag is ignored with this backend (the CLI's `--betas`
+flag is API-key-user-only and has different semantics).
+
+#### Escape hatch: `--claude-cli-allow-tools`
+
+By default the nested `claude -p` session is run with `--tools ""` and
+cannot read, edit, or execute anything on your system. For deliberately
+tool-capable use cases, you can weaken the sandbox:
+
+```bash
+omni-dev --ai-backend claude-cli --claude-cli-allow-tools git branch create pr
+# or:
+export OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS=true
+```
+
+**When enabled**, the nested session uses the CLI's default tool set
+(Read / Edit / Write / Bash / Glob / Grep, plus any MCP servers configured in
+your `~/.claude/settings.json`). This means the session can access your
+repository and run commands. Only enable it when you want that behaviour.
+When active, omni-dev logs a warning on every invocation.
+
+`--strict-mcp-config` and `--setting-sources ""` still apply, so MCP servers
+won't auto-load unless you explicitly allow them via further flags in a
+future slice.
+
+#### Spending cap: `--claude-cli-max-budget-usd`
+
+Pass a per-invocation spending cap in USD:
+
+```bash
+omni-dev --ai-backend claude-cli --claude-cli-max-budget-usd 0.50 \
+  git commit message twiddle HEAD~3..HEAD
+# or:
+export OMNI_DEV_CLAUDE_CLI_MAX_BUDGET_USD=0.50
+```
+
+The value is forwarded to `claude -p --max-budget-usd`. If the nested
+session exceeds the cap, it aborts with an error rather than running away
+with cost. Regardless of whether a cap is set, each invocation's
+`total_cost_usd` is logged at INFO level for observability — run with
+`RUST_LOG=omni_dev=info` to see it.
+
+The cap is ignored when `--ai-backend` is not `claude-cli`. Non-positive,
+non-finite, or non-numeric values are silently treated as no cap.
+
 ## 🐛 Debugging
 
 For troubleshooting and detailed logging, use the `RUST_LOG` environment variable:
