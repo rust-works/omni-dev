@@ -277,7 +277,7 @@ impl ClaudeCliAiClient {
             "Spawning claude -p subprocess"
         );
 
-        let mut child = cmd.spawn().map_err(|e| {
+        let mut child = spawn_with_etxtbsy_retry(&mut cmd).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 anyhow::Error::from(ClaudeError::SubprocessBinaryMissing(
                     self.binary_path.display().to_string(),
@@ -566,6 +566,36 @@ where
         buf.extend_from_slice(&chunk[..n]);
     }
     Ok(buf)
+}
+
+/// `execve` returns `ETXTBSY` (errno 26 on Linux) when *any* process
+/// holds a writable FD on the target binary. Under high test parallelism
+/// a sibling thread can `fork()` between our open-for-write and drop of
+/// the shim FD — `O_CLOEXEC` only closes on `execve`, not on bare
+/// `fork`, so the child inherits our writable FD and the kernel blocks
+/// our own `execve` of that same file until the child execs (or dies).
+/// Retry with bounded exponential backoff. See issue #642.
+async fn spawn_with_etxtbsy_retry(cmd: &mut Command) -> std::io::Result<tokio::process::Child> {
+    const ETXTBSY: i32 = 26;
+    const MAX_ATTEMPTS: u32 = 6;
+
+    let mut backoff = Duration::from_millis(5);
+    for attempt in 1..=MAX_ATTEMPTS {
+        match cmd.spawn() {
+            Ok(child) => return Ok(child),
+            Err(e) if e.raw_os_error() == Some(ETXTBSY) && attempt < MAX_ATTEMPTS => {
+                debug!(
+                    attempt,
+                    backoff_ms = backoff.as_millis() as u64,
+                    "spawn hit ETXTBSY; retrying"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = backoff.saturating_mul(2);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("loop exits via return")
 }
 
 #[cfg(test)]
@@ -1144,19 +1174,8 @@ mod tests {
 
     // ── End-to-end run() tests via shell-script shims ───────────────
 
-    /// Serializes every test that writes a shim script and then exec's
-    /// it. Belt-and-braces pairing with `write_exec_script`'s sync+close:
-    /// even with each test's FD fully released before exec, high
-    /// parallelism (cargo llvm-cov) could still land a fork() from one
-    /// test while another thread's writable FD was live, letting the
-    /// child inherit it and hit ETXTBSY. See issue #642.
     #[cfg(unix)]
-    static SHIM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[cfg(unix)]
-    fn shim_lock() -> std::sync::MutexGuard<'static, ()> {
-        SHIM_LOCK.lock().unwrap_or_else(|p| p.into_inner())
-    }
+    use crate::test_support::shim::{shim_lock, write_exec_script};
 
     /// Exercises the poison-recovery branch of `shim_lock()`: panics in
     /// a helper thread while holding the guard so the mutex becomes
@@ -1173,26 +1192,6 @@ mod tests {
         })
         .join();
         let _g = shim_lock();
-    }
-
-    /// Writes an executable script at `path` with the given mode, flushes
-    /// it to disk, and explicitly drops the writable FD before returning.
-    /// Setting mode via `OpenOptions` avoids a second open-for-write that
-    /// `chmod`-after-`fs::write` would cause.
-    #[cfg(unix)]
-    fn write_exec_script(path: &Path, script: &str) {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o755)
-            .open(path)
-            .unwrap();
-        file.write_all(script.as_bytes()).unwrap();
-        file.sync_all().unwrap();
-        drop(file);
     }
 
     /// Writes a shell-script shim that drains stdin, emits `body` on
@@ -1390,5 +1389,44 @@ mod tests {
             chain.contains("non-zero status"),
             "unexpected error: {chain}"
         );
+    }
+
+    /// Holds a writable FD on a shim long enough for `spawn_with_etxtbsy_retry`
+    /// to hit ETXTBSY, then drops it on a timer so a subsequent retry
+    /// succeeds. Exercises the retry branch on platforms where the kernel
+    /// enforces ETXTBSY (Linux). On platforms that don't, the first spawn
+    /// succeeds and the retry loop simply isn't exercised.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn spawn_retries_through_etxtbsy() {
+        let _guard = shim_lock();
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let shim = tmp.path().join("busy-shim");
+        write_exec_script(
+            &shim,
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"is_error\":false,\"result\":\"late\"}'\nexit 0\n",
+        );
+
+        // Pin a writable FD to the inode. While this lives, `execve` on
+        // the shim returns ETXTBSY.
+        let blocker = std::fs::OpenOptions::new()
+            .write(true)
+            .mode(0o755)
+            .open(&shim)
+            .unwrap();
+
+        // Drop the blocker after a short delay — enough for at least one
+        // ETXTBSY retry to fire.
+        let drop_after = Duration::from_millis(20);
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(drop_after).await;
+            drop(blocker);
+        });
+
+        let out = client_with_shim(shim).run("sys", "user").await.unwrap();
+        release.await.unwrap();
+        assert_eq!(out, "late");
     }
 }
