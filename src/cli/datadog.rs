@@ -4,6 +4,7 @@ pub(crate) mod auth;
 pub(crate) mod format;
 pub(crate) mod helpers;
 pub(crate) mod metrics;
+pub(crate) mod monitor;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -23,6 +24,8 @@ pub enum DatadogSubcommands {
     Auth(auth::AuthCommand),
     /// Queries Datadog metrics.
     Metrics(metrics::MetricsCommand),
+    /// Inspects Datadog monitors.
+    Monitor(monitor::MonitorCommand),
 }
 
 impl DatadogCommand {
@@ -31,6 +34,7 @@ impl DatadogCommand {
         match self.command {
             DatadogSubcommands::Auth(cmd) => cmd.execute().await,
             DatadogSubcommands::Metrics(cmd) => cmd.execute().await,
+            DatadogSubcommands::Monitor(cmd) => cmd.execute().await,
         }
     }
 }
@@ -95,6 +99,60 @@ mod tests {
         };
         // Fails at credential loading, not at dispatch — which is what we're
         // verifying here: the Metrics arm is wired through.
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err.to_string().contains("not configured"));
+    }
+
+    #[tokio::test]
+    async fn datadog_command_dispatches_monitor_get() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Monitor(monitor::MonitorCommand {
+                command: monitor::MonitorSubcommands::Get(monitor::get::GetCommand {
+                    id: 1,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        // Fails at credential loading, not at dispatch — verifies the Monitor
+        // arm is wired through to a leaf command's `execute`.
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err.to_string().contains("not configured"));
+    }
+
+    #[tokio::test]
+    async fn datadog_command_dispatches_monitor_list() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Monitor(monitor::MonitorCommand {
+                command: monitor::MonitorSubcommands::List(monitor::list::ListCommand {
+                    name: None,
+                    tags: None,
+                    monitor_tags: None,
+                    limit: 5,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err.to_string().contains("not configured"));
+    }
+
+    #[tokio::test]
+    async fn datadog_command_dispatches_monitor_search() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Monitor(monitor::MonitorCommand {
+                command: monitor::MonitorSubcommands::Search(monitor::search::SearchCommand {
+                    query: "q".into(),
+                    limit: 5,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
         let err = cmd.execute().await.unwrap_err();
         assert!(err.to_string().contains("not configured"));
     }
