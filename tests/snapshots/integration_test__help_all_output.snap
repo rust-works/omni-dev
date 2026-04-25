@@ -1488,6 +1488,7 @@ Usage: datadog <COMMAND>
 Commands:
   auth     Manages Datadog API credentials
   metrics  Queries Datadog metrics
+  monitor  Inspects Datadog monitors
   help     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1576,6 +1577,72 @@ Options:
       --query <QUERY>    Datadog query string (e.g. `avg:system.cpu.user{*}`)
       --from <FROM>      Start of the query window
       --to <TO>          End of the query window. Defaults to `now` when omitted
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev datadog monitor - Inspects Datadog monitors
+
+Inspects Datadog monitors
+
+Usage: monitor <COMMAND>
+
+Commands:
+  list    Lists monitors with optional name / tag filters
+  get     Fetches a single monitor by id
+  search  Searches monitors by free-text / faceted query
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev datadog monitor get - Fetches a single monitor by id
+
+Fetches a single monitor by id
+
+Usage: get [OPTIONS] <ID>
+
+Arguments:
+  <ID>  Numeric monitor identifier
+
+Options:
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev datadog monitor list - Lists monitors with optional name / tag filters
+
+Lists monitors with optional name / tag filters
+
+Usage: list [OPTIONS]
+
+Options:
+      --name <NAME>                  Filter by substring match on monitor name
+      --tags <TAGS>                  Filter by monitor `tags` (comma-separated `key:value` pairs)
+      --monitor-tags <MONITOR_TAGS>  Filter by `monitor_tags` (comma-separated `key:value` pairs)
+      --limit <LIMIT>                Maximum number of monitors to return [default: 100]
+  -o, --output <OUTPUT>              Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                         Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev datadog monitor search - Searches monitors by free-text / faceted query
+
+Searches monitors by free-text / faceted query
+
+Usage: search [OPTIONS] --query <QUERY>
+
+Options:
+      --query <QUERY>    Search query (e.g. `status:alert AND env:prod`)
+      --limit <LIMIT>    Maximum number of monitors to return [default: 100]
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
