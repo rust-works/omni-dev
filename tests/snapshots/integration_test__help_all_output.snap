@@ -1,5 +1,6 @@
 ---
 source: tests/integration_test.rs
+assertion_line: 269
 expression: help_output
 ---
 omni-dev - A comprehensive development toolkit
@@ -1488,6 +1489,7 @@ Usage: datadog <COMMAND>
 Commands:
   auth       Manages Datadog API credentials
   dashboard  Inspects Datadog dashboards
+  logs       Searches Datadog logs
   metrics    Queries Datadog metrics
   monitor    Inspects Datadog monitors
   help       Print this message or the help of the given subcommand(s)
@@ -1593,6 +1595,40 @@ Usage: list [OPTIONS]
 
 Options:
       --filter-shared    Restricts results to dashboards shared with the wider organisation
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev datadog logs - Searches Datadog logs
+
+Searches Datadog logs
+
+Usage: logs <COMMAND>
+
+Commands:
+  search  Searches log events via `POST /api/v2/logs/events/search`
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev datadog logs search - Searches log events via `POST /api/v2/logs/events/search`
+
+Searches log events via `POST /api/v2/logs/events/search`
+
+Usage: search [OPTIONS] --filter <FILTER>
+
+Options:
+      --filter <FILTER>  Search filter (Datadog logs query language; see Datadog docs)
+      --from <FROM>      Start of the time range (relative shorthand like `15m`/`1h`, `now`, RFC 3339, or Unix epoch seconds) [default: 15m]
+      --to <TO>          End of the time range; defaults to `now` [default: now]
+      --limit <LIMIT>    Maximum events to return (Datadog v2 logs search per-page cap is 1000; cursor pagination across pages is a Phase 2 follow-up) [default: 100]
+      --sort <SORT>      Sort order for returned events [default: timestamp-desc] [possible values: timestamp-asc, timestamp-desc]
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 

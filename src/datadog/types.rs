@@ -412,6 +412,196 @@ impl JsonlSerialize for Dashboard {
     }
 }
 
+/// Sort order for `POST /api/v2/logs/events/search`.
+///
+/// Datadog encodes the order on the wire as the field name optionally
+/// prefixed with `-` for descending. The CLI exposes the friendlier
+/// `timestamp-asc` / `timestamp-desc` value names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortOrder {
+    /// Oldest first — wire form `timestamp`.
+    TimestampAsc,
+    /// Newest first — wire form `-timestamp`.
+    TimestampDesc,
+}
+
+impl SortOrder {
+    /// Returns the wire representation used by the v2 logs API.
+    #[must_use]
+    pub fn as_api_str(self) -> &'static str {
+        match self {
+            Self::TimestampAsc => "timestamp",
+            Self::TimestampDesc => "-timestamp",
+        }
+    }
+}
+
+impl Serialize for SortOrder {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_api_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for SortOrder {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "timestamp" => Ok(Self::TimestampAsc),
+            "-timestamp" => Ok(Self::TimestampDesc),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown sort order: {other}"
+            ))),
+        }
+    }
+}
+
+/// Attributes payload of a log event returned by `POST /api/v2/logs/events/search`.
+///
+/// Datadog wraps each event in a `{ id, type, attributes }` envelope. Only
+/// the fields needed by the table renderer are surfaced as named fields;
+/// callers that need the full event attribute map can re-fetch through
+/// `-o json`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogEventAttributes {
+    /// Event timestamp as Datadog returns it (typically RFC 3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+
+    /// Service name reported by the log producer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+
+    /// Log status (e.g. `info`, `warn`, `error`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+
+    /// Originating host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+
+    /// Free-form log message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+
+    /// Tags applied to the event.
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// A single log event hit returned by `POST /api/v2/logs/events/search`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogEvent {
+    /// Datadog event identifier.
+    pub id: String,
+
+    /// Resource type marker — Datadog returns the literal string `"log"`.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub event_type: Option<String>,
+
+    /// Event payload.
+    #[serde(default)]
+    pub attributes: LogEventAttributes,
+}
+
+impl LogEvent {
+    /// Timestamp string suitable for table output. Falls back to `-`
+    /// when Datadog omits the field.
+    #[must_use]
+    pub fn timestamp_label(&self) -> &str {
+        self.attributes.timestamp.as_deref().unwrap_or("-")
+    }
+
+    /// Service string suitable for table output. Falls back to `-`
+    /// when Datadog omits the field.
+    #[must_use]
+    pub fn service_label(&self) -> &str {
+        self.attributes.service.as_deref().unwrap_or("-")
+    }
+
+    /// Status string suitable for table output. Falls back to `-`
+    /// when Datadog omits the field.
+    #[must_use]
+    pub fn status_label(&self) -> &str {
+        self.attributes.status.as_deref().unwrap_or("-")
+    }
+
+    /// Message string suitable for table output. Falls back to an
+    /// empty string when Datadog omits the field.
+    #[must_use]
+    pub fn message_label(&self) -> &str {
+        self.attributes.message.as_deref().unwrap_or("")
+    }
+}
+
+impl JsonlSerialize for LogEvent {
+    fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
+        write_scalar_jsonl(self, out)
+    }
+}
+
+/// Cursor pagination block returned by `POST /api/v2/logs/events/search`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogSearchPage {
+    /// Cursor token for the next page; absent when no further pages exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+}
+
+/// Search-level metadata returned by `POST /api/v2/logs/events/search`.
+///
+/// Datadog returns additional fields (`elapsed`, `request_id`, `warnings`,
+/// `status`) whose shapes vary; they're preserved as raw `serde_json::Value`
+/// so JSON / YAML output round-trips unchanged.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogSearchMeta {
+    /// Cursor pagination block (absent when no further pages exist).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<LogSearchPage>,
+
+    /// Search status reported by Datadog (e.g. `done`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+
+    /// Elapsed query time as reported by Datadog, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed: Option<i64>,
+
+    /// Datadog request id; useful for support escalations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+
+    /// Optional non-fatal warnings emitted by the search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warnings: Option<serde_json::Value>,
+}
+
+/// Response from `POST /api/v2/logs/events/search`.
+///
+/// Phase 1 ships single-page only; the cursor token is preserved on
+/// `meta.page.after` so a future Phase 2 follow-up can iterate without
+/// changing the wire types.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogSearchResult {
+    /// Events returned by the API.
+    #[serde(default)]
+    pub data: Vec<LogEvent>,
+
+    /// Pagination + status metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<LogSearchMeta>,
+}
+
+impl JsonlSerialize for LogSearchResult {
+    fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
+        write_items_jsonl(self.data.iter(), out)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -940,5 +1130,184 @@ mod tests {
         let json = serde_json::to_string(&d).unwrap();
         let d2: Dashboard = serde_json::from_str(&json).unwrap();
         assert_eq!(d, d2);
+    }
+
+    // ── SortOrder ──────────────────────────────────────────────────
+
+    #[test]
+    fn sort_order_as_api_str_uses_minus_for_desc() {
+        assert_eq!(SortOrder::TimestampAsc.as_api_str(), "timestamp");
+        assert_eq!(SortOrder::TimestampDesc.as_api_str(), "-timestamp");
+    }
+
+    #[test]
+    fn sort_order_serializes_to_api_string() {
+        assert_eq!(
+            serde_json::to_value(SortOrder::TimestampAsc).unwrap(),
+            serde_json::Value::String("timestamp".into())
+        );
+        assert_eq!(
+            serde_json::to_value(SortOrder::TimestampDesc).unwrap(),
+            serde_json::Value::String("-timestamp".into())
+        );
+    }
+
+    #[test]
+    fn sort_order_deserializes_known_values() {
+        let asc: SortOrder = serde_json::from_value(serde_json::json!("timestamp")).unwrap();
+        assert_eq!(asc, SortOrder::TimestampAsc);
+        let desc: SortOrder = serde_json::from_value(serde_json::json!("-timestamp")).unwrap();
+        assert_eq!(desc, SortOrder::TimestampDesc);
+    }
+
+    #[test]
+    fn sort_order_rejects_unknown_value() {
+        let err = serde_json::from_value::<SortOrder>(serde_json::json!("nope")).unwrap_err();
+        assert!(err.to_string().contains("unknown sort order"));
+    }
+
+    #[test]
+    fn sort_order_rejects_non_string_value() {
+        // Exercises the `String::deserialize(...)?` propagation: a JSON
+        // number can't be deserialised as a `String`, so the error short-
+        // circuits before the match-on-content arm runs.
+        let err = serde_json::from_value::<SortOrder>(serde_json::json!(42)).unwrap_err();
+        // serde_json's error for "expected string, got number" mentions
+        // the type name; we don't pin the exact wording.
+        assert!(err.to_string().to_lowercase().contains("string"));
+    }
+
+    // ── LogEvent / LogSearchResult ─────────────────────────────────
+
+    fn sample_log_search_json() -> serde_json::Value {
+        serde_json::json!({
+            "data": [
+                {
+                    "id": "AAAAAA",
+                    "type": "log",
+                    "attributes": {
+                        "timestamp": "2026-04-22T10:00:00.000Z",
+                        "service": "api",
+                        "status": "info",
+                        "host": "web-01",
+                        "message": "request handled",
+                        "tags": ["env:prod"]
+                    }
+                },
+                {
+                    "id": "BBBBBB",
+                    "type": "log",
+                    "attributes": {}
+                }
+            ],
+            "meta": {
+                "page": { "after": "next-cursor" },
+                "status": "done",
+                "elapsed": 23,
+                "request_id": "req-1",
+                "warnings": []
+            }
+        })
+    }
+
+    #[test]
+    fn log_search_result_deserializes_full_envelope() {
+        let r: LogSearchResult = serde_json::from_value(sample_log_search_json()).unwrap();
+        assert_eq!(r.data.len(), 2);
+        assert_eq!(r.data[0].id, "AAAAAA");
+        assert_eq!(r.data[0].event_type.as_deref(), Some("log"));
+        assert_eq!(
+            r.data[0].attributes.timestamp.as_deref(),
+            Some("2026-04-22T10:00:00.000Z")
+        );
+        assert_eq!(r.data[0].attributes.tags, vec!["env:prod"]);
+        assert!(r.data[1].attributes.tags.is_empty());
+        let meta = r.meta.as_ref().unwrap();
+        assert_eq!(
+            meta.page.as_ref().and_then(|p| p.after.as_deref()),
+            Some("next-cursor")
+        );
+        assert_eq!(meta.status.as_deref(), Some("done"));
+        assert_eq!(meta.elapsed, Some(23));
+        assert_eq!(meta.request_id.as_deref(), Some("req-1"));
+    }
+
+    #[test]
+    fn log_search_result_defaults_when_optional_fields_missing() {
+        let r: LogSearchResult = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(r.data.is_empty());
+        assert!(r.meta.is_none());
+    }
+
+    #[test]
+    fn log_event_labels_fall_back_to_dash_or_empty() {
+        let e = LogEvent {
+            id: "x".into(),
+            event_type: None,
+            attributes: LogEventAttributes::default(),
+        };
+        assert_eq!(e.timestamp_label(), "-");
+        assert_eq!(e.service_label(), "-");
+        assert_eq!(e.status_label(), "-");
+        assert_eq!(e.message_label(), "");
+    }
+
+    #[test]
+    fn log_event_labels_use_present_fields() {
+        let e = LogEvent {
+            id: "x".into(),
+            event_type: Some("log".into()),
+            attributes: LogEventAttributes {
+                timestamp: Some("t".into()),
+                service: Some("s".into()),
+                status: Some("info".into()),
+                host: None,
+                message: Some("hello".into()),
+                tags: vec![],
+            },
+        };
+        assert_eq!(e.timestamp_label(), "t");
+        assert_eq!(e.service_label(), "s");
+        assert_eq!(e.status_label(), "info");
+        assert_eq!(e.message_label(), "hello");
+    }
+
+    #[test]
+    fn log_search_result_jsonl_emits_one_line_per_event() {
+        let r: LogSearchResult = serde_json::from_value(sample_log_search_json()).unwrap();
+        let mut buf = Vec::new();
+        r.write_jsonl(&mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out.matches('\n').count(), 2);
+        let lines: Vec<&str> = out.lines().collect();
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(first["id"], "AAAAAA");
+    }
+
+    #[test]
+    fn log_search_result_jsonl_empty_data_emits_nothing() {
+        let r = LogSearchResult::default();
+        let mut buf = Vec::new();
+        r.write_jsonl(&mut buf).unwrap();
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn log_event_jsonl_emits_one_line_per_call() {
+        let r: LogSearchResult = serde_json::from_value(sample_log_search_json()).unwrap();
+        let mut buf = Vec::new();
+        r.data[0].write_jsonl(&mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out.matches('\n').count(), 1);
+        let v: serde_json::Value = serde_json::from_str(out.trim_end()).unwrap();
+        assert_eq!(v["id"], "AAAAAA");
+    }
+
+    #[test]
+    fn log_search_result_roundtrips_through_json() {
+        let r: LogSearchResult = serde_json::from_value(sample_log_search_json()).unwrap();
+        let json = serde_json::to_string(&r).unwrap();
+        let r2: LogSearchResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(r, r2);
     }
 }
