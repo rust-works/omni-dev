@@ -4,6 +4,7 @@ pub(crate) mod auth;
 pub(crate) mod dashboard;
 pub(crate) mod format;
 pub(crate) mod helpers;
+pub(crate) mod logs;
 pub(crate) mod metrics;
 pub(crate) mod monitor;
 
@@ -25,6 +26,8 @@ pub enum DatadogSubcommands {
     Auth(auth::AuthCommand),
     /// Inspects Datadog dashboards.
     Dashboard(dashboard::DashboardCommand),
+    /// Searches Datadog logs.
+    Logs(logs::LogsCommand),
     /// Queries Datadog metrics.
     Metrics(metrics::MetricsCommand),
     /// Inspects Datadog monitors.
@@ -37,6 +40,7 @@ impl DatadogCommand {
         match self.command {
             DatadogSubcommands::Auth(cmd) => cmd.execute().await,
             DatadogSubcommands::Dashboard(cmd) => cmd.execute().await,
+            DatadogSubcommands::Logs(cmd) => cmd.execute().await,
             DatadogSubcommands::Metrics(cmd) => cmd.execute().await,
             DatadogSubcommands::Monitor(cmd) => cmd.execute().await,
         }
@@ -198,6 +202,43 @@ mod tests {
             command: DatadogSubcommands::Dashboard(dashboard::DashboardCommand {
                 command: dashboard::DashboardSubcommands::Get(dashboard::get::GetCommand {
                     id: "abc".into(),
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err.to_string().contains("not configured"));
+    }
+
+    #[test]
+    fn datadog_subcommands_logs_variant() {
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Logs(logs::LogsCommand {
+                command: logs::LogsSubcommands::Search(logs::search::SearchCommand {
+                    filter: "*".into(),
+                    from: "15m".into(),
+                    to: "now".into(),
+                    limit: 10,
+                    sort: logs::search::SortArg::TimestampDesc,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        assert!(matches!(cmd.command, DatadogSubcommands::Logs(_)));
+    }
+
+    #[tokio::test]
+    async fn datadog_command_dispatches_logs_search() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Logs(logs::LogsCommand {
+                command: logs::LogsSubcommands::Search(logs::search::SearchCommand {
+                    filter: "*".into(),
+                    from: "15m".into(),
+                    to: "now".into(),
+                    limit: 10,
+                    sort: logs::search::SortArg::TimestampDesc,
                     output: OutputFormat::Table,
                 }),
             }),
