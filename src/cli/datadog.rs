@@ -1,6 +1,7 @@
 //! Datadog CLI commands (read-only).
 
 pub(crate) mod auth;
+pub(crate) mod dashboard;
 pub(crate) mod format;
 pub(crate) mod helpers;
 pub(crate) mod metrics;
@@ -22,6 +23,8 @@ pub struct DatadogCommand {
 pub enum DatadogSubcommands {
     /// Manages Datadog API credentials.
     Auth(auth::AuthCommand),
+    /// Inspects Datadog dashboards.
+    Dashboard(dashboard::DashboardCommand),
     /// Queries Datadog metrics.
     Metrics(metrics::MetricsCommand),
     /// Inspects Datadog monitors.
@@ -33,6 +36,7 @@ impl DatadogCommand {
     pub async fn execute(self) -> Result<()> {
         match self.command {
             DatadogSubcommands::Auth(cmd) => cmd.execute().await,
+            DatadogSubcommands::Dashboard(cmd) => cmd.execute().await,
             DatadogSubcommands::Metrics(cmd) => cmd.execute().await,
             DatadogSubcommands::Monitor(cmd) => cmd.execute().await,
         }
@@ -149,6 +153,51 @@ mod tests {
                 command: monitor::MonitorSubcommands::Search(monitor::search::SearchCommand {
                     query: "q".into(),
                     limit: 5,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err.to_string().contains("not configured"));
+    }
+
+    #[test]
+    fn datadog_subcommands_dashboard_variant() {
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Dashboard(dashboard::DashboardCommand {
+                command: dashboard::DashboardSubcommands::List(dashboard::list::ListCommand {
+                    filter_shared: false,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        assert!(matches!(cmd.command, DatadogSubcommands::Dashboard(_)));
+    }
+
+    #[tokio::test]
+    async fn datadog_command_dispatches_dashboard_list() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Dashboard(dashboard::DashboardCommand {
+                command: dashboard::DashboardSubcommands::List(dashboard::list::ListCommand {
+                    filter_shared: true,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err.to_string().contains("not configured"));
+    }
+
+    #[tokio::test]
+    async fn datadog_command_dispatches_dashboard_get() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Dashboard(dashboard::DashboardCommand {
+                command: dashboard::DashboardSubcommands::Get(dashboard::get::GetCommand {
+                    id: "abc".into(),
                     output: OutputFormat::Table,
                 }),
             }),
