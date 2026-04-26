@@ -250,6 +250,168 @@ impl JsonlSerialize for MonitorSearchResult {
     }
 }
 
+/// One row of `GET /api/v1/dashboard`'s `dashboards` array.
+///
+/// Datadog identifies dashboards by an opaque string (e.g. `abc-def-ghi`),
+/// not a numeric id. Optional fields are preserved as `Option<_>` so
+/// JSON / YAML output never invents a value the API didn't return.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DashboardSummary {
+    /// Datadog dashboard identifier.
+    pub id: String,
+
+    /// Human-readable title.
+    pub title: String,
+
+    /// Login of the dashboard's author.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_handle: Option<String>,
+
+    /// Web UI URL relative to the Datadog site (e.g. `/dashboard/abc-def-ghi`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+
+    /// ISO 8601 last-modified timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_at: Option<String>,
+
+    /// ISO 8601 creation timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+
+    /// Optional dashboard description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// Whether the dashboard is shared with the wider organisation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_shared: Option<bool>,
+
+    /// Whether the dashboard cannot be edited via the UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_read_only: Option<bool>,
+
+    /// Layout type as reported by Datadog (`ordered` or `free`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout_type: Option<String>,
+}
+
+impl DashboardSummary {
+    /// Author handle for table output. Falls back to `-` when Datadog
+    /// omits the field.
+    #[must_use]
+    pub fn author_label(&self) -> &str {
+        self.author_handle.as_deref().unwrap_or("-")
+    }
+
+    /// URL string for table output. Falls back to `-` when Datadog
+    /// omits the field.
+    #[must_use]
+    pub fn url_label(&self) -> &str {
+        self.url.as_deref().unwrap_or("-")
+    }
+}
+
+impl JsonlSerialize for DashboardSummary {
+    fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
+        write_scalar_jsonl(self, out)
+    }
+}
+
+/// Envelope returned by `GET /api/v1/dashboard`.
+///
+/// Datadog returns *all* dashboards in this single response — no
+/// server-side pagination — so the wrapper is a thin newtype kept only
+/// to mirror the on-the-wire shape.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DashboardListResponse {
+    /// Dashboards returned by the API.
+    #[serde(default)]
+    pub dashboards: Vec<DashboardSummary>,
+}
+
+/// A Datadog dashboard returned by `GET /api/v1/dashboard/{id}`.
+///
+/// `widgets` is preserved as a raw `serde_json::Value` because the per-
+/// widget schemas are deeply heterogeneous (timeseries, query value,
+/// note, group, log stream, …) — modelling each variant would explode
+/// the type surface for no CLI gain. This mirrors how the Atlassian
+/// integration treats ADF documents.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Dashboard {
+    /// Datadog dashboard identifier.
+    pub id: String,
+
+    /// Human-readable title.
+    pub title: String,
+
+    /// Optional dashboard description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// Web UI URL relative to the Datadog site.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+
+    /// Login of the dashboard's author.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_handle: Option<String>,
+
+    /// ISO 8601 creation timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+
+    /// ISO 8601 last-modified timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_at: Option<String>,
+
+    /// Layout type as reported by Datadog (`ordered` or `free`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout_type: Option<String>,
+
+    /// Whether the dashboard cannot be edited via the UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_read_only: Option<bool>,
+
+    /// Reflow type for `ordered` dashboards (`auto` or `fixed`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflow_type: Option<String>,
+
+    /// Notification list for the dashboard (raw value).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_list: Option<serde_json::Value>,
+
+    /// Template variables (raw value — schemas vary by variable type).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_variables: Option<serde_json::Value>,
+
+    /// Widget definitions. Preserved as raw JSON; see type docs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub widgets: Option<serde_json::Value>,
+}
+
+impl Dashboard {
+    /// Author handle for table output. Falls back to `-` when Datadog
+    /// omits the field.
+    #[must_use]
+    pub fn author_label(&self) -> &str {
+        self.author_handle.as_deref().unwrap_or("-")
+    }
+
+    /// URL string for table output. Falls back to `-` when Datadog
+    /// omits the field.
+    #[must_use]
+    pub fn url_label(&self) -> &str {
+        self.url.as_deref().unwrap_or("-")
+    }
+}
+
+impl JsonlSerialize for Dashboard {
+    fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
+        write_scalar_jsonl(self, out)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -586,5 +748,197 @@ mod tests {
         let json = serde_json::to_string(&r).unwrap();
         let r2: MonitorSearchResult = serde_json::from_str(&json).unwrap();
         assert_eq!(r, r2);
+    }
+
+    // ── Dashboard / DashboardSummary ───────────────────────────────
+
+    fn sample_dashboard_summary_json() -> serde_json::Value {
+        serde_json::json!({
+            "id": "abc-def-ghi",
+            "title": "Service Overview",
+            "author_handle": "alice@example.com",
+            "url": "/dashboard/abc-def-ghi/service-overview",
+            "modified_at": "2024-02-01T00:00:00.000Z",
+            "created_at": "2024-01-01T00:00:00.000Z",
+            "description": "Top-level service health.",
+            "is_shared": true,
+            "is_read_only": false,
+            "layout_type": "ordered",
+            "deleted": null
+        })
+    }
+
+    fn sample_dashboard_json() -> serde_json::Value {
+        serde_json::json!({
+            "id": "abc-def-ghi",
+            "title": "Service Overview",
+            "description": "Top-level service health.",
+            "url": "/dashboard/abc-def-ghi",
+            "author_handle": "alice@example.com",
+            "created_at": "2024-01-01T00:00:00.000Z",
+            "modified_at": "2024-02-01T00:00:00.000Z",
+            "layout_type": "ordered",
+            "is_read_only": false,
+            "reflow_type": "auto",
+            "notify_list": [],
+            "template_variables": [
+                {"name": "env", "default": "prod"}
+            ],
+            "widgets": [
+                {"id": 1, "definition": {"type": "note", "content": "hello"}}
+            ],
+            "extra_unknown": "ignored"
+        })
+    }
+
+    #[test]
+    fn dashboard_summary_deserializes_full_payload() {
+        let s: DashboardSummary = serde_json::from_value(sample_dashboard_summary_json()).unwrap();
+        assert_eq!(s.id, "abc-def-ghi");
+        assert_eq!(s.title, "Service Overview");
+        assert_eq!(s.author_handle.as_deref(), Some("alice@example.com"));
+        assert_eq!(
+            s.url.as_deref(),
+            Some("/dashboard/abc-def-ghi/service-overview")
+        );
+        assert_eq!(s.is_shared, Some(true));
+        assert_eq!(s.is_read_only, Some(false));
+        assert_eq!(s.layout_type.as_deref(), Some("ordered"));
+    }
+
+    #[test]
+    fn dashboard_summary_defaults_when_optional_fields_missing() {
+        let s: DashboardSummary = serde_json::from_value(serde_json::json!({
+            "id": "x",
+            "title": "y"
+        }))
+        .unwrap();
+        assert_eq!(s.author_handle, None);
+        assert_eq!(s.url, None);
+        assert_eq!(s.is_shared, None);
+        assert_eq!(s.author_label(), "-");
+        assert_eq!(s.url_label(), "-");
+    }
+
+    #[test]
+    fn dashboard_summary_labels_use_present_fields() {
+        let s = DashboardSummary {
+            id: "x".into(),
+            title: "y".into(),
+            author_handle: Some("alice".into()),
+            url: Some("/u".into()),
+            modified_at: None,
+            created_at: None,
+            description: None,
+            is_shared: None,
+            is_read_only: None,
+            layout_type: None,
+        };
+        assert_eq!(s.author_label(), "alice");
+        assert_eq!(s.url_label(), "/u");
+    }
+
+    #[test]
+    fn dashboard_summary_jsonl_emits_one_line_per_call() {
+        let s: DashboardSummary = serde_json::from_value(sample_dashboard_summary_json()).unwrap();
+        let mut buf = Vec::new();
+        s.write_jsonl(&mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out.matches('\n').count(), 1);
+        let v: serde_json::Value = serde_json::from_str(out.trim_end()).unwrap();
+        assert_eq!(v["id"], "abc-def-ghi");
+    }
+
+    #[test]
+    fn dashboard_summary_roundtrips_through_json() {
+        let s: DashboardSummary = serde_json::from_value(sample_dashboard_summary_json()).unwrap();
+        let json = serde_json::to_string(&s).unwrap();
+        let s2: DashboardSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, s2);
+    }
+
+    #[test]
+    fn dashboard_list_response_deserializes_envelope() {
+        let r: DashboardListResponse = serde_json::from_value(serde_json::json!({
+            "dashboards": [
+                sample_dashboard_summary_json(),
+                {"id": "zzz", "title": "Other"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(r.dashboards.len(), 2);
+        assert_eq!(r.dashboards[1].id, "zzz");
+    }
+
+    #[test]
+    fn dashboard_list_response_defaults_to_empty() {
+        let r: DashboardListResponse = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(r.dashboards.is_empty());
+    }
+
+    #[test]
+    fn dashboard_deserializes_full_payload_and_strips_unknowns() {
+        let d: Dashboard = serde_json::from_value(sample_dashboard_json()).unwrap();
+        assert_eq!(d.id, "abc-def-ghi");
+        assert_eq!(d.title, "Service Overview");
+        assert_eq!(d.layout_type.as_deref(), Some("ordered"));
+        assert_eq!(d.reflow_type.as_deref(), Some("auto"));
+        assert!(d.widgets.is_some());
+        assert!(d.template_variables.is_some());
+        assert!(d.notify_list.is_some());
+    }
+
+    #[test]
+    fn dashboard_defaults_when_optional_fields_missing() {
+        let d: Dashboard = serde_json::from_value(serde_json::json!({
+            "id": "x",
+            "title": "y"
+        }))
+        .unwrap();
+        assert!(d.widgets.is_none());
+        assert!(d.notify_list.is_none());
+        assert!(d.template_variables.is_none());
+        assert_eq!(d.author_label(), "-");
+        assert_eq!(d.url_label(), "-");
+    }
+
+    #[test]
+    fn dashboard_labels_use_present_fields() {
+        let d = Dashboard {
+            id: "x".into(),
+            title: "y".into(),
+            description: None,
+            url: Some("/u".into()),
+            author_handle: Some("alice".into()),
+            created_at: None,
+            modified_at: None,
+            layout_type: None,
+            is_read_only: None,
+            reflow_type: None,
+            notify_list: None,
+            template_variables: None,
+            widgets: None,
+        };
+        assert_eq!(d.author_label(), "alice");
+        assert_eq!(d.url_label(), "/u");
+    }
+
+    #[test]
+    fn dashboard_jsonl_emits_one_line_per_call() {
+        let d: Dashboard = serde_json::from_value(sample_dashboard_json()).unwrap();
+        let mut buf = Vec::new();
+        d.write_jsonl(&mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out.matches('\n').count(), 1);
+        let v: serde_json::Value = serde_json::from_str(out.trim_end()).unwrap();
+        assert_eq!(v["id"], "abc-def-ghi");
+    }
+
+    #[test]
+    fn dashboard_roundtrips_through_json() {
+        let d: Dashboard = serde_json::from_value(sample_dashboard_json()).unwrap();
+        let json = serde_json::to_string(&d).unwrap();
+        let d2: Dashboard = serde_json::from_str(&json).unwrap();
+        assert_eq!(d, d2);
     }
 }
