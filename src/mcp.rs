@@ -9,6 +9,7 @@ pub mod atlassian_tools;
 pub mod cancel;
 pub mod config_tools;
 pub mod confluence_tools;
+pub mod datadog_tools;
 pub mod error;
 pub mod git_tools;
 pub mod jira_core_tools;
