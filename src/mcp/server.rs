@@ -39,7 +39,8 @@ impl OmniDevServer {
                 + Self::confluence_tool_router()
                 + Self::atlassian_tool_router()
                 + Self::ai_tool_router()
-                + Self::config_tool_router(),
+                + Self::config_tool_router()
+                + Self::datadog_tool_router(),
         }
     }
 }
@@ -247,6 +248,23 @@ mod tests {
         );
         assert!(from_default.tool_router.has_route("git_view_commits"));
         assert!(from_default.tool_router.has_route("confluence_children"));
+    }
+
+    #[test]
+    fn tool_router_registers_all_datadog_tools() {
+        let server = OmniDevServer::new();
+        for name in [
+            "datadog_auth_status",
+            "datadog_metrics_query",
+            "datadog_monitor_list",
+            "datadog_monitor_get",
+            "datadog_monitor_search",
+            "datadog_dashboard_list",
+            "datadog_dashboard_get",
+            "datadog_logs_search",
+        ] {
+            assert!(server.tool_router.has_route(name), "missing route: {name}");
+        }
     }
 
     #[test]
