@@ -191,7 +191,9 @@ pub struct DatadogEventsListParams {
     /// Comma-separated list of `key:value` tags.
     #[serde(default)]
     pub tags: Option<String>,
-    /// Per-page cap; defaults to 100. Max 1000.
+    /// Maximum events to return. `0` means "fetch every match across
+    /// pages (capped at 10000)"; any non-zero value caps the total at
+    /// that count, paginating underneath as needed. Defaults to 100.
     #[serde(default)]
     pub limit: Option<usize>,
 }
@@ -209,9 +211,9 @@ pub struct DatadogLogsSearchParams {
     /// End of the time range. Defaults to `now` when omitted.
     #[serde(default)]
     pub to: Option<String>,
-    /// Maximum events to return (Datadog v2 logs search per-page cap is
-    /// 1000; cursor pagination across pages is a Phase 2 follow-up).
-    /// Defaults to 100 when omitted.
+    /// Maximum events to return. `0` means "fetch every match across
+    /// pages (capped at 10000)"; any non-zero value caps the total at
+    /// that count, paginating underneath as needed. Defaults to 100.
     #[serde(default)]
     pub limit: Option<usize>,
     /// Sort order: `"timestamp-asc"` (oldest first) or `"timestamp-desc"`
@@ -323,11 +325,11 @@ impl OmniDevServer {
         Ok(CallToolResult::success(vec![Content::text(yaml)]))
     }
 
-    /// Tool: search Datadog log events (single page).
+    /// Tool: search Datadog log events.
     #[tool(
-        description = "Search Datadog log events. Single page only — Datadog v2 logs \
-                       search uses cursor pagination; `limit` is the per-page cap (max 1000). \
-                       `sort` is `timestamp-asc` or `timestamp-desc` (default). \
+        description = "Search Datadog log events. `limit` of 0 (or omitted) auto-paginates \
+                       across cursor pages up to 10000; any non-zero value caps the total at \
+                       that count. `sort` is `timestamp-asc` or `timestamp-desc` (default). \
                        Mirrors `omni-dev datadog logs search`. Output is YAML."
     )]
     pub async fn datadog_logs_search(
@@ -338,11 +340,11 @@ impl OmniDevServer {
         Ok(CallToolResult::success(vec![Content::text(yaml)]))
     }
 
-    /// Tool: list Datadog events (single page).
+    /// Tool: list Datadog events.
     #[tool(
-        description = "List Datadog events. Single page only — Datadog v2 events use \
-                       cursor pagination; `limit` is the per-page cap (max 1000). \
-                       `from` / `to` accept relative shorthand (`15m`, `1h`), `now`, \
+        description = "List Datadog events. `limit` of 0 (or omitted) auto-paginates across \
+                       cursor pages up to 10000; any non-zero value caps the total at that \
+                       count. `from` / `to` accept relative shorthand (`15m`, `1h`), `now`, \
                        RFC 3339, or Unix epoch seconds. Mirrors \
                        `omni-dev datadog events list`. Output is YAML."
     )]
@@ -504,7 +506,7 @@ async fn run_logs_search(params: &DatadogLogsSearchParams) -> Result<String> {
 
     let (client, _site) = create_client()?;
     let result = LogsApi::new(&client)
-        .search(&params.filter, &from_str, &to_str, limit, sort)
+        .search_all(&params.filter, &from_str, &to_str, limit, sort)
         .await?;
     serde_yaml::to_string(&result).context("Failed to serialize logs search results")
 }
@@ -522,7 +524,7 @@ async fn run_events_list(params: &DatadogEventsListParams) -> Result<String> {
         tags: params.tags.clone(),
     };
     let result = EventsApi::new(&client)
-        .list(&filter, &from_str, &to_str, limit)
+        .list_all(&filter, &from_str, &to_str, limit)
         .await?;
     serde_yaml::to_string(&result).context("Failed to serialize events list")
 }
@@ -1042,6 +1044,9 @@ mod tests {
     // ── run_logs_search ───────────────────────────────────────────────
 
     fn logs_body() -> serde_json::Value {
+        // No `meta.page.after` so the auto-paginating wrapper terminates
+        // after a single request; cursor follow-up tests live in
+        // `LogsApi::search_all` unit tests.
         serde_json::json!({
             "data": [
                 {
@@ -1056,7 +1061,7 @@ mod tests {
                     }
                 }
             ],
-            "meta": {"page": {"after": "next"}, "status": "done"}
+            "meta": {"page": {}, "status": "done"}
         })
     }
 
