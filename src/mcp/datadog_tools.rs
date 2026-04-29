@@ -24,6 +24,7 @@ use crate::cli::datadog::helpers::create_client;
 use crate::datadog::auth;
 use crate::datadog::client::DatadogClient;
 use crate::datadog::dashboards_api::{DashboardListFilter, DashboardsApi};
+use crate::datadog::events_api::{EventsApi, EventsListFilter};
 use crate::datadog::logs_api::LogsApi;
 use crate::datadog::metrics_api::MetricsApi;
 use crate::datadog::monitors_api::{MonitorListFilter, MonitorsApi};
@@ -103,6 +104,29 @@ pub struct DatadogDashboardListParams {
 pub struct DatadogDashboardGetParams {
     /// Datadog dashboard identifier (e.g. `abc-def-ghi`).
     pub dashboard_id: String,
+}
+
+/// Parameters for the `datadog_events_list` tool.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct DatadogEventsListParams {
+    /// Datadog events query (e.g. `service:api`).
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// Start of the time range. Defaults to `1h`.
+    #[serde(default)]
+    pub from: Option<String>,
+    /// End of the time range. Defaults to `now`.
+    #[serde(default)]
+    pub to: Option<String>,
+    /// Comma-separated list of source names.
+    #[serde(default)]
+    pub sources: Option<String>,
+    /// Comma-separated list of `key:value` tags.
+    #[serde(default)]
+    pub tags: Option<String>,
+    /// Per-page cap; defaults to 100. Max 1000.
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 /// Parameters for the `datadog_logs_search` tool.
@@ -246,6 +270,22 @@ impl OmniDevServer {
         let yaml = run_logs_search(&params).await.map_err(tool_error)?;
         Ok(CallToolResult::success(vec![Content::text(yaml)]))
     }
+
+    /// Tool: list Datadog events (single page).
+    #[tool(
+        description = "List Datadog events. Single page only — Datadog v2 events use \
+                       cursor pagination; `limit` is the per-page cap (max 1000). \
+                       `from` / `to` accept relative shorthand (`15m`, `1h`), `now`, \
+                       RFC 3339, or Unix epoch seconds. Mirrors \
+                       `omni-dev datadog events list`. Output is YAML."
+    )]
+    pub async fn datadog_events_list(
+        &self,
+        Parameters(params): Parameters<DatadogEventsListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = run_events_list(&params).await.map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
 }
 
 // ── Internal run_* helpers ──────────────────────────────────────────
@@ -330,6 +370,24 @@ async fn run_logs_search(params: &DatadogLogsSearchParams) -> Result<String> {
         .search(&params.filter, &from_str, &to_str, limit, sort)
         .await?;
     serde_yaml::to_string(&result).context("Failed to serialize logs search results")
+}
+
+async fn run_events_list(params: &DatadogEventsListParams) -> Result<String> {
+    let from = params.from.as_deref().unwrap_or("1h");
+    let to = params.to.as_deref().unwrap_or("now");
+    let (from_str, to_str) = resolve_logs_time_range(from, to)?;
+    let limit = params.limit.unwrap_or(100);
+
+    let (client, _site) = create_client()?;
+    let filter = EventsListFilter {
+        query: params.filter.clone(),
+        sources: params.sources.clone(),
+        tags: params.tags.clone(),
+    };
+    let result = EventsApi::new(&client)
+        .list(&filter, &from_str, &to_str, limit)
+        .await?;
+    serde_yaml::to_string(&result).context("Failed to serialize events list")
 }
 
 /// Resolves `--from` / `--to` strings into RFC 3339 timestamps suitable
@@ -1219,9 +1277,10 @@ mod tests {
     // ── Router registration ───────────────────────────────────────────
 
     #[test]
-    fn datadog_tool_router_registers_all_phase1_tools() {
+    fn datadog_tool_router_registers_all_tools() {
         let router = OmniDevServer::datadog_tool_router();
         for name in [
+            // Phase 1
             "datadog_auth_status",
             "datadog_metrics_query",
             "datadog_monitor_list",
@@ -1230,8 +1289,125 @@ mod tests {
             "datadog_dashboard_list",
             "datadog_dashboard_get",
             "datadog_logs_search",
+            // Phase 2
+            "datadog_events_list",
         ] {
             assert!(router.has_route(name), "missing route: {name}");
         }
+    }
+
+    // ── Phase 2: events tests ────────────────────────────────────────
+
+    #[test]
+    fn events_list_params_accepts_empty_object() {
+        let _: DatadogEventsListParams = serde_json::from_str("{}").unwrap();
+    }
+
+    fn events_body() -> serde_json::Value {
+        serde_json::json!({
+            "data": [
+                {
+                    "id": "EV1",
+                    "type": "event",
+                    "attributes": {
+                        "timestamp": "2026-04-22T10:00:00.000Z",
+                        "title": "Deploy",
+                        "source": "github"
+                    }
+                }
+            ]
+        })
+    }
+
+    #[tokio::test]
+    async fn run_events_list_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/events"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(events_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server.uri());
+
+        let yaml = run_events_list(&DatadogEventsListParams {
+            filter: Some("service:api".into()),
+            from: Some("2026-04-22T09:00:00Z".into()),
+            to: Some("2026-04-22T10:00:00Z".into()),
+            sources: None,
+            tags: None,
+            limit: Some(10),
+        })
+        .await
+        .unwrap();
+        assert!(yaml.contains("EV1"));
+        assert!(yaml.contains("Deploy"));
+    }
+
+    #[tokio::test]
+    async fn run_events_list_rejects_invalid_time_range() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        let err = run_events_list(&DatadogEventsListParams {
+            filter: None,
+            from: Some("garbage".into()),
+            to: None,
+            sources: None,
+            tags: None,
+            limit: None,
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("Failed to parse"));
+    }
+
+    #[tokio::test]
+    async fn run_events_list_errors_when_credentials_missing() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        let err = run_events_list(&DatadogEventsListParams {
+            filter: None,
+            from: Some("2026-04-22T09:00:00Z".into()),
+            to: Some("2026-04-22T10:00:00Z".into()),
+            sources: None,
+            tags: None,
+            limit: None,
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("not configured"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn datadog_events_list_handler_success_returns_yaml() {
+        let server_mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/events"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(events_body()))
+            .expect(1)
+            .mount(&server_mock)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server_mock.uri());
+
+        let server = OmniDevServer::new();
+        let result = server
+            .datadog_events_list(Parameters(DatadogEventsListParams {
+                filter: None,
+                from: Some("2026-04-22T09:00:00Z".into()),
+                to: Some("2026-04-22T10:00:00Z".into()),
+                sources: None,
+                tags: None,
+                limit: Some(10),
+            }))
+            .await
+            .unwrap();
+        let body = handler_text(&result);
+        assert!(body.contains("EV1"));
     }
 }
