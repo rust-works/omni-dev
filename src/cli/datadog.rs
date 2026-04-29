@@ -5,6 +5,7 @@ pub(crate) mod dashboard;
 pub(crate) mod events;
 pub(crate) mod format;
 pub(crate) mod helpers;
+pub(crate) mod hosts;
 pub(crate) mod logs;
 pub(crate) mod metrics;
 pub(crate) mod monitor;
@@ -30,6 +31,8 @@ pub enum DatadogSubcommands {
     Dashboard(dashboard::DashboardCommand),
     /// Inspects the Datadog events stream.
     Events(events::EventsCommand),
+    /// Inspects Datadog reporting hosts.
+    Hosts(hosts::HostsCommand),
     /// Searches Datadog logs.
     Logs(logs::LogsCommand),
     /// Queries Datadog metrics.
@@ -47,6 +50,7 @@ impl DatadogCommand {
             DatadogSubcommands::Auth(cmd) => cmd.execute().await,
             DatadogSubcommands::Dashboard(cmd) => cmd.execute().await,
             DatadogSubcommands::Events(cmd) => cmd.execute().await,
+            DatadogSubcommands::Hosts(cmd) => cmd.execute().await,
             DatadogSubcommands::Logs(cmd) => cmd.execute().await,
             DatadogSubcommands::Metrics(cmd) => cmd.execute().await,
             DatadogSubcommands::Monitor(cmd) => cmd.execute().await,
@@ -339,6 +343,39 @@ mod tests {
             command: DatadogSubcommands::Slo(slo::SloCommand {
                 command: slo::SloSubcommands::Get(slo::get::GetCommand {
                     id: "abc".into(),
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err.to_string().contains("not configured"));
+    }
+
+    #[test]
+    fn datadog_subcommands_hosts_variant() {
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Hosts(hosts::HostsCommand {
+                command: hosts::HostsSubcommands::List(hosts::list::ListCommand {
+                    filter: None,
+                    from: None,
+                    limit: 5,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        assert!(matches!(cmd.command, DatadogSubcommands::Hosts(_)));
+    }
+
+    #[tokio::test]
+    async fn datadog_command_dispatches_hosts_list() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Hosts(hosts::HostsCommand {
+                command: hosts::HostsSubcommands::List(hosts::list::ListCommand {
+                    filter: None,
+                    from: None,
+                    limit: 5,
                     output: OutputFormat::Table,
                 }),
             }),

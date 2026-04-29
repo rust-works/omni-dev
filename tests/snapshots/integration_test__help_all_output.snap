@@ -1489,6 +1489,7 @@ Commands:
   auth       Manages Datadog API credentials
   dashboard  Inspects Datadog dashboards
   events     Inspects the Datadog events stream
+  hosts      Inspects Datadog reporting hosts
   logs       Searches Datadog logs
   metrics    Queries Datadog metrics
   monitor    Inspects Datadog monitors
@@ -1633,6 +1634,38 @@ Options:
       --tags <TAGS>        Comma-separated list of `key:value` tags applied to the event
   -o, --output <OUTPUT>    Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help               Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev datadog hosts - Inspects Datadog reporting hosts
+
+Inspects Datadog reporting hosts
+
+Usage: hosts <COMMAND>
+
+Commands:
+  list  Lists hosts via `GET /api/v1/hosts`
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev datadog hosts list - Lists hosts via `GET /api/v1/hosts`
+
+Lists hosts via `GET /api/v1/hosts`
+
+Usage: list [OPTIONS]
+
+Options:
+      --filter <FILTER>  Datadog hosts filter (e.g. `env:prod`)
+      --from <FROM>      Cutoff (Unix epoch seconds); hosts last reporting before this are excluded
+      --limit <LIMIT>    Maximum number of hosts to return; `0` = fetch all (capped at 10000) [default: 100]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================

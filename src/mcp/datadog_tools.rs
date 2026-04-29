@@ -25,6 +25,7 @@ use crate::datadog::auth;
 use crate::datadog::client::DatadogClient;
 use crate::datadog::dashboards_api::{DashboardListFilter, DashboardsApi};
 use crate::datadog::events_api::{EventsApi, EventsListFilter};
+use crate::datadog::hosts_api::{HostsApi, HostsListFilter};
 use crate::datadog::logs_api::LogsApi;
 use crate::datadog::metrics_api::MetricsApi;
 use crate::datadog::monitors_api::{MonitorListFilter, MonitorsApi};
@@ -105,6 +106,21 @@ pub struct DatadogDashboardListParams {
 pub struct DatadogDashboardGetParams {
     /// Datadog dashboard identifier (e.g. `abc-def-ghi`).
     pub dashboard_id: String,
+}
+
+/// Parameters for the `datadog_hosts_list` tool.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct DatadogHostsListParams {
+    /// Datadog hosts filter (e.g. `env:prod`).
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// Cutoff in Unix epoch seconds; hosts last reporting before this
+    /// are excluded.
+    #[serde(default)]
+    pub from: Option<i64>,
+    /// Maximum hosts to return. `0` (or omitted) auto-paginates up to 10000.
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 /// Parameters for the `datadog_slo_list` tool.
@@ -340,6 +356,20 @@ impl OmniDevServer {
         let yaml = run_slo_get(&params.slo_id).await.map_err(tool_error)?;
         Ok(CallToolResult::success(vec![Content::text(yaml)]))
     }
+
+    /// Tool: list Datadog reporting hosts.
+    #[tool(
+        description = "List Datadog reporting hosts. `limit` of 0 (or omitted) \
+                       auto-paginates up to 10000. Mirrors `omni-dev datadog hosts list`. \
+                       Output is YAML."
+    )]
+    pub async fn datadog_hosts_list(
+        &self,
+        Parameters(params): Parameters<DatadogHostsListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = run_hosts_list(&params).await.map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
 }
 
 // ── Internal run_* helpers ──────────────────────────────────────────
@@ -462,6 +492,19 @@ async fn run_slo_get(id: &str) -> Result<String> {
     let (client, _site) = create_client()?;
     let slo = SloApi::new(&client).get(id).await?;
     serde_yaml::to_string(&slo).context("Failed to serialize SLO")
+}
+
+async fn run_hosts_list(params: &DatadogHostsListParams) -> Result<String> {
+    let (client, _site) = create_client()?;
+    let filter = HostsListFilter {
+        filter: params.filter.clone(),
+        from: params.from,
+        ..HostsListFilter::default()
+    };
+    let result = HostsApi::new(&client)
+        .list(&filter, params.limit.unwrap_or(0))
+        .await?;
+    serde_yaml::to_string(&result).context("Failed to serialize hosts list")
 }
 
 /// Resolves `--from` / `--to` strings into RFC 3339 timestamps suitable
@@ -1367,6 +1410,7 @@ mod tests {
             "datadog_events_list",
             "datadog_slo_list",
             "datadog_slo_get",
+            "datadog_hosts_list",
         ] {
             assert!(router.has_route(name), "missing route: {name}");
         }
@@ -1643,5 +1687,96 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.message.contains("not configured"));
+    }
+
+    // ── Phase 2: hosts tests ────────────────────────────────────────
+
+    #[test]
+    fn hosts_list_params_accepts_empty_object() {
+        let _: DatadogHostsListParams = serde_json::from_str("{}").unwrap();
+    }
+
+    fn host_body(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "host_list": [{
+                "name": name,
+                "up": true,
+                "last_reported_time": 1_700_000_000_i64,
+                "apps": ["nginx"]
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn run_hosts_list_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/hosts"))
+            .and(query_param("filter", "env:prod"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(host_body("web-01")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server.uri());
+
+        let yaml = run_hosts_list(&DatadogHostsListParams {
+            filter: Some("env:prod".into()),
+            from: None,
+            limit: Some(5),
+        })
+        .await
+        .unwrap();
+        assert!(yaml.contains("web-01"));
+    }
+
+    #[tokio::test]
+    async fn run_hosts_list_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/hosts"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server.uri());
+
+        let err = run_hosts_list(&DatadogHostsListParams {
+            limit: Some(5),
+            ..DatadogHostsListParams::default()
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("500"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn datadog_hosts_list_handler_success_returns_yaml() {
+        let server_mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/hosts"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(host_body("web-01")))
+            .expect(1)
+            .mount(&server_mock)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server_mock.uri());
+
+        let server = OmniDevServer::new();
+        let result = server
+            .datadog_hosts_list(Parameters(DatadogHostsListParams {
+                limit: Some(5),
+                ..DatadogHostsListParams::default()
+            }))
+            .await
+            .unwrap();
+        let body = handler_text(&result);
+        assert!(body.contains("web-01"));
     }
 }
