@@ -602,6 +602,497 @@ impl JsonlSerialize for LogSearchResult {
     }
 }
 
+// ── Phase 2: events ────────────────────────────────────────────────
+
+/// Attributes payload of an event returned by `GET /api/v2/events`.
+///
+/// Datadog wraps each event in a `{ id, type, attributes }` envelope. The
+/// `attributes` block in turn contains a nested `attributes` map plus
+/// flat fields like `tags`, `timestamp`, and `service`. Only the fields
+/// the CLI uses for table rendering are surfaced as named fields; the
+/// rest round-trips through `extra` so JSON / YAML output stays lossless.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventAttributes {
+    /// Event timestamp as Datadog returns it (RFC 3339 string).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+
+    /// Event title (often the headline shown in the Datadog UI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+
+    /// Free-form event body / description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+
+    /// Source name reported by the event producer (e.g. `aws`, `kubernetes`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+
+    /// Service emitting the event (when applicable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+
+    /// Originating host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+
+    /// Event status (`info`, `warning`, `error`, `success`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+
+    /// Aggregation key — events sharing one collapse in the UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregation_key: Option<String>,
+
+    /// Tags applied to the event.
+    #[serde(default)]
+    pub tags: Vec<String>,
+
+    /// Nested per-source attributes Datadog returns under `attributes.attributes`.
+    /// Preserved as raw JSON because the schema varies by event type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attributes: Option<serde_json::Value>,
+}
+
+/// A single event hit returned by `GET /api/v2/events`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Event {
+    /// Datadog event identifier.
+    pub id: String,
+
+    /// Resource type marker — Datadog returns the literal string `"event"`.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub event_type: Option<String>,
+
+    /// Event payload.
+    #[serde(default)]
+    pub attributes: EventAttributes,
+}
+
+impl Event {
+    /// Timestamp string for table output. Falls back to `-` when unset.
+    #[must_use]
+    pub fn timestamp_label(&self) -> &str {
+        self.attributes.timestamp.as_deref().unwrap_or("-")
+    }
+
+    /// Title string for table output. Falls back to `-` when unset.
+    #[must_use]
+    pub fn title_label(&self) -> &str {
+        self.attributes.title.as_deref().unwrap_or("-")
+    }
+
+    /// Source string for table output. Falls back to `-` when unset.
+    #[must_use]
+    pub fn source_label(&self) -> &str {
+        self.attributes.source.as_deref().unwrap_or("-")
+    }
+
+    /// Host string for table output. Falls back to `-` when unset.
+    #[must_use]
+    pub fn host_label(&self) -> &str {
+        self.attributes.host.as_deref().unwrap_or("-")
+    }
+}
+
+impl JsonlSerialize for Event {
+    fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
+        write_scalar_jsonl(self, out)
+    }
+}
+
+/// Cursor pagination block returned by `GET /api/v2/events`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventsPage {
+    /// Cursor token for the next page; absent when no further pages exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+}
+
+/// Search-level metadata returned by `GET /api/v2/events`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventsMeta {
+    /// Cursor pagination block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<EventsPage>,
+
+    /// Search status reported by Datadog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+
+    /// Datadog request id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+
+    /// Elapsed query time as reported by Datadog, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed: Option<i64>,
+
+    /// Optional non-fatal warnings emitted by the search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warnings: Option<serde_json::Value>,
+}
+
+/// Response from `GET /api/v2/events`.
+///
+/// Phase 2 ships single-page only; the cursor token is preserved on
+/// `meta.page.after` for callers that need to iterate manually.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventsResponse {
+    /// Events returned by the API.
+    #[serde(default)]
+    pub data: Vec<Event>,
+
+    /// Pagination + status metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<EventsMeta>,
+
+    /// Cursor / self link block (preserved as raw JSON for round-trip).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub links: Option<serde_json::Value>,
+}
+
+impl JsonlSerialize for EventsResponse {
+    fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
+        write_items_jsonl(self.data.iter(), out)
+    }
+}
+
+// ── Phase 2: SLOs ──────────────────────────────────────────────────
+
+/// A Datadog Service Level Objective as returned by `GET /api/v1/slo`
+/// and `GET /api/v1/slo/{id}`.
+///
+/// The `query` and `thresholds` shapes vary by SLO type (metric / monitor
+/// / time-slice), so they're preserved as raw `serde_json::Value` to keep
+/// JSON / YAML output lossless without pulling Datadog's variant schemas
+/// into the type surface.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Slo {
+    /// Datadog SLO identifier.
+    pub id: String,
+
+    /// Human-readable name.
+    pub name: String,
+
+    /// SLO type as reported by Datadog (`metric`, `monitor`, `time_slice`).
+    #[serde(rename = "type")]
+    pub slo_type: String,
+
+    /// Query specification (raw — schema differs per SLO type).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<serde_json::Value>,
+
+    /// Target threshold definitions (raw — list of objects).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thresholds: Option<serde_json::Value>,
+
+    /// Tags applied to the SLO.
+    #[serde(default)]
+    pub tags: Vec<String>,
+
+    /// Underlying monitor ids (for monitor SLOs).
+    #[serde(default)]
+    pub monitor_ids: Vec<i64>,
+
+    /// Tags propagated from underlying monitors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor_tags: Option<Vec<String>>,
+
+    /// Optional description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// Creation timestamp (Datadog returns Unix epoch seconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
+
+    /// Last-modified timestamp (Datadog returns Unix epoch seconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_at: Option<i64>,
+
+    /// Creator (raw object).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator: Option<serde_json::Value>,
+
+    /// Optional grouping facets (raw — present for multi-group SLOs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub groups: Option<serde_json::Value>,
+
+    /// Configured alert ids (raw — list of integers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_alert_ids: Option<serde_json::Value>,
+}
+
+impl JsonlSerialize for Slo {
+    fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
+        write_scalar_jsonl(self, out)
+    }
+}
+
+/// Response envelope for `GET /api/v1/slo`.
+///
+/// `errors` is populated when Datadog rejects part of the request; the
+/// list façade surfaces those as a hard failure.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SloListResponse {
+    /// SLOs returned by the API.
+    #[serde(default)]
+    pub data: Vec<Slo>,
+
+    /// Optional non-fatal error list (raw — populated under partial failure).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<serde_json::Value>,
+
+    /// Optional non-fatal error list (per Datadog's plural variant).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub errors: Option<Vec<String>>,
+}
+
+/// Response envelope for `GET /api/v1/slo/{id}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SloGetResponse {
+    /// The SLO returned by the API.
+    pub data: Slo,
+
+    /// Optional non-fatal error block (raw).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<serde_json::Value>,
+
+    /// Optional non-fatal error list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub errors: Option<Vec<String>>,
+}
+
+// ── Phase 2: hosts ─────────────────────────────────────────────────
+
+/// A reporting host as returned by `GET /api/v1/hosts`.
+///
+/// Datadog returns dozens of fields per host; only the ones surfaced by
+/// the table renderer are typed. `meta`, `metrics`, and `tags_by_source`
+/// are preserved as raw JSON for `-o json/yaml` output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Host {
+    /// Hostname as reported by the agent.
+    pub name: String,
+
+    /// Alternate names (e.g. EC2 instance id, FQDN).
+    #[serde(default)]
+    pub aliases: Vec<String>,
+
+    /// Apps (integrations) reporting on this host.
+    #[serde(default)]
+    pub apps: Vec<String>,
+
+    /// Tag map keyed by source (raw — schema is `{ source: [tag, ...] }`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags_by_source: Option<serde_json::Value>,
+
+    /// Whether the host is currently reporting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub up: Option<bool>,
+
+    /// Last time the host reported, in Unix epoch seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reported_time: Option<i64>,
+
+    /// Sources Datadog has data from (e.g. `agent`, `aws`).
+    #[serde(default)]
+    pub sources: Vec<String>,
+
+    /// Whether the host is currently muted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_muted: Option<bool>,
+
+    /// Optional mute timeout (epoch seconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mute_timeout: Option<i64>,
+
+    /// Datadog-internal numeric host id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<i64>,
+
+    /// Reporting hostname (occasionally distinct from `name`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_name: Option<String>,
+
+    /// Per-source meta block (raw).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
+
+    /// Per-host metrics block (raw).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<serde_json::Value>,
+}
+
+impl Host {
+    /// `up` rendered as `yes` / `no` / `-` for the bespoke table view.
+    #[must_use]
+    pub fn up_label(&self) -> &'static str {
+        match self.up {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "-",
+        }
+    }
+}
+
+impl JsonlSerialize for Host {
+    fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
+        write_scalar_jsonl(self, out)
+    }
+}
+
+/// Response envelope for `GET /api/v1/hosts`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostsResponse {
+    /// Hosts returned in the current page.
+    #[serde(default)]
+    pub host_list: Vec<Host>,
+
+    /// Number of hosts in the current response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_returned: Option<i64>,
+
+    /// Total number of hosts matching the query across all pages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_matching: Option<i64>,
+}
+
+impl JsonlSerialize for HostsResponse {
+    fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
+        write_items_jsonl(self.host_list.iter(), out)
+    }
+}
+
+// ── Phase 2: downtimes ─────────────────────────────────────────────
+
+/// A scheduled downtime as returned by `GET /api/v1/downtime`.
+///
+/// `recurrence` is preserved as raw JSON because Datadog encodes it as
+/// either `null`, an object, or an array of objects depending on the
+/// downtime kind.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Downtime {
+    /// Datadog downtime identifier.
+    pub id: i64,
+
+    /// Scope tags the downtime applies to (e.g. `["env:prod"]`).
+    #[serde(default)]
+    pub scope: Vec<String>,
+
+    /// Optional monitor tags filter.
+    #[serde(default)]
+    pub monitor_tags: Vec<String>,
+
+    /// Start time (epoch seconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<i64>,
+
+    /// End time (epoch seconds). Absent for indefinite downtimes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<i64>,
+
+    /// Notification message body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+
+    /// Whether the downtime is currently active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<bool>,
+
+    /// Whether the downtime has been disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled: Option<bool>,
+
+    /// Underlying monitor id (for single-monitor downtimes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor_id: Option<i64>,
+
+    /// Recurrence rule (raw — null / object / array).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recurrence: Option<serde_json::Value>,
+
+    /// Creation timestamp (epoch seconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<i64>,
+
+    /// Last-modified timestamp (epoch seconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified: Option<i64>,
+
+    /// Creator user id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator_id: Option<i64>,
+
+    /// Parent downtime id (for child downtimes generated from a recurrence).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<i64>,
+
+    /// Timezone for the downtime schedule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+}
+
+impl Downtime {
+    /// Joins `scope` tags with commas, falling back to `*` for empty
+    /// scope (the convention Datadog's UI uses for "all").
+    #[must_use]
+    pub fn scope_label(&self) -> String {
+        if self.scope.is_empty() {
+            "*".to_string()
+        } else {
+            self.scope.join(",")
+        }
+    }
+
+    /// Message for table output (single-line, falling back to `-`).
+    #[must_use]
+    pub fn message_label(&self) -> &str {
+        self.message.as_deref().unwrap_or("-")
+    }
+
+    /// Monitor id for table output (formatted, fallback `-`).
+    #[must_use]
+    pub fn monitor_label(&self) -> String {
+        self.monitor_id
+            .map_or_else(|| "-".to_string(), |id| id.to_string())
+    }
+}
+
+impl JsonlSerialize for Downtime {
+    fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
+        write_scalar_jsonl(self, out)
+    }
+}
+
+// ── Phase 2: metric catalog ────────────────────────────────────────
+
+/// Response from `GET /api/v1/metrics`.
+///
+/// Datadog returns a flat array of metric names. The optional `from`
+/// echoes back the requested time anchor.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MetricCatalogResponse {
+    /// Echo of the requested `from` (Unix epoch seconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<i64>,
+
+    /// Metric names returned by the API.
+    #[serde(default)]
+    pub metrics: Vec<String>,
+}
+
+impl JsonlSerialize for MetricCatalogResponse {
+    fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
+        for m in &self.metrics {
+            write_scalar_jsonl(m, out)?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1309,5 +1800,454 @@ mod tests {
         let json = serde_json::to_string(&r).unwrap();
         let r2: LogSearchResult = serde_json::from_str(&json).unwrap();
         assert_eq!(r, r2);
+    }
+
+    // ── Phase 2: Event / EventsResponse ────────────────────────────
+
+    fn sample_events_json() -> serde_json::Value {
+        serde_json::json!({
+            "data": [
+                {
+                    "id": "EV1",
+                    "type": "event",
+                    "attributes": {
+                        "timestamp": "2026-04-22T10:00:00.000Z",
+                        "title": "Deploy",
+                        "text": "shipped v1.2.3",
+                        "source": "github",
+                        "service": "api",
+                        "host": "web-01",
+                        "status": "success",
+                        "aggregation_key": "deploy-1",
+                        "tags": ["env:prod"],
+                        "attributes": {"sha": "abc123"}
+                    }
+                },
+                {
+                    "id": "EV2",
+                    "type": "event",
+                    "attributes": {}
+                }
+            ],
+            "meta": {
+                "page": {"after": "next-cursor"},
+                "status": "done",
+                "request_id": "r-1",
+                "elapsed": 7,
+                "warnings": []
+            },
+            "links": {"self": "/api/v2/events"}
+        })
+    }
+
+    #[test]
+    fn events_response_deserializes_full_envelope() {
+        let r: EventsResponse = serde_json::from_value(sample_events_json()).unwrap();
+        assert_eq!(r.data.len(), 2);
+        assert_eq!(r.data[0].id, "EV1");
+        assert_eq!(r.data[0].event_type.as_deref(), Some("event"));
+        assert_eq!(r.data[0].attributes.title.as_deref(), Some("Deploy"));
+        assert_eq!(r.data[0].attributes.tags, vec!["env:prod"]);
+        assert!(r.data[0].attributes.attributes.is_some());
+        let meta = r.meta.as_ref().unwrap();
+        assert_eq!(
+            meta.page.as_ref().and_then(|p| p.after.as_deref()),
+            Some("next-cursor")
+        );
+        assert_eq!(meta.elapsed, Some(7));
+        assert_eq!(meta.request_id.as_deref(), Some("r-1"));
+        assert!(r.links.is_some());
+    }
+
+    #[test]
+    fn events_response_defaults_when_optional_fields_missing() {
+        let r: EventsResponse = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(r.data.is_empty());
+        assert!(r.meta.is_none());
+        assert!(r.links.is_none());
+    }
+
+    #[test]
+    fn event_labels_fall_back_to_dash() {
+        let e = Event {
+            id: "x".into(),
+            event_type: None,
+            attributes: EventAttributes::default(),
+        };
+        assert_eq!(e.timestamp_label(), "-");
+        assert_eq!(e.title_label(), "-");
+        assert_eq!(e.source_label(), "-");
+        assert_eq!(e.host_label(), "-");
+    }
+
+    #[test]
+    fn event_labels_use_present_fields() {
+        let r: EventsResponse = serde_json::from_value(sample_events_json()).unwrap();
+        let e = &r.data[0];
+        assert_eq!(e.timestamp_label(), "2026-04-22T10:00:00.000Z");
+        assert_eq!(e.title_label(), "Deploy");
+        assert_eq!(e.source_label(), "github");
+        assert_eq!(e.host_label(), "web-01");
+    }
+
+    #[test]
+    fn events_response_jsonl_emits_one_line_per_event() {
+        let r: EventsResponse = serde_json::from_value(sample_events_json()).unwrap();
+        let mut buf = Vec::new();
+        r.write_jsonl(&mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out.matches('\n').count(), 2);
+        let first: serde_json::Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+        assert_eq!(first["id"], "EV1");
+    }
+
+    #[test]
+    fn event_jsonl_emits_one_line_per_call() {
+        let r: EventsResponse = serde_json::from_value(sample_events_json()).unwrap();
+        let mut buf = Vec::new();
+        r.data[0].write_jsonl(&mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out.matches('\n').count(), 1);
+    }
+
+    #[test]
+    fn events_response_roundtrips_through_json() {
+        let r: EventsResponse = serde_json::from_value(sample_events_json()).unwrap();
+        let json = serde_json::to_string(&r).unwrap();
+        let r2: EventsResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(r, r2);
+    }
+
+    // ── Phase 2: Slo / Slo*Response ────────────────────────────────
+
+    fn sample_slo_json() -> serde_json::Value {
+        serde_json::json!({
+            "id": "abc-def",
+            "name": "API latency p95",
+            "type": "metric",
+            "query": {"numerator": "sum:requests.success{*}.as_count()", "denominator": "sum:requests{*}.as_count()"},
+            "thresholds": [{"timeframe": "30d", "target": 99.9}],
+            "tags": ["team:sre"],
+            "monitor_ids": [1_i64, 2_i64],
+            "monitor_tags": ["severity:high"],
+            "description": "Latency under 200ms",
+            "created_at": 1_700_000_000_i64,
+            "modified_at": 1_700_000_500_i64,
+            "creator": {"name": "Alice"},
+            "configured_alert_ids": [10_i64],
+            "groups": ["env:prod"],
+            "extra_unknown": "ignored"
+        })
+    }
+
+    #[test]
+    fn slo_deserializes_full_payload_and_strips_unknowns() {
+        let s: Slo = serde_json::from_value(sample_slo_json()).unwrap();
+        assert_eq!(s.id, "abc-def");
+        assert_eq!(s.name, "API latency p95");
+        assert_eq!(s.slo_type, "metric");
+        assert_eq!(s.tags, vec!["team:sre"]);
+        assert_eq!(s.monitor_ids, vec![1, 2]);
+        assert_eq!(
+            s.monitor_tags.as_deref(),
+            Some(&["severity:high".to_string()][..])
+        );
+        assert!(s.query.is_some());
+        assert!(s.thresholds.is_some());
+        assert!(s.creator.is_some());
+        assert!(s.configured_alert_ids.is_some());
+        assert!(s.groups.is_some());
+    }
+
+    #[test]
+    fn slo_defaults_when_optional_fields_missing() {
+        let s: Slo = serde_json::from_value(serde_json::json!({
+            "id": "x", "name": "y", "type": "monitor"
+        }))
+        .unwrap();
+        assert!(s.tags.is_empty());
+        assert!(s.monitor_ids.is_empty());
+        assert!(s.query.is_none());
+        assert!(s.thresholds.is_none());
+        assert!(s.monitor_tags.is_none());
+    }
+
+    #[test]
+    fn slo_jsonl_emits_one_line_per_call() {
+        let s: Slo = serde_json::from_value(sample_slo_json()).unwrap();
+        let mut buf = Vec::new();
+        s.write_jsonl(&mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out.matches('\n').count(), 1);
+        let v: serde_json::Value = serde_json::from_str(out.trim_end()).unwrap();
+        assert_eq!(v["id"], "abc-def");
+        assert_eq!(v["type"], "metric");
+    }
+
+    #[test]
+    fn slo_list_response_deserializes_envelope() {
+        let r: SloListResponse = serde_json::from_value(serde_json::json!({
+            "data": [sample_slo_json()],
+            "errors": ["soft warning"]
+        }))
+        .unwrap();
+        assert_eq!(r.data.len(), 1);
+        assert_eq!(r.errors.as_deref(), Some(&["soft warning".to_string()][..]));
+    }
+
+    #[test]
+    fn slo_list_response_defaults_to_empty() {
+        let r: SloListResponse = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(r.data.is_empty());
+        assert!(r.errors.is_none());
+        assert!(r.error.is_none());
+    }
+
+    #[test]
+    fn slo_get_response_deserializes_envelope() {
+        let r: SloGetResponse = serde_json::from_value(serde_json::json!({
+            "data": sample_slo_json()
+        }))
+        .unwrap();
+        assert_eq!(r.data.id, "abc-def");
+        assert!(r.errors.is_none());
+    }
+
+    #[test]
+    fn slo_roundtrips_through_json() {
+        let s: Slo = serde_json::from_value(sample_slo_json()).unwrap();
+        let json = serde_json::to_string(&s).unwrap();
+        let s2: Slo = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, s2);
+    }
+
+    // ── Phase 2: Host / HostsResponse ──────────────────────────────
+
+    fn sample_host_json() -> serde_json::Value {
+        serde_json::json!({
+            "name": "web-01",
+            "aliases": ["i-1234abcd", "web-01.example"],
+            "apps": ["nginx", "ntp"],
+            "tags_by_source": {"Datadog": ["env:prod"]},
+            "up": true,
+            "last_reported_time": 1_700_000_000_i64,
+            "sources": ["agent", "aws"],
+            "is_muted": false,
+            "mute_timeout": null,
+            "id": 99_i64,
+            "host_name": "web-01.example",
+            "meta": {"platform": "linux"},
+            "metrics": {"load": 0.5}
+        })
+    }
+
+    #[test]
+    fn host_deserializes_full_payload() {
+        let h: Host = serde_json::from_value(sample_host_json()).unwrap();
+        assert_eq!(h.name, "web-01");
+        assert_eq!(h.aliases.len(), 2);
+        assert_eq!(h.apps, vec!["nginx", "ntp"]);
+        assert_eq!(h.up, Some(true));
+        assert_eq!(h.last_reported_time, Some(1_700_000_000));
+        assert_eq!(h.sources, vec!["agent", "aws"]);
+        assert_eq!(h.is_muted, Some(false));
+        assert_eq!(h.id, Some(99));
+        assert!(h.meta.is_some());
+    }
+
+    #[test]
+    fn host_up_label_renders_yes_no_dash() {
+        let mut h: Host = serde_json::from_value(sample_host_json()).unwrap();
+        assert_eq!(h.up_label(), "yes");
+        h.up = Some(false);
+        assert_eq!(h.up_label(), "no");
+        h.up = None;
+        assert_eq!(h.up_label(), "-");
+    }
+
+    #[test]
+    fn host_defaults_when_optional_fields_missing() {
+        let h: Host = serde_json::from_value(serde_json::json!({"name": "x"})).unwrap();
+        assert!(h.aliases.is_empty());
+        assert!(h.apps.is_empty());
+        assert!(h.up.is_none());
+        assert_eq!(h.up_label(), "-");
+    }
+
+    #[test]
+    fn host_jsonl_emits_one_line_per_call() {
+        let h: Host = serde_json::from_value(sample_host_json()).unwrap();
+        let mut buf = Vec::new();
+        h.write_jsonl(&mut buf).unwrap();
+        assert_eq!(String::from_utf8(buf).unwrap().matches('\n').count(), 1);
+    }
+
+    #[test]
+    fn hosts_response_deserializes_envelope() {
+        let r: HostsResponse = serde_json::from_value(serde_json::json!({
+            "host_list": [sample_host_json()],
+            "total_returned": 1_i64,
+            "total_matching": 1_i64
+        }))
+        .unwrap();
+        assert_eq!(r.host_list.len(), 1);
+        assert_eq!(r.total_returned, Some(1));
+        assert_eq!(r.total_matching, Some(1));
+    }
+
+    #[test]
+    fn hosts_response_defaults_to_empty() {
+        let r: HostsResponse = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(r.host_list.is_empty());
+        assert!(r.total_returned.is_none());
+    }
+
+    #[test]
+    fn hosts_response_jsonl_emits_one_line_per_host() {
+        let r: HostsResponse = serde_json::from_value(serde_json::json!({
+            "host_list": [sample_host_json(), sample_host_json()],
+            "total_returned": 2_i64,
+            "total_matching": 2_i64
+        }))
+        .unwrap();
+        let mut buf = Vec::new();
+        r.write_jsonl(&mut buf).unwrap();
+        assert_eq!(String::from_utf8(buf).unwrap().matches('\n').count(), 2);
+    }
+
+    #[test]
+    fn hosts_response_jsonl_empty_emits_nothing() {
+        let r = HostsResponse::default();
+        let mut buf = Vec::new();
+        r.write_jsonl(&mut buf).unwrap();
+        assert!(buf.is_empty());
+    }
+
+    // ── Phase 2: Downtime ──────────────────────────────────────────
+
+    fn sample_downtime_json() -> serde_json::Value {
+        serde_json::json!({
+            "id": 12345_i64,
+            "scope": ["env:prod", "team:sre"],
+            "monitor_tags": ["severity:high"],
+            "start": 1_700_000_000_i64,
+            "end": 1_700_000_300_i64,
+            "message": "Maintenance window",
+            "active": true,
+            "disabled": false,
+            "monitor_id": 6789_i64,
+            "recurrence": {"type": "weeks", "period": 1},
+            "created": 1_699_999_000_i64,
+            "modified": 1_699_999_500_i64,
+            "creator_id": 42_i64,
+            "parent_id": null,
+            "timezone": "UTC"
+        })
+    }
+
+    #[test]
+    fn downtime_deserializes_full_payload() {
+        let d: Downtime = serde_json::from_value(sample_downtime_json()).unwrap();
+        assert_eq!(d.id, 12345);
+        assert_eq!(d.scope, vec!["env:prod", "team:sre"]);
+        assert_eq!(d.monitor_tags, vec!["severity:high"]);
+        assert_eq!(d.message.as_deref(), Some("Maintenance window"));
+        assert_eq!(d.active, Some(true));
+        assert_eq!(d.monitor_id, Some(6789));
+        assert!(d.recurrence.is_some());
+        assert_eq!(d.timezone.as_deref(), Some("UTC"));
+    }
+
+    #[test]
+    fn downtime_defaults_when_optional_fields_missing() {
+        let d: Downtime = serde_json::from_value(serde_json::json!({
+            "id": 1_i64
+        }))
+        .unwrap();
+        assert!(d.scope.is_empty());
+        assert!(d.monitor_tags.is_empty());
+        assert!(d.message.is_none());
+        assert!(d.recurrence.is_none());
+    }
+
+    #[test]
+    fn downtime_scope_label_joins_or_falls_back_to_star() {
+        let d1: Downtime = serde_json::from_value(sample_downtime_json()).unwrap();
+        assert_eq!(d1.scope_label(), "env:prod,team:sre");
+        let d2: Downtime = serde_json::from_value(serde_json::json!({"id": 1_i64})).unwrap();
+        assert_eq!(d2.scope_label(), "*");
+    }
+
+    #[test]
+    fn downtime_message_label_falls_back_to_dash() {
+        let d: Downtime = serde_json::from_value(serde_json::json!({"id": 1_i64})).unwrap();
+        assert_eq!(d.message_label(), "-");
+        let d_with: Downtime =
+            serde_json::from_value(serde_json::json!({"id": 1_i64, "message": "m"})).unwrap();
+        assert_eq!(d_with.message_label(), "m");
+    }
+
+    #[test]
+    fn downtime_monitor_label_renders_id_or_dash() {
+        let d_with: Downtime =
+            serde_json::from_value(serde_json::json!({"id": 1_i64, "monitor_id": 99_i64})).unwrap();
+        assert_eq!(d_with.monitor_label(), "99");
+        let d_without: Downtime = serde_json::from_value(serde_json::json!({"id": 1_i64})).unwrap();
+        assert_eq!(d_without.monitor_label(), "-");
+    }
+
+    #[test]
+    fn downtime_jsonl_emits_one_line_per_call() {
+        let d: Downtime = serde_json::from_value(sample_downtime_json()).unwrap();
+        let mut buf = Vec::new();
+        d.write_jsonl(&mut buf).unwrap();
+        assert_eq!(String::from_utf8(buf).unwrap().matches('\n').count(), 1);
+    }
+
+    #[test]
+    fn downtime_roundtrips_through_json() {
+        let d: Downtime = serde_json::from_value(sample_downtime_json()).unwrap();
+        let json = serde_json::to_string(&d).unwrap();
+        let d2: Downtime = serde_json::from_str(&json).unwrap();
+        assert_eq!(d, d2);
+    }
+
+    // ── Phase 2: MetricCatalogResponse ─────────────────────────────
+
+    #[test]
+    fn metric_catalog_response_deserializes_full_payload() {
+        let r: MetricCatalogResponse = serde_json::from_value(serde_json::json!({
+            "from": 1_700_000_000_i64,
+            "metrics": ["system.cpu.user", "system.cpu.idle"]
+        }))
+        .unwrap();
+        assert_eq!(r.from, Some(1_700_000_000));
+        assert_eq!(r.metrics, vec!["system.cpu.user", "system.cpu.idle"]);
+    }
+
+    #[test]
+    fn metric_catalog_response_defaults_to_empty() {
+        let r: MetricCatalogResponse = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(r.from.is_none());
+        assert!(r.metrics.is_empty());
+    }
+
+    #[test]
+    fn metric_catalog_response_jsonl_emits_one_line_per_metric() {
+        let r = MetricCatalogResponse {
+            from: Some(0),
+            metrics: vec!["a".into(), "b".into(), "c".into()],
+        };
+        let mut buf = Vec::new();
+        r.write_jsonl(&mut buf).unwrap();
+        assert_eq!(String::from_utf8(buf).unwrap(), "\"a\"\n\"b\"\n\"c\"\n");
+    }
+
+    #[test]
+    fn metric_catalog_response_jsonl_empty_emits_nothing() {
+        let r = MetricCatalogResponse::default();
+        let mut buf = Vec::new();
+        r.write_jsonl(&mut buf).unwrap();
+        assert!(buf.is_empty());
     }
 }
