@@ -2,11 +2,15 @@
 
 pub(crate) mod auth;
 pub(crate) mod dashboard;
+pub(crate) mod downtime;
+pub(crate) mod events;
 pub(crate) mod format;
 pub(crate) mod helpers;
+pub(crate) mod hosts;
 pub(crate) mod logs;
 pub(crate) mod metrics;
 pub(crate) mod monitor;
+pub(crate) mod slo;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -26,12 +30,20 @@ pub enum DatadogSubcommands {
     Auth(auth::AuthCommand),
     /// Inspects Datadog dashboards.
     Dashboard(dashboard::DashboardCommand),
+    /// Inspects Datadog scheduled downtimes.
+    Downtime(downtime::DowntimeCommand),
+    /// Inspects the Datadog events stream.
+    Events(events::EventsCommand),
+    /// Inspects Datadog reporting hosts.
+    Hosts(hosts::HostsCommand),
     /// Searches Datadog logs.
     Logs(logs::LogsCommand),
     /// Queries Datadog metrics.
     Metrics(metrics::MetricsCommand),
     /// Inspects Datadog monitors.
     Monitor(monitor::MonitorCommand),
+    /// Inspects Datadog Service Level Objectives.
+    Slo(slo::SloCommand),
 }
 
 impl DatadogCommand {
@@ -40,9 +52,13 @@ impl DatadogCommand {
         match self.command {
             DatadogSubcommands::Auth(cmd) => cmd.execute().await,
             DatadogSubcommands::Dashboard(cmd) => cmd.execute().await,
+            DatadogSubcommands::Downtime(cmd) => cmd.execute().await,
+            DatadogSubcommands::Events(cmd) => cmd.execute().await,
+            DatadogSubcommands::Hosts(cmd) => cmd.execute().await,
             DatadogSubcommands::Logs(cmd) => cmd.execute().await,
             DatadogSubcommands::Metrics(cmd) => cmd.execute().await,
             DatadogSubcommands::Monitor(cmd) => cmd.execute().await,
+            DatadogSubcommands::Slo(cmd) => cmd.execute().await,
         }
     }
 }
@@ -240,6 +256,181 @@ mod tests {
                     limit: 10,
                     sort: logs::search::SortArg::TimestampDesc,
                     output: OutputFormat::Table,
+                }),
+            }),
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err.to_string().contains("not configured"));
+    }
+
+    #[test]
+    fn datadog_subcommands_events_variant() {
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Events(events::EventsCommand {
+                command: events::EventsSubcommands::List(events::list::ListCommand {
+                    filter: None,
+                    from: "1h".into(),
+                    to: "now".into(),
+                    limit: 10,
+                    sources: None,
+                    tags: None,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        assert!(matches!(cmd.command, DatadogSubcommands::Events(_)));
+    }
+
+    #[tokio::test]
+    async fn datadog_command_dispatches_events_list() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Events(events::EventsCommand {
+                command: events::EventsSubcommands::List(events::list::ListCommand {
+                    filter: None,
+                    from: "1h".into(),
+                    to: "now".into(),
+                    limit: 10,
+                    sources: None,
+                    tags: None,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err.to_string().contains("not configured"));
+    }
+
+    #[test]
+    fn datadog_subcommands_slo_variant() {
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Slo(slo::SloCommand {
+                command: slo::SloSubcommands::List(slo::list::ListCommand {
+                    tags: None,
+                    query: None,
+                    ids: None,
+                    metrics_query: None,
+                    limit: 5,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        assert!(matches!(cmd.command, DatadogSubcommands::Slo(_)));
+    }
+
+    #[tokio::test]
+    async fn datadog_command_dispatches_slo_list() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Slo(slo::SloCommand {
+                command: slo::SloSubcommands::List(slo::list::ListCommand {
+                    tags: None,
+                    query: None,
+                    ids: None,
+                    metrics_query: None,
+                    limit: 5,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err.to_string().contains("not configured"));
+    }
+
+    #[tokio::test]
+    async fn datadog_command_dispatches_slo_get() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Slo(slo::SloCommand {
+                command: slo::SloSubcommands::Get(slo::get::GetCommand {
+                    id: "abc".into(),
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err.to_string().contains("not configured"));
+    }
+
+    #[test]
+    fn datadog_subcommands_hosts_variant() {
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Hosts(hosts::HostsCommand {
+                command: hosts::HostsSubcommands::List(hosts::list::ListCommand {
+                    filter: None,
+                    from: None,
+                    limit: 5,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        assert!(matches!(cmd.command, DatadogSubcommands::Hosts(_)));
+    }
+
+    #[tokio::test]
+    async fn datadog_command_dispatches_hosts_list() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Hosts(hosts::HostsCommand {
+                command: hosts::HostsSubcommands::List(hosts::list::ListCommand {
+                    filter: None,
+                    from: None,
+                    limit: 5,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err.to_string().contains("not configured"));
+    }
+
+    #[test]
+    fn datadog_subcommands_downtime_variant() {
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Downtime(downtime::DowntimeCommand {
+                command: downtime::DowntimeSubcommands::List(downtime::list::ListCommand {
+                    active_only: false,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        assert!(matches!(cmd.command, DatadogSubcommands::Downtime(_)));
+    }
+
+    #[tokio::test]
+    async fn datadog_command_dispatches_downtime_list() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Downtime(downtime::DowntimeCommand {
+                command: downtime::DowntimeSubcommands::List(downtime::list::ListCommand {
+                    active_only: true,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err.to_string().contains("not configured"));
+    }
+
+    #[tokio::test]
+    async fn datadog_command_dispatches_metrics_catalog_list() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Metrics(metrics::MetricsCommand {
+                command: metrics::MetricsSubcommands::Catalog(metrics::catalog::CatalogCommand {
+                    command: metrics::catalog::CatalogSubcommands::List(
+                        metrics::catalog::list::ListCommand {
+                            host: None,
+                            from: None,
+                            output: OutputFormat::Table,
+                        },
+                    ),
                 }),
             }),
         };
