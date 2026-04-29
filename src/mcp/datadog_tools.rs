@@ -28,6 +28,7 @@ use crate::datadog::events_api::{EventsApi, EventsListFilter};
 use crate::datadog::logs_api::LogsApi;
 use crate::datadog::metrics_api::MetricsApi;
 use crate::datadog::monitors_api::{MonitorListFilter, MonitorsApi};
+use crate::datadog::slo_api::{SloApi, SloListFilter};
 use crate::datadog::time::parse_time_range;
 use crate::datadog::types::SortOrder;
 
@@ -104,6 +105,34 @@ pub struct DatadogDashboardListParams {
 pub struct DatadogDashboardGetParams {
     /// Datadog dashboard identifier (e.g. `abc-def-ghi`).
     pub dashboard_id: String,
+}
+
+/// Parameters for the `datadog_slo_list` tool.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct DatadogSloListParams {
+    /// Comma-separated `key:value` tags applied to the SLO.
+    #[serde(default)]
+    pub tags: Option<String>,
+    /// Free-text query.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Comma-separated list of SLO ids.
+    #[serde(default)]
+    pub ids: Option<String>,
+    /// Comma-separated list of metric names referenced by the SLO.
+    #[serde(default)]
+    pub metrics_query: Option<String>,
+    /// Maximum SLOs to return. `0` (or omitted) means "fetch every match",
+    /// capped at 10000.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Parameters for the `datadog_slo_get` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DatadogSloGetParams {
+    /// Datadog SLO identifier (string).
+    pub slo_id: String,
 }
 
 /// Parameters for the `datadog_events_list` tool.
@@ -286,6 +315,31 @@ impl OmniDevServer {
         let yaml = run_events_list(&params).await.map_err(tool_error)?;
         Ok(CallToolResult::success(vec![Content::text(yaml)]))
     }
+
+    /// Tool: list Datadog SLOs.
+    #[tool(
+        description = "List Datadog Service Level Objectives. `limit` of 0 (or omitted) \
+                       auto-paginates up to 10000. Mirrors `omni-dev datadog slo list`. \
+                       Output is YAML."
+    )]
+    pub async fn datadog_slo_list(
+        &self,
+        Parameters(params): Parameters<DatadogSloListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = run_slo_list(&params).await.map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: fetch a single SLO by id.
+    #[tool(description = "Fetch a single Datadog SLO by id (string). \
+                       Mirrors `omni-dev datadog slo get`. Output is YAML.")]
+    pub async fn datadog_slo_get(
+        &self,
+        Parameters(params): Parameters<DatadogSloGetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = run_slo_get(&params.slo_id).await.map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
 }
 
 // ── Internal run_* helpers ──────────────────────────────────────────
@@ -388,6 +442,26 @@ async fn run_events_list(params: &DatadogEventsListParams) -> Result<String> {
         .list(&filter, &from_str, &to_str, limit)
         .await?;
     serde_yaml::to_string(&result).context("Failed to serialize events list")
+}
+
+async fn run_slo_list(params: &DatadogSloListParams) -> Result<String> {
+    let (client, _site) = create_client()?;
+    let filter = SloListFilter {
+        tags: params.tags.clone(),
+        query: params.query.clone(),
+        ids: params.ids.clone(),
+        metrics: params.metrics_query.clone(),
+    };
+    let slos = SloApi::new(&client)
+        .list(&filter, params.limit.unwrap_or(0))
+        .await?;
+    serde_yaml::to_string(&slos).context("Failed to serialize SLO list")
+}
+
+async fn run_slo_get(id: &str) -> Result<String> {
+    let (client, _site) = create_client()?;
+    let slo = SloApi::new(&client).get(id).await?;
+    serde_yaml::to_string(&slo).context("Failed to serialize SLO")
 }
 
 /// Resolves `--from` / `--to` strings into RFC 3339 timestamps suitable
@@ -1291,6 +1365,8 @@ mod tests {
             "datadog_logs_search",
             // Phase 2
             "datadog_events_list",
+            "datadog_slo_list",
+            "datadog_slo_get",
         ] {
             assert!(router.has_route(name), "missing route: {name}");
         }
@@ -1409,5 +1485,163 @@ mod tests {
             .unwrap();
         let body = handler_text(&result);
         assert!(body.contains("EV1"));
+    }
+
+    // ── Phase 2: SLO tests ──────────────────────────────────────────
+
+    #[test]
+    fn slo_list_params_accepts_empty_object() {
+        let _: DatadogSloListParams = serde_json::from_str("{}").unwrap();
+    }
+
+    #[test]
+    fn slo_get_params_requires_slo_id() {
+        let err = serde_json::from_str::<DatadogSloGetParams>("{}").unwrap_err();
+        assert!(err.to_string().contains("slo_id"));
+    }
+
+    fn slo_body(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "data": {
+                "id": id,
+                "name": "Latency",
+                "type": "metric",
+                "tags": ["team:sre"],
+                "monitor_ids": []
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn run_slo_list_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/slo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "abc", "name": "Latency", "type": "metric", "tags": [], "monitor_ids": []}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server.uri());
+
+        let yaml = run_slo_list(&DatadogSloListParams {
+            tags: Some("team:sre".into()),
+            limit: Some(5),
+            ..DatadogSloListParams::default()
+        })
+        .await
+        .unwrap();
+        assert!(yaml.contains("Latency"));
+    }
+
+    #[tokio::test]
+    async fn run_slo_list_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/slo"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
+            .mount(&server)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server.uri());
+
+        let err = run_slo_list(&DatadogSloListParams {
+            limit: Some(5),
+            ..DatadogSloListParams::default()
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn run_slo_get_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/slo/abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(slo_body("abc")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server.uri());
+
+        let yaml = run_slo_get("abc").await.unwrap();
+        assert!(yaml.contains("id: abc"));
+        assert!(yaml.contains("Latency"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn datadog_slo_list_handler_success_returns_yaml() {
+        let server_mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/slo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "abc", "name": "Latency", "type": "metric", "tags": [], "monitor_ids": []}]
+            })))
+            .expect(1)
+            .mount(&server_mock)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server_mock.uri());
+
+        let server = OmniDevServer::new();
+        let result = server
+            .datadog_slo_list(Parameters(DatadogSloListParams {
+                limit: Some(5),
+                ..DatadogSloListParams::default()
+            }))
+            .await
+            .unwrap();
+        let body = handler_text(&result);
+        assert!(body.contains("Latency"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn datadog_slo_get_handler_success_returns_yaml() {
+        let server_mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/slo/abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(slo_body("abc")))
+            .expect(1)
+            .mount(&server_mock)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server_mock.uri());
+
+        let server = OmniDevServer::new();
+        let result = server
+            .datadog_slo_get(Parameters(DatadogSloGetParams {
+                slo_id: "abc".into(),
+            }))
+            .await
+            .unwrap();
+        let body = handler_text(&result);
+        assert!(body.contains("id: abc"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn datadog_slo_list_handler_propagates_credentials_error() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+
+        let server = OmniDevServer::new();
+        let err = server
+            .datadog_slo_list(Parameters(DatadogSloListParams::default()))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("not configured"));
     }
 }
