@@ -8,6 +8,7 @@ pub(crate) mod helpers;
 pub(crate) mod logs;
 pub(crate) mod metrics;
 pub(crate) mod monitor;
+pub(crate) mod slo;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -35,6 +36,8 @@ pub enum DatadogSubcommands {
     Metrics(metrics::MetricsCommand),
     /// Inspects Datadog monitors.
     Monitor(monitor::MonitorCommand),
+    /// Inspects Datadog Service Level Objectives.
+    Slo(slo::SloCommand),
 }
 
 impl DatadogCommand {
@@ -47,6 +50,7 @@ impl DatadogCommand {
             DatadogSubcommands::Logs(cmd) => cmd.execute().await,
             DatadogSubcommands::Metrics(cmd) => cmd.execute().await,
             DatadogSubcommands::Monitor(cmd) => cmd.execute().await,
+            DatadogSubcommands::Slo(cmd) => cmd.execute().await,
         }
     }
 }
@@ -282,6 +286,59 @@ mod tests {
                     limit: 10,
                     sources: None,
                     tags: None,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err.to_string().contains("not configured"));
+    }
+
+    #[test]
+    fn datadog_subcommands_slo_variant() {
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Slo(slo::SloCommand {
+                command: slo::SloSubcommands::List(slo::list::ListCommand {
+                    tags: None,
+                    query: None,
+                    ids: None,
+                    metrics_query: None,
+                    limit: 5,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        assert!(matches!(cmd.command, DatadogSubcommands::Slo(_)));
+    }
+
+    #[tokio::test]
+    async fn datadog_command_dispatches_slo_list() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Slo(slo::SloCommand {
+                command: slo::SloSubcommands::List(slo::list::ListCommand {
+                    tags: None,
+                    query: None,
+                    ids: None,
+                    metrics_query: None,
+                    limit: 5,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err.to_string().contains("not configured"));
+    }
+
+    #[tokio::test]
+    async fn datadog_command_dispatches_slo_get() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Slo(slo::SloCommand {
+                command: slo::SloSubcommands::Get(slo::get::GetCommand {
+                    id: "abc".into(),
                     output: OutputFormat::Table,
                 }),
             }),

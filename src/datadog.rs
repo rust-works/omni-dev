@@ -12,6 +12,7 @@ pub mod events_api;
 pub mod logs_api;
 pub mod metrics_api;
 pub mod monitors_api;
+pub mod slo_api;
 pub mod time;
 pub mod types;
 

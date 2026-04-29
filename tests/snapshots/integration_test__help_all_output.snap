@@ -1492,6 +1492,7 @@ Commands:
   logs       Searches Datadog logs
   metrics    Queries Datadog metrics
   monitor    Inspects Datadog monitors
+  slo        Inspects Datadog Service Level Objectives
   help       Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1764,6 +1765,57 @@ Options:
       --limit <LIMIT>    Maximum number of monitors to return [default: 100]
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev datadog slo - Inspects Datadog Service Level Objectives
+
+Inspects Datadog Service Level Objectives
+
+Usage: slo <COMMAND>
+
+Commands:
+  list  Lists SLOs with optional tag filter
+  get   Fetches a single SLO definition by id
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev datadog slo get - Fetches a single SLO definition by id
+
+Fetches a single SLO definition by id
+
+Usage: get [OPTIONS] <ID>
+
+Arguments:
+  <ID>  Datadog SLO identifier
+
+Options:
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev datadog slo list - Lists SLOs with optional tag filter
+
+Lists SLOs with optional tag filter
+
+Usage: list [OPTIONS]
+
+Options:
+      --tags <TAGS>                    Comma-separated `key:value` tags applied to the SLO
+      --query <QUERY>                  Free-text query; matches SLO names / metrics
+      --ids <IDS>                      Comma-separated list of SLO ids
+      --metrics-query <METRICS_QUERY>  Comma-separated list of metric names referenced by the SLO
+      --limit <LIMIT>                  Maximum number of SLOs to return; `0` = fetch all (capped at 10000) [default: 50]
+  -o, --output <OUTPUT>                Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                           Print help (see more with '--help')
 
 
 ================================================================================
