@@ -1488,6 +1488,7 @@ Usage: datadog <COMMAND>
 Commands:
   auth       Manages Datadog API credentials
   dashboard  Inspects Datadog dashboards
+  downtime   Inspects Datadog scheduled downtimes
   events     Inspects the Datadog events stream
   hosts      Inspects Datadog reporting hosts
   logs       Searches Datadog logs
@@ -1597,6 +1598,36 @@ Usage: list [OPTIONS]
 
 Options:
       --filter-shared    Restricts results to dashboards shared with the wider organisation
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev datadog downtime - Inspects Datadog scheduled downtimes
+
+Inspects Datadog scheduled downtimes
+
+Usage: downtime <COMMAND>
+
+Commands:
+  list  Lists scheduled downtimes via `GET /api/v1/downtime`
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev datadog downtime list - Lists scheduled downtimes via `GET /api/v1/downtime`
+
+Lists scheduled downtimes via `GET /api/v1/downtime`
+
+Usage: list [OPTIONS]
+
+Options:
+      --active-only      Show only currently-active downtimes
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 

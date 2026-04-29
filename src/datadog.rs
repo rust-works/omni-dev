@@ -7,6 +7,7 @@
 pub mod auth;
 pub mod client;
 pub mod dashboards_api;
+pub mod downtimes_api;
 pub mod error;
 pub mod events_api;
 pub mod hosts_api;

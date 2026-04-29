@@ -2,6 +2,7 @@
 
 pub(crate) mod auth;
 pub(crate) mod dashboard;
+pub(crate) mod downtime;
 pub(crate) mod events;
 pub(crate) mod format;
 pub(crate) mod helpers;
@@ -29,6 +30,8 @@ pub enum DatadogSubcommands {
     Auth(auth::AuthCommand),
     /// Inspects Datadog dashboards.
     Dashboard(dashboard::DashboardCommand),
+    /// Inspects Datadog scheduled downtimes.
+    Downtime(downtime::DowntimeCommand),
     /// Inspects the Datadog events stream.
     Events(events::EventsCommand),
     /// Inspects Datadog reporting hosts.
@@ -49,6 +52,7 @@ impl DatadogCommand {
         match self.command {
             DatadogSubcommands::Auth(cmd) => cmd.execute().await,
             DatadogSubcommands::Dashboard(cmd) => cmd.execute().await,
+            DatadogSubcommands::Downtime(cmd) => cmd.execute().await,
             DatadogSubcommands::Events(cmd) => cmd.execute().await,
             DatadogSubcommands::Hosts(cmd) => cmd.execute().await,
             DatadogSubcommands::Logs(cmd) => cmd.execute().await,
@@ -376,6 +380,35 @@ mod tests {
                     filter: None,
                     from: None,
                     limit: 5,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err.to_string().contains("not configured"));
+    }
+
+    #[test]
+    fn datadog_subcommands_downtime_variant() {
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Downtime(downtime::DowntimeCommand {
+                command: downtime::DowntimeSubcommands::List(downtime::list::ListCommand {
+                    active_only: false,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        assert!(matches!(cmd.command, DatadogSubcommands::Downtime(_)));
+    }
+
+    #[tokio::test]
+    async fn datadog_command_dispatches_downtime_list() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Downtime(downtime::DowntimeCommand {
+                command: downtime::DowntimeSubcommands::List(downtime::list::ListCommand {
+                    active_only: true,
                     output: OutputFormat::Table,
                 }),
             }),

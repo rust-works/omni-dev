@@ -24,6 +24,7 @@ use crate::cli::datadog::helpers::create_client;
 use crate::datadog::auth;
 use crate::datadog::client::DatadogClient;
 use crate::datadog::dashboards_api::{DashboardListFilter, DashboardsApi};
+use crate::datadog::downtimes_api::DowntimesApi;
 use crate::datadog::events_api::{EventsApi, EventsListFilter};
 use crate::datadog::hosts_api::{HostsApi, HostsListFilter};
 use crate::datadog::logs_api::LogsApi;
@@ -106,6 +107,14 @@ pub struct DatadogDashboardListParams {
 pub struct DatadogDashboardGetParams {
     /// Datadog dashboard identifier (e.g. `abc-def-ghi`).
     pub dashboard_id: String,
+}
+
+/// Parameters for the `datadog_downtime_list` tool.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct DatadogDowntimeListParams {
+    /// When true, restricts results to currently-active downtimes.
+    #[serde(default)]
+    pub active_only: Option<bool>,
 }
 
 /// Parameters for the `datadog_hosts_list` tool.
@@ -370,6 +379,20 @@ impl OmniDevServer {
         let yaml = run_hosts_list(&params).await.map_err(tool_error)?;
         Ok(CallToolResult::success(vec![Content::text(yaml)]))
     }
+
+    /// Tool: list Datadog scheduled downtimes.
+    #[tool(
+        description = "List Datadog scheduled downtimes. `active_only` (boolean, optional) \
+                       restricts to currently-active downtimes. Mirrors \
+                       `omni-dev datadog downtime list`. Output is YAML."
+    )]
+    pub async fn datadog_downtime_list(
+        &self,
+        Parameters(params): Parameters<DatadogDowntimeListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = run_downtime_list(&params).await.map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
 }
 
 // ── Internal run_* helpers ──────────────────────────────────────────
@@ -505,6 +528,14 @@ async fn run_hosts_list(params: &DatadogHostsListParams) -> Result<String> {
         .list(&filter, params.limit.unwrap_or(0))
         .await?;
     serde_yaml::to_string(&result).context("Failed to serialize hosts list")
+}
+
+async fn run_downtime_list(params: &DatadogDowntimeListParams) -> Result<String> {
+    let (client, _site) = create_client()?;
+    let dts = DowntimesApi::new(&client)
+        .list(params.active_only.unwrap_or(false))
+        .await?;
+    serde_yaml::to_string(&dts).context("Failed to serialize downtime list")
 }
 
 /// Resolves `--from` / `--to` strings into RFC 3339 timestamps suitable
@@ -1411,6 +1442,7 @@ mod tests {
             "datadog_slo_list",
             "datadog_slo_get",
             "datadog_hosts_list",
+            "datadog_downtime_list",
         ] {
             assert!(router.has_route(name), "missing route: {name}");
         }
@@ -1778,5 +1810,82 @@ mod tests {
             .unwrap();
         let body = handler_text(&result);
         assert!(body.contains("web-01"));
+    }
+
+    // ── Phase 2: downtime tests ─────────────────────────────────────
+
+    #[test]
+    fn downtime_list_params_accepts_empty_object() {
+        let _: DatadogDowntimeListParams = serde_json::from_str("{}").unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_downtime_list_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/downtime"))
+            .and(query_param("current_only", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": 1_i64, "scope": ["env:prod"], "active": true}
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server.uri());
+
+        let yaml = run_downtime_list(&DatadogDowntimeListParams {
+            active_only: Some(true),
+        })
+        .await
+        .unwrap();
+        assert!(yaml.contains("env:prod"));
+    }
+
+    #[tokio::test]
+    async fn run_downtime_list_default_active_only_false() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/downtime"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server.uri());
+
+        let yaml = run_downtime_list(&DatadogDowntimeListParams::default())
+            .await
+            .unwrap();
+        assert!(yaml.contains("[]"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn datadog_downtime_list_handler_success_returns_yaml() {
+        let server_mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/downtime"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": 1_i64, "scope": ["env:prod"], "active": true}
+            ])))
+            .expect(1)
+            .mount(&server_mock)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server_mock.uri());
+
+        let server = OmniDevServer::new();
+        let result = server
+            .datadog_downtime_list(Parameters(DatadogDowntimeListParams::default()))
+            .await
+            .unwrap();
+        let body = handler_text(&result);
+        assert!(body.contains("env:prod"));
     }
 }
