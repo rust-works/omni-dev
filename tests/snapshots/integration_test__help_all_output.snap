@@ -1,6 +1,5 @@
 ---
 source: tests/integration_test.rs
-assertion_line: 269
 expression: help_output
 ---
 omni-dev - A comprehensive development toolkit
@@ -1489,9 +1488,13 @@ Usage: datadog <COMMAND>
 Commands:
   auth       Manages Datadog API credentials
   dashboard  Inspects Datadog dashboards
+  downtime   Inspects Datadog scheduled downtimes
+  events     Inspects the Datadog events stream
+  hosts      Inspects Datadog reporting hosts
   logs       Searches Datadog logs
   metrics    Queries Datadog metrics
   monitor    Inspects Datadog monitors
+  slo        Inspects Datadog Service Level Objectives
   help       Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1601,6 +1604,103 @@ Options:
 
 ================================================================================
 
+omni-dev datadog downtime - Inspects Datadog scheduled downtimes
+
+Inspects Datadog scheduled downtimes
+
+Usage: downtime <COMMAND>
+
+Commands:
+  list  Lists scheduled downtimes via `GET /api/v1/downtime`
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev datadog downtime list - Lists scheduled downtimes via `GET /api/v1/downtime`
+
+Lists scheduled downtimes via `GET /api/v1/downtime`
+
+Usage: list [OPTIONS]
+
+Options:
+      --active-only      Show only currently-active downtimes
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev datadog events - Inspects the Datadog events stream
+
+Inspects the Datadog events stream
+
+Usage: events <COMMAND>
+
+Commands:
+  list  Lists events via `GET /api/v2/events`
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev datadog events list - Lists events via `GET /api/v2/events`
+
+Lists events via `GET /api/v2/events`
+
+Usage: list [OPTIONS]
+
+Options:
+      --filter <FILTER>    Datadog events search filter (e.g. `service:api`)
+      --from <FROM>        Start of the time range (relative shorthand like `1h`, RFC 3339, `now`, or Unix epoch seconds) [default: 1h]
+      --to <TO>            End of the time range; defaults to `now` [default: now]
+      --limit <LIMIT>      Maximum events to return (Datadog v2 events per-page cap is 1000; cursor pagination across pages is a follow-up) [default: 100]
+      --sources <SOURCES>  Comma-separated list of source names (e.g. `aws,kubernetes`)
+      --tags <TAGS>        Comma-separated list of `key:value` tags applied to the event
+  -o, --output <OUTPUT>    Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help               Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev datadog hosts - Inspects Datadog reporting hosts
+
+Inspects Datadog reporting hosts
+
+Usage: hosts <COMMAND>
+
+Commands:
+  list  Lists hosts via `GET /api/v1/hosts`
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev datadog hosts list - Lists hosts via `GET /api/v1/hosts`
+
+Lists hosts via `GET /api/v1/hosts`
+
+Usage: list [OPTIONS]
+
+Options:
+      --filter <FILTER>  Datadog hosts filter (e.g. `env:prod`)
+      --from <FROM>      Cutoff (Unix epoch seconds); hosts last reporting before this are excluded
+      --limit <LIMIT>    Maximum number of hosts to return; `0` = fetch all (capped at 10000) [default: 100]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
 omni-dev datadog logs - Searches Datadog logs
 
 Searches Datadog logs
@@ -1642,11 +1742,43 @@ Queries Datadog metrics
 Usage: metrics <COMMAND>
 
 Commands:
-  query  Executes a point-in-time metrics timeseries query
-  help   Print this message or the help of the given subcommand(s)
+  query    Executes a point-in-time metrics timeseries query
+  catalog  Inspects the metric catalog (`/api/v1/metrics`)
+  help     Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev datadog metrics catalog - Inspects the metric catalog (`/api/v1/metrics`)
+
+Inspects the metric catalog (`/api/v1/metrics`)
+
+Usage: catalog <COMMAND>
+
+Commands:
+  list  Lists metrics in the catalog
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev datadog metrics catalog list - Lists metrics in the catalog
+
+Lists metrics in the catalog
+
+Usage: list [OPTIONS]
+
+Options:
+      --host <HOST>      Filter by host (e.g. `web-01`)
+      --from <FROM>      `from` cutoff in Unix epoch seconds; only metrics ingested since this timestamp are returned
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================
@@ -1729,6 +1861,57 @@ Options:
       --limit <LIMIT>    Maximum number of monitors to return [default: 100]
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev datadog slo - Inspects Datadog Service Level Objectives
+
+Inspects Datadog Service Level Objectives
+
+Usage: slo <COMMAND>
+
+Commands:
+  list  Lists SLOs with optional tag filter
+  get   Fetches a single SLO definition by id
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev datadog slo get - Fetches a single SLO definition by id
+
+Fetches a single SLO definition by id
+
+Usage: get [OPTIONS] <ID>
+
+Arguments:
+  <ID>  Datadog SLO identifier
+
+Options:
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev datadog slo list - Lists SLOs with optional tag filter
+
+Lists SLOs with optional tag filter
+
+Usage: list [OPTIONS]
+
+Options:
+      --tags <TAGS>                    Comma-separated `key:value` tags applied to the SLO
+      --query <QUERY>                  Free-text query; matches SLO names / metrics
+      --ids <IDS>                      Comma-separated list of SLO ids
+      --metrics-query <METRICS_QUERY>  Comma-separated list of metric names referenced by the SLO
+      --limit <LIMIT>                  Maximum number of SLOs to return; `0` = fetch all (capped at 10000) [default: 50]
+  -o, --output <OUTPUT>                Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                           Print help (see more with '--help')
 
 
 ================================================================================

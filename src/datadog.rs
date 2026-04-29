@@ -7,10 +7,15 @@
 pub mod auth;
 pub mod client;
 pub mod dashboards_api;
+pub mod downtimes_api;
 pub mod error;
+pub mod events_api;
+pub mod hosts_api;
 pub mod logs_api;
 pub mod metrics_api;
+pub mod metrics_catalog_api;
 pub mod monitors_api;
+pub mod slo_api;
 pub mod time;
 pub mod types;
 

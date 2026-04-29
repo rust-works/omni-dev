@@ -24,9 +24,14 @@ use crate::cli::datadog::helpers::create_client;
 use crate::datadog::auth;
 use crate::datadog::client::DatadogClient;
 use crate::datadog::dashboards_api::{DashboardListFilter, DashboardsApi};
+use crate::datadog::downtimes_api::DowntimesApi;
+use crate::datadog::events_api::{EventsApi, EventsListFilter};
+use crate::datadog::hosts_api::{HostsApi, HostsListFilter};
 use crate::datadog::logs_api::LogsApi;
 use crate::datadog::metrics_api::MetricsApi;
+use crate::datadog::metrics_catalog_api::MetricsCatalogApi;
 use crate::datadog::monitors_api::{MonitorListFilter, MonitorsApi};
+use crate::datadog::slo_api::{SloApi, SloListFilter};
 use crate::datadog::time::parse_time_range;
 use crate::datadog::types::SortOrder;
 
@@ -103,6 +108,92 @@ pub struct DatadogDashboardListParams {
 pub struct DatadogDashboardGetParams {
     /// Datadog dashboard identifier (e.g. `abc-def-ghi`).
     pub dashboard_id: String,
+}
+
+/// Parameters for the `datadog_metrics_catalog_list` tool.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct DatadogMetricsCatalogListParams {
+    /// Filter by host (e.g. `web-01`).
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Cutoff in Unix epoch seconds; only metrics ingested since this
+    /// timestamp are returned.
+    #[serde(default)]
+    pub from: Option<i64>,
+}
+
+/// Parameters for the `datadog_downtime_list` tool.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct DatadogDowntimeListParams {
+    /// When true, restricts results to currently-active downtimes.
+    #[serde(default)]
+    pub active_only: Option<bool>,
+}
+
+/// Parameters for the `datadog_hosts_list` tool.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct DatadogHostsListParams {
+    /// Datadog hosts filter (e.g. `env:prod`).
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// Cutoff in Unix epoch seconds; hosts last reporting before this
+    /// are excluded.
+    #[serde(default)]
+    pub from: Option<i64>,
+    /// Maximum hosts to return. `0` (or omitted) auto-paginates up to 10000.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Parameters for the `datadog_slo_list` tool.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct DatadogSloListParams {
+    /// Comma-separated `key:value` tags applied to the SLO.
+    #[serde(default)]
+    pub tags: Option<String>,
+    /// Free-text query.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Comma-separated list of SLO ids.
+    #[serde(default)]
+    pub ids: Option<String>,
+    /// Comma-separated list of metric names referenced by the SLO.
+    #[serde(default)]
+    pub metrics_query: Option<String>,
+    /// Maximum SLOs to return. `0` (or omitted) means "fetch every match",
+    /// capped at 10000.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Parameters for the `datadog_slo_get` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DatadogSloGetParams {
+    /// Datadog SLO identifier (string).
+    pub slo_id: String,
+}
+
+/// Parameters for the `datadog_events_list` tool.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct DatadogEventsListParams {
+    /// Datadog events query (e.g. `service:api`).
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// Start of the time range. Defaults to `1h`.
+    #[serde(default)]
+    pub from: Option<String>,
+    /// End of the time range. Defaults to `now`.
+    #[serde(default)]
+    pub to: Option<String>,
+    /// Comma-separated list of source names.
+    #[serde(default)]
+    pub sources: Option<String>,
+    /// Comma-separated list of `key:value` tags.
+    #[serde(default)]
+    pub tags: Option<String>,
+    /// Per-page cap; defaults to 100. Max 1000.
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 /// Parameters for the `datadog_logs_search` tool.
@@ -246,6 +337,92 @@ impl OmniDevServer {
         let yaml = run_logs_search(&params).await.map_err(tool_error)?;
         Ok(CallToolResult::success(vec![Content::text(yaml)]))
     }
+
+    /// Tool: list Datadog events (single page).
+    #[tool(
+        description = "List Datadog events. Single page only — Datadog v2 events use \
+                       cursor pagination; `limit` is the per-page cap (max 1000). \
+                       `from` / `to` accept relative shorthand (`15m`, `1h`), `now`, \
+                       RFC 3339, or Unix epoch seconds. Mirrors \
+                       `omni-dev datadog events list`. Output is YAML."
+    )]
+    pub async fn datadog_events_list(
+        &self,
+        Parameters(params): Parameters<DatadogEventsListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = run_events_list(&params).await.map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: list Datadog SLOs.
+    #[tool(
+        description = "List Datadog Service Level Objectives. `limit` of 0 (or omitted) \
+                       auto-paginates up to 10000. Mirrors `omni-dev datadog slo list`. \
+                       Output is YAML."
+    )]
+    pub async fn datadog_slo_list(
+        &self,
+        Parameters(params): Parameters<DatadogSloListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = run_slo_list(&params).await.map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: fetch a single SLO by id.
+    #[tool(description = "Fetch a single Datadog SLO by id (string). \
+                       Mirrors `omni-dev datadog slo get`. Output is YAML.")]
+    pub async fn datadog_slo_get(
+        &self,
+        Parameters(params): Parameters<DatadogSloGetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = run_slo_get(&params.slo_id).await.map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: list Datadog reporting hosts.
+    #[tool(
+        description = "List Datadog reporting hosts. `limit` of 0 (or omitted) \
+                       auto-paginates up to 10000. Mirrors `omni-dev datadog hosts list`. \
+                       Output is YAML."
+    )]
+    pub async fn datadog_hosts_list(
+        &self,
+        Parameters(params): Parameters<DatadogHostsListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = run_hosts_list(&params).await.map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: list Datadog scheduled downtimes.
+    #[tool(
+        description = "List Datadog scheduled downtimes. `active_only` (boolean, optional) \
+                       restricts to currently-active downtimes. Mirrors \
+                       `omni-dev datadog downtime list`. Output is YAML."
+    )]
+    pub async fn datadog_downtime_list(
+        &self,
+        Parameters(params): Parameters<DatadogDowntimeListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = run_downtime_list(&params).await.map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: list metrics in the Datadog catalog.
+    #[tool(
+        description = "List metrics in the Datadog catalog (`/api/v1/metrics`). Distinct \
+                       from `datadog_metrics_query`: returns metric *names* ingested since \
+                       `from`, optionally filtered by `host`. Mirrors \
+                       `omni-dev datadog metrics catalog list`. Output is YAML."
+    )]
+    pub async fn datadog_metrics_catalog_list(
+        &self,
+        Parameters(params): Parameters<DatadogMetricsCatalogListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = run_metrics_catalog_list(&params)
+            .await
+            .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
 }
 
 // ── Internal run_* helpers ──────────────────────────────────────────
@@ -330,6 +507,73 @@ async fn run_logs_search(params: &DatadogLogsSearchParams) -> Result<String> {
         .search(&params.filter, &from_str, &to_str, limit, sort)
         .await?;
     serde_yaml::to_string(&result).context("Failed to serialize logs search results")
+}
+
+async fn run_events_list(params: &DatadogEventsListParams) -> Result<String> {
+    let from = params.from.as_deref().unwrap_or("1h");
+    let to = params.to.as_deref().unwrap_or("now");
+    let (from_str, to_str) = resolve_logs_time_range(from, to)?;
+    let limit = params.limit.unwrap_or(100);
+
+    let (client, _site) = create_client()?;
+    let filter = EventsListFilter {
+        query: params.filter.clone(),
+        sources: params.sources.clone(),
+        tags: params.tags.clone(),
+    };
+    let result = EventsApi::new(&client)
+        .list(&filter, &from_str, &to_str, limit)
+        .await?;
+    serde_yaml::to_string(&result).context("Failed to serialize events list")
+}
+
+async fn run_slo_list(params: &DatadogSloListParams) -> Result<String> {
+    let (client, _site) = create_client()?;
+    let filter = SloListFilter {
+        tags: params.tags.clone(),
+        query: params.query.clone(),
+        ids: params.ids.clone(),
+        metrics: params.metrics_query.clone(),
+    };
+    let slos = SloApi::new(&client)
+        .list(&filter, params.limit.unwrap_or(0))
+        .await?;
+    serde_yaml::to_string(&slos).context("Failed to serialize SLO list")
+}
+
+async fn run_slo_get(id: &str) -> Result<String> {
+    let (client, _site) = create_client()?;
+    let slo = SloApi::new(&client).get(id).await?;
+    serde_yaml::to_string(&slo).context("Failed to serialize SLO")
+}
+
+async fn run_hosts_list(params: &DatadogHostsListParams) -> Result<String> {
+    let (client, _site) = create_client()?;
+    let filter = HostsListFilter {
+        filter: params.filter.clone(),
+        from: params.from,
+        ..HostsListFilter::default()
+    };
+    let result = HostsApi::new(&client)
+        .list(&filter, params.limit.unwrap_or(0))
+        .await?;
+    serde_yaml::to_string(&result).context("Failed to serialize hosts list")
+}
+
+async fn run_downtime_list(params: &DatadogDowntimeListParams) -> Result<String> {
+    let (client, _site) = create_client()?;
+    let dts = DowntimesApi::new(&client)
+        .list(params.active_only.unwrap_or(false))
+        .await?;
+    serde_yaml::to_string(&dts).context("Failed to serialize downtime list")
+}
+
+async fn run_metrics_catalog_list(params: &DatadogMetricsCatalogListParams) -> Result<String> {
+    let (client, _site) = create_client()?;
+    let result = MetricsCatalogApi::new(&client)
+        .list(params.host.as_deref(), params.from)
+        .await?;
+    serde_yaml::to_string(&result).context("Failed to serialize metrics catalog")
 }
 
 /// Resolves `--from` / `--to` strings into RFC 3339 timestamps suitable
@@ -1219,9 +1463,10 @@ mod tests {
     // ── Router registration ───────────────────────────────────────────
 
     #[test]
-    fn datadog_tool_router_registers_all_phase1_tools() {
+    fn datadog_tool_router_registers_all_tools() {
         let router = OmniDevServer::datadog_tool_router();
         for name in [
+            // Phase 1
             "datadog_auth_status",
             "datadog_metrics_query",
             "datadog_monitor_list",
@@ -1230,8 +1475,516 @@ mod tests {
             "datadog_dashboard_list",
             "datadog_dashboard_get",
             "datadog_logs_search",
+            // Phase 2
+            "datadog_events_list",
+            "datadog_slo_list",
+            "datadog_slo_get",
+            "datadog_hosts_list",
+            "datadog_downtime_list",
+            "datadog_metrics_catalog_list",
         ] {
             assert!(router.has_route(name), "missing route: {name}");
         }
+    }
+
+    // ── Phase 2: events tests ────────────────────────────────────────
+
+    #[test]
+    fn events_list_params_accepts_empty_object() {
+        let _: DatadogEventsListParams = serde_json::from_str("{}").unwrap();
+    }
+
+    fn events_body() -> serde_json::Value {
+        serde_json::json!({
+            "data": [
+                {
+                    "id": "EV1",
+                    "type": "event",
+                    "attributes": {
+                        "timestamp": "2026-04-22T10:00:00.000Z",
+                        "title": "Deploy",
+                        "source": "github"
+                    }
+                }
+            ]
+        })
+    }
+
+    #[tokio::test]
+    async fn run_events_list_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/events"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(events_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server.uri());
+
+        let yaml = run_events_list(&DatadogEventsListParams {
+            filter: Some("service:api".into()),
+            from: Some("2026-04-22T09:00:00Z".into()),
+            to: Some("2026-04-22T10:00:00Z".into()),
+            sources: None,
+            tags: None,
+            limit: Some(10),
+        })
+        .await
+        .unwrap();
+        assert!(yaml.contains("EV1"));
+        assert!(yaml.contains("Deploy"));
+    }
+
+    #[tokio::test]
+    async fn run_events_list_rejects_invalid_time_range() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        let err = run_events_list(&DatadogEventsListParams {
+            filter: None,
+            from: Some("garbage".into()),
+            to: None,
+            sources: None,
+            tags: None,
+            limit: None,
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("Failed to parse"));
+    }
+
+    #[tokio::test]
+    async fn run_events_list_errors_when_credentials_missing() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        let err = run_events_list(&DatadogEventsListParams {
+            filter: None,
+            from: Some("2026-04-22T09:00:00Z".into()),
+            to: Some("2026-04-22T10:00:00Z".into()),
+            sources: None,
+            tags: None,
+            limit: None,
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("not configured"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn datadog_events_list_handler_success_returns_yaml() {
+        let server_mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/events"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(events_body()))
+            .expect(1)
+            .mount(&server_mock)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server_mock.uri());
+
+        let server = OmniDevServer::new();
+        let result = server
+            .datadog_events_list(Parameters(DatadogEventsListParams {
+                filter: None,
+                from: Some("2026-04-22T09:00:00Z".into()),
+                to: Some("2026-04-22T10:00:00Z".into()),
+                sources: None,
+                tags: None,
+                limit: Some(10),
+            }))
+            .await
+            .unwrap();
+        let body = handler_text(&result);
+        assert!(body.contains("EV1"));
+    }
+
+    // ── Phase 2: SLO tests ──────────────────────────────────────────
+
+    #[test]
+    fn slo_list_params_accepts_empty_object() {
+        let _: DatadogSloListParams = serde_json::from_str("{}").unwrap();
+    }
+
+    #[test]
+    fn slo_get_params_requires_slo_id() {
+        let err = serde_json::from_str::<DatadogSloGetParams>("{}").unwrap_err();
+        assert!(err.to_string().contains("slo_id"));
+    }
+
+    fn slo_body(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "data": {
+                "id": id,
+                "name": "Latency",
+                "type": "metric",
+                "tags": ["team:sre"],
+                "monitor_ids": []
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn run_slo_list_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/slo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "abc", "name": "Latency", "type": "metric", "tags": [], "monitor_ids": []}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server.uri());
+
+        let yaml = run_slo_list(&DatadogSloListParams {
+            tags: Some("team:sre".into()),
+            limit: Some(5),
+            ..DatadogSloListParams::default()
+        })
+        .await
+        .unwrap();
+        assert!(yaml.contains("Latency"));
+    }
+
+    #[tokio::test]
+    async fn run_slo_list_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/slo"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
+            .mount(&server)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server.uri());
+
+        let err = run_slo_list(&DatadogSloListParams {
+            limit: Some(5),
+            ..DatadogSloListParams::default()
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn run_slo_get_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/slo/abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(slo_body("abc")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server.uri());
+
+        let yaml = run_slo_get("abc").await.unwrap();
+        assert!(yaml.contains("id: abc"));
+        assert!(yaml.contains("Latency"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn datadog_slo_list_handler_success_returns_yaml() {
+        let server_mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/slo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "abc", "name": "Latency", "type": "metric", "tags": [], "monitor_ids": []}]
+            })))
+            .expect(1)
+            .mount(&server_mock)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server_mock.uri());
+
+        let server = OmniDevServer::new();
+        let result = server
+            .datadog_slo_list(Parameters(DatadogSloListParams {
+                limit: Some(5),
+                ..DatadogSloListParams::default()
+            }))
+            .await
+            .unwrap();
+        let body = handler_text(&result);
+        assert!(body.contains("Latency"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn datadog_slo_get_handler_success_returns_yaml() {
+        let server_mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/slo/abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(slo_body("abc")))
+            .expect(1)
+            .mount(&server_mock)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server_mock.uri());
+
+        let server = OmniDevServer::new();
+        let result = server
+            .datadog_slo_get(Parameters(DatadogSloGetParams {
+                slo_id: "abc".into(),
+            }))
+            .await
+            .unwrap();
+        let body = handler_text(&result);
+        assert!(body.contains("id: abc"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn datadog_slo_list_handler_propagates_credentials_error() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+
+        let server = OmniDevServer::new();
+        let err = server
+            .datadog_slo_list(Parameters(DatadogSloListParams::default()))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("not configured"));
+    }
+
+    // ── Phase 2: hosts tests ────────────────────────────────────────
+
+    #[test]
+    fn hosts_list_params_accepts_empty_object() {
+        let _: DatadogHostsListParams = serde_json::from_str("{}").unwrap();
+    }
+
+    fn host_body(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "host_list": [{
+                "name": name,
+                "up": true,
+                "last_reported_time": 1_700_000_000_i64,
+                "apps": ["nginx"]
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn run_hosts_list_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/hosts"))
+            .and(query_param("filter", "env:prod"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(host_body("web-01")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server.uri());
+
+        let yaml = run_hosts_list(&DatadogHostsListParams {
+            filter: Some("env:prod".into()),
+            from: None,
+            limit: Some(5),
+        })
+        .await
+        .unwrap();
+        assert!(yaml.contains("web-01"));
+    }
+
+    #[tokio::test]
+    async fn run_hosts_list_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/hosts"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server.uri());
+
+        let err = run_hosts_list(&DatadogHostsListParams {
+            limit: Some(5),
+            ..DatadogHostsListParams::default()
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("500"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn datadog_hosts_list_handler_success_returns_yaml() {
+        let server_mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/hosts"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(host_body("web-01")))
+            .expect(1)
+            .mount(&server_mock)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server_mock.uri());
+
+        let server = OmniDevServer::new();
+        let result = server
+            .datadog_hosts_list(Parameters(DatadogHostsListParams {
+                limit: Some(5),
+                ..DatadogHostsListParams::default()
+            }))
+            .await
+            .unwrap();
+        let body = handler_text(&result);
+        assert!(body.contains("web-01"));
+    }
+
+    // ── Phase 2: downtime tests ─────────────────────────────────────
+
+    #[test]
+    fn downtime_list_params_accepts_empty_object() {
+        let _: DatadogDowntimeListParams = serde_json::from_str("{}").unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_downtime_list_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/downtime"))
+            .and(query_param("current_only", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": 1_i64, "scope": ["env:prod"], "active": true}
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server.uri());
+
+        let yaml = run_downtime_list(&DatadogDowntimeListParams {
+            active_only: Some(true),
+        })
+        .await
+        .unwrap();
+        assert!(yaml.contains("env:prod"));
+    }
+
+    #[tokio::test]
+    async fn run_downtime_list_default_active_only_false() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/downtime"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server.uri());
+
+        let yaml = run_downtime_list(&DatadogDowntimeListParams::default())
+            .await
+            .unwrap();
+        assert!(yaml.contains("[]"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn datadog_downtime_list_handler_success_returns_yaml() {
+        let server_mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/downtime"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": 1_i64, "scope": ["env:prod"], "active": true}
+            ])))
+            .expect(1)
+            .mount(&server_mock)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server_mock.uri());
+
+        let server = OmniDevServer::new();
+        let result = server
+            .datadog_downtime_list(Parameters(DatadogDowntimeListParams::default()))
+            .await
+            .unwrap();
+        let body = handler_text(&result);
+        assert!(body.contains("env:prod"));
+    }
+
+    // ── Phase 2: metrics catalog tests ──────────────────────────────
+
+    #[test]
+    fn metrics_catalog_list_params_accepts_empty_object() {
+        let _: DatadogMetricsCatalogListParams = serde_json::from_str("{}").unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_metrics_catalog_list_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/metrics"))
+            .and(query_param("host", "web-01"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "from": 1_700_000_000_i64,
+                "metrics": ["system.cpu.user"]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server.uri());
+
+        let yaml = run_metrics_catalog_list(&DatadogMetricsCatalogListParams {
+            host: Some("web-01".into()),
+            from: None,
+        })
+        .await
+        .unwrap();
+        assert!(yaml.contains("system.cpu.user"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn datadog_metrics_catalog_list_handler_success_returns_yaml() {
+        let server_mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/metrics"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "from": 0_i64,
+                "metrics": ["system.cpu.user"]
+            })))
+            .expect(1)
+            .mount(&server_mock)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server_mock.uri());
+
+        let server = OmniDevServer::new();
+        let result = server
+            .datadog_metrics_catalog_list(Parameters(DatadogMetricsCatalogListParams::default()))
+            .await
+            .unwrap();
+        let body = handler_text(&result);
+        assert!(body.contains("system.cpu.user"));
     }
 }
