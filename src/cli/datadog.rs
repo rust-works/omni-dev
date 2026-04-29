@@ -416,4 +416,25 @@ mod tests {
         let err = cmd.execute().await.unwrap_err();
         assert!(err.to_string().contains("not configured"));
     }
+
+    #[tokio::test]
+    async fn datadog_command_dispatches_metrics_catalog_list() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Metrics(metrics::MetricsCommand {
+                command: metrics::MetricsSubcommands::Catalog(metrics::catalog::CatalogCommand {
+                    command: metrics::catalog::CatalogSubcommands::List(
+                        metrics::catalog::list::ListCommand {
+                            host: None,
+                            from: None,
+                            output: OutputFormat::Table,
+                        },
+                    ),
+                }),
+            }),
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err.to_string().contains("not configured"));
+    }
 }

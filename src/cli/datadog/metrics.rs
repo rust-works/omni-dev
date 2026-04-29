@@ -1,5 +1,6 @@
 //! CLI commands for Datadog metrics queries.
 
+pub(crate) mod catalog;
 pub(crate) mod query;
 
 use anyhow::Result;
@@ -18,6 +19,8 @@ pub struct MetricsCommand {
 pub enum MetricsSubcommands {
     /// Executes a point-in-time metrics timeseries query.
     Query(query::QueryCommand),
+    /// Inspects the metric catalog (`/api/v1/metrics`).
+    Catalog(catalog::CatalogCommand),
 }
 
 impl MetricsCommand {
@@ -25,6 +28,7 @@ impl MetricsCommand {
     pub async fn execute(self) -> Result<()> {
         match self.command {
             MetricsSubcommands::Query(cmd) => cmd.execute().await,
+            MetricsSubcommands::Catalog(cmd) => cmd.execute().await,
         }
     }
 }
@@ -45,5 +49,19 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, MetricsSubcommands::Query(_)));
+    }
+
+    #[test]
+    fn metrics_subcommands_catalog_variant() {
+        let cmd = MetricsCommand {
+            command: MetricsSubcommands::Catalog(catalog::CatalogCommand {
+                command: catalog::CatalogSubcommands::List(catalog::list::ListCommand {
+                    host: None,
+                    from: None,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        assert!(matches!(cmd.command, MetricsSubcommands::Catalog(_)));
     }
 }

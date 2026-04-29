@@ -1742,11 +1742,43 @@ Queries Datadog metrics
 Usage: metrics <COMMAND>
 
 Commands:
-  query  Executes a point-in-time metrics timeseries query
-  help   Print this message or the help of the given subcommand(s)
+  query    Executes a point-in-time metrics timeseries query
+  catalog  Inspects the metric catalog (`/api/v1/metrics`)
+  help     Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev datadog metrics catalog - Inspects the metric catalog (`/api/v1/metrics`)
+
+Inspects the metric catalog (`/api/v1/metrics`)
+
+Usage: catalog <COMMAND>
+
+Commands:
+  list  Lists metrics in the catalog
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev datadog metrics catalog list - Lists metrics in the catalog
+
+Lists metrics in the catalog
+
+Usage: list [OPTIONS]
+
+Options:
+      --host <HOST>      Filter by host (e.g. `web-01`)
+      --from <FROM>      `from` cutoff in Unix epoch seconds; only metrics ingested since this timestamp are returned
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================
