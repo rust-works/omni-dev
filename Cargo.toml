@@ -26,7 +26,7 @@ anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3.27"
 reqwest = { version = "0.13", features = ["json"] }
-tokio = { version = "1.50", features = ["full"] }
+tokio = { version = "1.52", features = ["full"] }
 thiserror = "2.0"
 regex = "1.12.3"
 tracing = "0.1"
