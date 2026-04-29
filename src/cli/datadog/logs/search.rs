@@ -53,8 +53,9 @@ pub struct SearchCommand {
     #[arg(long, default_value = "now")]
     pub to: String,
 
-    /// Maximum events to return (Datadog v2 logs search per-page cap is
-    /// 1000; cursor pagination across pages is a Phase 2 follow-up).
+    /// Maximum events to return. Pass `0` to fetch every match across
+    /// pages (capped at 10000); any non-zero value caps the total at
+    /// that count, paginating underneath as needed.
     #[arg(long, default_value_t = 100)]
     pub limit: usize,
 
@@ -120,7 +121,7 @@ async fn run_search(
     output: &OutputFormat,
 ) -> Result<()> {
     let result: LogSearchResult = LogsApi::new(client)
-        .search(filter, from, to, limit, sort)
+        .search_all(filter, from, to, limit, sort)
         .await?;
     if output_as(&result, output)? {
         return Ok(());
@@ -147,6 +148,9 @@ mod tests {
     use crate::datadog::types::LogEventAttributes;
 
     fn search_body() -> serde_json::Value {
+        // No `meta.page.after` so the auto-paginating wrapper terminates
+        // after a single request; tests that exercise cursor follow-up
+        // live in `LogsApi::search_all` unit tests.
         serde_json::json!({
             "data": [
                 {
@@ -161,7 +165,7 @@ mod tests {
                     }
                 }
             ],
-            "meta": { "page": { "after": "next" } }
+            "meta": { "page": {} }
         })
     }
 
@@ -315,21 +319,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_search_propagates_client_side_limit_error() {
-        let client = DatadogClient::new("http://127.0.0.1:1", "api", "app").unwrap();
-        let err = run_search(
+    async fn run_search_with_zero_limit_auto_paginates_until_no_cursor() {
+        // limit == 0 means "fetch every match"; the wrapper requests
+        // pages of MAX_PAGE_LIMIT until the API stops returning a
+        // cursor.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/v2/logs/events/search"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "filter": {
+                    "query": "*",
+                    "from": "2026-04-22T09:00:00Z",
+                    "to": "2026-04-22T10:00:00Z"
+                },
+                "page": { "limit": 1000 },
+                "sort": "-timestamp"
+            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": [],
+                    "meta": { "page": {} }
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = DatadogClient::new(&server.uri(), "api", "app").unwrap();
+        run_search(
             &client,
             "*",
             "2026-04-22T09:00:00Z",
             "2026-04-22T10:00:00Z",
-            5000,
+            0,
             SortOrder::TimestampDesc,
-            &OutputFormat::Table,
+            &OutputFormat::Json,
         )
         .await
-        .unwrap_err();
-        assert!(err.to_string().contains("--limit"));
-        assert!(err.to_string().contains("1000"));
+        .unwrap();
     }
 
     // ── SearchCommand::execute error paths ─────────────────────────

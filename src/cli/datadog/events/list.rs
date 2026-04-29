@@ -28,8 +28,9 @@ pub struct ListCommand {
     #[arg(long, default_value = "now")]
     pub to: String,
 
-    /// Maximum events to return (Datadog v2 events per-page cap is 1000;
-    /// cursor pagination across pages is a follow-up).
+    /// Maximum events to return. Pass `0` to fetch every match across
+    /// pages (capped at 10000); any non-zero value caps the total at
+    /// that count, paginating underneath as needed.
     #[arg(long, default_value_t = 100)]
     pub limit: usize,
 
@@ -91,7 +92,9 @@ async fn run_list(
     limit: usize,
     output: &OutputFormat,
 ) -> Result<()> {
-    let result: EventsResponse = EventsApi::new(client).list(filter, from, to, limit).await?;
+    let result: EventsResponse = EventsApi::new(client)
+        .list_all(filter, from, to, limit)
+        .await?;
     if output_as(&result, output)? {
         return Ok(());
     }
@@ -216,6 +219,35 @@ mod tests {
             "2026-04-22T09:00:00Z",
             "2026-04-22T10:00:00Z",
             10,
+            &OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_list_with_zero_limit_auto_paginates_until_no_cursor() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v2/events"))
+            .and(wiremock::matchers::query_param("page[limit]", "1000"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": [],
+                    "meta": { "page": {} }
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = DatadogClient::new(&server.uri(), "api", "app").unwrap();
+        run_list(
+            &client,
+            &EventsListFilter::default(),
+            "2026-04-22T09:00:00Z",
+            "2026-04-22T10:00:00Z",
+            0,
             &OutputFormat::Json,
         )
         .await
