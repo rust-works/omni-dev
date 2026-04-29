@@ -2,6 +2,7 @@
 
 pub(crate) mod auth;
 pub(crate) mod dashboard;
+pub(crate) mod events;
 pub(crate) mod format;
 pub(crate) mod helpers;
 pub(crate) mod logs;
@@ -26,6 +27,8 @@ pub enum DatadogSubcommands {
     Auth(auth::AuthCommand),
     /// Inspects Datadog dashboards.
     Dashboard(dashboard::DashboardCommand),
+    /// Inspects the Datadog events stream.
+    Events(events::EventsCommand),
     /// Searches Datadog logs.
     Logs(logs::LogsCommand),
     /// Queries Datadog metrics.
@@ -40,6 +43,7 @@ impl DatadogCommand {
         match self.command {
             DatadogSubcommands::Auth(cmd) => cmd.execute().await,
             DatadogSubcommands::Dashboard(cmd) => cmd.execute().await,
+            DatadogSubcommands::Events(cmd) => cmd.execute().await,
             DatadogSubcommands::Logs(cmd) => cmd.execute().await,
             DatadogSubcommands::Metrics(cmd) => cmd.execute().await,
             DatadogSubcommands::Monitor(cmd) => cmd.execute().await,
@@ -239,6 +243,45 @@ mod tests {
                     to: "now".into(),
                     limit: 10,
                     sort: logs::search::SortArg::TimestampDesc,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        let err = cmd.execute().await.unwrap_err();
+        assert!(err.to_string().contains("not configured"));
+    }
+
+    #[test]
+    fn datadog_subcommands_events_variant() {
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Events(events::EventsCommand {
+                command: events::EventsSubcommands::List(events::list::ListCommand {
+                    filter: None,
+                    from: "1h".into(),
+                    to: "now".into(),
+                    limit: 10,
+                    sources: None,
+                    tags: None,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        assert!(matches!(cmd.command, DatadogSubcommands::Events(_)));
+    }
+
+    #[tokio::test]
+    async fn datadog_command_dispatches_events_list() {
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        let cmd = DatadogCommand {
+            command: DatadogSubcommands::Events(events::EventsCommand {
+                command: events::EventsSubcommands::List(events::list::ListCommand {
+                    filter: None,
+                    from: "1h".into(),
+                    to: "now".into(),
+                    limit: 10,
+                    sources: None,
+                    tags: None,
                     output: OutputFormat::Table,
                 }),
             }),

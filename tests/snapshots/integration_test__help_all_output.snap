@@ -1,6 +1,5 @@
 ---
 source: tests/integration_test.rs
-assertion_line: 269
 expression: help_output
 ---
 omni-dev - A comprehensive development toolkit
@@ -1489,6 +1488,7 @@ Usage: datadog <COMMAND>
 Commands:
   auth       Manages Datadog API credentials
   dashboard  Inspects Datadog dashboards
+  events     Inspects the Datadog events stream
   logs       Searches Datadog logs
   metrics    Queries Datadog metrics
   monitor    Inspects Datadog monitors
@@ -1597,6 +1597,41 @@ Options:
       --filter-shared    Restricts results to dashboards shared with the wider organisation
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev datadog events - Inspects the Datadog events stream
+
+Inspects the Datadog events stream
+
+Usage: events <COMMAND>
+
+Commands:
+  list  Lists events via `GET /api/v2/events`
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev datadog events list - Lists events via `GET /api/v2/events`
+
+Lists events via `GET /api/v2/events`
+
+Usage: list [OPTIONS]
+
+Options:
+      --filter <FILTER>    Datadog events search filter (e.g. `service:api`)
+      --from <FROM>        Start of the time range (relative shorthand like `1h`, RFC 3339, `now`, or Unix epoch seconds) [default: 1h]
+      --to <TO>            End of the time range; defaults to `now` [default: now]
+      --limit <LIMIT>      Maximum events to return (Datadog v2 events per-page cap is 1000; cursor pagination across pages is a follow-up) [default: 100]
+      --sources <SOURCES>  Comma-separated list of source names (e.g. `aws,kubernetes`)
+      --tags <TAGS>        Comma-separated list of `key:value` tags applied to the event
+  -o, --output <OUTPUT>    Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help               Print help (see more with '--help')
 
 
 ================================================================================
