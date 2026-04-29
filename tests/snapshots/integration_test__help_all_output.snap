@@ -1660,7 +1660,7 @@ Options:
       --filter <FILTER>    Datadog events search filter (e.g. `service:api`)
       --from <FROM>        Start of the time range (relative shorthand like `1h`, RFC 3339, `now`, or Unix epoch seconds) [default: 1h]
       --to <TO>            End of the time range; defaults to `now` [default: now]
-      --limit <LIMIT>      Maximum events to return (Datadog v2 events per-page cap is 1000; cursor pagination across pages is a follow-up) [default: 100]
+      --limit <LIMIT>      Maximum events to return. Pass `0` to fetch every match across pages (capped at 10000); any non-zero value caps the total at that count, paginating underneath as needed [default: 100]
       --sources <SOURCES>  Comma-separated list of source names (e.g. `aws,kubernetes`)
       --tags <TAGS>        Comma-separated list of `key:value` tags applied to the event
   -o, --output <OUTPUT>    Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
@@ -1727,7 +1727,7 @@ Options:
       --filter <FILTER>  Search filter (Datadog logs query language; see Datadog docs)
       --from <FROM>      Start of the time range (relative shorthand like `15m`/`1h`, `now`, RFC 3339, or Unix epoch seconds) [default: 15m]
       --to <TO>          End of the time range; defaults to `now` [default: now]
-      --limit <LIMIT>    Maximum events to return (Datadog v2 logs search per-page cap is 1000; cursor pagination across pages is a Phase 2 follow-up) [default: 100]
+      --limit <LIMIT>    Maximum events to return. Pass `0` to fetch every match across pages (capped at 10000); any non-zero value caps the total at that count, paginating underneath as needed [default: 100]
       --sort <SORT>      Sort order for returned events [default: timestamp-desc] [possible values: timestamp-asc, timestamp-desc]
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
