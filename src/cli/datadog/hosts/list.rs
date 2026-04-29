@@ -171,6 +171,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_list_table_path_renders_dash_when_last_reported_missing() {
+        // Covers the `|| "-".to_string()` arm of the
+        // `last_reported_time.map_or_else(...)` chain — `host_json` always
+        // sets `last_reported_time`, so we use a bare host body here.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v1/hosts"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "host_list": [{"name": "ghost", "apps": []}]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = DatadogClient::new(&server.uri(), "api", "app").unwrap();
+        run_list(
+            &client,
+            &HostsListFilter::default(),
+            5,
+            &OutputFormat::Table,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn run_list_propagates_api_errors() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))

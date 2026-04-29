@@ -124,8 +124,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_get_table_path_succeeds_when_description_missing() {
-        // Covers the `Some(desc)` branch where `desc.is_empty()` short-circuits
-        // (the SLO returned has no description at all).
+        // Covers the outer `if let Some(desc)` arm where the SLO has no
+        // description field at all — `slo.description` is `None`.
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/api/v1/slo/x"))
@@ -134,6 +134,31 @@ mod tests {
                     "data": {
                         "id": "x", "name": "y", "type": "metric",
                         "tags": [], "monitor_ids": []
+                    }
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = DatadogClient::new(&server.uri(), "api", "app").unwrap();
+        run_get(&client, "x", &OutputFormat::Table).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_get_table_path_succeeds_when_description_is_empty_string() {
+        // Covers the inner `if !desc.is_empty()` false arm — the SLO has
+        // `description: ""` so the `writeln!` is skipped. Without this
+        // case, the closing `}` of the inner if has zero coverage.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v1/slo/x"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": {
+                        "id": "x", "name": "y", "type": "metric",
+                        "tags": [], "monitor_ids": [],
+                        "description": ""
                     }
                 })),
             )

@@ -197,6 +197,22 @@ mod tests {
     }
 
     #[test]
+    fn build_list_url_inverted_booleans_take_other_arms() {
+        // `build_list_url_appends_full_filter_set` covers
+        // `include_muted_hosts_data=false` and `include_hosts_metadata=true`;
+        // this case exercises the reciprocal arms of both ternaries.
+        let filter = HostsListFilter {
+            include_muted_hosts_data: Some(true),
+            include_hosts_metadata: Some(false),
+            ..HostsListFilter::default()
+        };
+        let url = build_list_url("https://api.datadoghq.com", &filter, 0, 10).unwrap();
+        let qs = url.query().unwrap();
+        assert!(qs.contains("include_muted_hosts_data=true"));
+        assert!(qs.contains("include_hosts_metadata=false"));
+    }
+
+    #[test]
     fn build_list_url_rejects_invalid_base() {
         let err = build_list_url("not a url", &HostsListFilter::default(), 0, 100).unwrap_err();
         assert!(err.to_string().contains("Invalid Datadog base URL"));
