@@ -29,6 +29,7 @@ use crate::datadog::events_api::{EventsApi, EventsListFilter};
 use crate::datadog::hosts_api::{HostsApi, HostsListFilter};
 use crate::datadog::logs_api::LogsApi;
 use crate::datadog::metrics_api::MetricsApi;
+use crate::datadog::metrics_catalog_api::MetricsCatalogApi;
 use crate::datadog::monitors_api::{MonitorListFilter, MonitorsApi};
 use crate::datadog::slo_api::{SloApi, SloListFilter};
 use crate::datadog::time::parse_time_range;
@@ -107,6 +108,18 @@ pub struct DatadogDashboardListParams {
 pub struct DatadogDashboardGetParams {
     /// Datadog dashboard identifier (e.g. `abc-def-ghi`).
     pub dashboard_id: String,
+}
+
+/// Parameters for the `datadog_metrics_catalog_list` tool.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct DatadogMetricsCatalogListParams {
+    /// Filter by host (e.g. `web-01`).
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Cutoff in Unix epoch seconds; only metrics ingested since this
+    /// timestamp are returned.
+    #[serde(default)]
+    pub from: Option<i64>,
 }
 
 /// Parameters for the `datadog_downtime_list` tool.
@@ -393,6 +406,23 @@ impl OmniDevServer {
         let yaml = run_downtime_list(&params).await.map_err(tool_error)?;
         Ok(CallToolResult::success(vec![Content::text(yaml)]))
     }
+
+    /// Tool: list metrics in the Datadog catalog.
+    #[tool(
+        description = "List metrics in the Datadog catalog (`/api/v1/metrics`). Distinct \
+                       from `datadog_metrics_query`: returns metric *names* ingested since \
+                       `from`, optionally filtered by `host`. Mirrors \
+                       `omni-dev datadog metrics catalog list`. Output is YAML."
+    )]
+    pub async fn datadog_metrics_catalog_list(
+        &self,
+        Parameters(params): Parameters<DatadogMetricsCatalogListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = run_metrics_catalog_list(&params)
+            .await
+            .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
 }
 
 // ── Internal run_* helpers ──────────────────────────────────────────
@@ -536,6 +566,14 @@ async fn run_downtime_list(params: &DatadogDowntimeListParams) -> Result<String>
         .list(params.active_only.unwrap_or(false))
         .await?;
     serde_yaml::to_string(&dts).context("Failed to serialize downtime list")
+}
+
+async fn run_metrics_catalog_list(params: &DatadogMetricsCatalogListParams) -> Result<String> {
+    let (client, _site) = create_client()?;
+    let result = MetricsCatalogApi::new(&client)
+        .list(params.host.as_deref(), params.from)
+        .await?;
+    serde_yaml::to_string(&result).context("Failed to serialize metrics catalog")
 }
 
 /// Resolves `--from` / `--to` strings into RFC 3339 timestamps suitable
@@ -1443,6 +1481,7 @@ mod tests {
             "datadog_slo_get",
             "datadog_hosts_list",
             "datadog_downtime_list",
+            "datadog_metrics_catalog_list",
         ] {
             assert!(router.has_route(name), "missing route: {name}");
         }
@@ -1887,5 +1926,65 @@ mod tests {
             .unwrap();
         let body = handler_text(&result);
         assert!(body.contains("env:prod"));
+    }
+
+    // ── Phase 2: metrics catalog tests ──────────────────────────────
+
+    #[test]
+    fn metrics_catalog_list_params_accepts_empty_object() {
+        let _: DatadogMetricsCatalogListParams = serde_json::from_str("{}").unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_metrics_catalog_list_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/metrics"))
+            .and(query_param("host", "web-01"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "from": 1_700_000_000_i64,
+                "metrics": ["system.cpu.user"]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server.uri());
+
+        let yaml = run_metrics_catalog_list(&DatadogMetricsCatalogListParams {
+            host: Some("web-01".into()),
+            from: None,
+        })
+        .await
+        .unwrap();
+        assert!(yaml.contains("system.cpu.user"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn datadog_metrics_catalog_list_handler_success_returns_yaml() {
+        let server_mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/metrics"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "from": 0_i64,
+                "metrics": ["system.cpu.user"]
+            })))
+            .expect(1)
+            .mount(&server_mock)
+            .await;
+
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+        configure_credentials_and_api_url(dir.path(), &server_mock.uri());
+
+        let server = OmniDevServer::new();
+        let result = server
+            .datadog_metrics_catalog_list(Parameters(DatadogMetricsCatalogListParams::default()))
+            .await
+            .unwrap();
+        let body = handler_text(&result);
+        assert!(body.contains("system.cpu.user"));
     }
 }
