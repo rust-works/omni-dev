@@ -31,6 +31,7 @@ use crate::cli::atlassian::helpers::create_client;
 use crate::data::yaml::to_yaml;
 
 use super::error::tool_error;
+use super::output_file::write_to_file_yaml;
 use super::server::OmniDevServer;
 
 // ── Parameter structs ───────────────────────────────────────────────
@@ -44,6 +45,12 @@ pub struct ConfluenceReadParams {
     /// (raw ADF JSON).
     #[serde(default)]
     pub format: Option<String>,
+    /// When set, writes the rendered content to this path and returns a
+    /// short YAML summary (path/bytes/format) instead of the inline body.
+    /// Useful for large pages that would otherwise blow past the context
+    /// window — the assistant can then read the file with offset/limit.
+    #[serde(default)]
+    pub output_file: Option<String>,
 }
 
 /// Parameters for the `confluence_search` tool.
@@ -559,6 +566,8 @@ impl OmniDevServer {
     /// Tool: fetch a Confluence page as JFM markdown (default) or ADF JSON.
     #[tool(
         description = "Fetch a Confluence page by ID. Returns JFM markdown by default, or raw ADF JSON when format=\"adf\". \
+                       When `output_file` is set, the content is written to that path and the tool returns \
+                       a short YAML summary (path/bytes/format) — useful for large pages. \
                        Mirrors `omni-dev atlassian confluence read`."
     )]
     pub async fn confluence_read(
@@ -566,7 +575,7 @@ impl OmniDevServer {
         Parameters(params): Parameters<ConfluenceReadParams>,
     ) -> Result<CallToolResult, McpError> {
         let format = parse_format(params.format.as_deref()).map_err(tool_error)?;
-        let rendered = run_confluence_read(&params.id, format)
+        let rendered = run_confluence_read(&params.id, format, params.output_file.as_deref())
             .await
             .map_err(tool_error)?;
         Ok(CallToolResult::success(vec![Content::text(rendered)]))
@@ -782,11 +791,28 @@ impl OmniDevServer {
 
 // ── Internal run_* helpers ──────────────────────────────────────────
 
-async fn run_confluence_read(id: &str, format: ContentFormat) -> Result<String> {
+async fn run_confluence_read(
+    id: &str,
+    format: ContentFormat,
+    output_file: Option<&str>,
+) -> Result<String> {
     let (client, instance_url) = create_client()?;
     let api = ConfluenceApi::new(client);
     let item = api.get_content(id).await?;
-    render_content_item(&item, format, &instance_url)
+    let label = format_label(&format);
+    let rendered = render_content_item(&item, format, &instance_url)?;
+    match output_file {
+        Some(path) => write_to_file_yaml(path, &rendered, label),
+        None => Ok(rendered),
+    }
+}
+
+/// String label for a [`ContentFormat`], used in write summaries.
+fn format_label(format: &ContentFormat) -> &'static str {
+    match format {
+        ContentFormat::Jfm => "jfm",
+        ContentFormat::Adf => "adf",
+    }
 }
 
 async fn run_confluence_search(cql: &str, limit: u32) -> Result<String> {
@@ -1137,7 +1163,7 @@ mod tests {
         mock_page(&server, "12345").await;
         let _env = EnvGuard::set(&server.uri());
 
-        let out = run_confluence_read("12345", ContentFormat::Jfm)
+        let out = run_confluence_read("12345", ContentFormat::Jfm, None)
             .await
             .unwrap();
         assert!(out.contains("Mocked"));
@@ -1151,7 +1177,7 @@ mod tests {
         mock_page(&server, "12345").await;
         let _env = EnvGuard::set(&server.uri());
 
-        let out = run_confluence_read("12345", ContentFormat::Adf)
+        let out = run_confluence_read("12345", ContentFormat::Adf, None)
             .await
             .unwrap();
         assert!(out.contains("\"doc\""));
@@ -1168,10 +1194,79 @@ mod tests {
             .await;
         let _env = EnvGuard::set(&server.uri());
 
-        let err = run_confluence_read("99", ContentFormat::Jfm)
+        let err = run_confluence_read("99", ContentFormat::Jfm, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_confluence_read_jfm_writes_to_output_file() {
+        let _lock = env_lock();
+        let server = wiremock::MockServer::start().await;
+        mock_page(&server, "12345").await;
+        let _env = EnvGuard::set(&server.uri());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let out_path = tmp.path().join("page.md");
+        let path_str = out_path.to_str().unwrap();
+
+        let summary = run_confluence_read("12345", ContentFormat::Jfm, Some(path_str))
+            .await
+            .unwrap();
+
+        assert!(summary.contains(&format!("path: {path_str}")));
+        assert!(summary.contains("format: jfm"));
+        assert!(summary.contains("bytes:"));
+        // Inline content must NOT leak into the summary.
+        assert!(!summary.contains("Mocked"));
+
+        let written = std::fs::read_to_string(&out_path).unwrap();
+        assert!(written.contains("Mocked"));
+        assert!(written.contains("page_id"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_confluence_read_adf_writes_to_output_file() {
+        let _lock = env_lock();
+        let server = wiremock::MockServer::start().await;
+        mock_page(&server, "12345").await;
+        let _env = EnvGuard::set(&server.uri());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let out_path = tmp.path().join("page.json");
+        let path_str = out_path.to_str().unwrap();
+
+        let summary = run_confluence_read("12345", ContentFormat::Adf, Some(path_str))
+            .await
+            .unwrap();
+
+        assert!(summary.contains("format: adf"));
+        let written = std::fs::read_to_string(&out_path).unwrap();
+        assert!(written.contains("\"doc\""));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_confluence_read_output_file_invalid_path_errors() {
+        let _lock = env_lock();
+        let server = wiremock::MockServer::start().await;
+        mock_page(&server, "12345").await;
+        let _env = EnvGuard::set(&server.uri());
+
+        let err = run_confluence_read(
+            "12345",
+            ContentFormat::Jfm,
+            Some("/nonexistent_dir_zxq/out.md"),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("Failed to write"));
+    }
+
+    #[test]
+    fn format_label_matches_expected_strings() {
+        assert_eq!(format_label(&ContentFormat::Jfm), "jfm");
+        assert_eq!(format_label(&ContentFormat::Adf), "adf");
     }
 
     // ── run_confluence_search ──────────────────────────────────────
@@ -1541,6 +1636,7 @@ mod tests {
         let params = ConfluenceReadParams {
             id: "12345".to_string(),
             format: Some("xml".to_string()),
+            output_file: None,
         };
         let result = server.confluence_read(Parameters(params)).await;
         let err = result.unwrap_err();
@@ -1563,6 +1659,7 @@ mod tests {
             .confluence_read(Parameters(ConfluenceReadParams {
                 id: "12345".to_string(),
                 format: Some("jfm".to_string()),
+                output_file: None,
             }))
             .await
             .unwrap();

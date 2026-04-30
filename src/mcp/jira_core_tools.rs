@@ -21,6 +21,7 @@ use crate::atlassian::document::{issue_to_jfm_document, JfmDocument};
 use crate::cli::atlassian::helpers::create_client;
 
 use super::error::tool_error;
+use super::output_file::write_to_file_yaml;
 use super::server::OmniDevServer;
 
 // ── parameter types ────────────────────────────────────────────────────────
@@ -34,6 +35,12 @@ pub struct JiraReadParams {
     /// frontmatter; `adf` returns the raw ADF description payload as JSON.
     #[serde(default)]
     pub format: Option<String>,
+    /// When set, writes the rendered content to this path and returns a
+    /// short YAML summary (path/bytes/format) instead of the inline body.
+    /// Useful for large issues that would otherwise blow past the context
+    /// window — the assistant can then read the file with offset/limit.
+    #[serde(default)]
+    pub output_file: Option<String>,
 }
 
 /// Parameters for the `jira_search` tool.
@@ -154,6 +161,14 @@ impl ReadFormat {
             Some(other) => anyhow::bail!("unknown format {other:?} (expected 'jfm' or 'adf')"),
         }
     }
+
+    /// String label used in [`super::output_file::WriteFileSummary`].
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Jfm => "jfm",
+            Self::Adf => "adf",
+        }
+    }
 }
 
 fn yaml_result<T: serde::Serialize>(data: &T) -> Result<String> {
@@ -169,20 +184,27 @@ fn ok_text(text: String) -> Result<CallToolResult, McpError> {
 // Split out from the tool handlers so they can be tested against a
 // wiremock-backed [`AtlassianClient`] without needing real credentials.
 
-/// Fetches a JIRA issue and renders it in `format`.
+/// Fetches a JIRA issue and renders it in `format`. When `output_file` is
+/// set, writes the rendered content to disk and returns a YAML summary
+/// instead of the body.
 async fn run_jira_read(
     client: &AtlassianClient,
     instance_url: &str,
     key: &str,
     format: ReadFormat,
+    output_file: Option<&str>,
 ) -> Result<String> {
     let issue = client.get_issue(key).await?;
-    match format {
-        ReadFormat::Jfm => issue_to_jfm_document(&issue, instance_url)?.render(),
+    let rendered = match &format {
+        ReadFormat::Jfm => issue_to_jfm_document(&issue, instance_url)?.render()?,
         ReadFormat::Adf => {
             let adf = issue.description_adf.unwrap_or(serde_json::Value::Null);
-            serde_json::to_string_pretty(&adf).context("Failed to serialize ADF JSON")
+            serde_json::to_string_pretty(&adf).context("Failed to serialize ADF JSON")?
         }
+    };
+    match output_file {
+        Some(path) => write_to_file_yaml(path, &rendered, format.label()),
+        None => Ok(rendered),
     }
 }
 
@@ -394,7 +416,9 @@ impl OmniDevServer {
     /// Tool: fetch a JIRA issue as JFM markdown or raw ADF JSON.
     #[tool(
         description = "Fetch a JIRA issue. Returns JFM markdown (default, AI-friendly) \
-                       or raw ADF JSON when `format = \"adf\"`."
+                       or raw ADF JSON when `format = \"adf\"`. When `output_file` is set, \
+                       the content is written to that path and the tool returns a short \
+                       YAML summary (path/bytes/format) — useful for large issues."
     )]
     pub async fn jira_read(
         &self,
@@ -402,9 +426,15 @@ impl OmniDevServer {
     ) -> Result<CallToolResult, McpError> {
         let format = ReadFormat::parse(params.format.as_deref()).map_err(tool_error)?;
         let (client, instance_url) = create_client().map_err(tool_error)?;
-        let text = run_jira_read(&client, &instance_url, &params.key, format)
-            .await
-            .map_err(tool_error)?;
+        let text = run_jira_read(
+            &client,
+            &instance_url,
+            &params.key,
+            format,
+            params.output_file.as_deref(),
+        )
+        .await
+        .map_err(tool_error)?;
         ok_text(text)
     }
 
@@ -627,7 +657,7 @@ mod tests {
         mount_issue_response(&server, "PROJ-1", sample_issue_body()).await;
         let client = mock_client(&server.uri());
 
-        let rendered = run_jira_read(&client, &server.uri(), "PROJ-1", ReadFormat::Jfm)
+        let rendered = run_jira_read(&client, &server.uri(), "PROJ-1", ReadFormat::Jfm, None)
             .await
             .unwrap();
         assert!(rendered.contains("key: PROJ-1"));
@@ -641,7 +671,7 @@ mod tests {
         mount_issue_response(&server, "PROJ-1", sample_issue_body()).await;
         let client = mock_client(&server.uri());
 
-        let json = run_jira_read(&client, &server.uri(), "PROJ-1", ReadFormat::Adf)
+        let json = run_jira_read(&client, &server.uri(), "PROJ-1", ReadFormat::Adf, None)
             .await
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -662,7 +692,7 @@ mod tests {
         .await;
         let client = mock_client(&server.uri());
 
-        let json = run_jira_read(&client, &server.uri(), "PROJ-2", ReadFormat::Adf)
+        let json = run_jira_read(&client, &server.uri(), "PROJ-2", ReadFormat::Adf, None)
             .await
             .unwrap();
         assert_eq!(json.trim(), "null");
@@ -678,10 +708,91 @@ mod tests {
             .await;
         let client = mock_client(&server.uri());
 
-        let err = run_jira_read(&client, &server.uri(), "NOPE-1", ReadFormat::Jfm)
+        let err = run_jira_read(&client, &server.uri(), "NOPE-1", ReadFormat::Jfm, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_read_jfm_writes_to_output_file() {
+        let server = MockServer::start().await;
+        mount_issue_response(&server, "PROJ-1", sample_issue_body()).await;
+        let client = mock_client(&server.uri());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let out_path = tmp.path().join("issue.md");
+        let path_str = out_path.to_str().unwrap();
+
+        let summary = run_jira_read(
+            &client,
+            &server.uri(),
+            "PROJ-1",
+            ReadFormat::Jfm,
+            Some(path_str),
+        )
+        .await
+        .unwrap();
+
+        assert!(summary.contains(&format!("path: {path_str}")));
+        assert!(summary.contains("format: jfm"));
+        assert!(summary.contains("bytes:"));
+        // Inline content must NOT leak into the summary.
+        assert!(!summary.contains("Hello from JIRA"));
+
+        let written = std::fs::read_to_string(&out_path).unwrap();
+        assert!(written.contains("key: PROJ-1"));
+        assert!(written.contains("Hello from JIRA"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_read_adf_writes_to_output_file() {
+        let server = MockServer::start().await;
+        mount_issue_response(&server, "PROJ-1", sample_issue_body()).await;
+        let client = mock_client(&server.uri());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let out_path = tmp.path().join("issue.json");
+        let path_str = out_path.to_str().unwrap();
+
+        let summary = run_jira_read(
+            &client,
+            &server.uri(),
+            "PROJ-1",
+            ReadFormat::Adf,
+            Some(path_str),
+        )
+        .await
+        .unwrap();
+
+        assert!(summary.contains("format: adf"));
+        let written = std::fs::read_to_string(&out_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(parsed["type"], "doc");
+    }
+
+    #[tokio::test]
+    async fn run_jira_read_output_file_invalid_path_errors() {
+        let server = MockServer::start().await;
+        mount_issue_response(&server, "PROJ-1", sample_issue_body()).await;
+        let client = mock_client(&server.uri());
+
+        let err = run_jira_read(
+            &client,
+            &server.uri(),
+            "PROJ-1",
+            ReadFormat::Jfm,
+            Some("/nonexistent_dir_zxq/out.md"),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("Failed to write"));
+    }
+
+    #[test]
+    fn read_format_label_matches_expected_strings() {
+        assert_eq!(ReadFormat::Jfm.label(), "jfm");
+        assert_eq!(ReadFormat::Adf.label(), "adf");
     }
 
     // ── run_jira_search ────────────────────────────────────────────────────
