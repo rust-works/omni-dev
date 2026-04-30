@@ -1269,6 +1269,55 @@ mod tests {
         assert_eq!(format_label(&ContentFormat::Adf), "adf");
     }
 
+    /// Mocks a Confluence page whose body ADF is a JSON string instead of an
+    /// ADF document — parses past the API layer (the API just stores the
+    /// `Value`) but fails inside `content_item_to_document`, exercising the
+    /// `?` partial on `render_content_item(...)?` in [`run_confluence_read`].
+    async fn mock_page_with_bad_adf(server: &wiremock::MockServer, id: &str) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/wiki/api/v2/pages/{id}")))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": id,
+                    "title": "Bad ADF",
+                    "status": "current",
+                    "spaceId": "98765",
+                    "version": {"number": 1},
+                    "body": {
+                        "atlas_doc_format": {
+                            "value": "\"this is a JSON string, not an ADF doc\""
+                        }
+                    }
+                })),
+            )
+            .mount(server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/98765"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"key": "ENG"})),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_confluence_read_propagates_render_error() {
+        let _lock = env_lock();
+        let server = wiremock::MockServer::start().await;
+        mock_page_with_bad_adf(&server, "12345").await;
+        let _env = EnvGuard::set(&server.uri());
+
+        let err = run_confluence_read("12345", ContentFormat::Jfm, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to parse ADF"),
+            "got: {err}"
+        );
+    }
+
     // ── run_confluence_search ──────────────────────────────────────
 
     #[tokio::test(flavor = "current_thread")]

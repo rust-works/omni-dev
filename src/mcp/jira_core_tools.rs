@@ -195,16 +195,30 @@ async fn run_jira_read(
     output_file: Option<&str>,
 ) -> Result<String> {
     let issue = client.get_issue(key).await?;
-    let rendered = match &format {
-        ReadFormat::Jfm => issue_to_jfm_document(&issue, instance_url)?.render()?,
-        ReadFormat::Adf => {
-            let adf = issue.description_adf.unwrap_or(serde_json::Value::Null);
-            serde_json::to_string_pretty(&adf).context("Failed to serialize ADF JSON")?
-        }
-    };
+    let rendered = render_jira_issue(&issue, instance_url, &format)?;
     match output_file {
         Some(path) => write_to_file_yaml(path, &rendered, format.label()),
         None => Ok(rendered),
+    }
+}
+
+/// Renders a fetched [`crate::atlassian::client::JiraIssue`] in the requested
+/// format. Split out from [`run_jira_read`] so the rendering branch can be
+/// unit-tested without going through the HTTP client.
+fn render_jira_issue(
+    issue: &crate::atlassian::client::JiraIssue,
+    instance_url: &str,
+    format: &ReadFormat,
+) -> Result<String> {
+    match format {
+        ReadFormat::Jfm => issue_to_jfm_document(issue, instance_url)?.render(),
+        ReadFormat::Adf => {
+            let adf = issue
+                .description_adf
+                .clone()
+                .unwrap_or(serde_json::Value::Null);
+            serde_json::to_string_pretty(&adf).context("Failed to serialize ADF JSON")
+        }
     }
 }
 
@@ -793,6 +807,71 @@ mod tests {
     fn read_format_label_matches_expected_strings() {
         assert_eq!(ReadFormat::Jfm.label(), "jfm");
         assert_eq!(ReadFormat::Adf.label(), "adf");
+    }
+
+    // ── render_jira_issue ──────────────────────────────────────────────────
+
+    fn issue_with_description(
+        adf: Option<serde_json::Value>,
+    ) -> crate::atlassian::client::JiraIssue {
+        crate::atlassian::client::JiraIssue {
+            key: "PROJ-1".to_string(),
+            summary: "S".to_string(),
+            description_adf: adf,
+            status: None,
+            issue_type: None,
+            assignee: None,
+            priority: None,
+            labels: vec![],
+            custom_fields: vec![],
+        }
+    }
+
+    #[test]
+    fn render_jira_issue_jfm_propagates_adf_parse_error() {
+        // A JSON string is valid JSON but cannot deserialize into AdfDocument,
+        // so issue_to_jfm_document errors out — exercising the `?` partial.
+        let issue = issue_with_description(Some(serde_json::Value::String("not adf".into())));
+        let err = render_jira_issue(&issue, "https://org", &ReadFormat::Jfm).unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to parse ADF"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn render_jira_issue_adf_serialises_null_when_description_absent() {
+        let issue = issue_with_description(None);
+        let json = render_jira_issue(&issue, "https://org", &ReadFormat::Adf).unwrap();
+        assert_eq!(json.trim(), "null");
+    }
+
+    #[tokio::test]
+    async fn run_jira_read_propagates_render_error() {
+        // Mock returns a JIRA description that's a JSON string (not an ADF
+        // doc). render_jira_issue errors out, exercising the outer `?` on
+        // `render_jira_issue(...)?` in run_jira_read.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "key": "PROJ-1",
+                "fields": {
+                    "summary": "Bad ADF",
+                    "description": "this is not adf"
+                }
+            })))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+
+        let err = run_jira_read(&client, &server.uri(), "PROJ-1", ReadFormat::Jfm, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to parse ADF"),
+            "got: {err}"
+        );
     }
 
     // ── run_jira_search ────────────────────────────────────────────────────
