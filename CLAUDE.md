@@ -70,8 +70,9 @@ Common types: `feat`, `fix`, `docs`, `chore`, `refactor`, `test`
 2. **Follow the Style Guide**: Before writing or reviewing code, documentation, or other project artifacts, consult [docs/STYLE_GUIDE.md](docs/STYLE_GUIDE.md). Use the task-to-tag lookup table at the top of the guide to identify relevant tags, then search for those tags (e.g., `grep "Tags:.*code-style" docs/STYLE_GUIDE.md`). Read and follow the matched rules. Do not skip this step.
 3. **Configuration Changes**: When modifying config loading or scope resolution, consult [docs/configuration-best-practices.md](docs/configuration-best-practices.md) and [docs/plan/config-internals.md](docs/plan/config-internals.md)
 4. **Test Changes**: Run tests after modifications
-5. **Conventional Commits**: Use proper commit message format (see `.omni-dev/commit-guidelines.md`)
-6. **Incremental Changes**: Make focused, reviewable changes
+5. **CLI Surface Changes**: After any change to `src/cli/**`, `src/main.rs`, or any `#[derive(Parser)]` / `#[derive(Subcommand)]` / `#[arg(...)]` site, invoke the [`update-snapshots`](.claude/skills/update-snapshots/SKILL.md) skill to review and update `insta` golden snapshots — most often [tests/snapshots/integration_test__help_all_output.snap](tests/snapshots/integration_test__help_all_output.snap). Do **not** assume `cargo test` passing in isolation surfaces drift before you've inspected the new snapshot: golden tests fail loudly, but only after the full suite has run, and the fix (`cargo insta accept`) must only be applied when the diff matches the *intended* CLI change. If the diff contains anything you did not intend, investigate the regression instead of accepting.
+6. **Conventional Commits**: Use proper commit message format (see `.omni-dev/commit-guidelines.md`)
+7. **Incremental Changes**: Make focused, reviewable changes
 
 ### Release Process
 When preparing releases, follow the comprehensive guide in [docs/RELEASE.md](docs/RELEASE.md):
