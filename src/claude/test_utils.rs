@@ -135,3 +135,42 @@ impl AiClient for ConfigurableMockAiClient {
         self.metadata.clone()
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::claude::ai::RequestOptions;
+
+    /// MockAiClient must default to ''no schema support'' so existing
+    /// tests don't have to care about the new schema plumbing.
+    #[test]
+    fn mock_client_defaults_to_no_schema_support() {
+        let client = ConfigurableMockAiClient::new(vec![]);
+        let caps = client.capabilities();
+        assert!(
+            !caps.supports_response_schema,
+            "mock client should default to no schema support so tests don't have to care"
+        );
+    }
+
+    /// `send_request_with_options` falls through to `send_request` by
+    /// default — verify the mock observes the call.
+    #[tokio::test]
+    async fn mock_client_send_with_options_falls_through_to_send_request() {
+        let client = ConfigurableMockAiClient::new(vec![Ok("hello".to_string())]);
+        let prompt_handle = client.prompt_handle();
+
+        let result = client
+            .send_request_with_options("sys", "user", RequestOptions::default())
+            .await
+            .expect("default send_request_with_options should succeed");
+        assert_eq!(result, "hello");
+
+        // The default impl forwards to send_request, so the prompt is recorded
+        // exactly once.
+        let prompts = prompt_handle.prompts();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0], ("sys".to_string(), "user".to_string()));
+    }
+}

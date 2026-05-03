@@ -605,4 +605,19 @@ mod tests {
         assert!(!json.contains("max_completion_tokens"));
         assert!(json.contains("\"temperature\""));
     }
+
+    /// OpenAI / Ollama backends don't expose JSON Schema enforcement
+    /// here yet, so capabilities must report `false` for both.
+    #[test]
+    fn capabilities_default_to_no_schema_support_openai() {
+        let client =
+            OpenAiAiClient::new_openai("gpt-4o".to_string(), "key".to_string(), None).unwrap();
+        assert!(!client.capabilities().supports_response_schema);
+    }
+
+    #[test]
+    fn capabilities_default_to_no_schema_support_ollama() {
+        let client = OpenAiAiClient::new_ollama("llama2".to_string(), None, None).unwrap();
+        assert!(!client.capabilities().supports_response_schema);
+    }
 }

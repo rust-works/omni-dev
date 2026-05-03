@@ -267,4 +267,13 @@ mod tests {
         let metadata = client.get_metadata();
         assert!(metadata.active_beta.is_some());
     }
+
+    /// Anthropic backend doesn't expose JSON Schema enforcement (only
+    /// claude-cli does today), so capabilities must report `false`.
+    #[test]
+    fn capabilities_default_to_no_schema_support() {
+        let client =
+            ClaudeAiClient::new("claude-sonnet-4-6".to_string(), "key".to_string(), None).unwrap();
+        assert!(!client.capabilities().supports_response_schema);
+    }
 }
