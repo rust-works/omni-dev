@@ -150,14 +150,26 @@ Exports Claude Code conversation history to a target directory
 Usage: sync [OPTIONS] --target <PATH>
 
 Options:
-      --target <PATH>             Target directory for the export. Created if it does not exist
-      --source <PATH>             Override source root. Defaults to `~/.claude/projects`
-      --project <NAME_OR_PATH>    Restrict sync to one project. Accepts the encoded directory name (e.g. `-Users-jky-tmp`) or a decoded cwd path (matched after decoding)
-      --since <DURATION_OR_DATE>  Only sync sessions whose source mtime is at or after this point. Accepts a relative duration (`30s`, `5m`, `2h`, `7d`, `4w`) or an RFC 3339 timestamp
-      --prune                     Delete target files for sessions no longer present in the source. Only files matching `<slug>/<uuid>.jsonl` are eligible for deletion; anything else inside the target is preserved regardless
-      --dry-run                   Preview changes without touching the target
-      --format <FORMAT>           Output format [default: text] [possible values: text, yaml]
-  -h, --help                      Print help (see more with '--help')
+      --target <PATH>
+          Target directory for the export. Created if it does not exist
+      --source <PATH>
+          Override source root. Defaults to `~/.claude/projects`
+      --project <NAME_OR_PATH>
+          Restrict sync to one project. Accepts the encoded directory name (e.g. `-Users-jky-tmp`) or a decoded cwd path (matched after decoding)
+      --since <DURATION_OR_DATE>
+          Only sync sessions whose source mtime is at or after this point. Accepts a relative duration (`30s`, `5m`, `2h`, `7d`, `4w`) or an RFC 3339 timestamp
+      --prune
+          Delete target files for sessions no longer present in the source. Only files matching `<slug>/<uuid>.<ext>` are eligible for deletion; `<ext>` is restricted to the formats listed in `--output-format` so artifacts the run was not asked to manage are preserved regardless
+      --dry-run
+          Preview changes without touching the target
+      --format <FORMAT>
+          Report format [default: text] [possible values: text, yaml]
+      --output-format <FORMAT[,FORMAT...]>
+          On-disk file shape(s) to write. Accepts a comma-separated list, e.g. `--output-format jsonl,markdown` writes both side-by-side [default: jsonl] [possible values: jsonl, markdown]
+      --exclude-system
+          Hide system-side events (system reminders, attachments, permission-mode, summary, generic system events) from the rendered transcript. Affects markdown output only — jsonl is byte-identical regardless
+  -h, --help
+          Print help (see more with '--help')
 
 
 ================================================================================
