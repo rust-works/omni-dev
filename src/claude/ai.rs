@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use reqwest::Client;
+use serde_json::Value;
 
 use crate::claude::error::ClaudeError;
 use crate::claude::model_config::get_model_registry;
@@ -145,6 +146,78 @@ pub(crate) fn log_response_success(provider: &str, result: &Result<String>) {
     }
 }
 
+/// Capabilities advertised by an [`AiClient`] implementation.
+///
+/// Used by call sites to decide whether to attach a structured-response
+/// schema (or other backend-specific request options) before dispatching.
+/// The default value is the conservative ''nothing supported'' baseline so
+/// new fields can be added without forcing existing implementations to
+/// update.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AiClientCapabilities {
+    /// Whether the backend can enforce a JSON Schema on its response.
+    ///
+    /// When `true`, the call site may set
+    /// [`RequestOptions::response_schema`]; the backend will hand the schema
+    /// to its underlying API (e.g. `claude -p --json-schema <file>`) and the
+    /// API re-prompts until the model produces a validating response.
+    pub supports_response_schema: bool,
+}
+
+/// Whether the response should be formatted as YAML (default) or JSON
+/// matching a schema.
+///
+/// Used by the prompts module to swap the format-specific portion of a
+/// structured prompt without rewriting the semantic instructions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ResponseFormat {
+    /// Plain YAML, with the prompt asking the model to emit a fenced or
+    /// bare YAML document.
+    #[default]
+    Yaml,
+    /// JSON object that matches a schema attached via
+    /// [`RequestOptions::response_schema`]. The prompt drops the YAML
+    /// structure literal and tells the model to return only the JSON
+    /// object.
+    JsonSchema,
+}
+
+impl ResponseFormat {
+    /// Returns the response format that should be used given a backend's
+    /// capabilities.
+    #[must_use]
+    pub fn from_capabilities(caps: &AiClientCapabilities) -> Self {
+        if caps.supports_response_schema {
+            Self::JsonSchema
+        } else {
+            Self::Yaml
+        }
+    }
+}
+
+/// Per-request options passed to [`AiClient::send_request_with_options`].
+///
+/// Schema and other knobs live on the request, not the client, so a shared
+/// client cannot leak settings between concurrent calls. Backends that do
+/// not support an option are expected to ignore it (and the call site is
+/// expected to consult [`AiClient::capabilities`] before setting it).
+#[derive(Clone, Debug, Default)]
+pub struct RequestOptions {
+    /// Optional JSON Schema (as a `serde_json::Value`) constraining the
+    /// model's response. Only honoured by backends whose
+    /// [`AiClientCapabilities::supports_response_schema`] is `true`.
+    pub response_schema: Option<Value>,
+}
+
+impl RequestOptions {
+    /// Returns a new [`RequestOptions`] with [`response_schema`] set.
+    #[must_use]
+    pub fn with_response_schema(mut self, schema: Value) -> Self {
+        self.response_schema = Some(schema);
+        self
+    }
+}
+
 /// Trait for AI service clients.
 pub trait AiClient: Send + Sync {
     /// Sends a request to the AI service and returns the raw response.
@@ -156,6 +229,33 @@ pub trait AiClient: Send + Sync {
 
     /// Returns metadata about the AI client implementation.
     fn get_metadata(&self) -> AiClientMetadata;
+
+    /// Returns the optional capabilities advertised by this backend.
+    ///
+    /// The default implementation returns the all-disabled baseline so
+    /// existing backends remain source-compatible. Backends that gain new
+    /// capabilities (e.g. structured-output enforcement) should override
+    /// this method.
+    fn capabilities(&self) -> AiClientCapabilities {
+        AiClientCapabilities::default()
+    }
+
+    /// Sends a request with optional per-request settings.
+    ///
+    /// The default implementation drops `options` and dispatches via
+    /// [`send_request`]. Backends that honour any field in
+    /// [`RequestOptions`] (e.g. `response_schema`) override this method.
+    /// Backends that don't honour an option must ignore it; call sites
+    /// should consult [`capabilities`](Self::capabilities) before setting
+    /// options that not all backends support.
+    fn send_request_with_options<'a>(
+        &'a self,
+        system_prompt: &'a str,
+        user_prompt: &'a str,
+        _options: RequestOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+        self.send_request(system_prompt, user_prompt)
+    }
 }
 
 #[cfg(test)]
@@ -206,5 +306,49 @@ mod tests {
     fn prompt_style_case_sensitive() {
         assert_eq!(meta("openai").prompt_style(), PromptStyle::Claude);
         assert_eq!(meta("ollama").prompt_style(), PromptStyle::Claude);
+    }
+
+    #[test]
+    fn capabilities_default_is_all_disabled() {
+        let caps = AiClientCapabilities::default();
+        assert!(!caps.supports_response_schema);
+    }
+
+    #[test]
+    fn response_format_default_is_yaml() {
+        assert_eq!(ResponseFormat::default(), ResponseFormat::Yaml);
+    }
+
+    #[test]
+    fn response_format_from_capabilities_disabled_picks_yaml() {
+        let caps = AiClientCapabilities::default();
+        assert_eq!(
+            ResponseFormat::from_capabilities(&caps),
+            ResponseFormat::Yaml
+        );
+    }
+
+    #[test]
+    fn response_format_from_capabilities_enabled_picks_json_schema() {
+        let caps = AiClientCapabilities {
+            supports_response_schema: true,
+        };
+        assert_eq!(
+            ResponseFormat::from_capabilities(&caps),
+            ResponseFormat::JsonSchema
+        );
+    }
+
+    #[test]
+    fn request_options_with_response_schema_sets_field() {
+        let value = serde_json::json!({"type": "object"});
+        let opts = RequestOptions::default().with_response_schema(value.clone());
+        assert_eq!(opts.response_schema, Some(value));
+    }
+
+    #[test]
+    fn request_options_default_has_no_schema() {
+        let opts = RequestOptions::default();
+        assert!(opts.response_schema.is_none());
     }
 }

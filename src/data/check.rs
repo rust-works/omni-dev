@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Complete check report containing all commit analysis results.
@@ -55,7 +56,7 @@ pub struct CommitSuggestion {
 }
 
 /// Severity level for issues.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum IssueSeverity {
     /// Errors block CI (exit code 1).
@@ -218,14 +219,16 @@ impl fmt::Display for OutputFormat {
 }
 
 /// AI response structure for parsing check results.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct AiCheckResponse {
     /// List of commit checks.
     pub checks: Vec<AiCommitCheck>,
 }
 
 /// Single commit check from AI response.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct AiCommitCheck {
     /// Commit hash (short or full).
     pub commit: String,
@@ -235,7 +238,7 @@ pub struct AiCommitCheck {
     #[serde(default)]
     pub issues: Vec<AiIssue>,
     /// Suggested message improvement.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suggestion: Option<AiSuggestion>,
     /// Brief summary of what this commit changes (for cross-commit coherence).
     #[serde(default)]
@@ -243,7 +246,8 @@ pub struct AiCommitCheck {
 }
 
 /// Issue from AI response.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct AiIssue {
     /// Reasoning written before the verdict. Forces think-first ordering so
     /// `severity` is conditioned on fully-worked-through reasoning instead of
@@ -262,7 +266,8 @@ pub struct AiIssue {
 }
 
 /// Suggestion from AI response.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct AiSuggestion {
     /// Suggested message.
     pub message: String,

@@ -388,4 +388,18 @@ mod tests {
         assert_eq!(client.base_url, "https://bedrock.us-east-1.amazonaws.com");
         assert!(client.active_beta.is_none());
     }
+
+    /// Bedrock backend doesn't expose JSON Schema enforcement here yet, so
+    /// capabilities must report `false`.
+    #[test]
+    fn capabilities_default_to_no_schema_support() {
+        let client = BedrockAiClient::new(
+            "claude-sonnet-4-20250514".to_string(),
+            "token".to_string(),
+            "https://example.com".to_string(),
+            None,
+        )
+        .unwrap();
+        assert!(!client.capabilities().supports_response_schema);
+    }
 }

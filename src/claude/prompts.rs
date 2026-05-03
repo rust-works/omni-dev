@@ -1,7 +1,116 @@
 //! Prompt templates and engineering for Claude API.
 
-use crate::claude::ai::PromptStyle;
+use crate::claude::ai::{PromptStyle, ResponseFormat};
 use crate::data::context::{CommitContext, VerbosityLevel, WorkPattern};
+
+/// Suffix appended to the system prompt when the response is constrained
+/// by a JSON Schema (i.e. [`ResponseFormat::JsonSchema`]).
+///
+/// Existing prompts ask the model to format the response as YAML in a
+/// fenced or bare block. When `claude -p --json-schema` is in play, the
+/// CLI re-prompts until the model produces a JSON object validating
+/// against the supplied schema. The original YAML instructions are then
+/// actively misleading: they cost a re-prompt as the model first emits
+/// YAML and the CLI rejects it.
+///
+/// This suffix overrides the format directive without rewriting the
+/// surrounding semantic content. It is intentionally placed at the end
+/// of the system prompt so its instructions are the most-recent (and
+/// thus most-attended-to) text for the model.
+pub const JSON_SCHEMA_RESPONSE_OVERRIDE: &str = "\n\n=== STRUCTURED OUTPUT OVERRIDE ===\n\
+DISREGARD any previous instructions to format your response as YAML or in a fenced \
+code block. Instead, return a single JSON object that exactly matches the JSON Schema \
+provided to the runtime via the --json-schema flag. \
+\n\nFormat rules:\
+\n- Return ONLY the JSON object — no preamble, no narration, no explanation, no fenced \
+code blocks around the response itself.\
+\n- The outer response must be a bare JSON object. Markdown values inside the JSON \
+(e.g. a `description` field) MAY contain fenced code blocks like ```rust ...``` — only \
+the outermost wrapping must be a bare object, not the string contents within it.\
+\n- All required fields must be present. Do not invent additional fields not in the schema.";
+
+/// Returns the system-prompt suffix to apply for the given response
+/// format, or `None` when no override is needed (YAML path).
+///
+/// Call sites append this to the end of their system prompt before
+/// dispatching, so the override always wins over earlier YAML
+/// formatting instructions when [`ResponseFormat::JsonSchema`] is in
+/// effect.
+#[must_use]
+pub fn response_format_system_suffix(format: ResponseFormat) -> Option<&'static str> {
+    match format {
+        ResponseFormat::Yaml => None,
+        ResponseFormat::JsonSchema => Some(JSON_SCHEMA_RESPONSE_OVERRIDE),
+    }
+}
+
+/// Appends [`response_format_system_suffix`] when needed.
+///
+/// Returns `prompt` with the suffix appended when the format is
+/// [`ResponseFormat::JsonSchema`]; otherwise returns `prompt`
+/// unchanged. Convenience for call sites that already have a system
+/// prompt string in hand.
+#[must_use]
+pub fn apply_response_format_to_system_prompt(prompt: String, format: ResponseFormat) -> String {
+    match response_format_system_suffix(format) {
+        Some(suffix) => format!("{prompt}{suffix}"),
+        None => prompt,
+    }
+}
+
+#[cfg(test)]
+mod response_format_tests {
+    use super::*;
+
+    #[test]
+    fn yaml_format_returns_no_suffix() {
+        assert!(response_format_system_suffix(ResponseFormat::Yaml).is_none());
+    }
+
+    #[test]
+    fn json_schema_format_returns_override_suffix() {
+        assert_eq!(
+            response_format_system_suffix(ResponseFormat::JsonSchema),
+            Some(JSON_SCHEMA_RESPONSE_OVERRIDE)
+        );
+    }
+
+    #[test]
+    fn apply_with_yaml_passes_prompt_through() {
+        let original = "system prompt body".to_string();
+        let result = apply_response_format_to_system_prompt(original.clone(), ResponseFormat::Yaml);
+        assert_eq!(result, original);
+    }
+
+    #[test]
+    fn apply_with_json_schema_appends_override() {
+        let original = "system prompt body".to_string();
+        let result =
+            apply_response_format_to_system_prompt(original.clone(), ResponseFormat::JsonSchema);
+        assert!(result.starts_with(&original));
+        assert!(result.contains("STRUCTURED OUTPUT OVERRIDE"));
+        assert!(result.len() > original.len());
+    }
+
+    /// The override addendum must explicitly carve out the embedded-fence
+    /// case so PR descriptions containing rust/json/etc. fenced blocks
+    /// inside the response's string fields are not mangled.
+    #[test]
+    fn override_carves_out_embedded_fences() {
+        assert!(JSON_SCHEMA_RESPONSE_OVERRIDE.contains("Markdown values inside the JSON"));
+    }
+
+    /// Override must instruct the model to drop preamble/narration so a
+    /// stray "Here is the response:" line doesn't trigger a re-prompt.
+    #[test]
+    fn override_forbids_preamble() {
+        let lower = JSON_SCHEMA_RESPONSE_OVERRIDE.to_ascii_lowercase();
+        assert!(
+            lower.contains("no preamble") || lower.contains("only the json object"),
+            "override should forbid preamble: {JSON_SCHEMA_RESPONSE_OVERRIDE}"
+        );
+    }
+}
 
 /// Default commit guidelines embedded from markdown file at compile time.
 /// Used by both twiddle and check commands when no project-specific guidelines are provided.
