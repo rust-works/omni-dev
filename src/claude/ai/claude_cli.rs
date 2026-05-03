@@ -238,6 +238,14 @@ impl ClaudeCliAiClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        // Make the child its own process-group leader so we can later
+        // signal the whole group via `killpg`. Without this, `claude -p`
+        // helper Node workers spawned at runtime get reparented to PID 1
+        // when only the direct PID is killed on timeout, and accumulate
+        // as orphans. See issue #633.
+        #[cfg(unix)]
+        cmd.process_group(0);
+
         // Scrub risky env vars rather than clearing wholesale. Clearing the
         // env breaks the Node runtime inside `claude` (needs HOME, PATH,
         // possibly DYLD_* / homebrew PATH entries on macOS).
@@ -352,13 +360,11 @@ impl ClaudeCliAiClient {
         let (stdout_bytes, stderr_bytes) = match io_result {
             Ok(Ok(pair)) => pair,
             Ok(Err(e)) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                kill_and_reap(&mut child).await;
                 return Err(e);
             }
             Err(_) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                kill_and_reap(&mut child).await;
                 return Err(ClaudeError::SubprocessTimeout {
                     secs: self.timeout.as_secs(),
                 }
@@ -566,6 +572,46 @@ where
         buf.extend_from_slice(&chunk[..n]);
     }
     Ok(buf)
+}
+
+/// Kills the subprocess and reaps it.
+///
+/// On Unix, sends SIGKILL to the entire process group so any helpers
+/// the child forked (e.g. Node workers spawned by `claude -p`) die
+/// alongside the direct child. Pairs with the `process_group(0)` call
+/// in [`ClaudeCliAiClient::build_command`]. See issue #633.
+///
+/// On non-Unix, falls back to `tokio::process::Child::kill`, which
+/// already terminates the process tree on Windows via
+/// `TerminateProcess`.
+async fn kill_and_reap(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            // Cast through i32: tokio's PID is u32; nix's Pid wraps i32
+            // (matching the kernel's pid_t). PIDs always fit in i32 in
+            // practice — Linux caps at PID_MAX_LIMIT (~2^22) and macOS
+            // at 99999.
+            let group = nix::unistd::Pid::from_raw(pid as i32);
+            if let Err(e) = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL) {
+                // ESRCH is expected when the group has already drained
+                // (everyone exited between timeout and kill). Anything
+                // else is worth logging but not fatal — we still wait
+                // below to reap whatever remains of the direct child.
+                if e != nix::errno::Errno::ESRCH {
+                    debug!(error = %e, pid, "killpg failed; falling back to direct kill");
+                    let _ = child.start_kill();
+                }
+            }
+        } else {
+            // Already reaped; nothing to signal.
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill().await;
+    }
+    let _ = child.wait().await;
 }
 
 /// `execve` returns `ETXTBSY` (errno 26 on Linux) when *any* process
@@ -1428,5 +1474,247 @@ mod tests {
         let out = client_with_shim(shim).run("sys", "user").await.unwrap();
         release.await.unwrap();
         assert_eq!(out, "late");
+    }
+
+    // ── Process-group reaping on timeout (issue #633) ──────────────
+
+    /// Polls `kill(pid, 0)` until the process is gone or the deadline
+    /// elapses. `Ok(())` indicates the process is gone (`ESRCH`); `Err`
+    /// reports the elapsed time so the assertion site can show how long
+    /// the process lingered.
+    #[cfg(unix)]
+    async fn wait_for_pid_gone(pid: i32, deadline: Duration) -> Result<(), Duration> {
+        let nix_pid = nix::unistd::Pid::from_raw(pid);
+        let start = std::time::Instant::now();
+        loop {
+            if nix::sys::signal::kill(nix_pid, None) == Err(nix::errno::Errno::ESRCH) {
+                return Ok(());
+            }
+            if start.elapsed() >= deadline {
+                return Err(start.elapsed());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Acceptance test for issue #633: when a `claude -p` invocation
+    /// times out, the entire subprocess group is reaped — including
+    /// helper processes the child forked into the background. Without
+    /// `process_group(0)` + `killpg`, the background sleeper would
+    /// be reparented to PID 1 and survive its parent.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn timeout_reaps_full_process_group() {
+        let _guard = shim_lock();
+        let tmp = TempDir::new().unwrap();
+        let pid_file = tmp.path().join("sleeper.pid");
+        let shim = tmp.path().join("group-shim");
+
+        // Shim starts a long-lived background sleeper, records its PID
+        // for the parent test, then blocks long enough that the
+        // configured timeout fires. With process_group(0) + killpg the
+        // background sleeper dies alongside the shim; without them it
+        // survives until its own `sleep` elapses.
+        let script = format!(
+            "#!/bin/sh\nsleep 30 &\nprintf '%s' \"$!\" > '{}'\nsleep 30\n",
+            pid_file.display()
+        );
+        write_exec_script(&shim, &script);
+
+        let cli = ClaudeCliAiClient::new_with_config(
+            "sonnet".to_string(),
+            Duration::from_millis(500),
+            DEFAULT_STDOUT_CAP,
+            false,
+            shim,
+        );
+
+        let err = cli
+            .run("sys", "user")
+            .await
+            .expect_err("expected timeout error");
+        let chain = format!("{err:#}");
+        assert!(chain.contains("timed out"), "expected timeout: {chain}");
+
+        let pid_str = std::fs::read_to_string(&pid_file)
+            .expect("shim should have recorded sleeper PID before sleeping");
+        let sleeper_pid: i32 = pid_str.trim().parse().expect("valid pid");
+
+        wait_for_pid_gone(sleeper_pid, Duration::from_secs(3))
+            .await
+            .unwrap_or_else(|elapsed| {
+                panic!(
+                    "background sleeper {sleeper_pid} still alive {elapsed:?} after \
+                     parent timeout — process-group reap regressed (issue #633)"
+                )
+            });
+    }
+
+    /// Companion to `timeout_reaps_full_process_group`: same shim
+    /// shape, but the inner I/O fails (write task errors via a closed
+    /// pipe by exiting fast) is not what we want here — instead we
+    /// assert the helper still gets reaped on the *write-error* branch
+    /// of `run()` by invoking `kill_and_reap` directly against a
+    /// fresh subprocess. This exercises the helper without depending
+    /// on the timeout path.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn kill_and_reap_kills_full_process_group() {
+        let _guard = shim_lock();
+        let tmp = TempDir::new().unwrap();
+        let pid_file = tmp.path().join("sleeper-direct.pid");
+        let shim = tmp.path().join("direct-shim");
+        let script = format!(
+            "#!/bin/sh\nsleep 30 &\nprintf '%s' \"$!\" > '{}'\nsleep 30\n",
+            pid_file.display()
+        );
+        write_exec_script(&shim, &script);
+
+        let mut cmd = tokio::process::Command::new(&shim);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = cmd.spawn().expect("spawn shim");
+
+        // Wait until the shim has written its sleeper PID — the file
+        // appears after a few ms in practice, but poll defensively.
+        let pid_path = pid_file.clone();
+        let pid_str = tokio::time::timeout(Duration::from_secs(2), async move {
+            loop {
+                if let Ok(s) = std::fs::read_to_string(&pid_path) {
+                    if !s.trim().is_empty() {
+                        return s;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shim wrote PID");
+        let sleeper_pid: i32 = pid_str.trim().parse().expect("valid pid");
+
+        kill_and_reap(&mut child).await;
+
+        wait_for_pid_gone(sleeper_pid, Duration::from_secs(3))
+            .await
+            .unwrap_or_else(|elapsed| {
+                panic!(
+                    "background sleeper {sleeper_pid} still alive {elapsed:?} after \
+                     kill_and_reap"
+                )
+            });
+    }
+
+    /// `kill_and_reap` must tolerate a child that has already exited.
+    /// In that case `child.id()` may still return Some until reaped —
+    /// the killpg call returns ESRCH, which the helper swallows.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn kill_and_reap_tolerates_already_exited_child() {
+        let _guard = shim_lock();
+        let tmp = TempDir::new().unwrap();
+        let shim = tmp.path().join("fast-exit");
+        write_exec_script(&shim, "#!/bin/sh\nexit 0\n");
+
+        let mut cmd = tokio::process::Command::new(&shim);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = cmd.spawn().expect("spawn shim");
+
+        // Give the child a moment to exit before we try to reap.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Should not panic / hang, even though the group is already
+        // empty.
+        kill_and_reap(&mut child).await;
+    }
+
+    /// `kill_and_reap` must be safe to call even after the child has
+    /// been explicitly waited on, which makes `child.id()` return None.
+    /// Covers the `else` branch of the helper.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn kill_and_reap_handles_already_waited_child() {
+        let _guard = shim_lock();
+        let tmp = TempDir::new().unwrap();
+        let shim = tmp.path().join("waited-shim");
+        write_exec_script(&shim, "#!/bin/sh\nexit 0\n");
+
+        let mut cmd = tokio::process::Command::new(&shim);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = cmd.spawn().expect("spawn shim");
+
+        // Reap explicitly so child.id() reports None on the next call.
+        let _ = child.wait().await.expect("wait succeeds");
+        assert!(child.id().is_none(), "post-wait id should be None");
+
+        // Should be a no-op — exercises the `else` branch where the
+        // helper has no PID to signal.
+        kill_and_reap(&mut child).await;
+    }
+
+    /// `wait_for_pid_gone` must report `Err` (with elapsed time) when
+    /// its deadline expires before the process dies. Covers the
+    /// deadline branch of the polling loop.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn wait_for_pid_gone_returns_err_on_deadline() {
+        let _guard = shim_lock();
+        let tmp = TempDir::new().unwrap();
+        let shim = tmp.path().join("alive-long");
+        write_exec_script(&shim, "#!/bin/sh\nsleep 30\n");
+
+        let mut cmd = tokio::process::Command::new(&shim);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = cmd.spawn().expect("spawn shim");
+        let pid = child.id().expect("has pid") as i32;
+
+        let deadline = Duration::from_millis(80);
+        let res = wait_for_pid_gone(pid, deadline).await;
+        let elapsed = res.expect_err("should hit deadline before sleeper exits");
+        assert!(
+            elapsed >= deadline,
+            "elapsed {elapsed:?} should be at least the deadline {deadline:?}"
+        );
+
+        // Cleanup so we don't leak a 30s sleeper.
+        kill_and_reap(&mut child).await;
+    }
+
+    /// `kill_and_reap` must reap a child that's actively running, not
+    /// just one that already exited. Confirms the `wait()` half of the
+    /// helper (otherwise the child would persist as a zombie).
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn kill_and_reap_reaps_running_child() {
+        let _guard = shim_lock();
+        let tmp = TempDir::new().unwrap();
+        let shim = tmp.path().join("running-shim");
+        write_exec_script(&shim, "#!/bin/sh\nsleep 30\n");
+
+        let mut cmd = tokio::process::Command::new(&shim);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = cmd.spawn().expect("spawn shim");
+        let pid = child.id().expect("child has pid before reap");
+
+        kill_and_reap(&mut child).await;
+
+        wait_for_pid_gone(pid as i32, Duration::from_secs(3))
+            .await
+            .unwrap_or_else(|elapsed| {
+                panic!("direct child {pid} still alive {elapsed:?} after kill_and_reap")
+            });
     }
 }
