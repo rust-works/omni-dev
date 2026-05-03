@@ -5,9 +5,11 @@
 //! separate API key.
 //!
 //! Sandboxing:
-//! - `--tools ""` disables built-in tools.
+//! - `--tools ""` disables built-in tools (skipped when [`ALLOW_TOOLS_ENV_VAR`]
+//!   is set).
 //! - `--strict-mcp-config` (with no accompanying `--mcp-config`) blocks MCP
-//!   server pickup from user settings.
+//!   server pickup from user settings (skipped when [`ALLOW_MCP_ENV_VAR`] is
+//!   set; the two escape hatches are independent).
 //! - `--setting-sources ""` skips user / project / local settings discovery.
 //! - `--disable-slash-commands` blocks skills.
 //! - `--no-session-persistence` avoids writing session state to disk.
@@ -56,6 +58,16 @@ pub(crate) const BINARY_ENV_VAR: &str = "OMNI_DEV_CLAUDE_CLI_BIN";
 /// instead of being run with `--tools ""`. **This weakens the sandbox and
 /// should only be used for deliberately tool-capable use cases.**
 pub(crate) const ALLOW_TOOLS_ENV_VAR: &str = "OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS";
+
+/// Env var enabling the MCP-access escape hatch.
+///
+/// When set to `true` / `1` / `yes`, the nested `claude -p` session is
+/// allowed to load MCP servers from the user's `~/.claude/settings.json`
+/// instead of being run with `--strict-mcp-config` (which blocks MCP pickup
+/// entirely). **This exposes any OAuth tokens or network-attached services
+/// configured in those MCP servers and should be opted into deliberately,
+/// independently of the tool-access escape hatch.**
+pub(crate) const ALLOW_MCP_ENV_VAR: &str = "OMNI_DEV_CLAUDE_CLI_ALLOW_MCP";
 
 /// Env var setting a per-invocation spending cap in USD.
 ///
@@ -110,6 +122,10 @@ pub struct ClaudeCliAiClient {
     /// When true, skip `--tools ""` (escape hatch for future tool-enabled
     /// use cases). Off by default.
     allow_tools: bool,
+    /// When true, skip `--strict-mcp-config`, letting the nested session
+    /// pick up MCP servers from the user's `~/.claude/settings.json`.
+    /// Off by default. Independent of [`Self::allow_tools`].
+    allow_mcp: bool,
     /// Path to the `claude` binary (defaults to `claude` on PATH).
     binary_path: PathBuf,
     /// Optional per-invocation spending cap in USD (forwarded to
@@ -129,6 +145,7 @@ impl ClaudeCliAiClient {
             Self::allow_tools_from_env(),
             Self::binary_from_env(),
         )
+        .with_allow_mcp(Self::allow_mcp_from_env())
         .with_max_budget_usd(Self::max_budget_from_env())
     }
 
@@ -150,9 +167,19 @@ impl ClaudeCliAiClient {
             timeout,
             stdout_cap,
             allow_tools,
+            allow_mcp: false,
             binary_path,
             max_budget_usd: None,
         }
+    }
+
+    /// Sets the MCP-access escape hatch. Builder-style for ergonomics so
+    /// existing callers of [`Self::new_with_config`] do not need to update
+    /// when new optional knobs are added.
+    #[must_use]
+    pub fn with_allow_mcp(mut self, allow_mcp: bool) -> Self {
+        self.allow_mcp = allow_mcp;
+        self
     }
 
     /// Sets the per-invocation spending cap. Builder-style for ergonomics.
@@ -187,6 +214,15 @@ impl ClaudeCliAiClient {
     /// everything else (including unset) means disabled.
     fn allow_tools_from_env() -> bool {
         crate::utils::settings::get_env_var(ALLOW_TOOLS_ENV_VAR)
+            .ok()
+            .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+    }
+
+    /// Reads [`ALLOW_MCP_ENV_VAR`] and returns whether the MCP-access escape
+    /// hatch is enabled. Accepts `true` / `1` / `yes` (case-insensitive);
+    /// everything else (including unset) means disabled.
+    fn allow_mcp_from_env() -> bool {
+        crate::utils::settings::get_env_var(ALLOW_MCP_ENV_VAR)
             .ok()
             .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
     }
@@ -230,7 +266,6 @@ impl ClaudeCliAiClient {
             .arg("default")
             .arg("--no-session-persistence")
             .arg("--disable-slash-commands")
-            .arg("--strict-mcp-config")
             .arg("--setting-sources")
             .arg("")
             .arg("--system-prompt")
@@ -238,6 +273,10 @@ impl ClaudeCliAiClient {
 
         if !self.allow_tools {
             cmd.arg("--tools").arg("");
+        }
+
+        if !self.allow_mcp {
+            cmd.arg("--strict-mcp-config");
         }
 
         if let Some(budget) = self.max_budget_usd {
@@ -330,10 +369,21 @@ impl ClaudeCliAiClient {
             );
         }
 
+        if self.allow_mcp {
+            warn!(
+                "claude -p sandbox weakened: MCP-access escape hatch is enabled \
+                 (--claude-cli-allow-mcp / OMNI_DEV_CLAUDE_CLI_ALLOW_MCP). \
+                 The nested session can now load MCP servers configured in \
+                 ~/.claude/settings.json, exposing any OAuth tokens or \
+                 network-attached services they hold."
+            );
+        }
+
         info!(
             binary = %self.binary_path.display(),
             model = %self.model,
             allow_tools = self.allow_tools,
+            allow_mcp = self.allow_mcp,
             timeout_secs = self.timeout.as_secs(),
             "Spawning claude -p subprocess"
         );
@@ -722,6 +772,18 @@ async fn spawn_with_etxtbsy_retry(cmd: &mut Command) -> std::io::Result<tokio::p
     unreachable!("loop exits via return")
 }
 
+/// Test-only mutex serialising every test that mutates global state read
+/// by `claude-cli` (env vars and process-global config).
+///
+/// Shared across this module's tests **and** `crate::cli`'s tests because
+/// `Cli::propagate_global_flags` forwards CLI flags to the same env vars
+/// (`OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS`, `OMNI_DEV_CLAUDE_CLI_ALLOW_MCP`,
+/// `OMNI_DEV_CLAUDE_CLI_MAX_BUDGET_USD`, `OMNI_DEV_AI_BACKEND`) that the
+/// guards below snapshot. A single shared mutex eliminates cross-module
+/// races and avoids multi-lock deadlock entirely.
+#[cfg(test)]
+pub(crate) static CLI_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -897,11 +959,76 @@ mod tests {
         );
     }
 
-    /// Test-scoped mutex + guard to serialise env-mutating escape-hatch
-    /// tests. Separate from other modules' locks on purpose — these tests
-    /// only touch `OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS`.
-    static ALLOW_TOOLS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Four-way matrix between the two escape hatches. Asserts that
+    /// `allow_tools` and `allow_mcp` toggle independent argv flags.
+    fn build_args(allow_tools: bool, allow_mcp: bool) -> Vec<String> {
+        let cli = ClaudeCliAiClient::new_with_config(
+            "sonnet".to_string(),
+            DEFAULT_TIMEOUT,
+            DEFAULT_STDOUT_CAP,
+            allow_tools,
+            PathBuf::from("claude"),
+        )
+        .with_allow_mcp(allow_mcp);
+        let tmp = TempDir::new().unwrap();
+        args_of(&cli.build_command("sys", tmp.path()))
+    }
 
+    #[test]
+    fn matrix_default_includes_both_guards() {
+        let args = build_args(false, false);
+        assert!(
+            args.contains(&"--tools".to_string()),
+            "default must keep --tools: {args:?}"
+        );
+        assert!(
+            args.contains(&"--strict-mcp-config".to_string()),
+            "default must keep --strict-mcp-config: {args:?}"
+        );
+    }
+
+    #[test]
+    fn matrix_allow_mcp_alone_drops_only_strict_mcp() {
+        let args = build_args(false, true);
+        assert!(
+            args.contains(&"--tools".to_string()),
+            "allow_mcp alone must keep --tools: {args:?}"
+        );
+        assert!(
+            !args.contains(&"--strict-mcp-config".to_string()),
+            "allow_mcp alone must drop --strict-mcp-config: {args:?}"
+        );
+    }
+
+    #[test]
+    fn matrix_allow_tools_alone_drops_only_tools() {
+        let args = build_args(true, false);
+        assert!(
+            !args.contains(&"--tools".to_string()),
+            "allow_tools alone must drop --tools: {args:?}"
+        );
+        assert!(
+            args.contains(&"--strict-mcp-config".to_string()),
+            "allow_tools alone must keep --strict-mcp-config: {args:?}"
+        );
+    }
+
+    #[test]
+    fn matrix_both_drops_both_guards() {
+        let args = build_args(true, true);
+        assert!(
+            !args.contains(&"--tools".to_string()),
+            "both flags must drop --tools: {args:?}"
+        );
+        assert!(
+            !args.contains(&"--strict-mcp-config".to_string()),
+            "both flags must drop --strict-mcp-config: {args:?}"
+        );
+    }
+
+    /// Test-scoped guard for `OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS`. Serialises
+    /// against every other env-mutating test via the shared
+    /// [`CLI_ENV_LOCK`].
     struct AllowToolsEnvGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
         saved: Option<String>,
@@ -909,7 +1036,7 @@ mod tests {
 
     impl AllowToolsEnvGuard {
         fn new() -> Self {
-            let lock = ALLOW_TOOLS_ENV_LOCK
+            let lock = CLI_ENV_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let saved = std::env::var(ALLOW_TOOLS_ENV_VAR).ok();
@@ -1000,10 +1127,125 @@ mod tests {
         );
     }
 
+    /// Test-scoped guard for `OMNI_DEV_CLAUDE_CLI_ALLOW_MCP`. Serialises
+    /// against every other env-mutating test via the shared
+    /// [`CLI_ENV_LOCK`].
+    struct AllowMcpEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Option<String>,
+    }
+
+    impl AllowMcpEnvGuard {
+        fn new() -> Self {
+            let lock = CLI_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let saved = std::env::var(ALLOW_MCP_ENV_VAR).ok();
+            std::env::remove_var(ALLOW_MCP_ENV_VAR);
+            Self { _lock: lock, saved }
+        }
+
+        fn set(&self, value: &str) {
+            std::env::set_var(ALLOW_MCP_ENV_VAR, value);
+        }
+    }
+
+    impl Drop for AllowMcpEnvGuard {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(v) => std::env::set_var(ALLOW_MCP_ENV_VAR, v),
+                None => std::env::remove_var(ALLOW_MCP_ENV_VAR),
+            }
+        }
+    }
+
+    #[test]
+    fn allow_mcp_from_env_defaults_to_false_when_unset() {
+        let _g = AllowMcpEnvGuard::new();
+        assert!(!ClaudeCliAiClient::allow_mcp_from_env());
+    }
+
+    #[test]
+    fn allow_mcp_from_env_true() {
+        let g = AllowMcpEnvGuard::new();
+        g.set("true");
+        assert!(ClaudeCliAiClient::allow_mcp_from_env());
+    }
+
+    #[test]
+    fn allow_mcp_from_env_true_case_insensitive_and_trimmed() {
+        let g = AllowMcpEnvGuard::new();
+        g.set("  TRUE  ");
+        assert!(ClaudeCliAiClient::allow_mcp_from_env());
+    }
+
+    #[test]
+    fn allow_mcp_from_env_one_and_yes_accepted() {
+        let g = AllowMcpEnvGuard::new();
+        g.set("1");
+        assert!(ClaudeCliAiClient::allow_mcp_from_env());
+        g.set("yes");
+        assert!(ClaudeCliAiClient::allow_mcp_from_env());
+    }
+
+    #[test]
+    fn allow_mcp_from_env_other_values_are_false() {
+        let g = AllowMcpEnvGuard::new();
+        for v in ["false", "0", "no", "off", "TRUE1", "YES!", ""] {
+            g.set(v);
+            assert!(
+                !ClaudeCliAiClient::allow_mcp_from_env(),
+                "value {v:?} should not enable the escape hatch"
+            );
+        }
+    }
+
+    #[test]
+    fn new_picks_up_allow_mcp_env_var() {
+        // Single guard locks `CLI_ENV_LOCK`; we manually snapshot
+        // `ALLOW_TOOLS_ENV_VAR` here because acquiring a second guard would
+        // deadlock on the shared mutex.
+        let mcp_guard = AllowMcpEnvGuard::new();
+        let saved_tools = std::env::var(ALLOW_TOOLS_ENV_VAR).ok();
+        std::env::remove_var(ALLOW_TOOLS_ENV_VAR);
+        mcp_guard.set("true");
+        let cli = ClaudeCliAiClient::new("sonnet".to_string());
+        let tmp = TempDir::new().unwrap();
+        let cmd = cli.build_command("sys", tmp.path());
+        let args = args_of(&cmd);
+        match saved_tools {
+            Some(v) => std::env::set_var(ALLOW_TOOLS_ENV_VAR, v),
+            None => std::env::remove_var(ALLOW_TOOLS_ENV_VAR),
+        }
+        assert!(
+            !args.contains(&"--strict-mcp-config".to_string()),
+            "ALLOW_MCP=true should omit --strict-mcp-config: {args:?}"
+        );
+        // --tools must still be present when only MCP is enabled.
+        assert!(
+            args.contains(&"--tools".to_string()),
+            "ALLOW_MCP=true alone should keep --tools: {args:?}"
+        );
+    }
+
+    #[test]
+    fn new_defaults_to_strict_mcp_when_env_unset() {
+        let _g = AllowMcpEnvGuard::new();
+        let cli = ClaudeCliAiClient::new("sonnet".to_string());
+        let tmp = TempDir::new().unwrap();
+        let cmd = cli.build_command("sys", tmp.path());
+        let args = args_of(&cmd);
+        assert!(
+            args.contains(&"--strict-mcp-config".to_string()),
+            "default (no env) must include --strict-mcp-config: {args:?}"
+        );
+    }
+
     // ── Budget cap tests (MAX_BUDGET_ENV_VAR / with_max_budget_usd) ──
 
-    static MAX_BUDGET_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// Test-scoped guard for `OMNI_DEV_CLAUDE_CLI_MAX_BUDGET_USD`. Serialises
+    /// against every other env-mutating test via the shared
+    /// [`CLI_ENV_LOCK`].
     struct MaxBudgetEnvGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
         saved: Option<String>,
@@ -1011,7 +1253,7 @@ mod tests {
 
     impl MaxBudgetEnvGuard {
         fn new() -> Self {
-            let lock = MAX_BUDGET_ENV_LOCK
+            let lock = CLI_ENV_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let saved = std::env::var(MAX_BUDGET_ENV_VAR).ok();
