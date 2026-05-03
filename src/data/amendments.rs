@@ -4,17 +4,20 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Amendment file structure.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct AmendmentFile {
     /// List of commit amendments to apply.
     pub amendments: Vec<Amendment>,
 }
 
 /// Individual commit amendment.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct Amendment {
     /// Full 40-character SHA-1 commit hash.
     pub commit: String,

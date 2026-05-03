@@ -28,7 +28,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
-use super::{AiClient, AiClientMetadata};
+use super::{AiClient, AiClientCapabilities, AiClientMetadata, RequestOptions};
 use crate::claude::error::ClaudeError;
 
 /// Default subprocess timeout.
@@ -205,7 +205,21 @@ impl ClaudeCliAiClient {
     /// Broken out so tests can inspect the argv / env / cwd via
     /// `Command::get_args`, `get_envs`, `get_current_dir` without running
     /// a subprocess.
+    #[cfg(test)]
     pub(crate) fn build_command(&self, system_prompt: &str, cwd: &Path) -> Command {
+        self.build_command_with_schema(system_prompt, cwd, None)
+    }
+
+    /// Variant of [`build_command`] that adds a `--json-schema <path>`
+    /// argument when `schema_path` is supplied. The path itself is the
+    /// caller's responsibility — typically a file written into the same
+    /// `cwd` so its lifetime tracks the temp directory.
+    pub(crate) fn build_command_with_schema(
+        &self,
+        system_prompt: &str,
+        cwd: &Path,
+        schema_path: Option<&Path>,
+    ) -> Command {
         let mut cmd = Command::new(&self.binary_path);
         cmd.arg("-p")
             .arg("--model")
@@ -231,6 +245,12 @@ impl ClaudeCliAiClient {
             // format that round-trips through its parser (no locale
             // formatting, no scientific notation).
             cmd.arg("--max-budget-usd").arg(format!("{budget}"));
+        }
+
+        if let Some(path) = schema_path {
+            // Schemas can grow large; pass via file path rather than inline
+            // argv to avoid argv-length limits and shell-escape pitfalls.
+            cmd.arg("--json-schema").arg(path);
         }
 
         cmd.current_dir(cwd);
@@ -261,12 +281,45 @@ impl ClaudeCliAiClient {
     }
 
     async fn run(&self, system_prompt: &str, user_prompt: &str) -> Result<String> {
+        self.run_with_options(system_prompt, user_prompt, &RequestOptions::default())
+            .await
+    }
+
+    /// Variant of [`run`] that materialises any options on the request.
+    ///
+    /// When `options.response_schema` is `Some`, the schema is written to
+    /// a `response_schema.json` file inside the subprocess's temp cwd and
+    /// passed via `--json-schema <path>`. The file lives only as long as
+    /// the [`tempfile::TempDir`], so it is cleaned up when this function
+    /// returns regardless of success or error.
+    async fn run_with_options(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+        options: &RequestOptions,
+    ) -> Result<String> {
         let combined_system = format!("{system_prompt}{TOOL_SUPPRESSION_SUFFIX}");
 
         let temp_dir = tempfile::TempDir::new()
             .context("Failed to create temp directory for claude subprocess")?;
 
-        let mut cmd = self.build_command(&combined_system, temp_dir.path());
+        let schema_path = if let Some(schema) = &options.response_schema {
+            let path = temp_dir.path().join("response_schema.json");
+            let body = serde_json::to_vec(schema)
+                .context("Failed to serialize response schema for claude -p --json-schema")?;
+            tokio::fs::write(&path, body)
+                .await
+                .context("Failed to write response schema file for claude -p")?;
+            Some(path)
+        } else {
+            None
+        };
+
+        let mut cmd = self.build_command_with_schema(
+            &combined_system,
+            temp_dir.path(),
+            schema_path.as_deref(),
+        );
 
         if self.allow_tools {
             warn!(
@@ -485,6 +538,31 @@ impl AiClient for ClaudeCliAiClient {
                 "Preparing claude -p subprocess request"
             );
             self.run(system_prompt, user_prompt).await
+        })
+    }
+
+    fn capabilities(&self) -> AiClientCapabilities {
+        AiClientCapabilities {
+            supports_response_schema: true,
+        }
+    }
+
+    fn send_request_with_options<'a>(
+        &'a self,
+        system_prompt: &'a str,
+        user_prompt: &'a str,
+        options: RequestOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+        Box::pin(async move {
+            debug!(
+                system_prompt_len = system_prompt.len(),
+                user_prompt_len = user_prompt.len(),
+                has_schema = options.response_schema.is_some(),
+                model = %self.model,
+                "Preparing claude -p subprocess request (with options)"
+            );
+            self.run_with_options(system_prompt, user_prompt, &options)
+                .await
         })
     }
 
@@ -1107,6 +1185,114 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_advertise_response_schema_support() {
+        let cli = client_with_defaults("sonnet");
+        let caps = cli.capabilities();
+        assert!(
+            caps.supports_response_schema,
+            "claude-cli backend should advertise response-schema support"
+        );
+    }
+
+    #[test]
+    fn build_command_omits_json_schema_when_no_path_given() {
+        let cli = client_with_defaults("sonnet");
+        let tmp = TempDir::new().unwrap();
+        let cmd = cli.build_command_with_schema("sys", tmp.path(), None);
+        let args = args_of(&cmd);
+        assert!(
+            !args.contains(&"--json-schema".to_string()),
+            "no schema → argv must omit --json-schema: {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_command_includes_json_schema_when_path_given() {
+        let cli = client_with_defaults("sonnet");
+        let tmp = TempDir::new().unwrap();
+        let schema_path = tmp.path().join("schema.json");
+        let cmd = cli.build_command_with_schema("sys", tmp.path(), Some(&schema_path));
+        let args = args_of(&cmd);
+        let idx = args
+            .iter()
+            .position(|a| a == "--json-schema")
+            .expect("argv should contain --json-schema");
+        assert_eq!(args[idx + 1], schema_path.to_string_lossy());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn run_with_options_writes_schema_and_succeeds() {
+        let _guard = shim_lock();
+        // The shim ignores --json-schema and just emits a JSON envelope.
+        // What matters is that run_with_options serializes/writes the
+        // schema and adds the flag without erroring out.
+        let tmp = TempDir::new().unwrap();
+        let shim = make_shim(&tmp, r#"{"is_error":false,"result":"ok"}"#, 0);
+        let cli = client_with_shim(shim);
+        let schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["title"],
+            "properties": {"title": {"type": "string"}}
+        });
+        let opts = RequestOptions::default().with_response_schema(schema);
+        let out = cli
+            .run_with_options("sys", "user", &opts)
+            .await
+            .expect("run_with_options should succeed");
+        assert_eq!(out, "ok");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn send_request_with_options_default_acts_like_send_request() {
+        let _guard = shim_lock();
+        // No schema in options → behaves exactly like send_request.
+        let tmp = TempDir::new().unwrap();
+        let shim = make_shim(&tmp, r#"{"is_error":false,"result":"hi"}"#, 0);
+        let cli = client_with_shim(shim);
+        let out = cli
+            .send_request_with_options("sys", "user", RequestOptions::default())
+            .await
+            .expect("send_request_with_options should succeed");
+        assert_eq!(out, "hi");
+    }
+
+    /// Initialises a tracing subscriber at debug level so the
+    /// instrumented `debug!` macro inside [`send_request_with_options`]
+    /// evaluates its arguments — without a subscriber, the macro elides
+    /// its body and the field-formatting expressions register as
+    /// uncovered. The test set is otherwise the same shape as
+    /// [`send_request_with_options_default_acts_like_send_request`].
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn send_request_with_options_records_debug_trace() {
+        let _guard = shim_lock();
+        // Ignore the result: another test may have already installed a
+        // subscriber. Either way is fine; we only need *some* subscriber
+        // to make the debug! macro's expressions execute.
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_test_writer()
+            .try_init();
+
+        let tmp = TempDir::new().unwrap();
+        let shim = make_shim(&tmp, r#"{"is_error":false,"result":"hi"}"#, 0);
+        let cli = client_with_shim(shim);
+        let schema = serde_json::json!({"type": "object", "additionalProperties": false});
+        let out = cli
+            .send_request_with_options(
+                "sys",
+                "user",
+                RequestOptions::default().with_response_schema(schema),
+            )
+            .await
+            .expect("send_request_with_options should succeed");
+        assert_eq!(out, "hi");
+    }
+
+    #[test]
     fn strip_fence_removes_yaml_wrapping() {
         let raw = "```yaml\namendments: []\n```";
         assert_eq!(strip_wrapping_code_fence(raw), "amendments: []");
@@ -1575,7 +1761,13 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .process_group(0);
-        let mut child = cmd.spawn().expect("spawn shim");
+        // Bare cmd.spawn() races with sibling test threads on Linux —
+        // the kernel returns ETXTBSY while another thread holds a
+        // writable FD on the freshly-written shim. Use the same retry
+        // helper production code uses.
+        let mut child = spawn_with_etxtbsy_retry(&mut cmd)
+            .await
+            .expect("spawn shim");
 
         // Wait until the shim has written its sleeper PID — the file
         // appears after a few ms in practice, but poll defensively.
@@ -1622,7 +1814,9 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .process_group(0);
-        let mut child = cmd.spawn().expect("spawn shim");
+        let mut child = spawn_with_etxtbsy_retry(&mut cmd)
+            .await
+            .expect("spawn shim");
 
         // Give the child a moment to exit before we try to reap.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1648,7 +1842,9 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .process_group(0);
-        let mut child = cmd.spawn().expect("spawn shim");
+        let mut child = spawn_with_etxtbsy_retry(&mut cmd)
+            .await
+            .expect("spawn shim");
 
         // Reap explicitly so child.id() reports None on the next call.
         let _ = child.wait().await.expect("wait succeeds");
@@ -1675,7 +1871,9 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .process_group(0);
-        let mut child = cmd.spawn().expect("spawn shim");
+        let mut child = spawn_with_etxtbsy_retry(&mut cmd)
+            .await
+            .expect("spawn shim");
         let pid = child.id().expect("has pid") as i32;
 
         let deadline = Duration::from_millis(80);
@@ -1706,7 +1904,13 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .process_group(0);
-        let mut child = cmd.spawn().expect("spawn shim");
+        // Use the same ETXTBSY-retry helper that production code uses;
+        // a bare cmd.spawn() races with concurrent test threads on Linux
+        // because the kernel returns ETXTBSY while another thread holds
+        // a writable FD on the shim binary.
+        let mut child = spawn_with_etxtbsy_retry(&mut cmd)
+            .await
+            .expect("spawn shim");
         let pid = child.id().expect("child has pid before reap");
 
         kill_and_reap(&mut child).await;

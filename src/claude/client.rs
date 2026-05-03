@@ -5,7 +5,11 @@ use tracing::{debug, info, warn};
 
 use crate::claude::token_budget::TokenBudget;
 use crate::claude::{ai::bedrock::BedrockAiClient, ai::claude::ClaudeAiClient};
-use crate::claude::{ai::AiClient, error::ClaudeError, prompts};
+use crate::claude::{
+    ai::{AiClient, RequestOptions, ResponseFormat},
+    error::ClaudeError,
+    prompts, response_schema,
+};
 use crate::data::{
     amendments::{Amendment, AmendmentFile},
     context::CommitContext,
@@ -39,6 +43,69 @@ impl ClaudeClient {
     /// Returns metadata about the AI client.
     pub fn get_ai_client_metadata(&self) -> crate::claude::ai::AiClientMetadata {
         self.ai_client.get_metadata()
+    }
+
+    /// Adjusts a structured-call system prompt for the active backend's
+    /// response format.
+    ///
+    /// Backends advertising
+    /// [`AiClientCapabilities::supports_response_schema`](crate::claude::ai::AiClientCapabilities::supports_response_schema)
+    /// receive the [`prompts::JSON_SCHEMA_RESPONSE_OVERRIDE`] suffix, which
+    /// instructs the model to emit a bare JSON object matching the schema
+    /// supplied via [`RequestOptions`]. Other backends receive the prompt
+    /// unchanged. Should be called once at the top of each entry point so
+    /// the suffix is included in subsequent token-budget calculations.
+    fn adjusted_system_prompt(&self, system_prompt: String) -> String {
+        let format = ResponseFormat::from_capabilities(&self.ai_client.capabilities());
+        prompts::apply_response_format_to_system_prompt(system_prompt, format)
+    }
+
+    /// Returns the cached schema when the active backend can enforce
+    /// response schemas, or `None` when it cannot.
+    ///
+    /// Used to gate per-call schema attachment so call sites stay
+    /// readable: build the schema unconditionally, gate attachment on
+    /// capabilities.
+    fn schema_if_supported<'a>(
+        &self,
+        schema: &'a serde_json::Value,
+    ) -> Option<&'a serde_json::Value> {
+        if self.ai_client.capabilities().supports_response_schema {
+            Some(schema)
+        } else {
+            None
+        }
+    }
+
+    /// Dispatches a structured AI call with optional schema enforcement.
+    ///
+    /// When `schema` is `Some`, sends via
+    /// [`AiClient::send_request_with_options`] so the backend can enforce
+    /// the schema (e.g. `claude -p --json-schema <file>`); otherwise
+    /// falls back to plain [`AiClient::send_request`]. Backends without
+    /// schema support are expected to report
+    /// [`AiClientCapabilities::supports_response_schema`](crate::claude::ai::AiClientCapabilities::supports_response_schema)
+    /// `= false`, in which case [`schema_if_supported`](Self::schema_if_supported)
+    /// at the call site returns `None` and we take the second branch.
+    async fn send_with_optional_schema(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+        schema: Option<&serde_json::Value>,
+    ) -> Result<String> {
+        match schema {
+            Some(s) => {
+                let opts = RequestOptions::default().with_response_schema(s.clone());
+                self.ai_client
+                    .send_request_with_options(system_prompt, user_prompt, opts)
+                    .await
+            }
+            None => {
+                self.ai_client
+                    .send_request(system_prompt, user_prompt)
+                    .await
+            }
+        }
     }
 
     /// Validates that the prompt fits within the model's token budget.
@@ -240,8 +307,11 @@ impl ClaudeClient {
             );
 
             let content = match self
-                .ai_client
-                .send_request(system_prompt, &user_prompt)
+                .send_with_optional_schema(
+                    system_prompt,
+                    &user_prompt,
+                    self.schema_if_supported(response_schema::amendment_file_schema()),
+                )
                 .await
             {
                 Ok(content) => content,
@@ -307,7 +377,8 @@ impl ClaudeClient {
         diff_summary: &str,
         chunk_amendments: &[Amendment],
     ) -> Result<Amendment> {
-        let system_prompt = prompts::AMENDMENT_CHUNK_MERGE_SYSTEM_PROMPT;
+        let system_prompt =
+            self.adjusted_system_prompt(prompts::AMENDMENT_CHUNK_MERGE_SYSTEM_PROMPT.to_string());
         let user_prompt = prompts::generate_chunk_merge_user_prompt(
             commit_hash,
             original_message,
@@ -315,11 +386,14 @@ impl ClaudeClient {
             chunk_amendments,
         );
 
-        self.validate_prompt_budget(system_prompt, &user_prompt)?;
+        self.validate_prompt_budget(&system_prompt, &user_prompt)?;
 
         let content = self
-            .ai_client
-            .send_request(system_prompt, &user_prompt)
+            .send_with_optional_schema(
+                &system_prompt,
+                &user_prompt,
+                self.schema_if_supported(response_schema::amendment_file_schema()),
+            )
             .await
             .context("Merge pass failed for chunk amendments")?;
 
@@ -485,8 +559,11 @@ impl ClaudeClient {
                 self.build_prompt_fitting_budget(&partial_view, system_prompt, &build_user_prompt)?;
 
             let content = self
-                .ai_client
-                .send_request(system_prompt, &user_prompt)
+                .send_with_optional_schema(
+                    system_prompt,
+                    &user_prompt,
+                    self.schema_if_supported(response_schema::check_response_schema()),
+                )
                 .await
                 .with_context(|| {
                     format!(
@@ -587,7 +664,8 @@ impl ClaudeClient {
         let summaries: Vec<Option<&str>> =
             chunk_results.iter().map(|r| r.summary.as_deref()).collect();
 
-        let system_prompt = prompts::CHECK_CHUNK_MERGE_SYSTEM_PROMPT;
+        let system_prompt =
+            self.adjusted_system_prompt(prompts::CHECK_CHUNK_MERGE_SYSTEM_PROMPT.to_string());
         let user_prompt = prompts::generate_check_chunk_merge_user_prompt(
             commit_hash,
             original_message,
@@ -597,11 +675,14 @@ impl ClaudeClient {
             &summaries,
         );
 
-        self.validate_prompt_budget(system_prompt, &user_prompt)?;
+        self.validate_prompt_budget(&system_prompt, &user_prompt)?;
 
         let content = self
-            .ai_client
-            .send_request(system_prompt, &user_prompt)
+            .send_with_optional_schema(
+                &system_prompt,
+                &user_prompt,
+                self.schema_if_supported(response_schema::check_response_schema()),
+            )
             .await
             .context("Merge pass failed for check chunk suggestions")?;
 
@@ -661,13 +742,13 @@ impl ClaudeClient {
             RepositoryViewForAI::from_repository_view_with_options(repo_view.clone(), fresh)
                 .context("Failed to enhance repository view with diff content")?;
 
-        let system_prompt = prompts::SYSTEM_PROMPT;
+        let system_prompt = self.adjusted_system_prompt(prompts::SYSTEM_PROMPT.to_string());
         let build_user_prompt = |yaml: &str| prompts::generate_user_prompt(yaml);
 
         // Try full view first; fall back to per-commit split dispatch
-        match self.try_full_diff_budget(&ai_repo_view, system_prompt, &build_user_prompt)? {
+        match self.try_full_diff_budget(&ai_repo_view, &system_prompt, &build_user_prompt)? {
             Ok(user_prompt) => {
-                self.send_and_parse_amendment_with_retry(system_prompt, &user_prompt)
+                self.send_and_parse_amendment_with_retry(&system_prompt, &user_prompt)
                     .await
             }
             Err(_exceeded) => {
@@ -677,7 +758,7 @@ impl ClaudeClient {
                         .generate_amendment_for_commit(
                             commit,
                             &ai_repo_view,
-                            system_prompt,
+                            &system_prompt,
                             &build_user_prompt,
                             fresh,
                         )
@@ -721,8 +802,9 @@ impl ClaudeClient {
 
         // Generate contextual prompts using intelligence
         let prompt_style = self.ai_client.get_metadata().prompt_style();
-        let system_prompt =
-            prompts::generate_contextual_system_prompt_for_provider(context, prompt_style);
+        let system_prompt = self.adjusted_system_prompt(
+            prompts::generate_contextual_system_prompt_for_provider(context, prompt_style),
+        );
 
         // Debug logging to troubleshoot custom commit type issue
         match &context.project.commit_guidelines {
@@ -812,8 +894,11 @@ impl ClaudeClient {
         let mut last_error = None;
         for attempt in 0..=AMENDMENT_PARSE_MAX_RETRIES {
             match self
-                .ai_client
-                .send_request(system_prompt, user_prompt)
+                .send_with_optional_schema(
+                    system_prompt,
+                    user_prompt,
+                    self.schema_if_supported(response_schema::amendment_file_schema()),
+                )
                 .await
             {
                 Ok(content) => match self.parse_amendment_response(&content) {
@@ -942,8 +1027,11 @@ impl ClaudeClient {
                 self.build_prompt_fitting_budget(&partial_view, system_prompt, build_user_prompt)?;
 
             let content = self
-                .ai_client
-                .send_request(system_prompt, &user_prompt)
+                .send_with_optional_schema(
+                    system_prompt,
+                    &user_prompt,
+                    self.schema_if_supported(response_schema::pr_content_schema()),
+                )
                 .await
                 .with_context(|| {
                     format!(
@@ -977,15 +1065,19 @@ impl ClaudeClient {
         partial_contents: &[crate::cli::git::PrContent],
         pr_template: &str,
     ) -> Result<crate::cli::git::PrContent> {
-        let system_prompt = prompts::PR_CONTENT_MERGE_SYSTEM_PROMPT;
+        let system_prompt =
+            self.adjusted_system_prompt(prompts::PR_CONTENT_MERGE_SYSTEM_PROMPT.to_string());
         let user_prompt =
             prompts::generate_pr_content_merge_user_prompt(partial_contents, pr_template);
 
-        self.validate_prompt_budget(system_prompt, &user_prompt)?;
+        self.validate_prompt_budget(&system_prompt, &user_prompt)?;
 
         let content = self
-            .ai_client
-            .send_request(system_prompt, &user_prompt)
+            .send_with_optional_schema(
+                &system_prompt,
+                &user_prompt,
+                self.schema_if_supported(response_schema::pr_content_schema()),
+            )
             .await
             .context("Merge pass failed for PR content chunks")?;
 
@@ -1008,8 +1100,11 @@ impl ClaudeClient {
         match self.try_full_diff_budget(&single_view, system_prompt, build_user_prompt)? {
             Ok(user_prompt) => {
                 let content = self
-                    .ai_client
-                    .send_request(system_prompt, &user_prompt)
+                    .send_with_optional_schema(
+                        system_prompt,
+                        &user_prompt,
+                        self.schema_if_supported(response_schema::pr_content_schema()),
+                    )
                     .await?;
                 self.parse_pr_response(&content)
             }
@@ -1043,19 +1138,21 @@ impl ClaudeClient {
         let ai_repo_view = RepositoryViewForAI::from_repository_view(repo_view.clone())
             .context("Failed to enhance repository view with diff content")?;
 
+        let system_prompt =
+            self.adjusted_system_prompt(prompts::PR_GENERATION_SYSTEM_PROMPT.to_string());
+
         let build_user_prompt =
             |yaml: &str| prompts::generate_pr_description_prompt(yaml, pr_template);
 
         // Try full view first; fall back to per-commit split dispatch
-        match self.try_full_diff_budget(
-            &ai_repo_view,
-            prompts::PR_GENERATION_SYSTEM_PROMPT,
-            &build_user_prompt,
-        )? {
+        match self.try_full_diff_budget(&ai_repo_view, &system_prompt, &build_user_prompt)? {
             Ok(user_prompt) => {
                 let content = self
-                    .ai_client
-                    .send_request(prompts::PR_GENERATION_SYSTEM_PROMPT, &user_prompt)
+                    .send_with_optional_schema(
+                        &system_prompt,
+                        &user_prompt,
+                        self.schema_if_supported(response_schema::pr_content_schema()),
+                    )
                     .await?;
                 self.parse_pr_response(&content)
             }
@@ -1066,7 +1163,7 @@ impl ClaudeClient {
                         .generate_pr_content_for_commit(
                             commit,
                             &ai_repo_view,
-                            prompts::PR_GENERATION_SYSTEM_PROMPT,
+                            &system_prompt,
                             &build_user_prompt,
                             pr_template,
                         )
@@ -1098,8 +1195,9 @@ impl ClaudeClient {
 
         // Generate contextual prompts for PR description with provider-specific handling
         let prompt_style = self.ai_client.get_metadata().prompt_style();
-        let system_prompt =
-            prompts::generate_pr_system_prompt_with_context_for_provider(context, prompt_style);
+        let system_prompt = self.adjusted_system_prompt(
+            prompts::generate_pr_system_prompt_with_context_for_provider(context, prompt_style),
+        );
 
         let build_user_prompt = |yaml: &str| {
             prompts::generate_pr_description_prompt_with_context(yaml, pr_template, context)
@@ -1109,8 +1207,11 @@ impl ClaudeClient {
         match self.try_full_diff_budget(&ai_repo_view, &system_prompt, &build_user_prompt)? {
             Ok(user_prompt) => {
                 let content = self
-                    .ai_client
-                    .send_request(&system_prompt, &user_prompt)
+                    .send_with_optional_schema(
+                        &system_prompt,
+                        &user_prompt,
+                        self.schema_if_supported(response_schema::pr_content_schema()),
+                    )
                     .await?;
 
                 debug!(
@@ -1200,8 +1301,9 @@ impl ClaudeClient {
         max_retries: u32,
     ) -> Result<crate::data::check::CheckReport> {
         // Generate system prompt with scopes
-        let system_prompt =
-            prompts::generate_check_system_prompt_with_scopes(guidelines, valid_scopes);
+        let system_prompt = self.adjusted_system_prompt(
+            prompts::generate_check_system_prompt_with_scopes(guidelines, valid_scopes),
+        );
 
         let build_user_prompt =
             |yaml: &str| prompts::generate_check_user_prompt(yaml, include_suggestions);
@@ -1219,8 +1321,11 @@ impl ClaudeClient {
                 let mut last_error = None;
                 for attempt in 0..=max_retries {
                     match self
-                        .ai_client
-                        .send_request(&system_prompt, &user_prompt)
+                        .send_with_optional_schema(
+                            &system_prompt,
+                            &user_prompt,
+                            self.schema_if_supported(response_schema::check_response_schema()),
+                        )
                         .await
                     {
                         Ok(content) => match self.parse_check_response(&content, repo_view) {
@@ -1269,8 +1374,13 @@ impl ClaudeClient {
                     )? {
                         Ok(user_prompt) => {
                             let content = self
-                                .ai_client
-                                .send_request(&system_prompt, &user_prompt)
+                                .send_with_optional_schema(
+                                    &system_prompt,
+                                    &user_prompt,
+                                    self.schema_if_supported(
+                                        response_schema::check_response_schema(),
+                                    ),
+                                )
                                 .await?;
                             let report = self.parse_check_response(&content, &single_view)?;
                             all_results.extend(report.commits);
@@ -1398,14 +1508,18 @@ impl ClaudeClient {
         &self,
         items: &[(crate::data::amendments::Amendment, String)],
     ) -> Result<AmendmentFile> {
-        let system_prompt = prompts::AMENDMENT_COHERENCE_SYSTEM_PROMPT;
+        let system_prompt =
+            self.adjusted_system_prompt(prompts::AMENDMENT_COHERENCE_SYSTEM_PROMPT.to_string());
         let user_prompt = prompts::generate_amendment_coherence_user_prompt(items);
 
-        self.validate_prompt_budget(system_prompt, &user_prompt)?;
+        self.validate_prompt_budget(&system_prompt, &user_prompt)?;
 
         let content = self
-            .ai_client
-            .send_request(system_prompt, &user_prompt)
+            .send_with_optional_schema(
+                &system_prompt,
+                &user_prompt,
+                self.schema_if_supported(response_schema::amendment_file_schema()),
+            )
             .await?;
 
         self.parse_amendment_response(&content)
@@ -1421,14 +1535,18 @@ impl ClaudeClient {
         items: &[(crate::data::check::CommitCheckResult, String)],
         repo_view: &RepositoryView,
     ) -> Result<crate::data::check::CheckReport> {
-        let system_prompt = prompts::CHECK_COHERENCE_SYSTEM_PROMPT;
+        let system_prompt =
+            self.adjusted_system_prompt(prompts::CHECK_COHERENCE_SYSTEM_PROMPT.to_string());
         let user_prompt = prompts::generate_check_coherence_user_prompt(items);
 
-        self.validate_prompt_budget(system_prompt, &user_prompt)?;
+        self.validate_prompt_budget(&system_prompt, &user_prompt)?;
 
         let content = self
-            .ai_client
-            .send_request(system_prompt, &user_prompt)
+            .send_with_optional_schema(
+                &system_prompt,
+                &user_prompt,
+                self.schema_if_supported(response_schema::check_response_schema()),
+            )
             .await?;
 
         self.parse_check_response(&content, repo_view)
@@ -1626,9 +1744,10 @@ pub fn create_default_claude_client(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::claude::ai::{AiClient, AiClientMetadata};
+    use crate::claude::ai::{AiClient, AiClientCapabilities, AiClientMetadata};
     use std::future::Future;
     use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
 
     /// Mock AI client for testing — never makes real HTTP requests.
     struct MockAiClient;
@@ -1655,6 +1774,291 @@ mod tests {
 
     fn make_client() -> ClaudeClient {
         ClaudeClient::new(Box::new(MockAiClient))
+    }
+
+    /// Mock AI client that records both prompts and per-call options
+    /// (the schema attached, if any). Used to verify
+    /// [`ClaudeClient::send_with_optional_schema`] dispatches via the
+    /// options-aware method when a schema is provided and via the plain
+    /// method otherwise.
+    ///
+    /// Returns the configured `response` string from both `send_request`
+    /// and `send_request_with_options` so tests that need a parseable
+    /// response (e.g. the refine_* coherence paths) can plug in canned
+    /// YAML/JSON.
+    struct SchemaRecordingMockAiClient {
+        capabilities: AiClientCapabilities,
+        response: String,
+        recorded_options: Arc<Mutex<Vec<RequestOptions>>>,
+        recorded_plain: Arc<Mutex<Vec<(String, String)>>>,
+    }
+    impl SchemaRecordingMockAiClient {
+        fn new(supports_response_schema: bool) -> Self {
+            Self::with_response(supports_response_schema, String::new())
+        }
+
+        fn with_response(supports_response_schema: bool, response: String) -> Self {
+            Self {
+                capabilities: AiClientCapabilities {
+                    supports_response_schema,
+                },
+                response,
+                recorded_options: Arc::new(Mutex::new(Vec::new())),
+                recorded_plain: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl AiClient for SchemaRecordingMockAiClient {
+        fn send_request<'a>(
+            &'a self,
+            system_prompt: &'a str,
+            user_prompt: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+            let plain = self.recorded_plain.clone();
+            let sys = system_prompt.to_string();
+            let usr = user_prompt.to_string();
+            let response = self.response.clone();
+            Box::pin(async move {
+                plain.lock().unwrap().push((sys, usr));
+                Ok(response)
+            })
+        }
+
+        fn capabilities(&self) -> AiClientCapabilities {
+            self.capabilities
+        }
+
+        fn send_request_with_options<'a>(
+            &'a self,
+            _system_prompt: &'a str,
+            _user_prompt: &'a str,
+            options: RequestOptions,
+        ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+            let recorded = self.recorded_options.clone();
+            let response = self.response.clone();
+            Box::pin(async move {
+                recorded.lock().unwrap().push(options);
+                Ok(response)
+            })
+        }
+
+        fn get_metadata(&self) -> AiClientMetadata {
+            AiClientMetadata {
+                provider: "SchemaMock".to_string(),
+                model: "schema-mock".to_string(),
+                max_context_length: 200_000,
+                max_response_length: 8_192,
+                active_beta: None,
+            }
+        }
+    }
+
+    // ── ClaudeClient schema-routing helpers ───────────────────────────
+
+    /// Backends that don't advertise schema support take the
+    /// `send_request` branch in `send_with_optional_schema` regardless
+    /// of whether a schema was supplied at the call site.
+    #[tokio::test]
+    async fn send_with_optional_schema_without_caps_uses_plain_send() {
+        let inner = SchemaRecordingMockAiClient::new(false);
+        let plain_log = inner.recorded_plain.clone();
+        let opts_log = inner.recorded_options.clone();
+        let client = ClaudeClient::new(Box::new(inner));
+
+        let schema = serde_json::json!({"type": "object"});
+        client
+            .send_with_optional_schema(
+                "sys",
+                "usr",
+                client.schema_if_supported(&schema), // → None
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(plain_log.lock().unwrap().len(), 1);
+        assert!(opts_log.lock().unwrap().is_empty());
+    }
+
+    /// Backends that advertise schema support take the
+    /// `send_request_with_options` branch and receive the schema in the
+    /// options struct.
+    #[tokio::test]
+    async fn send_with_optional_schema_with_caps_uses_options_send() {
+        let inner = SchemaRecordingMockAiClient::new(true);
+        let plain_log = inner.recorded_plain.clone();
+        let opts_log = inner.recorded_options.clone();
+        let client = ClaudeClient::new(Box::new(inner));
+
+        let schema = serde_json::json!({"type": "object", "additionalProperties": false});
+        client
+            .send_with_optional_schema(
+                "sys",
+                "usr",
+                client.schema_if_supported(&schema), // → Some
+            )
+            .await
+            .unwrap();
+
+        let recorded = opts_log.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].response_schema.as_ref(), Some(&schema));
+        assert!(plain_log.lock().unwrap().is_empty());
+    }
+
+    /// `adjusted_system_prompt` only appends the JSON-schema override
+    /// suffix when the active backend supports schema enforcement.
+    #[test]
+    fn adjusted_system_prompt_adds_suffix_when_supported() {
+        let client = ClaudeClient::new(Box::new(SchemaRecordingMockAiClient::new(true)));
+        let result = client.adjusted_system_prompt("body".to_string());
+        assert!(result.starts_with("body"));
+        assert!(result.contains("STRUCTURED OUTPUT OVERRIDE"));
+    }
+
+    #[test]
+    fn adjusted_system_prompt_passes_through_when_not_supported() {
+        let client = ClaudeClient::new(Box::new(SchemaRecordingMockAiClient::new(false)));
+        let result = client.adjusted_system_prompt("body".to_string());
+        assert_eq!(result, "body");
+    }
+
+    #[test]
+    fn schema_if_supported_returns_some_when_supported() {
+        let client = ClaudeClient::new(Box::new(SchemaRecordingMockAiClient::new(true)));
+        let schema = serde_json::json!({"type": "object"});
+        let returned = client.schema_if_supported(&schema);
+        assert!(returned.is_some());
+        assert!(std::ptr::eq(
+            returned.unwrap() as *const _,
+            &schema as *const _
+        ));
+    }
+
+    #[test]
+    fn schema_if_supported_returns_none_when_not_supported() {
+        let client = ClaudeClient::new(Box::new(SchemaRecordingMockAiClient::new(false)));
+        let schema = serde_json::json!({"type": "object"});
+        assert!(client.schema_if_supported(&schema).is_none());
+    }
+
+    // ── refine_amendments_coherence / refine_checks_coherence ────────
+
+    /// Exercises the full body of `refine_amendments_coherence`:
+    /// adjusted_system_prompt → validate_prompt_budget → schema-aware
+    /// dispatch → parse_amendment_response. Uses a schema-supporting
+    /// mock so the schema attachment branch is taken too.
+    #[tokio::test]
+    async fn refine_amendments_coherence_round_trip() {
+        let mock = SchemaRecordingMockAiClient::with_response(
+            true, // supports_response_schema
+            "amendments: []".to_string(),
+        );
+        let recorded_opts = mock.recorded_options.clone();
+        let client = ClaudeClient::new(Box::new(mock));
+
+        let amendment = crate::data::amendments::Amendment {
+            commit: "abc123".to_string(),
+            message: "feat: do thing".to_string(),
+            summary: Some("did the thing".to_string()),
+        };
+        let items = vec![(amendment, "summary text".to_string())];
+
+        let result = client
+            .refine_amendments_coherence(&items)
+            .await
+            .expect("coherence refinement should succeed");
+        assert!(result.amendments.is_empty());
+
+        // Verify the schema-aware dispatch path was taken and that the
+        // attached schema is the AmendmentFile schema.
+        let recorded = recorded_opts.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        let attached = recorded[0]
+            .response_schema
+            .as_ref()
+            .expect("schema must be attached when capability is true");
+        assert_eq!(
+            attached,
+            response_schema::amendment_file_schema(),
+            "refine_amendments_coherence should attach the AmendmentFile schema"
+        );
+    }
+
+    /// Same coverage shape as the amendment variant, but for the check
+    /// coherence path. Uses `parse_check_response` which needs a
+    /// repository view to map commit hashes back to messages — we
+    /// supply an empty view.
+    #[tokio::test]
+    async fn refine_checks_coherence_round_trip() {
+        let mock = SchemaRecordingMockAiClient::with_response(
+            true, // supports_response_schema
+            "checks: []".to_string(),
+        );
+        let recorded_opts = mock.recorded_options.clone();
+        let client = ClaudeClient::new(Box::new(mock));
+
+        let check = crate::data::check::CommitCheckResult {
+            hash: "abc123".to_string(),
+            message: "feat: do thing".to_string(),
+            issues: Vec::new(),
+            suggestion: None,
+            passes: true,
+            summary: Some("summary".to_string()),
+        };
+        let items = vec![(check, "summary text".to_string())];
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo_view = make_test_repo_view(&dir);
+
+        let result = client
+            .refine_checks_coherence(&items, &repo_view)
+            .await
+            .expect("coherence refinement should succeed");
+        assert_eq!(result.summary.total_commits, 0);
+
+        let recorded = recorded_opts.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        let attached = recorded[0]
+            .response_schema
+            .as_ref()
+            .expect("schema must be attached when capability is true");
+        assert_eq!(
+            attached,
+            response_schema::check_response_schema(),
+            "refine_checks_coherence should attach the AiCheckResponse schema"
+        );
+    }
+
+    /// Verifies the no-schema branch of refine_amendments_coherence —
+    /// when the backend doesn't advertise schema support, dispatch
+    /// falls through to plain `send_request` and no schema is attached.
+    #[tokio::test]
+    async fn refine_amendments_coherence_without_schema_capability() {
+        let mock = SchemaRecordingMockAiClient::with_response(
+            false, // supports_response_schema
+            "amendments: []".to_string(),
+        );
+        let recorded_plain = mock.recorded_plain.clone();
+        let recorded_opts = mock.recorded_options.clone();
+        let client = ClaudeClient::new(Box::new(mock));
+
+        let amendment = crate::data::amendments::Amendment {
+            commit: "abc123".to_string(),
+            message: "feat: do thing".to_string(),
+            summary: None,
+        };
+        let items = vec![(amendment, "summary".to_string())];
+
+        client
+            .refine_amendments_coherence(&items)
+            .await
+            .expect("coherence refinement should succeed without schema support");
+
+        assert_eq!(recorded_plain.lock().unwrap().len(), 1);
+        assert!(
+            recorded_opts.lock().unwrap().is_empty(),
+            "no-schema backend must not be reached via the options path"
+        );
     }
 
     // ── extract_yaml_from_response ─────────────────────────────────
