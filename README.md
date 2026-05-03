@@ -210,6 +210,40 @@ site-derived URL entirely.
 omni-dev git commit message amend amendments.yaml
 ```
 
+### 🗒️ Claude Conversation History
+
+Export your Claude Code chat history to a directory of `.jsonl` files for
+behavioural analysis, work-log generation, or downstream tooling. Re-running
+acts as an idempotent sync: new chats are added, modified chats are
+overwritten, unchanged chats are skipped.
+
+```bash
+# Mirror ~/.claude/projects to ./history/ (one .jsonl per chat, grouped by project slug)
+omni-dev ai claude history sync --target ./history
+
+# Limit to one project (encoded slug or decoded cwd path)
+omni-dev ai claude history sync --target ./history --project /Users/me/work/repo
+
+# Only sessions touched in the last week
+omni-dev ai claude history sync --target ./history --since 7d
+
+# Preview without writing, then prune target files for sessions removed upstream
+omni-dev ai claude history sync --target ./history --dry-run --prune
+```
+
+The export is a **behavioural transcript**, not a faithful archive. The
+top-level session jsonl captures all prompts, responses, thinking blocks, tool
+calls, and tool-result metadata — the signal needed for analysis. Sub-agent
+internal turns, large tool-output sidecars, PDF page rasters, and Claude's
+auto-memory are deliberately excluded; they would bloat any LLM-ingested
+corpus without adding interaction-pattern signal.
+
+In-progress chats produce a valid jsonl prefix (the source size is captured
+once at the start of the copy), so you can sync safely while a chat is open.
+The target layout mirrors the source — `<target>/<slug>/<uuid>.jsonl` — and
+source `mtime` is preserved on each target file so downstream tooling can
+sort sessions chronologically without parsing every file.
+
 ### 🔌 MCP Server
 
 omni-dev ships an optional **Model Context Protocol** server so AI assistants

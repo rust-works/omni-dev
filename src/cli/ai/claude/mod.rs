@@ -1,6 +1,7 @@
 //! Claude Code diagnostics and inspection commands.
 
 mod cli;
+pub mod history;
 pub mod skills;
 
 use anyhow::Result;
@@ -21,6 +22,8 @@ pub enum ClaudeSubcommands {
     Cli(cli::CliCommand),
     /// Manages Claude Code skills across repositories and worktrees.
     Skills(skills::SkillsCommand),
+    /// Exports Claude Code conversation history.
+    History(history::HistoryCommand),
 }
 
 impl ClaudeCommand {
@@ -29,6 +32,7 @@ impl ClaudeCommand {
         match self.command {
             ClaudeSubcommands::Cli(cmd) => cmd.execute(),
             ClaudeSubcommands::Skills(cmd) => cmd.execute(),
+            ClaudeSubcommands::History(cmd) => cmd.execute(),
         }
     }
 }
@@ -78,6 +82,23 @@ mod tests {
     #[test]
     fn dispatches_cli_subcommand_via_clap() {
         let cmd = ClaudeCommand::try_parse_from(["claude", "cli", "model", "resolve"]).unwrap();
+        cmd.execute().unwrap();
+    }
+
+    #[test]
+    fn dispatches_history_subcommand_via_clap() {
+        let src = tempdir();
+        let tgt = tempdir();
+        let cmd = ClaudeCommand::try_parse_from([
+            "claude",
+            "history",
+            "sync",
+            "--source",
+            src.path().to_str().unwrap(),
+            "--target",
+            tgt.path().to_str().unwrap(),
+        ])
+        .unwrap();
         cmd.execute().unwrap();
     }
 }
