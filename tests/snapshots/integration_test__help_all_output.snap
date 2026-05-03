@@ -22,7 +22,9 @@ Options:
       --ai-backend <AI_BACKEND>
           Selects the AI backend used by commands that invoke an AI model [possible values: default, claude-cli]
       --claude-cli-allow-tools
-          Weakens the `claude-cli` sandbox by allowing the nested `claude -p` session to use its default tool set (Read/Edit/Write/Bash/Glob/Grep and any user-level MCP servers)
+          Weakens the `claude-cli` sandbox by allowing the nested `claude -p` session to use its default built-in tools (Read, Edit, Write, Bash, Glob, Grep)
+      --claude-cli-allow-mcp
+          Weakens the `claude-cli` sandbox by allowing the nested `claude -p` session to load MCP servers from `~/.claude/settings.json`
       --claude-cli-max-budget-usd <AMOUNT>
           Per-invocation spending cap in USD for the `claude-cli` backend
   -h, --help
