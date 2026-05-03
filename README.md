@@ -554,6 +554,8 @@ the default HTTP backend which has no such floor.
   4 MiB).
 - `OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS` — **escape hatch** (default: disabled).
   See below.
+- `OMNI_DEV_CLAUDE_CLI_ALLOW_MCP` — **escape hatch** for MCP server pickup
+  (default: disabled). See below.
 - `OMNI_DEV_CLAUDE_CLI_MAX_BUDGET_USD` — per-invocation spending cap in USD
   (default: none). See below.
 
@@ -572,15 +574,36 @@ omni-dev --ai-backend claude-cli --claude-cli-allow-tools git branch create pr
 export OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS=true
 ```
 
-**When enabled**, the nested session uses the CLI's default tool set
-(Read / Edit / Write / Bash / Glob / Grep, plus any MCP servers configured in
-your `~/.claude/settings.json`). This means the session can access your
-repository and run commands. Only enable it when you want that behaviour.
+**When enabled**, the nested session uses the CLI's default built-in tool
+set (Read / Edit / Write / Bash / Glob / Grep). This means the session can
+access your repository and run commands. Only enable it when you want that
+behaviour. When active, omni-dev logs a warning on every invocation.
+
+`--strict-mcp-config` and `--setting-sources ""` still apply unless you
+*also* enable `--claude-cli-allow-mcp` (see below). The two escape hatches
+are independent so you can grant tool access without exposing MCP server
+credentials, and vice-versa.
+
+#### Escape hatch: `--claude-cli-allow-mcp`
+
+By default the nested `claude -p` session is run with `--strict-mcp-config`
+and no `--mcp-config`, blocking every MCP server you have configured in
+`~/.claude/settings.json`. To re-enable MCP server pickup:
+
+```bash
+omni-dev --ai-backend claude-cli --claude-cli-allow-mcp git branch create pr
+# or:
+export OMNI_DEV_CLAUDE_CLI_ALLOW_MCP=true
+```
+
+**When enabled**, the nested session can connect to any MCP server in your
+user settings. Be aware that MCP servers commonly hold OAuth tokens (Gmail,
+Drive, Slack) or expose internal network services; enabling this exposes
+them to the nested session. Only enable it when you want that behaviour.
 When active, omni-dev logs a warning on every invocation.
 
-`--strict-mcp-config` and `--setting-sources ""` still apply, so MCP servers
-won't auto-load unless you explicitly allow them via further flags in a
-future slice.
+This flag is independent of `--claude-cli-allow-tools`. Built-in tools
+remain disabled unless you enable that flag separately.
 
 #### Spending cap: `--claude-cli-max-budget-usd`
 
