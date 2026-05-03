@@ -139,7 +139,9 @@ Backends are selected inside `src/claude/client.rs::create_default_claude_client
 
 Preflight (`src/utils/preflight.rs`) mirrors this switch and must change in lock-step when adding backends.
 
-**Escape hatch.** `OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS=true` or `--claude-cli-allow-tools` removes the `--tools ""` flag from the subprocess argv, letting the nested session use Read/Edit/Write/Bash/Glob/Grep. Other sandbox flags (`--strict-mcp-config`, `--setting-sources ""`, `--disable-slash-commands`, `--no-session-persistence`, temp cwd, scrubbed env) still apply. A warning is logged every time the escape hatch is active. See `ClaudeCliAiClient::run` for the warn site.
+**Escape hatch (tools).** `OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS=true` or `--claude-cli-allow-tools` removes the `--tools ""` flag from the subprocess argv, letting the nested session use Read/Edit/Write/Bash/Glob/Grep. Other sandbox flags (`--setting-sources ""`, `--disable-slash-commands`, `--no-session-persistence`, temp cwd, scrubbed env) still apply, as does `--strict-mcp-config` unless the MCP escape hatch is also set. A warning is logged every time the escape hatch is active. See `ClaudeCliAiClient::run` for the warn site.
+
+**Escape hatch (MCP).** `OMNI_DEV_CLAUDE_CLI_ALLOW_MCP=true` or `--claude-cli-allow-mcp` removes the `--strict-mcp-config` flag from the subprocess argv, letting the nested session load MCP servers from `~/.claude/settings.json`. Independent of the tool escape hatch — the two can be combined or used separately. A warning is logged every time the escape hatch is active. See `ClaudeCliAiClient::run` for the warn site.
 
 **Spending cap.** `OMNI_DEV_CLAUDE_CLI_MAX_BUDGET_USD=<amount>` or `--claude-cli-max-budget-usd <amount>` forwards to `claude -p --max-budget-usd`, aborting the nested session if it exceeds the cap. Every invocation logs `total_cost_usd` from the JSON envelope at INFO level regardless of cap, for cost observability. Non-positive / non-finite values are silently treated as no cap. See `ClaudeCliAiClient::run` for the log site and the post-response warn when cost exceeds the configured cap.
 

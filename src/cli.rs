@@ -36,17 +36,32 @@ pub struct Cli {
     pub ai_backend: Option<AiBackend>,
 
     /// Weakens the `claude-cli` sandbox by allowing the nested `claude -p`
-    /// session to use its default tool set (Read/Edit/Write/Bash/Glob/Grep
-    /// and any user-level MCP servers).
+    /// session to use its default built-in tools (Read, Edit, Write, Bash,
+    /// Glob, Grep).
     ///
     /// **Only use for deliberately tool-capable use cases.** By default the
     /// nested session runs with `--tools ""` and cannot touch the
     /// file system. This flag removes that guard. Equivalent to setting
-    /// `OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS=true`.
+    /// `OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS=true`. Independent of
+    /// `--claude-cli-allow-mcp`.
     ///
     /// Ignored when `--ai-backend` is not `claude-cli`.
     #[arg(long, global = true)]
     pub claude_cli_allow_tools: bool,
+
+    /// Weakens the `claude-cli` sandbox by allowing the nested `claude -p`
+    /// session to load MCP servers from `~/.claude/settings.json`.
+    ///
+    /// **Only use deliberately.** MCP servers commonly hold OAuth tokens
+    /// (Gmail, Drive, Slack) and may be arbitrary network-attached services;
+    /// enabling this exposes them to the nested session. By default the
+    /// session runs with `--strict-mcp-config` and no MCP servers load.
+    /// Equivalent to setting `OMNI_DEV_CLAUDE_CLI_ALLOW_MCP=true`.
+    /// Independent of `--claude-cli-allow-tools`.
+    ///
+    /// Ignored when `--ai-backend` is not `claude-cli`.
+    #[arg(long, global = true)]
+    pub claude_cli_allow_mcp: bool,
 
     /// Per-invocation spending cap in USD for the `claude-cli` backend.
     ///
@@ -84,11 +99,11 @@ pub enum Commands {
 }
 
 impl Cli {
-    /// Executes the CLI command.
-    pub async fn execute(self) -> Result<()> {
-        // Propagate --ai-backend to the env var the factory reads. Setting
-        // the env var here (rather than threading an extra argument through
-        // every command) keeps the factory signature stable.
+    /// Forwards global flags to the env vars that downstream factories
+    /// read. Extracted so it can be unit-tested without invoking a real
+    /// subcommand. Setting the env vars here (rather than threading extra
+    /// arguments through every command) keeps factory signatures stable.
+    fn propagate_global_flags(&self) {
         if let Some(backend) = self.ai_backend {
             match backend {
                 AiBackend::Default => std::env::remove_var("OMNI_DEV_AI_BACKEND"),
@@ -100,9 +115,18 @@ impl Cli {
             std::env::set_var("OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS", "true");
         }
 
+        if self.claude_cli_allow_mcp {
+            std::env::set_var("OMNI_DEV_CLAUDE_CLI_ALLOW_MCP", "true");
+        }
+
         if let Some(budget) = self.claude_cli_max_budget_usd {
             std::env::set_var("OMNI_DEV_CLAUDE_CLI_MAX_BUDGET_USD", format!("{budget}"));
         }
+    }
+
+    /// Executes the CLI command.
+    pub async fn execute(self) -> Result<()> {
+        self.propagate_global_flags();
 
         match self.command {
             Commands::Ai(ai_cmd) => ai_cmd.execute().await,
@@ -140,6 +164,7 @@ mod tests {
         let cli = Cli::try_parse_from(["omni-dev", "help-all"]).unwrap();
         assert!(cli.ai_backend.is_none());
         assert!(!cli.claude_cli_allow_tools);
+        assert!(!cli.claude_cli_allow_mcp);
     }
 
     #[test]
@@ -147,6 +172,36 @@ mod tests {
         let cli =
             Cli::try_parse_from(["omni-dev", "--claude-cli-allow-tools", "help-all"]).unwrap();
         assert!(cli.claude_cli_allow_tools);
+    }
+
+    #[test]
+    fn parses_claude_cli_allow_mcp_flag() {
+        let cli = Cli::try_parse_from(["omni-dev", "--claude-cli-allow-mcp", "help-all"]).unwrap();
+        assert!(cli.claude_cli_allow_mcp);
+        assert!(!cli.claude_cli_allow_tools);
+    }
+
+    #[test]
+    fn allow_mcp_and_allow_tools_are_independent() {
+        let only_mcp =
+            Cli::try_parse_from(["omni-dev", "--claude-cli-allow-mcp", "help-all"]).unwrap();
+        assert!(only_mcp.claude_cli_allow_mcp);
+        assert!(!only_mcp.claude_cli_allow_tools);
+
+        let only_tools =
+            Cli::try_parse_from(["omni-dev", "--claude-cli-allow-tools", "help-all"]).unwrap();
+        assert!(only_tools.claude_cli_allow_tools);
+        assert!(!only_tools.claude_cli_allow_mcp);
+
+        let both = Cli::try_parse_from([
+            "omni-dev",
+            "--claude-cli-allow-tools",
+            "--claude-cli-allow-mcp",
+            "help-all",
+        ])
+        .unwrap();
+        assert!(both.claude_cli_allow_tools);
+        assert!(both.claude_cli_allow_mcp);
     }
 
     #[test]
@@ -194,5 +249,129 @@ mod tests {
             panic!("expected parse error for non-numeric budget");
         };
         assert!(err.to_string().contains("invalid"));
+    }
+
+    // ── propagate_global_flags() tests ──
+    //
+    // These tests mutate process-global env vars, so they serialise on
+    // `crate::claude::ai::claude_cli::CLI_ENV_LOCK` (shared with claude-cli's
+    // own env-mutating tests to avoid cross-module races).
+
+    const BACKEND_VAR: &str = "OMNI_DEV_AI_BACKEND";
+    const ALLOW_TOOLS_VAR: &str = "OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS";
+    const ALLOW_MCP_VAR: &str = "OMNI_DEV_CLAUDE_CLI_ALLOW_MCP";
+    const MAX_BUDGET_VAR: &str = "OMNI_DEV_CLAUDE_CLI_MAX_BUDGET_USD";
+
+    /// Locks the shared mutex and snapshots/restores every env var
+    /// `propagate_global_flags` may touch.
+    struct GlobalFlagsEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: [(&'static str, Option<String>); 4],
+    }
+
+    impl GlobalFlagsEnvGuard {
+        fn new() -> Self {
+            let lock = crate::claude::ai::claude_cli::CLI_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let names = [BACKEND_VAR, ALLOW_TOOLS_VAR, ALLOW_MCP_VAR, MAX_BUDGET_VAR];
+            let saved = names.map(|n| (n, std::env::var(n).ok()));
+            for (n, _) in &saved {
+                std::env::remove_var(n);
+            }
+            Self { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for GlobalFlagsEnvGuard {
+        fn drop(&mut self) {
+            for (n, value) in &self.saved {
+                match value {
+                    Some(v) => std::env::set_var(n, v),
+                    None => std::env::remove_var(n),
+                }
+            }
+        }
+    }
+
+    fn cli_with_defaults() -> Cli {
+        Cli::try_parse_from(["omni-dev", "help-all"]).unwrap()
+    }
+
+    #[test]
+    fn propagate_global_flags_defaults_set_nothing() {
+        let _g = GlobalFlagsEnvGuard::new();
+        cli_with_defaults().propagate_global_flags();
+        assert!(std::env::var(BACKEND_VAR).is_err());
+        assert!(std::env::var(ALLOW_TOOLS_VAR).is_err());
+        assert!(std::env::var(ALLOW_MCP_VAR).is_err());
+        assert!(std::env::var(MAX_BUDGET_VAR).is_err());
+    }
+
+    #[test]
+    fn propagate_global_flags_sets_ai_backend_claude_cli() {
+        let _g = GlobalFlagsEnvGuard::new();
+        let mut cli = cli_with_defaults();
+        cli.ai_backend = Some(AiBackend::ClaudeCli);
+        cli.propagate_global_flags();
+        assert_eq!(
+            std::env::var(BACKEND_VAR).ok().as_deref(),
+            Some("claude-cli")
+        );
+    }
+
+    #[test]
+    fn propagate_global_flags_default_backend_removes_env_var() {
+        let _g = GlobalFlagsEnvGuard::new();
+        std::env::set_var(BACKEND_VAR, "claude-cli");
+        let mut cli = cli_with_defaults();
+        cli.ai_backend = Some(AiBackend::Default);
+        cli.propagate_global_flags();
+        assert!(std::env::var(BACKEND_VAR).is_err());
+    }
+
+    #[test]
+    fn propagate_global_flags_sets_allow_tools() {
+        let _g = GlobalFlagsEnvGuard::new();
+        let mut cli = cli_with_defaults();
+        cli.claude_cli_allow_tools = true;
+        cli.propagate_global_flags();
+        assert_eq!(std::env::var(ALLOW_TOOLS_VAR).ok().as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn propagate_global_flags_sets_allow_mcp() {
+        let _g = GlobalFlagsEnvGuard::new();
+        let mut cli = cli_with_defaults();
+        cli.claude_cli_allow_mcp = true;
+        cli.propagate_global_flags();
+        assert_eq!(std::env::var(ALLOW_MCP_VAR).ok().as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn propagate_global_flags_sets_max_budget_usd() {
+        let _g = GlobalFlagsEnvGuard::new();
+        let mut cli = cli_with_defaults();
+        cli.claude_cli_max_budget_usd = Some(1.5);
+        cli.propagate_global_flags();
+        assert_eq!(std::env::var(MAX_BUDGET_VAR).ok().as_deref(), Some("1.5"));
+    }
+
+    #[test]
+    fn propagate_global_flags_independent_flags_compose() {
+        let _g = GlobalFlagsEnvGuard::new();
+        let mut cli = cli_with_defaults();
+        cli.ai_backend = Some(AiBackend::ClaudeCli);
+        cli.claude_cli_allow_tools = true;
+        cli.claude_cli_allow_mcp = true;
+        cli.claude_cli_max_budget_usd = Some(0.25);
+        cli.propagate_global_flags();
+        assert_eq!(
+            std::env::var(BACKEND_VAR).ok().as_deref(),
+            Some("claude-cli")
+        );
+        assert_eq!(std::env::var(ALLOW_TOOLS_VAR).ok().as_deref(), Some("true"));
+        assert_eq!(std::env::var(ALLOW_MCP_VAR).ok().as_deref(), Some("true"));
+        assert_eq!(std::env::var(MAX_BUDGET_VAR).ok().as_deref(), Some("0.25"));
     }
 }
