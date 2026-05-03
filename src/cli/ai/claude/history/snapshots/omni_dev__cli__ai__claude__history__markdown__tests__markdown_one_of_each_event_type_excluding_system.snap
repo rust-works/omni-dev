@@ -1,0 +1,21 @@
+---
+source: src/cli/ai/claude/history/markdown.rs
+expression: out
+---
+---
+session_id: u-2
+project_slug: -Users-jky-foo
+project_cwd: /Users/jky/foo
+ai_title: null
+first_event: 2026-05-03T03:14:22Z
+last_event: 2026-05-03T03:14:22Z
+event_count: 7
+---
+
+## User · 2026-05-03T03:14:22Z
+
+real prompt
+
+## Assistant
+
+real reply

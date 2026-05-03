@@ -229,6 +229,12 @@ omni-dev ai claude history sync --target ./history --since 7d
 
 # Preview without writing, then prune target files for sessions removed upstream
 omni-dev ai claude history sync --target ./history --dry-run --prune
+
+# Render LLM-friendly markdown alongside the raw jsonl (one .md per session)
+omni-dev ai claude history sync --target ./history --output-format jsonl,markdown
+
+# Markdown only — suitable for piping into a coaching LLM
+omni-dev ai claude history sync --target ./history --output-format markdown
 ```
 
 The export is a **behavioural transcript**, not a faithful archive. The
@@ -243,6 +249,32 @@ once at the start of the copy), so you can sync safely while a chat is open.
 The target layout mirrors the source — `<target>/<slug>/<uuid>.jsonl` — and
 source `mtime` is preserved on each target file so downstream tooling can
 sort sessions chronologically without parsing every file.
+
+`--output-format markdown` writes a derived `<target>/<slug>/<uuid>.md`
+alongside (or instead of) the jsonl. Each markdown file has YAML frontmatter
+with session metadata followed by `## User` / `## Assistant` turns; tool calls
+render as `### Tool call: <name>` blocks, thinking blocks collapse into
+`<details>`, and sub-agent (`Agent`) calls render the prompt argument only.
+
+Agent-to-user interactions are surfaced as first-class structured events so
+the analyst LLM sees what was actually asked and how the user responded:
+
+- `AskUserQuestion` calls render as `### Agent question: <header>` with the
+  question text and a bulleted list of options (with descriptions); the
+  paired user reply renders as `## User response`.
+- Tool denials show up as `**Tool result (<tool>, denied by user):**` —
+  detected by the canonical "The user doesn't want to proceed with this tool
+  use" sentinel Claude Code stuffs into the next `tool_result`.
+- Tool interrupts (escape mid-execution) render as
+  `**Tool result (<tool>, interrupted by user):**`.
+- Errors (real tool failures, distinct from user denials) keep the
+  `error` label; successes use `ok`.
+
+System reminders, attachments, and permission-mode events are included by
+default — pass `--exclude-system` to drop them. Markdown idempotency keys off
+source mtime alone (the rendered length differs from the source length), and
+`--prune` only deletes artifacts whose extension matches one of the formats
+listed in `--output-format`.
 
 ### 🔌 MCP Server
 

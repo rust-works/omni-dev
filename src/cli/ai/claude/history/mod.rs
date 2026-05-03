@@ -8,13 +8,14 @@
 //! the rationale and the planned follow-ups.
 
 pub mod common;
+pub mod markdown;
 pub mod sync;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
-pub use common::OutputFormat;
+pub use common::{FileFormat, OutputFormat};
 
 /// Conversation-history operations.
 #[derive(Parser)]
@@ -80,8 +81,10 @@ fn print_report_text(report: &sync::SyncReport, dry_run: bool) {
                 session,
                 target,
                 bytes,
+                format,
             } => println!(
-                "{prefix}created {}/{} -> {} ({bytes} bytes)",
+                "{prefix}created {} {}/{} -> {} ({bytes} bytes)",
+                file_format_label(*format),
                 project,
                 session,
                 target.display()
@@ -91,8 +94,10 @@ fn print_report_text(report: &sync::SyncReport, dry_run: bool) {
                 session,
                 target,
                 bytes,
+                format,
             } => println!(
-                "{prefix}updated {}/{} -> {} ({bytes} bytes)",
+                "{prefix}updated {} {}/{} -> {} ({bytes} bytes)",
+                file_format_label(*format),
                 project,
                 session,
                 target.display()
@@ -102,8 +107,10 @@ fn print_report_text(report: &sync::SyncReport, dry_run: bool) {
                 session,
                 target,
                 reason,
+                format,
             } => println!(
-                "{prefix}skipped {}/{} ({}) -> {}",
+                "{prefix}skipped {} {}/{} ({}) -> {}",
+                file_format_label(*format),
                 project,
                 session,
                 skip_reason_label(reason),
@@ -113,8 +120,10 @@ fn print_report_text(report: &sync::SyncReport, dry_run: bool) {
                 project,
                 session,
                 target,
+                format,
             } => println!(
-                "{prefix}pruned {}/{} -> {}",
+                "{prefix}pruned {} {}/{} -> {}",
+                file_format_label(*format),
                 project,
                 session,
                 target.display()
@@ -123,6 +132,13 @@ fn print_report_text(report: &sync::SyncReport, dry_run: bool) {
     }
     for err in &report.errors {
         eprintln!("error: {}/{} -- {}", err.project, err.session, err.reason);
+    }
+}
+
+fn file_format_label(format: FileFormat) -> &'static str {
+    match format {
+        FileFormat::Jsonl => "jsonl",
+        FileFormat::Markdown => "markdown",
     }
 }
 
@@ -149,35 +165,41 @@ mod tests {
                     session: "abc".into(),
                     target: PathBuf::from("/t/slug/abc.jsonl"),
                     bytes: 42,
+                    format: FileFormat::Jsonl,
                 },
                 SyncAction::Updated {
                     project: "slug".into(),
                     session: "def".into(),
-                    target: PathBuf::from("/t/slug/def.jsonl"),
+                    target: PathBuf::from("/t/slug/def.md"),
                     bytes: 99,
+                    format: FileFormat::Markdown,
                 },
                 SyncAction::Skipped {
                     project: "slug".into(),
                     session: "ghi".into(),
                     target: PathBuf::from("/t/slug/ghi.jsonl"),
                     reason: SkipReason::Unchanged,
+                    format: FileFormat::Jsonl,
                 },
                 SyncAction::Skipped {
                     project: "slug".into(),
                     session: "jkl".into(),
                     target: PathBuf::from("/t/slug/jkl.jsonl"),
                     reason: SkipReason::FilteredBySince,
+                    format: FileFormat::Jsonl,
                 },
                 SyncAction::Skipped {
                     project: "slug".into(),
                     session: "mno".into(),
                     target: PathBuf::from("/t/slug/mno.jsonl"),
                     reason: SkipReason::FilteredByProject,
+                    format: FileFormat::Jsonl,
                 },
                 SyncAction::Pruned {
                     project: "slug".into(),
                     session: "old".into(),
                     target: PathBuf::from("/t/slug/old.jsonl"),
+                    format: FileFormat::Jsonl,
                 },
             ],
             errors: vec![SyncError {
@@ -248,6 +270,28 @@ mod tests {
         // every match arm is reachable without panicking.
         print_report_text(&report_with_one_of_each(), true);
         print_report_text(&report_with_one_of_each(), false);
+    }
+
+    #[test]
+    fn file_format_label_distinct() {
+        assert_eq!(file_format_label(FileFormat::Jsonl), "jsonl");
+        assert_eq!(file_format_label(FileFormat::Markdown), "markdown");
+    }
+
+    #[test]
+    fn yaml_render_includes_format_for_each_action() {
+        let report = report_with_one_of_each();
+        let yaml = serde_yaml::to_string(&SyncOutput {
+            dry_run: false,
+            actions: &report.actions,
+            errors: &report.errors,
+        })
+        .unwrap();
+        assert!(yaml.contains("format: jsonl"), "missing jsonl: {yaml}");
+        assert!(
+            yaml.contains("format: markdown"),
+            "missing markdown: {yaml}"
+        );
     }
 
     use std::io::Write as _;

@@ -18,6 +18,28 @@ pub enum OutputFormat {
     Yaml,
 }
 
+/// On-disk file shape produced by `history sync`. Independent of the report
+/// format ([`OutputFormat`]) — `--format` controls what the **report** looks
+/// like; this enum controls what the **artifacts** on disk look like.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileFormat {
+    /// Lossless byte copy of the source jsonl.
+    Jsonl,
+    /// LLM-friendly markdown rendering of the session.
+    Markdown,
+}
+
+impl FileFormat {
+    /// Returns the file extension (without leading dot) used for this format.
+    pub const fn extension(self) -> &'static str {
+        match self {
+            Self::Jsonl => "jsonl",
+            Self::Markdown => "md",
+        }
+    }
+}
+
 /// Returns the default source root: `$HOME/.claude/projects`.
 pub fn default_source_root() -> Result<PathBuf> {
     let home = dirs::home_dir().context("Failed to determine home directory")?;
@@ -221,5 +243,37 @@ mod tests {
         let a = PathBuf::from("/tmp/aaa-history-a");
         let b = PathBuf::from("/tmp/aaa-history-b");
         assert!(!is_inside(&a, &b));
+    }
+
+    #[test]
+    fn file_format_extension_jsonl() {
+        assert_eq!(FileFormat::Jsonl.extension(), "jsonl");
+    }
+
+    #[test]
+    fn file_format_extension_markdown() {
+        assert_eq!(FileFormat::Markdown.extension(), "md");
+    }
+
+    #[test]
+    fn file_format_value_enum_round_trip() {
+        // Drives the clap ValueEnum derive so the parser pin remains accurate.
+        use clap::ValueEnum;
+        assert_eq!(
+            FileFormat::from_str("jsonl", false).unwrap(),
+            FileFormat::Jsonl
+        );
+        assert_eq!(
+            FileFormat::from_str("markdown", false).unwrap(),
+            FileFormat::Markdown
+        );
+        assert!(FileFormat::from_str("garbage", false).is_err());
+    }
+
+    #[test]
+    fn file_format_orders_jsonl_before_markdown() {
+        // BTreeSet iteration order is relied on by the sync planner so
+        // jsonl actions appear before markdown actions in the report.
+        assert!(FileFormat::Jsonl < FileFormat::Markdown);
     }
 }
