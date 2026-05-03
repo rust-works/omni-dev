@@ -1,0 +1,64 @@
+---
+source: src/cli/ai/claude/history/markdown.rs
+expression: out
+---
+---
+session_id: u-1
+project_slug: -Users-jky-foo
+project_cwd: /Users/jky/foo
+git_branch: issue-665
+version: 1.2.3
+entrypoint: claude
+ai_title: Test Session
+first_event: 2026-05-03T03:14:22Z
+last_event: 2026-05-03T03:14:22Z
+event_count: 11
+---
+
+## User · 2026-05-03T03:14:22Z
+
+Hello, can you help?
+
+> **System reminder:** be terse
+
+## Assistant
+
+<details>
+<summary>Thinking</summary>
+
+Let me think...
+
+</details>
+
+Sure, here's a thought.
+
+### Tool call: `Bash`
+
+```bash
+{
+  "command": "ls"
+}
+```
+
+**Tool result (Bash, ok):**
+
+```
+file1
+file2
+```
+
+## Assistant
+
+### Tool call: `Agent`
+
+```
+plan this
+```
+
+> **Attachment (skill_listing):** 3 skills
+
+> _Permission mode: default_
+
+> _Turn duration: 1500ms, messages: 2_
+
+> **Summary:** compaction
