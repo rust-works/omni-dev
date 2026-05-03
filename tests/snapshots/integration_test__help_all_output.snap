@@ -72,9 +72,10 @@ Claude Code diagnostics and inspection
 Usage: claude <COMMAND>
 
 Commands:
-  cli     Claude Code CLI inspection
-  skills  Manages Claude Code skills across repositories and worktrees
-  help    Print this message or the help of the given subcommand(s)
+  cli      Claude Code CLI inspection
+  skills   Manages Claude Code skills across repositories and worktrees
+  history  Exports Claude Code conversation history
+  help     Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
@@ -122,6 +123,41 @@ Usage: resolve
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev ai claude history - Exports Claude Code conversation history
+
+Exports Claude Code conversation history
+
+Usage: history <COMMAND>
+
+Commands:
+  sync  Exports Claude Code conversation history to a target directory
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev ai claude history sync - Exports Claude Code conversation history to a target directory
+
+Exports Claude Code conversation history to a target directory
+
+Usage: sync [OPTIONS] --target <PATH>
+
+Options:
+      --target <PATH>             Target directory for the export. Created if it does not exist
+      --source <PATH>             Override source root. Defaults to `~/.claude/projects`
+      --project <NAME_OR_PATH>    Restrict sync to one project. Accepts the encoded directory name (e.g. `-Users-jky-tmp`) or a decoded cwd path (matched after decoding)
+      --since <DURATION_OR_DATE>  Only sync sessions whose source mtime is at or after this point. Accepts a relative duration (`30s`, `5m`, `2h`, `7d`, `4w`) or an RFC 3339 timestamp
+      --prune                     Delete target files for sessions no longer present in the source. Only files matching `<slug>/<uuid>.jsonl` are eligible for deletion; anything else inside the target is preserved regardless
+      --dry-run                   Preview changes without touching the target
+      --format <FORMAT>           Output format [default: text] [possible values: text, yaml]
+  -h, --help                      Print help (see more with '--help')
 
 
 ================================================================================
