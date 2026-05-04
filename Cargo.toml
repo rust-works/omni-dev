@@ -37,7 +37,7 @@ crossterm = "0.29"
 url = "2.5.8"
 base64 = "0.22"
 futures = "0.3"
-rmcp = { version = "1.5", features = ["server", "transport-io", "macros"], optional = true }
+rmcp = { version = "1.6", features = ["server", "transport-io", "macros"], optional = true }
 schemars = "1.2"
 tokio-util = { version = "0.7", optional = true }
 
@@ -52,7 +52,7 @@ tempfile = "3.27"
 insta = "1.47"
 proptest = "1"
 wiremock = "0.6"
-rmcp = { version = "1.5", features = ["client", "server", "transport-io", "macros"] }
+rmcp = { version = "1.6", features = ["client", "server", "transport-io", "macros"] }
 
 [lib]
 name = "omni_dev"
