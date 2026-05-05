@@ -210,6 +210,50 @@ pub fn parse_set_field(input: &str) -> Result<(String, serde_yaml::Value)> {
     Ok((name, yaml_value))
 }
 
+/// Translates an `accountId`-style assignee/reporter input to the JSON
+/// shape JIRA expects.
+///
+/// The empty string clears the user (Atlassian's supported `null` payload);
+/// any other value is wrapped as `{"accountId": "<value>"}`. The literal
+/// `-1` is preserved as `{"accountId": "-1"}`, which JIRA interprets as
+/// automatic assignment.
+pub fn user_field_value(raw: &str) -> serde_json::Value {
+    if raw.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::json!({ "accountId": raw })
+    }
+}
+
+/// Merges typed `assignee`/`reporter` parameters into a resolved JIRA fields
+/// map.
+///
+/// Rejects collisions where the same field id has already been set
+/// (typically via the `fields` escape hatch on the MCP side or `--set-field`
+/// on the CLI side). `other_source_label` is interpolated into the error
+/// message to identify the colliding source — for example
+/// `the same key inside fields` or ``--set-field`` of the same name``.
+pub fn apply_user_field_overrides(
+    fields: &mut BTreeMap<String, serde_json::Value>,
+    assignee: Option<&str>,
+    reporter: Option<&str>,
+    other_source_label: &str,
+) -> Result<()> {
+    if let Some(value) = assignee {
+        if fields.contains_key("assignee") {
+            bail!("`assignee` collides with {other_source_label}; supply only one");
+        }
+        fields.insert("assignee".to_string(), user_field_value(value));
+    }
+    if let Some(value) = reporter {
+        if fields.contains_key("reporter") {
+            bail!("`reporter` collides with {other_source_label}; supply only one");
+        }
+        fields.insert("reporter".to_string(), user_field_value(value));
+    }
+    Ok(())
+}
+
 /// Merges CLI `--set-field` overrides into a frontmatter scalar map,
 /// with CLI overriding frontmatter on name conflicts.
 pub fn merge_set_field_overrides(
@@ -244,6 +288,85 @@ mod tests {
             );
         }
         EditMeta { fields }
+    }
+
+    // ── user_field_value ──────────────────────────────────────
+
+    #[test]
+    fn user_field_value_empty_string_is_null() {
+        assert_eq!(user_field_value(""), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn user_field_value_account_id_wrapped() {
+        assert_eq!(
+            user_field_value("abc123"),
+            serde_json::json!({"accountId": "abc123"})
+        );
+    }
+
+    #[test]
+    fn user_field_value_dash_one_preserves_auto_assign() {
+        assert_eq!(
+            user_field_value("-1"),
+            serde_json::json!({"accountId": "-1"})
+        );
+    }
+
+    // ── apply_user_field_overrides ────────────────────────────
+
+    #[test]
+    fn apply_user_field_overrides_inserts_assignee_and_reporter() {
+        let mut fields = BTreeMap::new();
+        apply_user_field_overrides(&mut fields, Some("a1"), Some("r1"), "ignored").unwrap();
+        assert_eq!(
+            fields.get("assignee"),
+            Some(&serde_json::json!({"accountId": "a1"}))
+        );
+        assert_eq!(
+            fields.get("reporter"),
+            Some(&serde_json::json!({"accountId": "r1"}))
+        );
+    }
+
+    #[test]
+    fn apply_user_field_overrides_skips_none() {
+        let mut fields = BTreeMap::new();
+        apply_user_field_overrides(&mut fields, None, None, "ignored").unwrap();
+        assert!(fields.is_empty());
+    }
+
+    #[test]
+    fn apply_user_field_overrides_empty_string_clears() {
+        let mut fields = BTreeMap::new();
+        apply_user_field_overrides(&mut fields, Some(""), None, "ignored").unwrap();
+        assert_eq!(fields.get("assignee"), Some(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn apply_user_field_overrides_assignee_collision_errors() {
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "assignee".to_string(),
+            serde_json::json!({"accountId": "existing"}),
+        );
+        let err = apply_user_field_overrides(&mut fields, Some("new"), None, "the test source")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("assignee"));
+        assert!(msg.contains("the test source"));
+    }
+
+    #[test]
+    fn apply_user_field_overrides_reporter_collision_errors() {
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "reporter".to_string(),
+            serde_json::json!({"accountId": "existing"}),
+        );
+        let err = apply_user_field_overrides(&mut fields, None, Some("new"), "the test source")
+            .unwrap_err();
+        assert!(err.to_string().contains("reporter"));
     }
 
     #[test]

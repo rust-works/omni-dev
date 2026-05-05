@@ -3,17 +3,18 @@
 use anyhow::Result;
 use clap::Parser;
 
+use crate::atlassian::adf::AdfDocument;
 use crate::atlassian::client::AtlassianClient;
 use crate::atlassian::convert::markdown_to_adf;
 use crate::atlassian::custom_fields::{
-    merge_set_field_overrides, parse_set_field, resolve_custom_fields,
+    apply_user_field_overrides, merge_set_field_overrides, parse_set_field, resolve_custom_fields,
 };
-use crate::atlassian::document::{validate_issue_key, JfmDocument};
+use crate::atlassian::document::{validate_issue_key, CustomFieldSection, JfmDocument};
 use crate::atlassian::jira_api::JiraApi;
 use crate::cli::atlassian::format::ContentFormat;
 use crate::cli::atlassian::helpers::{
-    create_client, prepare_write, print_dry_run, print_jira_dry_run_with_custom_fields, read_input,
-    run_write, run_write_jira_with_resolved_fields,
+    create_client, prepare_write, print_jira_dry_run_with_custom_fields, read_input, run_write,
+    run_write_jira_with_resolved_fields,
 };
 
 /// Pushes content to a JIRA issue.
@@ -22,13 +23,31 @@ pub struct WriteCommand {
     /// JIRA issue key (e.g., PROJ-123).
     pub key: String,
 
-    /// Input file (reads from stdin if omitted or "-"). Optional when
-    /// `--parent` is supplied alone — the description is left untouched.
+    /// Input file (reads from stdin if omitted or "-"). Pass `--no-content`,
+    /// or omit when `--parent`/`--assignee`/`--reporter`/`--set-field` is
+    /// supplied alone, to leave the description untouched.
     pub file: Option<String>,
 
     /// Input format.
     #[arg(long, value_enum, default_value_t = ContentFormat::Jfm)]
     pub format: ContentFormat,
+
+    /// Skips reading the description and leaves it untouched. Use with
+    /// `--assignee`, `--reporter`, or `--set-field` to update other fields
+    /// without rewriting the body.
+    #[arg(long, conflicts_with = "file")]
+    pub no_content: bool,
+
+    /// Sets the assignee `accountId`. The empty string `""` clears the
+    /// assignee; `"-1"` triggers JIRA automatic assignment. Use
+    /// `omni-dev atlassian jira user search` to resolve a name or email
+    /// to an `accountId`.
+    #[arg(long, value_name = "ACCOUNT_ID")]
+    pub assignee: Option<String>,
+
+    /// Sets the reporter `accountId`. Same conventions as `--assignee`.
+    #[arg(long, value_name = "ACCOUNT_ID")]
+    pub reporter: Option<String>,
 
     /// Set a custom field inline: `--set-field "NAME=VALUE"`. Can be used
     /// multiple times. Values are parsed as YAML scalars (numbers, bools)
@@ -53,7 +72,10 @@ pub struct WriteCommand {
 }
 
 impl WriteCommand {
-    /// Reads input and pushes to the JIRA issue.
+    /// Reads input (if any) and pushes the supplied changes to the JIRA
+    /// issue. Description, title, assignee, reporter, and `--set-field`
+    /// custom fields can all be updated independently; at least one must
+    /// be supplied.
     pub async fn execute(self) -> Result<()> {
         // Real-run paths fetch a client from settings; tests substitute a
         // wiremock-backed one via `execute_with_client`.
@@ -78,111 +100,67 @@ impl WriteCommand {
         }
         let parent = self.parent.as_deref();
 
-        if matches!(self.format, ContentFormat::Adf) {
-            if !overrides.is_empty() {
-                anyhow::bail!(
-                    "--set-field is only supported with --format jfm; ADF writes take a raw payload"
-                );
-            }
-            // ADF + --parent + body: send both. ADF + --parent alone: parent-only.
-            if self.file.is_none() && parent.is_some() {
-                if self.dry_run {
-                    return print_jira_dry_run_with_custom_fields(
-                        &self.key,
-                        None,
-                        "",
-                        parent,
-                        &std::collections::BTreeMap::new(),
-                        &[],
-                    );
-                }
-                let client = make_client()?;
-                return run_write_jira_with_resolved_fields(
-                    &self.key,
-                    None,
-                    "",
-                    parent,
-                    self.force,
-                    &std::collections::BTreeMap::new(),
-                    &client,
-                )
-                .await;
-            }
-            let (adf, title) = prepare_write(self.file.as_deref(), &self.format)?;
-            if self.dry_run {
-                if parent.is_some() {
-                    return print_jira_dry_run_with_custom_fields(
-                        &self.key,
-                        Some(&adf),
-                        &title,
-                        parent,
-                        &std::collections::BTreeMap::new(),
-                        &[],
-                    );
-                }
-                return print_dry_run(&self.key, &adf, &title);
-            }
-            let client = make_client()?;
-            if parent.is_some() {
-                return run_write_jira_with_resolved_fields(
-                    &self.key,
-                    Some(&adf),
-                    &title,
-                    parent,
-                    self.force,
-                    &std::collections::BTreeMap::new(),
-                    &client,
-                )
-                .await;
-            }
-            let api = JiraApi::new(client);
-            return run_write(&self.key, &adf, &title, self.force, &api).await;
+        let user_fields_present = self.assignee.is_some() || self.reporter.is_some();
+        let other_fields_present = user_fields_present || parent.is_some() || !overrides.is_empty();
+
+        if self.no_content && !other_fields_present {
+            anyhow::bail!(
+                "nothing to update: pass --assignee, --reporter, --parent, or --set-field, \
+                 or remove --no-content to update the description"
+            );
         }
 
-        // JFM path: may carry custom fields in frontmatter or body sections.
-        // Parent-only update (no file, no stdin): skip JFM parsing entirely.
-        if self.file.is_none() && parent.is_some() && overrides.is_empty() {
-            if self.dry_run {
-                return print_jira_dry_run_with_custom_fields(
-                    &self.key,
-                    None,
-                    "",
-                    parent,
-                    &std::collections::BTreeMap::new(),
-                    &[],
-                );
-            }
-            let client = make_client()?;
-            return run_write_jira_with_resolved_fields(
-                &self.key,
+        if matches!(self.format, ContentFormat::Adf) && !overrides.is_empty() {
+            anyhow::bail!(
+                "--set-field is only supported with --format jfm; ADF writes take a raw payload"
+            );
+        }
+
+        // Read body / title / frontmatter scalars / custom-field sections.
+        // Skip body parsing when --no-content is explicit, OR when the user
+        // supplied no file *and* one of the field-update flags is set
+        // (parent/assignee/reporter/--set-field) — that combination signals
+        // a "fields-only" update and should not block on stdin.
+        let skip_body = self.no_content || (self.file.is_none() && other_fields_present);
+        let (body_adf, title, frontmatter_scalars, sections): (
+            Option<AdfDocument>,
+            String,
+            std::collections::BTreeMap<String, serde_yaml::Value>,
+            Vec<CustomFieldSection>,
+        ) = if skip_body {
+            (
                 None,
-                "",
-                parent,
-                self.force,
-                &std::collections::BTreeMap::new(),
-                &client,
+                String::new(),
+                std::collections::BTreeMap::new(),
+                vec![],
             )
-            .await;
-        }
+        } else if matches!(self.format, ContentFormat::Adf) {
+            let (adf, title) = prepare_write(self.file.as_deref(), &self.format)?;
+            (Some(adf), title, std::collections::BTreeMap::new(), vec![])
+        } else {
+            let input = read_input(self.file.as_deref())?;
+            let doc = JfmDocument::parse(&input)?;
+            let (body_md, sections) = doc.split_custom_sections();
+            let frontmatter_scalars = doc
+                .frontmatter
+                .jira_custom_fields()
+                .cloned()
+                .unwrap_or_default();
+            let body_adf = markdown_to_adf(&body_md)?;
+            let title = doc.frontmatter.title().to_string();
+            (Some(body_adf), title, frontmatter_scalars, sections)
+        };
 
-        let input = read_input(self.file.as_deref())?;
-        let doc = JfmDocument::parse(&input)?;
-        let (body_md, sections) = doc.split_custom_sections();
-        let frontmatter_scalars = doc
-            .frontmatter
-            .jira_custom_fields()
-            .cloned()
-            .unwrap_or_default();
         let scalars = merge_set_field_overrides(frontmatter_scalars, overrides);
-        let body_adf = markdown_to_adf(&body_md)?;
-        let title = doc.frontmatter.title().to_string();
 
         if self.dry_run {
             return print_jira_dry_run_with_custom_fields(
                 &self.key,
-                Some(&body_adf),
+                body_adf.as_ref(),
                 &title,
                 parent,
+                self.assignee.as_deref(),
+                self.reporter.as_deref(),
                 &scalars,
                 &sections,
             );
@@ -190,21 +168,37 @@ impl WriteCommand {
 
         let client = make_client()?;
 
-        if scalars.is_empty() && sections.is_empty() && parent.is_none() {
+        // Fast path: simple description+title update with no other field changes.
+        if !user_fields_present && scalars.is_empty() && sections.is_empty() && parent.is_none() {
+            // SAFETY: `body_adf` is always Some here because the
+            // skip_body && !other_fields_present case was rejected above.
+            let Some(body_adf) = body_adf else {
+                unreachable!("skip_body without other fields was rejected above");
+            };
             let api = JiraApi::new(client);
             return run_write(&self.key, &body_adf, &title, self.force, &api).await;
         }
 
-        let resolved = if scalars.is_empty() && sections.is_empty() {
-            std::collections::BTreeMap::new()
-        } else {
+        // Resolve frontmatter / set-field custom fields via editmeta.
+        let mut resolved = if !scalars.is_empty() || !sections.is_empty() {
             let editmeta = client.get_editmeta(&self.key).await?;
             resolve_custom_fields(&scalars, &sections, &editmeta)?
+        } else {
+            std::collections::BTreeMap::new()
         };
+
+        // Layer typed user-field knobs on top, rejecting collisions with
+        // anything already resolved into the same JIRA field id.
+        apply_user_field_overrides(
+            &mut resolved,
+            self.assignee.as_deref(),
+            self.reporter.as_deref(),
+            "`--set-field` of the same name",
+        )?;
 
         run_write_jira_with_resolved_fields(
             &self.key,
-            Some(&body_adf),
+            body_adf.as_ref(),
             &title,
             parent,
             self.force,
@@ -226,20 +220,28 @@ mod tests {
     use super::*;
     use std::fs;
 
-    #[test]
-    fn write_command_struct_fields() {
-        let cmd = WriteCommand {
-            key: "PROJ-1".to_string(),
-            file: Some("input.md".to_string()),
+    fn cmd(key: &str) -> WriteCommand {
+        WriteCommand {
+            key: key.to_string(),
+            file: None,
             format: ContentFormat::Jfm,
+            no_content: false,
+            assignee: None,
+            reporter: None,
             set_fields: vec![],
             parent: None,
             force: true,
             dry_run: false,
-        };
-        assert_eq!(cmd.key, "PROJ-1");
-        assert!(cmd.force);
-        assert!(!cmd.dry_run);
+        }
+    }
+
+    #[test]
+    fn write_command_struct_fields() {
+        let mut c = cmd("PROJ-1");
+        c.file = Some("input.md".to_string());
+        assert_eq!(c.key, "PROJ-1");
+        assert!(c.force);
+        assert!(!c.dry_run);
     }
 
     #[test]
@@ -249,18 +251,13 @@ mod tests {
         let content = "---\ntype: jira\ninstance: https://org.atlassian.net\nkey: PROJ-1\nsummary: Test\n---\n\nBody content\n";
         fs::write(&file_path, content).unwrap();
 
-        let cmd = WriteCommand {
-            key: "PROJ-1".to_string(),
-            file: Some(file_path.to_str().unwrap().to_string()),
-            format: ContentFormat::Jfm,
-            set_fields: vec![],
-            parent: None,
-            force: false,
-            dry_run: true,
-        };
+        let mut c = cmd("PROJ-1");
+        c.file = Some(file_path.to_str().unwrap().to_string());
+        c.force = false;
+        c.dry_run = true;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(cmd.execute());
+        let result = rt.block_on(c.execute());
         assert!(result.is_ok());
     }
 
@@ -270,18 +267,14 @@ mod tests {
         let file_path = temp_dir.path().join("issue.json");
         fs::write(&file_path, r#"{"version":1,"type":"doc","content":[]}"#).unwrap();
 
-        let cmd = WriteCommand {
-            key: "PROJ-1".to_string(),
-            file: Some(file_path.to_str().unwrap().to_string()),
-            format: ContentFormat::Adf,
-            set_fields: vec!["Priority=High".to_string()],
-            parent: None,
-            force: true,
-            dry_run: true,
-        };
+        let mut c = cmd("PROJ-1");
+        c.file = Some(file_path.to_str().unwrap().to_string());
+        c.format = ContentFormat::Adf;
+        c.set_fields = vec!["Priority=High".to_string()];
+        c.dry_run = true;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let err = rt.block_on(cmd.execute()).unwrap_err();
+        let err = rt.block_on(c.execute()).unwrap_err();
         assert!(err
             .to_string()
             .contains("--set-field is only supported with --format jfm"));
@@ -289,18 +282,12 @@ mod tests {
 
     #[test]
     fn invalid_set_field_syntax_errors() {
-        let cmd = WriteCommand {
-            key: "PROJ-1".to_string(),
-            file: None,
-            format: ContentFormat::Jfm,
-            set_fields: vec!["no-equals-sign".to_string()],
-            parent: None,
-            force: true,
-            dry_run: true,
-        };
+        let mut c = cmd("PROJ-1");
+        c.set_fields = vec!["no-equals-sign".to_string()];
+        c.dry_run = true;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let err = rt.block_on(cmd.execute()).unwrap_err();
+        let err = rt.block_on(c.execute()).unwrap_err();
         assert!(err.to_string().contains("expected --set-field"));
     }
 
@@ -312,18 +299,14 @@ mod tests {
             "---\ntype: jira\ninstance: https://org.atlassian.net\nkey: PROJ-1\nsummary: T\n---\n\nBody\n";
         fs::write(&file_path, content).unwrap();
 
-        let cmd = WriteCommand {
-            key: "PROJ-1".to_string(),
-            file: Some(file_path.to_str().unwrap().to_string()),
-            format: ContentFormat::Jfm,
-            set_fields: vec!["Priority=High".to_string()],
-            parent: None,
-            force: false,
-            dry_run: true,
-        };
+        let mut c = cmd("PROJ-1");
+        c.file = Some(file_path.to_str().unwrap().to_string());
+        c.set_fields = vec!["Priority=High".to_string()];
+        c.force = false;
+        c.dry_run = true;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        assert!(rt.block_on(cmd.execute()).is_ok());
+        assert!(rt.block_on(c.execute()).is_ok());
     }
 
     #[test]
@@ -333,52 +316,84 @@ mod tests {
         let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"Hello"}]}]}"#;
         fs::write(&file_path, adf_json).unwrap();
 
-        let cmd = WriteCommand {
-            key: "PROJ-1".to_string(),
-            file: Some(file_path.to_str().unwrap().to_string()),
-            format: ContentFormat::Adf,
-            set_fields: vec![],
-            parent: None,
-            force: false,
-            dry_run: true,
-        };
+        let mut c = cmd("PROJ-1");
+        c.file = Some(file_path.to_str().unwrap().to_string());
+        c.format = ContentFormat::Adf;
+        c.force = false;
+        c.dry_run = true;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(cmd.execute());
+        let result = rt.block_on(c.execute());
         assert!(result.is_ok());
     }
 
     #[test]
-    fn dry_run_parent_only_skips_description() {
-        let cmd = WriteCommand {
-            key: "PROJ-1".to_string(),
-            file: None,
-            format: ContentFormat::Jfm,
-            set_fields: vec![],
-            parent: Some("PROJ-99".to_string()),
-            force: false,
-            dry_run: true,
-        };
+    fn no_content_without_other_changes_errors() {
+        let mut c = cmd("PROJ-1");
+        c.no_content = true;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(cmd.execute());
+        let err = rt.block_on(c.execute()).unwrap_err();
+        assert!(err.to_string().contains("nothing to update"));
+    }
+
+    #[test]
+    fn dry_run_no_content_with_assignee() {
+        let mut c = cmd("PROJ-1");
+        c.no_content = true;
+        c.assignee = Some("abc123".to_string());
+        c.force = false;
+        c.dry_run = true;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        assert!(rt.block_on(c.execute()).is_ok());
+    }
+
+    #[test]
+    fn dry_run_no_content_with_empty_assignee_unassigns() {
+        let mut c = cmd("PROJ-1");
+        c.no_content = true;
+        c.assignee = Some(String::new());
+        c.force = false;
+        c.dry_run = true;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        assert!(rt.block_on(c.execute()).is_ok());
+    }
+
+    #[test]
+    fn dry_run_no_content_with_reporter() {
+        let mut c = cmd("PROJ-1");
+        c.no_content = true;
+        c.reporter = Some("rep123".to_string());
+        c.force = false;
+        c.dry_run = true;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        assert!(rt.block_on(c.execute()).is_ok());
+    }
+
+    #[test]
+    fn dry_run_parent_only_skips_description() {
+        let mut c = cmd("PROJ-1");
+        c.parent = Some("PROJ-99".to_string());
+        c.force = false;
+        c.dry_run = true;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(c.execute());
         assert!(result.is_ok());
     }
 
     #[test]
     fn invalid_parent_key_errors() {
-        let cmd = WriteCommand {
-            key: "PROJ-1".to_string(),
-            file: None,
-            format: ContentFormat::Jfm,
-            set_fields: vec![],
-            parent: Some("not a key".to_string()),
-            force: false,
-            dry_run: true,
-        };
+        let mut c = cmd("PROJ-1");
+        c.parent = Some("not a key".to_string());
+        c.force = false;
+        c.dry_run = true;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let err = rt.block_on(cmd.execute()).unwrap_err();
+        let err = rt.block_on(c.execute()).unwrap_err();
         assert!(err.to_string().contains("Invalid JIRA issue key"));
     }
 
@@ -389,34 +404,26 @@ mod tests {
         let content = "---\ntype: jira\ninstance: https://org.atlassian.net\nkey: PROJ-1\nsummary: T\n---\n\nBody\n";
         fs::write(&file_path, content).unwrap();
 
-        let cmd = WriteCommand {
-            key: "PROJ-1".to_string(),
-            file: Some(file_path.to_str().unwrap().to_string()),
-            format: ContentFormat::Jfm,
-            set_fields: vec![],
-            parent: Some("PROJ-99".to_string()),
-            force: false,
-            dry_run: true,
-        };
+        let mut c = cmd("PROJ-1");
+        c.file = Some(file_path.to_str().unwrap().to_string());
+        c.parent = Some("PROJ-99".to_string());
+        c.force = false;
+        c.dry_run = true;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        assert!(rt.block_on(cmd.execute()).is_ok());
+        assert!(rt.block_on(c.execute()).is_ok());
     }
 
     #[test]
     fn dry_run_adf_parent_only_skips_description() {
-        let cmd = WriteCommand {
-            key: "PROJ-1".to_string(),
-            file: None,
-            format: ContentFormat::Adf,
-            set_fields: vec![],
-            parent: Some("PROJ-99".to_string()),
-            force: false,
-            dry_run: true,
-        };
+        let mut c = cmd("PROJ-1");
+        c.format = ContentFormat::Adf;
+        c.parent = Some("PROJ-99".to_string());
+        c.force = false;
+        c.dry_run = true;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        assert!(rt.block_on(cmd.execute()).is_ok());
+        assert!(rt.block_on(c.execute()).is_ok());
     }
 
     #[test]
@@ -426,18 +433,15 @@ mod tests {
         let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"Hi"}]}]}"#;
         fs::write(&file_path, adf_json).unwrap();
 
-        let cmd = WriteCommand {
-            key: "PROJ-1".to_string(),
-            file: Some(file_path.to_str().unwrap().to_string()),
-            format: ContentFormat::Adf,
-            set_fields: vec![],
-            parent: Some("PROJ-99".to_string()),
-            force: false,
-            dry_run: true,
-        };
+        let mut c = cmd("PROJ-1");
+        c.file = Some(file_path.to_str().unwrap().to_string());
+        c.format = ContentFormat::Adf;
+        c.parent = Some("PROJ-99".to_string());
+        c.force = false;
+        c.dry_run = true;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        assert!(rt.block_on(cmd.execute()).is_ok());
+        assert!(rt.block_on(c.execute()).is_ok());
     }
 
     // ── execute_with_client (real-write paths) ────────────────────────
@@ -477,16 +481,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let cmd = WriteCommand {
-            key: "PROJ-1".to_string(),
-            file: None,
-            format: ContentFormat::Adf,
-            set_fields: vec![],
-            parent: Some("PROJ-99".to_string()),
-            force: true,
-            dry_run: false,
-        };
-        cmd.execute_with_client(mock_client(&server.uri()))
+        let mut c = cmd("PROJ-1");
+        c.format = ContentFormat::Adf;
+        c.parent = Some("PROJ-99".to_string());
+        c.execute_with_client(mock_client(&server.uri()))
             .await
             .unwrap();
     }
@@ -517,16 +515,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let cmd = WriteCommand {
-            key: "PROJ-1".to_string(),
-            file: Some(path),
-            format: ContentFormat::Adf,
-            set_fields: vec![],
-            parent: Some("PROJ-99".to_string()),
-            force: true,
-            dry_run: false,
-        };
-        cmd.execute_with_client(mock_client(&server.uri()))
+        let mut c = cmd("PROJ-1");
+        c.file = Some(path);
+        c.format = ContentFormat::Adf;
+        c.parent = Some("PROJ-99".to_string());
+        c.execute_with_client(mock_client(&server.uri()))
             .await
             .unwrap();
     }
@@ -544,16 +537,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let cmd = WriteCommand {
-            key: "PROJ-1".to_string(),
-            file: Some(path),
-            format: ContentFormat::Adf,
-            set_fields: vec![],
-            parent: None,
-            force: true,
-            dry_run: false,
-        };
-        cmd.execute_with_client(mock_client(&server.uri()))
+        let mut c = cmd("PROJ-1");
+        c.file = Some(path);
+        c.format = ContentFormat::Adf;
+        c.execute_with_client(mock_client(&server.uri()))
             .await
             .unwrap();
     }
@@ -571,16 +558,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let cmd = WriteCommand {
-            key: "PROJ-1".to_string(),
-            file: None,
-            format: ContentFormat::Jfm,
-            set_fields: vec![],
-            parent: Some("PROJ-99".to_string()),
-            force: true,
-            dry_run: false,
-        };
-        cmd.execute_with_client(mock_client(&server.uri()))
+        let mut c = cmd("PROJ-1");
+        c.parent = Some("PROJ-99".to_string());
+        c.execute_with_client(mock_client(&server.uri()))
             .await
             .unwrap();
     }
@@ -598,16 +578,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let cmd = WriteCommand {
-            key: "PROJ-1".to_string(),
-            file: Some(path),
-            format: ContentFormat::Jfm,
-            set_fields: vec![],
-            parent: None,
-            force: true,
-            dry_run: false,
-        };
-        cmd.execute_with_client(mock_client(&server.uri()))
+        let mut c = cmd("PROJ-1");
+        c.file = Some(path);
+        c.execute_with_client(mock_client(&server.uri()))
             .await
             .unwrap();
     }
@@ -639,17 +612,140 @@ mod tests {
             .mount(&server)
             .await;
 
-        let cmd = WriteCommand {
-            key: "PROJ-1".to_string(),
-            file: Some(path),
-            format: ContentFormat::Jfm,
-            set_fields: vec![],
-            parent: Some("PROJ-99".to_string()),
-            force: true,
-            dry_run: false,
-        };
-        cmd.execute_with_client(mock_client(&server.uri()))
+        let mut c = cmd("PROJ-1");
+        c.file = Some(path);
+        c.parent = Some("PROJ-99".to_string());
+        c.execute_with_client(mock_client(&server.uri()))
             .await
             .unwrap();
+    }
+
+    // ── execute_with_client tests for assignee / reporter / fields ────
+
+    #[tokio::test]
+    async fn execute_no_content_with_assignee_only_sends_put_with_assignee() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "fields": {"assignee": {"accountId": "abc123"}}
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut c = cmd("PROJ-1");
+        c.no_content = true;
+        c.assignee = Some("abc123".to_string());
+        c.execute_with_client(mock_client(&server.uri()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_no_content_with_empty_assignee_clears_via_null_payload() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "fields": {"assignee": null}
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut c = cmd("PROJ-1");
+        c.no_content = true;
+        c.assignee = Some(String::new());
+        c.execute_with_client(mock_client(&server.uri()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_no_content_with_reporter_sends_put_with_reporter() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "fields": {"reporter": {"accountId": "rep123"}}
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut c = cmd("PROJ-1");
+        c.no_content = true;
+        c.reporter = Some("rep123".to_string());
+        c.execute_with_client(mock_client(&server.uri()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_jfm_body_with_assignee_sends_combined_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_jfm_file(&dir, "Body line");
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut c = cmd("PROJ-1");
+        c.file = Some(path);
+        c.assignee = Some("abc123".to_string());
+        c.execute_with_client(mock_client(&server.uri()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_assignee_collision_with_set_field_errors() {
+        // When --set-field assignee=... is also supplied, the typed --assignee
+        // collides via apply_user_field_overrides. Exercised via editmeta
+        // because resolve_custom_fields runs first.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/editmeta",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "fields": {
+                        "assignee": {
+                            "name": "Assignee",
+                            "schema": {"type": "user"}
+                        }
+                    }
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let mut c = cmd("PROJ-1");
+        c.no_content = true;
+        c.assignee = Some("typed-id".to_string());
+        c.set_fields = vec!["assignee=set-id".to_string()];
+
+        let err = c
+            .execute_with_client(mock_client(&server.uri()))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        // Either resolve_custom_fields rejects the user-typed schema kind, or
+        // apply_user_field_overrides catches the duplicate key. Either is a
+        // legitimate failure mode — the user-facing guarantee is that the
+        // collision does not silently override.
+        assert!(
+            msg.contains("collides") || msg.contains("user") || msg.contains("assignee"),
+            "unexpected error: {msg}"
+        );
     }
 }

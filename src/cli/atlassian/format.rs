@@ -8,8 +8,8 @@ use serde::Serialize;
 
 use crate::atlassian::client::{
     AgileBoardList, AgileSprintList, ConfluenceSearchResults, ConfluenceUserSearchResults,
-    JiraDevStatus, JiraDevStatusSummary, JiraProjectList, JiraSearchResult, JiraWatcherList,
-    JiraWorklogList,
+    JiraDevStatus, JiraDevStatusSummary, JiraProjectList, JiraSearchResult, JiraUserSearchResults,
+    JiraWatcherList, JiraWorklogList,
 };
 
 /// Output/input format for Atlassian content (read/write/create commands).
@@ -117,6 +117,12 @@ impl JsonlSerialize for ConfluenceSearchResults {
 }
 
 impl JsonlSerialize for ConfluenceUserSearchResults {
+    fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
+        write_items_jsonl(self.users.iter(), out)
+    }
+}
+
+impl JsonlSerialize for JiraUserSearchResults {
     fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
         write_items_jsonl(self.users.iter(), out)
     }
@@ -569,6 +575,34 @@ mod tests {
         let out = jsonl_string(&list);
         assert_eq!(out.lines().count(), 1);
         assert!(out.contains("\"accountId\":\"u1\"") || out.contains("\"account_id\":\"u1\""));
+    }
+
+    #[test]
+    fn jira_user_search_results_jsonl() {
+        use crate::atlassian::client::{JiraUserSearchResult, JiraUserSearchResults};
+        let list = JiraUserSearchResults {
+            users: vec![
+                JiraUserSearchResult {
+                    account_id: "u1".to_string(),
+                    display_name: Some("Alice".to_string()),
+                    email_address: Some("alice@example.com".to_string()),
+                    active: true,
+                    account_type: Some("atlassian".to_string()),
+                },
+                JiraUserSearchResult {
+                    account_id: "u2".to_string(),
+                    display_name: None,
+                    email_address: None,
+                    active: false,
+                    account_type: None,
+                },
+            ],
+            count: 2,
+        };
+        let out = jsonl_string(&list);
+        assert_eq!(out.lines().count(), 2);
+        assert!(out.contains("\"account_id\":\"u1\""));
+        assert!(out.contains("\"account_id\":\"u2\""));
     }
 
     #[test]

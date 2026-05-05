@@ -232,6 +232,40 @@ pub struct ConfluenceUserSearchResults {
     pub total: u32,
 }
 
+/// A JIRA user in search results.
+///
+/// JIRA's `/rest/api/3/user/search` endpoint may omit `emailAddress` and
+/// `displayName` for tenants where the operating account lacks the
+/// privacy-controlled fields permission, so both are optional. `accountId`
+/// is the canonical identifier and is always present for atlassian-account
+/// users.
+#[derive(Debug, Clone, Serialize)]
+pub struct JiraUserSearchResult {
+    /// Account ID (unique identifier).
+    pub account_id: String,
+    /// Display name. May be absent on GDPR-redacted tenants.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Email address. Often absent due to GDPR / privacy settings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email_address: Option<String>,
+    /// Whether the account is currently active.
+    pub active: bool,
+    /// Account type, e.g. `"atlassian"`, `"app"`, `"customer"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_type: Option<String>,
+}
+
+/// Result from searching JIRA users.
+#[derive(Debug, Clone, Serialize)]
+pub struct JiraUserSearchResults {
+    /// Matching users.
+    pub users: Vec<JiraUserSearchResult>,
+    /// Number of users returned (the JIRA API does not report a true total
+    /// across all pages; `count` is `users.len()`).
+    pub count: u32,
+}
+
 /// A JIRA issue comment.
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraComment {
@@ -797,6 +831,22 @@ struct ConfluenceContentSearchEntry {
 #[derive(Deserialize)]
 struct ConfluenceExpandable {
     space: Option<String>,
+}
+
+// ── JIRA user search API response struct ──────────────────────────
+
+#[derive(Deserialize)]
+struct JiraUserSearchEntry {
+    #[serde(rename = "accountId")]
+    account_id: String,
+    #[serde(rename = "displayName", default)]
+    display_name: Option<String>,
+    #[serde(rename = "emailAddress", default)]
+    email_address: Option<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(rename = "accountType", default)]
+    account_type: Option<String>,
 }
 
 // ── Confluence user search API response structs ───────────────────
@@ -2794,6 +2844,179 @@ mod tests {
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
         let result = client.search_confluence("type = page", 10).await.unwrap();
         assert_eq!(result.results[0].space_key, "");
+    }
+
+    // ── search_jira_users ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn search_jira_users_returns_decoded_results() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/user/search"))
+            .and(wiremock::matchers::query_param("query", "alice"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {
+                        "accountId": "abc123",
+                        "displayName": "Alice Smith",
+                        "emailAddress": "alice@example.com",
+                        "active": true,
+                        "accountType": "atlassian"
+                    },
+                    {
+                        "accountId": "def456",
+                        "displayName": "Alice Jones",
+                        "active": true,
+                        "accountType": "atlassian"
+                    }
+                ])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.search_jira_users("alice", 25).await.unwrap();
+        assert_eq!(result.count, 2);
+        assert_eq!(result.users[0].account_id, "abc123");
+        assert_eq!(result.users[0].display_name.as_deref(), Some("Alice Smith"));
+        assert_eq!(
+            result.users[0].email_address.as_deref(),
+            Some("alice@example.com")
+        );
+        assert!(result.users[0].active);
+        // The second user has email redacted by GDPR.
+        assert!(result.users[1].email_address.is_none());
+    }
+
+    #[tokio::test]
+    async fn search_jira_users_empty_returns_empty_list() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/user/search"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.search_jira_users("nobody", 25).await.unwrap();
+        assert_eq!(result.count, 0);
+        assert!(result.users.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_jira_users_truncates_at_limit() {
+        let server = wiremock::MockServer::start().await;
+        let users_page_1 = serde_json::json!([
+            {"accountId": "u1", "displayName": "U1", "active": true, "accountType": "atlassian"},
+            {"accountId": "u2", "displayName": "U2", "active": true, "accountType": "atlassian"}
+        ]);
+
+        // limit=2 fits the first page exactly, so only one request should fire.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/user/search"))
+            .and(wiremock::matchers::query_param("startAt", "0"))
+            .and(wiremock::matchers::query_param("maxResults", "2"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&users_page_1))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.search_jira_users("u", 2).await.unwrap();
+        assert_eq!(result.count, 2);
+    }
+
+    #[tokio::test]
+    async fn search_jira_users_unlimited_paginates_to_completion() {
+        let server = wiremock::MockServer::start().await;
+
+        // Build a full page of PAGE_SIZE (100) users, then a short page of 3.
+        let full_page: Vec<serde_json::Value> = (0..100)
+            .map(|i| {
+                serde_json::json!({
+                    "accountId": format!("u{i}"),
+                    "displayName": format!("User {i}"),
+                    "active": true,
+                    "accountType": "atlassian"
+                })
+            })
+            .collect();
+        let short_page: Vec<serde_json::Value> = (100..103)
+            .map(|i| {
+                serde_json::json!({
+                    "accountId": format!("u{i}"),
+                    "displayName": format!("User {i}"),
+                    "active": true,
+                    "accountType": "atlassian"
+                })
+            })
+            .collect();
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/user/search"))
+            .and(wiremock::matchers::query_param("startAt", "0"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::Value::Array(full_page)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/user/search"))
+            .and(wiremock::matchers::query_param("startAt", "100"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::Value::Array(short_page)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.search_jira_users("u", 0).await.unwrap();
+        assert_eq!(result.count, 103);
+    }
+
+    #[tokio::test]
+    async fn search_jira_users_propagates_403() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/user/search"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.search_jira_users("alice", 25).await.unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn search_jira_users_inactive_user_passes_through() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/user/search"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {
+                        "accountId": "old1",
+                        "displayName": "Former Employee",
+                        "active": false,
+                        "accountType": "atlassian"
+                    }
+                ])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client.search_jira_users("former", 25).await.unwrap();
+        assert_eq!(result.count, 1);
+        assert!(!result.users[0].active);
     }
 
     // ── search_confluence_users ─────────────────────────────────
@@ -5640,9 +5863,11 @@ impl AtlassianClient {
     ///
     /// `description_adf`, `summary`, and `parent` are each `Option`: `None`
     /// leaves the field untouched, `Some` overwrites it. `custom_fields` is
-    /// merged verbatim into the `fields` payload, keyed by stable ID
-    /// (e.g., `customfield_19300`). Returns an error when nothing would be
-    /// sent (avoids a no-op PUT that JIRA still validates).
+    /// merged verbatim into the `fields` payload, keyed by stable JIRA field
+    /// id — both standard fields (`assignee`, `reporter`, `priority`,
+    /// `labels`) and custom fields (`customfield_19300`). Returns an error
+    /// when nothing would be sent (avoids a no-op PUT that JIRA still
+    /// validates).
     pub async fn update_issue_with_custom_fields(
         &self,
         key: &str,
@@ -6271,6 +6496,83 @@ impl AtlassianClient {
         Ok(ConfluenceSearchResults {
             results: all_results,
             total,
+        })
+    }
+
+    /// Searches JIRA users by display name or email substring.
+    ///
+    /// `query` is matched against `displayName` and `emailAddress` server-
+    /// side; matching is substring and case-insensitive. `limit` of `0`
+    /// returns every match (paginating internally), otherwise the result
+    /// is truncated. Inactive users and app/customer account types are
+    /// included — callers that need only assignable atlassian-account
+    /// users should filter on `active` and `account_type`.
+    ///
+    /// Note: many tenants strip `emailAddress` from search results due to
+    /// GDPR / privacy settings, even when the user has an email on file.
+    pub async fn search_jira_users(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<JiraUserSearchResults> {
+        let effective_limit = if limit == 0 { u32::MAX } else { limit };
+        let mut all_results: Vec<JiraUserSearchResult> = Vec::new();
+        let mut start_at: u32 = 0;
+
+        loop {
+            let remaining = effective_limit.saturating_sub(all_results.len() as u32);
+            if remaining == 0 {
+                break;
+            }
+            let page_size = remaining.min(PAGE_SIZE);
+
+            let base = format!("{}/rest/api/3/user/search", self.instance_url);
+            let url = reqwest::Url::parse_with_params(
+                &base,
+                &[
+                    ("query", query),
+                    ("maxResults", &page_size.to_string()),
+                    ("startAt", &start_at.to_string()),
+                ],
+            )
+            .context("Failed to build JIRA user search URL")?;
+
+            let response = self.get_json(url.as_str()).await?;
+
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+            }
+
+            let page: Vec<JiraUserSearchEntry> = response
+                .json()
+                .await
+                .context("Failed to parse JIRA user search response")?;
+
+            let page_count = page.len() as u32;
+            for entry in page {
+                all_results.push(JiraUserSearchResult {
+                    account_id: entry.account_id,
+                    display_name: entry.display_name,
+                    email_address: entry.email_address,
+                    active: entry.active,
+                    account_type: entry.account_type,
+                });
+            }
+
+            // The API has no `isLast` / `next` envelope; when the page comes
+            // back shorter than the page size, we've reached the end.
+            if page_count < page_size {
+                break;
+            }
+            start_at += page_count;
+        }
+
+        let count = all_results.len() as u32;
+        Ok(JiraUserSearchResults {
+            users: all_results,
+            count,
         })
     }
 
