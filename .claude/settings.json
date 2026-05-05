@@ -2,10 +2,13 @@
   "permissions": {
     "allow": [
       "Bash(.claude/hooks/check-snapshots.sh)",
+      "Bash(target/debug/omni-dev:*)",
+      "Bash(target/release/omni-dev:*)",
       "Bash(target/debug/deps/omni_dev-*:*)",
       "Bash(target/debug/deps/omni_dev:*)",
       "Bash(target/release/deps/omni_dev-*:*)",
-      "Bash(target/release/deps/omni_dev:*)"
+      "Bash(target/release/deps/omni_dev:*)",
+      "Bash(git diff *)"
     ]
   },
   "hooks": {
