@@ -1,4 +1,13 @@
 {
+  "permissions": {
+    "allow": [
+      "Bash(.claude/hooks/check-snapshots.sh)",
+      "Bash(target/debug/deps/omni_dev-*:*)",
+      "Bash(target/debug/deps/omni_dev:*)",
+      "Bash(target/release/deps/omni_dev-*:*)",
+      "Bash(target/release/deps/omni_dev:*)"
+    ]
+  },
   "hooks": {
     "PostToolUse": [
       {
@@ -12,11 +21,18 @@
           }
         ]
       }
-    ]
-  },
-  "permissions": {
-    "allow": [
-      "Bash(target/debug/deps/omni_dev-a18167d0c04a86e3 --list)"
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/check-snapshots.sh",
+            "timeout": 30,
+            "statusMessage": "snapshot drift check"
+          }
+        ]
+      }
     ]
   }
 }
