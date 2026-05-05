@@ -3,7 +3,6 @@
     "PostToolUse": [
       {
         "matcher": "Edit|Write|MultiEdit",
-        "if": "Edit(*.rs)|Write(*.rs)|MultiEdit(*.rs)",
         "hooks": [
           {
             "type": "command",
@@ -13,6 +12,11 @@
           }
         ]
       }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(target/debug/deps/omni_dev-a18167d0c04a86e3 --list)"
     ]
   }
 }
