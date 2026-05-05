@@ -608,7 +608,9 @@ impl OmniDevServer {
 
     /// Tool: create a new Confluence page.
     #[tool(
-        description = "Create a new Confluence page. Returns the new page's ID. \
+        description = "Create a new Confluence page from JFM markdown (default) or raw ADF JSON. \
+                       JFM is GitHub-style markdown, NOT Confluence wiki markup — see resource \
+                       `omni-dev://specs/jfm` for syntax. Returns the new page's ID. \
                        Mirrors `omni-dev atlassian confluence create`."
     )]
     pub async fn confluence_create(
@@ -623,9 +625,12 @@ impl OmniDevServer {
     }
 
     /// Tool: update a Confluence page's body (and optionally title).
-    #[tool(description = "Overwrite a Confluence page's body. \
-                       Accepts JFM markdown (default) or ADF JSON. \
-                       Mirrors `omni-dev atlassian confluence write --force`.")]
+    #[tool(
+        description = "Overwrite a Confluence page's body from JFM markdown (default) or raw ADF JSON. \
+                       JFM is GitHub-style markdown, NOT Confluence wiki markup — see resource \
+                       `omni-dev://specs/jfm` for syntax. \
+                       Mirrors `omni-dev atlassian confluence write --force`."
+    )]
     pub async fn confluence_write(
         &self,
         Parameters(params): Parameters<ConfluenceWriteParams>,
