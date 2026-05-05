@@ -18,6 +18,7 @@ pub mod output_file;
 pub mod resources;
 pub mod runtime;
 pub mod server;
+pub mod specs;
 pub mod truncate;
 pub mod validate;
 

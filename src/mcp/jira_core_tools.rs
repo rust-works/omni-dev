@@ -64,7 +64,10 @@ pub struct JiraCreateParams {
     pub project: String,
     /// Issue summary / title.
     pub summary: String,
-    /// Optional description in JFM markdown.
+    /// Optional description in JFM markdown — see resource
+    /// `omni-dev://specs/jfm` for syntax. JFM is GitHub-style markdown,
+    /// NOT JIRA wiki markup (use `##` not `h2.`, triple-backtick fences not
+    /// `{code}`, backtick inline code not `{{...}}`).
     #[serde(default)]
     pub description: Option<String>,
     /// Issue type (defaults to `Task`).
@@ -78,6 +81,11 @@ pub struct JiraWriteParams {
     /// JIRA issue key (e.g., `PROJ-123`).
     pub key: String,
     /// New description body. Interpreted per `format`.
+    ///
+    /// For `format = "jfm"` (the default), this is GitHub-style markdown,
+    /// NOT JIRA wiki markup. Use `##` not `h2.`, triple-backtick fences not
+    /// `{code}`, backtick inline code not `{{...}}`. Full reference:
+    /// MCP resource `omni-dev://specs/jfm`.
     pub content: String,
     /// Content format — `jfm` (default) parses Markdown/JFM; `adf` accepts
     /// a raw ADF JSON document.
@@ -109,7 +117,8 @@ pub struct JiraCommentParams {
     pub key: String,
     /// `list` to fetch comments; `add` to post a new one.
     pub action: String,
-    /// Comment body (JFM markdown). Required for `action = "add"`.
+    /// Comment body (JFM markdown — see resource `omni-dev://specs/jfm`).
+    /// Required for `action = "add"`.
     #[serde(default)]
     pub body: Option<String>,
     /// Maximum number of comments to return. `0` means unlimited.
@@ -505,7 +514,8 @@ impl OmniDevServer {
 
     /// Tool: update a JIRA issue's description.
     #[tool(
-        description = "Update the description of a JIRA issue from JFM markdown (default) or raw ADF JSON."
+        description = "Update the description of a JIRA issue from JFM markdown (default) or raw ADF JSON. \
+                       JFM is GitHub-style markdown — see resource `omni-dev://specs/jfm` for syntax."
     )]
     pub async fn jira_write(
         &self,

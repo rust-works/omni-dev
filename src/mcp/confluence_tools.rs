@@ -71,6 +71,11 @@ pub struct ConfluenceCreateParams {
     /// Page title.
     pub title: String,
     /// Page body. Parsed according to `format`.
+    ///
+    /// For `format = "jfm"` (the default), this is GitHub-style markdown,
+    /// NOT Confluence wiki markup. Use `##` not `h2.`, triple-backtick fences
+    /// not `{code}`, backtick inline code not `{{...}}`. Full reference:
+    /// MCP resource `omni-dev://specs/jfm`.
     pub content: String,
     /// Optional parent page ID for nesting under an existing page.
     #[serde(default)]
@@ -86,6 +91,11 @@ pub struct ConfluenceWriteParams {
     /// Confluence page ID.
     pub id: String,
     /// New page body.
+    ///
+    /// For `format = "jfm"` (the default), this is GitHub-style markdown,
+    /// NOT Confluence wiki markup. Use `##` not `h2.`, triple-backtick fences
+    /// not `{code}`, backtick inline code not `{{...}}`. Full reference:
+    /// MCP resource `omni-dev://specs/jfm`.
     pub content: String,
     /// Format of `content`: `"jfm"` (default markdown) or `"adf"` (raw ADF JSON).
     #[serde(default)]
