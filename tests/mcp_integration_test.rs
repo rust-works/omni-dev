@@ -162,6 +162,7 @@ async fn list_tools_includes_all_jira_tools() -> Result<()> {
         "jira_comment",
         "jira_link",
         "jira_dev",
+        "jira_user_search",
     ] {
         assert!(names.contains(&expected), "missing {expected}: {names:?}");
     }
@@ -679,6 +680,7 @@ async fn jira_tool_handlers_surface_tool_error_without_credentials() -> Result<(
         "jira_comment",
         "jira_link",
         "jira_dev",
+        "jira_user_search",
     ] {
         // Supply the minimum required params so schema validation passes.
         let args = match name {
@@ -687,6 +689,7 @@ async fn jira_tool_handlers_surface_tool_error_without_credentials() -> Result<(
             "jira_write" => serde_json::json!({"key": "X-1", "content": "b"}),
             "jira_comment" => serde_json::json!({"key": "X-1", "action": "list"}),
             "jira_link" => serde_json::json!({"action": "types"}),
+            "jira_user_search" => serde_json::json!({"query": "alice"}),
             _ => serde_json::json!({"key": "X-1"}),
         };
         let outcome = client

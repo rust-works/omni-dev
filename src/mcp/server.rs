@@ -282,6 +282,7 @@ mod tests {
             "jira_comment",
             "jira_link",
             "jira_dev",
+            "jira_user_search",
         ] {
             assert!(server.tool_router.has_route(name), "missing tool: {name}");
         }

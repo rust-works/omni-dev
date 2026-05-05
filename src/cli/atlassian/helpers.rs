@@ -177,10 +177,10 @@ pub async fn run_write(
 /// fields) to a JIRA issue via
 /// [`AtlassianClient::update_issue_with_custom_fields`].
 ///
-/// `description_adf` is `None` for parent-only or fields-only updates that
-/// must not overwrite the existing description. Goes direct to the client
-/// rather than through [`AtlassianApi`] since the trait does not model
-/// custom fields or parent.
+/// `description_adf` is `None` for parent-only, assignee-only, reporter-only,
+/// or fields-only updates that must not overwrite the existing description.
+/// Goes direct to the client rather than through [`AtlassianApi`] since the
+/// trait does not model custom fields or parent.
 pub async fn run_write_jira_with_resolved_fields(
     key: &str,
     description_adf: Option<&AdfDocument>,
@@ -197,6 +197,9 @@ pub async fn run_write_jira_with_resolved_fields(
         }
         if let Some(parent_key) = parent {
             println!("  Parent: {parent_key}");
+        }
+        if description_adf.is_some() {
+            println!("  Description: (will overwrite)");
         }
         if !custom_fields.is_empty() {
             println!("  Custom fields: {}", custom_fields.len());
@@ -223,24 +226,49 @@ pub async fn run_write_jira_with_resolved_fields(
 }
 
 /// Prints a dry-run summary including the resolved custom fields payload.
+/// `adf` of `None` indicates the description will not be updated.
+/// `assignee` / `reporter` of `None` indicate the field will not be updated;
+/// `Some("")` indicates it will be cleared.
+#[allow(clippy::too_many_arguments)]
 pub fn print_jira_dry_run_with_custom_fields(
     key: &str,
     adf: Option<&AdfDocument>,
     title: &str,
     parent: Option<&str>,
+    assignee: Option<&str>,
+    reporter: Option<&str>,
     scalars: &std::collections::BTreeMap<String, serde_yaml::Value>,
     sections: &[crate::atlassian::document::CustomFieldSection],
 ) -> Result<()> {
-    if let Some(adf) = adf {
-        print_dry_run(key, adf, title)?;
-    } else {
-        println!("Dry run: would update {key} (no description change)");
-        if !title.is_empty() {
-            println!("  Title: {title}");
-        }
+    println!("Dry run for {key}:");
+    if !title.is_empty() {
+        println!("  Title: {title}");
     }
     if let Some(parent_key) = parent {
-        println!("\nParent: {parent_key}");
+        println!("  Parent: {parent_key}");
+    }
+    if let Some(value) = assignee {
+        let rendered = if value.is_empty() {
+            "<unassign>".to_string()
+        } else {
+            value.to_string()
+        };
+        println!("  Assignee: {rendered}");
+    }
+    if let Some(value) = reporter {
+        let rendered = if value.is_empty() {
+            "<unassign>".to_string()
+        } else {
+            value.to_string()
+        };
+        println!("  Reporter: {rendered}");
+    }
+    match adf {
+        Some(adf) => println!(
+            "\nADF output:\n{}",
+            serde_json::to_string_pretty(adf).context("Failed to serialize ADF")?
+        ),
+        None => println!("  Description: (unchanged)"),
     }
     if !scalars.is_empty() {
         println!("\nCustom field scalars (frontmatter):");
@@ -1079,6 +1107,8 @@ mod tests {
             Some(&adf),
             "T",
             None,
+            None,
+            None,
             &scalars,
             &sections,
         );
@@ -1089,8 +1119,16 @@ mod tests {
     fn print_jira_dry_run_without_extras_still_prints_description() {
         let adf = AdfDocument::new();
         let scalars = std::collections::BTreeMap::new();
-        let result =
-            print_jira_dry_run_with_custom_fields("ACCS-1", Some(&adf), "", None, &scalars, &[]);
+        let result = print_jira_dry_run_with_custom_fields(
+            "ACCS-1",
+            Some(&adf),
+            "",
+            None,
+            None,
+            None,
+            &scalars,
+            &[],
+        );
         assert!(result.is_ok());
     }
 
@@ -1102,6 +1140,72 @@ mod tests {
             None,
             "",
             Some("ACCS-1"),
+            None,
+            None,
+            &scalars,
+            &[],
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn print_jira_dry_run_with_assignee_and_no_content() {
+        let scalars = std::collections::BTreeMap::new();
+        let result = print_jira_dry_run_with_custom_fields(
+            "ACCS-1",
+            None,
+            "",
+            None,
+            Some("abc123"),
+            None,
+            &scalars,
+            &[],
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn print_jira_dry_run_with_empty_assignee_renders_unassign() {
+        let scalars = std::collections::BTreeMap::new();
+        let result = print_jira_dry_run_with_custom_fields(
+            "ACCS-1",
+            None,
+            "",
+            None,
+            Some(""),
+            None,
+            &scalars,
+            &[],
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn print_jira_dry_run_with_reporter_renders_value() {
+        let scalars = std::collections::BTreeMap::new();
+        let result = print_jira_dry_run_with_custom_fields(
+            "ACCS-1",
+            None,
+            "",
+            None,
+            None,
+            Some("rep123"),
+            &scalars,
+            &[],
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn print_jira_dry_run_with_empty_reporter_renders_unassign() {
+        let scalars = std::collections::BTreeMap::new();
+        let result = print_jira_dry_run_with_custom_fields(
+            "ACCS-1",
+            None,
+            "",
+            None,
+            None,
+            Some(""),
             &scalars,
             &[],
         );
