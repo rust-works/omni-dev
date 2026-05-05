@@ -1857,9 +1857,87 @@ mod tests {
             serde_json::json!({"type": "doc", "version": 1, "content": [{"type": "paragraph"}]}),
         );
         let result = client
-            .update_issue_with_custom_fields("ACCS-1", &adf, Some("New title"), &custom)
+            .update_issue_with_custom_fields("ACCS-1", Some(&adf), Some("New title"), None, &custom)
             .await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn update_issue_with_parent_sends_parent_key() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/ACCS-2"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "fields": {
+                    "description": {"version": 1, "type": "doc", "content": []},
+                    "parent": {"key": "ACCS-1"}
+                }
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let adf = AdfDocument::new();
+        let result = client
+            .update_issue_with_custom_fields(
+                "ACCS-2",
+                Some(&adf),
+                None,
+                Some("ACCS-1"),
+                &std::collections::BTreeMap::new(),
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn update_issue_with_parent_only_omits_description() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/ACCS-2"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "fields": {
+                    "parent": {"key": "ACCS-1"}
+                }
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client
+            .update_issue_with_custom_fields(
+                "ACCS-2",
+                None,
+                None,
+                Some("ACCS-1"),
+                &std::collections::BTreeMap::new(),
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn update_issue_with_no_fields_errors() {
+        let client =
+            AtlassianClient::new("https://example.atlassian.net", "user@test.com", "token")
+                .unwrap();
+        let err = client
+            .update_issue_with_custom_fields(
+                "ACCS-1",
+                None,
+                None,
+                None,
+                &std::collections::BTreeMap::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no fields to update"));
     }
 
     #[tokio::test]
@@ -3714,29 +3792,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn link_to_epic_success() {
+    async fn set_issue_parent_success() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("PUT"))
             .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-2"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "fields": {"parent": {"key": "EPIC-1"}}
+            })))
             .respond_with(wiremock::ResponseTemplate::new(204))
             .expect(1)
             .mount(&server)
             .await;
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
-        assert!(client.link_to_epic("EPIC-1", "PROJ-2").await.is_ok());
+        assert!(client.set_issue_parent("PROJ-2", "EPIC-1").await.is_ok());
     }
 
     #[tokio::test]
-    async fn link_to_epic_api_error() {
+    async fn set_issue_parent_api_error() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("PUT"))
             .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-2"))
-            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("Not an epic"))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string("Not allowed"))
             .expect(1)
             .mount(&server)
             .await;
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
-        let err = client.link_to_epic("NOPE-1", "PROJ-2").await.unwrap_err();
+        let err = client
+            .set_issue_parent("PROJ-2", "NOPE-1")
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("400"));
     }
 
@@ -5544,37 +5628,56 @@ impl AtlassianClient {
     ) -> Result<()> {
         self.update_issue_with_custom_fields(
             key,
-            description_adf,
+            Some(description_adf),
             summary,
+            None,
             &std::collections::BTreeMap::new(),
         )
         .await
     }
 
-    /// Updates a JIRA issue's description, optionally its summary, and any
-    /// custom fields keyed by stable ID (e.g., `customfield_19300`).
+    /// Updates a JIRA issue with any subset of supported fields.
+    ///
+    /// `description_adf`, `summary`, and `parent` are each `Option`: `None`
+    /// leaves the field untouched, `Some` overwrites it. `custom_fields` is
+    /// merged verbatim into the `fields` payload, keyed by stable ID
+    /// (e.g., `customfield_19300`). Returns an error when nothing would be
+    /// sent (avoids a no-op PUT that JIRA still validates).
     pub async fn update_issue_with_custom_fields(
         &self,
         key: &str,
-        description_adf: &AdfDocument,
+        description_adf: Option<&AdfDocument>,
         summary: Option<&str>,
+        parent: Option<&str>,
         custom_fields: &std::collections::BTreeMap<String, serde_json::Value>,
     ) -> Result<()> {
         let url = format!("{}/rest/api/3/issue/{}", self.instance_url, key);
 
         let mut fields = serde_json::Map::new();
-        fields.insert(
-            "description".to_string(),
-            serde_json::to_value(description_adf).context("Failed to serialize ADF document")?,
-        );
+        if let Some(adf) = description_adf {
+            fields.insert(
+                "description".to_string(),
+                serde_json::to_value(adf).context("Failed to serialize ADF document")?,
+            );
+        }
         if let Some(summary_text) = summary {
             fields.insert(
                 "summary".to_string(),
                 serde_json::Value::String(summary_text.to_string()),
             );
         }
+        if let Some(parent_key) = parent {
+            fields.insert(
+                "parent".to_string(),
+                serde_json::json!({ "key": parent_key }),
+            );
+        }
         for (id, value) in custom_fields {
             fields.insert(id.clone(), value.clone());
+        }
+
+        if fields.is_empty() {
+            anyhow::bail!("update_issue_with_custom_fields: no fields to update");
         }
 
         let body = serde_json::json!({ "fields": fields });
@@ -6744,10 +6847,12 @@ impl AtlassianClient {
         Ok(())
     }
 
-    /// Links an issue to an epic by setting the parent field.
-    pub async fn link_to_epic(&self, epic_key: &str, issue_key: &str) -> Result<()> {
+    /// Sets the parent of a JIRA issue (e.g., links a Story to its Epic, a
+    /// Sub-task to its Story, or any issue to a parent of a hierarchy-allowed
+    /// type).
+    pub async fn set_issue_parent(&self, issue_key: &str, parent_key: &str) -> Result<()> {
         let url = format!("{}/rest/api/3/issue/{}", self.instance_url, issue_key);
-        let body = serde_json::json!({"fields": {"parent": {"key": epic_key}}});
+        let body = serde_json::json!({"fields": {"parent": {"key": parent_key}}});
         let response = self.put_json(&url, &body).await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();

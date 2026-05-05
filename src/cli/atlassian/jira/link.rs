@@ -185,7 +185,7 @@ async fn run_remove_link(client: &AtlassianClient, link_id: &str) -> Result<()> 
 
 /// Links an issue to an epic.
 async fn run_epic_link(client: &AtlassianClient, epic: &str, issue: &str) -> Result<()> {
-    client.link_to_epic(epic, issue).await?;
+    client.set_issue_parent(issue, epic).await?;
     println!("Linked {issue} to epic {epic}.");
     Ok(())
 }
