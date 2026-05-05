@@ -1516,7 +1516,7 @@ async fn git_view_commits_default_range_is_head() -> Result<()> {
 static CWD_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[tokio::test]
-async fn list_resources_returns_all_five_uri_templates() -> Result<()> {
+async fn list_resources_returns_all_uri_templates() -> Result<()> {
     let (client, server_handle) = spawn_server().await;
     let listing = client.list_resources(Option::default()).await?;
     let uris: Vec<&str> = listing.resources.iter().map(|r| r.uri.as_str()).collect();
@@ -1528,6 +1528,7 @@ async fn list_resources_returns_all_five_uri_templates() -> Result<()> {
     assert!(uris.contains(&"jira://issue/{key}.adf"));
     assert!(uris.contains(&"confluence://page/{id}"));
     assert!(uris.contains(&"confluence://page/{id}.adf"));
+    assert!(uris.contains(&"omni-dev://specs/{name}"));
     client.cancel().await?;
     let _ = server_handle.await;
     Ok(())
@@ -1537,7 +1538,7 @@ async fn list_resources_returns_all_five_uri_templates() -> Result<()> {
 async fn list_resource_templates_returns_descriptions() -> Result<()> {
     let (client, server_handle) = spawn_server().await;
     let listing = client.list_resource_templates(Option::default()).await?;
-    assert_eq!(listing.resource_templates.len(), 5);
+    assert_eq!(listing.resource_templates.len(), 6);
     for tpl in &listing.resource_templates {
         assert!(
             tpl.description.is_some(),
@@ -1633,6 +1634,53 @@ async fn read_resource_malformed_git_uri_is_resource_not_found() -> Result<()> {
     let rendered = err.to_string();
     assert!(
         rendered.contains("git://repo/bogus-path"),
+        "missing uri in err: {rendered}"
+    );
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_resource_omni_dev_specs_jfm_returns_markdown() -> Result<()> {
+    let (client, server_handle) = spawn_server().await;
+    let result = client
+        .read_resource(ReadResourceRequestParams::new("omni-dev://specs/jfm"))
+        .await?;
+    assert_eq!(result.contents.len(), 1);
+    match &result.contents[0] {
+        ResourceContents::TextResourceContents {
+            text,
+            mime_type,
+            uri,
+            ..
+        } => {
+            assert_eq!(mime_type.as_deref(), Some("text/markdown"));
+            assert_eq!(uri, "omni-dev://specs/jfm");
+            assert!(
+                text.contains("# JFM (JIRA-Flavored Markdown) Specification"),
+                "spec body missing heading"
+            );
+        }
+        other @ ResourceContents::BlobResourceContents { .. } => {
+            panic!("expected text resource, got {other:?}")
+        }
+    }
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_resource_omni_dev_specs_unknown_name_errors() -> Result<()> {
+    let (client, server_handle) = spawn_server().await;
+    let err = client
+        .read_resource(ReadResourceRequestParams::new("omni-dev://specs/bogus"))
+        .await
+        .expect_err("unknown spec should error");
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("omni-dev://specs/bogus"),
         "missing uri in err: {rendered}"
     );
     client.cancel().await?;
