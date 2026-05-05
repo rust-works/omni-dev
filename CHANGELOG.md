@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`jira_transition` MCP Tool Discoverability** ([#671](https://github.com/rust-works/omni-dev/issues/671)): The `jira_transition` tool description now leads with the most common usage (executing by name, e.g. `transition: "In Progress"`), shows the numeric-id form (`transition: "31"`), and explicitly tells the assistant to call with `list = true` first when the available transitions are not yet known. The `transition` field doc carries the same examples into the JSON schema. When the underlying `POST /rest/api/3/issue/{key}/transitions` call fails, the error chain now includes a hint that the workflow may require additional fields (assignee, resolution, screen-driven field) or that the transition may not be valid from the current status, suggesting `list = true` to confirm — the original `AtlassianError::ApiRequestFailed { status, body }` stays in the chain so the HTTP status and response body remain visible. No API surface change.
+
 ## [0.24.0] - 2026-05-03
 
 ### Added
