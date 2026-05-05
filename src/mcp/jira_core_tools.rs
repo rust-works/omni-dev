@@ -90,8 +90,8 @@ pub struct JiraWriteParams {
 pub struct JiraTransitionParams {
     /// JIRA issue key (e.g., `PROJ-123`).
     pub key: String,
-    /// Transition name (case-insensitive) or id. Required unless `list` is
-    /// true.
+    /// Transition name (case-insensitive) or numeric id, e.g. `"In Progress"`
+    /// or `"31"`. Required unless `list` is true.
     #[serde(default)]
     pub transition: Option<String>,
     /// Optional comment to add after the transition.
@@ -286,7 +286,18 @@ async fn run_jira_transition(
 
     let target = transition.unwrap_or_default();
     let matched = resolve_transition(target, &transitions)?.clone();
-    client.do_transition(key, &matched.id).await?;
+    client
+        .do_transition(key, &matched.id)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to transition {key} to \"{name}\" (id: {id}); the workflow may require \
+                 additional fields (assignee, resolution, screen-driven field) or this transition \
+                 may not be valid from the current status — try `list = true` to confirm availability",
+                name = matched.name,
+                id = matched.id,
+            )
+        })?;
 
     if let Some(body) = comment.filter(|s| !s.is_empty()) {
         let adf = markdown_to_adf(body)?;
@@ -510,8 +521,13 @@ impl OmniDevServer {
 
     /// Tool: list or execute a transition on a JIRA issue.
     #[tool(
-        description = "List available transitions (when `list = true` or no `transition` is given), \
-                       or execute a transition by name or id. Optionally posts `comment` afterwards."
+        description = "Transition a JIRA issue to a new workflow status. Most common usage: \
+                       pass the transition name in `transition`, e.g. `transition: \"In Progress\"`. \
+                       The numeric id also works, e.g. `transition: \"31\"`. Names are matched \
+                       case-insensitively. If unsure which transitions are valid from the issue's \
+                       current status, call this tool first with `list = true` (or omit `transition`) \
+                       to get the available `{id, name}` pairs as YAML, then call again with one of \
+                       those names. Optionally posts `comment` (JFM markdown) after the transition succeeds."
     )]
     pub async fn jira_transition(
         &self,
@@ -1187,7 +1203,19 @@ mod tests {
         let err = run_jira_transition(&client, "PROJ-1", Some("Done"), None, false)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("400"));
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("400"),
+            "expected 400 in error chain, got: {chain}"
+        );
+        assert!(
+            chain.contains("list = true"),
+            "expected hint about `list = true` in error chain, got: {chain}",
+        );
+        assert!(
+            chain.contains("workflow may require"),
+            "expected hint about workflow requirements in error chain, got: {chain}",
+        );
     }
 
     #[tokio::test]
