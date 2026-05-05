@@ -17,6 +17,7 @@ use serde::Deserialize;
 use crate::atlassian::adf::AdfDocument;
 use crate::atlassian::client::{AtlassianClient, JiraTransition};
 use crate::atlassian::convert::markdown_to_adf;
+use crate::atlassian::custom_fields::apply_user_field_overrides;
 use crate::atlassian::document::{issue_to_jfm_document, JfmDocument};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -80,8 +81,9 @@ pub struct JiraCreateParams {
 pub struct JiraWriteParams {
     /// JIRA issue key (e.g., `PROJ-123`).
     pub key: String,
-    /// New description body. Interpreted per `format`. Optional — at least
-    /// one of `content` or `parent` must be supplied.
+    /// New description body. Interpreted per `format`. Omit to leave the
+    /// existing description unchanged (useful when only updating
+    /// `parent`/`assignee`/`reporter`/`fields`).
     ///
     /// For `format = "jfm"` (the default), this is GitHub-style markdown,
     /// NOT JIRA wiki markup. Use `##` not `h2.`, triple-backtick fences not
@@ -99,6 +101,24 @@ pub struct JiraWriteParams {
     /// "Composition"-style links rather than the system parent field.
     #[serde(default)]
     pub parent: Option<String>,
+    /// Assignee `accountId`. The empty string `""` clears the assignee;
+    /// `"-1"` triggers JIRA automatic assignment. Use `jira_user_search` to
+    /// resolve a name or email to an `accountId`.
+    #[serde(default)]
+    pub assignee: Option<String>,
+    /// Reporter `accountId`. Same conventions as `assignee` (`""` clears,
+    /// `"-1"` is JIRA automatic).
+    #[serde(default)]
+    pub reporter: Option<String>,
+    /// Additional `fields` keys merged into the issue update payload as-is.
+    /// Keys must already be canonical JIRA field ids (e.g. `priority`,
+    /// `labels`, `customfield_10010`). Values must already be in the API's
+    /// JSON shape (e.g. `{"name": "High"}` for priority,
+    /// `["a", "b"]` for labels). Setting `assignee` or `reporter` here
+    /// collides with the typed parameters and is rejected — pass the typed
+    /// parameter instead.
+    #[serde(default)]
+    pub fields: Option<std::collections::BTreeMap<String, serde_json::Value>>,
 }
 
 /// Parameters for the `jira_transition` tool.
@@ -161,6 +181,16 @@ pub struct JiraLinkParams {
 pub struct JiraDevParams {
     /// JIRA issue key (e.g., `PROJ-123`).
     pub key: String,
+}
+
+/// Parameters for the `jira_user_search` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct JiraUserSearchParams {
+    /// Search text — matched against display name and email substrings.
+    pub query: String,
+    /// Maximum number of results (`0` = unlimited). Defaults to 25.
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 // ── format helpers ─────────────────────────────────────────────────────────
@@ -265,44 +295,59 @@ async fn run_jira_create(
     yaml_result(&created)
 }
 
-/// Updates a JIRA issue body and/or parent.
-///
-/// At least one of `content` or `parent` must be supplied. When both are
-/// supplied, both are sent in a single PUT.
+/// Updates a JIRA issue. Any combination of description (`content`),
+/// `parent`, `assignee`, `reporter`, and arbitrary `fields` may be supplied;
+/// absent inputs leave the corresponding JIRA values untouched. At least one
+/// of these must be supplied.
+#[allow(clippy::too_many_arguments)]
 async fn run_jira_write(
     client: &AtlassianClient,
     key: &str,
     content: Option<&str>,
     format: ReadFormat,
     parent: Option<&str>,
+    assignee: Option<&str>,
+    reporter: Option<&str>,
+    extra_fields: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
 ) -> Result<String> {
-    if content.is_none() && parent.is_none() {
-        anyhow::bail!("jira_write: at least one of `content` or `parent` is required");
-    }
-
     let adf: Option<AdfDocument> = match content {
-        Some(text) => Some(match format {
+        Some(c) => Some(match format {
             ReadFormat::Jfm => {
-                if text.starts_with("---\n") {
-                    let doc = JfmDocument::parse(text)?;
+                if c.starts_with("---\n") {
+                    let doc = JfmDocument::parse(c)?;
                     markdown_to_adf(&doc.body)?
                 } else {
-                    markdown_to_adf(text)?
+                    markdown_to_adf(c)?
                 }
             }
-            ReadFormat::Adf => serde_json::from_str(text).context("Failed to parse ADF JSON")?,
+            ReadFormat::Adf => serde_json::from_str(c).context("Failed to parse ADF JSON")?,
         }),
         None => None,
     };
 
+    let mut merged: std::collections::BTreeMap<String, serde_json::Value> =
+        std::collections::BTreeMap::new();
+    if let Some(extras) = extra_fields {
+        for (k, v) in extras {
+            merged.insert(k.clone(), v.clone());
+        }
+    }
+
+    apply_user_field_overrides(
+        &mut merged,
+        assignee,
+        reporter,
+        "the same key inside `fields`",
+    )?;
+
+    if adf.is_none() && merged.is_empty() && parent.is_none() {
+        anyhow::bail!(
+            "no changes supplied for {key}: provide `content`, `parent`, `assignee`, `reporter`, or `fields`"
+        );
+    }
+
     client
-        .update_issue_with_custom_fields(
-            key,
-            adf.as_ref(),
-            None,
-            parent,
-            &std::collections::BTreeMap::new(),
-        )
+        .update_issue_with_custom_fields(key, adf.as_ref(), None, parent, &merged)
         .await?;
     Ok(format!("Updated {key}.\n"))
 }
@@ -484,6 +529,13 @@ async fn run_jira_dev(client: &AtlassianClient, key: &str) -> Result<String> {
     yaml_result(&status)
 }
 
+/// Searches JIRA users by name/email substring and returns the result as
+/// YAML.
+async fn run_jira_user_search(client: &AtlassianClient, query: &str, limit: u32) -> Result<String> {
+    let result = client.search_jira_users(query, limit).await?;
+    yaml_result(&result)
+}
+
 // ── tool router ────────────────────────────────────────────────────────────
 
 #[allow(missing_docs)] // #[tool_router] generates a pub `jira_core_tool_router` fn.
@@ -554,15 +606,23 @@ impl OmniDevServer {
         ok_text(text)
     }
 
-    /// Tool: update a JIRA issue's description and/or parent.
+    /// Tool: update a JIRA issue's description, parent, assignee, reporter,
+    /// or arbitrary fields.
     #[tool(
-        description = "Update a JIRA issue. `content` sets the description (JFM markdown by default, \
-                       or raw ADF JSON when `format = \"adf\"`). JFM is GitHub-style markdown — see \
-                       resource `omni-dev://specs/jfm` for syntax. `parent` sets the system parent \
-                       field for hierarchy (Epic → Story, Story → Sub-task) — distinct from the \
-                       `jira_link` actions, which create relationship links (Blocks, Composition, \
-                       etc.) rather than the parent field. At least one of `content`/`parent` is \
-                       required."
+        description = "Update a JIRA issue. `content` updates the description (JFM markdown by \
+                       default, or raw ADF JSON when `format = \"adf\"`); omit it to leave the \
+                       description unchanged. JFM is GitHub-style markdown — see resource \
+                       `omni-dev://specs/jfm` for syntax. `parent` sets the system parent field \
+                       for hierarchy (Epic → Story, Story → Sub-task) — distinct from \
+                       `jira_link` actions, which create relationship links (Blocks, \
+                       Composition, etc.) rather than the parent field. `assignee`/`reporter` \
+                       accept an `accountId` (use the empty string `\"\"` to clear, `\"-1\"` for \
+                       JIRA automatic assignment); call `jira_user_search` first if you only \
+                       have a name or email. `fields` is an escape hatch — a map of canonical \
+                       JIRA field id to its API JSON value (e.g. `{\"priority\": {\"name\": \
+                       \"High\"}}`) — for fields without a typed parameter. At least one of \
+                       `content`, `parent`, `assignee`, `reporter`, or `fields` must be \
+                       supplied."
     )]
     pub async fn jira_write(
         &self,
@@ -576,6 +636,9 @@ impl OmniDevServer {
             params.content.as_deref(),
             format,
             params.parent.as_deref(),
+            params.assignee.as_deref(),
+            params.reporter.as_deref(),
+            params.fields.as_ref(),
         )
         .await
         .map_err(tool_error)?;
@@ -670,6 +733,28 @@ impl OmniDevServer {
     ) -> Result<CallToolResult, McpError> {
         let (client, _instance_url) = create_client().map_err(tool_error)?;
         let text = run_jira_dev(&client, &params.key)
+            .await
+            .map_err(tool_error)?;
+        ok_text(text)
+    }
+
+    /// Tool: search JIRA users by name or email substring.
+    #[tool(
+        description = "Search JIRA users by display-name or email substring. Returns matches as \
+                       YAML — each entry includes `account_id`, `display_name`, `email_address` \
+                       (often redacted by GDPR), `active`, and `account_type`. Use the returned \
+                       `account_id` as input to `jira_write`'s `assignee` or `reporter` \
+                       parameter. `limit` defaults to 25; pass `0` for unlimited. Atlassian \
+                       matches substrings on display name and email — try a shorter or alternate \
+                       spelling if the first attempt returns nothing."
+    )]
+    pub async fn jira_user_search(
+        &self,
+        Parameters(params): Parameters<JiraUserSearchParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = params.limit.unwrap_or(25);
+        let (client, _instance_url) = create_client().map_err(tool_error)?;
+        let text = run_jira_user_search(&client, &params.query, limit)
             .await
             .map_err(tool_error)?;
         ok_text(text)
@@ -1063,9 +1148,18 @@ mod tests {
             .await;
 
         let client = mock_client(&server.uri());
-        run_jira_write(&client, "PROJ-1", Some("New body\n"), ReadFormat::Jfm, None)
-            .await
-            .unwrap();
+        run_jira_write(
+            &client,
+            "PROJ-1",
+            Some("New body\n"),
+            ReadFormat::Jfm,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -1079,9 +1173,18 @@ mod tests {
 
         let client = mock_client(&server.uri());
         let content = "---\ntype: jira\ninstance: https://org.atlassian.net\nkey: PROJ-1\nsummary: T\n---\n\nBody\n";
-        run_jira_write(&client, "PROJ-1", Some(content), ReadFormat::Jfm, None)
-            .await
-            .unwrap();
+        run_jira_write(
+            &client,
+            "PROJ-1",
+            Some(content),
+            ReadFormat::Jfm,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -1100,6 +1203,9 @@ mod tests {
             Some(r#"{"version":1,"type":"doc","content":[]}"#),
             ReadFormat::Adf,
             None,
+            None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1108,9 +1214,18 @@ mod tests {
     #[tokio::test]
     async fn run_jira_write_adf_rejects_invalid_json() {
         let client = mock_client("http://127.0.0.1:1");
-        let err = run_jira_write(&client, "PROJ-1", Some("not json"), ReadFormat::Adf, None)
-            .await
-            .unwrap_err();
+        let err = run_jira_write(
+            &client,
+            "PROJ-1",
+            Some("not json"),
+            ReadFormat::Adf,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("Failed to parse ADF JSON"));
     }
 
@@ -1123,10 +1238,227 @@ mod tests {
             .mount(&server)
             .await;
         let client = mock_client(&server.uri());
-        let err = run_jira_write(&client, "PROJ-1", Some("Body"), ReadFormat::Jfm, None)
-            .await
-            .unwrap_err();
+        let err = run_jira_write(
+            &client,
+            "PROJ-1",
+            Some("Body"),
+            ReadFormat::Jfm,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("400"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_write_with_assignee_emits_account_id_payload() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .and(body_json(serde_json::json!({
+                "fields": {
+                    "description": {"version": 1, "type": "doc", "content": []},
+                    "assignee": {"accountId": "abc123"}
+                }
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        run_jira_write(
+            &client,
+            "PROJ-1",
+            Some(""),
+            ReadFormat::Jfm,
+            None,
+            Some("abc123"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_jira_write_with_assignee_dash_one_means_auto() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .and(body_json(serde_json::json!({
+                "fields": {"assignee": {"accountId": "-1"}}
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        run_jira_write(
+            &client,
+            "PROJ-1",
+            None,
+            ReadFormat::Jfm,
+            None,
+            Some("-1"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_jira_write_with_empty_assignee_clears() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .and(body_json(serde_json::json!({
+                "fields": {"assignee": null}
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        run_jira_write(
+            &client,
+            "PROJ-1",
+            None,
+            ReadFormat::Jfm,
+            None,
+            Some(""),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_jira_write_with_reporter_emits_account_id_payload() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .and(body_json(serde_json::json!({
+                "fields": {"reporter": {"accountId": "rep123"}}
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        run_jira_write(
+            &client,
+            "PROJ-1",
+            None,
+            ReadFormat::Jfm,
+            None,
+            None,
+            Some("rep123"),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_jira_write_extra_fields_merge_into_payload() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .and(body_json(serde_json::json!({
+                "fields": {
+                    "priority": {"name": "High"},
+                    "labels": ["a", "b"]
+                }
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert("priority".to_string(), serde_json::json!({"name": "High"}));
+        extra.insert("labels".to_string(), serde_json::json!(["a", "b"]));
+        run_jira_write(
+            &client,
+            "PROJ-1",
+            None,
+            ReadFormat::Jfm,
+            None,
+            None,
+            None,
+            Some(&extra),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_jira_write_assignee_collision_with_fields_errors() {
+        let client = mock_client("http://127.0.0.1:1");
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert(
+            "assignee".to_string(),
+            serde_json::json!({"accountId": "x"}),
+        );
+        let err = run_jira_write(
+            &client,
+            "PROJ-1",
+            None,
+            ReadFormat::Jfm,
+            None,
+            Some("y"),
+            None,
+            Some(&extra),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("collides"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_write_reporter_collision_with_fields_errors() {
+        let client = mock_client("http://127.0.0.1:1");
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert(
+            "reporter".to_string(),
+            serde_json::json!({"accountId": "x"}),
+        );
+        let err = run_jira_write(
+            &client,
+            "PROJ-1",
+            None,
+            ReadFormat::Jfm,
+            None,
+            None,
+            Some("y"),
+            Some(&extra),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("collides"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_write_no_changes_errors() {
+        let client = mock_client("http://127.0.0.1:1");
+        let err = run_jira_write(
+            &client,
+            "PROJ-1",
+            None,
+            ReadFormat::Jfm,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("no changes supplied"));
     }
 
     #[tokio::test]
@@ -1142,9 +1474,18 @@ mod tests {
             .mount(&server)
             .await;
         let client = mock_client(&server.uri());
-        run_jira_write(&client, "PROJ-1", None, ReadFormat::Jfm, Some("EPIC-1"))
-            .await
-            .unwrap();
+        run_jira_write(
+            &client,
+            "PROJ-1",
+            None,
+            ReadFormat::Jfm,
+            Some("EPIC-1"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -1176,20 +1517,12 @@ mod tests {
             Some("Body"),
             ReadFormat::Jfm,
             Some("EPIC-1"),
+            None,
+            None,
+            None,
         )
         .await
         .unwrap();
-    }
-
-    #[tokio::test]
-    async fn run_jira_write_rejects_no_content_no_parent() {
-        let client = mock_client("http://127.0.0.1:1");
-        let err = run_jira_write(&client, "PROJ-1", None, ReadFormat::Jfm, None)
-            .await
-            .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("at least one of `content` or `parent`"));
     }
 
     // ── run_jira_transition ────────────────────────────────────────────────
@@ -1949,6 +2282,64 @@ mod tests {
         assert!(mcp.message.contains("top"));
         assert!(mcp.message.contains("Caused by: middle"));
         assert!(mcp.message.contains("Caused by: root"));
+    }
+
+    // ── run_jira_user_search ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_jira_user_search_yaml_includes_account_id_and_active() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/user/search"))
+            .and(query_param("query", "alice"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "accountId": "abc123",
+                    "displayName": "Alice Smith",
+                    "emailAddress": "alice@example.com",
+                    "active": true,
+                    "accountType": "atlassian"
+                }
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let yaml = run_jira_user_search(&client, "alice", 25).await.unwrap();
+        assert!(yaml.contains("account_id: abc123"));
+        assert!(yaml.contains("display_name: Alice Smith"));
+        assert!(yaml.contains("active: true"));
+        assert!(yaml.contains("count: 1"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_user_search_no_matches_yields_empty_users() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/user/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = run_jira_user_search(&client, "nobody", 25).await.unwrap();
+        assert!(yaml.contains("count: 0"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_user_search_propagates_403() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/user/search"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = run_jira_user_search(&client, "alice", 25)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("403"));
     }
 
     // ── ok_text / yaml_result helpers ──────────────────────────────────────
