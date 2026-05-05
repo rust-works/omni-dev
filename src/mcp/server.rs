@@ -62,7 +62,10 @@ impl ServerHandler for OmniDevServer {
         .with_instructions(
             "omni-dev MCP server. Provides tools for git analysis, commit \
              improvement, and Atlassian integration. Resources expose \
-             URI-addressable content via `git://`, `jira://`, and `confluence://`.",
+             URI-addressable content via `git://`, `jira://`, `confluence://`, \
+             and `omni-dev://` (e.g. `omni-dev://specs/jfm` for the \
+             JIRA-Flavoured Markdown reference — fetch before writing JIRA or \
+             Confluence content).",
         )
     }
 

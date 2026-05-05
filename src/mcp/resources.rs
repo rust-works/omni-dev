@@ -20,6 +20,7 @@ use crate::atlassian::confluence_api::ConfluenceApi;
 use crate::atlassian::document::content_item_to_document;
 use crate::atlassian::jira_api::JiraApi;
 use crate::cli::atlassian::helpers::create_client;
+use crate::mcp::specs;
 
 /// Format suffix for a resource URI.
 ///
@@ -56,13 +57,20 @@ pub enum ResourceUri {
         /// Output format: JFM or ADF JSON.
         format: ResourceFormat,
     },
+    /// `omni-dev://specs/{name}` — embedded reference spec (e.g. `jfm`).
+    Specs {
+        /// Spec identifier — see [`specs::lookup`] for the registered set.
+        name: String,
+    },
 }
 
 /// Errors returned by the URI parser.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum UriParseError {
     /// The URI scheme is not one omni-dev knows about.
-    #[error("unknown URI scheme in `{0}`; expected git://, jira://, or confluence://")]
+    #[error(
+        "unknown URI scheme in `{0}`; expected git://, jira://, confluence://, or omni-dev://"
+    )]
     UnknownScheme(String),
     /// The URI authority/path shape does not match any known template.
     #[error("malformed URI `{0}`: {1}")]
@@ -108,6 +116,15 @@ impl ResourceUri {
             });
         }
 
+        if let Some(rest) = uri.strip_prefix("omni-dev://specs/") {
+            if rest.is_empty() {
+                return Err(UriParseError::EmptyIdentifier(uri.to_string()));
+            }
+            return Ok(Self::Specs {
+                name: rest.to_string(),
+            });
+        }
+
         // Reject `<scheme>://` URIs with a different path shape explicitly
         // rather than falling through to UnknownScheme, so the client sees
         // what's actually wrong. Placeholders are escaped for the lint.
@@ -127,6 +144,12 @@ impl ResourceUri {
             return Err(UriParseError::Malformed(
                 uri.to_string(),
                 "expected `confluence://page/<id>` or `confluence://page/<id>.adf`",
+            ));
+        }
+        if uri.starts_with("omni-dev://") {
+            return Err(UriParseError::Malformed(
+                uri.to_string(),
+                "expected `omni-dev://specs/<name>`",
             ));
         }
 
@@ -172,12 +195,21 @@ pub fn resource_templates() -> Vec<ResourceTemplate> {
             .with_description("Confluence page body as raw ADF JSON.")
             .with_mime_type("application/json");
 
+    let omni_dev_spec = RawResourceTemplate::new("omni-dev://specs/{name}", "omni_dev_spec")
+        .with_description(
+            "Reference specs maintained by omni-dev. Currently supports `jfm` \
+             (JIRA-Flavoured Markdown) — fetch before writing JIRA or Confluence \
+             content via `jira_write`, `jira_create`, or `confluence_write`.",
+        )
+        .with_mime_type("text/markdown");
+
     vec![
         annotate_template(git_commits),
         annotate_template(jira_issue_jfm),
         annotate_template(jira_issue_adf),
         annotate_template(confluence_page_jfm),
         annotate_template(confluence_page_adf),
+        annotate_template(omni_dev_spec),
     ]
 }
 
@@ -263,6 +295,19 @@ pub async fn read_resource(uri: &ResourceUri, raw_uri: &str) -> Result<ReadResou
             let (text, mime) = render_content_item(&item, &instance_url, *format)?;
             Ok(ReadResourceResult::new(vec![ResourceContents::text(
                 text, raw_uri,
+            )
+            .with_mime_type(mime)]))
+        }
+        ResourceUri::Specs { name } => {
+            let (text, mime) = specs::lookup(name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown spec `{name}`; known: {known}",
+                    known = specs::KNOWN_SPECS,
+                )
+            })?;
+            Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                text.to_string(),
+                raw_uri,
             )
             .with_mime_type(mime)]))
         }
@@ -411,6 +456,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_omni_dev_spec_jfm() {
+        let uri = ResourceUri::parse("omni-dev://specs/jfm").unwrap();
+        assert_eq!(
+            uri,
+            ResourceUri::Specs {
+                name: "jfm".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_omni_dev_spec_empty_name_is_empty_identifier() {
+        let err = ResourceUri::parse("omni-dev://specs/").unwrap_err();
+        assert!(matches!(err, UriParseError::EmptyIdentifier(_)));
+    }
+
+    #[test]
+    fn parse_omni_dev_wrong_path_is_malformed() {
+        let err = ResourceUri::parse("omni-dev://other/x").unwrap_err();
+        assert!(matches!(err, UriParseError::Malformed(_, _)));
+    }
+
+    #[test]
     fn parse_unknown_scheme_is_rejected() {
         let err = ResourceUri::parse("http://example.com/resource").unwrap_err();
         assert!(matches!(err, UriParseError::UnknownScheme(_)));
@@ -481,7 +549,7 @@ mod tests {
     // ── Templates / listings ───────────────────────────────────────
 
     #[test]
-    fn templates_include_all_five_uris() {
+    fn templates_include_all_known_uris() {
         let templates = resource_templates();
         let template_uris: Vec<&str> = templates
             .iter()
@@ -492,6 +560,7 @@ mod tests {
         assert!(template_uris.contains(&"jira://issue/{key}.adf"));
         assert!(template_uris.contains(&"confluence://page/{id}"));
         assert!(template_uris.contains(&"confluence://page/{id}.adf"));
+        assert!(template_uris.contains(&"omni-dev://specs/{name}"));
     }
 
     #[test]
@@ -525,14 +594,14 @@ mod tests {
     fn list_resources_result_has_no_pagination() {
         let result = list_resources_result();
         assert!(result.next_cursor.is_none());
-        assert_eq!(result.resources.len(), 5);
+        assert_eq!(result.resources.len(), 6);
     }
 
     #[test]
     fn list_resource_templates_result_has_no_pagination() {
         let result = list_resource_templates_result();
         assert!(result.next_cursor.is_none());
-        assert_eq!(result.resource_templates.len(), 5);
+        assert_eq!(result.resource_templates.len(), 6);
     }
 
     // ── not_found ──────────────────────────────────────────────────
@@ -1059,5 +1128,47 @@ mod tests {
         let b = a;
         assert_eq!(a, b);
         assert_ne!(a, ResourceFormat::Jfm);
+    }
+
+    // ── Specs branch of read_resource ──────────────────────────────────
+    //
+    // No credentials, no network — the spec is embedded at compile time.
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_resource_specs_jfm_returns_markdown() {
+        let uri = ResourceUri::parse("omni-dev://specs/jfm").unwrap();
+        let result = read_resource(&uri, "omni-dev://specs/jfm").await.unwrap();
+        assert_eq!(result.contents.len(), 1);
+        match &result.contents[0] {
+            ResourceContents::TextResourceContents {
+                text,
+                mime_type,
+                uri: reply_uri,
+                ..
+            } => {
+                assert_eq!(mime_type.as_deref(), Some("text/markdown"));
+                assert_eq!(reply_uri, "omni-dev://specs/jfm");
+                assert!(
+                    text.contains("# JFM (JIRA-Flavored Markdown) Specification"),
+                    "spec body missing heading"
+                );
+            }
+            other @ ResourceContents::BlobResourceContents { .. } => {
+                panic!("expected text resource contents, got {other:?}")
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_resource_specs_unknown_name_errors() {
+        let uri = ResourceUri::parse("omni-dev://specs/nope").unwrap();
+        let err = read_resource(&uri, "omni-dev://specs/nope")
+            .await
+            .expect_err("unknown spec must error");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("unknown spec") && chain.contains("nope"),
+            "unexpected chain: {chain}"
+        );
     }
 }
