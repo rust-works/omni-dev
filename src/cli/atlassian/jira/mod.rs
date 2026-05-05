@@ -15,6 +15,7 @@ pub(crate) mod read;
 pub(crate) mod search;
 pub(crate) mod sprint;
 pub(crate) mod transition;
+pub(crate) mod user;
 pub(crate) mod watcher;
 pub(crate) mod worklog;
 pub(crate) mod write;
@@ -69,6 +70,8 @@ pub enum JiraSubcommands {
     Watcher(watcher::WatcherCommand),
     /// Manages worklogs (time tracking) on a JIRA issue.
     Worklog(worklog::WorklogCommand),
+    /// JIRA user operations (search by name or email).
+    User(user::UserCommand),
 }
 
 impl JiraCommand {
@@ -93,6 +96,7 @@ impl JiraCommand {
             JiraSubcommands::Attachment(cmd) => cmd.execute().await,
             JiraSubcommands::Watcher(cmd) => cmd.execute().await,
             JiraSubcommands::Worklog(cmd) => cmd.execute().await,
+            JiraSubcommands::User(cmd) => cmd.execute().await,
         }
     }
 }
@@ -123,6 +127,9 @@ mod tests {
                 key: "PROJ-1".to_string(),
                 file: None,
                 format: ContentFormat::Jfm,
+                no_content: false,
+                assignee: None,
+                reporter: None,
                 set_fields: vec![],
                 parent: None,
                 force: false,
@@ -344,5 +351,19 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Worklog(_)));
+    }
+
+    #[test]
+    fn jira_subcommands_user_variant() {
+        let cmd = JiraCommand {
+            command: JiraSubcommands::User(user::UserCommand {
+                command: user::UserSubcommands::Search(user::UserSearchCommand {
+                    query: "alice".to_string(),
+                    limit: 25,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        assert!(matches!(cmd.command, JiraSubcommands::User(_)));
     }
 }
