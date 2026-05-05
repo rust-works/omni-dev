@@ -80,17 +80,25 @@ pub struct JiraCreateParams {
 pub struct JiraWriteParams {
     /// JIRA issue key (e.g., `PROJ-123`).
     pub key: String,
-    /// New description body. Interpreted per `format`.
+    /// New description body. Interpreted per `format`. Optional — at least
+    /// one of `content` or `parent` must be supplied.
     ///
     /// For `format = "jfm"` (the default), this is GitHub-style markdown,
     /// NOT JIRA wiki markup. Use `##` not `h2.`, triple-backtick fences not
     /// `{code}`, backtick inline code not `{{...}}`. Full reference:
     /// MCP resource `omni-dev://specs/jfm`.
-    pub content: String,
+    #[serde(default)]
+    pub content: Option<String>,
     /// Content format — `jfm` (default) parses Markdown/JFM; `adf` accepts
     /// a raw ADF JSON document.
     #[serde(default)]
     pub format: Option<String>,
+    /// Parent issue key (e.g., `PROJ-100`). When set, establishes a
+    /// parent-child hierarchy on the issue (Epic → Story, Story → Sub-task,
+    /// etc.). Distinct from `jira_link` actions, which create
+    /// "Composition"-style links rather than the system parent field.
+    #[serde(default)]
+    pub parent: Option<String>,
 }
 
 /// Parameters for the `jira_transition` tool.
@@ -129,13 +137,15 @@ pub struct JiraCommentParams {
 /// Parameters for the `jira_link` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct JiraLinkParams {
-    /// Action: `list`, `types`, `create`, or `remove`.
+    /// Action: `list`, `types`, `create`, `remove`, or `parent`.
     pub action: String,
     /// Issue key. Required for `list`; for `create`, this is the source
-    /// (inward) issue. Ignored for `types`.
+    /// (inward) issue; for `parent`, this is the child issue. Ignored for
+    /// `types`.
     #[serde(default)]
     pub key: Option<String>,
-    /// Target issue key (for `create`).
+    /// Target issue key. Required for `create` (the outward issue) and for
+    /// `parent` (the parent issue).
     #[serde(default)]
     pub target: Option<String>,
     /// Link type name (for `create`), e.g., `Blocks`.
@@ -255,26 +265,45 @@ async fn run_jira_create(
     yaml_result(&created)
 }
 
-/// Updates a JIRA issue body.
+/// Updates a JIRA issue body and/or parent.
+///
+/// At least one of `content` or `parent` must be supplied. When both are
+/// supplied, both are sent in a single PUT.
 async fn run_jira_write(
     client: &AtlassianClient,
     key: &str,
-    content: &str,
+    content: Option<&str>,
     format: ReadFormat,
+    parent: Option<&str>,
 ) -> Result<String> {
-    let adf: AdfDocument = match format {
-        ReadFormat::Jfm => {
-            if content.starts_with("---\n") {
-                let doc = JfmDocument::parse(content)?;
-                markdown_to_adf(&doc.body)?
-            } else {
-                markdown_to_adf(content)?
+    if content.is_none() && parent.is_none() {
+        anyhow::bail!("jira_write: at least one of `content` or `parent` is required");
+    }
+
+    let adf: Option<AdfDocument> = match content {
+        Some(text) => Some(match format {
+            ReadFormat::Jfm => {
+                if text.starts_with("---\n") {
+                    let doc = JfmDocument::parse(text)?;
+                    markdown_to_adf(&doc.body)?
+                } else {
+                    markdown_to_adf(text)?
+                }
             }
-        }
-        ReadFormat::Adf => serde_json::from_str(content).context("Failed to parse ADF JSON")?,
+            ReadFormat::Adf => serde_json::from_str(text).context("Failed to parse ADF JSON")?,
+        }),
+        None => None,
     };
 
-    client.update_issue(key, &adf, None).await?;
+    client
+        .update_issue_with_custom_fields(
+            key,
+            adf.as_ref(),
+            None,
+            parent,
+            &std::collections::BTreeMap::new(),
+        )
+        .await?;
     Ok(format!("Updated {key}.\n"))
 }
 
@@ -430,8 +459,21 @@ async fn run_jira_link(
             client.remove_issue_link(id).await?;
             Ok(format!("Removed link {id}.\n"))
         }
+        "parent" => {
+            // Sets the JIRA system `parent` field — distinct from `create`,
+            // which produces a relationship link (Blocks, Composition, etc.).
+            // `key` is the child; `target` is the parent.
+            let child = key.ok_or_else(|| {
+                anyhow::anyhow!("`key` (child issue) is required for link parent")
+            })?;
+            let parent_key = target.ok_or_else(|| {
+                anyhow::anyhow!("`target` (parent issue) is required for link parent")
+            })?;
+            client.set_issue_parent(child, parent_key).await?;
+            Ok(format!("Set parent of {child} to {parent_key}.\n"))
+        }
         other => anyhow::bail!(
-            "unknown link action {other:?} (expected \"list\", \"types\", \"create\", or \"remove\")"
+            "unknown link action {other:?} (expected \"list\", \"types\", \"create\", \"remove\", or \"parent\")"
         ),
     }
 }
@@ -512,10 +554,15 @@ impl OmniDevServer {
         ok_text(text)
     }
 
-    /// Tool: update a JIRA issue's description.
+    /// Tool: update a JIRA issue's description and/or parent.
     #[tool(
-        description = "Update the description of a JIRA issue from JFM markdown (default) or raw ADF JSON. \
-                       JFM is GitHub-style markdown — see resource `omni-dev://specs/jfm` for syntax."
+        description = "Update a JIRA issue. `content` sets the description (JFM markdown by default, \
+                       or raw ADF JSON when `format = \"adf\"`). JFM is GitHub-style markdown — see \
+                       resource `omni-dev://specs/jfm` for syntax. `parent` sets the system parent \
+                       field for hierarchy (Epic → Story, Story → Sub-task) — distinct from the \
+                       `jira_link` actions, which create relationship links (Blocks, Composition, \
+                       etc.) rather than the parent field. At least one of `content`/`parent` is \
+                       required."
     )]
     pub async fn jira_write(
         &self,
@@ -523,9 +570,15 @@ impl OmniDevServer {
     ) -> Result<CallToolResult, McpError> {
         let format = ReadFormat::parse(params.format.as_deref()).map_err(tool_error)?;
         let (client, _instance_url) = create_client().map_err(tool_error)?;
-        let text = run_jira_write(&client, &params.key, &params.content, format)
-            .await
-            .map_err(tool_error)?;
+        let text = run_jira_write(
+            &client,
+            &params.key,
+            params.content.as_deref(),
+            format,
+            params.parent.as_deref(),
+        )
+        .await
+        .map_err(tool_error)?;
         ok_text(text)
     }
 
@@ -582,9 +635,11 @@ impl OmniDevServer {
 
     /// Tool: manage issue links.
     #[tool(
-        description = "Manage JIRA issue links. Actions: \"list\" (needs `key`), \"types\", \
-                       \"create\" (needs `key`, `target`, `link_type`), \
-                       \"remove\" (needs `link_id`)."
+        description = "Manage JIRA issue links and hierarchy. Actions: \"list\" (needs `key`), \
+                       \"types\", \"create\" (needs `key`, `target`, `link_type`), \
+                       \"remove\" (needs `link_id`), \"parent\" (needs `key` = child, \
+                       `target` = parent — sets the system parent field for Epic → Story / \
+                       Story → Sub-task hierarchy, distinct from relationship links)."
     )]
     pub async fn jira_link(
         &self,
@@ -1008,7 +1063,7 @@ mod tests {
             .await;
 
         let client = mock_client(&server.uri());
-        run_jira_write(&client, "PROJ-1", "New body\n", ReadFormat::Jfm)
+        run_jira_write(&client, "PROJ-1", Some("New body\n"), ReadFormat::Jfm, None)
             .await
             .unwrap();
     }
@@ -1024,7 +1079,7 @@ mod tests {
 
         let client = mock_client(&server.uri());
         let content = "---\ntype: jira\ninstance: https://org.atlassian.net\nkey: PROJ-1\nsummary: T\n---\n\nBody\n";
-        run_jira_write(&client, "PROJ-1", content, ReadFormat::Jfm)
+        run_jira_write(&client, "PROJ-1", Some(content), ReadFormat::Jfm, None)
             .await
             .unwrap();
     }
@@ -1042,8 +1097,9 @@ mod tests {
         run_jira_write(
             &client,
             "PROJ-1",
-            r#"{"version":1,"type":"doc","content":[]}"#,
+            Some(r#"{"version":1,"type":"doc","content":[]}"#),
             ReadFormat::Adf,
+            None,
         )
         .await
         .unwrap();
@@ -1052,7 +1108,7 @@ mod tests {
     #[tokio::test]
     async fn run_jira_write_adf_rejects_invalid_json() {
         let client = mock_client("http://127.0.0.1:1");
-        let err = run_jira_write(&client, "PROJ-1", "not json", ReadFormat::Adf)
+        let err = run_jira_write(&client, "PROJ-1", Some("not json"), ReadFormat::Adf, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Failed to parse ADF JSON"));
@@ -1067,10 +1123,73 @@ mod tests {
             .mount(&server)
             .await;
         let client = mock_client(&server.uri());
-        let err = run_jira_write(&client, "PROJ-1", "Body", ReadFormat::Jfm)
+        let err = run_jira_write(&client, "PROJ-1", Some("Body"), ReadFormat::Jfm, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("400"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_write_parent_only_sends_parent_key() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "fields": {"parent": {"key": "EPIC-1"}}
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        run_jira_write(&client, "PROJ-1", None, ReadFormat::Jfm, Some("EPIC-1"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_jira_write_content_and_parent_sends_both() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "fields": {
+                    "description": {
+                        "version": 1,
+                        "type": "doc",
+                        "content": [{
+                            "type": "paragraph",
+                            "content": [{"type": "text", "text": "Body"}]
+                        }]
+                    },
+                    "parent": {"key": "EPIC-1"}
+                }
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        run_jira_write(
+            &client,
+            "PROJ-1",
+            Some("Body"),
+            ReadFormat::Jfm,
+            Some("EPIC-1"),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_jira_write_rejects_no_content_no_parent() {
+        let client = mock_client("http://127.0.0.1:1");
+        let err = run_jira_write(&client, "PROJ-1", None, ReadFormat::Jfm, None)
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("at least one of `content` or `parent`"));
     }
 
     // ── run_jira_transition ────────────────────────────────────────────────
@@ -1566,6 +1685,76 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("unknown link action"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_link_parent_sets_parent_field() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-2"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "fields": {"parent": {"key": "EPIC-1"}}
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let out = run_jira_link(
+            &client,
+            "parent",
+            Some("PROJ-2"),
+            Some("EPIC-1"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("Set parent of PROJ-2 to EPIC-1"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_link_parent_requires_key() {
+        let client = mock_client("http://127.0.0.1:1");
+        let err = run_jira_link(&client, "parent", None, Some("EPIC-1"), None, None)
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("`key` (child issue) is required for link parent"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_link_parent_requires_target() {
+        let client = mock_client("http://127.0.0.1:1");
+        let err = run_jira_link(&client, "parent", Some("PROJ-2"), None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("`target` (parent issue) is required for link parent"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_link_parent_propagates_api_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-2"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("Not allowed"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = run_jira_link(
+            &client,
+            "parent",
+            Some("PROJ-2"),
+            Some("EPIC-1"),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("400"));
     }
 
     #[tokio::test]

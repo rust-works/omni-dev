@@ -124,6 +124,7 @@ mod tests {
                 file: None,
                 format: ContentFormat::Jfm,
                 set_fields: vec![],
+                parent: None,
                 force: false,
                 dry_run: false,
             }),
