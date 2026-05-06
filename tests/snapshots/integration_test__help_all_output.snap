@@ -27,6 +27,8 @@ Options:
           Weakens the `claude-cli` sandbox by allowing the nested `claude -p` session to load MCP servers from `~/.claude/settings.json`
       --claude-cli-max-budget-usd <AMOUNT>
           Per-invocation spending cap in USD for the `claude-cli` backend
+      --models-yaml <PATH>
+          Path to a single user-side `models.yaml` that short-circuits the standard `./.omni-dev/models.yaml` and `~/.omni-dev/models.yaml` lookup. The file is still merged over the embedded catalog. Equivalent to setting `OMNI_DEV_MODELS_YAML`
   -h, --help
           Print help (see more with '--help')
   -V, --version
@@ -1544,7 +1546,7 @@ AI model configuration and information
 Usage: models <COMMAND>
 
 Commands:
-  show  Shows the embedded models.yaml configuration
+  show  Shows the model catalog (merged user/project layers over the embedded `models.yaml`), annotating each entry with its source layer
   help  Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1553,14 +1555,15 @@ Options:
 
 ================================================================================
 
-omni-dev config models show - Shows the embedded models.yaml configuration
+omni-dev config models show - Shows the model catalog (merged user/project layers over the embedded `models.yaml`), annotating each entry with its source layer
 
-Shows the embedded models.yaml configuration
+Shows the model catalog (merged user/project layers over the embedded `models.yaml`), annotating each entry with its source layer
 
-Usage: show
+Usage: show [OPTIONS]
 
 Options:
-  -h, --help  Print help
+      --embedded-only  Show only the embedded `models.yaml` verbatim, ignoring any user/project overrides
+  -h, --help           Print help
 
 
 ================================================================================
