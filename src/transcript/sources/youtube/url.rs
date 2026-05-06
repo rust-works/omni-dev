@@ -1,7 +1,8 @@
-//! Extract a YouTube video ID from a public URL.
+//! Extract a YouTube video ID from a public URL or a bare ID.
 //!
 //! Recognised forms:
 //!
+//! - A bare 11-character ID like `dQw4w9WgXcQ`
 //! - `https://www.youtube.com/watch?v=<id>` (any query parameters)
 //! - `https://youtu.be/<id>` (any trailing query / fragment)
 //! - `https://www.youtube.com/shorts/<id>`
@@ -16,14 +17,18 @@ use crate::transcript::error::{Result, TranscriptError};
 /// Length of a YouTube video ID. Stable since 2008.
 const VIDEO_ID_LEN: usize = 11;
 
-/// Extract the 11-character YouTube video ID from a public URL.
+/// Extract the 11-character YouTube video ID from a public URL or a bare ID.
 ///
 /// Accepts the watch, share, shorts, and embed forms listed in the module
-/// docs. Returns
+/// docs, plus a bare 11-character ID that already matches the YouTube ID
+/// shape. Returns
 /// [`TranscriptError::InvalidLocator`](crate::transcript::TranscriptError::InvalidLocator)
-/// if `input` is not a recognised YouTube URL or the embedded ID does not
-/// match the expected shape.
+/// if `input` is neither.
 pub fn extract_video_id(input: &str) -> Result<String> {
+    if is_valid_video_id(input) {
+        return Ok(input.to_string());
+    }
+
     let parsed =
         Url::parse(input).map_err(|_| TranscriptError::InvalidLocator(input.to_string()))?;
 
@@ -234,6 +239,26 @@ mod tests {
     #[test]
     fn youtu_be_with_root_path_errors() {
         let err = extract_video_id("https://youtu.be").unwrap_err();
+        assert!(matches!(err, TranscriptError::InvalidLocator(_)));
+    }
+
+    #[test]
+    fn bare_video_id_accepted() {
+        let id = extract_video_id(ID).unwrap();
+        assert_eq!(id, ID);
+    }
+
+    #[test]
+    fn bare_id_with_dashes_and_underscores_accepted() {
+        let id = "abc-def_GHI";
+        let extracted = extract_video_id(id).unwrap();
+        assert_eq!(extracted, id);
+    }
+
+    #[test]
+    fn bare_id_wrong_length_falls_through_to_url_parse() {
+        // 10 chars looks neither like an ID nor a URL.
+        let err = extract_video_id("abcdefghij").unwrap_err();
         assert!(matches!(err, TranscriptError::InvalidLocator(_)));
     }
 }
