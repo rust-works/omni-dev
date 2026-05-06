@@ -246,15 +246,16 @@ impl ClaudeCliAiClient {
         self.build_command_with_schema(system_prompt, cwd, None)
     }
 
-    /// Variant of [`build_command`] that adds a `--json-schema <path>`
-    /// argument when `schema_path` is supplied. The path itself is the
-    /// caller's responsibility — typically a file written into the same
-    /// `cwd` so its lifetime tracks the temp directory.
+    /// Variant of [`build_command`] that adds a `--json-schema <json>`
+    /// argument when `schema_json` is supplied. `claude -p` requires the
+    /// schema verbatim on argv (file paths silently produce empty output);
+    /// the caller is responsible for serialising the schema to a JSON
+    /// string before calling.
     pub(crate) fn build_command_with_schema(
         &self,
         system_prompt: &str,
         cwd: &Path,
-        schema_path: Option<&Path>,
+        schema_json: Option<&str>,
     ) -> Command {
         let mut cmd = Command::new(&self.binary_path);
         cmd.arg("-p")
@@ -286,10 +287,13 @@ impl ClaudeCliAiClient {
             cmd.arg("--max-budget-usd").arg(format!("{budget}"));
         }
 
-        if let Some(path) = schema_path {
-            // Schemas can grow large; pass via file path rather than inline
-            // argv to avoid argv-length limits and shell-escape pitfalls.
-            cmd.arg("--json-schema").arg(path);
+        if let Some(json) = schema_json {
+            // `claude -p --json-schema` only accepts an inline JSON string;
+            // a file path makes the subprocess exit silently with empty
+            // output. `Command::arg` skips shell parsing, so escape
+            // pitfalls do not apply, and project schemas sit well under
+            // ARG_MAX.
+            cmd.arg("--json-schema").arg(json);
         }
 
         cmd.current_dir(cwd);
@@ -326,11 +330,10 @@ impl ClaudeCliAiClient {
 
     /// Variant of [`run`] that materialises any options on the request.
     ///
-    /// When `options.response_schema` is `Some`, the schema is written to
-    /// a `response_schema.json` file inside the subprocess's temp cwd and
-    /// passed via `--json-schema <path>`. The file lives only as long as
-    /// the [`tempfile::TempDir`], so it is cleaned up when this function
-    /// returns regardless of success or error.
+    /// When `options.response_schema` is `Some`, the schema is serialised
+    /// to a JSON string and passed inline via `--json-schema <json>`.
+    /// `claude -p` requires the schema on argv; passing a file path makes
+    /// the subprocess exit silently with empty output.
     async fn run_with_options(
         &self,
         system_prompt: &str,
@@ -342,22 +345,13 @@ impl ClaudeCliAiClient {
         let temp_dir = tempfile::TempDir::new()
             .context("Failed to create temp directory for claude subprocess")?;
 
-        let schema_path = if let Some(schema) = &options.response_schema {
-            let path = temp_dir.path().join("response_schema.json");
-            let body = serde_json::to_vec(schema)
-                .context("Failed to serialize response schema for claude -p --json-schema")?;
-            tokio::fs::write(&path, body)
-                .await
-                .context("Failed to write response schema file for claude -p")?;
-            Some(path)
-        } else {
-            None
-        };
+        // `Value::to_string` is infallible; no `?` needed.
+        let schema_json = options.response_schema.as_ref().map(ToString::to_string);
 
         let mut cmd = self.build_command_with_schema(
             &combined_system,
             temp_dir.path(),
-            schema_path.as_deref(),
+            schema_json.as_deref(),
         );
 
         if self.allow_tools {
@@ -1449,26 +1443,52 @@ mod tests {
     }
 
     #[test]
-    fn build_command_includes_json_schema_when_path_given() {
+    fn build_command_includes_inline_json_schema_when_given() {
         let cli = client_with_defaults("sonnet");
         let tmp = TempDir::new().unwrap();
-        let schema_path = tmp.path().join("schema.json");
-        let cmd = cli.build_command_with_schema("sys", tmp.path(), Some(&schema_path));
+        let schema_json = r#"{"type":"object","required":["title"]}"#;
+        let cmd = cli.build_command_with_schema("sys", tmp.path(), Some(schema_json));
         let args = args_of(&cmd);
         let idx = args
             .iter()
             .position(|a| a == "--json-schema")
             .expect("argv should contain --json-schema");
-        assert_eq!(args[idx + 1], schema_path.to_string_lossy());
+        assert_eq!(args[idx + 1], schema_json);
+    }
+
+    #[test]
+    fn build_command_inline_schema_is_passed_verbatim_not_as_path() {
+        // Regression for #681: a previous implementation wrote the schema
+        // to disk and passed the path. `claude -p --json-schema` silently
+        // returns empty stdout for a file path, so the value on argv must
+        // be JSON, not a path.
+        let cli = client_with_defaults("sonnet");
+        let tmp = TempDir::new().unwrap();
+        let schema_json = r#"{"type":"object"}"#;
+        let cmd = cli.build_command_with_schema("sys", tmp.path(), Some(schema_json));
+        let args = args_of(&cmd);
+        let idx = args
+            .iter()
+            .position(|a| a == "--json-schema")
+            .expect("argv should contain --json-schema");
+        let value = &args[idx + 1];
+        assert!(
+            value.trim_start().starts_with('{'),
+            "--json-schema value must be inline JSON, got: {value:?}"
+        );
+        assert!(
+            !std::path::Path::new(value).is_absolute(),
+            "--json-schema value must not be a filesystem path, got: {value:?}"
+        );
     }
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn run_with_options_writes_schema_and_succeeds() {
+    async fn run_with_options_passes_schema_inline_and_succeeds() {
         let _guard = shim_lock();
         // The shim ignores --json-schema and just emits a JSON envelope.
-        // What matters is that run_with_options serializes/writes the
-        // schema and adds the flag without erroring out.
+        // What matters is that run_with_options serialises the schema and
+        // adds the flag without erroring out.
         let tmp = TempDir::new().unwrap();
         let shim = make_shim(&tmp, r#"{"is_error":false,"result":"ok"}"#, 0);
         let cli = client_with_shim(shim);
@@ -1484,6 +1504,43 @@ mod tests {
             .await
             .expect("run_with_options should succeed");
         assert_eq!(out, "ok");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn run_with_options_forwards_inline_schema_to_subprocess_argv() {
+        let _guard = shim_lock();
+        // The shim writes its argv (NUL-separated) to a side-channel
+        // file, then emits a normal JSON envelope on stdout. We then
+        // assert the inline schema appears verbatim in the recorded
+        // argv — proving the path-based regression (#681) is gone.
+        let tmp = TempDir::new().unwrap();
+        let (shim, argv_file) = make_argv_capture_shim(&tmp);
+        let cli = client_with_shim(shim);
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["answer"],
+            "properties": {"answer": {"type": "string"}}
+        });
+        let opts = RequestOptions::default().with_response_schema(schema.clone());
+        let out = cli
+            .run_with_options("sys", "user", &opts)
+            .await
+            .expect("run_with_options should succeed");
+        assert_eq!(out, "ok");
+
+        let captured = std::fs::read(&argv_file).expect("argv file should exist");
+        let argv: Vec<String> = captured
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+        let idx = argv
+            .iter()
+            .position(|a| a == "--json-schema")
+            .expect("captured argv should contain --json-schema");
+        let expected_inline = serde_json::to_string(&schema).unwrap();
+        assert_eq!(argv[idx + 1], expected_inline);
     }
 
     #[tokio::test]
@@ -1684,6 +1741,30 @@ mod tests {
         );
         write_exec_script(&shim, &script);
         shim
+    }
+
+    /// Writes a shell-script shim that drains stdin, captures its own
+    /// argv (NUL-separated) to a side-channel file, and emits a
+    /// `{"is_error":false,"result":"ok"}` envelope on stdout. Returns
+    /// `(shim_path, argv_capture_path)`.
+    ///
+    /// The side-channel avoids JSON-escaping argv characters in shell —
+    /// the parent reads the file directly and splits on NUL.
+    #[cfg(unix)]
+    fn make_argv_capture_shim(tmp: &TempDir) -> (PathBuf, PathBuf) {
+        let shim = tmp.path().join("claude-argv-capture");
+        let argv_file = tmp.path().join("captured-argv.bin");
+        let script = format!(
+            "#!/bin/sh\n\
+             cat >/dev/null\n\
+             : > '{path}'\n\
+             for a in \"$@\"; do printf '%s\\0' \"$a\" >> '{path}'; done\n\
+             printf '%s' '{{\"is_error\":false,\"result\":\"ok\"}}'\n\
+             exit 0\n",
+            path = argv_file.display()
+        );
+        write_exec_script(&shim, &script);
+        (shim, argv_file)
     }
 
     #[cfg(unix)]
