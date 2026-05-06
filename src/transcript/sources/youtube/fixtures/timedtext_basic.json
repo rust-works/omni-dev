@@ -1,0 +1,33 @@
+{
+  "wireMagic": "pb3",
+  "events": [
+    {
+      "tStartMs": 0,
+      "dDurationMs": 1500,
+      "segs": [
+        { "utf8": "Hello, " },
+        { "utf8": "world." }
+      ]
+    },
+    {
+      "tStartMs": 2000,
+      "dDurationMs": 1000,
+      "segs": [
+        { "utf8": "This is a test." }
+      ]
+    },
+    {
+      "tStartMs": 3500,
+      "dDurationMs": 500,
+      "wsWinStyles": []
+    },
+    {
+      "tStartMs": 4000,
+      "dDurationMs": 2000,
+      "segs": [
+        { "utf8": "Final cue\n" },
+        { "utf8": "with newline." }
+      ]
+    }
+  ]
+}

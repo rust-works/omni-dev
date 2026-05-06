@@ -1,0 +1,37 @@
+{
+  "playabilityStatus": {
+    "status": "OK"
+  },
+  "videoDetails": {
+    "videoId": "dQw4w9WgXcQ",
+    "title": "Sample Video",
+    "lengthSeconds": "212",
+    "author": "Sample Channel"
+  },
+  "captions": {
+    "playerCaptionsTracklistRenderer": {
+      "captionTracks": [
+        {
+          "baseUrl": "https://www.youtube.com/api/timedtext?v=dQw4w9WgXcQ&lang=en-US",
+          "name": { "simpleText": "English (United States)" },
+          "languageCode": "en-US"
+        },
+        {
+          "baseUrl": "https://www.youtube.com/api/timedtext?v=dQw4w9WgXcQ&lang=en&kind=asr",
+          "name": { "simpleText": "English (auto-generated)" },
+          "languageCode": "en",
+          "kind": "asr"
+        },
+        {
+          "baseUrl": "https://www.youtube.com/api/timedtext?v=dQw4w9WgXcQ&lang=es",
+          "name": { "simpleText": "Spanish" },
+          "languageCode": "es"
+        }
+      ],
+      "translationLanguages": [
+        { "languageCode": "fr", "languageName": { "simpleText": "French" } },
+        { "languageCode": "de", "languageName": { "simpleText": "German" } }
+      ]
+    }
+  }
+}
