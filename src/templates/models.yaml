@@ -3,6 +3,12 @@
 # Used by omni-dev to configure API requests correctly
 # Last updated: February 2026
 
+# Schema version. Bumped when the YAML structure changes in a backwards-
+# incompatible way. User/project files declaring a different version receive
+# a warning at load time. Files without a version are accepted with a warning
+# for backwards compatibility.
+version: "1"
+
 models:
   # Claude 4.6 Series (Current Generation)
   - provider: "claude"
