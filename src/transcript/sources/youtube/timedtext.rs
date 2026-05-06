@@ -38,6 +38,16 @@ struct Segment {
     utf8: Option<String>,
 }
 
+/// GET a fully-prepared timedtext URL and return the response body.
+///
+/// `url` is consumed as-is. Callers normally obtain it from
+/// [`super::player_response::SelectedTrack::fetch_url`], which already
+/// carries the signed signature, `fmt=json3`, and any `tlang=` parameter.
+pub async fn fetch(http: &reqwest::Client, url: &str) -> Result<String> {
+    let response = http.get(url).send().await?.error_for_status()?;
+    Ok(response.text().await?)
+}
+
 /// Parse a json3 timedtext document into a list of cues, dropping events
 /// that carry no text (styling / window markers).
 pub fn parse(raw: &str) -> Result<Vec<Cue>> {
@@ -203,6 +213,44 @@ mod tests {
         }"#;
         let cues = parse(raw).unwrap();
         assert_eq!(cues, vec![Cue::new(0, 100, "こんにちは 🌍")]);
+    }
+
+    #[tokio::test]
+    async fn fetch_returns_body_for_2xx() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/timedtext"))
+            .and(query_param("fmt", "json3"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(FIXTURE_BASIC))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::builder().build().unwrap();
+        let url = format!("{}/api/timedtext?lang=en&fmt=json3", server.uri());
+        let body = fetch(&http, &url).await.unwrap();
+        assert_eq!(body, FIXTURE_BASIC);
+    }
+
+    #[tokio::test]
+    async fn fetch_surfaces_non_2xx_as_http_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/timedtext"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::builder().build().unwrap();
+        let url = format!("{}/api/timedtext?lang=en&fmt=json3", server.uri());
+        let err = fetch(&http, &url).await.unwrap_err();
+        assert!(matches!(err, TranscriptError::Http(_)));
     }
 
     #[test]
