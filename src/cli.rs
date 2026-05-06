@@ -73,6 +73,13 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "AMOUNT")]
     pub claude_cli_max_budget_usd: Option<f64>,
 
+    /// Path to a single user-side `models.yaml` that short-circuits the
+    /// standard `./.omni-dev/models.yaml` and `~/.omni-dev/models.yaml`
+    /// lookup. The file is still merged over the embedded catalog.
+    /// Equivalent to setting `OMNI_DEV_MODELS_YAML`.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub models_yaml: Option<std::path::PathBuf>,
+
     /// The main command to execute.
     #[command(subcommand)]
     pub command: Commands,
@@ -121,6 +128,10 @@ impl Cli {
 
         if let Some(budget) = self.claude_cli_max_budget_usd {
             std::env::set_var("OMNI_DEV_CLAUDE_CLI_MAX_BUDGET_USD", format!("{budget}"));
+        }
+
+        if let Some(path) = &self.models_yaml {
+            std::env::set_var("OMNI_DEV_MODELS_YAML", path);
         }
     }
 
@@ -261,12 +272,13 @@ mod tests {
     const ALLOW_TOOLS_VAR: &str = "OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS";
     const ALLOW_MCP_VAR: &str = "OMNI_DEV_CLAUDE_CLI_ALLOW_MCP";
     const MAX_BUDGET_VAR: &str = "OMNI_DEV_CLAUDE_CLI_MAX_BUDGET_USD";
+    const MODELS_YAML_VAR: &str = "OMNI_DEV_MODELS_YAML";
 
     /// Locks the shared mutex and snapshots/restores every env var
     /// `propagate_global_flags` may touch.
     struct GlobalFlagsEnvGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
-        saved: [(&'static str, Option<String>); 4],
+        saved: [(&'static str, Option<String>); 5],
     }
 
     impl GlobalFlagsEnvGuard {
@@ -274,7 +286,13 @@ mod tests {
             let lock = crate::claude::ai::claude_cli::CLI_ENV_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let names = [BACKEND_VAR, ALLOW_TOOLS_VAR, ALLOW_MCP_VAR, MAX_BUDGET_VAR];
+            let names = [
+                BACKEND_VAR,
+                ALLOW_TOOLS_VAR,
+                ALLOW_MCP_VAR,
+                MAX_BUDGET_VAR,
+                MODELS_YAML_VAR,
+            ];
             let saved = names.map(|n| (n, std::env::var(n).ok()));
             for (n, _) in &saved {
                 std::env::remove_var(n);
@@ -306,6 +324,7 @@ mod tests {
         assert!(std::env::var(ALLOW_TOOLS_VAR).is_err());
         assert!(std::env::var(ALLOW_MCP_VAR).is_err());
         assert!(std::env::var(MAX_BUDGET_VAR).is_err());
+        assert!(std::env::var(MODELS_YAML_VAR).is_err());
     }
 
     #[test]
@@ -355,6 +374,33 @@ mod tests {
         cli.claude_cli_max_budget_usd = Some(1.5);
         cli.propagate_global_flags();
         assert_eq!(std::env::var(MAX_BUDGET_VAR).ok().as_deref(), Some("1.5"));
+    }
+
+    #[test]
+    fn parses_models_yaml_flag() {
+        let cli = Cli::try_parse_from([
+            "omni-dev",
+            "--models-yaml",
+            "/tmp/custom-models.yaml",
+            "help-all",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.models_yaml.as_deref(),
+            Some(std::path::Path::new("/tmp/custom-models.yaml"))
+        );
+    }
+
+    #[test]
+    fn propagate_global_flags_sets_models_yaml() {
+        let _g = GlobalFlagsEnvGuard::new();
+        let mut cli = cli_with_defaults();
+        cli.models_yaml = Some(std::path::PathBuf::from("/tmp/custom-models.yaml"));
+        cli.propagate_global_flags();
+        assert_eq!(
+            std::env::var(MODELS_YAML_VAR).ok().as_deref(),
+            Some("/tmp/custom-models.yaml")
+        );
     }
 
     #[test]

@@ -973,7 +973,90 @@ Once a backend is chosen, the model name resolves in this precedence
 5. The hard-coded default for the backend
 
 Run `omni-dev config models show` to list every model omni-dev knows about
-along with token limits and capabilities.
+along with token limits and capabilities. Pass `--embedded-only` to print
+the embedded catalog verbatim (useful for diffing against the merged view).
+
+### Customising the model catalog
+
+omni-dev ships with an embedded `models.yaml` that defines token limits,
+beta-header unlocks, and provider defaults for known Claude / OpenAI /
+Gemini models. You can extend or override that catalog without rebuilding
+by dropping a YAML file in either of:
+
+| Layer       | Path                          | Purpose                                                                 |
+|-------------|-------------------------------|-------------------------------------------------------------------------|
+| Project     | `./.omni-dev/models.yaml`     | Per-repository overrides (commit this if your team agrees on the values) |
+| User        | `~/.omni-dev/models.yaml`     | Personal overrides across all projects                                  |
+| Override    | `OMNI_DEV_MODELS_YAML=<path>` | Single explicit file; short-circuits the project/user lookup            |
+| (Embedded)  | built-in                      | Compile-time fallback; always present                                   |
+
+Layers are deep-merged with **project > user > embedded** precedence. You
+can also pass `--models-yaml <PATH>` as a global CLI flag, which is
+equivalent to setting `OMNI_DEV_MODELS_YAML`.
+
+#### Adding a brand-new model
+
+```yaml
+# ~/.omni-dev/models.yaml
+version: "1"
+models:
+  - provider: "claude"
+    model: "Claude Custom Future"
+    api_identifier: "claude-future-9000"
+    max_output_tokens: 250000
+    input_context: 5000000
+    generation: 9.0
+    tier: "flagship"
+```
+
+The next omni-dev invocation that targets `claude-future-9000` will pick up
+the limits you declared instead of falling through to provider defaults.
+
+#### Correcting limits on an embedded entry
+
+User entries with the same `api_identifier` deep-merge over the embedded
+entry, so you only need to redeclare the fields you want to change:
+
+```yaml
+# ./.omni-dev/models.yaml
+version: "1"
+models:
+  - api_identifier: "claude-opus-4-6"
+    max_output_tokens: 200000   # raised locally
+```
+
+#### Tweaking provider defaults
+
+Provider blocks deep-merge per field, so you can override
+`providers.claude.default_model` without redeclaring tiers, defaults, or
+API base:
+
+```yaml
+# ./.omni-dev/models.yaml
+version: "1"
+providers:
+  claude:
+    default_model: "claude-opus-4-6"
+```
+
+#### Inspecting the merged view
+
+`omni-dev config models show` serialises the resulting configuration with
+each entry's source layer recorded as `source: embedded|user|project|override`.
+A header at the top counts entries per layer so you can see at a glance
+which of your overrides are actually winning.
+
+#### Failure modes
+
+- Missing user/project files fall through silently — the embedded catalog
+  alone is fully functional.
+- Malformed user/project YAML logs an error to stderr and the layer is
+  skipped; the registry continues to load.
+- A missing path supplied via `OMNI_DEV_MODELS_YAML` / `--models-yaml`
+  emits a warning (the user explicitly named the file).
+- The `version:` field is advisory — files declaring a different version
+  load with a warning rather than failing. The current schema version is
+  `"1"`.
 
 ### Anthropic API backend (default)
 
