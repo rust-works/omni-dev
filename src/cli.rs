@@ -10,6 +10,7 @@ pub mod config;
 pub mod datadog;
 pub mod git;
 pub mod help;
+pub mod transcript;
 
 /// AI backend selector.
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -100,6 +101,8 @@ pub enum Commands {
     Atlassian(atlassian::AtlassianCommand),
     /// Datadog: read-only API operations.
     Datadog(datadog::DatadogCommand),
+    /// Transcript and caption fetching from media platforms.
+    Transcript(transcript::TranscriptCommand),
     /// Displays comprehensive help for all commands.
     #[command(name = "help-all")]
     HelpAll(help::HelpCommand),
@@ -145,6 +148,7 @@ impl Cli {
             Commands::Commands(commands_cmd) => commands_cmd.execute(),
             Commands::Atlassian(cmd) => cmd.execute().await,
             Commands::Datadog(cmd) => cmd.execute().await,
+            Commands::Transcript(cmd) => cmd.execute().await,
             Commands::Config(config_cmd) => config_cmd.execute(),
             Commands::HelpAll(help_cmd) => help_cmd.execute(),
         }
