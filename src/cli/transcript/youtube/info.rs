@@ -3,8 +3,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 
+use crate::cli::transcript::youtube::fetch::build_youtube;
 use crate::transcript::source::{MediaInfo, TrackKind, TranscriptSource};
-use crate::transcript::sources::youtube::Youtube;
+use crate::transcript::sources::youtube::InnertubeClient;
 
 /// Shows top-level metadata (title, channel, duration, languages) for a YouTube video.
 #[derive(Parser)]
@@ -15,6 +16,11 @@ pub struct InfoCommand {
     /// Output format.
     #[arg(long, value_enum, default_value_t = InfoOutput::Table)]
     pub output: InfoOutput,
+
+    /// Force a specific InnerTube client instead of the default fallback
+    /// chain (`web` → `android-vr` → `tv-embedded` → `ios`).
+    #[arg(long, value_enum, value_name = "CLIENT")]
+    pub client: Option<InnertubeClient>,
 }
 
 /// Output format for `info`.
@@ -30,7 +36,7 @@ pub enum InfoOutput {
 impl InfoCommand {
     /// Fetches the metadata and prints it.
     pub async fn execute(self) -> Result<()> {
-        let yt = Youtube::new()?;
+        let yt = build_youtube(self.client)?;
         let info = yt.info(&self.url).await?;
         match self.output {
             InfoOutput::Table => print_table(&info),

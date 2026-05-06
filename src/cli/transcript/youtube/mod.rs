@@ -52,6 +52,7 @@ mod tests {
                 auto: false,
                 translate: None,
                 output: None,
+                client: None,
             }),
         };
         assert!(matches!(cmd.command, YoutubeSubcommands::Fetch(_)));
@@ -63,6 +64,7 @@ mod tests {
             command: YoutubeSubcommands::ListLangs(list_langs::ListLangsCommand {
                 url: "https://youtu.be/abc".to_string(),
                 output: list_langs::ListLangsOutput::Table,
+                client: None,
             }),
         };
         assert!(matches!(cmd.command, YoutubeSubcommands::ListLangs(_)));
@@ -74,6 +76,7 @@ mod tests {
             command: YoutubeSubcommands::Info(info::InfoCommand {
                 url: "https://youtu.be/abc".to_string(),
                 output: info::InfoOutput::Table,
+                client: None,
             }),
         };
         assert!(matches!(cmd.command, YoutubeSubcommands::Info(_)));

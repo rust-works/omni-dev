@@ -9,7 +9,7 @@ use clap::Parser;
 use crate::cli::transcript::format::CliFormat;
 use crate::transcript::format::Format;
 use crate::transcript::source::{FetchOpts, TranscriptSource};
-use crate::transcript::sources::youtube::Youtube;
+use crate::transcript::sources::youtube::{InnertubeClient, Youtube};
 
 /// Fetches the transcript for a YouTube video.
 #[derive(Parser)]
@@ -39,12 +39,18 @@ pub struct FetchCommand {
     /// Output file (writes to stdout if omitted).
     #[arg(short, long)]
     pub output: Option<String>,
+
+    /// Force a specific InnerTube client instead of the default fallback
+    /// chain (`web` → `android-vr` → `tv-embedded` → `ios`). Useful for
+    /// reproducing client-specific bugs and isolating regressions.
+    #[arg(long, value_enum, value_name = "CLIENT")]
+    pub client: Option<InnertubeClient>,
 }
 
 impl FetchCommand {
     /// Fetches the transcript and writes it to stdout or `--output`.
     pub async fn execute(self) -> Result<()> {
-        let yt = Youtube::new()?;
+        let yt = build_youtube(self.client)?;
         let opts = FetchOpts {
             language: self.lang,
             allow_auto: self.auto,
@@ -54,6 +60,16 @@ impl FetchCommand {
         let rendered = Format::from(self.format).render(&transcript)?;
         write_output(&rendered, self.output.as_deref())
     }
+}
+
+/// Build a [`Youtube`] source either with the default fallback chain or
+/// pinned to a single user-supplied client.
+pub(crate) fn build_youtube(client: Option<InnertubeClient>) -> Result<Youtube> {
+    let yt = Youtube::new()?;
+    Ok(match client {
+        Some(c) => yt.with_chain(vec![c]),
+        None => yt,
+    })
 }
 
 fn write_output(text: &str, file: Option<&str>) -> Result<()> {
@@ -90,6 +106,7 @@ mod tests {
         assert!(!cmd.auto);
         assert_eq!(cmd.translate, None);
         assert_eq!(cmd.output, None);
+        assert_eq!(cmd.client, None);
     }
 
     #[test]
@@ -105,6 +122,8 @@ mod tests {
             "en",
             "--output",
             "out.vtt",
+            "--client",
+            "android-vr",
         ]);
         assert_eq!(cmd.url, "abc");
         assert_eq!(cmd.lang, "fr");
@@ -112,6 +131,20 @@ mod tests {
         assert!(cmd.auto);
         assert_eq!(cmd.translate.as_deref(), Some("en"));
         assert_eq!(cmd.output.as_deref(), Some("out.vtt"));
+        assert_eq!(cmd.client, Some(InnertubeClient::AndroidVr));
+    }
+
+    #[test]
+    fn fetch_command_client_accepts_each_variant() {
+        for (arg, want) in [
+            ("web", InnertubeClient::Web),
+            ("android-vr", InnertubeClient::AndroidVr),
+            ("tv-embedded", InnertubeClient::TvEmbedded),
+            ("ios", InnertubeClient::Ios),
+        ] {
+            let cmd = parse(&["abc", "--client", arg]);
+            assert_eq!(cmd.client, Some(want));
+        }
     }
 
     #[test]

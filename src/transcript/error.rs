@@ -37,13 +37,26 @@ pub enum TranscriptError {
     /// removed, or login-required). Carries the platform's status string so
     /// callers can react to the specific reason rather than a generic HTTP
     /// failure.
-    #[error("media platform refused playback: status={status}{}", reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default())]
+    #[error(
+        "media platform refused playback: status={status}{}{}",
+        reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default(),
+        if attempted.len() > 1 {
+            format!(" [tried: {}]", attempted.join(", "))
+        } else {
+            String::new()
+        }
+    )]
     PlayabilityRefused {
         /// Platform-specific status code (e.g. YouTube `LOGIN_REQUIRED`,
         /// `AGE_VERIFICATION_REQUIRED`, `UNPLAYABLE`).
         status: String,
         /// Optional human-readable reason from the platform.
         reason: Option<String>,
+        /// Names of the source-specific clients that were tried before the
+        /// refusal was surfaced. Empty when only one client was attempted.
+        /// For YouTube these are InnerTube `clientName` values like `WEB`,
+        /// `ANDROID_VR`.
+        attempted: Vec<String>,
     },
 
     /// An I/O error occurred (e.g. writing transcript to a file).
@@ -108,6 +121,7 @@ mod tests {
         let err = TranscriptError::PlayabilityRefused {
             status: "LOGIN_REQUIRED".to_string(),
             reason: Some("Sign in to confirm your age".to_string()),
+            attempted: vec![],
         };
         let msg = err.to_string();
         assert!(msg.contains("LOGIN_REQUIRED"));
@@ -119,10 +133,36 @@ mod tests {
         let err = TranscriptError::PlayabilityRefused {
             status: "UNPLAYABLE".to_string(),
             reason: None,
+            attempted: vec![],
         };
         let msg = err.to_string();
         assert!(msg.contains("UNPLAYABLE"));
         assert!(!msg.contains("()"));
+    }
+
+    #[test]
+    fn playability_refused_with_single_attempt_omits_chain() {
+        // One-client attempt suppresses the `[tried: ...]` suffix to keep
+        // the message clean for sources that don't fan out.
+        let err = TranscriptError::PlayabilityRefused {
+            status: "UNPLAYABLE".to_string(),
+            reason: None,
+            attempted: vec!["WEB".to_string()],
+        };
+        let msg = err.to_string();
+        assert!(!msg.contains("tried"));
+    }
+
+    #[test]
+    fn playability_refused_with_multiple_attempts_shows_chain() {
+        let err = TranscriptError::PlayabilityRefused {
+            status: "UNPLAYABLE".to_string(),
+            reason: Some("Video unavailable".to_string()),
+            attempted: vec!["WEB".to_string(), "ANDROID_VR".to_string()],
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("tried: WEB, ANDROID_VR"));
+        assert!(msg.contains("Video unavailable"));
     }
 
     #[test]

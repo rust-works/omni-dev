@@ -4,8 +4,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 
+use crate::cli::transcript::youtube::fetch::build_youtube;
 use crate::transcript::source::{LanguageInfo, TrackKind, TranscriptSource};
-use crate::transcript::sources::youtube::Youtube;
+use crate::transcript::sources::youtube::InnertubeClient;
 
 /// Lists the caption tracks available on a YouTube video.
 #[derive(Parser)]
@@ -16,6 +17,11 @@ pub struct ListLangsCommand {
     /// Output format.
     #[arg(long, value_enum, default_value_t = ListLangsOutput::Table)]
     pub output: ListLangsOutput,
+
+    /// Force a specific InnerTube client instead of the default fallback
+    /// chain (`web` → `android-vr` → `tv-embedded` → `ios`).
+    #[arg(long, value_enum, value_name = "CLIENT")]
+    pub client: Option<InnertubeClient>,
 }
 
 /// Output format for `list-langs`.
@@ -31,7 +37,7 @@ pub enum ListLangsOutput {
 impl ListLangsCommand {
     /// Fetches the caption-track list and prints it.
     pub async fn execute(self) -> Result<()> {
-        let yt = Youtube::new()?;
+        let yt = build_youtube(self.client)?;
         let langs = yt.list_languages(&self.url).await?;
         match self.output {
             ListLangsOutput::Table => print_table(&langs),

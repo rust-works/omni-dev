@@ -45,6 +45,7 @@ mod tests {
                 command: youtube::YoutubeSubcommands::Info(youtube::info::InfoCommand {
                     url: "https://youtu.be/dQw4w9WgXcQ".to_string(),
                     output: youtube::info::InfoOutput::Table,
+                    client: None,
                 }),
             }),
         };

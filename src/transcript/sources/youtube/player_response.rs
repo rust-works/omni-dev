@@ -149,6 +149,10 @@ pub fn parse(raw: &str) -> Result<PlayerResponse> {
 }
 
 /// Surface a non-`OK` playability status as a typed error.
+///
+/// The returned [`TranscriptError::PlayabilityRefused`] has an empty
+/// `attempted` field; callers that try multiple clients (see
+/// [`super::DEFAULT_CHAIN`]) populate it before propagating.
 pub fn check_playability(response: &PlayerResponse) -> Result<()> {
     if response.playability_status.status == "OK" {
         Ok(())
@@ -156,6 +160,7 @@ pub fn check_playability(response: &PlayerResponse) -> Result<()> {
         Err(TranscriptError::PlayabilityRefused {
             status: response.playability_status.status.clone(),
             reason: response.playability_status.reason.clone(),
+            attempted: Vec::new(),
         })
     }
 }
@@ -377,9 +382,14 @@ mod tests {
         let r = parse(FIXTURE_AGE_GATED).unwrap();
         let err = check_playability(&r).unwrap_err();
         match err {
-            TranscriptError::PlayabilityRefused { status, reason } => {
+            TranscriptError::PlayabilityRefused {
+                status,
+                reason,
+                attempted,
+            } => {
                 assert_eq!(status, "LOGIN_REQUIRED");
                 assert_eq!(reason.as_deref(), Some("Sign in to confirm your age"));
+                assert!(attempted.is_empty());
             }
             other => panic!("wrong variant: {other:?}"),
         }

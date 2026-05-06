@@ -2293,6 +2293,7 @@ Options:
       --auto              Allow falling through to auto-generated (ASR) captions when no manual track matches
       --translate <LANG>  Synthesise a translated track in this target language when no native track matches
   -o, --output <OUTPUT>   Output file (writes to stdout if omitted)
+      --client <CLIENT>   Force a specific InnerTube client instead of the default fallback chain (`web` → `android-vr` → `tv-embedded` → `ios`). Useful for reproducing client-specific bugs and isolating regressions [possible values: web, android-vr, tv-embedded, ios]
   -h, --help              Print help (see more with '--help')
 
 
@@ -2309,6 +2310,7 @@ Arguments:
 
 Options:
       --output <OUTPUT>  Output format [default: table] [possible values: table, json]
+      --client <CLIENT>  Force a specific InnerTube client instead of the default fallback chain (`web` → `android-vr` → `tv-embedded` → `ios`) [possible values: web, android-vr, tv-embedded, ios]
   -h, --help             Print help (see more with '--help')
 
 
@@ -2325,4 +2327,5 @@ Arguments:
 
 Options:
       --output <OUTPUT>  Output format [default: table] [possible values: table, json]
+      --client <CLIENT>  Force a specific InnerTube client instead of the default fallback chain (`web` → `android-vr` → `tv-embedded` → `ios`) [possible values: web, android-vr, tv-embedded, ios]
   -h, --help             Print help (see more with '--help')
