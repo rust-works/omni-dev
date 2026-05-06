@@ -4,65 +4,78 @@ This document describes the high-level design of omni-dev. It is intended to hel
 
 ## System overview
 
-omni-dev is an AI-powered Git commit message toolkit. It analyzes commit diffs and metadata, sends them to an AI provider, and applies the results. The three core workflows are:
+omni-dev is a developer toolkit that pairs AI-powered Git commit analysis with read/write access to Atlassian and Datadog. It ships as two binaries:
+
+- **`omni-dev`** — the primary CLI: git commit workflows, PR creation, JIRA/Confluence integration, Datadog queries, and AI diagnostics.
+- **`omni-dev-mcp`** — an optional MCP server gated behind the `mcp` Cargo feature that exposes the same surface to AI assistants over stdio. See [ADR-0021](docs/adrs/adr-0021.md).
+
+The git/AI workflows are:
 
 - **twiddle** — Generate or improve commit messages using AI analysis of diffs
 - **check** — Validate existing commit messages against project guidelines
 - **create-pr** — Generate pull request titles and descriptions from branch commits
 
-All workflows share the same pipeline: parse CLI arguments, read git repository state, build a structured YAML representation, construct a token-budget-aware prompt, call an AI provider, parse the response, and apply or display the result.
+All AI-powered workflows share the same pipeline: parse CLI arguments, read git repository state, build a structured YAML representation, construct a token-budget-aware prompt, call an AI provider, parse the response, and apply or display the result. The Atlassian and Datadog command trees are thinner — they wrap typed REST clients and emit YAML/table/json/yamls/jsonl output without invoking AI.
 
 ## Module map
 
 ```
 src/
-├── main.rs              Entry point: tracing setup, Cli::parse(), execute()
+├── main.rs              `omni-dev` entry point: tracing, Cli::parse(), execute()
+├── mcp_server.rs        `omni-dev-mcp` entry point (gated by `mcp` feature)
 ├── lib.rs               Public module exports and VERSION constant
-├── cli.rs               Clap command hierarchy root
+├── cli.rs               Clap command hierarchy root + global flags
 ├── cli/
-│   ├── git/
-│   │   ├── twiddle.rs   AI-powered message improvement
-│   │   ├── check.rs     Message validation against guidelines
-│   │   ├── view.rs      Raw YAML repository view output
-│   │   ├── amend.rs     Apply amendment files to commits
-│   │   ├── info.rs      Branch information display
-│   │   └── create_pr.rs AI-powered PR creation
-│   ├── ai.rs            Interactive chat command
+│   ├── git/             twiddle / check / view / amend / info / create_pr
+│   ├── ai/              chat, claude history, claude skills, claude cli model
+│   ├── atlassian/       jira/* and confluence/* command trees, convert
+│   ├── datadog/         metrics / monitor / dashboard / logs / events / slo / hosts / downtime / auth
 │   ├── config.rs        Model registry display
-│   ├── commands.rs      Command template management
-│   └── help.rs          Help system
+│   ├── commands.rs      Command template generators (`commands generate ...`)
+│   └── help.rs          Help system (`help-all`)
+├── mcp/                 (mcp feature) MCP server runtime
+│   ├── server.rs        rmcp ServerHandler implementation
+│   ├── runtime.rs       stdio transport bootstrapping
+│   ├── git_tools.rs     git_view_commits, git_branch_info, git_check_commits, git_twiddle_commits, git_create_pr
+│   ├── jira_core_tools.rs / jira_tools.rs   ~28 jira_* tools
+│   ├── confluence_tools.rs                  13 confluence_* tools
+│   ├── atlassian_tools.rs                   atlassian_convert (offline JFM ↔ ADF)
+│   ├── datadog_tools.rs                     14 datadog_* tools
+│   ├── ai_tools.rs                          ai_chat, claude_skills_*
+│   ├── config_tools.rs                      config_models_show, atlassian_auth_status
+│   ├── resources.rs                         git://, jira://, confluence://, omni-dev://specs/{name}
+│   ├── specs.rs                             include_str! reference specs (jfm)
+│   ├── output_file.rs                       Off-context write helper for read tools
+│   └── truncate.rs / validate.rs / cancel.rs / error.rs
 ├── claude/
 │   ├── ai.rs            AiClient trait and metadata types
 │   ├── ai/
-│   │   ├── claude.rs    Claude API implementation
+│   │   ├── claude.rs    Anthropic API implementation
+│   │   ├── claude_cli.rs Subprocess `claude -p` backend with sandbox + budget cap
 │   │   ├── openai.rs    OpenAI/Ollama implementation
 │   │   └── bedrock.rs   AWS Bedrock implementation
-│   ├── client.rs        ClaudeClient orchestrator
+│   ├── client.rs        Backend dispatch (create_default_claude_client) + orchestrator
 │   ├── prompts.rs       System and user prompt templates
 │   ├── model_config.rs  Model registry with fuzzy matching
 │   ├── token_budget.rs  Token estimation and budget validation
 │   ├── batch.rs         Token-budget-aware commit batching
 │   ├── error.rs         ClaudeError types
-│   └── context/
-│       ├── discovery.rs Config loading, ecosystem detection, scope merging
-│       ├── branch.rs    Branch analysis context
-│       ├── files.rs     File-level change context
-│       └── patterns.rs  Work pattern analysis
-├── data.rs              RepositoryView, RepositoryViewForAI, field types
-├── data/
-│   ├── amendments.rs    AmendmentFile and Amendment serialization
-│   ├── check.rs         CheckReport, CommitCheckResult, IssueSeverity
-│   ├── context.rs       ProjectContext, ScopeDefinition, Ecosystem enum
-│   └── yaml.rs          YAML serialization utilities
-├── git/
-│   ├── repository.rs    GitRepository wrapper over git2
-│   ├── commit.rs        CommitInfo, CommitInfoForAI, analysis structures
-│   ├── amendment.rs     AmendmentHandler (git rebase operations)
-│   └── remote.rs        RemoteInfo extraction
+│   └── context/         discovery / branch / files / patterns
+├── atlassian/           Typed Atlassian client + ADF/JFM bidirectional conversion
+│   ├── client.rs        REST client (JIRA + Confluence)
+│   ├── adf/ jfm/        ADF and JIRA-Flavoured Markdown types
+│   ├── custom_fields.rs Custom-field overrides (`--set-field` / assignee / reporter)
+│   └── ...              issues, sprints, boards, links, watchers, worklogs, attachments
+├── datadog/             Typed Datadog client + per-endpoint API façades
+│   ├── client.rs        Auth, 429 handling, X-RateLimit-* surfacing
+│   ├── metrics_api.rs / monitors_api.rs / dashboards_api.rs / logs_api.rs / events_api.rs / slo_api.rs / hosts_api.rs / downtimes_api.rs / metrics_catalog_api.rs
+│   └── types.rs / time.rs
+├── data/                RepositoryView, AmendmentFile, CheckReport, ProjectContext, YAML utils
+├── git/                 GitRepository (git2 wrapper), CommitInfo, AmendmentHandler, RemoteInfo
 ├── utils/
 │   ├── settings.rs      Settings loading (env vars → ~/.omni-dev/settings.json)
-│   ├── preflight.rs     AI credential and GitHub CLI validation
-│   ├── ai_scratch.rs    AI scratch directory management
+│   ├── preflight.rs     AI credential / GitHub CLI / Atlassian / Datadog preflight
+│   ├── ai_scratch.rs    `~/.cache/omni-dev/ai-scratch/` management
 │   └── general.rs       General utilities
 └── templates/
     ├── models.yaml                  AI model specifications
@@ -80,6 +93,24 @@ src/
 **`git/`** — Git operations via the `git2` crate. `GitRepository` wraps `git2::Repository` with higher-level methods for commit enumeration, diff generation, and working directory status. `AmendmentHandler` applies message changes through `git commit --amend` or interactive rebase.
 
 **`utils/`** — Cross-cutting utilities. Settings resolution, preflight credential checks, and AI scratch directory management.
+
+**`atlassian/`** — Typed JIRA + Confluence REST client and the bidirectional ADF ↔ JFM (JIRA-Flavoured Markdown) conversion layer. The CLI subcommands and the MCP `jira_*` / `confluence_*` tools are thin wrappers over this client; both paths share `custom_fields.rs` for typed assignee/reporter/`set_field` handling. See [ADR-0020](docs/adrs/adr-0020.md) for the ADF/JFM design.
+
+**`datadog/`** — Typed Datadog v1/v2 client. Each endpoint family has its own façade (`monitors_api.rs`, `dashboards_api.rs`, etc.) emitting strongly-typed responses. The base `DatadogClient` handles 429 with `Retry-After` / `X-RateLimit-Reset` and surfaces rate-limit headers in error output.
+
+**`mcp/`** *(feature `mcp`)* — MCP server runtime built on `rmcp`. Each tool family lives in its own module; tools are registered via the `#[tool]` macro and the per-domain `tool_router()` builders in `OmniDevServer::new()`. Tools build a fresh client per invocation so credential changes take effect without restart.
+
+### AI backend dispatch
+
+`src/claude/client.rs::create_default_claude_client` selects an `AiClient` implementation in this order:
+
+1. `OMNI_DEV_AI_BACKEND=claude-cli` (or `--ai-backend claude-cli`) → `ClaudeCliAiClient` — shells out to `claude -p` in a sandbox (tools off, MCP off, settings skipped, fresh temp cwd, scrubbed env). Honours escape hatches `OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS` / `OMNI_DEV_CLAUDE_CLI_ALLOW_MCP` and the per-call cap `OMNI_DEV_CLAUDE_CLI_MAX_BUDGET_USD`.
+2. `USE_OLLAMA=true` → `OpenAiAiClient::new_ollama`.
+3. `USE_OPENAI=true` → `OpenAiAiClient::new_openai`.
+4. `CLAUDE_CODE_USE_BEDROCK=true` → `BedrockAiClient`.
+5. Default → `ClaudeAiClient` (direct Anthropic API).
+
+`src/utils/preflight.rs` mirrors this switch and must change in lock-step when adding backends.
 
 ## Data flow
 
