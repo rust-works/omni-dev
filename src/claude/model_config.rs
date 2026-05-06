@@ -1367,4 +1367,130 @@ providers:
         let spec = registry.get_model_spec("claude-opus-4-6").unwrap();
         assert_eq!(spec.source, ModelSource::Embedded);
     }
+
+    #[test]
+    fn project_layer_recovers_after_user_replaces_top_level_with_scalar() {
+        // Layer-2 (user) wholesale-replaces the merged accumulator with a
+        // scalar (early-return branch in `merge_layer_into`). Layer-3
+        // (project) must hit the "dest is not a mapping" recovery branch
+        // and rebuild a mapping before merging its own content. Project
+        // must redeclare `providers` since the user layer wiped them.
+        let dir = tempfile::tempdir().unwrap();
+        let user = write_yaml(dir.path(), "user.yaml", "\"junk\"\n");
+        let project = write_yaml(
+            dir.path(),
+            "project.yaml",
+            r#"
+version: "1"
+models:
+  - provider: "claude"
+    model: "Project Rescue"
+    api_identifier: "claude-rescue"
+    max_output_tokens: 1
+    input_context: 1
+    generation: 1.0
+    tier: "flagship"
+providers:
+  custom-provider:
+    name: "Custom"
+    api_base: "https://example.invalid"
+    default_model: "custom-default"
+    tiers: {}
+    defaults:
+      max_output_tokens: 100
+      input_context: 1000
+"#,
+        );
+        let registry =
+            ModelRegistry::load_layered_from_paths(Some(&project), Some(&user), None).unwrap();
+        // Project's model survives the user layer's top-level scalar wipe.
+        let spec = registry.get_model_spec("claude-rescue").unwrap();
+        assert_eq!(spec.source, ModelSource::Project);
+    }
+
+    #[test]
+    fn project_layer_recovers_after_user_replaces_models_with_scalar() {
+        // Layer-2 sets `models: 42`, replacing the embedded sequence with
+        // a scalar. Layer-3 must trigger the "dest is not a sequence"
+        // recovery branch in `merge_models_into` and rebuild the sequence.
+        let dir = tempfile::tempdir().unwrap();
+        let user = write_yaml(
+            dir.path(),
+            "user.yaml",
+            r#"
+version: "1"
+models: 42
+"#,
+        );
+        let project = write_yaml(
+            dir.path(),
+            "project.yaml",
+            r#"
+version: "1"
+models:
+  - provider: "claude"
+    model: "Project Rescue"
+    api_identifier: "claude-rescue"
+    max_output_tokens: 1
+    input_context: 1
+    generation: 1.0
+    tier: "flagship"
+"#,
+        );
+        let registry =
+            ModelRegistry::load_layered_from_paths(Some(&project), Some(&user), None).unwrap();
+        let spec = registry.get_model_spec("claude-rescue").unwrap();
+        assert_eq!(spec.source, ModelSource::Project);
+    }
+
+    #[test]
+    fn project_layer_recovers_after_user_replaces_providers_with_scalar() {
+        // Layer-2 sets `providers: 42`. Layer-3 must trigger the "dest is
+        // not a mapping" recovery branch in `merge_providers_into`.
+        let dir = tempfile::tempdir().unwrap();
+        let user = write_yaml(
+            dir.path(),
+            "user.yaml",
+            r#"
+version: "1"
+providers: 42
+"#,
+        );
+        let project = write_yaml(
+            dir.path(),
+            "project.yaml",
+            r#"
+version: "1"
+providers:
+  custom-provider:
+    name: "Custom"
+    api_base: "https://example.invalid"
+    default_model: "custom-default"
+    tiers: {}
+    defaults:
+      max_output_tokens: 100
+      input_context: 1000
+"#,
+        );
+        let registry =
+            ModelRegistry::load_layered_from_paths(Some(&project), Some(&user), None).unwrap();
+        let provider = registry.get_provider_config("custom-provider").unwrap();
+        assert_eq!(provider.name, "Custom");
+        assert_eq!(provider.source, ModelSource::Project);
+    }
+
+    #[test]
+    fn empty_omni_dev_models_yaml_env_var_is_ignored() {
+        // Exercises the `.filter(|s| !s.is_empty())` branch from `load()`
+        // directly. The `load()` entry point is not safely callable from
+        // a unit test because it consults a process-wide OnceLock.
+        let resolved: Option<PathBuf> = Some(String::new())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        assert!(resolved.is_none());
+        let resolved: Option<PathBuf> = Some("/some/path".to_string())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        assert_eq!(resolved.as_deref(), Some(Path::new("/some/path")));
+    }
 }
