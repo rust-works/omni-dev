@@ -945,6 +945,94 @@ echo "Key length: $(echo $CLAUDE_API_KEY | wc -c)"
 RUST_LOG=omni_dev=debug omni-dev git commit message view HEAD --use-context
 ```
 
+## AI Backend Selection
+
+omni-dev supports five AI backends. Selection happens once at startup in
+`src/claude/client.rs::create_default_claude_client` and is checked in this
+order:
+
+| Order | Selector | Backend | Notes |
+|-------|----------|---------|-------|
+| 1 | `OMNI_DEV_AI_BACKEND=claude-cli` (or `--ai-backend claude-cli`) | `ClaudeCliAiClient` | Shells out to `claude -p` in a sandbox |
+| 2 | `USE_OLLAMA=true` | `OpenAiAiClient` (Ollama) | Local Ollama server |
+| 3 | `USE_OPENAI=true` | `OpenAiAiClient` (OpenAI) | OpenAI-compatible API |
+| 4 | `CLAUDE_CODE_USE_BEDROCK=true` | `BedrockAiClient` | AWS Bedrock |
+| (default) | — | `ClaudeAiClient` | Direct Anthropic API |
+
+The first match wins; later selectors are ignored.
+
+### Model selection
+
+Once a backend is chosen, the model name resolves in this precedence
+(highest first):
+
+1. `--model` flag on the invoking command
+2. `CLAUDE_MODEL` environment variable
+3. `CLAUDE_CODE_MODEL` environment variable
+4. `ANTHROPIC_MODEL` environment variable
+5. The hard-coded default for the backend
+
+Run `omni-dev config models show` to list every model omni-dev knows about
+along with token limits and capabilities.
+
+### Anthropic API backend (default)
+
+```bash
+export CLAUDE_API_KEY=sk-ant-...
+# or, equivalently, ANTHROPIC_AUTH_TOKEN
+```
+
+### `claude-cli` backend
+
+Runs the user's installed Claude Code CLI as a subprocess. By default it
+denies tool use, blocks MCP server loading, skips user/project settings, and
+runs in a fresh temp working directory with a scrubbed environment.
+
+```bash
+# Switch backends
+export OMNI_DEV_AI_BACKEND=claude-cli
+# or pass --ai-backend claude-cli per-invocation
+
+# Override the CLI binary path
+export OMNI_DEV_CLAUDE_CLI_BIN=/opt/homebrew/bin/claude
+
+# Tune the subprocess timeout (default: 300s) and stdout cap (default: 4 MiB)
+export OMNI_DEV_CLAUDE_CLI_TIMEOUT_SECS=600
+export OMNI_DEV_CLAUDE_CLI_STDOUT_MAX_BYTES=33554432
+
+# Per-invocation budget cap (forwarded to `claude -p --max-budget-usd`)
+export OMNI_DEV_CLAUDE_CLI_MAX_BUDGET_USD=2.50
+# or pass --claude-cli-max-budget-usd 2.50
+
+# Escape hatches (each logs a WARN every time it is active)
+export OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS=true   # remove --tools "" lockdown
+export OMNI_DEV_CLAUDE_CLI_ALLOW_MCP=true     # remove --strict-mcp-config
+# or pass --claude-cli-allow-tools / --claude-cli-allow-mcp
+```
+
+Every invocation logs `total_cost_usd` from the Claude CLI JSON envelope at
+INFO level for cost observability. When the configured cap is exceeded, a
+WARN fires in addition to the abort.
+
+### Bedrock backend
+
+```bash
+export CLAUDE_CODE_USE_BEDROCK=true
+export ANTHROPIC_BEDROCK_BASE_URL=https://bedrock-runtime.us-east-1.amazonaws.com
+# Plus the standard AWS_* credentials your AWS SDK config requires
+```
+
+### OpenAI / Ollama backends
+
+```bash
+# OpenAI-compatible API
+export USE_OPENAI=true
+export OPENAI_API_KEY=...
+
+# Local Ollama (defaults to http://localhost:11434)
+export USE_OLLAMA=true
+```
+
 ## Example Setups
 
 Complete example configurations for different project types:

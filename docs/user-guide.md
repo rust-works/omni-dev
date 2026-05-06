@@ -9,10 +9,11 @@ intelligence.
 2. [Core Concepts](#core-concepts)
 3. [Command Reference](#command-reference)
 4. [Atlassian Integration](#atlassian---jira-and-confluence-integration)
-5. [Contextual Intelligence](#contextual-intelligence)
-6. [Workflows](#workflows)
-7. [Advanced Usage](#advanced-usage)
-8. [Best Practices](#best-practices)
+5. [Datadog Integration](#datadog-integration)
+6. [Contextual Intelligence](#contextual-intelligence)
+7. [Workflows](#workflows)
+8. [Advanced Usage](#advanced-usage)
+9. [Best Practices](#best-practices)
 
 ## Getting Started
 
@@ -113,7 +114,6 @@ omni-dev git commit message twiddle [RANGE] [OPTIONS]
 | `--save-only FILE` | Save suggestions to file instead of applying | `--save-only suggestions.yaml` |
 | `--context-dir PATH` | Custom context directory | `--context-dir ./config` |
 | `--no-context` | Disable contextual features | `--no-context` |
-| `--edit` | Edit amendments in external editor before applying | `--edit` |
 
 **Commit Range Examples:**
 
@@ -175,6 +175,53 @@ amendments:
       - Role-based access control
 ```
 
+### `check` - Commit Message Validation
+
+Validate commit messages against guidelines without modifying anything.
+Useful in CI, pre-push hooks, and as a non-destructive sibling to `twiddle`.
+
+```bash
+# Default range: commits ahead of main
+omni-dev git commit message check
+
+# Explicit range
+omni-dev git commit message check 'HEAD~5..HEAD'
+
+# CI-friendly: exit non-zero on any issue (warnings included)
+omni-dev git commit message check --strict
+
+# Quiet output (errors/warnings only)
+omni-dev git commit message check --quiet
+
+# Show analysis for passing commits too
+omni-dev git commit message check --verbose
+omni-dev git commit message check --show-passing
+
+# Structured output for tooling
+omni-dev git commit message check --format json
+omni-dev git commit message check --format yaml
+
+# Offer to apply suggested fixes when issues are found
+omni-dev git commit message check --twiddle
+```
+
+**Key Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--strict` | Exit non-zero if any issue is reported (including warnings) |
+| `--quiet` | Suppress info-level output |
+| `--verbose` | Include detailed analysis for every commit |
+| `--show-passing` | Include passing commits in the report |
+| `--format text\|json\|yaml` | Output format (default `text`) |
+| `--no-coherence` | Skip the cross-commit coherence pass |
+| `--no-suggestions` | Skip generating corrected message suggestions |
+| `--twiddle` | When issues are found, prompt to apply suggested fixes |
+| `--guidelines PATH` | Use a guidelines file outside `.omni-dev/` |
+| `--context-dir PATH` | Custom context directory |
+| `--concurrency N` | Maximum concurrent AI requests (default 4) |
+| `--model MODEL` / `--beta-header KEY:VALUE` | Override the Claude model and beta headers |
+
 ### `create pr` - AI-Powered Pull Request Creation
 
 Generate professional pull requests with AI-analyzed descriptions:
@@ -194,6 +241,12 @@ omni-dev git branch create pr [BASE_BRANCH] [OPTIONS]
 
 | Option | Description | Example |
 |--------|-------------|---------|
+| `--base BRANCH` | Base branch (defaults to `main` / `master`) | `--base release/2.x` |
+| `--ready` | Force the PR to open as ready-for-review | `--ready` |
+| `--draft` | Force the PR to open as a draft | `--draft` |
+| `--no-push` | Skip the implicit `git push` before creating the PR | `--no-push` |
+| `--model MODEL` | Override the Claude model used to draft the PR body | `--model claude-opus-4-7` |
+| `--context-dir PATH` | Custom context directory (defaults to `.omni-dev/`) | `--context-dir ./config` |
 | `--auto-apply` | Create/update PR without confirmation | `--auto-apply` |
 | `--save-only FILE` | Save PR details to YAML file instead of creating | `--save-only pr-details.yaml` |
 
@@ -246,6 +299,110 @@ description: |
   error handling for edge cases.
 ```
 
+### `ai` - Assistant Commands
+
+Diagnostics, history export, and skill management for Claude Code
+integrations.
+
+#### `ai chat` — One-shot chat session
+
+```bash
+# Use the configured model
+omni-dev ai chat
+
+# Override the model for this session
+omni-dev ai chat --model claude-opus-4-7
+```
+
+Honours the same backend dispatch as the rest of omni-dev (see
+[Configuration Guide — AI Backend Selection](configuration.md#ai-backend-selection)).
+
+#### `ai claude history sync` — Export conversations
+
+Export Claude Code conversation history to a target directory as one
+`.jsonl` (and optionally `.md`) per chat, grouped by encoded project slug.
+Re-running is idempotent: unchanged sessions are skipped, modified sessions
+are rewritten via tempfile + rename, and source `mtime` is preserved on the
+target.
+
+```bash
+# Basic export to ~/coaching/claude-history
+omni-dev ai claude history sync --target ~/coaching/claude-history
+
+# Both formats side-by-side (markdown is LLM-friendly with YAML frontmatter)
+omni-dev ai claude history sync --target ~/history --output-format jsonl,markdown
+
+# Restrict to one project (encoded slug or decoded cwd path)
+omni-dev ai claude history sync --target ~/history --project -Users-jky-wrk
+
+# Window: relative duration or RFC 3339
+omni-dev ai claude history sync --target ~/history --since 7d
+omni-dev ai claude history sync --target ~/history --since 2026-04-01T00:00:00Z
+
+# Hide system-side events from markdown (jsonl is byte-identical regardless)
+omni-dev ai claude history sync --target ~/history --output-format markdown --exclude-system
+
+# Preview without touching the target
+omni-dev ai claude history sync --target ~/history --dry-run
+
+# Delete target files for sessions removed upstream (scoped to listed formats)
+omni-dev ai claude history sync --target ~/history --prune
+```
+
+The export is a behavioural transcript — prompts, responses, thinking,
+tool calls, tool-result metadata, and structured agent-to-user interactions
+(`AskUserQuestion`, denials, interrupts). Sub-agent internal turns are not
+captured. See `omni-dev ai claude history sync --help` for the complete
+flag reference.
+
+#### `ai claude skills` — Worktree-aware skill distribution
+
+Manage `.claude/skills/` symlinks and the managed `.gitignore` exclude
+block across a repository and its worktrees.
+
+```bash
+# Sync skills from the source repo into the current dir (and all its worktrees)
+omni-dev ai claude skills sync --worktrees
+
+# Sync into an explicit target
+omni-dev ai claude skills sync --source ~/wrk/canonical --target ~/wrk/feature-branch
+
+# Inspect what `sync` left behind
+omni-dev ai claude skills status
+omni-dev ai claude skills status --worktrees --format yaml
+
+# Remove the symlinks and exclude-block entries
+omni-dev ai claude skills clean --worktrees
+omni-dev ai claude skills clean --dry-run
+```
+
+#### `ai claude cli model resolve` — Diagnostics
+
+Print how Claude Code resolves the active model in the current directory
+(useful when project / user / env settings disagree).
+
+```bash
+omni-dev ai claude cli model resolve
+```
+
+### `commands generate` - Command Templates
+
+Bootstrap a project's `.omni-dev/` directory with the canonical command
+templates omni-dev expects.
+
+```bash
+# All templates at once
+omni-dev commands generate all
+
+# Or individually
+omni-dev commands generate commit-twiddle
+omni-dev commands generate pr-create
+omni-dev commands generate pr-update
+```
+
+Each subcommand writes a template to the standard location under
+`.omni-dev/`. Run from the repository root.
+
 ### `atlassian` - JIRA and Confluence Integration
 
 Read, edit, and manage JIRA issues and Confluence pages from the command line.
@@ -286,14 +443,32 @@ omni-dev atlassian jira read PROJ-123
 omni-dev atlassian jira read PROJ-123 -o issue.md
 omni-dev atlassian jira read PROJ-123 --format adf   # raw ADF JSON
 
+# Include specific custom fields
+omni-dev atlassian jira read PROJ-123 --fields "Acceptance Criteria,customfield_19300"
+
+# Include every populated custom field
+omni-dev atlassian jira read PROJ-123 --all-fields
+
 # Write changes back (prompts for confirmation)
 omni-dev atlassian jira write PROJ-123 issue.md
 omni-dev atlassian jira write PROJ-123 issue.md --force
 omni-dev atlassian jira write PROJ-123 issue.md --dry-run
 
+# Update fields without re-posting the description body
+omni-dev atlassian jira write PROJ-123 --no-content --assignee 5b10a2844c20165700ede21g
+omni-dev atlassian jira write PROJ-123 --no-content --parent EPIC-1
+omni-dev atlassian jira write PROJ-123 --no-content --reporter "" --set-field "Priority=High"
+
 # Interactive edit: fetch -> $EDITOR -> push
 omni-dev atlassian jira edit PROJ-123
 ```
+
+`--assignee` / `--reporter` take an Atlassian `accountId` — pass the empty
+string `""` to clear, or `"-1"` to trigger automatic assignment. Use
+[`jira user search`](#jira-user-search) to resolve a display name or email
+to an `accountId`. `--parent` sets JIRA's system parent field (Epic → Story
+or Story → Sub-task); it is distinct from "Composition" links created via
+[`jira link`](#jira-issue-links).
 
 The edit command opens an interactive loop:
 1. Fetches the issue and writes JFM to a temp file
@@ -350,11 +525,18 @@ omni-dev atlassian jira create issue.md --project PROJ --type Bug --summary "Fix
 # From ADF JSON (all metadata via flags)
 omni-dev atlassian jira create body.json --format adf --project PROJ --summary "Title"
 
+# Set custom fields inline (repeatable)
+omni-dev atlassian jira create issue.md --set-field "Story Points=5" \
+  --set-field "Sprint=customfield_10020"
+
 # Preview without creating
 omni-dev atlassian jira create issue.md --dry-run
 ```
 
-Prints the created issue key (e.g., `PROJ-124`) to stdout.
+Prints the created issue key (e.g., `PROJ-124`) to stdout. `--set-field`
+values are parsed as YAML scalars (numbers, bools) when possible, falling
+back to strings; entries override the frontmatter `custom_fields:` map for
+the same name.
 
 #### JIRA: Transitions
 
@@ -442,9 +624,66 @@ omni-dev atlassian jira sprint list --board-id 1 --state active
 
 # List issues in a sprint
 omni-dev atlassian jira sprint issues --sprint-id 10
+omni-dev atlassian jira sprint issues --sprint-id 10 --jql "status = Open"
 
 # Add issues to a sprint
 omni-dev atlassian jira sprint add --sprint-id 10 --issues PROJ-1,PROJ-2,PROJ-3
+
+# Create a new sprint (start/end dates and goal optional)
+omni-dev atlassian jira sprint create --board-id 1 --name "Sprint 42" \
+  --start-date 2026-05-01 --end-date 2026-05-14 --goal "Ship checkout v2"
+
+# Update an existing sprint (only supplied fields change)
+omni-dev atlassian jira sprint update --sprint-id 10 --state active
+omni-dev atlassian jira sprint update --sprint-id 10 --name "Sprint 42 (extended)" \
+  --end-date 2026-05-21
+```
+
+#### JIRA: Watchers
+
+```bash
+# List watchers
+omni-dev atlassian jira watcher list PROJ-123
+
+# Add or remove a watcher (account ID — use `jira user search` to resolve)
+omni-dev atlassian jira watcher add PROJ-123 --user 5b10a2844c20165700ede21g
+omni-dev atlassian jira watcher remove PROJ-123 --user 5b10a2844c20165700ede21g
+```
+
+#### JIRA: Worklogs
+
+```bash
+# List worklog entries
+omni-dev atlassian jira worklog list PROJ-123
+omni-dev atlassian jira worklog list PROJ-123 --limit 100
+
+# Log time (`--time-spent` accepts JIRA duration format: "2h 30m", "1d", "45m")
+omni-dev atlassian jira worklog add PROJ-123 --time-spent "2h 30m" \
+  --comment "Investigated cache invalidation"
+omni-dev atlassian jira worklog add PROJ-123 --time-spent 1d \
+  --started "2026-04-16T09:00:00.000+0000"
+```
+
+#### JIRA: User Search
+
+Resolve a display name or email substring to an Atlassian `accountId` —
+required input for `jira write --assignee/--reporter` and `jira watcher
+add/remove`.
+
+```bash
+omni-dev atlassian jira user search --query "Alice"
+omni-dev atlassian jira user search --query "@example.com" --limit 100
+```
+
+#### JIRA: Development Info
+
+Show linked PRs, branches, and repositories for an issue (requires JIRA's
+GitHub/Bitbucket integration).
+
+```bash
+omni-dev atlassian jira dev PROJ-123
+omni-dev atlassian jira dev PROJ-123 --type pullrequest
+omni-dev atlassian jira dev PROJ-123 --app GitHub --summary
 ```
 
 #### JIRA: Issue Links
@@ -568,6 +807,88 @@ omni-dev atlassian confluence delete 12345 --force
 omni-dev atlassian confluence delete 12345 --force --purge
 ```
 
+#### Confluence: Children
+
+List direct children of a page or top-level pages in a space.
+
+```bash
+# Direct children of a page
+omni-dev atlassian confluence children 12345
+
+# Top-level pages in a space (no parent ID)
+omni-dev atlassian confluence children --space ENG
+
+# Recursive tree (--max-depth 0 = unlimited)
+omni-dev atlassian confluence children 12345 --recursive
+omni-dev atlassian confluence children --space ENG --recursive --max-depth 3
+```
+
+#### Confluence: Comments
+
+```bash
+# List comments
+omni-dev atlassian confluence comment list 12345
+omni-dev atlassian confluence comment list 12345 --limit 100
+
+# Add a comment from a file or stdin
+omni-dev atlassian confluence comment add 12345 comment.md
+echo "Looks good" | omni-dev atlassian confluence comment add 12345
+
+# Add an ADF JSON comment
+omni-dev atlassian confluence comment add 12345 body.json --format adf
+```
+
+#### Confluence: Labels
+
+```bash
+# List labels on a page
+omni-dev atlassian confluence label list 12345
+
+# Add or remove labels (comma-separated)
+omni-dev atlassian confluence label add 12345 --labels architecture,reviewed
+omni-dev atlassian confluence label remove 12345 --labels deprecated
+```
+
+#### Confluence: User Search
+
+```bash
+omni-dev atlassian confluence user search --query "Alice"
+omni-dev atlassian confluence user search --query "@example.com" --limit 50
+```
+
+#### Confluence: Bulk Download
+
+Recursively download a page tree (or an entire space) to disk. Each page is
+written to a `<title>.md` (or `.adf.json`) file mirroring the page tree.
+
+```bash
+# Download a subtree starting at a single page
+omni-dev atlassian confluence download 12345 --output-dir ./pages
+
+# Download every top-level page in a space
+omni-dev atlassian confluence download --space ENG --output-dir ./eng-docs
+
+# Download as raw ADF JSON instead of JFM
+omni-dev atlassian confluence download 12345 --format adf
+
+# Filter by title (case-insensitive substring; non-matching parents are
+# still traversed so deeply-nested matches still surface)
+omni-dev atlassian confluence download --space ENG --title-filter "auth"
+
+# Resume after an interrupted run (uses a manifest to skip done pages)
+omni-dev atlassian confluence download --space ENG --resume
+
+# Tune concurrency and depth
+omni-dev atlassian confluence download --space ENG --concurrency 16 --max-depth 5
+
+# Conflict resolution when a file already exists
+omni-dev atlassian confluence download --space ENG --on-conflict overwrite
+omni-dev atlassian confluence download --space ENG --on-conflict skip
+```
+
+`--on-conflict` accepts `backup` (default — writes `.bak` and overwrites),
+`skip`, or `overwrite`.
+
 #### Offline Format Conversion
 
 Convert between JFM markdown and ADF JSON locally without credentials:
@@ -579,10 +900,15 @@ omni-dev atlassian convert to-adf issue.md --compact
 
 # ADF JSON to markdown
 omni-dev atlassian convert from-adf issue.json
+omni-dev atlassian convert from-adf issue.json --strip-local-ids   # cleaner output
 
 # Pipe for inspection
 cat issue.md | omni-dev atlassian convert to-adf | jq .
 ```
+
+`--strip-local-ids` drops the `localId` attributes ADF emits on tables,
+panels, etc. — useful when the rendered markdown is going to a human
+reviewer rather than back into Atlassian.
 
 #### Auto-Pagination
 
@@ -634,6 +960,112 @@ Hidden content here.
 ```markdown
 ::card[https://example.com/page]
 ```
+
+## Datadog Integration
+
+omni-dev exposes read-only access to the Datadog v1/v2 APIs through the
+`omni-dev datadog` command tree. Every subcommand accepts
+`-o table|json|yaml|yamls|jsonl` (default `table`).
+
+### Authentication
+
+```bash
+# Configure credentials interactively (writes to ~/.omni-dev/settings.json)
+omni-dev datadog auth login
+
+# Verify credentials by calling /api/v1/validate
+omni-dev datadog auth status
+
+# Remove stored credentials
+omni-dev datadog auth logout
+```
+
+Environment variables override stored settings: `DATADOG_API_KEY`,
+`DATADOG_APP_KEY`, `DATADOG_SITE`. `DATADOG_SITE` defaults to
+`datadoghq.com`; `datadoghq.eu`, `us3.datadoghq.com`, `us5.datadoghq.com`,
+`ap1.datadoghq.com`, and `ddog-gov.com` are recognised. For on-prem or
+proxied installs, set `DATADOG_API_URL` to override the site-derived URL
+entirely.
+
+### Metrics
+
+```bash
+# Point-in-time timeseries query
+omni-dev datadog metrics query --query 'avg:system.cpu.user{*}' --from 15m
+omni-dev datadog metrics query --query 'sum:requests.total{env:prod}.as_rate()' \
+  --from 1h --to now
+
+# List available metric names (optionally filtered by host or ingestion cutoff)
+omni-dev datadog metrics catalog list --host web-01
+```
+
+`--from` and `--to` accept relative shorthand (`15m`, `1h`, `2d`), the
+literal `now`, RFC 3339 timestamps, or Unix epoch seconds.
+
+### Monitors
+
+```bash
+# Filter by name / tags / monitor_tags
+omni-dev datadog monitor list --name 'API latency' --tags env:prod
+omni-dev datadog monitor list --monitor-tags team:platform --limit 50
+
+# Faceted search
+omni-dev datadog monitor search --query 'status:alert AND env:prod'
+
+# Single monitor by id
+omni-dev datadog monitor get 12345
+```
+
+### Dashboards
+
+```bash
+# List all dashboards (optionally just shared ones)
+omni-dev datadog dashboard list
+omni-dev datadog dashboard list --filter-shared
+
+# Fetch a single dashboard's full definition
+omni-dev datadog dashboard get abc-123-xyz
+```
+
+Per-widget schemas are heterogeneous, so widgets are preserved as raw JSON
+in the response.
+
+### Logs
+
+```bash
+omni-dev datadog logs search --filter 'service:api status:error' --from 1h
+omni-dev datadog logs search --filter '@http.status_code:5*' \
+  --from 30m --limit 500 --sort timestamp-asc
+```
+
+Pagination is cursor-based (`meta.page.after`); `--limit 0` auto-paginates
+with a hard cap of 10 000 events per invocation.
+
+### Events, SLOs, hosts, downtimes
+
+```bash
+# Events stream — auto-paginates (default `--limit 100`; `0` = all up to 10 000)
+omni-dev datadog events list --filter 'service:api' --from 1h \
+  --sources kubernetes,aws --tags env:prod
+
+# Service Level Objectives — auto-paginates, hard cap 10 000
+omni-dev datadog slo list --tags team:platform
+omni-dev datadog slo list --query 'checkout' --metrics-query 'requests'
+omni-dev datadog slo get abc123def456
+
+# Hosts last reporting since the cutoff
+omni-dev datadog hosts list --filter env:prod --limit 200
+
+# Scheduled downtimes
+omni-dev datadog downtime list
+omni-dev datadog downtime list --active-only
+```
+
+### MCP equivalents
+
+Every Datadog CLI subcommand has a matching `datadog_*` MCP tool — see
+[docs/mcp.md](mcp.md#datadog-14-tools). The MCP versions accept the same
+filters and emit YAML matching the CLI's `-o yaml` output.
 
 ## Contextual Intelligence
 

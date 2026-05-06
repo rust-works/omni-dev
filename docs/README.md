@@ -18,6 +18,11 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 - **[User Guide - Atlassian](user-guide.md#atlassian---jira-and-confluence-integration)** - JIRA and Confluence commands
 - **[JFM Specification](specs/jfm.md)** - JIRA-Flavored Markdown format and ADF conversion
 
+### MCP Server
+
+- **[MCP Reference](mcp.md)** - Tool catalog, resources, and setup for Claude Desktop / Claude Code / MCP Inspector
+- **[ADR-0021](adrs/adr-0021.md)** - Architectural decision behind the second binary
+
 ### Reference & Support
 
 - **[Troubleshooting](troubleshooting.md)** - Common issues and solutions  
@@ -90,6 +95,8 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 | **Workflow Integration** | [User Guide - Workflows](user-guide.md#workflows) | [Examples - Enterprise](examples.md#enterprise-monorepo) |
 | **Configuration Quality** | [Best Practices](configuration-best-practices.md) | [Config Internals](plan/config-internals.md) |
 | **Atlassian Integration** | [User Guide - Atlassian](user-guide.md#atlassian---jira-and-confluence-integration) | [JFM Spec](specs/jfm.md) |
+| **Datadog Integration** | [User Guide - Datadog](user-guide.md#datadog-integration) | [README - Datadog](../README.md#-datadog-integration-read-only) |
+| **MCP Server** | [MCP Reference](mcp.md) | [README - MCP Server](../README.md#-mcp-server) |
 
 ## 🔗 External Resources
 
