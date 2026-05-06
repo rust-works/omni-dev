@@ -180,8 +180,10 @@ omni-dev atlassian convert to-adf input.md
 
 ### 📊 Datadog Integration (read-only)
 
-Authenticate against the Datadog API. Subsequent slices add metrics, monitor,
-dashboard, and logs subcommands.
+Authenticate against the Datadog API and query metrics, monitors, dashboards,
+logs, events, SLOs, hosts, and downtimes. See the [Datadog section of the
+user guide](docs/user-guide.md#datadog-integration) for the full subcommand
+reference.
 
 ```bash
 # Configure Datadog API credentials (prompts for API key, APP key, and site)
@@ -190,18 +192,22 @@ omni-dev datadog auth login
 # Verify the credentials by calling /api/v1/validate
 omni-dev datadog auth status
 
-# Remove Datadog credentials from ~/.omni-dev/settings.json
-omni-dev datadog auth logout
+# Query metrics, monitors, dashboards, logs, and SLOs
+omni-dev datadog metrics query --query 'avg:system.cpu.user{*}' --from 15m
+omni-dev datadog monitor list --tags env:prod
+omni-dev datadog dashboard list
+omni-dev datadog logs search --filter 'service:api status:error' --from 1h
+omni-dev datadog slo list --tags team:platform
 ```
 
 `DATADOG_SITE` defaults to `datadoghq.com`. Other regions (`datadoghq.eu`,
 `us3.datadoghq.com`, `us5.datadoghq.com`, `ap1.datadoghq.com`, `ddog-gov.com`)
 are recognised without warning. Environment variables `DATADOG_API_KEY`,
-`DATADOG_APP_KEY`, `DATADOG_SITE` override the stored settings.
+`DATADOG_APP_KEY`, `DATADOG_SITE` override the stored settings. For on-prem
+or proxied installs, set `DATADOG_API_URL` to override the site-derived URL.
 
-For on-prem or proxied Datadog installs, set `DATADOG_API_URL` to the full
-API base URL (e.g. `https://datadog.corp.example`) — it overrides the
-site-derived URL entirely.
+All Datadog subcommands are also exposed as MCP tools (`datadog_*`) — see
+[docs/mcp.md](docs/mcp.md#datadog-14-tools).
 
 ### ✏️ Manual Amendment
 
@@ -280,21 +286,35 @@ listed in `--output-format`.
 
 omni-dev ships an optional **Model Context Protocol** server so AI assistants
 (Claude Desktop, Claude Code, the MCP Inspector, custom agents) can call
-omni-dev over stdio instead of shelling out to the CLI.
+omni-dev over stdio instead of shelling out to the CLI. The server is
+delivered as a second binary, `omni-dev-mcp`, gated behind the `mcp` Cargo
+feature (see [ADR-0021](docs/adrs/adr-0021.md)).
 
-Tools currently exposed:
+Tools cover six domains:
 
-- `git_view_commits` — YAML commit analysis (mirrors `omni-dev git commit message view`)
+| Domain | Examples |
+|--------|----------|
+| **Git** (5) | `git_view_commits`, `git_branch_info`, `git_check_commits`, `git_twiddle_commits`, `git_create_pr` |
+| **JIRA** (28) | core read/write/search/transition/comment/link/dev/delete; sprints, boards, watchers, worklogs, fields, attachments, projects, changelog |
+| **Confluence** (13) | read/write/search/create/delete/download/children, comments, labels, user search |
+| **Atlassian shared** (2) | `atlassian_auth_status`, `atlassian_convert` (offline JFM ↔ ADF) |
+| **Datadog** (14) | metrics, monitors, dashboards, logs, events, SLOs, hosts, downtimes, metrics catalog |
+| **AI / Config** (5) | `ai_chat`, `claude_skills_*`, `config_models_show` |
 
 Resources exposed via URI templates:
 
-| URI template                   | Returns                   |
-|--------------------------------|---------------------------|
-| `git://repo/commits/{range}`   | YAML commit analysis      |
-| `jira://issue/{key}`           | JIRA issue as JFM         |
-| `jira://issue/{key}.adf`       | JIRA issue body as ADF    |
-| `confluence://page/{id}`       | Confluence page as JFM    |
-| `confluence://page/{id}.adf`   | Confluence page body as ADF |
+| URI template                    | Returns                          |
+|---------------------------------|----------------------------------|
+| `git://repo/commits/{range}`    | YAML commit analysis             |
+| `jira://issue/{key}`            | JIRA issue as JFM                |
+| `jira://issue/{key}.adf`        | JIRA issue body as ADF           |
+| `confluence://page/{id}`        | Confluence page as JFM           |
+| `confluence://page/{id}.adf`    | Confluence page body as ADF      |
+| `omni-dev://specs/{name}`       | Embedded reference specs (e.g. `jfm`) |
+
+See [docs/mcp.md](docs/mcp.md) for the full tool catalog, resource
+reference, cross-cutting parameters (`output_file`, `confirm`), and
+troubleshooting.
 
 #### Install
 
@@ -348,23 +368,11 @@ npx @modelcontextprotocol/inspector omni-dev-mcp
 ```
 
 The Inspector opens a browser UI where you can list tools and resources,
-call `git_view_commits`, and fetch `git://repo/commits/HEAD` against the
-current working directory.
+call any tool interactively, and fetch resources against the current working
+directory.
 
-#### Troubleshooting
-
-- **Logs go to stderr.** MCP uses stdin/stdout for protocol framing, so
-  tracing output is routed to stderr — tail your client's MCP log pane or
-  run the binary in a terminal to see it.
-- **Verbose tracing:** `RUST_LOG=debug omni-dev-mcp` turns on debug-level
-  logs. Module-scoped filters work too, e.g.
-  `RUST_LOG=omni_dev::mcp=trace`.
-- **Permission errors:** the assistant runs `omni-dev-mcp` with its own
-  working directory. Tools that open a git repository use that directory
-  unless an explicit `repo_path` parameter (or a resource URI placing you
-  elsewhere) overrides it. If tool calls fail with "failed to open git
-  repository", confirm the assistant launched the server from inside the
-  repo you expected.
+For troubleshooting (stderr logs, `RUST_LOG=debug`, "failed to open git
+repository"), see [docs/mcp.md#troubleshooting](docs/mcp.md#troubleshooting).
 
 ### ⚙️ Configuration Commands
 
@@ -456,7 +464,6 @@ omni-dev git commit message twiddle 'main..HEAD' --concurrency 2
 | `--context-dir PATH` | Custom context directory | `--context-dir ./config` |
 | `--auto-apply` | Apply without confirmation | `--auto-apply` |
 | `--save-only FILE` | Save to file without applying | `--save-only fixes.yaml` |
-| `--edit` | Edit amendments in external editor | `--edit` |
 
 ## 📖 Real-World Examples
 
@@ -552,7 +559,7 @@ We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.
 
 ## 🔧 Requirements
 
-- **Rust**: 1.70+ (for installation from source)
+- **Rust**: 1.80+ (for installation from source)
 - **Claude API Key**: Required for AI-powered features
   - Get your key from
     [Anthropic Console](https://console.anthropic.com/)

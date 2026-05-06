@@ -40,6 +40,13 @@ Thank you for your interest in contributing to omni-dev! We welcome contribution
 - For major changes, please open an issue first to discuss the proposed changes
 - Make sure tests pass locally before submitting a PR
 
+### Worktree convention
+
+Create new git worktrees in the `.work/` directory of the project (e.g.
+`git worktree add .work/<branch-name> <branch-name>`). `.work/` is
+gitignored and keeps worktrees scoped to the project rather than scattered
+across sibling directories.
+
 ### Making Changes
 
 1. **Create a new branch** for your feature or bug fix:

@@ -11,7 +11,11 @@ Common issues and solutions when using omni-dev.
 5. [Performance Issues](#performance-issues)
 6. [Git Repository Issues](#git-repository-issues)
 7. [Command Line Issues](#command-line-issues)
-8. [Getting Help](#getting-help)
+8. [Atlassian Integration Issues](#atlassian-integration-issues)
+9. [Datadog Integration Issues](#datadog-integration-issues)
+10. [MCP Server Issues](#mcp-server-issues)
+11. [`claude-cli` Backend Issues](#claude-cli-backend-issues)
+12. [Getting Help](#getting-help)
 
 ## Installation Issues
 
@@ -27,7 +31,7 @@ Common issues and solutions when using omni-dev.
    # Check Rust version
    rustc --version
    
-   # Update Rust (need 1.70+)
+   # Update Rust (need 1.80+)
    rustup update
    ```
 
@@ -573,6 +577,178 @@ omni-dev git commit message twiddle HEAD~5..HEAD
 # On Windows Command Prompt:
 omni-dev git commit message twiddle "HEAD~5..HEAD"
 ```
+
+## Atlassian Integration Issues
+
+### Error: `Atlassian: missing instance URL / email / API token`
+
+**Cause**: omni-dev cannot find Atlassian credentials in the environment or
+in `~/.omni-dev/settings.json`.
+
+**Solution**:
+
+```bash
+# Run interactive setup
+omni-dev atlassian auth login
+
+# Or export environment variables (override the settings file)
+export ATLASSIAN_INSTANCE_URL=https://myorg.atlassian.net
+export ATLASSIAN_EMAIL=you@example.com
+export ATLASSIAN_API_TOKEN=...
+
+# Verify
+omni-dev atlassian auth status
+```
+
+API tokens are issued at <https://id.atlassian.com/manage-profile/security/api-tokens>.
+Note: Atlassian API tokens are scoped to the email account and the instance
+URL — copy them carefully and avoid trailing whitespace.
+
+### Error: `404 Not Found` on a known JIRA key or Confluence page
+
+Almost always one of:
+
+1. **Wrong instance URL.** Check `ATLASSIAN_INSTANCE_URL` matches the
+   Atlassian Cloud site that contains the resource.
+2. **Permission.** Your account does not have read access to the project /
+   space.
+3. **Trailing slash.** `omni-dev atlassian auth login` strips them, but if
+   you set `ATLASSIAN_INSTANCE_URL` manually, ensure no trailing slash.
+
+### MCP `jira_*` / `confluence_*` tools fail with auth errors
+
+The MCP server inherits the environment of whatever launched it (Claude
+Desktop, Claude Code, the Inspector). If you exported credentials in your
+shell after launching the client, restart the client. Run the
+`atlassian_auth_status` MCP tool to confirm what the server sees.
+
+## Datadog Integration Issues
+
+### Error: `Datadog: missing API key / APP key`
+
+**Cause**: Datadog requires both keys (an API key authenticates the source,
+an APP key scopes the user). Missing either fails.
+
+```bash
+# Interactive
+omni-dev datadog auth login
+
+# Environment variables (override the settings file)
+export DATADOG_API_KEY=...
+export DATADOG_APP_KEY=...
+export DATADOG_SITE=datadoghq.com   # or datadoghq.eu, us3.datadoghq.com, etc.
+
+# Verify
+omni-dev datadog auth status
+```
+
+### Error: `403 Forbidden` from a Datadog endpoint
+
+The site is wrong. Datadog accounts are bound to a region; an EU account
+will return 403 against `datadoghq.com`. Check the URL of the Datadog UI you
+log into in the browser:
+
+| Browser URL host          | `DATADOG_SITE`        |
+|---------------------------|-----------------------|
+| `app.datadoghq.com`       | `datadoghq.com` (default) |
+| `app.datadoghq.eu`        | `datadoghq.eu`        |
+| `app.us3.datadoghq.com`   | `us3.datadoghq.com`   |
+| `app.us5.datadoghq.com`   | `us5.datadoghq.com`   |
+| `app.ap1.datadoghq.com`   | `ap1.datadoghq.com`   |
+| `app.ddog-gov.com`        | `ddog-gov.com`        |
+
+For on-prem / proxied installs, set `DATADOG_API_URL` to the full base URL
+(it overrides the site-derived URL entirely).
+
+### Error: `429 Too Many Requests`
+
+omni-dev honours `Retry-After` and Datadog's `X-RateLimit-Reset` headers.
+When retries are exhausted, the error message includes the rate-limit
+headers so you can see the window. Either back off and retry, or split your
+query into smaller windows.
+
+## MCP Server Issues
+
+### Error: `omni-dev-mcp: command not found`
+
+The default `cargo install omni-dev` does **not** install the MCP server.
+Re-install with the feature flag:
+
+```bash
+cargo install omni-dev --features mcp
+```
+
+### Error: `failed to open git repository`
+
+The MCP server uses its own working directory when tools that need a git
+repo are called without an explicit `repo_path`. The assistant launched
+the server from somewhere outside your repo (commonly the user home).
+
+Either configure the server to launch from the repo (Claude Code's
+`.mcp.json` at the repo root does this automatically), or pass `repo_path`
+to each git tool call.
+
+### Tools list as expected but never return / hang
+
+Use the MCP Inspector to bypass the assistant and rule out a client-side
+issue:
+
+```bash
+npx @modelcontextprotocol/inspector omni-dev-mcp
+```
+
+If the Inspector also hangs, run with verbose logs:
+
+```bash
+RUST_LOG=debug omni-dev-mcp
+RUST_LOG=omni_dev::mcp=trace omni-dev-mcp
+```
+
+Logs go to **stderr** because stdin/stdout are reserved for MCP framing.
+
+## `claude-cli` Backend Issues
+
+### Error: `the assistant tried to use a tool but tools are disabled`
+
+The `claude-cli` backend runs the nested Claude session with `--tools ""`
+by default. If your prompt requires tool use, opt in with the escape hatch:
+
+```bash
+export OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS=true
+# or pass --claude-cli-allow-tools
+```
+
+A WARN is logged every time the escape hatch is active.
+
+### Error: `MCP server X not loaded`
+
+The backend also passes `--strict-mcp-config` by default, which suppresses
+all MCP servers from `~/.claude/settings.json`. Opt in with:
+
+```bash
+export OMNI_DEV_CLAUDE_CLI_ALLOW_MCP=true
+# or pass --claude-cli-allow-mcp
+```
+
+Independent of the tool escape hatch — combine or use separately.
+
+### Error: `claude -p exited with cost cap exceeded`
+
+You set a per-invocation cap and the nested session went past it:
+
+```bash
+export OMNI_DEV_CLAUDE_CLI_MAX_BUDGET_USD=2.50
+# or --claude-cli-max-budget-usd 2.50
+```
+
+omni-dev logs `total_cost_usd` from every invocation at INFO level — review
+the logs to size the cap appropriately, then re-run.
+
+### AI scratch directory growing
+
+Both the default and `claude-cli` backends spool large artefacts to
+`~/.cache/omni-dev/ai-scratch/`. The directory is not purged automatically
+(yet). Safe to delete manually between runs.
 
 ## Getting Help
 
