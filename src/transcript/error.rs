@@ -49,6 +49,10 @@ pub enum TranscriptError {
     /// An I/O error occurred (e.g. writing transcript to a file).
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// An HTTP transport or non-2xx response error.
+    #[error("HTTP error: {0}")]
+    Http(#[from] reqwest::Error),
 }
 
 #[cfg(test)]

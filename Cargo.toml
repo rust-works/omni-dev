@@ -71,6 +71,11 @@ required-features = ["mcp"]
 
 [lints.rust]
 unsafe_code = "deny"
+# Custom cfgs declared so `cargo check`/`cargo test` don't warn on them.
+# `online_tests` gates network-dependent tests that hit real services
+# (currently: youtube.com); it is *not* a cargo feature so `--all-features`
+# does not enable it. Run with `RUSTFLAGS='--cfg online_tests' cargo test`.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(online_tests)'] }
 
 [lints.clippy]
 # Lint groups (priority -1 so individual overrides win)
