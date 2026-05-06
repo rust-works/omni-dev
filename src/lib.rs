@@ -26,6 +26,7 @@ pub mod datadog;
 pub mod git;
 #[cfg(feature = "mcp")]
 pub mod mcp;
+pub mod transcript;
 pub mod utils;
 
 #[cfg(test)]
