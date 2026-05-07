@@ -1,11 +1,11 @@
 //! YouTube [`TranscriptSource`](crate::transcript::TranscriptSource).
 //!
-//! Step 3 of [issue #687](https://github.com/rust-works/omni-dev/issues/687)
-//! wires the HTTP layer for the WEB client and binds the offline parsers
-//! ([`url`], [`player_response`], [`timedtext`]) into a concrete
-//! [`TranscriptSource`] implementation. The Android / IosEmbedded fallback
-//! chain used for age-gated content lands in step 5 and will live in a
-//! sibling `client.rs` module.
+//! Wires the offline parsers ([`url`], [`player_response`], [`timedtext`])
+//! into a concrete [`TranscriptSource`] backed by an HTTP client. The
+//! request shape is pinned to the `ANDROID_VR` InnerTube client (see
+//! [`innertube`]); a `visitorData` token is scraped from the watch page
+//! on first use ([`watch_page`]) and cached for the lifetime of the
+//! [`Youtube`] instance.
 
 use std::time::Duration;
 
@@ -18,6 +18,7 @@ pub mod innertube;
 pub mod player_response;
 pub mod timedtext;
 pub mod url;
+pub mod watch_page;
 
 pub use player_response::{
     check_playability, extract_media_info, list_languages, parse as parse_player_response,
@@ -34,11 +35,16 @@ const DEFAULT_BASE_URL: &str = "https://www.youtube.com";
 /// [`crate::atlassian::client::AtlassianClient`]'s 30 s timeout.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// User-Agent advertised to YouTube. A recent desktop Chrome string maximises
-/// compatibility with the WEB context InnerTube expects; YouTube tightens
-/// caption-track availability for unrecognised UAs.
-const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
-     (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+/// User-Agent advertised to YouTube on InnerTube `/player` calls. Must
+/// match the `clientName` / `clientVersion` constants in [`innertube`] —
+/// YouTube cross-checks UA against `clientName` as part of bot detection
+/// and a mismatch is one of the flagged signals. The trailing `gzip`
+/// token isn't decorative; that's what the real Quest YouTube app emits.
+///
+/// The watch-page bootstrap in [`watch_page`] uses a separate
+/// browser-shaped UA — it scrapes a public HTML page, not InnerTube.
+const USER_AGENT: &str = "com.google.android.apps.youtube.vr.oculus/1.62.27 \
+     (Linux; U; Android 12; Quest 3) gzip";
 
 /// Whether `input` is recognised as a YouTube locator (URL or bare ID).
 ///
@@ -50,18 +56,24 @@ pub fn matches_url(input: &str) -> bool {
 
 /// YouTube [`TranscriptSource`].
 ///
-/// Holds a single [`reqwest::Client`] reused across the InnerTube and
-/// timedtext calls. Cheap to construct; in steady state it is fine to keep
-/// one instance per process.
+/// Holds a single [`reqwest::Client`] reused across the watch-page,
+/// InnerTube, and timedtext calls. Cheap to construct; in steady state
+/// it is fine to keep one instance per process.
+///
+/// On first use, a `visitorData` token is scraped from the watch page
+/// and cached in [`tokio::sync::OnceCell`]. Concurrent first-callers
+/// serialise on a single fetch rather than double-fetching, and every
+/// subsequent InnerTube `/player` POST forwards the cached token.
 #[derive(Debug, Clone)]
 pub struct Youtube {
     http: reqwest::Client,
     base_url: String,
+    visitor_data: tokio::sync::OnceCell<String>,
 }
 
 impl Youtube {
     /// Construct a YouTube source with default HTTP settings (30 s timeout,
-    /// desktop Chrome User-Agent) targeting the public YouTube origin.
+    /// ANDROID_VR User-Agent) targeting the public YouTube origin.
     pub fn new() -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
@@ -70,6 +82,7 @@ impl Youtube {
         Ok(Self {
             http,
             base_url: DEFAULT_BASE_URL.to_string(),
+            visitor_data: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -85,14 +98,32 @@ impl Youtube {
         Ok(Self {
             http,
             base_url: base_url.into(),
+            visitor_data: tokio::sync::OnceCell::new(),
         })
     }
 
-    /// Common preamble: locator → video ID → InnerTube POST →
-    /// `playerResponse` parse → playability check.
+    /// Cached `visitorData` token. First call scrapes the watch page;
+    /// concurrent first-callers serialise on a single in-flight scrape
+    /// (`OnceCell::get_or_try_init`) rather than double-fetching.
+    async fn visitor_data(&self) -> Result<&str> {
+        self.visitor_data
+            .get_or_try_init(|| watch_page::fetch_visitor_data(&self.http, &self.base_url))
+            .await
+            .map(String::as_str)
+    }
+
+    /// Common preamble: locator → video ID → watch-page bootstrap →
+    /// InnerTube POST → `playerResponse` parse → playability check.
+    ///
+    /// `extract_video_id` runs first so an invalid locator short-circuits
+    /// before any HTTP — lazy `visitor_data` fetch only happens on a
+    /// validated locator.
     async fn load_player_response(&self, locator: &str) -> Result<PlayerResponse> {
         let video_id = extract_video_id(locator)?;
-        let raw = innertube::fetch_player_response(&self.http, &self.base_url, &video_id).await?;
+        let visitor_data = self.visitor_data().await?;
+        let raw =
+            innertube::fetch_player_response(&self.http, &self.base_url, &video_id, visitor_data)
+                .await?;
         let response = parse_player_response(&raw)?;
         check_playability(&response)?;
         Ok(response)
@@ -247,9 +278,29 @@ mod tests {
         serde_json::to_string(&value).unwrap()
     }
 
+    /// Watch-page fixture used to satisfy the `visitorData` bootstrap in
+    /// every wiremock-driven test below. The exact token value doesn't
+    /// matter for these tests — only that the bootstrap returns *some*
+    /// token so [`load_player_response`] can proceed.
+    const WATCH_PAGE: &str = include_str!("youtube/fixtures/watch_page_with_visitor_data.html");
+
+    /// Mount the watch-page bootstrap mock onto `server`. Every
+    /// [`Youtube::fetch`] / `list_languages` / `info` call in the tests
+    /// below triggers this on first use (cached thereafter via
+    /// `OnceCell`).
+    async fn mount_watch_page(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/watch"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(WATCH_PAGE))
+            .mount(server)
+            .await;
+    }
+
     async fn mock_server_with_basic_video() -> MockServer {
         let server = MockServer::start().await;
         let player_response = fixture_with_rewritten_caption_urls(&server.uri());
+
+        mount_watch_page(&server).await;
 
         Mock::given(method("POST"))
             .and(path(innertube::PLAYER_PATH))
@@ -313,6 +364,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_surfaces_age_gated_as_playability_refused() {
         let server = MockServer::start().await;
+        mount_watch_page(&server).await;
         Mock::given(method("POST"))
             .and(path(innertube::PLAYER_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_string(PLAYER_RESPONSE_AGE_GATED))
@@ -343,6 +395,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_surfaces_innertube_500_as_http_error() {
         let server = MockServer::start().await;
+        mount_watch_page(&server).await;
         Mock::given(method("POST"))
             .and(path(innertube::PLAYER_PATH))
             .respond_with(ResponseTemplate::new(500))
@@ -406,8 +459,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_threads_visitor_data_into_innertube_body() {
+        // Pin the bootstrap → InnerTube wiring: the token scraped from the
+        // watch page must appear under `context.client.visitorData` on the
+        // outbound /player POST. Captures the inbound JSON and asserts on
+        // the value the fixture publishes.
+        const EXPECTED_TOKEN: &str = "CgtkUTQyOFR3aV9NSSjFoYvBBjIKCgJVUxIEGgAgPg%3D%3D";
+
+        let server = MockServer::start().await;
+        mount_watch_page(&server).await;
+        let player_response = fixture_with_rewritten_caption_urls(&server.uri());
+
+        Mock::given(method("POST"))
+            .and(path(innertube::PLAYER_PATH))
+            .respond_with(move |req: &wiremock::Request| {
+                let parsed: Value = serde_json::from_slice(&req.body).unwrap();
+                assert_eq!(
+                    parsed["context"]["client"]["visitorData"],
+                    Value::String(EXPECTED_TOKEN.to_string()),
+                );
+                ResponseTemplate::new(200).set_body_string(player_response.clone())
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/timedtext"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(TIMEDTEXT))
+            .mount(&server)
+            .await;
+
+        let yt = Youtube::with_base_url(server.uri()).unwrap();
+        let _ = yt.fetch(VIDEO_ID, &FetchOpts::new("en-US")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn visitor_data_fetched_only_once_for_repeated_calls() {
+        // Sequential calls via a single `Youtube` instance must hit the
+        // watch page exactly once — `OnceCell` caches across calls.
+        let server = MockServer::start().await;
+        let player_response = fixture_with_rewritten_caption_urls(&server.uri());
+
+        Mock::given(method("GET"))
+            .and(path("/watch"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(WATCH_PAGE))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path(innertube::PLAYER_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_string(player_response))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/timedtext"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(TIMEDTEXT))
+            .mount(&server)
+            .await;
+
+        let yt = Youtube::with_base_url(server.uri()).unwrap();
+        let _ = yt.fetch(VIDEO_ID, &FetchOpts::new("en-US")).await.unwrap();
+        let _ = yt.fetch(VIDEO_ID, &FetchOpts::new("en-US")).await.unwrap();
+        // wiremock asserts expect(1) on server drop.
+    }
+
+    #[tokio::test]
+    async fn visitor_data_fetched_only_once_under_concurrency() {
+        // Concurrent first-callers must serialise on a single in-flight
+        // scrape rather than each issuing their own watch-page GET.
+        // `tokio::sync::OnceCell::get_or_try_init` is documented to
+        // provide this guarantee; this test pins the contract.
+        let server = MockServer::start().await;
+        let player_response = fixture_with_rewritten_caption_urls(&server.uri());
+
+        Mock::given(method("GET"))
+            .and(path("/watch"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(WATCH_PAGE))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path(innertube::PLAYER_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_string(player_response))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/timedtext"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(TIMEDTEXT))
+            .mount(&server)
+            .await;
+
+        let yt = Youtube::with_base_url(server.uri()).unwrap();
+        let opts = FetchOpts::new("en-US");
+        let (a, b, c) = tokio::join!(
+            yt.fetch(VIDEO_ID, &opts),
+            yt.fetch(VIDEO_ID, &opts),
+            yt.fetch(VIDEO_ID, &opts),
+        );
+        a.unwrap();
+        b.unwrap();
+        c.unwrap();
+        // wiremock asserts expect(1) on server drop.
+    }
+
+    #[tokio::test]
+    async fn fetch_surfaces_missing_visitor_data_as_typed_error() {
+        // Watch-page format has drifted (no visitorData token): the fetch
+        // must propagate `MissingVisitorData` rather than fall through to
+        // an unauthenticated /player call.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/watch"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("<html><body>no token</body></html>"),
+            )
+            .mount(&server)
+            .await;
+
+        let yt = Youtube::with_base_url(server.uri()).unwrap();
+        let err = yt.fetch(VIDEO_ID, &FetchOpts::new("en")).await.unwrap_err();
+        assert!(matches!(err, TranscriptError::MissingVisitorData { .. }));
+    }
+
+    #[tokio::test]
     async fn fetch_surfaces_malformed_innertube_json_as_parse_error() {
         let server = MockServer::start().await;
+        mount_watch_page(&server).await;
         Mock::given(method("POST"))
             .and(path(innertube::PLAYER_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_string("{ not json"))
