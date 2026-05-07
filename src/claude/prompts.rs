@@ -180,7 +180,7 @@ TYPE SELECTION RULES (must match the commit checker's expectations):
    - Changing doc comments or help text in source code is `refactor` or `fix`, not `docs`
 3. Before finalizing, verify: would the commit checker accept this type given the files that changed?
 
-CRITICAL OUTPUT REQUIREMENT: You MUST include ALL commits in your response, regardless of whether they need changes or not. If a commit message is already perfect, include it unchanged. Never skip commits from the amendments array.
+CRITICAL OUTPUT REQUIREMENT: Return exactly one amendment per commit in the input `commits[]` array — no more, no fewer. Count the entries in `commits[]` and produce that many amendments. Each amendment's `commit` field must match a hash that appears in the input. DO NOT invent additional amendments, duplicate a commit hash across multiple amendments, or omit any input commit. If a commit message is already perfect, include it unchanged with its original hash.
 
 CRITICAL RESPONSE FORMAT: You MUST respond with ONLY valid YAML content. Do not include any explanatory text, markdown wrappers, or code blocks. Your entire response must be parseable YAML starting immediately with "amendments:" and containing nothing else.
 
@@ -427,7 +427,7 @@ CRITICAL ANALYSIS STEPS:
 3. **CHOOSE APPROPRIATE TYPE**: Select commit type (feat/fix/refactor/etc.) based on actual changes, not file locations
 4. **SELECT MEANINGFUL SCOPE**: Choose scope based on functionality affected, not just directory names
 
-MANDATORY: Include ALL commits in the amendments array - both those that need improvement AND those that are already well-formatted.
+MANDATORY CARDINALITY: The repository data above contains a `commits[]` array. Return exactly one amendment per entry — no more, no fewer. Each amendment's `commit` field must be a hash that appears in `commits[]`. Do not invent additional commits, do not emit two amendments with the same hash, and do not skip any input commit.
 
 For each commit, analyze whether improvements are needed:
 - Check if it follows conventional commit format
@@ -439,7 +439,7 @@ For each commit, analyze whether improvements are needed:
 
 Remember: File paths and directory names are just hints. The diff content shows the real changes.
 
-CRITICAL: Even if a commit message is perfect and needs no changes, include it in the amendments array with its current message unchanged. This allows users to review all commits and make manual adjustments if desired. DO NOT skip any commits from the amendments array.
+CRITICAL: Even if a commit message is perfect and needs no changes, include it in the amendments array with its current message and original hash. Do not skip any commit, and do not emit more amendments than there are commits in the input.
 
 SUMMARY FIELD: For each commit, include a `summary` field containing one sentence describing what the commit changes. Keep it factual and brief."
     )
@@ -473,7 +473,7 @@ pub fn generate_contextual_user_prompt(repo_yaml: &str, context: &CommitContext)
     prompt.push('\n');
 
     // Add context-specific focus areas
-    prompt.push_str("MANDATORY: Include ALL commits in the amendments array - both those needing improvement AND those already well-formatted.\n\n");
+    prompt.push_str("MANDATORY CARDINALITY: The repository data above contains a `commits[]` array. Return exactly one amendment per entry — no more, no fewer. Each amendment's `commit` field must be a hash that appears in `commits[]`. Do not invent additional commits, do not emit two amendments with the same hash, and do not skip any input commit.\n\n");
     prompt.push_str("For each commit, analyze whether improvements are needed:\n");
     prompt.push_str("- Check if it follows conventional commit format\n");
     prompt.push_str("- Verify descriptions are clear and accurate\n");
@@ -531,7 +531,7 @@ pub fn generate_contextual_user_prompt(repo_yaml: &str, context: &CommitContext)
         }
     }
 
-    prompt.push_str("\nCRITICAL: Include ALL commits in the amendments array. Even if a commit message is perfect and needs no changes, include it with its current message unchanged. This allows users to review all commits and make manual adjustments if desired. DO NOT skip any commits from the amendments array.");
+    prompt.push_str("\nCRITICAL: Return exactly one amendment per input commit. Even if a commit message is perfect, include it with its current message and original hash. Do not skip any commit, and do not emit more amendments than there are commits in the input.");
     prompt.push_str(SUMMARY_INSTRUCTION);
 
     prompt
@@ -1335,7 +1335,9 @@ mod tests {
     #[test]
     fn user_prompt_requires_all_commits() {
         let prompt = generate_user_prompt("test");
-        assert!(prompt.contains("Include ALL commits"));
+        assert!(prompt.contains("exactly one amendment per entry"));
+        assert!(prompt.contains("Do not skip any commit"));
+        assert!(prompt.contains("do not emit more amendments"));
     }
 
     // ── generate_contextual_system_prompt ──────────────────────────
