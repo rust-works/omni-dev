@@ -53,6 +53,17 @@ pub enum TranscriptError {
     /// An HTTP transport or non-2xx response error.
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
+
+    /// The bootstrap GET to a media platform's watch page returned a body
+    /// without the expected session-bootstrap token. The page format drifts
+    /// every few months; this variant signals the scrape needs to be
+    /// retuned and is distinct from a generic [`Self::ParseError`] so
+    /// callers can react to it specifically (e.g. a clearer CLI message).
+    #[error("watch page at {url} did not contain the expected session token")]
+    MissingVisitorData {
+        /// The URL whose response body was scraped.
+        url: String,
+    },
 }
 
 #[cfg(test)]
@@ -138,5 +149,15 @@ mod tests {
         let err = TranscriptError::InvalidLocator("x".to_string());
         let dbg = format!("{err:?}");
         assert!(dbg.contains("InvalidLocator"));
+    }
+
+    #[test]
+    fn missing_visitor_data_display() {
+        let err = TranscriptError::MissingVisitorData {
+            url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("watch page"));
+        assert!(msg.contains("https://www.youtube.com/watch?v=dQw4w9WgXcQ"));
     }
 }
