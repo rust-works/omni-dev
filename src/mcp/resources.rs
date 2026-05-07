@@ -368,7 +368,7 @@ pub fn list_resource_templates_result() -> ListResourceTemplatesResult {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::await_holding_lock)]
 mod tests {
     use super::*;
 
