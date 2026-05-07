@@ -114,7 +114,8 @@ impl CreatePrCommand {
         self.show_guidance_files_status(&project_context)?;
 
         // 4. Show AI model configuration before generation
-        let claude_client = crate::claude::create_default_claude_client(self.model.clone(), None)?;
+        let claude_client =
+            crate::claude::create_default_claude_client(self.model.clone(), None).await?;
         self.show_model_info_from_client(&claude_client)?;
 
         // 5. Show branch analysis and commit information
@@ -1386,7 +1387,7 @@ pub async fn run_create_pr(
 
     let repo_view = cmd.generate_repository_view()?;
     let context = cmd.collect_context(&repo_view).await?;
-    let claude_client = crate::claude::create_default_claude_client(model, None)?;
+    let claude_client = crate::claude::create_default_claude_client(model, None).await?;
     run_create_pr_with_client(&cmd, &repo_view, &context, &claude_client).await
 }
 
