@@ -1,5 +1,7 @@
 //! Shared test utilities for the `claude` module.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;

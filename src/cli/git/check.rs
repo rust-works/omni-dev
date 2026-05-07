@@ -1298,6 +1298,7 @@ fn format_commit_line(icon: &str, short_hash: &str, message: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::data::check::{
