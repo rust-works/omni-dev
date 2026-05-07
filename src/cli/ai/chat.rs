@@ -27,7 +27,7 @@ impl ChatCommand {
         );
         eprintln!("Enter to send, Shift+Enter for newline, Ctrl+D to exit.\n");
 
-        let client = crate::claude::create_default_claude_client(self.model, None)?;
+        let client = crate::claude::create_default_claude_client(self.model, None).await?;
 
         chat_loop(&client).await
     }
@@ -49,7 +49,7 @@ pub async fn run_chat(
     system_prompt: Option<String>,
 ) -> Result<String> {
     crate::utils::preflight::check_ai_credentials(model.as_deref())?;
-    let client = crate::claude::create_default_claude_client(model, None)?;
+    let client = crate::claude::create_default_claude_client(model, None).await?;
     let system = system_prompt
         .as_deref()
         .unwrap_or("You are a helpful assistant.");

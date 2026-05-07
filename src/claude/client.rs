@@ -1610,7 +1610,12 @@ fn validate_beta_header(model: &str, beta_header: &Option<(String, String)>) -> 
 }
 
 /// Creates a default Claude client using environment variables and settings.
-pub fn create_default_claude_client(
+///
+/// Async because the Ollama branch probes the local server for its
+/// loaded context length so token-budget checks reflect what the server
+/// actually loaded the model with (registry values are an estimate that
+/// can exceed the live limit). All other branches finish synchronously.
+pub async fn create_default_claude_client(
     model: Option<String>,
     beta_header: Option<(String, String)>,
 ) -> Result<ClaudeClient> {
@@ -1674,7 +1679,23 @@ pub fn create_default_claude_client(
             .unwrap_or_else(|| "llama2".to_string());
         validate_beta_header(&ollama_model, &beta_header)?;
         let base_url = get_env_var("OLLAMA_BASE_URL").ok();
-        let ai_client = OpenAiAiClient::new_ollama(ollama_model, base_url, beta_header)?;
+        let mut ai_client = OpenAiAiClient::new_ollama(ollama_model, base_url, beta_header)?;
+        match ai_client.probe_loaded_context_length().await {
+            Some(source) => {
+                info!(
+                    loaded_context_length = ai_client.loaded_context_length(),
+                    source = source.as_str(),
+                    model = %ai_client.get_metadata().model,
+                    "Probed loaded context length from local server"
+                );
+            }
+            None => {
+                debug!(
+                    "Loaded context length probe did not return a value; \
+                     falling back to registry/default for token budget"
+                );
+            }
+        }
         return Ok(ClaudeClient::new(Box::new(ai_client)));
     }
 
@@ -3975,8 +3996,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn factory_claude_cli_backend_dispatches_to_claude_cli_client() {
+    #[tokio::test]
+    async fn factory_claude_cli_backend_dispatches_to_claude_cli_client() {
         let guard = FactoryEnvGuard::new(&[
             "OMNI_DEV_AI_BACKEND",
             "USE_OPENAI",
@@ -3988,15 +4009,17 @@ mod tests {
         ]);
         guard.set("OMNI_DEV_AI_BACKEND", "claude-cli");
 
-        let client = create_default_claude_client(None, None).expect("factory should succeed");
+        let client = create_default_claude_client(None, None)
+            .await
+            .expect("factory should succeed");
         let metadata = client.get_ai_client_metadata();
         assert_eq!(metadata.provider, "Claude CLI");
         // Default model falls through to the registry's claude default.
         assert_eq!(metadata.model, "claude-sonnet-4-6");
     }
 
-    #[test]
-    fn factory_claude_cli_backend_honours_model_precedence() {
+    #[tokio::test]
+    async fn factory_claude_cli_backend_honours_model_precedence() {
         let guard = FactoryEnvGuard::new(&[
             "OMNI_DEV_AI_BACKEND",
             "USE_OPENAI",
@@ -4011,14 +4034,16 @@ mod tests {
         // CLAUDE_MODEL has higher precedence than CLAUDE_CODE_MODEL.
         guard.set("CLAUDE_MODEL", "haiku");
 
-        let client = create_default_claude_client(None, None).expect("factory should succeed");
+        let client = create_default_claude_client(None, None)
+            .await
+            .expect("factory should succeed");
         let metadata = client.get_ai_client_metadata();
         assert_eq!(metadata.provider, "Claude CLI");
         assert_eq!(metadata.model, "haiku");
     }
 
-    #[test]
-    fn factory_claude_cli_backend_explicit_model_wins_over_env() {
+    #[tokio::test]
+    async fn factory_claude_cli_backend_explicit_model_wins_over_env() {
         let guard = FactoryEnvGuard::new(&[
             "OMNI_DEV_AI_BACKEND",
             "USE_OPENAI",
@@ -4032,13 +4057,14 @@ mod tests {
         guard.set("CLAUDE_MODEL", "haiku");
 
         let client = create_default_claude_client(Some("opus".to_string()), None)
+            .await
             .expect("factory should succeed");
         let metadata = client.get_ai_client_metadata();
         assert_eq!(metadata.model, "opus");
     }
 
-    #[test]
-    fn factory_claude_cli_backend_accepts_underscore_alias() {
+    #[tokio::test]
+    async fn factory_claude_cli_backend_accepts_underscore_alias() {
         let guard = FactoryEnvGuard::new(&[
             "OMNI_DEV_AI_BACKEND",
             "USE_OPENAI",
@@ -4050,8 +4076,129 @@ mod tests {
         ]);
         guard.set("OMNI_DEV_AI_BACKEND", "claude_cli");
 
-        let client = create_default_claude_client(None, None).expect("factory should succeed");
+        let client = create_default_claude_client(None, None)
+            .await
+            .expect("factory should succeed");
         let metadata = client.get_ai_client_metadata();
         assert_eq!(metadata.provider, "Claude CLI");
+    }
+
+    #[tokio::test]
+    async fn factory_ollama_branch_probes_loaded_context_length() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v0/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    { "id": "lm-loaded", "state": "loaded", "loaded_context_length": 6144_u64 }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let guard = FactoryEnvGuard::new(&[
+            "OMNI_DEV_AI_BACKEND",
+            "USE_OPENAI",
+            "USE_OLLAMA",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "OLLAMA_BASE_URL",
+            "OLLAMA_MODEL",
+        ]);
+        guard.set("USE_OLLAMA", "true");
+        guard.set("OLLAMA_BASE_URL", &server.uri());
+        guard.set("OLLAMA_MODEL", "lm-loaded");
+
+        let client = create_default_claude_client(None, None)
+            .await
+            .expect("factory should succeed");
+        let metadata = client.get_ai_client_metadata();
+        assert_eq!(metadata.provider, "Ollama");
+        assert_eq!(metadata.model, "lm-loaded");
+        // The probed value (6144) overrides the registry/default.
+        assert_eq!(metadata.max_context_length, 6144);
+    }
+
+    #[tokio::test]
+    async fn factory_ollama_branch_falls_back_when_probe_fails() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v0/models"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/show"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let guard = FactoryEnvGuard::new(&[
+            "OMNI_DEV_AI_BACKEND",
+            "USE_OPENAI",
+            "USE_OLLAMA",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "OLLAMA_BASE_URL",
+            "OLLAMA_MODEL",
+        ]);
+        guard.set("USE_OLLAMA", "true");
+        guard.set("OLLAMA_BASE_URL", &server.uri());
+        guard.set("OLLAMA_MODEL", "no-such-model");
+
+        let client = create_default_claude_client(None, None)
+            .await
+            .expect("factory should succeed");
+        let metadata = client.get_ai_client_metadata();
+        // Probe failure → fall back to the registry estimate (which
+        // resolves to FALLBACK_INPUT_CONTEXT for unknown models).
+        let registry_value =
+            crate::claude::model_config::get_model_registry().get_input_context("no-such-model");
+        assert_eq!(metadata.max_context_length, registry_value);
+    }
+
+    /// LM Studio path is tested above. This complements it by exercising
+    /// the Ollama-native fallthrough through the factory, so the
+    /// info-log arm fires for both `ProbeSource` variants.
+    #[tokio::test]
+    async fn factory_ollama_branch_probes_via_ollama_native() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v0/models"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/show"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model_info": { "llama.context_length": 12288_u64 }
+            })))
+            .mount(&server)
+            .await;
+
+        let guard = FactoryEnvGuard::new(&[
+            "OMNI_DEV_AI_BACKEND",
+            "USE_OPENAI",
+            "USE_OLLAMA",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "OLLAMA_BASE_URL",
+            "OLLAMA_MODEL",
+        ]);
+        guard.set("USE_OLLAMA", "true");
+        guard.set("OLLAMA_BASE_URL", &server.uri());
+        guard.set("OLLAMA_MODEL", "ollama-native-model");
+
+        let client = create_default_claude_client(None, None)
+            .await
+            .expect("factory should succeed");
+        let metadata = client.get_ai_client_metadata();
+        assert_eq!(metadata.max_context_length, 12288);
     }
 }
