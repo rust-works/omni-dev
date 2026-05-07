@@ -3,6 +3,8 @@
 //! These utilities are consumed by unit tests across the crate and must
 //! stay in sync between shim-writing sites — see issue #642.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 #[cfg(unix)]
 pub(crate) mod shim {
     use std::path::Path;
