@@ -89,6 +89,7 @@ pub(crate) fn parse_editor_command(editor: &str) -> (&str, Vec<&str>) {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
