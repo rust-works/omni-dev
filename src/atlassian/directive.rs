@@ -202,6 +202,7 @@ pub fn is_container_close(line: &str, min_colons: usize) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

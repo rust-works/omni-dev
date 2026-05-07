@@ -218,6 +218,7 @@ fn parse_quoted_value(text: &str, quote: char) -> Option<(String, &str)> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
