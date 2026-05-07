@@ -166,7 +166,8 @@ impl TwiddleCommand {
             .as_deref()
             .map(parse_beta_header)
             .transpose()?;
-        let claude_client = crate::claude::create_default_claude_client(self.model.clone(), beta)?;
+        let claude_client =
+            crate::claude::create_default_claude_client(self.model.clone(), beta).await?;
 
         // Show model information
         self.show_model_info_from_client(&claude_client)?;
@@ -263,7 +264,8 @@ impl TwiddleCommand {
             .as_deref()
             .map(parse_beta_header)
             .transpose()?;
-        let claude_client = crate::claude::create_default_claude_client(self.model.clone(), beta)?;
+        let claude_client =
+            crate::claude::create_default_claude_client(self.model.clone(), beta).await?;
 
         // Show model information
         self.show_model_info_from_client(&claude_client)?;
@@ -1073,7 +1075,8 @@ impl TwiddleCommand {
             .as_deref()
             .map(parse_beta_header)
             .transpose()?;
-        let claude_client = crate::claude::create_default_claude_client(self.model.clone(), beta)?;
+        let claude_client =
+            crate::claude::create_default_claude_client(self.model.clone(), beta).await?;
 
         for attempt in 0..=MAX_CHECK_RETRIES {
             println!();
@@ -1742,7 +1745,7 @@ pub async fn run_twiddle(
         crate::utils::preflight::check_working_directory_clean()?;
     }
 
-    let claude_client = crate::claude::create_default_claude_client(model, None)?;
+    let claude_client = crate::claude::create_default_claude_client(model, None).await?;
     run_twiddle_with_client(range, dry_run, &claude_client).await
 }
 
