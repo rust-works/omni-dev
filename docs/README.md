@@ -23,6 +23,10 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 - **[MCP Reference](mcp.md)** - Tool catalog, resources, and setup for Claude Desktop / Claude Code / MCP Inspector
 - **[ADR-0021](adrs/adr-0021.md)** - Architectural decision behind the second binary
 
+### Transcript Fetching
+
+- **[Transcript Reference](transcript.md)** - `omni-dev transcript` CLI reference, library architecture, and the recipe for adding a new source
+
 ### Reference & Support
 
 - **[Troubleshooting](troubleshooting.md)** - Common issues and solutions  
