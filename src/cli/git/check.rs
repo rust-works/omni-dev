@@ -129,7 +129,8 @@ impl CheckCommand {
             .as_deref()
             .map(parse_beta_header)
             .transpose()?;
-        let claude_client = crate::claude::create_default_claude_client(self.model.clone(), beta)?;
+        let claude_client =
+            crate::claude::create_default_claude_client(self.model.clone(), beta).await?;
 
         if self.verbose && output_format == OutputFormat::Text {
             self.show_model_info(&claude_client)?;
@@ -910,7 +911,7 @@ pub async fn run_check(
     // Preflight: validate AI credentials.
     crate::utils::check_ai_command_prerequisites(model.as_deref())?;
 
-    let claude_client = crate::claude::create_default_claude_client(model, None)?;
+    let claude_client = crate::claude::create_default_claude_client(model, None).await?;
     run_check_with_client(range, guidelines_path, strict, &claude_client).await
 }
 
