@@ -209,6 +209,38 @@ or proxied installs, set `DATADOG_API_URL` to override the site-derived URL.
 All Datadog subcommands are also exposed as MCP tools (`datadog_*`) — see
 [docs/mcp.md](docs/mcp.md#datadog-14-tools).
 
+### 🎙️ Transcript Fetching
+
+Pull captions and transcripts from external media platforms. YouTube is the
+first supported source; the CLI namespace and library are designed so
+additional sources (Vimeo, podcast RSS, generic VTT/SRT URLs) can be
+added without restructuring. See [docs/transcript.md](docs/transcript.md)
+for the full reference and the recipe for adding a new source.
+
+```bash
+# Fetch captions for a YouTube video as SubRip (default).
+omni-dev transcript youtube fetch https://www.youtube.com/watch?v=jNQXAC9IVRw
+
+# WebVTT to a file, falling through to auto-generated captions if needed.
+omni-dev transcript youtube fetch jNQXAC9IVRw \
+  --format vtt --auto --output me-at-the-zoo.vtt
+
+# Synthesise a translated track when no native French track exists.
+omni-dev transcript youtube fetch <url> --lang fr --translate fr
+
+# List available caption tracks (manual + auto-generated).
+omni-dev transcript youtube list-langs <url>
+
+# Show video metadata (title, channel, duration, languages).
+omni-dev transcript youtube info <url> --output json
+```
+
+`--format` accepts `srt`, `vtt`, `txt`, or `json`. Locators may be a
+`watch?v=` URL, a `youtu.be/` short URL, a `/shorts/` or `/embed/` URL,
+or a bare 11-character video ID. Age-gated and login-required videos
+surface as a typed `PlayabilityRefused` error carrying YouTube's status
+code rather than a generic HTTP failure.
+
 ### ✏️ Manual Amendment
 
 ```bash
