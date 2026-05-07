@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sample Watch Page</title>
+</head>
+<body>
+<!--
+This fixture mimics the shape of a real YouTube /watch page response — only
+the bits the scraper actually inspects. Three quirks of the live page are
+intentionally preserved:
+
+  1. ytcfg.set is called once with a single JSON literal argument.
+  2. INNERTUBE_CONTEXT.client.visitorData is a long opaque base64-ish string.
+  3. There are several other "...Data" keys nearby (sessionData, fooData) so
+     the regex must anchor on "visitorData" specifically, not a suffix match.
+-->
+<script nonce="abc">
+(function() {
+window.ytcfg = window.ytcfg || {};
+window.ytcfg.set({"INNERTUBE_API_KEY":"AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w","INNERTUBE_CONTEXT":{"client":{"hl":"en","gl":"US","clientName":"WEB","clientVersion":"2.20250101.00.00","sessionData":"unrelated-session-blob","visitorData":"CgtkUTQyOFR3aV9NSSjFoYvBBjIKCgJVUxIEGgAgPg%3D%3D","extraData":"trailing-noise"}},"VISITOR_DATA":"CgtkUTQyOFR3aV9NSSjFoYvBBjIKCgJVUxIEGgAgPg%3D%3D"});
+})();
+</script>
+<div>player markup goes here in the real response</div>
+</body>
+</html>

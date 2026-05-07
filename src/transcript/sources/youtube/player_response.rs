@@ -83,7 +83,7 @@ pub struct CaptionTrack {
     pub base_url: String,
     /// Display name of the track, e.g. `English (United States)`.
     #[serde(default)]
-    pub name: Option<SimpleText>,
+    pub name: Option<LocalizedText>,
     /// IETF-style language tag, e.g. `en`, `en-US`, `pt-BR`.
     pub language_code: String,
     /// Present and equal to `"asr"` for auto-generated tracks; absent
@@ -95,13 +95,47 @@ pub struct CaptionTrack {
     pub is_translatable: Option<bool>,
 }
 
-/// YouTube's `{ "simpleText": "..." }` shape. Some fields use a richer
-/// `runs[]` form; we don't model those because we only need the human label.
+/// A localised text payload, in either of YouTube's two text shapes.
+///
+/// `{ "simpleText": "..." }` for short labels, or
+/// `{ "runs": [{ "text": "..." }, ...] }` for fields that mix runs of
+/// styled text. The shape varies by client and by field; modern
+/// `ANDROID_VR` `/player` responses typically use `runs` for caption
+/// track names. Either is accepted; [`Self::text`] returns the
+/// concatenation.
 #[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SimpleText {
-    /// The text payload.
-    pub simple_text: String,
+#[serde(untagged)]
+pub enum LocalizedText {
+    /// `{ "simpleText": "<label>" }`.
+    Simple {
+        /// The flat text payload.
+        #[serde(rename = "simpleText")]
+        simple_text: String,
+    },
+    /// `{ "runs": [{ "text": "..." }, ...] }`.
+    Runs {
+        /// The styled text fragments.
+        runs: Vec<TextRun>,
+    },
+}
+
+/// A single styled-text fragment within a [`LocalizedText::Runs`] payload.
+#[derive(Clone, Debug, Deserialize)]
+pub struct TextRun {
+    /// The fragment's text. Only the text is consumed; YouTube also
+    /// includes styling fields (`bold`, `italics`, `navigationEndpoint`,
+    /// etc.) that are dropped by this crate.
+    pub text: String,
+}
+
+impl LocalizedText {
+    /// Resolve to a flat string, joining `runs[].text` if present.
+    pub fn text(&self) -> String {
+        match self {
+            Self::Simple { simple_text } => simple_text.clone(),
+            Self::Runs { runs } => runs.iter().map(|r| r.text.as_str()).collect(),
+        }
+    }
 }
 
 /// A target language for machine translation.
@@ -112,7 +146,7 @@ pub struct TranslationLanguage {
     pub language_code: String,
     /// Display name of the translation target.
     #[serde(default)]
-    pub language_name: Option<SimpleText>,
+    pub language_name: Option<LocalizedText>,
 }
 
 impl CaptionTrack {
@@ -255,7 +289,7 @@ fn pick_translation_base<'a>(
 fn materialise_native(track: &CaptionTrack) -> SelectedTrack<'_> {
     SelectedTrack {
         track,
-        fetch_url: append_query(&track.base_url, "fmt=json3"),
+        fetch_url: timedtext_url(&track.base_url, None),
         language: track.language_code.clone(),
         kind: if track.is_asr() {
             TrackKind::Auto
@@ -266,19 +300,55 @@ fn materialise_native(track: &CaptionTrack) -> SelectedTrack<'_> {
 }
 
 fn materialise_translation<'a>(track: &'a CaptionTrack, target: &str) -> SelectedTrack<'a> {
-    let with_format = append_query(&track.base_url, "fmt=json3");
-    let with_tlang = append_query(&with_format, &format!("tlang={target}"));
     SelectedTrack {
         track,
-        fetch_url: with_tlang,
+        fetch_url: timedtext_url(&track.base_url, Some(target)),
         language: target.to_string(),
         kind: TrackKind::Translated,
     }
 }
 
-fn append_query(url: &str, kv: &str) -> String {
-    let sep = if url.contains('?') { '&' } else { '?' };
-    format!("{url}{sep}{kv}")
+/// Build the timedtext fetch URL from a caption track's `baseUrl`.
+///
+/// YouTube embeds a default `fmt=` (typically `srv3`, the legacy XML
+/// format) in the `baseUrl` it ships in `playerResponse`. A naive
+/// `&fmt=json3` append produces a URL with two `fmt=` params; YouTube
+/// honours the *first* one and returns SRV3, which the json3 parser
+/// rejects with a 1:1 "expected value" error. Replacing rather than
+/// appending is required.
+///
+/// Same treatment for `tlang=` on the translation path.
+fn timedtext_url(base_url: &str, tlang: Option<&str>) -> String {
+    let Ok(mut url) = url::Url::parse(base_url) else {
+        // Defensive: if YouTube ever returns a non-URL baseUrl, fall
+        // back to a naive append so the caller still gets *some*
+        // reachable URL instead of a hard error here.
+        let mut s = base_url.to_string();
+        s.push(if s.contains('?') { '&' } else { '?' });
+        s.push_str("fmt=json3");
+        if let Some(t) = tlang {
+            s.push_str("&tlang=");
+            s.push_str(t);
+        }
+        return s;
+    };
+    let preserved: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(k, _)| k != "fmt" && k != "tlang")
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    url.query_pairs_mut().clear();
+    {
+        let mut q = url.query_pairs_mut();
+        for (k, v) in &preserved {
+            q.append_pair(k, v);
+        }
+        q.append_pair("fmt", "json3");
+        if let Some(t) = tlang {
+            q.append_pair("tlang", t);
+        }
+    }
+    url.to_string()
 }
 
 /// Project a [`PlayerResponse`] to the [`LanguageInfo`] list expected by
@@ -296,7 +366,7 @@ pub fn list_languages(response: &PlayerResponse) -> Vec<LanguageInfo> {
                     name: t
                         .name
                         .as_ref()
-                        .map_or_else(|| t.language_code.clone(), |n| n.simple_text.clone()),
+                        .map_or_else(|| t.language_code.clone(), LocalizedText::text),
                     kind: if t.is_asr() {
                         TrackKind::Auto
                     } else {
@@ -570,6 +640,111 @@ mod tests {
     }
 
     #[test]
+    fn fetch_url_replaces_existing_fmt_param() {
+        // Real ANDROID_VR /player responses ship caption URLs with an
+        // embedded `fmt=srv3` (legacy XML). A naive append would leave
+        // both `fmt` params; YouTube honours the first and serves SRV3,
+        // which the json3 parser rejects. Pin the replacement contract.
+        let track = CaptionTrack {
+            base_url: "https://example.com/timedtext?lang=en&fmt=srv3&signature=ABC".to_string(),
+            name: None,
+            language_code: "en".to_string(),
+            kind: None,
+            is_translatable: Some(true),
+        };
+        let s = materialise_native(&track);
+        assert!(s.fetch_url.contains("fmt=json3"));
+        assert!(!s.fetch_url.contains("fmt=srv3"));
+        assert!(s.fetch_url.contains("signature=ABC"));
+        assert!(s.fetch_url.contains("lang=en"));
+    }
+
+    #[test]
+    fn translation_url_replaces_existing_fmt_and_tlang() {
+        let track = CaptionTrack {
+            base_url: "https://example.com/timedtext?lang=en&fmt=srv3&tlang=de&signature=X"
+                .to_string(),
+            name: None,
+            language_code: "en".to_string(),
+            kind: None,
+            is_translatable: Some(true),
+        };
+        let s = materialise_translation(&track, "fr");
+        assert!(s.fetch_url.contains("fmt=json3"));
+        assert!(!s.fetch_url.contains("fmt=srv3"));
+        assert!(s.fetch_url.contains("tlang=fr"));
+        assert!(!s.fetch_url.contains("tlang=de"));
+        assert!(s.fetch_url.contains("signature=X"));
+    }
+
+    #[test]
+    fn fetch_url_handles_non_url_base_defensively() {
+        // If YouTube ever returns a baseUrl that isn't parseable as a
+        // URL, the helper falls back to a naive append rather than
+        // panicking — the caller still gets a reachable string.
+        let track = CaptionTrack {
+            base_url: "not a url".to_string(),
+            name: None,
+            language_code: "en".to_string(),
+            kind: None,
+            is_translatable: Some(true),
+        };
+        let s = materialise_native(&track);
+        assert!(s.fetch_url.contains("fmt=json3"));
+    }
+
+    #[test]
+    fn translation_url_handles_non_url_base_defensively() {
+        // Same fallback, exercised through the translation path so the
+        // `&tlang=` branch of the non-URL fallback is covered.
+        let track = CaptionTrack {
+            base_url: "not a url".to_string(),
+            name: None,
+            language_code: "en".to_string(),
+            kind: None,
+            is_translatable: Some(true),
+        };
+        let s = materialise_translation(&track, "fr");
+        assert!(s.fetch_url.contains("fmt=json3"));
+        assert!(s.fetch_url.contains("&tlang=fr"));
+    }
+
+    #[test]
+    fn fallback_appends_with_ampersand_when_base_already_has_query() {
+        // `?` vs `&` separator branch in the non-URL fallback. The
+        // string contains `?` so the next param is joined with `&`.
+        let track = CaptionTrack {
+            base_url: "broken url with ?existing=q".to_string(),
+            name: None,
+            language_code: "en".to_string(),
+            kind: None,
+            is_translatable: Some(true),
+        };
+        let s = materialise_native(&track);
+        assert!(s.fetch_url.ends_with("&fmt=json3"));
+    }
+
+    #[test]
+    fn list_languages_falls_back_to_language_code_when_name_absent() {
+        // Track without a `name` field: `LanguageInfo.name` falls back
+        // to the language code rather than panicking. Exercises the
+        // `None` branch of `t.name.as_ref().map_or_else(...)`.
+        let mut r = parse(FIXTURE_BASIC).unwrap();
+        for t in &mut r
+            .captions
+            .as_mut()
+            .unwrap()
+            .player_captions_tracklist_renderer
+            .caption_tracks
+        {
+            t.name = None;
+        }
+        let langs = list_languages(&r);
+        assert!(langs.iter().any(|l| l.code == "en-US" && l.name == "en-US"));
+        assert!(langs.iter().any(|l| l.code == "es" && l.name == "es"));
+    }
+
+    #[test]
     fn list_languages_projects_all_tracks() {
         let r = parse(FIXTURE_BASIC).unwrap();
         let langs = list_languages(&r);
@@ -580,6 +755,65 @@ mod tests {
         assert_eq!(by_code["en"].kind, TrackKind::Auto);
         assert_eq!(by_code["es"].kind, TrackKind::Manual);
         assert_eq!(by_code["en-US"].name, "English (United States)");
+    }
+
+    #[test]
+    fn localized_text_deserialises_simple_shape() {
+        let json = r#"{ "simpleText": "English (United States)" }"#;
+        let lt: LocalizedText = serde_json::from_str(json).unwrap();
+        assert!(matches!(lt, LocalizedText::Simple { .. }));
+        assert_eq!(lt.text(), "English (United States)");
+    }
+
+    #[test]
+    fn localized_text_deserialises_runs_shape() {
+        // Real-world ANDROID_VR /player responses use this shape for
+        // caption-track names; the previous struct-only deserialiser
+        // failed with `missing field simpleText` on these payloads.
+        let json = r#"{ "runs": [{ "text": "English (auto-generated)" }] }"#;
+        let lt: LocalizedText = serde_json::from_str(json).unwrap();
+        assert!(matches!(lt, LocalizedText::Runs { .. }));
+        assert_eq!(lt.text(), "English (auto-generated)");
+    }
+
+    #[test]
+    fn localized_text_concatenates_multiple_runs() {
+        let json = r#"{ "runs": [{ "text": "English" }, { "text": " " }, { "text": "(auto)" }] }"#;
+        let lt: LocalizedText = serde_json::from_str(json).unwrap();
+        assert_eq!(lt.text(), "English (auto)");
+    }
+
+    #[test]
+    fn localized_text_handles_empty_runs() {
+        let json = r#"{ "runs": [] }"#;
+        let lt: LocalizedText = serde_json::from_str(json).unwrap();
+        assert_eq!(lt.text(), "");
+    }
+
+    #[test]
+    fn caption_track_accepts_runs_name_shape() {
+        // End-to-end: a player_response carrying `name: { runs: [...] }`
+        // must deserialise and project to LanguageInfo.name correctly.
+        let json = r#"{
+            "playabilityStatus": { "status": "OK" },
+            "captions": {
+                "playerCaptionsTracklistRenderer": {
+                    "captionTracks": [{
+                        "baseUrl": "https://www.youtube.com/api/timedtext?lang=en",
+                        "name": { "runs": [{ "text": "English (auto-generated)" }] },
+                        "languageCode": "en",
+                        "kind": "asr"
+                    }],
+                    "translationLanguages": []
+                }
+            }
+        }"#;
+        let r = parse(json).unwrap();
+        let langs = list_languages(&r);
+        assert_eq!(langs.len(), 1);
+        assert_eq!(langs[0].code, "en");
+        assert_eq!(langs[0].name, "English (auto-generated)");
+        assert_eq!(langs[0].kind, TrackKind::Auto);
     }
 
     #[test]
