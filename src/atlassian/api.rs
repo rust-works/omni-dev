@@ -83,7 +83,11 @@ pub trait AtlassianApi: Send + Sync {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::match_wildcard_for_single_variants
+)]
 mod tests {
     use super::*;
 

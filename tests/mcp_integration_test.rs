@@ -5,7 +5,11 @@
 //! tool dispatch end-to-end.
 
 #![cfg(feature = "mcp")]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::semicolon_if_nothing_returned
+)]
 
 use std::fs;
 use std::path::PathBuf;
@@ -427,7 +431,9 @@ impl AtlassianEnvGuard {
     /// env vars to the given values, suppressing any real credentials
     /// in the process for the duration of the guard.
     fn new(instance_url: &str, email: &str, token: &str) -> Result<Self> {
-        let guard = ATLASSIAN_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = ATLASSIAN_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir()?;
         let prev_home = std::env::var("HOME").ok();
         let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
@@ -453,7 +459,9 @@ impl AtlassianEnvGuard {
     /// Variant that clears every Atlassian env var so `create_client()`
     /// will fail with a credentials-not-found error.
     fn empty() -> Result<Self> {
-        let guard = ATLASSIAN_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = ATLASSIAN_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir()?;
         let prev_home = std::env::var("HOME").ok();
         let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
@@ -697,12 +705,12 @@ async fn jira_tool_handlers_surface_tool_error_without_credentials() -> Result<(
                 CallToolRequestParams::new(name).with_arguments(args.as_object().unwrap().clone()),
             )
             .await;
-        match outcome {
-            Ok(result) => assert!(
+        if let Ok(result) = outcome {
+            assert!(
                 result.is_error.unwrap_or(false),
                 "{name} should have returned tool_error without credentials"
-            ),
-            Err(_) => { /* protocol-level error is also acceptable */ }
+            )
+        } else { /* protocol-level error is also acceptable */
         }
     }
 
@@ -1100,7 +1108,9 @@ async fn git_branch_info_invalid_repo_returns_error() -> Result<()> {
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn atlassian_auth_status_never_leaks_secrets() -> Result<()> {
-    let _lock = ATLASSIAN_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _lock = ATLASSIAN_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let original_home = std::env::var("HOME").ok();
     let original_url = std::env::var("ATLASSIAN_INSTANCE_URL").ok();
@@ -1168,7 +1178,9 @@ async fn atlassian_auth_status_never_leaks_secrets() -> Result<()> {
 async fn ai_chat_returns_tool_error_when_credentials_missing() -> Result<()> {
     // Share the Atlassian env lock so this test doesn't race with other
     // env-mutating tests in the binary.
-    let _lock = ATLASSIAN_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _lock = ATLASSIAN_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let original_home = std::env::var("HOME").ok();
     let snapshots: Vec<(&str, Option<String>)> = vec![

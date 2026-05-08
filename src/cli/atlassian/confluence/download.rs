@@ -1119,7 +1119,9 @@ mod tests {
     async fn execute_runs_with_env_credentials() {
         use std::sync::Mutex;
         static ENV_MUTEX: Mutex<()> = Mutex::new(());
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
