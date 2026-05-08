@@ -779,7 +779,7 @@ async fn spawn_with_etxtbsy_retry(cmd: &mut Command) -> std::io::Result<tokio::p
 pub(crate) static CLI_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use std::ffi::OsStr;
