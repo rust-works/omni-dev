@@ -75,9 +75,9 @@ jobs:
     - name: Run clippy
       run: |
         if [ -z "${{ matrix.features }}" ]; then
-          cargo clippy -- -D warnings
+          cargo clippy --all-targets -- -D warnings
         else
-          cargo clippy --features "${{ matrix.features }}" -- -D warnings
+          cargo clippy --all-targets --features "${{ matrix.features }}" -- -D warnings
         fi
 
   docs:
