@@ -22,7 +22,9 @@ pub(crate) mod shim {
     /// intentional panics in one test don't cascade into the rest of the
     /// suite.
     pub(crate) fn shim_lock() -> MutexGuard<'static, ()> {
-        SHIM_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+        SHIM_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Writes an executable script at `path`, flushes it to disk, and

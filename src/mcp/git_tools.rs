@@ -255,6 +255,38 @@ pub(crate) fn build_truncated_result(text: String) -> CallToolResult {
     }
 }
 
+/// Indents a multi-line string for inclusion as a YAML block scalar value.
+fn indent_for_yaml(body: &str) -> String {
+    body.lines()
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Formats the payload returned by the `git_check_commits` tool.
+fn format_check_payload(outcome: &crate::cli::git::CheckOutcome) -> String {
+    format!(
+        "# git_check_commits outcome\nexit_code: {}\nstrict: {}\nhas_errors: {}\nhas_warnings: {}\ntotal_commits: {}\nreport: |\n{}",
+        outcome.exit_code,
+        outcome.strict,
+        outcome.has_errors,
+        outcome.has_warnings,
+        outcome.total_commits,
+        indent_for_yaml(&outcome.report_yaml),
+    )
+}
+
+/// Formats the payload returned by the `git_twiddle_commits` tool.
+fn format_twiddle_payload(outcome: &crate::cli::git::TwiddleOutcome, dry_run: bool) -> String {
+    format!(
+        "# git_twiddle_commits outcome\napplied: {}\ndry_run: {}\namendment_count: {}\namendments: |\n{}",
+        outcome.applied,
+        dry_run,
+        outcome.amendment_count,
+        indent_for_yaml(&outcome.amendments_yaml),
+    )
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -435,36 +467,4 @@ mod tests {
         let err = server.git_create_pr(Parameters(params)).await.unwrap_err();
         assert!(!err.message.is_empty());
     }
-}
-
-/// Indents a multi-line string for inclusion as a YAML block scalar value.
-fn indent_for_yaml(body: &str) -> String {
-    body.lines()
-        .map(|line| format!("  {line}"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Formats the payload returned by the `git_check_commits` tool.
-fn format_check_payload(outcome: &crate::cli::git::CheckOutcome) -> String {
-    format!(
-        "# git_check_commits outcome\nexit_code: {}\nstrict: {}\nhas_errors: {}\nhas_warnings: {}\ntotal_commits: {}\nreport: |\n{}",
-        outcome.exit_code,
-        outcome.strict,
-        outcome.has_errors,
-        outcome.has_warnings,
-        outcome.total_commits,
-        indent_for_yaml(&outcome.report_yaml),
-    )
-}
-
-/// Formats the payload returned by the `git_twiddle_commits` tool.
-fn format_twiddle_payload(outcome: &crate::cli::git::TwiddleOutcome, dry_run: bool) -> String {
-    format!(
-        "# git_twiddle_commits outcome\napplied: {}\ndry_run: {}\namendment_count: {}\namendments: |\n{}",
-        outcome.applied,
-        dry_run,
-        outcome.amendment_count,
-        indent_for_yaml(&outcome.amendments_yaml),
-    )
 }

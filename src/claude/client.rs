@@ -1762,7 +1762,11 @@ pub async fn create_default_claude_client(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::format_in_format_args
+)]
 mod tests {
     use super::*;
     use crate::claude::ai::{AiClient, AiClientCapabilities, AiClientMetadata};
@@ -1951,8 +1955,8 @@ mod tests {
         let returned = client.schema_if_supported(&schema);
         assert!(returned.is_some());
         assert!(std::ptr::eq(
-            returned.unwrap() as *const _,
-            &schema as *const _
+            std::ptr::from_ref(returned.unwrap()),
+            std::ptr::addr_of!(schema)
         ));
     }
 

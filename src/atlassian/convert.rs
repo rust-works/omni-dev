@@ -4845,7 +4845,13 @@ fn link_href(mark: &AdfMark) -> &str {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::needless_update,
+    clippy::needless_collect,
+    duplicate_macro_attributes
+)]
 mod tests {
     use super::*;
 
@@ -5010,11 +5016,7 @@ mod tests {
         }"#;
         let doc: AdfDocument = serde_json::from_str(json).unwrap();
         let md = adf_to_markdown(&doc).unwrap();
-        let stripped: String = md
-            .lines()
-            .map(|l| l.trim_end())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let stripped: String = md.lines().map(str::trim_end).collect::<Vec<_>>().join("\n");
         let parsed = markdown_to_adf(&stripped).unwrap();
         assert_eq!(parsed.content[0].node_type, "taskList");
         let items = parsed.content[0].content.as_ref().unwrap();
@@ -12771,7 +12773,7 @@ mod tests {
 
     #[test]
     fn media_border_size_only_defaults_color() {
-        let adf_json = r##"{"version":1,"type":"doc","content":[{"type":"mediaSingle","attrs":{"layout":"center"},"content":[{"type":"media","attrs":{"id":"abc","type":"file","collection":"col"},"marks":[{"type":"border","attrs":{"size":4}}]}]}]}"##;
+        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"mediaSingle","attrs":{"layout":"center"},"content":[{"type":"media","attrs":{"id":"abc","type":"file","collection":"col"},"marks":[{"type":"border","attrs":{"size":4}}]}]}]}"#;
         let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
         let md = adf_to_markdown(&doc).unwrap();
         assert!(md.contains("border-size=4"), "md: {md}");
@@ -16585,7 +16587,7 @@ mod tests {
                     .as_ref()
                     .and_then(|c| c.first())
                     .and_then(|n| n.text.as_deref())
-                    .map_or(false, |t| t.contains("after"))
+                    .is_some_and(|t| t.contains("after"))
         });
         assert!(after_para.is_some(), "should have paragraph with 'after'");
     }
@@ -21264,8 +21266,7 @@ C
         for (i, child) in children.iter().enumerate() {
             assert_eq!(
                 child.node_type, "paragraph",
-                "Child {} should be a paragraph",
-                i
+                "Child {i} should be a paragraph"
             );
         }
     }
