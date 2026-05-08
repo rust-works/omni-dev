@@ -899,10 +899,10 @@ mod tests {
                 let diff_path = dir.path().join(format!("{i}.diff"));
                 std::fs::write(&diff_path, format!("+line from commit {i}\n")).unwrap();
                 CommitInfo {
-                    hash: format!("{:0>40}", i),
+                    hash: format!("{i:0>40}"),
                     author: "Test <test@test.com>".to_string(),
                     date: Utc::now().fixed_offset(),
-                    original_message: msg.to_string(),
+                    original_message: (*msg).to_string(),
                     in_main_branches: Vec::new(),
                     analysis: CommitAnalysis {
                         detected_type: "feat".to_string(),
@@ -947,9 +947,7 @@ mod tests {
         let view = make_human_view_with_diff_files(&dir, &["first", "second"]);
         assert_eq!(view.commits.len(), 2);
 
-        let mapped: RepositoryView<String> = view
-            .map_commits(|c| Ok(c.original_message.clone()))
-            .unwrap();
+        let mapped: RepositoryView<String> = view.map_commits(|c| Ok(c.original_message)).unwrap();
         assert_eq!(
             mapped.commits,
             vec!["first".to_string(), "second".to_string()]

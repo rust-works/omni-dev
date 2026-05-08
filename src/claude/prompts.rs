@@ -1694,7 +1694,7 @@ mod tests {
     fn check_chunk_merge_user_prompt_includes_all_chunks() {
         use crate::data::check::CommitSuggestion;
 
-        let suggestions = vec![
+        let suggestions = [
             CommitSuggestion {
                 message: "feat(cli): add flag".to_string(),
                 explanation: "improved clarity".to_string(),
@@ -1726,7 +1726,7 @@ mod tests {
     fn check_chunk_merge_user_prompt_includes_context() {
         use crate::data::check::CommitSuggestion;
 
-        let suggestions = vec![CommitSuggestion {
+        let suggestions = [CommitSuggestion {
             message: "fix: correct typo".to_string(),
             explanation: "typo in subject".to_string(),
         }];
@@ -1751,7 +1751,7 @@ mod tests {
     fn check_chunk_merge_user_prompt_handles_missing_summaries() {
         use crate::data::check::CommitSuggestion;
 
-        let suggestions = vec![CommitSuggestion {
+        let suggestions = [CommitSuggestion {
             message: "feat: change".to_string(),
             explanation: "reason".to_string(),
         }];

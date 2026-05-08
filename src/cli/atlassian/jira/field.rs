@@ -244,7 +244,7 @@ mod tests {
 
     #[test]
     fn print_fields_with_data() {
-        let fields = vec![
+        let fields = [
             sample_field("summary", "Summary", false, Some("string")),
             sample_field("customfield_10001", "Story Points", true, Some("number")),
         ];
@@ -254,7 +254,7 @@ mod tests {
 
     #[test]
     fn print_fields_no_schema() {
-        let fields = vec![sample_field("labels", "Labels", false, None)];
+        let fields = [sample_field("labels", "Labels", false, None)];
         let refs: Vec<&JiraField> = fields.iter().collect();
         print_fields(&refs);
     }

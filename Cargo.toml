@@ -127,3 +127,5 @@ redundant_pub_crate          = "allow"  # conflicts with STYLE-0005
 missing_const_for_fn         = "allow"
 or_fun_call                  = "allow"  # false positives
 significant_drop_tightening  = "allow"  # often produces wrong suggestions
+large_stack_frames           = "allow"  # fires on test fns with large fixture literals; no usable span
+large_stack_arrays           = "allow"  # ditto — fixture arrays in tests
