@@ -792,7 +792,7 @@ fn file_extension(format: &ContentFormat) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::await_holding_lock)]
 mod tests {
     use super::*;
 
