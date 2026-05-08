@@ -239,7 +239,7 @@ mod tests {
     #[test]
     fn clone() {
         let format = ContentFormat::Adf;
-        let cloned = format.clone();
+        let cloned = format;
         assert!(matches!(cloned, ContentFormat::Adf));
     }
 
@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn output_clone() {
         let format = OutputFormat::Jsonl;
-        let cloned = format.clone();
+        let cloned = format;
         assert!(matches!(cloned, OutputFormat::Jsonl));
     }
 
