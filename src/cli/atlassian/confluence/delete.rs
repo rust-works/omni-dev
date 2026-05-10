@@ -1,12 +1,11 @@
 //! CLI command for deleting Confluence pages.
 
-use std::io::{self, BufRead, Write};
-
 use anyhow::Result;
 use clap::Parser;
 
 use crate::atlassian::api::AtlassianApi;
 use crate::atlassian::confluence_api::ConfluenceApi;
+use crate::cli::atlassian::confirm::{guard_destructive, GuardOptions, GuardOutcome};
 use crate::cli::atlassian::helpers::create_client;
 
 /// Deletes a Confluence page.
@@ -32,10 +31,21 @@ impl DeleteCommand {
 
         if !self.force {
             let item = api.get_content(&self.id).await?;
-            let prompt = format_delete_prompt(&self.id, &item.title);
-            if !confirm_with_reader(&prompt, &mut io::stdin().lock())? {
-                println!("Cancelled.");
-                return Ok(());
+            let suffix = if self.purge { " (purge)" } else { "" };
+            let prompt = format!("Delete page {} ({}){}? [y/N] ", self.id, item.title, suffix);
+            let dry_run_message =
+                format!("Would delete page {} ({}){}.", self.id, item.title, suffix);
+
+            let outcome = guard_destructive(&GuardOptions {
+                prompt: &prompt,
+                dry_run_message: &dry_run_message,
+                force: self.force,
+                dry_run: false,
+            })?;
+
+            match outcome {
+                GuardOutcome::Cancelled | GuardOutcome::DryRun => return Ok(()),
+                GuardOutcome::Proceed => {}
             }
         }
 
@@ -46,28 +56,10 @@ impl DeleteCommand {
     }
 }
 
-/// Formats the deletion confirmation prompt.
-fn format_delete_prompt(id: &str, title: &str) -> String {
-    format!("Delete page {id} ({title})? [y/N] ")
-}
-
-/// Prompts the user for confirmation using the given reader for input.
-fn confirm_with_reader(prompt: &str, reader: &mut dyn BufRead) -> Result<bool> {
-    print!("{prompt}");
-    io::stdout().flush()?;
-
-    let mut answer = String::new();
-    reader.read_line(&mut answer)?;
-    Ok(answer.trim().eq_ignore_ascii_case("y"))
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
-
-    // ── DeleteCommand struct ───────────────────────────────────────
 
     #[test]
     fn delete_command_struct_fields() {
@@ -99,57 +91,5 @@ mod tests {
             purge: true,
         };
         assert!(cmd.purge);
-    }
-
-    // ── format_delete_prompt ───────────────────────────────────────
-
-    #[test]
-    fn format_prompt_includes_id_and_title() {
-        let prompt = format_delete_prompt("12345", "Architecture Overview");
-        assert_eq!(prompt, "Delete page 12345 (Architecture Overview)? [y/N] ");
-    }
-
-    #[test]
-    fn format_prompt_with_empty_title() {
-        let prompt = format_delete_prompt("99999", "");
-        assert_eq!(prompt, "Delete page 99999 ()? [y/N] ");
-    }
-
-    // ── confirm_with_reader ────────────────────────────────────────
-
-    #[test]
-    fn confirm_yes_lowercase() {
-        let mut input = Cursor::new(b"y\n");
-        assert!(confirm_with_reader("Delete? ", &mut input).unwrap());
-    }
-
-    #[test]
-    fn confirm_yes_uppercase() {
-        let mut input = Cursor::new(b"Y\n");
-        assert!(confirm_with_reader("Delete? ", &mut input).unwrap());
-    }
-
-    #[test]
-    fn confirm_no() {
-        let mut input = Cursor::new(b"n\n");
-        assert!(!confirm_with_reader("Delete? ", &mut input).unwrap());
-    }
-
-    #[test]
-    fn confirm_empty_is_no() {
-        let mut input = Cursor::new(b"\n");
-        assert!(!confirm_with_reader("Delete? ", &mut input).unwrap());
-    }
-
-    #[test]
-    fn confirm_random_text_is_no() {
-        let mut input = Cursor::new(b"maybe\n");
-        assert!(!confirm_with_reader("Delete? ", &mut input).unwrap());
-    }
-
-    #[test]
-    fn confirm_yes_with_whitespace() {
-        let mut input = Cursor::new(b"  y  \n");
-        assert!(confirm_with_reader("Delete? ", &mut input).unwrap());
     }
 }
