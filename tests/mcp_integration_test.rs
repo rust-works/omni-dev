@@ -139,6 +139,9 @@ async fn list_tools_includes_jira_extension_tools() -> Result<()> {
         "jira_watcher_list",
         "jira_watcher_add",
         "jira_watcher_remove",
+        "jira_link_list",
+        "jira_link_types",
+        "jira_link_remove",
         "jira_worklog_list",
         "jira_worklog_add",
     ] {
@@ -282,6 +285,9 @@ async fn jira_extension_tools_route_through_mcp() -> Result<()> {
             "jira_watcher_remove",
             serde_json::json!({"key": "PROJ-1", "account_id": "abc"}),
         ),
+        ("jira_link_list", serde_json::json!({"key": "PROJ-1"})),
+        ("jira_link_types", serde_json::json!({})),
+        ("jira_link_remove", serde_json::json!({"link_id": "1001"})),
         ("jira_worklog_list", serde_json::json!({"key": "PROJ-1"})),
         (
             "jira_worklog_add",

@@ -412,6 +412,44 @@ pub(crate) async fn watcher_remove_yaml(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Link tools
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Parameters for the `jira_link_list` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LinkListParams {
+    /// JIRA issue key (e.g., `PROJ-123`).
+    pub key: String,
+}
+
+/// Parameters for the `jira_link_types` tool. No fields — accepts `{}`.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct LinkTypesParams {}
+
+/// Parameters for the `jira_link_remove` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LinkRemoveParams {
+    /// Link ID to remove (typically obtained from `jira_link_list` or
+    /// `jira_read`).
+    pub link_id: String,
+}
+
+pub(crate) async fn link_list_yaml(client: &AtlassianClient, key: &str) -> Result<String> {
+    let links = client.get_issue_links(key).await?;
+    serde_yaml::to_string(&links).context("Failed to serialize issue links as YAML")
+}
+
+pub(crate) async fn link_types_yaml(client: &AtlassianClient) -> Result<String> {
+    let types = client.get_link_types().await?;
+    serde_yaml::to_string(&types).context("Failed to serialize link types as YAML")
+}
+
+pub(crate) async fn link_remove_yaml(client: &AtlassianClient, link_id: &str) -> Result<String> {
+    client.remove_issue_link(link_id).await?;
+    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Worklog tools
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -864,6 +902,67 @@ impl OmniDevServer {
         let yaml = (async {
             let (client, _) = create_client()?;
             watcher_remove_yaml(&client, &params.key, &params.account_id).await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    // ── links ──────────────────────────────────────────────────────
+
+    /// Tool: list issue links on an issue.
+    #[tool(
+        description = "List issue links on a JIRA issue. Returns YAML with inward and outward \
+                       link entries — each carries the link id, link type name, direction, \
+                       linked issue key, and linked issue summary. Mirrors `omni-dev atlassian \
+                       jira link list`."
+    )]
+    pub async fn jira_link_list(
+        &self,
+        Parameters(params): Parameters<LinkListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            link_list_yaml(&client, &params.key).await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: list available issue link types.
+    #[tool(
+        description = "List the configured JIRA issue link types (e.g., Blocks, Relates, \
+                       Duplicates) with both directional descriptions. Returns YAML. The \
+                       catalogue is global to the JIRA instance, not per-issue. Mirrors \
+                       `omni-dev atlassian jira link types`."
+    )]
+    pub async fn jira_link_types(
+        &self,
+        Parameters(_params): Parameters<LinkTypesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            link_types_yaml(&client).await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: remove an issue link by ID.
+    #[tool(
+        description = "Remove a JIRA issue link by its `link_id` (typically obtained from \
+                       `jira_link_list` or `jira_read`). Returns YAML `{status: ok}`. Mirrors \
+                       `omni-dev atlassian jira link remove`."
+    )]
+    pub async fn jira_link_remove(
+        &self,
+        Parameters(params): Parameters<LinkRemoveParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            link_remove_yaml(&client, &params.link_id).await
         })
         .await
         .map_err(tool_error)?;
@@ -1515,6 +1614,106 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("403"));
+    }
+
+    // ── links ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn link_list_yaml_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .and(query_param("fields", "issuelinks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "key": "PROJ-1",
+                "fields": {
+                    "issuelinks": [{
+                        "id": "1001",
+                        "type": {"name": "Blocks", "inward": "is blocked by", "outward": "blocks"},
+                        "outwardIssue": {"key": "PROJ-2", "fields": {"summary": "downstream"}}
+                    }]
+                }
+            })))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = link_list_yaml(&client, "PROJ-1").await.unwrap();
+        assert!(yaml.contains("PROJ-2"));
+        assert!(yaml.contains("Blocks"));
+        assert!(yaml.contains("outward"));
+        assert!(yaml.contains("downstream"));
+    }
+
+    #[tokio::test]
+    async fn link_list_yaml_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/NOPE"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("missing"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = link_list_yaml(&client, "NOPE").await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn link_types_yaml_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issueLinkType"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issueLinkTypes": [
+                    {"id": "1", "name": "Blocks", "inward": "is blocked by", "outward": "blocks"},
+                    {"id": "2", "name": "Duplicates", "inward": "is duplicated by", "outward": "duplicates"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = link_types_yaml(&client).await.unwrap();
+        assert!(yaml.contains("Blocks"));
+        assert!(yaml.contains("is blocked by"));
+        assert!(yaml.contains("Duplicates"));
+    }
+
+    #[tokio::test]
+    async fn link_types_yaml_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issueLinkType"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = link_types_yaml(&client).await.unwrap_err();
+        assert!(err.to_string().contains("500"));
+    }
+
+    #[tokio::test]
+    async fn link_remove_yaml_returns_status_ok() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/issueLink/1001"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = link_remove_yaml(&client, "1001").await.unwrap();
+        assert!(yaml.contains("ok"));
+    }
+
+    #[tokio::test]
+    async fn link_remove_yaml_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/issueLink/99"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = link_remove_yaml(&client, "99").await.unwrap_err();
+        assert!(err.to_string().contains("404"));
     }
 
     // ── worklogs ───────────────────────────────────────────────────
