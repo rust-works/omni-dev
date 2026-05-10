@@ -186,4 +186,99 @@ mod tests {
                 .unwrap();
         assert_eq!(outcome, GuardOutcome::Cancelled);
     }
+
+    // ── error propagation paths ────────────────────────────────────
+
+    /// Writer that always fails on `write` with ErrorKind::Other.
+    struct FailingWriter;
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("simulated write failure"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("simulated flush failure"))
+        }
+    }
+
+    /// Reader that always fails on `read`.
+    struct FailingReader;
+
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("simulated read failure"))
+        }
+    }
+
+    impl std::io::BufRead for FailingReader {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            Err(std::io::Error::other("simulated read failure"))
+        }
+        fn consume(&mut self, _: usize) {}
+    }
+
+    #[test]
+    fn dry_run_propagates_writer_error() {
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut writer = FailingWriter;
+        let mut o = opts("Delete? ", "Would delete.");
+        o.dry_run = true;
+        let err = guard_destructive_with_io(&o, &mut input, &mut writer).unwrap_err();
+        assert!(err.to_string().contains("simulated write failure"));
+    }
+
+    #[test]
+    fn prompt_propagates_writer_error() {
+        let mut input = Cursor::new(b"y\n".to_vec());
+        let mut writer = FailingWriter;
+        let err =
+            guard_destructive_with_io(&opts("Delete? ", "Would delete."), &mut input, &mut writer)
+                .unwrap_err();
+        assert!(err.to_string().contains("simulated"));
+    }
+
+    #[test]
+    fn prompt_propagates_reader_error() {
+        let mut reader = FailingReader;
+        let mut output = Vec::<u8>::new();
+        let err =
+            guard_destructive_with_io(&opts("Delete? ", "Would delete."), &mut reader, &mut output)
+                .unwrap_err();
+        assert!(err.to_string().contains("simulated read failure"));
+    }
+
+    #[test]
+    fn cancellation_notice_propagates_writer_error() {
+        // Writer that succeeds for the prompt write but fails on the
+        // cancellation writeln after the user types "n".
+        struct WriterFailsAfter {
+            successes_remaining: usize,
+        }
+        impl std::io::Write for WriterFailsAfter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if self.successes_remaining == 0 {
+                    Err(std::io::Error::other(
+                        "simulated cancellation write failure",
+                    ))
+                } else {
+                    self.successes_remaining -= 1;
+                    Ok(buf.len())
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut input = Cursor::new(b"n\n".to_vec());
+        let mut writer = WriterFailsAfter {
+            successes_remaining: 1,
+        };
+        let err =
+            guard_destructive_with_io(&opts("Delete? ", "Would delete."), &mut input, &mut writer)
+                .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("simulated cancellation write failure"));
+    }
 }

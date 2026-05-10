@@ -325,4 +325,64 @@ mod tests {
         .await
         .unwrap();
     }
+
+    #[tokio::test]
+    async fn execute_with_force_propagates_delete_api_error() {
+        let (server, api) = setup_mock().await;
+        Mock::given(method("DELETE"))
+            .and(path("/wiki/api/v2/pages/12345"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        let cmd = DeleteCommand {
+            id: "12345".to_string(),
+            force: true,
+            dry_run: false,
+            purge: false,
+        };
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        let err = cmd
+            .execute_with_io(
+                &api,
+                "https://example.atlassian.net",
+                &mut input,
+                &mut output,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn execute_lookup_error_aborts_before_prompt() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/wiki/api/v2/pages/12345"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+        let client = AtlassianClient::new(&server.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+
+        let cmd = DeleteCommand {
+            id: "12345".to_string(),
+            force: false,
+            dry_run: false,
+            purge: false,
+        };
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        let err = cmd
+            .execute_with_io(
+                &api,
+                "https://example.atlassian.net",
+                &mut input,
+                &mut output,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
 }

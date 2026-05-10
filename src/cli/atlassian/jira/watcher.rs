@@ -500,4 +500,31 @@ mod tests {
         assert!(out.contains("Cancelled."));
         assert!(!out.contains("Removed watcher"));
     }
+
+    #[tokio::test]
+    async fn remove_execute_force_propagates_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/watchers",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let cmd = RemoveCommand {
+            key: "PROJ-1".to_string(),
+            user: "abc".to_string(),
+            force: true,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        let err = cmd
+            .execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
 }
