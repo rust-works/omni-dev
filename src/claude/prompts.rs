@@ -820,11 +820,11 @@ checks:
   - commit: "abc123..."
     passes: false
     issues:
-      - reasoning: "Subject is 85 characters, guideline caps at 72. 85 > 72, so this violates the Subject Line rule. Section 'Subject Line' maps to severity 'error'."
+      - reasoning: "Subject 'Added user endpoint' begins with 'Added', a past-tense verb. The Subject Line section requires imperative mood ('add', not 'added'/'adds'). Section 'Subject Line' maps to severity 'error'."
         severity: error
         section: "Subject Line"
-        rule: "Keep under 72 characters"
-        explanation: "Subject is 85 characters"
+        rule: "Use imperative mood"
+        explanation: "Subject uses past tense ('Added'); should use imperative ('add')"
       - reasoning: "Diff shows 142 lines changed. Body Guidelines requires a body for large changes. No body present. Section 'Content' maps to severity 'warning'."
         severity: warning
         section: "Body Guidelines"
@@ -836,7 +836,7 @@ checks:
 
         Implement POST /api/users with validation.
       explanation: |
-        - Shortened subject to under 72 chars
+        - Changed subject to imperative mood
         - Added body explaining the change
     summary: "Add REST endpoint for user creation with input validation"
 

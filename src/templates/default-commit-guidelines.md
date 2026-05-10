@@ -41,7 +41,6 @@ Use meaningful scopes that describe the area of code affected.
 
 ## Subject Line
 
-- Keep under 72 characters total
 - Use imperative mood: "add feature" not "added feature" or "adds feature"
 - Be specific: avoid vague terms like "update", "fix stuff", "changes"
 
