@@ -248,6 +248,28 @@ mod tests {
     }
 
     #[test]
+    fn prompt_propagates_flush_error() {
+        // Writer that succeeds on `write` but fails on `flush`, so the
+        // `writer.flush()?` after the prompt write is the failure point.
+        struct FlushFailsWriter;
+        impl std::io::Write for FlushFailsWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("simulated flush failure"))
+            }
+        }
+
+        let mut input = Cursor::new(b"y\n".to_vec());
+        let mut writer = FlushFailsWriter;
+        let err =
+            guard_destructive_with_io(&opts("Delete? ", "Would delete."), &mut input, &mut writer)
+                .unwrap_err();
+        assert!(err.to_string().contains("simulated flush failure"));
+    }
+
+    #[test]
     fn cancellation_notice_propagates_writer_error() {
         // Writer that succeeds for the prompt write but fails on the
         // cancellation writeln after the user types "n".

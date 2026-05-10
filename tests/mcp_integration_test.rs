@@ -266,7 +266,10 @@ async fn jira_extension_tools_route_through_mcp() -> Result<()> {
         ),
         ("jira_link_list", serde_json::json!({"key": "PROJ-1"})),
         ("jira_link_types", serde_json::json!({})),
-        ("jira_link_remove", serde_json::json!({"link_id": "1"})),
+        (
+            "jira_link_remove",
+            serde_json::json!({"link_id": "1", "confirm": true}),
+        ),
         ("jira_project_list", serde_json::json!({})),
         ("jira_sprint_list", serde_json::json!({"board_id": 1})),
         ("jira_sprint_issues", serde_json::json!({"sprint_id": 1})),
@@ -286,7 +289,7 @@ async fn jira_extension_tools_route_through_mcp() -> Result<()> {
         ),
         (
             "jira_watcher_remove",
-            serde_json::json!({"key": "PROJ-1", "account_id": "abc"}),
+            serde_json::json!({"key": "PROJ-1", "account_id": "abc", "confirm": true}),
         ),
         ("jira_worklog_list", serde_json::json!({"key": "PROJ-1"})),
         (
