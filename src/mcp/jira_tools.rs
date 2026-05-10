@@ -21,9 +21,10 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
+use super::catalogue_cache::CatalogueCache;
 use super::error::tool_error;
 use super::server::OmniDevServer;
-use crate::atlassian::client::{AtlassianClient, JiraAttachment};
+use crate::atlassian::client::{AgileBoard, AtlassianClient, JiraAttachment, JiraProject};
 use crate::cli::atlassian::helpers::create_client;
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -203,12 +204,28 @@ pub struct BoardIssuesParams {
 
 pub(crate) async fn board_list_yaml(
     client: &AtlassianClient,
+    cache: &CatalogueCache,
     project: Option<&str>,
     board_type: Option<&str>,
     limit: u32,
 ) -> Result<String> {
-    let result = client.get_boards(project, board_type, limit).await?;
-    serde_yaml::to_string(&result).context("Failed to serialize boards as YAML")
+    let cached = cache.boards(client).await?;
+    let effective_limit = if limit == 0 {
+        usize::MAX
+    } else {
+        limit as usize
+    };
+    let boards: Vec<AgileBoard> = cached
+        .boards
+        .iter()
+        .filter(|b| project.map_or(true, |p| b.project_key.as_deref() == Some(p)))
+        .filter(|b| board_type.map_or(true, |t| b.board_type == t))
+        .take(effective_limit)
+        .cloned()
+        .collect();
+    let total = boards.len() as u32;
+    let view = crate::atlassian::client::AgileBoardList { boards, total };
+    serde_yaml::to_string(&view).context("Failed to serialize boards as YAML")
 }
 
 pub(crate) async fn board_issues_yaml(
@@ -518,9 +535,12 @@ pub(crate) async fn link_list_yaml(client: &AtlassianClient, key: &str) -> Resul
     serde_yaml::to_string(&links).context("Failed to serialize issue links as YAML")
 }
 
-pub(crate) async fn link_types_yaml(client: &AtlassianClient) -> Result<String> {
-    let types = client.get_link_types().await?;
-    serde_yaml::to_string(&types).context("Failed to serialize link types as YAML")
+pub(crate) async fn link_types_yaml(
+    client: &AtlassianClient,
+    cache: &CatalogueCache,
+) -> Result<String> {
+    let types = cache.link_types(client).await?;
+    serde_yaml::to_string(&*types).context("Failed to serialize link types as YAML")
 }
 
 pub(crate) async fn link_remove_yaml(client: &AtlassianClient, link_id: &str) -> Result<String> {
@@ -603,14 +623,22 @@ pub struct FieldOptionsParams {
 
 pub(crate) async fn field_list_yaml(
     client: &AtlassianClient,
+    cache: &CatalogueCache,
     search: Option<&str>,
 ) -> Result<String> {
-    let mut fields = client.get_fields().await?;
-    if let Some(needle) = search {
-        let needle_lower = needle.to_lowercase();
-        fields.retain(|f| f.name.to_lowercase().contains(&needle_lower));
-    }
-    serde_yaml::to_string(&fields).context("Failed to serialize fields as YAML")
+    let cached = cache.fields(client).await?;
+    let view: Vec<_> = match search {
+        Some(needle) => {
+            let needle_lower = needle.to_lowercase();
+            cached
+                .iter()
+                .filter(|f| f.name.to_lowercase().contains(&needle_lower))
+                .cloned()
+                .collect()
+        }
+        None => cached.iter().cloned().collect(),
+    };
+    serde_yaml::to_string(&view).context("Failed to serialize fields as YAML")
 }
 
 pub(crate) async fn field_options_yaml(
@@ -634,9 +662,26 @@ pub struct ProjectListParams {
     pub limit: u32,
 }
 
-pub(crate) async fn project_list_yaml(client: &AtlassianClient, limit: u32) -> Result<String> {
-    let result = client.get_projects(limit).await?;
-    serde_yaml::to_string(&result).context("Failed to serialize projects as YAML")
+pub(crate) async fn project_list_yaml(
+    client: &AtlassianClient,
+    cache: &CatalogueCache,
+    limit: u32,
+) -> Result<String> {
+    let cached = cache.projects(client).await?;
+    let effective_limit = if limit == 0 {
+        usize::MAX
+    } else {
+        limit as usize
+    };
+    let projects: Vec<JiraProject> = cached
+        .projects
+        .iter()
+        .take(effective_limit)
+        .cloned()
+        .collect();
+    let total = projects.len() as u32;
+    let view = crate::atlassian::client::JiraProjectList { projects, total };
+    serde_yaml::to_string(&view).context("Failed to serialize projects as YAML")
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -768,10 +813,12 @@ impl OmniDevServer {
         &self,
         Parameters(params): Parameters<BoardListParams>,
     ) -> Result<CallToolResult, McpError> {
+        let cache = self.catalogue_cache.clone();
         let yaml = (async {
             let (client, _) = create_client()?;
             board_list_yaml(
                 &client,
+                &cache,
                 params.project.as_deref(),
                 params.board_type.as_deref(),
                 params.limit,
@@ -1069,9 +1116,10 @@ impl OmniDevServer {
         &self,
         Parameters(_params): Parameters<LinkTypesParams>,
     ) -> Result<CallToolResult, McpError> {
+        let cache = self.catalogue_cache.clone();
         let yaml = (async {
             let (client, _) = create_client()?;
-            link_types_yaml(&client).await
+            link_types_yaml(&client, &cache).await
         })
         .await
         .map_err(tool_error)?;
@@ -1154,9 +1202,10 @@ impl OmniDevServer {
         &self,
         Parameters(params): Parameters<FieldListParams>,
     ) -> Result<CallToolResult, McpError> {
+        let cache = self.catalogue_cache.clone();
         let yaml = (async {
             let (client, _) = create_client()?;
-            field_list_yaml(&client, params.search.as_deref()).await
+            field_list_yaml(&client, &cache, params.search.as_deref()).await
         })
         .await
         .map_err(tool_error)?;
@@ -1193,9 +1242,10 @@ impl OmniDevServer {
         &self,
         Parameters(params): Parameters<ProjectListParams>,
     ) -> Result<CallToolResult, McpError> {
+        let cache = self.catalogue_cache.clone();
         let yaml = (async {
             let (client, _) = create_client()?;
-            project_list_yaml(&client, params.limit).await
+            project_list_yaml(&client, &cache, params.limit).await
         })
         .await
         .map_err(tool_error)?;
@@ -1445,9 +1495,58 @@ mod tests {
             .mount(&server)
             .await;
         let client = mock_client(&server.uri());
-        let yaml = board_list_yaml(&client, None, None, 50).await.unwrap();
+        let cache = CatalogueCache::new(std::time::Duration::from_secs(60));
+        let yaml = board_list_yaml(&client, &cache, None, None, 50)
+            .await
+            .unwrap();
         assert!(yaml.contains("scrum"));
         assert!(yaml.contains("projectKey: PROJ") || yaml.contains("project_key: PROJ"));
+    }
+
+    #[tokio::test]
+    async fn board_list_yaml_limit_zero_returns_all_filtered_clientside() {
+        // limit=0 hits the unlimited branch in `effective_limit`; the cache
+        // fetches with limit=0, and the helper applies the project +
+        // board_type filters client-side against the cached full list.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/agile/1.0/board"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "values": [
+                    {"id": 1, "name": "Alpha",  "type": "scrum",  "location": {"projectKey": "PROJ"}},
+                    {"id": 2, "name": "Beta",   "type": "kanban", "location": {"projectKey": "PROJ"}},
+                    {"id": 3, "name": "Gamma",  "type": "scrum",  "location": {"projectKey": "OTHER"}}
+                ],
+                "isLast": true
+            })))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let cache = CatalogueCache::new(std::time::Duration::from_secs(60));
+
+        let yaml = board_list_yaml(&client, &cache, Some("PROJ"), Some("scrum"), 0)
+            .await
+            .unwrap();
+        // Only Alpha matches both filters.
+        assert!(yaml.contains("Alpha"));
+        assert!(!yaml.contains("Beta"));
+        assert!(!yaml.contains("Gamma"));
+
+        // Project-only filter exercises the project-Some lambda body.
+        let yaml = board_list_yaml(&client, &cache, Some("PROJ"), None, 0)
+            .await
+            .unwrap();
+        assert!(yaml.contains("Alpha"));
+        assert!(yaml.contains("Beta"));
+        assert!(!yaml.contains("Gamma"));
+
+        // Board-type-only filter exercises the board_type-Some lambda body.
+        let yaml = board_list_yaml(&client, &cache, None, Some("kanban"), 0)
+            .await
+            .unwrap();
+        assert!(!yaml.contains("Alpha"));
+        assert!(yaml.contains("Beta"));
+        assert!(!yaml.contains("Gamma"));
     }
 
     #[tokio::test]
@@ -1459,7 +1558,10 @@ mod tests {
             .mount(&server)
             .await;
         let client = mock_client(&server.uri());
-        let err = board_list_yaml(&client, None, None, 50).await.unwrap_err();
+        let cache = CatalogueCache::new(std::time::Duration::from_secs(60));
+        let err = board_list_yaml(&client, &cache, None, None, 50)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("403"));
     }
 
@@ -1933,7 +2035,8 @@ mod tests {
             .mount(&server)
             .await;
         let client = mock_client(&server.uri());
-        let yaml = link_types_yaml(&client).await.unwrap();
+        let cache = CatalogueCache::new(std::time::Duration::from_secs(60));
+        let yaml = link_types_yaml(&client, &cache).await.unwrap();
         assert!(yaml.contains("Blocks"));
         assert!(yaml.contains("Duplicates"));
     }
@@ -1947,7 +2050,8 @@ mod tests {
             .mount(&server)
             .await;
         let client = mock_client(&server.uri());
-        let err = link_types_yaml(&client).await.unwrap_err();
+        let cache = CatalogueCache::new(std::time::Duration::from_secs(60));
+        let err = link_types_yaml(&client, &cache).await.unwrap_err();
         assert!(err.to_string().contains("403"));
     }
 
@@ -2060,7 +2164,8 @@ mod tests {
             .mount(&server)
             .await;
         let client = mock_client(&server.uri());
-        let yaml = field_list_yaml(&client, None).await.unwrap();
+        let cache = CatalogueCache::new(std::time::Duration::from_secs(60));
+        let yaml = field_list_yaml(&client, &cache, None).await.unwrap();
         assert!(yaml.contains("Summary"));
         assert!(yaml.contains("Story Points"));
     }
@@ -2077,7 +2182,10 @@ mod tests {
             .mount(&server)
             .await;
         let client = mock_client(&server.uri());
-        let yaml = field_list_yaml(&client, Some("story")).await.unwrap();
+        let cache = CatalogueCache::new(std::time::Duration::from_secs(60));
+        let yaml = field_list_yaml(&client, &cache, Some("story"))
+            .await
+            .unwrap();
         assert!(yaml.contains("Story Points"));
         assert!(!yaml.contains("Summary"));
     }
@@ -2091,7 +2199,8 @@ mod tests {
             .mount(&server)
             .await;
         let client = mock_client(&server.uri());
-        let err = field_list_yaml(&client, None).await.unwrap_err();
+        let cache = CatalogueCache::new(std::time::Duration::from_secs(60));
+        let err = field_list_yaml(&client, &cache, None).await.unwrap_err();
         assert!(err.to_string().contains("500"));
     }
 
@@ -2170,8 +2279,32 @@ mod tests {
             .mount(&server)
             .await;
         let client = mock_client(&server.uri());
-        let yaml = project_list_yaml(&client, 50).await.unwrap();
+        let cache = CatalogueCache::new(std::time::Duration::from_secs(60));
+        let yaml = project_list_yaml(&client, &cache, 50).await.unwrap();
         assert!(yaml.contains("PROJ"));
+    }
+
+    #[tokio::test]
+    async fn project_list_yaml_limit_zero_returns_all() {
+        // limit=0 takes the `usize::MAX` branch in `effective_limit`.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/project/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "values": [
+                    {"id": "10001", "key": "PROJ", "name": "Project"},
+                    {"id": "10002", "key": "OTHER", "name": "Other"}
+                ],
+                "total": 2,
+                "isLast": true
+            })))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let cache = CatalogueCache::new(std::time::Duration::from_secs(60));
+        let yaml = project_list_yaml(&client, &cache, 0).await.unwrap();
+        assert!(yaml.contains("PROJ"));
+        assert!(yaml.contains("OTHER"));
     }
 
     #[tokio::test]
@@ -2183,7 +2316,8 @@ mod tests {
             .mount(&server)
             .await;
         let client = mock_client(&server.uri());
-        let err = project_list_yaml(&client, 50).await.unwrap_err();
+        let cache = CatalogueCache::new(std::time::Duration::from_secs(60));
+        let err = project_list_yaml(&client, &cache, 50).await.unwrap_err();
         assert!(err.to_string().contains("500"));
     }
 
