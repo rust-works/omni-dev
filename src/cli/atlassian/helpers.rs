@@ -3,9 +3,10 @@
 use std::fs;
 use std::io::{self, Read, Write};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 
 use crate::atlassian::adf::AdfDocument;
+use crate::atlassian::adf_schema::validate_document;
 use crate::atlassian::api::AtlassianApi;
 use crate::atlassian::auth;
 use crate::atlassian::client::{AtlassianClient, FieldSelection};
@@ -107,6 +108,10 @@ pub fn prepare_write(file: Option<&str>, format: &ContentFormat) -> Result<(AdfD
 }
 
 /// Prints a dry-run summary without making any API calls.
+///
+/// Runs the ADF schema validator over `adf` after printing the JSON output and
+/// reports any violations. Returns an error if violations are found, so the
+/// process exits non-zero — useful as a CI pre-flight check.
 pub fn print_dry_run(id: &str, adf: &AdfDocument, title: &str) -> Result<()> {
     println!("Dry run for {id}:");
     if !title.is_empty() {
@@ -116,7 +121,24 @@ pub fn print_dry_run(id: &str, adf: &AdfDocument, title: &str) -> Result<()> {
         "\nADF output:\n{}",
         serde_json::to_string_pretty(adf).context("Failed to serialize ADF")?
     );
-    Ok(())
+
+    let violations = validate_document(adf);
+    if violations.is_empty() {
+        println!("\nValidation: OK");
+        Ok(())
+    } else {
+        let count = violations.len();
+        let noun = if count == 1 {
+            "violation"
+        } else {
+            "violations"
+        };
+        println!("\nValidation: {count} {noun}");
+        for v in &violations {
+            println!("  ✗ {v}");
+        }
+        Err(anyhow!("ADF validation failed: {count} {noun}"))
+    }
 }
 
 /// Prints a dry-run summary for issue creation.
@@ -694,6 +716,68 @@ mod tests {
         let adf = AdfDocument::new();
         let result = print_dry_run("PROJ-1", &adf, "My Title");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn print_dry_run_pluralises_violation_count() {
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "panel",
+                "attrs": { "panelType": "info" },
+                "content": [
+                    {
+                        "type": "expand",
+                        "attrs": { "title": "a" },
+                        "content": [{
+                            "type": "paragraph",
+                            "content": [{ "type": "text", "text": "x" }]
+                        }]
+                    },
+                    {
+                        "type": "expand",
+                        "attrs": { "title": "b" },
+                        "content": [{
+                            "type": "paragraph",
+                            "content": [{ "type": "text", "text": "y" }]
+                        }]
+                    }
+                ]
+            }]
+        }"#;
+        let adf = AdfDocument::from_json_str(adf_json).unwrap();
+
+        let result = print_dry_run("12345", &adf, "Title");
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("2 violations"), "got: {err}");
+    }
+
+    #[test]
+    fn print_dry_run_fails_on_schema_violation() {
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "panel",
+                "attrs": { "panelType": "info" },
+                "content": [{
+                    "type": "expand",
+                    "attrs": { "title": "x" },
+                    "content": [{
+                        "type": "paragraph",
+                        "content": [{ "type": "text", "text": "hi" }]
+                    }]
+                }]
+            }]
+        }"#;
+        let adf = AdfDocument::from_json_str(adf_json).unwrap();
+
+        let result = print_dry_run("12345", &adf, "Title");
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("ADF validation failed"), "got: {err}");
     }
 
     #[test]
