@@ -405,6 +405,36 @@ pub struct AgileSprintList {
     pub total: u32,
 }
 
+/// A JIRA project version (release version).
+#[derive(Debug, Clone, Serialize)]
+pub struct JiraProjectVersion {
+    /// Version ID.
+    pub id: String,
+    /// Version name (e.g., "1.0.0").
+    pub name: String,
+    /// Version description.
+    pub description: Option<String>,
+    /// Owning project key.
+    pub project_key: String,
+    /// Whether the version is released.
+    pub released: bool,
+    /// Whether the version is archived.
+    pub archived: bool,
+    /// Release date (ISO 8601, `YYYY-MM-DD`).
+    pub release_date: Option<String>,
+    /// Start date (ISO 8601, `YYYY-MM-DD`).
+    pub start_date: Option<String>,
+}
+
+/// Result from listing JIRA project versions.
+#[derive(Debug, Clone, Serialize)]
+pub struct JiraProjectVersionList {
+    /// Versions returned.
+    pub versions: Vec<JiraProjectVersion>,
+    /// Total number of versions.
+    pub total: u32,
+}
+
 /// A JIRA issue changelog entry.
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraChangelogEntry {
@@ -724,6 +754,17 @@ fn extract_display_name(value: Option<serde_json::Value>) -> Option<String> {
         .and_then(|n| n.as_str().map(str::to_string))
 }
 
+/// Validates that a date string is `YYYY-MM-DD`.
+///
+/// Surfaces a clear error before the request is sent, so callers don't
+/// have to interpret JIRA's opaque 400s on malformed dates.
+fn validate_iso_date(date: Option<&str>, field: &str) -> Result<()> {
+    let Some(d) = date else { return Ok(()) };
+    chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
+        .with_context(|| format!("{field} must be YYYY-MM-DD, got {d:?}"))?;
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct JiraEditMetaResponse {
     #[serde(default)]
@@ -1003,6 +1044,22 @@ struct AgileSprintEntry {
     #[serde(rename = "endDate")]
     end_date: Option<String>,
     goal: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct JiraProjectVersionEntry {
+    id: String,
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    released: bool,
+    #[serde(default)]
+    archived: bool,
+    #[serde(rename = "releaseDate", default)]
+    release_date: Option<String>,
+    #[serde(rename = "startDate", default)]
+    start_date: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -4102,6 +4159,337 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn get_project_versions_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/project/PROJ/versions",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {
+                        "id": "10000",
+                        "name": "1.0.0",
+                        "description": "First release",
+                        "released": true,
+                        "archived": false,
+                        "releaseDate": "2026-04-01",
+                        "startDate": "2026-03-01",
+                    },
+                    {
+                        "id": "10001",
+                        "name": "1.1.0",
+                        "released": false,
+                        "archived": false,
+                    }
+                ])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client
+            .get_project_versions("PROJ", None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.total, 2);
+        assert_eq!(result.versions[0].id, "10000");
+        assert_eq!(result.versions[0].name, "1.0.0");
+        assert_eq!(result.versions[0].project_key, "PROJ");
+        assert!(result.versions[0].released);
+        assert_eq!(
+            result.versions[0].release_date.as_deref(),
+            Some("2026-04-01")
+        );
+        assert_eq!(result.versions[1].name, "1.1.0");
+        assert!(!result.versions[1].released);
+    }
+
+    #[tokio::test]
+    async fn get_project_versions_filters_released() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/project/PROJ/versions",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"id": "1", "name": "1.0", "released": true, "archived": false},
+                    {"id": "2", "name": "2.0", "released": false, "archived": false},
+                    {"id": "3", "name": "0.9", "released": true, "archived": true},
+                ])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let result = client
+            .get_project_versions("PROJ", Some(true), Some(false))
+            .await
+            .unwrap();
+
+        assert_eq!(result.total, 1);
+        assert_eq!(result.versions[0].name, "1.0");
+    }
+
+    #[tokio::test]
+    async fn get_project_versions_api_error() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/project/NONE/versions",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .get_project_versions("NONE", None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn create_project_version_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/version"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "id": "10010",
+                    "name": "1.2.0",
+                    "description": "Bugfix release",
+                    "released": false,
+                    "archived": false,
+                    "releaseDate": "2026-06-01",
+                    "startDate": "2026-05-01",
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let version = client
+            .create_project_version(
+                "PROJ",
+                "1.2.0",
+                Some("Bugfix release"),
+                Some("2026-06-01"),
+                Some("2026-05-01"),
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(version.id, "10010");
+        assert_eq!(version.name, "1.2.0");
+        assert_eq!(version.project_key, "PROJ");
+        assert_eq!(version.description.as_deref(), Some("Bugfix release"));
+        assert_eq!(version.release_date.as_deref(), Some("2026-06-01"));
+    }
+
+    #[tokio::test]
+    async fn create_project_version_minimal() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/version"))
+            .respond_with(wiremock::ResponseTemplate::new(201).set_body_json(
+                serde_json::json!({"id": "10011", "name": "2.0.0", "released": false, "archived": false}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let version = client
+            .create_project_version("PROJ", "2.0.0", None, None, None, false, false)
+            .await
+            .unwrap();
+
+        assert_eq!(version.id, "10011");
+        assert!(version.release_date.is_none());
+    }
+
+    #[tokio::test]
+    async fn create_project_version_forbidden() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/version"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(403)
+                    .set_body_string("You do not have permission to administer this project."),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .create_project_version("PROJ", "1.0", None, None, None, false, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn create_project_version_invalid_date_short_circuits() {
+        // Server should never be hit because validation fails client-side.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/version"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .create_project_version("PROJ", "1.0", None, Some("06-01-2026"), None, false, false)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("release_date"));
+        assert!(msg.contains("YYYY-MM-DD"));
+    }
+
+    #[tokio::test]
+    async fn create_project_version_invalid_start_date_short_circuits() {
+        // start_date validation runs after release_date; this test drives that
+        // second branch by passing a valid release_date with a malformed
+        // start_date.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/version"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .create_project_version(
+                "PROJ",
+                "1.0",
+                None,
+                Some("2026-06-01"),
+                Some("not-a-date"),
+                false,
+                false,
+            )
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("start_date"));
+        assert!(msg.contains("YYYY-MM-DD"));
+    }
+
+    #[test]
+    fn validate_iso_date_accepts_valid() {
+        assert!(validate_iso_date(Some("2026-05-10"), "release_date").is_ok());
+        assert!(validate_iso_date(None, "release_date").is_ok());
+    }
+
+    #[test]
+    fn validate_iso_date_rejects_bad_shape() {
+        let err = validate_iso_date(Some("2026/05/10"), "release_date").unwrap_err();
+        assert!(err.to_string().contains("release_date"));
+    }
+
+    #[test]
+    fn validate_iso_date_rejects_impossible() {
+        let err = validate_iso_date(Some("2026-13-40"), "start_date").unwrap_err();
+        assert!(err.to_string().contains("start_date"));
+    }
+
+    /// Exercises the `?` Err propagation on the `get_json` call in
+    /// `get_project_versions` by pointing the client at an unreachable port.
+    #[tokio::test]
+    async fn get_project_versions_transport_error() {
+        // Port 1 is reserved for `tcpmux` and almost never has a listener,
+        // so connection attempts fail before any response.
+        let client = AtlassianClient::new("http://127.0.0.1:1", "user@test.com", "token").unwrap();
+        let err = client
+            .get_project_versions("PROJ", None, None)
+            .await
+            .unwrap_err();
+        // Transport failures bubble up via anyhow `Context` from `get_json`.
+        assert!(err.to_string().contains("Failed to send GET request"));
+    }
+
+    /// Exercises the `?` Err propagation on the `.json().context(...)?`
+    /// call in `get_project_versions` by returning a 200 with a body that
+    /// can't be parsed as the expected JSON shape.
+    #[tokio::test]
+    async fn get_project_versions_invalid_json() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/project/PROJ/versions",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("not-json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .get_project_versions("PROJ", None, None)
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Failed to parse project versions response"));
+    }
+
+    /// Exercises the `?` Err propagation on the `post_json` call in
+    /// `create_project_version`.
+    #[tokio::test]
+    async fn create_project_version_transport_error() {
+        let client = AtlassianClient::new("http://127.0.0.1:1", "user@test.com", "token").unwrap();
+        let err = client
+            .create_project_version("PROJ", "1.0", None, None, None, false, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Failed to send POST request"));
+    }
+
+    /// Exercises the `?` Err propagation on the `.json().context(...)?`
+    /// call in `create_project_version`.
+    #[tokio::test]
+    async fn create_project_version_invalid_json() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/version"))
+            .respond_with(wiremock::ResponseTemplate::new(201).set_body_string("not-json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .create_project_version("PROJ", "1.0", None, None, None, false, false)
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Failed to parse version create response"));
     }
 
     #[tokio::test]
@@ -7378,6 +7766,117 @@ impl AtlassianClient {
         }
 
         Ok(())
+    }
+
+    /// Lists versions for a JIRA project.
+    ///
+    /// Uses the lightweight `GET /rest/api/3/project/{key}/versions` endpoint,
+    /// which returns all versions in a single response without pagination.
+    /// `released` and `archived` filters are applied client-side.
+    pub async fn get_project_versions(
+        &self,
+        project_key: &str,
+        released: Option<bool>,
+        archived: Option<bool>,
+    ) -> Result<JiraProjectVersionList> {
+        let url = format!(
+            "{}/rest/api/3/project/{}/versions",
+            self.instance_url, project_key
+        );
+
+        let response = self.get_json(&url).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let entries: Vec<JiraProjectVersionEntry> = response
+            .json()
+            .await
+            .context("Failed to parse project versions response")?;
+
+        let versions: Vec<JiraProjectVersion> = entries
+            .into_iter()
+            .filter(|e| released.map_or(true, |r| e.released == r))
+            .filter(|e| archived.map_or(true, |a| e.archived == a))
+            .map(|e| JiraProjectVersion {
+                id: e.id,
+                name: e.name,
+                description: e.description,
+                project_key: project_key.to_string(),
+                released: e.released,
+                archived: e.archived,
+                release_date: e.release_date,
+                start_date: e.start_date,
+            })
+            .collect();
+
+        let total = versions.len() as u32;
+        Ok(JiraProjectVersionList { versions, total })
+    }
+
+    /// Creates a new version in a JIRA project.
+    ///
+    /// Validates `release_date` and `start_date` as `YYYY-MM-DD` client-side
+    /// to surface clear errors before JIRA rejects the request with an
+    /// opaque 400.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_project_version(
+        &self,
+        project_key: &str,
+        name: &str,
+        description: Option<&str>,
+        release_date: Option<&str>,
+        start_date: Option<&str>,
+        released: bool,
+        archived: bool,
+    ) -> Result<JiraProjectVersion> {
+        validate_iso_date(release_date, "release_date")?;
+        validate_iso_date(start_date, "start_date")?;
+
+        let url = format!("{}/rest/api/3/version", self.instance_url);
+
+        let mut body = serde_json::json!({
+            "project": project_key,
+            "name": name,
+            "released": released,
+            "archived": archived,
+        });
+        if let Some(d) = description {
+            body["description"] = serde_json::Value::String(d.to_string());
+        }
+        if let Some(rd) = release_date {
+            body["releaseDate"] = serde_json::Value::String(rd.to_string());
+        }
+        if let Some(sd) = start_date {
+            body["startDate"] = serde_json::Value::String(sd.to_string());
+        }
+
+        let response = self.post_json(&url, &body).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let entry: JiraProjectVersionEntry = response
+            .json()
+            .await
+            .context("Failed to parse version create response")?;
+
+        Ok(JiraProjectVersion {
+            id: entry.id,
+            name: entry.name,
+            description: entry.description,
+            project_key: project_key.to_string(),
+            released: entry.released,
+            archived: entry.archived,
+            release_date: entry.release_date,
+            start_date: entry.start_date,
+        })
     }
 
     /// Lists links on a JIRA issue.
