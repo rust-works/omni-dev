@@ -15,6 +15,7 @@ use rmcp::{
 use serde::Deserialize;
 
 use crate::atlassian::adf::AdfDocument;
+use crate::atlassian::adf_validated::ValidatedAdfDocument;
 use crate::atlassian::client::{
     AtlassianClient, JiraTransition, JiraVisibility, JiraVisibilityType,
 };
@@ -321,7 +322,7 @@ async fn run_jira_create(
     issue_type: &str,
 ) -> Result<String> {
     let adf = match description {
-        Some(md) if !md.is_empty() => Some(markdown_to_adf(md)?),
+        Some(md) if !md.is_empty() => Some(ValidatedAdfDocument::try_new(markdown_to_adf(md)?)?),
         _ => None,
     };
     let created = client
@@ -345,18 +346,21 @@ async fn run_jira_write(
     reporter: Option<&str>,
     extra_fields: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
 ) -> Result<String> {
-    let adf: Option<AdfDocument> = match content {
-        Some(c) => Some(match format {
-            ReadFormat::Jfm => {
-                if c.starts_with("---\n") {
-                    let doc = JfmDocument::parse(c)?;
-                    markdown_to_adf(&doc.body)?
-                } else {
-                    markdown_to_adf(c)?
+    let adf: Option<ValidatedAdfDocument> = match content {
+        Some(c) => {
+            let raw: AdfDocument = match format {
+                ReadFormat::Jfm => {
+                    if c.starts_with("---\n") {
+                        let doc = JfmDocument::parse(c)?;
+                        markdown_to_adf(&doc.body)?
+                    } else {
+                        markdown_to_adf(c)?
+                    }
                 }
-            }
-            ReadFormat::Adf => serde_json::from_str(c).context("Failed to parse ADF JSON")?,
-        }),
+                ReadFormat::Adf => serde_json::from_str(c).context("Failed to parse ADF JSON")?,
+            };
+            Some(ValidatedAdfDocument::try_new(raw)?)
+        }
         None => None,
     };
 
@@ -418,7 +422,7 @@ async fn run_jira_transition(
         })?;
 
     if let Some(body) = comment.filter(|s| !s.is_empty()) {
-        let adf = markdown_to_adf(body)?;
+        let adf = ValidatedAdfDocument::try_new(markdown_to_adf(body)?)?;
         client.add_comment(key, &adf).await?;
     }
 
@@ -496,7 +500,7 @@ async fn run_jira_comment(
         "add" => {
             let text =
                 body.ok_or_else(|| anyhow::anyhow!("`body` is required when action is \"add\""))?;
-            let adf = markdown_to_adf(text)?;
+            let adf = ValidatedAdfDocument::try_new(markdown_to_adf(text)?)?;
             client.add_comment(key, &adf).await?;
             Ok(format!("Comment added to {key}.\n"))
         }
@@ -514,7 +518,7 @@ async fn run_jira_comment_edit(
     body: &str,
     visibility: Option<&JiraVisibilityParam>,
 ) -> Result<String> {
-    let adf = markdown_to_adf(body)?;
+    let adf = ValidatedAdfDocument::try_new(markdown_to_adf(body)?)?;
     let visibility = visibility.map(parse_visibility).transpose()?;
     let updated = client
         .update_comment(key, comment_id, &adf, visibility.as_ref())
@@ -1237,6 +1241,22 @@ mod tests {
             .unwrap();
     }
 
+    /// Issue #714: a body whose ADF would violate Confluence's content
+    /// model is rejected locally before any HTTP call. Uses an unreachable
+    /// URL to assert the validation `?` short-circuits before the wire.
+    const BAD_ADF_JFM: &str = ":::panel{type=info}\n:::expand{title=\"x\"}\nbody\n:::\n:::";
+
+    #[tokio::test]
+    async fn run_jira_create_rejects_invalid_adf_nesting() {
+        let client = mock_client("http://127.0.0.1:1");
+        let err = run_jira_create(&client, "PROJ", "Title", Some(BAD_ADF_JFM), "Task")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid ADF nesting"));
+        assert!(msg.contains("`expand` cannot be a child of `panel`"));
+    }
+
     #[tokio::test]
     async fn run_jira_create_propagates_api_error() {
         let server = MockServer::start().await;
@@ -1343,6 +1363,27 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("Failed to parse ADF JSON"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_write_rejects_invalid_adf_nesting() {
+        // Issue #714: validation runs before the network call.
+        let client = mock_client("http://127.0.0.1:1");
+        let err = run_jira_write(
+            &client,
+            "PROJ-1",
+            Some(BAD_ADF_JFM),
+            ReadFormat::Jfm,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid ADF nesting"));
+        assert!(msg.contains("`expand` cannot be a child of `panel`"));
     }
 
     #[tokio::test]
@@ -1722,6 +1763,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_jira_transition_rejects_invalid_comment_adf_nesting() {
+        // Issue #714: when transition succeeds but the optional comment body
+        // produces invalid ADF, the validation `?` rejects it. The transition
+        // POST has already happened; the comment POST does not (no mock).
+        let server = MockServer::start().await;
+        mount_transitions(
+            &server,
+            "PROJ-1",
+            serde_json::json!({"transitions": [{"id": "21", "name": "Done"}]}),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue/PROJ-1/transitions"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_jira_transition(&client, "PROJ-1", Some("Done"), Some(BAD_ADF_JFM), false)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid ADF nesting"));
+        assert!(msg.contains("`expand` cannot be a child of `panel`"));
+    }
+
+    #[tokio::test]
     async fn run_jira_transition_posts_comment_when_provided() {
         let server = MockServer::start().await;
         mount_transitions(
@@ -2018,6 +2086,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_jira_comment_add_rejects_invalid_adf_nesting() {
+        // Issue #714: invalid body short-circuits before the network call.
+        let client = mock_client("http://127.0.0.1:1");
+        let err = run_jira_comment(&client, "PROJ-1", "add", Some(BAD_ADF_JFM), 0)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid ADF nesting"));
+        assert!(msg.contains("`expand` cannot be a child of `panel`"));
+    }
+
+    #[tokio::test]
     async fn run_jira_comment_unknown_action_errors() {
         let client = mock_client("http://127.0.0.1:1");
         let err = run_jira_comment(&client, "PROJ-1", "delete", None, 0)
@@ -2057,6 +2137,18 @@ mod tests {
     }
 
     // ── run_jira_comment_edit ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_jira_comment_edit_rejects_invalid_adf_nesting() {
+        // Issue #714: invalid body short-circuits before the network call.
+        let client = mock_client("http://127.0.0.1:1");
+        let err = run_jira_comment_edit(&client, "PROJ-1", "100", BAD_ADF_JFM, None)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid ADF nesting"));
+        assert!(msg.contains("`expand` cannot be a child of `panel`"));
+    }
 
     #[tokio::test]
     async fn run_jira_comment_edit_success() {

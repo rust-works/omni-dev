@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use crate::atlassian::adf::AdfDocument;
+use crate::atlassian::adf_validated::ValidatedAdfDocument;
 use crate::atlassian::confluence_api::ConfluenceApi;
 use crate::atlassian::convert::markdown_to_adf;
 use crate::atlassian::document::{JfmDocument, JfmFrontmatter};
@@ -43,7 +44,7 @@ struct CreateParams {
     space: String,
     title: String,
     parent_id: Option<String>,
-    adf: AdfDocument,
+    adf: ValidatedAdfDocument,
 }
 
 impl CreateCommand {
@@ -72,7 +73,7 @@ impl CreateCommand {
     fn resolve_from_jfm(&self) -> Result<CreateParams> {
         let input = read_input(self.file.as_deref())?;
         let doc = JfmDocument::parse(&input)?;
-        let adf = markdown_to_adf(&doc.body)?;
+        let adf = ValidatedAdfDocument::try_new(markdown_to_adf(&doc.body)?)?;
 
         let (fm_space, fm_title, fm_parent) = match &doc.frontmatter {
             JfmFrontmatter::Confluence(fm) => (
@@ -108,6 +109,7 @@ impl CreateCommand {
         let input = read_input(self.file.as_deref())?;
         let adf: AdfDocument =
             serde_json::from_str(&input).context("Failed to parse ADF JSON input")?;
+        let adf = ValidatedAdfDocument::try_new(adf)?;
 
         let space = self
             .space
@@ -207,6 +209,29 @@ mod tests {
         let params = cmd.resolve_params().unwrap();
         assert_eq!(params.space, "DOC");
         assert!(params.parent_id.is_none());
+    }
+
+    #[test]
+    fn resolve_from_jfm_rejects_invalid_adf_nesting() {
+        // Issue #714: page body that produces invalid ADF (panel→expand)
+        // must be rejected at resolve time, before the API call.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("page.md");
+        let content = "---\ntype: confluence\ninstance: https://org.atlassian.net\ntitle: P\nspace_key: ENG\n---\n\n:::panel{type=info}\n:::expand{title=\"x\"}\nbody\n:::\n:::\n";
+        fs::write(&file_path, content).unwrap();
+
+        let cmd = CreateCommand {
+            file: Some(file_path.to_str().unwrap().to_string()),
+            format: ContentFormat::Jfm,
+            space: None,
+            title: None,
+            parent: None,
+            dry_run: false,
+        };
+        let err = cmd.resolve_params().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid ADF nesting"));
+        assert!(msg.contains("`expand` cannot be a child of `panel`"));
     }
 
     #[test]
@@ -361,7 +386,7 @@ mod tests {
             space: "ENG".to_string(),
             title: "Child Page".to_string(),
             parent_id: Some("11111".to_string()),
-            adf: AdfDocument::new(),
+            adf: ValidatedAdfDocument::empty(),
         };
         assert!(print_create_dry_run(&params).is_ok());
     }
@@ -372,7 +397,7 @@ mod tests {
             space: "ENG".to_string(),
             title: "Root Page".to_string(),
             parent_id: None,
-            adf: AdfDocument::new(),
+            adf: ValidatedAdfDocument::empty(),
         };
         assert!(print_create_dry_run(&params).is_ok());
     }
@@ -401,7 +426,7 @@ mod tests {
             space: "ENG".to_string(),
             title: "New Page".to_string(),
             parent_id: None,
-            adf: AdfDocument::new(),
+            adf: ValidatedAdfDocument::empty(),
         }
     }
 

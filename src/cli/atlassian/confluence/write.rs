@@ -3,6 +3,7 @@
 use anyhow::Result;
 use clap::Parser;
 
+use crate::atlassian::adf_validated::ValidatedAdfDocument;
 use crate::atlassian::confluence_api::ConfluenceApi;
 use crate::cli::atlassian::format::ContentFormat;
 use crate::cli::atlassian::helpers::{create_client, prepare_write, run_write};
@@ -38,10 +39,11 @@ impl WriteCommand {
             return crate::cli::atlassian::helpers::print_dry_run(&self.id, &adf, &title);
         }
 
+        let validated = ValidatedAdfDocument::try_new(adf)?;
         let (client, _instance_url) = create_client()?;
         let api = ConfluenceApi::new(client);
 
-        run_write(&self.id, &adf, &title, self.force, &api).await
+        run_write(&self.id, &validated, &title, self.force, &api).await
     }
 }
 
@@ -83,6 +85,33 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(cmd.execute());
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn execute_send_path_rejects_invalid_adf_nesting() {
+        // Issue #714: when --dry-run is NOT set, WriteCommand::execute wraps
+        // the ADF in `ValidatedAdfDocument::try_new(...)?` before reaching
+        // create_client(). A body that produces invalid ADF (panel→expand)
+        // must short-circuit with a validation error before any env / network
+        // is touched.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("page.md");
+        let content = "---\ntype: confluence\ninstance: https://org.atlassian.net\npage_id: '12345'\ntitle: Bad\nspace_key: ENG\n---\n\n:::panel{type=info}\n:::expand{title=\"x\"}\nbody\n:::\n:::\n";
+        fs::write(&file_path, content).unwrap();
+
+        let cmd = WriteCommand {
+            id: "12345".to_string(),
+            file: Some(file_path.to_str().unwrap().to_string()),
+            format: ContentFormat::Jfm,
+            force: true,
+            dry_run: false,
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = rt.block_on(cmd.execute()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid ADF nesting"));
+        assert!(msg.contains("`expand` cannot be a child of `panel`"));
     }
 
     #[test]

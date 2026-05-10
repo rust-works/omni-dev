@@ -6,6 +6,7 @@
 
 pub mod adf;
 pub mod adf_schema;
+pub mod adf_validated;
 pub mod api;
 pub mod attrs;
 pub mod auth;

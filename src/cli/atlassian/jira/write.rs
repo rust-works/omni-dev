@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::Parser;
 
 use crate::atlassian::adf::AdfDocument;
+use crate::atlassian::adf_validated::ValidatedAdfDocument;
 use crate::atlassian::client::AtlassianClient;
 use crate::atlassian::convert::markdown_to_adf;
 use crate::atlassian::custom_fields::{
@@ -175,8 +176,9 @@ impl WriteCommand {
             let Some(body_adf) = body_adf else {
                 unreachable!("skip_body without other fields was rejected above");
             };
+            let validated = ValidatedAdfDocument::try_new(body_adf)?;
             let api = JiraApi::new(client);
-            return run_write(&self.key, &body_adf, &title, self.force, &api).await;
+            return run_write(&self.key, &validated, &title, self.force, &api).await;
         }
 
         // Resolve frontmatter / set-field custom fields via editmeta.
@@ -196,9 +198,10 @@ impl WriteCommand {
             "`--set-field` of the same name",
         )?;
 
+        let validated_body = body_adf.map(ValidatedAdfDocument::try_new).transpose()?;
         run_write_jira_with_resolved_fields(
             &self.key,
-            body_adf.as_ref(),
+            validated_body.as_ref(),
             &title,
             parent,
             self.force,
@@ -543,6 +546,32 @@ mod tests {
         c.execute_with_client(mock_client(&server.uri()))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_send_path_rejects_invalid_adf_nesting() {
+        // Issue #714: when --dry-run is NOT set, the dispatch wraps body_adf
+        // in `ValidatedAdfDocument::try_new(...)?` before reaching the API.
+        // A body that produces invalid ADF (panel→expand) must short-circuit
+        // with a validation error before any HTTP call.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_jfm_file(
+            &dir,
+            ":::panel{type=info}\n:::expand{title=\"x\"}\nbody\n:::\n:::",
+        );
+
+        let server = wiremock::MockServer::start().await;
+        // Intentionally no PUT mock — validation must short-circuit first.
+
+        let mut c = cmd("PROJ-1");
+        c.file = Some(path);
+        let err = c
+            .execute_with_client(mock_client(&server.uri()))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid ADF nesting"));
+        assert!(msg.contains("`expand` cannot be a child of `panel`"));
     }
 
     #[tokio::test]
