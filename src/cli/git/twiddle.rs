@@ -193,6 +193,15 @@ impl TwiddleCommand {
         };
 
         refine_amendment_scopes(&mut amendments, &full_repo_view, &scope_defs);
+        {
+            use std::io::IsTerminal;
+            resolve_duplicate_amendments(
+                &mut amendments,
+                self.auto_apply,
+                std::io::stdin().is_terminal(),
+                &mut std::io::BufReader::new(std::io::stdin()),
+            )?;
+        }
 
         // 6. Handle different output modes
         if let Some(save_path) = self.save_only {
@@ -520,6 +529,15 @@ impl TwiddleCommand {
         };
 
         refine_amendment_scopes(&mut all_amendments, &full_repo_view, &scope_defs);
+        {
+            use std::io::IsTerminal;
+            resolve_duplicate_amendments(
+                &mut all_amendments,
+                self.auto_apply,
+                std::io::stdin().is_terminal(),
+                &mut std::io::BufReader::new(std::io::stdin()),
+            )?;
+        }
 
         println!(
             "✅ All commits processed! Found {} amendments.",
@@ -2091,6 +2109,128 @@ fn format_scope_list(scopes: &[crate::data::context::ScopeDefinition]) -> String
         .join(", ")
 }
 
+/// Resolves duplicate amendments (same commit hash) by prompting the user, or
+/// silently picking the first occurrence when `auto_pick` is set.
+///
+/// Models occasionally return the same amendment twice with slight formatting
+/// variations (issue #697). The apply path can't tolerate duplicates: the
+/// first amendment rewrites the commit, leaving subsequent amendments
+/// pointing at a hash that no longer exists in branch history.
+fn resolve_duplicate_amendments(
+    amendments: &mut AmendmentFile,
+    auto_pick: bool,
+    is_terminal: bool,
+    reader: &mut (dyn std::io::BufRead + Send),
+) -> Result<()> {
+    use std::collections::hash_map::Entry;
+    use std::collections::{HashMap, HashSet};
+    use std::io::{self, Write};
+
+    if amendments.amendments.len() < 2 {
+        return Ok(());
+    }
+
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, a) in amendments.amendments.iter().enumerate() {
+        match groups.entry(a.commit.clone()) {
+            Entry::Vacant(slot) => {
+                order.push(a.commit.clone());
+                slot.insert(vec![i]);
+            }
+            Entry::Occupied(mut slot) => {
+                slot.get_mut().push(i);
+            }
+        }
+    }
+
+    if groups.values().all(|v| v.len() <= 1) {
+        return Ok(());
+    }
+
+    let mut drop_indices: HashSet<usize> = HashSet::new();
+
+    for hash in &order {
+        let Some(idxs) = groups.get(hash) else {
+            continue;
+        };
+        if idxs.len() <= 1 {
+            continue;
+        }
+
+        let short = &hash[..crate::git::SHORT_HASH_LEN.min(hash.len())];
+
+        let chosen = if auto_pick {
+            eprintln!(
+                "warning: model returned {} duplicate amendments for commit {short}; \
+                 keeping the first.",
+                idxs.len()
+            );
+            idxs[0]
+        } else if !is_terminal {
+            eprintln!(
+                "warning: model returned {} duplicate amendments for commit {short}; \
+                 stdin not interactive — keeping the first.",
+                idxs.len()
+            );
+            idxs[0]
+        } else {
+            println!(
+                "\n⚠️  Model returned {} duplicate amendments for commit {short}:",
+                idxs.len()
+            );
+            for (n, &i) in idxs.iter().enumerate() {
+                println!("\n  [{}] -----", n + 1);
+                for line in amendments.amendments[i].message.lines() {
+                    println!("      {line}");
+                }
+            }
+            println!();
+
+            loop {
+                print!(
+                    "❓ Which amendment to apply? [1-{}] (default 1) ",
+                    idxs.len()
+                );
+                io::stdout().flush()?;
+
+                let Some(input) = super::read_interactive_line(reader)? else {
+                    eprintln!("warning: stdin closed; keeping the first amendment.");
+                    break idxs[0];
+                };
+
+                let trimmed = input.trim();
+                if trimmed.is_empty() {
+                    break idxs[0];
+                }
+                match trimmed.parse::<usize>() {
+                    Ok(n) if (1..=idxs.len()).contains(&n) => break idxs[n - 1],
+                    _ => println!(
+                        "Invalid choice. Please enter a number between 1 and {}.",
+                        idxs.len()
+                    ),
+                }
+            }
+        };
+
+        for &i in idxs {
+            if i != chosen {
+                drop_indices.insert(i);
+            }
+        }
+    }
+
+    let kept: Vec<_> = std::mem::take(&mut amendments.amendments)
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !drop_indices.contains(i))
+        .map(|(_, a)| a)
+        .collect();
+    amendments.amendments = kept;
+
+    Ok(())
+}
+
 /// Refine scopes in generated amendment messages using the same deterministic
 /// file-pattern logic the checker uses, so generator and checker agree.
 fn refine_amendment_scopes(
@@ -2861,6 +3001,150 @@ mod tests {
         refine_amendment_scopes(&mut amendments, &repo_view, &[]);
 
         assert_eq!(amendments.amendments[0].message, "feat(stuff): add feature",);
+    }
+
+    // --- resolve_duplicate_amendments ---
+
+    fn dup_hash(byte: char) -> String {
+        std::iter::repeat(byte).take(40).collect()
+    }
+
+    fn dup_amendments(items: &[(&str, &str)]) -> AmendmentFile {
+        use crate::data::amendments::Amendment;
+        AmendmentFile {
+            amendments: items
+                .iter()
+                .map(|(hash, msg)| Amendment {
+                    commit: (*hash).to_string(),
+                    message: (*msg).to_string(),
+                    summary: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn resolve_duplicates_empty_is_noop() {
+        let mut af = AmendmentFile { amendments: vec![] };
+        let mut reader = std::io::Cursor::new(b"" as &[u8]);
+        resolve_duplicate_amendments(&mut af, false, true, &mut reader).unwrap();
+        assert!(af.amendments.is_empty());
+    }
+
+    #[test]
+    fn resolve_duplicates_single_is_noop() {
+        let h = dup_hash('a');
+        let mut af = dup_amendments(&[(&h, "feat: only")]);
+        let mut reader = std::io::Cursor::new(b"" as &[u8]);
+        resolve_duplicate_amendments(&mut af, false, true, &mut reader).unwrap();
+        assert_eq!(af.amendments.len(), 1);
+        assert_eq!(af.amendments[0].message, "feat: only");
+    }
+
+    #[test]
+    fn resolve_duplicates_no_dups_unchanged() {
+        let h_a = dup_hash('a');
+        let h_b = dup_hash('b');
+        let mut af = dup_amendments(&[(&h_a, "feat: a"), (&h_b, "feat: b")]);
+        let mut reader = std::io::Cursor::new(b"" as &[u8]);
+        resolve_duplicate_amendments(&mut af, false, true, &mut reader).unwrap();
+        assert_eq!(af.amendments.len(), 2);
+        assert_eq!(af.amendments[0].message, "feat: a");
+        assert_eq!(af.amendments[1].message, "feat: b");
+    }
+
+    #[test]
+    fn resolve_duplicates_auto_pick_keeps_first() {
+        let h = dup_hash('a');
+        let mut af = dup_amendments(&[(&h, "feat: first"), (&h, "feat: second")]);
+        let mut reader = std::io::Cursor::new(b"" as &[u8]);
+        resolve_duplicate_amendments(&mut af, true, true, &mut reader).unwrap();
+        assert_eq!(af.amendments.len(), 1);
+        assert_eq!(af.amendments[0].message, "feat: first");
+    }
+
+    #[test]
+    fn resolve_duplicates_non_terminal_keeps_first() {
+        let h = dup_hash('a');
+        let mut af = dup_amendments(&[(&h, "feat: first"), (&h, "feat: second")]);
+        let mut reader = std::io::Cursor::new(b"" as &[u8]);
+        resolve_duplicate_amendments(&mut af, false, false, &mut reader).unwrap();
+        assert_eq!(af.amendments.len(), 1);
+        assert_eq!(af.amendments[0].message, "feat: first");
+    }
+
+    #[test]
+    fn resolve_duplicates_prompt_picks_second() {
+        let h = dup_hash('a');
+        let mut af = dup_amendments(&[(&h, "feat: first"), (&h, "feat: second")]);
+        let mut reader = std::io::Cursor::new(b"2\n" as &[u8]);
+        resolve_duplicate_amendments(&mut af, false, true, &mut reader).unwrap();
+        assert_eq!(af.amendments.len(), 1);
+        assert_eq!(af.amendments[0].message, "feat: second");
+    }
+
+    #[test]
+    fn resolve_duplicates_prompt_default_picks_first() {
+        let h = dup_hash('a');
+        let mut af = dup_amendments(&[(&h, "feat: first"), (&h, "feat: second")]);
+        let mut reader = std::io::Cursor::new(b"\n" as &[u8]);
+        resolve_duplicate_amendments(&mut af, false, true, &mut reader).unwrap();
+        assert_eq!(af.amendments.len(), 1);
+        assert_eq!(af.amendments[0].message, "feat: first");
+    }
+
+    #[test]
+    fn resolve_duplicates_prompt_invalid_then_valid() {
+        let h = dup_hash('a');
+        let mut af = dup_amendments(&[(&h, "feat: first"), (&h, "feat: second")]);
+        let mut reader = std::io::Cursor::new(b"x\n9\n2\n" as &[u8]);
+        resolve_duplicate_amendments(&mut af, false, true, &mut reader).unwrap();
+        assert_eq!(af.amendments.len(), 1);
+        assert_eq!(af.amendments[0].message, "feat: second");
+    }
+
+    #[test]
+    fn resolve_duplicates_prompt_eof_keeps_first() {
+        let h = dup_hash('a');
+        let mut af = dup_amendments(&[(&h, "feat: first"), (&h, "feat: second")]);
+        let mut reader = std::io::Cursor::new(b"" as &[u8]);
+        resolve_duplicate_amendments(&mut af, false, true, &mut reader).unwrap();
+        assert_eq!(af.amendments.len(), 1);
+        assert_eq!(af.amendments[0].message, "feat: first");
+    }
+
+    #[test]
+    fn resolve_duplicates_preserves_unique_amendments_order() {
+        let h_a = dup_hash('a');
+        let h_b = dup_hash('b');
+        let h_c = dup_hash('c');
+        let mut af = dup_amendments(&[
+            (&h_a, "feat: a1"),
+            (&h_b, "feat: b"),
+            (&h_a, "feat: a2"),
+            (&h_c, "feat: c"),
+        ]);
+        let mut reader = std::io::Cursor::new(b"" as &[u8]);
+        resolve_duplicate_amendments(&mut af, true, true, &mut reader).unwrap();
+        assert_eq!(af.amendments.len(), 3);
+        assert_eq!(af.amendments[0].commit, h_a);
+        assert_eq!(af.amendments[0].message, "feat: a1");
+        assert_eq!(af.amendments[1].commit, h_b);
+        assert_eq!(af.amendments[2].commit, h_c);
+    }
+
+    #[test]
+    fn resolve_duplicates_three_way_picks_third() {
+        let h = dup_hash('a');
+        let mut af = dup_amendments(&[
+            (&h, "feat: first"),
+            (&h, "feat: second"),
+            (&h, "feat: third"),
+        ]);
+        let mut reader = std::io::Cursor::new(b"3\n" as &[u8]);
+        resolve_duplicate_amendments(&mut af, false, true, &mut reader).unwrap();
+        assert_eq!(af.amendments.len(), 1);
+        assert_eq!(af.amendments[0].message, "feat: third");
     }
 
     #[test]
