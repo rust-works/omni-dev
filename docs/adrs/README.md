@@ -48,3 +48,4 @@ by Michael Nygard.
 | [ADR-0022](adr-0022.md)  | ✅ Accepted   | 2026-05-06 | Layered Model Catalog with User and Project Overrides                                  |
 | [ADR-0023](adr-0023.md)  | ✅ Accepted   | 2026-05-10 | Data-Driven ADF Content-Model Schema and Validator                                     |
 | [ADR-0024](adr-0024.md)  | ✅ Accepted   | 2026-05-10 | TTL-Bounded In-Memory Cache for Near-Static JIRA Catalogues                            |
+| [ADR-0025](adr-0025.md)  | ✅ Accepted   | 2026-05-10 | Wire ADF Schema Validator into the API Send Path via `ValidatedAdfDocument`            |
