@@ -770,7 +770,13 @@ mod tests {
         let result = print_dry_run("12345", &adf, "Title");
         assert!(result.is_err());
         let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("2 violations"), "got: {err}");
+        // Two `expand` children inside a `panel` produce three violations:
+        // one DisallowedChild per expand plus one Arity for the panel
+        // (panel needs ≥1 valid block child; disallowed children don't
+        // satisfy arity). The exact count is incidental — what this test
+        // pins is the plural noun.
+        assert!(err.contains("violations"), "got: {err}");
+        assert!(!err.contains("1 violation,"), "expected plural, got: {err}");
     }
 
     #[test]
@@ -804,6 +810,55 @@ mod tests {
         let adf = AdfDocument::default();
         let result = print_dry_run("PROJ-1", &adf, "");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn print_dry_run_fails_on_disallowed_mark() {
+        // Per #733: code mark on heading text is not permitted.
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "heading",
+                "attrs": { "level": 2 },
+                "content": [
+                    { "type": "text", "text": "hi", "marks": [{"type": "code"}] }
+                ]
+            }]
+        }"#;
+        let adf = AdfDocument::from_json_str(adf_json).unwrap();
+        let result = print_dry_run("12345", &adf, "Title");
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("ADF validation failed"),
+            "expected validation failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn print_dry_run_fails_on_invalid_attribute() {
+        // Per #733: panelType: "purple" is not in the allowed enum.
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "panel",
+                "attrs": { "panelType": "purple" },
+                "content": [{
+                    "type": "paragraph",
+                    "content": [{ "type": "text", "text": "x" }]
+                }]
+            }]
+        }"#;
+        let adf = AdfDocument::from_json_str(adf_json).unwrap();
+        let result = print_dry_run("12345", &adf, "Title");
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("ADF validation failed"),
+            "expected validation failure, got: {err}"
+        );
     }
 
     // ── run_read ───────────────────────────────────────────────

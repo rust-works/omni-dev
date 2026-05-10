@@ -17469,10 +17469,12 @@ mod tests {
         let adf = markdown_to_adf(md).unwrap();
 
         let err = crate::atlassian::adf_validated::validate(&adf).unwrap_err();
-        assert!(err
-            .violations
-            .iter()
-            .any(|v| v.parent_type == "panel" && v.child_type == "expand"));
+        assert!(err.violations.iter().any(|v| matches!(
+            v,
+            crate::atlassian::adf_schema::AdfSchemaViolation::DisallowedChild {
+                parent_type, child_type, ..
+            } if parent_type == "panel" && child_type == "expand"
+        )));
     }
 
     #[test]
@@ -17484,24 +17486,28 @@ mod tests {
         let adf = markdown_to_adf(md).unwrap();
 
         let err = crate::atlassian::adf_validated::validate(&adf).unwrap_err();
-        assert!(err
-            .violations
-            .iter()
-            .any(|v| v.parent_type == "tableCell" && v.child_type == "expand"));
+        assert!(err.violations.iter().any(|v| matches!(
+            v,
+            crate::atlassian::adf_schema::AdfSchemaViolation::DisallowedChild {
+                parent_type, child_type, ..
+            } if parent_type == "tableCell" && child_type == "expand"
+        )));
     }
 
     #[test]
     fn nested_expand_inside_layout_column() {
         // Issue #714 sanity check: `expand` inside a `layoutColumn` is
         // legitimate per the ADF schema and must NOT trigger validation.
-        let md = ":::layout\n:::column{width=100}\n:::expand{title=\"Col Expand\"}\nExpanded\n:::\n:::\n:::";
+        // Note: layoutSection requires 2..=3 columns per #733's quantifier
+        // checks, so the markdown declares two columns.
+        let md = ":::layout\n:::column{width=50}\n:::expand{title=\"Col Expand\"}\nExpanded\n:::\n:::\n:::column{width=50}\nFiller paragraph.\n:::\n:::";
         let adf = markdown_to_adf(md).unwrap();
 
         assert_eq!(adf.content.len(), 1);
         assert_eq!(adf.content[0].node_type, "layoutSection");
 
         let columns = adf.content[0].content.as_ref().unwrap();
-        assert_eq!(columns.len(), 1);
+        assert_eq!(columns.len(), 2);
         let col_content = columns[0].content.as_ref().unwrap();
         assert!(
             col_content.iter().any(|n| n.node_type == "expand"),

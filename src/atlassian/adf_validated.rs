@@ -24,7 +24,11 @@ use crate::atlassian::adf_schema::{validate_document, AdfSchemaViolation};
 
 /// One or more nesting violations discovered when validating an
 /// [`AdfDocument`] against the upstream content model.
-#[derive(Debug, Clone, PartialEq, Eq)]
+//
+// `Eq` is intentionally not derived: `AdfSchemaViolation::InvalidAttr`
+// carries an `AttrProblem` whose `OutOfRangeF` variant holds `f64`, which
+// does not implement `Eq`. `PartialEq` is sufficient for all uses.
+#[derive(Debug, Clone, PartialEq)]
 pub struct AdfValidationError {
     /// All violations found, in document order.
     pub violations: Vec<AdfSchemaViolation>,
@@ -42,25 +46,46 @@ impl std::fmt::Display for AdfValidationError {
                 out.push_str("\n\n");
             }
             let path = v
-                .path
+                .path()
                 .iter()
                 .map(usize::to_string)
                 .collect::<Vec<_>>()
                 .join("/");
-            out.push_str(&format!(
-                "invalid ADF nesting — `{}` cannot be a child of `{}` at /{}.\n",
-                v.child_type, v.parent_type, path
-            ));
-            let hint = hint_for(&v.parent_type, &v.child_type).map_or_else(
-                || {
-                    format!(
-                        "hint: restructure the document so `{}` is not a direct child of `{}`.",
-                        v.child_type, v.parent_type
-                    )
-                },
-                |h| format!("hint: {h}"),
-            );
-            out.push_str(&hint);
+            match v {
+                AdfSchemaViolation::DisallowedChild {
+                    child_type,
+                    parent_type,
+                    ..
+                } => {
+                    out.push_str(&format!(
+                        "invalid ADF nesting — `{child_type}` cannot be a child of `{parent_type}` at /{path}.\n",
+                    ));
+                    let hint = hint_for(parent_type, child_type).map_or_else(
+                        || {
+                            format!(
+                                "hint: restructure the document so `{child_type}` is not a direct child of `{parent_type}`.",
+                            )
+                        },
+                        |h| format!("hint: {h}"),
+                    );
+                    out.push_str(&hint);
+                }
+                AdfSchemaViolation::Arity { .. } => {
+                    out.push_str(&format!("invalid ADF nesting — {v}.\n"));
+                    out.push_str(
+                        "hint: adjust the number of children to match the schema's quantifier.",
+                    );
+                }
+                AdfSchemaViolation::MissingAttr { .. } | AdfSchemaViolation::InvalidAttr { .. } => {
+                    out.push_str(&format!("invalid ADF attribute — {v}.\n"));
+                    out.push_str("hint: fix the offending attribute on the node before retrying.");
+                }
+                AdfSchemaViolation::DisallowedMark { .. }
+                | AdfSchemaViolation::InvalidMarkAttr { .. } => {
+                    out.push_str(&format!("invalid ADF mark — {v}.\n"));
+                    out.push_str("hint: remove or correct the offending mark before retrying.");
+                }
+            }
         }
         f.write_str(&out)
     }
@@ -292,15 +317,20 @@ mod tests {
 
     #[test]
     fn try_new_rejects_panel_with_expand() {
-        // Issue #714 reproducer.
+        // Issue #714 reproducer. Since arity checking landed in #733, an
+        // empty `expand` (and the panel that lacks any valid children)
+        // also generate Arity violations — assertion is on the
+        // disallowed-child case, the one the user cares about.
         let d = doc(vec![AdfNode::panel(
             "info",
             vec![AdfNode::expand(None, vec![])],
         )]);
         let err = ValidatedAdfDocument::try_new(d).unwrap_err();
-        assert_eq!(err.violations.len(), 1);
-        assert_eq!(err.violations[0].child_type, "expand");
-        assert_eq!(err.violations[0].parent_type, "panel");
+        assert!(err.violations.iter().any(|v| matches!(
+            v,
+            AdfSchemaViolation::DisallowedChild { child_type, parent_type, .. }
+                if child_type == "expand" && parent_type == "panel"
+        )));
     }
 
     #[test]
@@ -309,18 +339,20 @@ mod tests {
             AdfNode::table_cell(vec![AdfNode::expand(None, vec![])]),
         ])])]);
         let err = ValidatedAdfDocument::try_new(d).unwrap_err();
-        assert!(err
-            .violations
-            .iter()
-            .any(|v| v.child_type == "expand" && v.parent_type == "tableCell"));
+        assert!(err.violations.iter().any(|v| matches!(
+            v,
+            AdfSchemaViolation::DisallowedChild { child_type, parent_type, .. }
+                if child_type == "expand" && parent_type == "tableCell"
+        )));
     }
 
     #[test]
     fn try_new_allows_expand_inside_layout_column() {
-        let d = doc(vec![AdfNode::layout_section(vec![AdfNode::layout_column(
-            100,
-            vec![AdfNode::expand(None, vec![])],
-        )])]);
+        // layoutSection requires 2..=3 columns (Range quantifier) and the
+        // expand needs ≥1 child, so the document is composed accordingly.
+        let inner = || AdfNode::paragraph(vec![AdfNode::text("x")]);
+        let column = || AdfNode::layout_column(50, vec![AdfNode::expand(None, vec![inner()])]);
+        let d = doc(vec![AdfNode::layout_section(vec![column(), column()])]);
         assert!(ValidatedAdfDocument::try_new(d).is_ok());
     }
 
@@ -388,5 +420,82 @@ mod tests {
         // Two violations imply a blank-line separator (two consecutive
         // newlines) between them.
         assert!(msg.contains("\n\n"));
+    }
+
+    // ── Display arms for non-nesting variant kinds ────────────────────
+    //
+    // Each variant kind in `AdfSchemaViolation` produces a different
+    // `AdfValidationError` Display section (nesting / arity / attr / mark).
+    // Cover the attr and mark sections directly by constructing the
+    // error rather than going through the validator.
+
+    #[test]
+    fn error_display_for_missing_attr_violation() {
+        let err = AdfValidationError {
+            violations: vec![AdfSchemaViolation::MissingAttr {
+                node_type: "panel".to_string(),
+                attr_name: "panelType".to_string(),
+                path: vec![0],
+            }],
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("invalid ADF attribute"), "got: {msg}");
+        assert!(msg.contains("'panelType'"), "got: {msg}");
+        assert!(msg.contains("hint:"), "got: {msg}");
+    }
+
+    #[test]
+    fn error_display_for_invalid_attr_violation() {
+        use crate::atlassian::adf_attr_schema::AttrProblem;
+        let err = AdfValidationError {
+            violations: vec![AdfSchemaViolation::InvalidAttr {
+                node_type: "heading".to_string(),
+                attr_name: "level".to_string(),
+                problem: AttrProblem::OutOfRange {
+                    lo: 1,
+                    hi: 6,
+                    actual: 7,
+                },
+                path: vec![0],
+            }],
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("invalid ADF attribute"), "got: {msg}");
+        assert!(msg.contains("'heading.level'"), "got: {msg}");
+    }
+
+    #[test]
+    fn error_display_for_disallowed_mark_violation() {
+        let err = AdfValidationError {
+            violations: vec![AdfSchemaViolation::DisallowedMark {
+                mark_type: "code".to_string(),
+                parent_type: "heading".to_string(),
+                inline_index: Some(0),
+                path: vec![0],
+            }],
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("invalid ADF mark"), "got: {msg}");
+        assert!(msg.contains("'code' mark"), "got: {msg}");
+        assert!(msg.contains("hint: remove or correct"), "got: {msg}");
+    }
+
+    #[test]
+    fn error_display_for_invalid_mark_attr_violation() {
+        use crate::atlassian::adf_attr_schema::AttrProblem;
+        let err = AdfValidationError {
+            violations: vec![AdfSchemaViolation::InvalidMarkAttr {
+                mark_type: "link".to_string(),
+                attr_name: "href".to_string(),
+                problem: AttrProblem::BadFormat {
+                    reason: "not a valid URL",
+                },
+                inline_index: Some(0),
+                path: vec![0],
+            }],
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("invalid ADF mark"), "got: {msg}");
+        assert!(msg.contains("'link' mark"), "got: {msg}");
     }
 }
