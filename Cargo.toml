@@ -40,6 +40,7 @@ base64 = "0.22"
 futures = "0.3"
 rmcp = { version = "1.6", features = ["server", "transport-io", "macros"], optional = true }
 schemars = "1.2"
+similar = "2.7"
 tokio-util = { version = "0.7", features = ["codec", "io"] }
 mime_guess = "2"
 
