@@ -191,6 +191,98 @@ On conversion back to ADF, these blocks are deserialized and restored to
 their original ADF structure, enabling lossless round-trips for unsupported
 content.
 
+## Content Model Constraints
+
+ADF uses a strict content model: each container node permits only a specific
+set of child node types. Atlassian's APIs reject documents that violate the
+model, often as an opaque HTTP 500 with no indication of which nesting was at
+fault. JFM directives are unaware of these rules — `:::expand` inside
+`:::panel` parses cleanly into ADF, but the API will refuse it.
+
+### Source of truth
+
+The full allowed-children table for every container node is encoded in
+`src/atlassian/adf_schema.rs`, transcribed faithfully from the upstream
+`@atlaskit/adf-schema` npm package. The pinned upstream version is recorded
+in the `SCHEMA_VERSION` and `UPSTREAM_TARBALL_SHA256` constants in that file.
+Treat the module as authoritative; the prose below is illustrative.
+
+Three public helpers expose the model:
+
+- `adf_schema::allowed_children(parent)` — returns the allowed direct
+  children for a parent node type, or `None` for leaf / unknown types.
+- `adf_schema::permits_child(parent, child)` — `true` if `child` is permitted
+  as a direct child of `parent`. Permissive on unknown parents (returns
+  `true`) so that future Atlassian node types do not break round-trips.
+- `adf_schema::validate_document(&doc)` — depth-first walker that returns
+  every nesting violation in document order, with `parent_type`,
+  `child_type`, and an index path from the document root.
+
+### Common pitfalls
+
+These illustrate the kinds of constraint the schema encodes; they are not an
+exhaustive list. Consult the schema module for the full set.
+
+- **`panel`** does not permit `expand`, `nestedExpand`, `panel`,
+  `bodiedExtension`, `blockquote`, `layoutSection`, or `table`. Its content
+  is paragraphs, headings, lists (bullet, ordered, decision, task), code
+  blocks, media, rules, extensions, and block cards.
+- **`expand`** does not permit another `expand`, but **does** permit
+  `nestedExpand` as a child. It also does not permit `bodiedExtension` or
+  `layoutSection`.
+- **`nestedExpand`** has a tighter content model than `expand`: it does not
+  permit `expand`, `nestedExpand`, `table`, `blockCard`, `embedCard`, or
+  `bodiedExtension`. It **does** permit `panel` and `blockquote`.
+- **`tableCell`** and **`tableHeader`** permit `nestedExpand` but **not**
+  `expand`. They also do not permit nested `table` or `layoutSection`. Use
+  `:::nested-expand` instead of `:::expand` inside table cells.
+- **`blockquote`** is restrictive: it permits paragraphs, lists (bullet,
+  ordered), code blocks, media, and extensions only. It does not permit
+  headings, tables, panels, expands, decision lists, task lists, or further
+  blockquotes.
+- **`listItem`** permits paragraphs, code blocks, media, extensions, and
+  nested lists (bullet, ordered, task). It does not permit headings,
+  blockquotes, panels, expands, decision lists, tables, or layout sections.
+- **`layoutSection`** permits only `layoutColumn` children — layout sections
+  cannot be nested directly. Use multiple `:::column`s within a single
+  `::::layout` instead.
+- **`decisionItem`** and **`taskItem`** are inline-only — they cannot
+  contain block content.
+
+### Workarounds
+
+When the desired nesting is rejected, common rewrites are:
+
+- **`expand` inside `panel`**: invert the nesting (place the panel inside
+  the expand), or render the two as siblings.
+- **`expand` inside a table cell**: use `:::nested-expand` instead.
+- **List, decision, or task list inside `> blockquote`**: render the quoted
+  text as a paragraph and place the list as a sibling block.
+- **Nested layout sections**: collapse to a single `::::layout` with
+  multiple `:::column` children.
+- **Rich blocks (expand, panel, layout) inside a table cell**: keep them as
+  siblings of the table rather than embedding them.
+
+### Forward-compatibility notes
+
+- `unsupportedBlock` and `unsupportedInline` (the runtime preservation
+  wrappers behind the `adf-unsupported` fenced block) are accepted under any
+  parent by the validator, regardless of the parent's allowed-children set.
+  This preserves the round-trip guarantee for nodes the snapshot does not
+  yet model.
+- Unknown parent node types are treated permissively: their subtrees are
+  not walked. A future Atlassian node type therefore does not become a
+  validation failure until its content model is added to the schema.
+
+### Soft-launch caveat
+
+The validator is library-only as of `SCHEMA_VERSION 52.9.5-2026-05-10`. The
+JFM-to-ADF converter does **not** yet reject invalid nestings before sending
+them to the API; this section is preventive guidance for authors and tools
+producing JFM. Wiring the validator into the write path is tracked
+separately, as is broader coverage (arity, mark whitelists, attribute-value
+constraints) beyond direct-child nesting.
+
 ## Generic Directive System
 
 JFM uses the CommonMark Generic Directives proposal to represent ADF-specific
