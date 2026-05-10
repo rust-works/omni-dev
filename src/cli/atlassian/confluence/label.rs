@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::atlassian::confluence_api::{ConfluenceApi, ConfluenceLabel};
+use crate::cli::atlassian::confirm::{guard_destructive, GuardOptions, GuardOutcome};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -113,6 +114,14 @@ pub struct RemoveCommand {
     /// Comma-separated list of labels to remove.
     #[arg(long, value_delimiter = ',', required = true)]
     pub labels: Vec<String>,
+
+    /// Skips the confirmation prompt.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Prints what would be removed without making any API calls.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 impl RemoveCommand {
@@ -120,7 +129,29 @@ impl RemoveCommand {
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
         let api = ConfluenceApi::new(client);
-        run_remove(&api, &self.id, &self.labels).await
+
+        let joined = self.labels.join(", ");
+        let count = self.labels.len();
+        let prompt = format!(
+            "Remove {count} label(s) [{joined}] from page {}? [y/N] ",
+            self.id
+        );
+        let dry_run_message = format!(
+            "Would remove {count} label(s) from page {}: {joined}.",
+            self.id
+        );
+
+        let outcome = guard_destructive(&GuardOptions {
+            prompt: &prompt,
+            dry_run_message: &dry_run_message,
+            force: self.force,
+            dry_run: self.dry_run,
+        })?;
+
+        match outcome {
+            GuardOutcome::Proceed => run_remove(&api, &self.id, &self.labels).await,
+            GuardOutcome::Cancelled | GuardOutcome::DryRun => Ok(()),
+        }
     }
 }
 
@@ -216,6 +247,8 @@ mod tests {
             command: LabelSubcommands::Remove(RemoveCommand {
                 id: "12345".to_string(),
                 labels: vec!["draft".to_string()],
+                force: true,
+                dry_run: false,
             }),
         };
         assert!(matches!(cmd.command, LabelSubcommands::Remove(_)));
@@ -433,8 +466,23 @@ mod tests {
         let cmd = RemoveCommand {
             id: "12345".to_string(),
             labels: vec!["test".to_string()],
+            force: false,
+            dry_run: false,
         };
         assert_eq!(cmd.id, "12345");
         assert_eq!(cmd.labels, vec!["test"]);
+        assert!(!cmd.force);
+        assert!(!cmd.dry_run);
+    }
+
+    #[test]
+    fn remove_command_dry_run_field() {
+        let cmd = RemoveCommand {
+            id: "12345".to_string(),
+            labels: vec!["test".to_string()],
+            force: false,
+            dry_run: true,
+        };
+        assert!(cmd.dry_run);
     }
 }
