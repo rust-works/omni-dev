@@ -212,4 +212,84 @@ mod tests {
         assert!(msg.contains("at least one"), "got: {msg}");
         assert!(msg.contains("Hint: a list must contain"), "got: {msg}");
     }
+
+    #[test]
+    fn api_request_failed_with_diagnosis_display_for_missing_attr() {
+        let err = AtlassianError::ApiRequestFailedWithDiagnosis {
+            body: String::new(),
+            diagnosis: AdfSchemaViolation::MissingAttr {
+                node_type: "panel".to_string(),
+                attr_name: "panelType".to_string(),
+                path: vec![0],
+            },
+            hint: None,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("`panel`"), "got: {msg}");
+        assert!(msg.contains("missing required attribute"), "got: {msg}");
+        assert!(msg.contains("`panelType`"), "got: {msg}");
+    }
+
+    #[test]
+    fn api_request_failed_with_diagnosis_display_for_invalid_attr() {
+        use crate::atlassian::adf_attr_schema::AttrProblem;
+        let err = AtlassianError::ApiRequestFailedWithDiagnosis {
+            body: String::new(),
+            diagnosis: AdfSchemaViolation::InvalidAttr {
+                node_type: "heading".to_string(),
+                attr_name: "level".to_string(),
+                problem: AttrProblem::OutOfRange {
+                    lo: 1,
+                    hi: 6,
+                    actual: 7,
+                },
+                path: vec![0],
+            },
+            hint: None,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("`heading.level`"), "got: {msg}");
+        assert!(msg.contains("invalid"), "got: {msg}");
+        assert!(msg.contains("[1, 6]"), "got: {msg}");
+    }
+
+    #[test]
+    fn api_request_failed_with_diagnosis_display_for_disallowed_mark() {
+        let err = AtlassianError::ApiRequestFailedWithDiagnosis {
+            body: String::new(),
+            diagnosis: AdfSchemaViolation::DisallowedMark {
+                mark_type: "code".to_string(),
+                parent_type: "heading".to_string(),
+                inline_index: Some(0),
+                path: vec![0],
+            },
+            hint: None,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("`code` mark"), "got: {msg}");
+        assert!(msg.contains("`heading`"), "got: {msg}");
+        assert!(msg.contains("not permitted"), "got: {msg}");
+    }
+
+    #[test]
+    fn api_request_failed_with_diagnosis_display_for_invalid_mark_attr() {
+        use crate::atlassian::adf_attr_schema::AttrProblem;
+        let err = AtlassianError::ApiRequestFailedWithDiagnosis {
+            body: String::new(),
+            diagnosis: AdfSchemaViolation::InvalidMarkAttr {
+                mark_type: "link".to_string(),
+                attr_name: "href".to_string(),
+                problem: AttrProblem::BadFormat {
+                    reason: "not a valid URL",
+                },
+                inline_index: Some(0),
+                path: vec![0],
+            },
+            hint: None,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("`link` mark"), "got: {msg}");
+        assert!(msg.contains("`href`"), "got: {msg}");
+        assert!(msg.contains("not a valid URL"), "got: {msg}");
+    }
 }

@@ -1747,6 +1747,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn display_format_for_missing_attr() {
+        let v = AdfSchemaViolation::MissingAttr {
+            node_type: "panel".into(),
+            attr_name: "panelType".into(),
+            path: vec![0],
+        };
+        assert_eq!(
+            v.to_string(),
+            "ADF schema violation at /0: 'panel' is missing required attribute 'panelType'"
+        );
+    }
+
+    #[test]
+    fn display_format_for_invalid_attr() {
+        let v = AdfSchemaViolation::InvalidAttr {
+            node_type: "heading".into(),
+            attr_name: "level".into(),
+            problem: crate::atlassian::adf_attr_schema::AttrProblem::OutOfRange {
+                lo: 1,
+                hi: 6,
+                actual: 7,
+            },
+            path: vec![0],
+        };
+        let s = v.to_string();
+        assert!(s.contains("'heading.level'"), "got: {s}");
+        assert!(s.contains("invalid"), "got: {s}");
+        assert!(s.contains("[1, 6]"), "got: {s}");
+    }
+
+    #[test]
+    fn display_format_for_disallowed_mark() {
+        let v = AdfSchemaViolation::DisallowedMark {
+            mark_type: "code".into(),
+            parent_type: "heading".into(),
+            inline_index: Some(0),
+            path: vec![0, 1],
+        };
+        assert_eq!(
+            v.to_string(),
+            "ADF schema violation at /0/1: 'code' mark is not permitted on 'heading'"
+        );
+    }
+
+    #[test]
+    fn display_format_for_invalid_mark_attr() {
+        let v = AdfSchemaViolation::InvalidMarkAttr {
+            mark_type: "link".into(),
+            attr_name: "href".into(),
+            problem: crate::atlassian::adf_attr_schema::AttrProblem::BadFormat {
+                reason: "not a valid URL",
+            },
+            inline_index: Some(0),
+            path: vec![0, 1],
+        };
+        let s = v.to_string();
+        assert!(s.contains("'link' mark"), "got: {s}");
+        assert!(s.contains("'href'"), "got: {s}");
+        assert!(s.contains("not a valid URL"), "got: {s}");
+    }
+
     // ---- Quantifier behaviour --------------------------------------------
 
     #[test]
@@ -1769,5 +1831,121 @@ mod tests {
         assert!(Quantifier::Range(2, 3).satisfied_by(2));
         assert!(Quantifier::Range(2, 3).satisfied_by(3));
         assert!(!Quantifier::Range(2, 3).satisfied_by(4));
+    }
+
+    // ── Quantifier::phrasing arm coverage ─────────────────────────────
+    //
+    // Each variant has its own phrasing fragment used in
+    // `AdfSchemaViolation::Arity`'s Display. The fixture-driven Display
+    // tests above only exercise OneOrMore, Exactly(1), and Range; cover
+    // the remaining arms (ZeroOrOne, ZeroOrMore, Exactly(n>1)) here so
+    // future renumbering of the Display wording is caught.
+
+    #[test]
+    fn display_format_for_arity_zero_or_one() {
+        let v = AdfSchemaViolation::Arity {
+            parent_type: "mediaSingle".into(),
+            atoms: vec!["caption"],
+            expected: Quantifier::ZeroOrOne,
+            actual: 2,
+            path: vec![0],
+        };
+        assert_eq!(
+            v.to_string(),
+            "ADF schema violation at /0: 'mediaSingle' must contain at most one 'caption' (found 2)"
+        );
+    }
+
+    #[test]
+    fn display_format_for_arity_zero_or_more() {
+        // ZeroOrMore is never violated (any count is OK), so the Arity
+        // variant with ZeroOrMore is not produced by the walker. Construct
+        // directly to exercise the Display arm.
+        let v = AdfSchemaViolation::Arity {
+            parent_type: "paragraph".into(),
+            atoms: vec!["text"],
+            expected: Quantifier::ZeroOrMore,
+            actual: 0,
+            path: vec![0],
+        };
+        assert_eq!(
+            v.to_string(),
+            "ADF schema violation at /0: 'paragraph' must contain any number of 'text' (found 0)"
+        );
+    }
+
+    #[test]
+    fn display_format_for_arity_exactly_n_greater_than_one() {
+        let v = AdfSchemaViolation::Arity {
+            parent_type: "futureNode".into(),
+            atoms: vec!["child"],
+            expected: Quantifier::Exactly(3),
+            actual: 2,
+            path: vec![0],
+        };
+        assert_eq!(
+            v.to_string(),
+            "ADF schema violation at /0: 'futureNode' must contain exactly 3 'child' (found 2)"
+        );
+    }
+
+    // ── path() accessor: every variant returns its path ─────────────────
+    //
+    // The match in `path()` uses an or-pattern `A | B | C => path`, so
+    // each arm needs to be exercised separately to count as covered.
+
+    #[test]
+    fn path_accessor_returns_path_for_each_variant() {
+        let v1 = AdfSchemaViolation::DisallowedChild {
+            child_type: "x".into(),
+            parent_type: "y".into(),
+            path: vec![1],
+        };
+        assert_eq!(v1.path(), &[1]);
+
+        let v2 = AdfSchemaViolation::Arity {
+            parent_type: "y".into(),
+            atoms: vec!["x"],
+            expected: Quantifier::OneOrMore,
+            actual: 0,
+            path: vec![2],
+        };
+        assert_eq!(v2.path(), &[2]);
+
+        let v3 = AdfSchemaViolation::MissingAttr {
+            node_type: "y".into(),
+            attr_name: "a".into(),
+            path: vec![3],
+        };
+        assert_eq!(v3.path(), &[3]);
+
+        let v4 = AdfSchemaViolation::InvalidAttr {
+            node_type: "y".into(),
+            attr_name: "a".into(),
+            problem: crate::atlassian::adf_attr_schema::AttrProblem::WrongType {
+                expected: "string",
+            },
+            path: vec![4],
+        };
+        assert_eq!(v4.path(), &[4]);
+
+        let v5 = AdfSchemaViolation::DisallowedMark {
+            mark_type: "code".into(),
+            parent_type: "heading".into(),
+            inline_index: Some(0),
+            path: vec![5],
+        };
+        assert_eq!(v5.path(), &[5]);
+
+        let v6 = AdfSchemaViolation::InvalidMarkAttr {
+            mark_type: "link".into(),
+            attr_name: "href".into(),
+            problem: crate::atlassian::adf_attr_schema::AttrProblem::BadFormat {
+                reason: "not a valid URL",
+            },
+            inline_index: Some(0),
+            path: vec![6],
+        };
+        assert_eq!(v6.path(), &[6]);
     }
 }

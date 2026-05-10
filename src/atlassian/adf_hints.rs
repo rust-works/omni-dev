@@ -267,4 +267,399 @@ mod tests {
         let hint = hint_for(&v).expect("hint expected");
         assert!(hint.contains("at most"), "got: {hint}");
     }
+
+    // ── disallowed_child_hint coverage ──────────────────────────────────
+    //
+    // One assertion per match arm so a future arm-removal regression fails
+    // here loudly instead of silently dropping user-facing guidance.
+
+    fn dc(parent: &str, child: &str) -> AdfSchemaViolation {
+        AdfSchemaViolation::DisallowedChild {
+            parent_type: parent.to_string(),
+            child_type: child.to_string(),
+            path: vec![0],
+        }
+    }
+
+    #[test]
+    fn disallowed_child_hint_arms_all_match() {
+        let cases: &[(&str, &str, &str)] = &[
+            ("panel", "expand", "invert the nesting"),
+            ("panel", "nestedExpand", "invert the nesting"),
+            ("expand", "expand", "expand cannot contain another expand"),
+            (
+                "expand",
+                "nestedExpand",
+                "expand cannot contain another expand",
+            ),
+            (
+                "nestedExpand",
+                "expand",
+                "nestedExpand cannot contain another expand",
+            ),
+            (
+                "nestedExpand",
+                "nestedExpand",
+                "nestedExpand cannot contain another expand",
+            ),
+            (
+                "tableCell",
+                "expand",
+                "table cells permit nestedExpand only",
+            ),
+            (
+                "tableHeader",
+                "expand",
+                "table cells permit nestedExpand only",
+            ),
+            (
+                "blockquote",
+                "expand",
+                "blockquote does not allow this child",
+            ),
+            (
+                "blockquote",
+                "nestedExpand",
+                "blockquote does not allow this child",
+            ),
+            (
+                "blockquote",
+                "panel",
+                "blockquote does not allow this child",
+            ),
+            (
+                "blockquote",
+                "table",
+                "blockquote does not allow this child",
+            ),
+        ];
+        for (parent, child, needle) in cases {
+            let h = hint_for(&dc(parent, child))
+                .unwrap_or_else(|| panic!("expected hint for ({parent}, {child})"));
+            assert!(h.contains(needle), "({parent},{child}) got: {h}");
+        }
+    }
+
+    // ── arity_hint coverage ────────────────────────────────────────────
+
+    fn ar(parent: &str, q: Quantifier, actual: usize) -> AdfSchemaViolation {
+        AdfSchemaViolation::Arity {
+            parent_type: parent.to_string(),
+            atoms: vec!["x"],
+            expected: q,
+            actual,
+            path: vec![0],
+        }
+    }
+
+    #[test]
+    fn arity_hint_arms_all_match() {
+        let cases: &[(&str, Quantifier, usize, &str)] = &[
+            ("bulletList", Quantifier::OneOrMore, 0, "at least one item"),
+            ("orderedList", Quantifier::OneOrMore, 0, "at least one item"),
+            (
+                "mediaSingle",
+                Quantifier::Exactly(1),
+                0,
+                "exactly one media child",
+            ),
+            ("mediaSingle", Quantifier::Exactly(1), 2, "mediaGroup"),
+            ("mediaGroup", Quantifier::OneOrMore, 0, "at least one media"),
+            ("table", Quantifier::OneOrMore, 0, "at least one row"),
+            ("tableRow", Quantifier::OneOrMore, 0, "at least one cell"),
+            (
+                "layoutSection",
+                Quantifier::Range(2, 3),
+                1,
+                "2 or 3 columns",
+            ),
+            (
+                "layoutSection",
+                Quantifier::Range(2, 3),
+                4,
+                "at most 3 columns",
+            ),
+        ];
+        for (parent, q, actual, needle) in cases {
+            let h = hint_for(&ar(parent, q.clone(), *actual))
+                .unwrap_or_else(|| panic!("expected hint for ({parent}, {q:?}, {actual})"));
+            assert!(h.contains(needle), "({parent},{q:?},{actual}) got: {h}");
+        }
+    }
+
+    #[test]
+    fn arity_hint_returns_none_for_unknown_parent() {
+        assert!(hint_for(&ar("madeUp", Quantifier::OneOrMore, 0)).is_none());
+    }
+
+    // ── missing_attr_hint coverage ─────────────────────────────────────
+
+    fn ma(node: &str, attr: &str) -> AdfSchemaViolation {
+        AdfSchemaViolation::MissingAttr {
+            node_type: node.to_string(),
+            attr_name: attr.to_string(),
+            path: vec![0],
+        }
+    }
+
+    #[test]
+    fn missing_attr_hint_arms_all_match() {
+        let cases: &[(&str, &str, &str)] = &[
+            ("panel", "panelType", "panelType to one of"),
+            ("heading", "level", "1..=6"),
+            ("taskItem", "state", "TODO or DONE"),
+            ("decisionItem", "state", "DECIDED or UNDECIDED"),
+            ("media", "type", "file, link, or external"),
+            ("status", "color", "neutral, purple, blue"),
+            ("anyNode", "localId", "unique identifier"),
+        ];
+        for (node, attr, needle) in cases {
+            let h = hint_for(&ma(node, attr))
+                .unwrap_or_else(|| panic!("expected hint for ({node}, {attr})"));
+            assert!(h.contains(needle), "({node},{attr}) got: {h}");
+        }
+    }
+
+    #[test]
+    fn missing_attr_hint_returns_none_for_unknown_pair() {
+        assert!(hint_for(&ma("future", "unknown")).is_none());
+    }
+
+    // ── invalid_attr_hint coverage ─────────────────────────────────────
+
+    fn ia(node: &str, attr: &str, problem: AttrProblem) -> AdfSchemaViolation {
+        AdfSchemaViolation::InvalidAttr {
+            node_type: node.to_string(),
+            attr_name: attr.to_string(),
+            problem,
+            path: vec![0],
+        }
+    }
+
+    #[test]
+    fn invalid_attr_hint_panel_panel_type_enum() {
+        let v = ia(
+            "panel",
+            "panelType",
+            AttrProblem::NotInEnum {
+                allowed: vec!["info"],
+                actual: "purple".to_string(),
+            },
+        );
+        assert!(hint_for(&v).unwrap().contains("info, note, warning"));
+    }
+
+    #[test]
+    fn invalid_attr_hint_heading_level_range() {
+        let v = ia(
+            "heading",
+            "level",
+            AttrProblem::OutOfRange {
+                lo: 1,
+                hi: 6,
+                actual: 7,
+            },
+        );
+        assert!(hint_for(&v).unwrap().contains("1..=6"));
+    }
+
+    #[test]
+    fn invalid_attr_hint_media_type_enum() {
+        let v = ia(
+            "media",
+            "type",
+            AttrProblem::NotInEnum {
+                allowed: vec!["file"],
+                actual: "video".to_string(),
+            },
+        );
+        assert!(hint_for(&v).unwrap().contains("file, link, external"));
+    }
+
+    #[test]
+    fn invalid_attr_hint_layout_column_width_any_problem() {
+        // The wildcard `_` for problem means any problem matches. Try one
+        // shape just to confirm the arm fires.
+        let v = ia(
+            "layoutColumn",
+            "width",
+            AttrProblem::OutOfRangeF {
+                lo: 0.0,
+                hi: 100.0,
+                actual: 200.0,
+            },
+        );
+        assert!(hint_for(&v).unwrap().contains("0..=100"));
+    }
+
+    #[test]
+    fn invalid_attr_hint_url_bad_format_fallback() {
+        // BadFormat with reason containing "URL" hits the catch-all arm.
+        let v = ia(
+            "anyNode",
+            "anyAttr",
+            AttrProblem::BadFormat {
+                reason: "not a valid URL",
+            },
+        );
+        assert!(hint_for(&v).unwrap().contains("absolute"));
+    }
+
+    #[test]
+    fn invalid_attr_hint_returns_none_for_unknown_combination() {
+        assert!(hint_for(&ia(
+            "future",
+            "unknown",
+            AttrProblem::WrongType { expected: "string" }
+        ))
+        .is_none());
+    }
+
+    // ── disallowed_mark_hint coverage ──────────────────────────────────
+
+    fn dm(mark: &str, parent: &str) -> AdfSchemaViolation {
+        AdfSchemaViolation::DisallowedMark {
+            mark_type: mark.to_string(),
+            parent_type: parent.to_string(),
+            inline_index: None,
+            path: vec![0],
+        }
+    }
+
+    #[test]
+    fn disallowed_mark_hint_code_on_heading() {
+        assert!(hint_for(&dm("code", "heading"))
+            .unwrap()
+            .contains("headings cannot carry"));
+    }
+
+    #[test]
+    fn disallowed_mark_hint_any_mark_on_code_block() {
+        assert!(hint_for(&dm("strong", "codeBlock"))
+            .unwrap()
+            .contains("codeBlock text is literal"));
+    }
+
+    #[test]
+    fn disallowed_mark_hint_border_on_paragraph() {
+        // border on a non-table-cell parent → the per-mark guard arm.
+        assert!(hint_for(&dm("border", "paragraph"))
+            .unwrap()
+            .contains("tableCell/tableHeader only"));
+    }
+
+    #[test]
+    fn disallowed_mark_hint_background_color_on_paragraph() {
+        assert!(hint_for(&dm("backgroundColor", "paragraph"))
+            .unwrap()
+            .contains("tableCell/tableHeader only"));
+    }
+
+    #[test]
+    fn disallowed_mark_hint_alignment_on_table_cell() {
+        // alignment on something other than paragraph/heading → block-mark arm.
+        assert!(hint_for(&dm("alignment", "tableCell"))
+            .unwrap()
+            .contains("paragraph/heading only"));
+    }
+
+    #[test]
+    fn disallowed_mark_hint_indentation_on_table_cell() {
+        assert!(hint_for(&dm("indentation", "tableCell"))
+            .unwrap()
+            .contains("paragraph/heading only"));
+    }
+
+    #[test]
+    fn disallowed_mark_hint_returns_none_for_unknown_combination() {
+        assert!(hint_for(&dm("madeUpMark", "paragraph")).is_none());
+    }
+
+    // ── invalid_mark_attr_hint coverage ─────────────────────────────────
+
+    fn ima(mark: &str, attr: &str, problem: AttrProblem) -> AdfSchemaViolation {
+        AdfSchemaViolation::InvalidMarkAttr {
+            mark_type: mark.to_string(),
+            attr_name: attr.to_string(),
+            problem,
+            inline_index: None,
+            path: vec![0],
+        }
+    }
+
+    #[test]
+    fn invalid_mark_attr_hint_link_href_bad_format() {
+        let v = ima(
+            "link",
+            "href",
+            AttrProblem::BadFormat {
+                reason: "not a valid URL",
+            },
+        );
+        assert!(hint_for(&v).unwrap().contains("absolute URL"));
+    }
+
+    #[test]
+    fn invalid_mark_attr_hint_subsup_type_enum() {
+        let v = ima(
+            "subsup",
+            "type",
+            AttrProblem::NotInEnum {
+                allowed: vec!["sub", "sup"],
+                actual: "side".to_string(),
+            },
+        );
+        assert!(hint_for(&v).unwrap().contains("sub' or 'sup"));
+    }
+
+    #[test]
+    fn invalid_mark_attr_hint_border_size_range() {
+        let v = ima(
+            "border",
+            "size",
+            AttrProblem::OutOfRange {
+                lo: 1,
+                hi: 3,
+                actual: 5,
+            },
+        );
+        assert!(hint_for(&v).unwrap().contains("1..=3"));
+    }
+
+    #[test]
+    fn invalid_mark_attr_hint_indentation_level_range() {
+        let v = ima(
+            "indentation",
+            "level",
+            AttrProblem::OutOfRange {
+                lo: 1,
+                hi: 6,
+                actual: 9,
+            },
+        );
+        assert!(hint_for(&v).unwrap().contains("1..=6"));
+    }
+
+    #[test]
+    fn invalid_mark_attr_hint_alignment_align_enum() {
+        let v = ima(
+            "alignment",
+            "align",
+            AttrProblem::NotInEnum {
+                allowed: vec!["start"],
+                actual: "middle".to_string(),
+            },
+        );
+        assert!(hint_for(&v).unwrap().contains("start, end, center"));
+    }
+
+    #[test]
+    fn invalid_mark_attr_hint_returns_none_for_unknown_combination() {
+        assert!(hint_for(&ima(
+            "futureMark",
+            "futureAttr",
+            AttrProblem::WrongType { expected: "string" }
+        ))
+        .is_none());
+    }
 }

@@ -740,4 +740,70 @@ mod tests {
         let node = AdfNode::text("hi");
         assert!(run_inline("paragraph", node).is_empty());
     }
+
+    // ── malformed attrs path on a mark ─────────────────────────────────
+
+    #[test]
+    fn link_mark_with_array_attrs_flagged_as_disallowed_mark() {
+        // attrs is present but not an object (array). The link schema has
+        // a required `href`, so the malformed-attrs branch fires and emits
+        // a DisallowedMark with a sentinel parent_type marker.
+        let node = text_with_marks(
+            "click",
+            vec![mark("link", Some(serde_json::json!([1, 2, 3])))],
+        );
+        let v = run_inline("paragraph", node);
+        let disallowed: Vec<_> = v
+            .iter()
+            .filter(|v| matches!(v, AdfSchemaViolation::DisallowedMark { .. }))
+            .collect();
+        assert_eq!(disallowed.len(), 1, "got: {v:?}");
+        match disallowed[0] {
+            AdfSchemaViolation::DisallowedMark {
+                mark_type,
+                parent_type,
+                ..
+            } => {
+                assert_eq!(mark_type, "link");
+                assert!(
+                    parent_type.contains("malformed attrs"),
+                    "expected malformed-attrs sentinel, got: {parent_type}"
+                );
+            }
+            other => panic!("expected DisallowedMark, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn code_mark_with_array_attrs_no_violation() {
+        // `code` mark schema has no required fields, so the malformed-attrs
+        // branch should fall through without emitting anything (covers the
+        // bare `return;` arm at the bottom of the malformed-attrs match).
+        let node = text_with_marks("x", vec![mark("code", Some(serde_json::json!([1, 2, 3])))]);
+        assert!(run_inline("paragraph", node).is_empty());
+    }
+
+    // ── inline node under a parent without an inline-mark allow-list ──
+
+    #[test]
+    fn inline_node_under_unknown_parent_skips_mark_check() {
+        // Parent has no inline-mark allow-list, so the mark is neither
+        // accepted-by-allow-list nor flagged. Validates that the
+        // `if let Some(allowed) = allowed { ... }` guard short-circuits
+        // cleanly when `allowed` is `None`, but the per-mark attr schema
+        // still runs (link.href validation here).
+        let node = text_with_marks(
+            "x",
+            vec![mark("link", Some(serde_json::json!({"href": "not a url"})))],
+        );
+        let v = run_inline("madeUpParent", node);
+        // No DisallowedMark (no allow-list to violate).
+        assert!(v
+            .iter()
+            .all(|v| !matches!(v, AdfSchemaViolation::DisallowedMark { .. })));
+        // But the mark-attr validation still fires.
+        assert!(v
+            .iter()
+            .any(|v| matches!(v, AdfSchemaViolation::InvalidMarkAttr { .. })));
+    }
 }
