@@ -118,6 +118,28 @@ impl TwiddleCommand {
         crate::utils::preflight::check_working_directory_clean()?;
         println!("✓ Working directory is clean");
 
+        // Initialize Claude client
+        let beta = self
+            .beta_header
+            .as_deref()
+            .map(parse_beta_header)
+            .transpose()?;
+        let claude_client =
+            crate::claude::create_default_claude_client(self.model.clone(), beta).await?;
+
+        self.execute_with_client(claude_client).await
+    }
+
+    /// Test-injectable inner core of [`Self::execute`].
+    ///
+    /// Caller is responsible for any preflight (AI credentials, clean
+    /// working directory) and for resolving the deprecated `--batch-size`
+    /// alias into `--concurrency`. The `--no-ai` branch is handled by the
+    /// outer [`Self::execute`] before this is reached.
+    pub(crate) async fn execute_with_client(
+        self,
+        claude_client: crate::claude::client::ClaudeClient,
+    ) -> Result<()> {
         // Determine if contextual analysis should be used
         let use_contextual = self.use_context && !self.no_context;
 
@@ -135,7 +157,7 @@ impl TwiddleCommand {
         // 2. Use parallel map-reduce for multiple commits
         if full_repo_view.commits.len() > 1 {
             return self
-                .execute_with_map_reduce(use_contextual, full_repo_view)
+                .execute_with_map_reduce(use_contextual, full_repo_view, claude_client)
                 .await;
         }
 
@@ -159,15 +181,6 @@ impl TwiddleCommand {
         if let Some(ref ctx) = context {
             self.show_context_summary(ctx)?;
         }
-
-        // 5. Initialize Claude client
-        let beta = self
-            .beta_header
-            .as_deref()
-            .map(parse_beta_header)
-            .transpose()?;
-        let claude_client =
-            crate::claude::create_default_claude_client(self.model.clone(), beta).await?;
 
         // Show model information
         self.show_model_info_from_client(&claude_client)?;
@@ -258,6 +271,7 @@ impl TwiddleCommand {
         &self,
         use_contextual: bool,
         mut full_repo_view: crate::data::RepositoryView,
+        claude_client: crate::claude::client::ClaudeClient,
     ) -> Result<()> {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -266,15 +280,6 @@ impl TwiddleCommand {
         use crate::claude::token_budget;
 
         let concurrency = self.concurrency;
-
-        // Initialize Claude client
-        let beta = self
-            .beta_header
-            .as_deref()
-            .map(parse_beta_header)
-            .transpose()?;
-        let claude_client =
-            crate::claude::create_default_claude_client(self.model.clone(), beta).await?;
 
         // Show model information
         self.show_model_info_from_client(&claude_client)?;
@@ -2068,6 +2073,274 @@ mod run_twiddle_tests {
             head_msg.contains("much better subject"),
             "HEAD message should be rewritten: {head_msg}"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod execute_tests {
+    use super::*;
+    use crate::claude::client::ClaudeClient;
+    use crate::claude::test_utils::ConfigurableMockAiClient;
+    use git2::{Repository, Signature};
+
+    /// Creates a tempdir-backed git repo with `n` commits on a linear
+    /// history. Each commit writes a distinct file so diffs are non-empty.
+    /// Returns the tempdir and the list of commit hashes (oldest-first).
+    fn init_test_repo_with_n_commits(n: usize) -> (tempfile::TempDir, Vec<String>) {
+        assert!(n >= 1);
+        let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
+        std::fs::create_dir_all(&tmp_root).unwrap();
+        let temp_dir = tempfile::tempdir_in(&tmp_root).unwrap();
+        let repo = Repository::init(temp_dir.path()).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Test").unwrap();
+            cfg.set_str("user.email", "test@example.com").unwrap();
+        }
+        let signature = Signature::now("Test", "test@example.com").unwrap();
+
+        let mut hashes = Vec::with_capacity(n);
+        let mut parent_oid: Option<git2::Oid> = None;
+
+        for i in 0..n {
+            let file = format!("f{i}.txt");
+            std::fs::write(temp_dir.path().join(&file), format!("contents {i}")).unwrap();
+            let mut idx = repo.index().unwrap();
+            idx.add_path(std::path::Path::new(&file)).unwrap();
+            idx.write().unwrap();
+            let tree_id = idx.write_tree().unwrap();
+            let tree = repo.find_tree(tree_id).unwrap();
+            let msg = format!("feat: original commit {i}");
+
+            let oid = if let Some(parent) = parent_oid {
+                let parent_commit = repo.find_commit(parent).unwrap();
+                repo.commit(
+                    Some("HEAD"),
+                    &signature,
+                    &signature,
+                    &msg,
+                    &tree,
+                    &[&parent_commit],
+                )
+                .unwrap()
+            } else {
+                repo.commit(Some("HEAD"), &signature, &signature, &msg, &tree, &[])
+                    .unwrap()
+            };
+            parent_oid = Some(oid);
+            hashes.push(oid.to_string());
+        }
+
+        (temp_dir, hashes)
+    }
+
+    /// Creates a single-commit repo for the `execute_no_ai` test. Mirrors
+    /// the helper in `run_twiddle_tests` so the two test modules stay
+    /// self-contained.
+    fn init_test_repo_with_commit() -> (tempfile::TempDir, String) {
+        let (temp_dir, hashes) = init_test_repo_with_n_commits(1);
+        (temp_dir, hashes.into_iter().next().unwrap())
+    }
+
+    /// Builds a `TwiddleCommand` with all flags at sensible defaults for
+    /// the AI-dispatch tests: non-contextual, save-only output, quiet.
+    fn make_cmd(commit_range: &str, save_path: std::path::PathBuf) -> TwiddleCommand {
+        TwiddleCommand {
+            commit_range: Some(commit_range.to_string()),
+            model: None,
+            beta_header: None,
+            auto_apply: false,
+            save_only: Some(save_path.to_string_lossy().into_owned()),
+            use_context: false,
+            context_dir: None,
+            work_context: None,
+            branch_context: None,
+            no_context: true,
+            concurrency: 1,
+            batch_size: None,
+            no_coherence: true,
+            no_ai: false,
+            fresh: false,
+            refine: false,
+            check: false,
+            quiet: true,
+        }
+    }
+
+    /// Builds an amendments YAML block containing one entry per (hash, message, summary)
+    /// triple. Mirrors what a successful AI batch response looks like.
+    fn batch_amendment_yaml(entries: &[(&str, &str, &str)]) -> String {
+        let mut out = String::from("amendments:\n");
+        for (hash, msg, summary) in entries {
+            out.push_str(&format!(
+                "  - commit: {hash}\n    message: '{msg}'\n    summary: '{summary}'\n"
+            ));
+        }
+        out
+    }
+
+    /// Test 1 — happy path: a single batch response succeeds for a
+    /// 2-commit range, exercising the success branch of
+    /// `execute_with_map_reduce` (the `let summary = a.summary.clone();`
+    /// at line 392 in the original `twiddle.rs`).
+    #[tokio::test]
+    async fn execute_with_client_multi_commit_batch_success_covers_line_392() {
+        let (temp_dir, hashes) = init_test_repo_with_n_commits(3);
+        let _guard = super::super::CwdGuard::enter(temp_dir.path())
+            .await
+            .unwrap();
+
+        // Range yields the 2 most recent commits (oldest excluded).
+        let h_mid = &hashes[1];
+        let h_new = &hashes[2];
+
+        let yaml = batch_amendment_yaml(&[
+            (h_mid, "feat: improved mid", "improved mid summary"),
+            (h_new, "feat: improved new", "improved new summary"),
+        ]);
+        let mock = ConfigurableMockAiClient::new(vec![Ok(yaml)]);
+        let response_handle = mock.response_handle();
+        let prompt_handle = mock.prompt_handle();
+        let client = ClaudeClient::new(Box::new(mock));
+
+        let save_path = temp_dir.path().join("amendments.yaml");
+        let cmd = make_cmd("HEAD~2..HEAD", save_path.clone());
+
+        cmd.execute_with_client(client).await.unwrap();
+
+        // Single batch dispatch, single AI request.
+        assert_eq!(response_handle.remaining(), 0);
+        assert_eq!(prompt_handle.request_count(), 1);
+
+        // Verify the saved file contains both amendments with summaries
+        // intact (proving line 392 ran for each amendment).
+        let saved = AmendmentFile::load_from_file(&save_path).unwrap();
+        assert_eq!(saved.amendments.len(), 2);
+        let summaries: Vec<&str> = saved
+            .amendments
+            .iter()
+            .map(|a| a.summary.as_str())
+            .collect();
+        assert!(
+            summaries.contains(&"improved mid summary"),
+            "summaries: {summaries:?}"
+        );
+        assert!(
+            summaries.contains(&"improved new summary"),
+            "summaries: {summaries:?}"
+        );
+    }
+
+    /// Test 2 — split-and-retry: the initial multi-commit batch fails
+    /// (consuming 3 mock responses to exhaust `AMENDMENT_PARSE_MAX_RETRIES`),
+    /// then per-commit retries succeed. Exercises the `batch_size > 1`
+    /// failure branch (the `let summary = a.summary.clone();` at line 424
+    /// in the original `twiddle.rs`).
+    #[tokio::test]
+    async fn execute_with_client_multi_commit_split_retry_covers_line_424() {
+        let (temp_dir, hashes) = init_test_repo_with_n_commits(3);
+        let _guard = super::super::CwdGuard::enter(temp_dir.path())
+            .await
+            .unwrap();
+
+        let h_mid = &hashes[1];
+        let h_new = &hashes[2];
+
+        // 3 Errs exhaust the batch retry loop, then one Ok per individual
+        // retry. Each retry has its own retry budget but succeeds on first
+        // attempt, so it consumes one response.
+        let mock = ConfigurableMockAiClient::new(vec![
+            Err(anyhow::anyhow!("simulated batch failure 1")),
+            Err(anyhow::anyhow!("simulated batch failure 2")),
+            Err(anyhow::anyhow!("simulated batch failure 3")),
+            Ok(batch_amendment_yaml(&[(
+                h_mid,
+                "feat: solo mid",
+                "solo mid summary",
+            )])),
+            Ok(batch_amendment_yaml(&[(
+                h_new,
+                "feat: solo new",
+                "solo new summary",
+            )])),
+        ]);
+        let response_handle = mock.response_handle();
+        let prompt_handle = mock.prompt_handle();
+        let client = ClaudeClient::new(Box::new(mock));
+
+        let save_path = temp_dir.path().join("amendments.yaml");
+        let cmd = make_cmd("HEAD~2..HEAD", save_path.clone());
+
+        cmd.execute_with_client(client).await.unwrap();
+
+        // 3 batch attempts + 2 individual retries = 5 AI requests.
+        assert_eq!(response_handle.remaining(), 0);
+        assert_eq!(prompt_handle.request_count(), 5);
+
+        let saved = AmendmentFile::load_from_file(&save_path).unwrap();
+        assert_eq!(saved.amendments.len(), 2);
+        let summaries: Vec<&str> = saved
+            .amendments
+            .iter()
+            .map(|a| a.summary.as_str())
+            .collect();
+        assert!(
+            summaries.contains(&"solo mid summary"),
+            "summaries: {summaries:?}"
+        );
+        assert!(
+            summaries.contains(&"solo new summary"),
+            "summaries: {summaries:?}"
+        );
+    }
+
+    /// Test 3 — `--no-ai` save-only path: drives `execute()` with
+    /// `--no-ai` (which short-circuits before preflight), exercising the
+    /// `summary: String::new()` initialiser at line 1031 in
+    /// `execute_no_ai`.
+    #[tokio::test]
+    async fn execute_no_ai_save_only_covers_line_1031() {
+        let (temp_dir, hash) = init_test_repo_with_commit();
+        let _guard = super::super::CwdGuard::enter(temp_dir.path())
+            .await
+            .unwrap();
+
+        let save_path = temp_dir.path().join("amendments.yaml");
+        let cmd = TwiddleCommand {
+            commit_range: Some("HEAD".to_string()),
+            model: None,
+            beta_header: None,
+            auto_apply: false,
+            save_only: Some(save_path.to_string_lossy().into_owned()),
+            use_context: false,
+            context_dir: None,
+            work_context: None,
+            branch_context: None,
+            no_context: true,
+            concurrency: 1,
+            batch_size: None,
+            no_coherence: true,
+            no_ai: true,
+            fresh: false,
+            refine: false,
+            check: false,
+            quiet: true,
+        };
+
+        cmd.execute().await.unwrap();
+
+        let saved = AmendmentFile::load_from_file(&save_path).unwrap();
+        assert_eq!(saved.amendments.len(), 1);
+        let amendment = &saved.amendments[0];
+        assert_eq!(amendment.commit, hash);
+        assert!(
+            amendment.message.contains("feat: original commit 0"),
+            "message: {}",
+            amendment.message
+        );
+        // The whole point of line 1031: `summary: String::new()`.
+        assert_eq!(amendment.summary, "");
     }
 }
 
