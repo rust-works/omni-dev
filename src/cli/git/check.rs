@@ -1807,7 +1807,7 @@ mod tests {
         crate::data::amendments::Amendment {
             commit: "abc0000000000000000000000000000000000001".to_string(),
             message: "feat: improved commit message".to_string(),
-            summary: None,
+            summary: String::new(),
         }
     }
 

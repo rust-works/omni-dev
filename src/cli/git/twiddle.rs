@@ -389,7 +389,7 @@ impl TwiddleCommand {
                                 .amendments
                                 .into_iter()
                                 .map(|a| {
-                                    let summary = a.summary.clone().unwrap_or_default();
+                                    let summary = a.summary.clone();
                                     (a, summary)
                                 })
                                 .collect();
@@ -421,7 +421,7 @@ impl TwiddleCommand {
                                 match single_result {
                                     Ok(af) => {
                                         if let Some(a) = af.amendments.into_iter().next() {
-                                            let summary = a.summary.clone().unwrap_or_default();
+                                            let summary = a.summary.clone();
                                             items.push((a, summary));
                                         }
                                         let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1028,7 +1028,7 @@ impl TwiddleCommand {
             .map(|commit| Amendment {
                 commit: commit.hash.clone(),
                 message: commit.original_message.clone(),
-                summary: None,
+                summary: String::new(),
             })
             .collect();
 
@@ -1635,7 +1635,7 @@ impl TwiddleCommand {
                         match result {
                             Ok(af) => {
                                 if let Some(a) = af.amendments.into_iter().next() {
-                                    let summary = a.summary.clone().unwrap_or_default();
+                                    let summary = a.summary.clone();
                                     successes.push((a, summary));
                                 }
                             }
@@ -2705,7 +2705,7 @@ mod tests {
             amendments: vec![crate::data::amendments::Amendment {
                 commit: "abc0000000000000000000000000000000000001".to_string(),
                 message: "feat: improved commit message".to_string(),
-                summary: None,
+                summary: String::new(),
             }],
         }
     }
@@ -2970,7 +2970,7 @@ mod tests {
             amendments: vec![Amendment {
                 commit: "aaa00000".to_string(),
                 message: "fix(wrong-scope): tweak something".to_string(),
-                summary: None,
+                summary: String::new(),
             }],
         };
 
@@ -2993,7 +2993,7 @@ mod tests {
             amendments: vec![Amendment {
                 commit: "bbb00000".to_string(),
                 message: "feat(stuff): add feature".to_string(),
-                summary: None,
+                summary: String::new(),
             }],
         };
 
@@ -3017,7 +3017,7 @@ mod tests {
                 .map(|(hash, msg)| Amendment {
                     commit: (*hash).to_string(),
                     message: (*msg).to_string(),
-                    summary: None,
+                    summary: String::new(),
                 })
                 .collect(),
         }
@@ -3166,7 +3166,7 @@ mod tests {
             amendments: vec![Amendment {
                 commit: "unknown_hash".to_string(),
                 message: "fix(wrong): something".to_string(),
-                summary: None,
+                summary: String::new(),
             }],
         };
 
