@@ -21,11 +21,16 @@ This project follows conventional commit format with specific requirements.
 ```
 
 Multiple scopes are allowed when a commit spans more than one area.
-Separate scopes with a comma and no space:
+Separate scopes with a comma. An optional single space after the comma
+is permitted; both forms are accepted:
 
 ```
 <type>(<scope1>,<scope2>): <description>
+<type>(<scope1>, <scope2>): <description>
 ```
+
+Two or more spaces after a comma, or any whitespace before a comma, is
+not permitted.
 
 ## Types
 
