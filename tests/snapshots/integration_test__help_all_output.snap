@@ -570,9 +570,10 @@ Arguments:
   <ID>  Confluence page ID (e.g., 12345678)
 
 Options:
-      --force  Skips the confirmation prompt
-      --purge  Permanently purges the page instead of moving to trash (requires space admin)
-  -h, --help   Print help
+      --force    Skips the confirmation prompt
+      --dry-run  Prints what would be deleted without making any API calls
+      --purge    Permanently purges the page instead of moving to trash (requires space admin)
+  -h, --help     Print help
 
 
 ================================================================================
@@ -687,13 +688,15 @@ omni-dev atlassian confluence label remove - Removes labels from a Confluence pa
 
 Removes labels from a Confluence page
 
-Usage: remove --labels <LABELS> <ID>
+Usage: remove [OPTIONS] --labels <LABELS> <ID>
 
 Arguments:
   <ID>  Confluence page ID (e.g., 12345678)
 
 Options:
       --labels <LABELS>  Comma-separated list of labels to remove
+      --force            Skips the confirmation prompt
+      --dry-run          Prints what would be removed without making any API calls
   -h, --help             Print help
 
 
@@ -1108,8 +1111,9 @@ Arguments:
   <KEY>  JIRA issue key (e.g., PROJ-123)
 
 Options:
-      --force  Skips the confirmation prompt
-  -h, --help   Print help
+      --force    Skips the confirmation prompt
+      --dry-run  Prints what would be deleted without making any API calls
+  -h, --help     Print help
 
 
 ================================================================================
@@ -1263,10 +1267,12 @@ omni-dev atlassian jira link remove - Removes an issue link by ID
 
 Removes an issue link by ID
 
-Usage: remove --link-id <LINK_ID>
+Usage: remove [OPTIONS] --link-id <LINK_ID>
 
 Options:
       --link-id <LINK_ID>  Link ID to remove
+      --force              Skips the confirmation prompt
+      --dry-run            Prints what would be removed without making any API calls
   -h, --help               Print help
 
 
@@ -1641,13 +1647,15 @@ omni-dev atlassian jira watcher remove - Removes a user from watchers on an issu
 
 Removes a user from watchers on an issue
 
-Usage: remove --user <USER> <KEY>
+Usage: remove [OPTIONS] --user <USER> <KEY>
 
 Arguments:
   <KEY>  Issue key (e.g., "PROJ-123")
 
 Options:
       --user <USER>  Account ID of the user to remove
+      --force        Skips the confirmation prompt
+      --dry-run      Prints what would be removed without making any API calls
   -h, --help         Print help
 
 
