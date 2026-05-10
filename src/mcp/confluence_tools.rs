@@ -160,6 +160,21 @@ pub struct ConfluenceChildrenParams {
     pub max_depth: Option<u32>,
 }
 
+/// Parameters for the `confluence_history` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceHistoryParams {
+    /// Confluence page ID.
+    pub id: String,
+    /// Filter to versions at or after this point. Accepts a numeric version
+    /// number (e.g. `"5"`) or an ISO 8601 date (e.g. `"2026-01-01T00:00:00Z"`).
+    #[serde(default)]
+    pub since: Option<String>,
+    /// Maximum number of versions to return. `0` means unlimited. Defaults
+    /// to 20.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
 /// Parameters for the `confluence_comment_list` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ConfluenceCommentListParams {
@@ -400,6 +415,22 @@ fn resolve_output_dir(requested: Option<String>) -> Result<(PathBuf, Option<temp
 }
 
 // ── Children / comment / label / user-search helpers ───────────────
+
+/// Builds the YAML output for the `confluence_history` tool.
+///
+/// Delegates to the CLI's `fetch_history` so MCP and CLI share a single
+/// schema.
+pub async fn fetch_history_yaml(
+    api: &ConfluenceApi,
+    page_id: &str,
+    since: Option<&str>,
+    limit: u32,
+) -> Result<String> {
+    let history =
+        crate::cli::atlassian::confluence::history::fetch_history(api, page_id, since, limit)
+            .await?;
+    to_yaml(&history)
+}
 
 /// Builds the YAML output for the `confluence_children` tool.
 ///
@@ -696,6 +727,34 @@ impl OmniDevServer {
             params.space.as_deref(),
             params.recursive.unwrap_or(false),
             params.max_depth.unwrap_or(0),
+        )
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Lists version history (metadata only) for a Confluence page.
+    #[tool(
+        description = "List version history (metadata only) for a Confluence page. \
+                       Returns version number, timestamp, author account ID, edit \
+                       message, and minor-edit flag for each version, newest-first. \
+                       Does NOT fetch version bodies — use `confluence_read` for \
+                       content. `since` filters to versions at or after a numeric \
+                       version (\"5\") or ISO 8601 date (\"2026-01-01T00:00:00Z\"). \
+                       `limit` defaults to 20; `0` means unlimited. Mirrors \
+                       `omni-dev atlassian confluence history`."
+    )]
+    pub async fn confluence_history(
+        &self,
+        Parameters(params): Parameters<ConfluenceHistoryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _url) = create_client().map_err(tool_error)?;
+        let api = ConfluenceApi::new(client);
+        let yaml = fetch_history_yaml(
+            &api,
+            &params.id,
+            params.since.as_deref(),
+            params.limit.unwrap_or(20),
         )
         .await
         .map_err(tool_error)?;
@@ -2022,6 +2081,7 @@ mod tests {
             "confluence_delete",
             "confluence_download",
             "confluence_children",
+            "confluence_history",
             "confluence_comment_list",
             "confluence_comment_add",
             "confluence_label_list",
@@ -2031,6 +2091,137 @@ mod tests {
         ] {
             assert!(router.has_route(name), "missing tool: {name}");
         }
+    }
+
+    // ── confluence_history handler / fetch_history_yaml ────────────
+
+    async fn mock_history_endpoints(
+        server: &wiremock::MockServer,
+        page_id: &str,
+        version: u32,
+        results: serde_json::Value,
+    ) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!(
+                "/wiki/api/v2/pages/{page_id}"
+            )))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": page_id,
+                    "title": "Sample",
+                    "status": "current",
+                    "spaceId": "1",
+                    "version": {"number": version}
+                })),
+            )
+            .mount(server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!(
+                "/wiki/api/v2/pages/{page_id}/versions"
+            )))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": results
+                })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn fetch_history_yaml_returns_yaml() {
+        let server = wiremock::MockServer::start().await;
+        mock_history_endpoints(
+            &server,
+            "12",
+            2,
+            serde_json::json!([
+                {"number": 2, "createdAt": "2026-05-08T10:00:00Z", "authorId": "a", "message": "two", "minorEdit": false},
+                {"number": 1, "createdAt": "2026-05-07T10:00:00Z", "authorId": "b", "message": "", "minorEdit": true},
+            ]),
+        )
+        .await;
+        let client = AtlassianClient::new(&server.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        let yaml = fetch_history_yaml(&api, "12", None, 20).await.unwrap();
+        assert!(yaml.contains("page:"));
+        assert!(yaml.contains("title: Sample"));
+        assert!(yaml.contains("number: 2"));
+        assert!(yaml.contains("truncated: false"));
+    }
+
+    #[tokio::test]
+    async fn fetch_history_yaml_propagates_invalid_since() {
+        let server = wiremock::MockServer::start().await;
+        let client = AtlassianClient::new(&server.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = fetch_history_yaml(&api, "12", Some("garbage"), 20)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid `since`"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_history_handler_success_via_mock() {
+        let _lock = env_lock();
+        let server = wiremock::MockServer::start().await;
+        mock_history_endpoints(
+            &server,
+            "12",
+            1,
+            serde_json::json!([
+                {"number": 1, "createdAt": "2026-05-06T10:00:00Z", "authorId": "a", "message": "first", "minorEdit": false},
+            ]),
+        )
+        .await;
+        let _env = EnvGuard::set(&server.uri());
+
+        let result = make_server()
+            .confluence_history(Parameters(ConfluenceHistoryParams {
+                id: "12".to_string(),
+                since: None,
+                limit: Some(20),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_history_handler_invalid_since_returns_tool_error() {
+        // Drives the `.map_err(tool_error)?` (line 760) by triggering an
+        // error inside `fetch_history_yaml` via an invalid `since` value.
+        let _lock = env_lock();
+        let _env = EnvGuard::set("http://127.0.0.1:1");
+        let result = make_server()
+            .confluence_history(Parameters(ConfluenceHistoryParams {
+                id: "12".to_string(),
+                since: Some("garbage".to_string()),
+                limit: None,
+            }))
+            .await;
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("Invalid `since`"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_history_handler_no_credentials_returns_tool_error() {
+        let _lock = env_lock();
+        clear_env();
+        let result = make_server()
+            .confluence_history(Parameters(ConfluenceHistoryParams {
+                id: "12".to_string(),
+                since: None,
+                limit: None,
+            }))
+            .await;
+        assert!(result.is_err());
     }
 
     // ── Phase 2d: children / comment / label / user-search tests ───

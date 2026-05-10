@@ -227,6 +227,121 @@ struct ConfluenceAddLabelEntry {
     name: String,
 }
 
+// ── Versions ───────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ConfluenceVersionsResponse {
+    results: Vec<ConfluenceVersionEntry>,
+    #[serde(rename = "_links", default)]
+    links: Option<ConfluenceVersionsLinks>,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceVersionEntry {
+    number: u32,
+    #[serde(rename = "createdAt", default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(rename = "minorEdit", default)]
+    minor_edit: Option<bool>,
+    #[serde(rename = "authorId", default)]
+    author_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceVersionsLinks {
+    next: Option<String>,
+}
+
+/// A single version entry from a Confluence page's history.
+///
+/// Optional fields (`created_at`, `author_id`, `message`) are returned as
+/// empty strings when the API omits them — older pages can have null author
+/// or timestamp data, see issue #708.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageVersion {
+    /// Version number (1-based; current version at the head of the list).
+    pub number: u32,
+    /// ISO 8601 creation timestamp; empty if the API returned null.
+    #[serde(default)]
+    pub created_at: String,
+    /// Account ID of the author; empty if the API returned null.
+    #[serde(default)]
+    pub author_id: String,
+    /// Version comment / edit message; empty if the API returned null.
+    #[serde(default)]
+    pub message: String,
+    /// Whether the edit was marked as minor.
+    #[serde(default)]
+    pub minor_edit: bool,
+}
+
+/// Filter applied to a version listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SinceFilter {
+    /// Keep versions whose `number >= n`.
+    Version(u32),
+    /// Keep versions whose `created_at >= iso` (lexicographic compare on
+    /// ISO 8601 strings — ordering is correct as long as the timestamps
+    /// are fully qualified with offsets, which Confluence's API guarantees).
+    CreatedAt(String),
+}
+
+impl SinceFilter {
+    /// Parses a `since` parameter. A purely numeric input is interpreted as
+    /// a version number; anything containing `-` or `T` (the typical ISO 8601
+    /// markers) is treated as a date.
+    pub fn parse(raw: &str) -> Result<Self> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("`since` must be a version number or ISO 8601 date");
+        }
+        if trimmed.chars().all(|c| c.is_ascii_digit()) {
+            let n: u32 = trimmed
+                .parse()
+                .with_context(|| format!("Invalid version number \"{trimmed}\""))?;
+            return Ok(Self::Version(n));
+        }
+        if trimmed.contains('-') || trimmed.contains('T') {
+            return Ok(Self::CreatedAt(trimmed.to_string()));
+        }
+        anyhow::bail!(
+            "`since` must be a numeric version (e.g. \"5\") or ISO 8601 date \
+             (e.g. \"2026-01-01T00:00:00Z\"); got \"{trimmed}\""
+        );
+    }
+
+    /// Whether `version` satisfies this filter (i.e. should be kept).
+    fn matches(&self, version: &PageVersion) -> bool {
+        match self {
+            Self::Version(min) => version.number >= *min,
+            Self::CreatedAt(min) => {
+                if version.created_at.is_empty() {
+                    // Tolerate missing timestamps: treat as too-old.
+                    false
+                } else {
+                    version.created_at.as_str() >= min.as_str()
+                }
+            }
+        }
+    }
+}
+
+// ── Page metadata ──────────────────────────────────────────────────
+
+/// Lightweight metadata about a Confluence page, returned by
+/// [`ConfluenceApi::get_page_metadata`].
+#[derive(Debug, Clone, Serialize)]
+pub struct PageMetadata {
+    /// Page ID.
+    pub id: String,
+    /// Page title.
+    pub title: String,
+    /// Current version number, if known.
+    pub current_version: Option<u32>,
+}
+
 // ── Create request ─────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -834,6 +949,124 @@ impl ConfluenceApi {
         }
 
         Ok(())
+    }
+
+    /// Fetches lightweight metadata (id, title, current version) for a page.
+    ///
+    /// Cheaper than [`AtlassianApi::get_content`] because it skips the body
+    /// and the space-key lookup.
+    pub async fn get_page_metadata(&self, page_id: &str) -> Result<PageMetadata> {
+        let url = format!(
+            "{}/wiki/api/v2/pages/{}",
+            self.client.instance_url(),
+            page_id
+        );
+
+        let response = self
+            .client
+            .get_json(&url)
+            .await
+            .context("Failed to fetch Confluence page metadata")?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let page: ConfluencePageResponse = response
+            .json()
+            .await
+            .context("Failed to parse Confluence page response")?;
+
+        Ok(PageMetadata {
+            id: page.id,
+            title: page.title,
+            current_version: page.version.map(|v| v.number),
+        })
+    }
+
+    /// Lists version history for a Confluence page, auto-paginated.
+    ///
+    /// Returns up to `limit` versions matching the optional `since` filter.
+    /// `limit = 0` means unlimited. The Confluence v2 API returns versions
+    /// newest-first, so encountering a version older than `since` ends
+    /// pagination early.
+    ///
+    /// The boolean in the return tuple is `truncated`: `true` when `limit`
+    /// was hit before the API was exhausted (more newer-than-`since`
+    /// versions exist upstream).
+    pub async fn list_page_versions(
+        &self,
+        page_id: &str,
+        since: Option<&SinceFilter>,
+        limit: u32,
+    ) -> Result<(Vec<PageVersion>, bool)> {
+        // Page size: cap at 100 per the v2 API; otherwise size to `limit`.
+        let page_size = if limit == 0 { 100 } else { limit.min(100) };
+        let mut url = format!(
+            "{}/wiki/api/v2/pages/{}/versions?limit={}",
+            self.client.instance_url(),
+            page_id,
+            page_size
+        );
+
+        let mut collected: Vec<PageVersion> = Vec::new();
+
+        loop {
+            let response = self
+                .client
+                .get_json(&url)
+                .await
+                .context("Failed to fetch Confluence page versions")?;
+
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+            }
+
+            let resp: ConfluenceVersionsResponse = response
+                .json()
+                .await
+                .context("Failed to parse Confluence versions response")?;
+
+            let page_count = resp.results.len();
+            let next_link = resp.links.and_then(|l| l.next);
+
+            for (idx, entry) in resp.results.into_iter().enumerate() {
+                let version = PageVersion {
+                    number: entry.number,
+                    created_at: entry.created_at.unwrap_or_default(),
+                    author_id: entry.author_id.unwrap_or_default(),
+                    message: entry.message.unwrap_or_default(),
+                    minor_edit: entry.minor_edit.unwrap_or(false),
+                };
+
+                if let Some(filter) = since {
+                    if !filter.matches(&version) {
+                        // Versions are newest-first; nothing further can match.
+                        return Ok((collected, false));
+                    }
+                }
+
+                collected.push(version);
+                if limit > 0 && collected.len() as u32 >= limit {
+                    // Truncated if more results exist on this page or in
+                    // subsequent pages.
+                    let more_on_page = idx + 1 < page_count;
+                    let has_next = next_link.is_some();
+                    return Ok((collected, more_on_page || has_next));
+                }
+            }
+
+            match next_link {
+                Some(next_path) if page_count > 0 => {
+                    url = format!("{}{}", self.client.instance_url(), next_path);
+                }
+                _ => return Ok((collected, false)),
+            }
+        }
     }
 }
 
@@ -2101,5 +2334,515 @@ mod tests {
         let json = serde_json::to_value(&entry).unwrap();
         assert_eq!(json["prefix"], "global");
         assert_eq!(json["name"], "test");
+    }
+
+    // ── SinceFilter::parse ────────────────────────────────────────
+
+    #[test]
+    fn since_filter_parse_numeric() {
+        assert_eq!(SinceFilter::parse("5").unwrap(), SinceFilter::Version(5));
+        assert_eq!(SinceFilter::parse("0").unwrap(), SinceFilter::Version(0));
+    }
+
+    #[test]
+    fn since_filter_parse_iso_date() {
+        let f = SinceFilter::parse("2026-01-01T00:00:00Z").unwrap();
+        assert_eq!(
+            f,
+            SinceFilter::CreatedAt("2026-01-01T00:00:00Z".to_string())
+        );
+    }
+
+    #[test]
+    fn since_filter_parse_iso_date_no_time() {
+        let f = SinceFilter::parse("2026-01-01").unwrap();
+        assert_eq!(f, SinceFilter::CreatedAt("2026-01-01".to_string()));
+    }
+
+    #[test]
+    fn since_filter_parse_trims_whitespace() {
+        assert_eq!(
+            SinceFilter::parse("  7  ").unwrap(),
+            SinceFilter::Version(7)
+        );
+    }
+
+    #[test]
+    fn since_filter_parse_empty_rejected() {
+        assert!(SinceFilter::parse("").is_err());
+        assert!(SinceFilter::parse("   ").is_err());
+    }
+
+    #[test]
+    fn since_filter_parse_garbage_rejected() {
+        assert!(SinceFilter::parse("nope").is_err());
+    }
+
+    #[test]
+    fn since_filter_matches_version() {
+        let v = PageVersion {
+            number: 5,
+            created_at: String::new(),
+            author_id: String::new(),
+            message: String::new(),
+            minor_edit: false,
+        };
+        assert!(SinceFilter::Version(5).matches(&v));
+        assert!(SinceFilter::Version(4).matches(&v));
+        assert!(!SinceFilter::Version(6).matches(&v));
+    }
+
+    #[test]
+    fn since_filter_matches_created_at() {
+        let v = PageVersion {
+            number: 1,
+            created_at: "2026-05-01T00:00:00Z".to_string(),
+            author_id: String::new(),
+            message: String::new(),
+            minor_edit: false,
+        };
+        assert!(SinceFilter::CreatedAt("2026-04-01T00:00:00Z".to_string()).matches(&v));
+        assert!(SinceFilter::CreatedAt("2026-05-01T00:00:00Z".to_string()).matches(&v));
+        assert!(!SinceFilter::CreatedAt("2026-06-01T00:00:00Z".to_string()).matches(&v));
+    }
+
+    #[test]
+    fn since_filter_created_at_treats_empty_as_too_old() {
+        let v = PageVersion {
+            number: 1,
+            created_at: String::new(),
+            author_id: String::new(),
+            message: String::new(),
+            minor_edit: false,
+        };
+        assert!(!SinceFilter::CreatedAt("2026-01-01".to_string()).matches(&v));
+    }
+
+    // ── ConfluenceVersionEntry deserialization ────────────────────
+
+    #[test]
+    fn version_entry_deserialization_full() {
+        let json = r#"{
+            "number": 9,
+            "createdAt": "2026-05-08T10:23:11Z",
+            "message": "Updated DB version",
+            "minorEdit": false,
+            "authorId": "abc-123"
+        }"#;
+        let entry: ConfluenceVersionEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.number, 9);
+        assert_eq!(entry.created_at.as_deref(), Some("2026-05-08T10:23:11Z"));
+        assert_eq!(entry.message.as_deref(), Some("Updated DB version"));
+        assert_eq!(entry.minor_edit, Some(false));
+        assert_eq!(entry.author_id.as_deref(), Some("abc-123"));
+    }
+
+    #[test]
+    fn version_entry_deserialization_sparse() {
+        let json = r#"{"number": 1}"#;
+        let entry: ConfluenceVersionEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.number, 1);
+        assert!(entry.created_at.is_none());
+        assert!(entry.message.is_none());
+        assert!(entry.minor_edit.is_none());
+        assert!(entry.author_id.is_none());
+    }
+
+    // ── get_page_metadata ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_page_metadata_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12345"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "12345",
+                    "title": "Hello",
+                    "status": "current",
+                    "spaceId": "1",
+                    "version": {"number": 7}
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        let meta = api.get_page_metadata("12345").await.unwrap();
+        assert_eq!(meta.id, "12345");
+        assert_eq!(meta.title, "Hello");
+        assert_eq!(meta.current_version, Some(7));
+    }
+
+    #[tokio::test]
+    async fn get_page_metadata_no_version() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12345"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "12345",
+                    "title": "Hello",
+                    "status": "current",
+                    "spaceId": "1"
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        let meta = api.get_page_metadata("12345").await.unwrap();
+        assert_eq!(meta.current_version, None);
+    }
+
+    #[tokio::test]
+    async fn get_page_metadata_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/99999"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = api.get_page_metadata("99999").await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    // ── list_page_versions ────────────────────────────────────────
+
+    fn version_json(
+        number: u32,
+        created: &str,
+        author: &str,
+        msg: &str,
+        minor: bool,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "number": number,
+            "createdAt": created,
+            "message": msg,
+            "minorEdit": minor,
+            "authorId": author
+        })
+    }
+
+    #[tokio::test]
+    async fn list_page_versions_single_page() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12/versions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        version_json(3, "2026-05-08T10:00:00Z", "a", "third", false),
+                        version_json(2, "2026-05-07T10:00:00Z", "b", "second", true),
+                        version_json(1, "2026-05-06T10:00:00Z", "c", "first", false),
+                    ]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        let (versions, truncated) = api.list_page_versions("12", None, 0).await.unwrap();
+        assert_eq!(versions.len(), 3);
+        assert!(!truncated);
+        assert_eq!(versions[0].number, 3);
+        assert_eq!(versions[0].author_id, "a");
+        assert_eq!(versions[0].message, "third");
+        assert!(versions[1].minor_edit);
+    }
+
+    #[tokio::test]
+    async fn list_page_versions_paginates_until_exhausted() {
+        let server = wiremock::MockServer::start().await;
+        // First page advertises a `next` link; second page is the last.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12/versions"))
+            .and(wiremock::matchers::query_param("limit", "100"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        version_json(4, "2026-05-08T10:00:00Z", "a", "four", false),
+                        version_json(3, "2026-05-07T10:00:00Z", "b", "three", false),
+                    ],
+                    "_links": {"next": "/wiki/api/v2/pages/12/versions?cursor=abc"}
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12/versions"))
+            .and(wiremock::matchers::query_param("cursor", "abc"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        version_json(2, "2026-05-06T10:00:00Z", "c", "two", false),
+                        version_json(1, "2026-05-05T10:00:00Z", "d", "one", false),
+                    ]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        let (versions, truncated) = api.list_page_versions("12", None, 0).await.unwrap();
+        assert_eq!(
+            versions.iter().map(|v| v.number).collect::<Vec<_>>(),
+            vec![4, 3, 2, 1]
+        );
+        assert!(!truncated);
+    }
+
+    #[tokio::test]
+    async fn list_page_versions_limit_truncates() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12/versions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        version_json(5, "2026-05-09T10:00:00Z", "a", "five", false),
+                        version_json(4, "2026-05-08T10:00:00Z", "b", "four", false),
+                        version_json(3, "2026-05-07T10:00:00Z", "c", "three", false),
+                    ]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        let (versions, truncated) = api.list_page_versions("12", None, 2).await.unwrap();
+        assert_eq!(versions.len(), 2);
+        assert!(truncated, "limit reached mid-page should mark truncated");
+        assert_eq!(versions[0].number, 5);
+        assert_eq!(versions[1].number, 4);
+    }
+
+    #[tokio::test]
+    async fn list_page_versions_limit_exact_page_with_next_truncated() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12/versions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        version_json(5, "2026-05-09T10:00:00Z", "a", "five", false),
+                        version_json(4, "2026-05-08T10:00:00Z", "b", "four", false),
+                    ],
+                    "_links": {"next": "/wiki/api/v2/pages/12/versions?cursor=z"}
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        let (versions, truncated) = api.list_page_versions("12", None, 2).await.unwrap();
+        assert_eq!(versions.len(), 2);
+        assert!(truncated);
+    }
+
+    #[tokio::test]
+    async fn list_page_versions_since_numeric_filter() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12/versions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        version_json(5, "2026-05-09T10:00:00Z", "a", "5", false),
+                        version_json(4, "2026-05-08T10:00:00Z", "b", "4", false),
+                        version_json(3, "2026-05-07T10:00:00Z", "c", "3", false),
+                        version_json(2, "2026-05-06T10:00:00Z", "d", "2", false),
+                    ]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        let filter = SinceFilter::parse("4").unwrap();
+        let (versions, truncated) = api
+            .list_page_versions("12", Some(&filter), 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            versions.iter().map(|v| v.number).collect::<Vec<_>>(),
+            vec![5, 4]
+        );
+        assert!(!truncated);
+    }
+
+    #[tokio::test]
+    async fn list_page_versions_since_iso_filter() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12/versions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        version_json(3, "2026-05-08T10:00:00Z", "a", "", false),
+                        version_json(2, "2026-04-01T10:00:00Z", "b", "", false),
+                        version_json(1, "2026-03-01T10:00:00Z", "c", "", false),
+                    ]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        let filter = SinceFilter::parse("2026-05-01").unwrap();
+        let (versions, truncated) = api
+            .list_page_versions("12", Some(&filter), 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            versions.iter().map(|v| v.number).collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert!(!truncated);
+    }
+
+    #[tokio::test]
+    async fn list_page_versions_since_stops_pagination_early() {
+        let server = wiremock::MockServer::start().await;
+        // Page 1 has results that all match; page 2 includes the cutoff version.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12/versions"))
+            .and(wiremock::matchers::query_param("limit", "100"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        version_json(5, "2026-05-09T10:00:00Z", "a", "5", false),
+                        version_json(4, "2026-05-08T10:00:00Z", "b", "4", false),
+                    ],
+                    "_links": {"next": "/wiki/api/v2/pages/12/versions?cursor=p2"}
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12/versions"))
+            .and(wiremock::matchers::query_param("cursor", "p2"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        version_json(3, "2026-05-07T10:00:00Z", "c", "3", false),
+                        version_json(2, "2026-04-30T10:00:00Z", "d", "2", false),
+                    ]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        let filter = SinceFilter::parse("2026-05-01").unwrap();
+        let (versions, truncated) = api
+            .list_page_versions("12", Some(&filter), 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            versions.iter().map(|v| v.number).collect::<Vec<_>>(),
+            vec![5, 4, 3]
+        );
+        assert!(!truncated, "since cutoff is a stop, not a truncation");
+    }
+
+    #[tokio::test]
+    async fn list_page_versions_tolerates_missing_optional_fields() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12/versions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {"number": 1}
+                    ]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        let (versions, truncated) = api.list_page_versions("12", None, 0).await.unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].number, 1);
+        assert_eq!(versions[0].created_at, "");
+        assert_eq!(versions[0].author_id, "");
+        assert_eq!(versions[0].message, "");
+        assert!(!versions[0].minor_edit);
+        assert!(!truncated);
+    }
+
+    #[tokio::test]
+    async fn list_page_versions_empty_result() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12/versions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        let (versions, truncated) = api.list_page_versions("12", None, 0).await.unwrap();
+        assert!(versions.is_empty());
+        assert!(!truncated);
+    }
+
+    #[tokio::test]
+    async fn list_page_versions_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/99999/versions",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = api.list_page_versions("99999", None, 0).await.unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn list_page_versions_uses_limit_as_page_size_when_small() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12/versions"))
+            .and(wiremock::matchers::query_param("limit", "5"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        version_json(1, "2026-05-01T00:00:00Z", "a", "", false),
+                    ]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        let (versions, _) = api.list_page_versions("12", None, 5).await.unwrap();
+        assert_eq!(versions.len(), 1);
     }
 }
