@@ -8,6 +8,7 @@ pub(crate) mod download;
 pub(crate) mod edit;
 pub(crate) mod history;
 pub(crate) mod label;
+pub(crate) mod move_page;
 pub(crate) mod read;
 pub(crate) mod search;
 pub(crate) mod user;
@@ -41,6 +42,8 @@ pub enum ConfluenceSubcommands {
     Create(create::CreateCommand),
     /// Deletes a Confluence page.
     Delete(delete::DeleteCommand),
+    /// Moves or reparents a Confluence page (same-space only).
+    Move(move_page::MoveCommand),
     /// Manages labels on Confluence pages.
     Label(label::LabelCommand),
     /// Recursively downloads a Confluence page tree.
@@ -65,6 +68,7 @@ impl ConfluenceCommand {
             ConfluenceSubcommands::Create(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Label(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Delete(cmd) => cmd.execute().await,
+            ConfluenceSubcommands::Move(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Download(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Children(cmd) => cmd.execute().await,
             ConfluenceSubcommands::History(cmd) => cmd.execute().await,
@@ -180,6 +184,41 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::Delete(_)));
+    }
+
+    #[test]
+    fn confluence_subcommands_move_variant() {
+        let cmd = ConfluenceCommand {
+            command: ConfluenceSubcommands::Move(move_page::MoveCommand {
+                id: "12345".to_string(),
+                target: "456".to_string(),
+                position: move_page::MovePosition::Append,
+            }),
+        };
+        assert!(matches!(cmd.command, ConfluenceSubcommands::Move(_)));
+    }
+
+    /// Exercises the `Move` dispatch arm in `ConfluenceCommand::execute` with
+    /// injected fake credentials so `create_client()` succeeds; the API call
+    /// is allowed to fail.
+    #[tokio::test]
+    async fn confluence_command_execute_move_dispatch() {
+        std::env::set_var("ATLASSIAN_INSTANCE_URL", "http://127.0.0.1:1");
+        std::env::set_var("ATLASSIAN_EMAIL", "test@example.com");
+        std::env::set_var("ATLASSIAN_API_TOKEN", "fake-token");
+
+        let cmd = ConfluenceCommand {
+            command: ConfluenceSubcommands::Move(move_page::MoveCommand {
+                id: "12345".to_string(),
+                target: "456".to_string(),
+                position: move_page::MovePosition::Append,
+            }),
+        };
+        let _ = cmd.execute().await;
+
+        std::env::remove_var("ATLASSIAN_INSTANCE_URL");
+        std::env::remove_var("ATLASSIAN_EMAIL");
+        std::env::remove_var("ATLASSIAN_API_TOKEN");
     }
 
     #[test]

@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::atlassian::adf::AdfDocument;
 use crate::atlassian::api::{AtlassianApi, ContentItem};
 use crate::atlassian::client::AtlassianClient;
-use crate::atlassian::confluence_api::{ChildPage, ConfluenceApi};
+use crate::atlassian::confluence_api::{ChildPage, ConfluenceApi, MovePosition};
 use crate::atlassian::convert::markdown_to_adf;
 use crate::atlassian::document::{content_item_to_document, JfmDocument, JfmFrontmatter};
 use crate::cli::atlassian::confluence::download::{
@@ -113,6 +113,21 @@ pub struct ConfluenceDeleteParams {
     /// Requires space admin permission.
     #[serde(default)]
     pub purge: Option<bool>,
+}
+
+/// Parameters for the `confluence_move` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceMoveParams {
+    /// ID of the Confluence page to move.
+    pub page_id: String,
+    /// Target page ID — new parent for `position: "append"`, or sibling
+    /// reference for `"before"`/`"after"`.
+    pub target_id: String,
+    /// Position relative to the target. Defaults to `"append"`.
+    /// Accepted values: `"append"` (target becomes new parent), `"before"`,
+    /// `"after"`. Same-space only — cross-space moves are not supported.
+    #[serde(default)]
+    pub position: Option<String>,
 }
 
 /// Parameters for the `confluence_download` tool.
@@ -693,6 +708,23 @@ impl OmniDevServer {
         ))]))
     }
 
+    /// Tool: move/reparent a Confluence page within its current space.
+    #[tool(
+        description = "Move or reparent a Confluence page within its current space. \
+                       `position` is `\"append\"` (default — target becomes new parent), \
+                       `\"before\"`, or `\"after\"` (sibling reorder relative to target). \
+                       Same-space only — cross-space moves are not supported. \
+                       Returns the moved page's metadata as YAML (id, title, parent_id, ancestors). \
+                       Mirrors `omni-dev atlassian confluence move`."
+    )]
+    pub async fn confluence_move(
+        &self,
+        Parameters(params): Parameters<ConfluenceMoveParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = run_confluence_move(&params).await.map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
     /// Tool: recursively download a Confluence page tree.
     #[tool(
         description = "Recursively download a Confluence page or an entire space into a directory. \
@@ -937,6 +969,28 @@ async fn run_confluence_delete(params: &ConfluenceDeleteParams) -> Result<()> {
     let api = ConfluenceApi::new(client);
     api.delete_page(&params.id, params.purge.unwrap_or(false))
         .await
+}
+
+/// Parses a `position` param (`"append"`/`"before"`/`"after"`, case-insensitive).
+fn parse_move_position(raw: Option<&str>) -> Result<MovePosition> {
+    match raw.map(str::to_ascii_lowercase).as_deref() {
+        None | Some("append") => Ok(MovePosition::Append),
+        Some("before") => Ok(MovePosition::Before),
+        Some("after") => Ok(MovePosition::After),
+        Some(other) => anyhow::bail!(
+            "Invalid position \"{other}\": must be \"append\", \"before\", or \"after\""
+        ),
+    }
+}
+
+async fn run_confluence_move(params: &ConfluenceMoveParams) -> Result<String> {
+    let position = parse_move_position(params.position.as_deref())?;
+    let (client, _instance_url) = create_client()?;
+    let api = ConfluenceApi::new(client);
+    let moved = api
+        .move_page(&params.page_id, &params.target_id, position)
+        .await?;
+    to_yaml(&moved)
 }
 
 async fn run_confluence_download(params: ConfluenceDownloadParams) -> Result<String> {
@@ -1997,6 +2051,112 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // ── parse_move_position ────────────────────────────────────────
+
+    #[test]
+    fn parse_move_position_default_is_append() {
+        assert!(matches!(
+            parse_move_position(None).unwrap(),
+            MovePosition::Append
+        ));
+    }
+
+    #[test]
+    fn parse_move_position_case_insensitive() {
+        assert!(matches!(
+            parse_move_position(Some("APPEND")).unwrap(),
+            MovePosition::Append
+        ));
+        assert!(matches!(
+            parse_move_position(Some("Before")).unwrap(),
+            MovePosition::Before
+        ));
+        assert!(matches!(
+            parse_move_position(Some("after")).unwrap(),
+            MovePosition::After
+        ));
+    }
+
+    #[test]
+    fn parse_move_position_invalid_errors() {
+        let err = parse_move_position(Some("sideways")).unwrap_err();
+        assert!(err.to_string().contains("Invalid position"));
+    }
+
+    // ── confluence_move handler ────────────────────────────────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_move_handler_invalid_position_returns_tool_error() {
+        let server = make_server();
+        let result = server
+            .confluence_move(Parameters(ConfluenceMoveParams {
+                page_id: "12345".to_string(),
+                target_id: "456".to_string(),
+                position: Some("sideways".to_string()),
+            }))
+            .await;
+        let err = result.unwrap_err();
+        assert!(err.message.contains("Invalid position"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_move_handler_success_via_mock() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/move/append/456",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"pageId": "12345"})),
+            )
+            .mount(&srv)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12345"))
+            .and(wiremock::matchers::query_param("include-ancestors", "true"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "12345",
+                    "title": "Moved Page",
+                    "status": "current",
+                    "spaceId": "98765",
+                    "parentId": "456",
+                    "ancestors": [{"id": "456"}]
+                })),
+            )
+            .mount(&srv)
+            .await;
+        let _env = EnvGuard::set(&srv.uri());
+
+        let server = make_server();
+        let result = server
+            .confluence_move(Parameters(ConfluenceMoveParams {
+                page_id: "12345".to_string(),
+                target_id: "456".to_string(),
+                position: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_move_handler_error_path_without_credentials() {
+        let _lock = env_lock();
+        clear_env();
+        let server = make_server();
+        let result = server
+            .confluence_move(Parameters(ConfluenceMoveParams {
+                page_id: "12345".to_string(),
+                target_id: "456".to_string(),
+                position: Some("append".to_string()),
+            }))
+            .await;
+        assert!(result.is_err());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn confluence_download_handler_missing_id_and_space_returns_tool_error() {
         let server = make_server();
@@ -2079,6 +2239,7 @@ mod tests {
             "confluence_create",
             "confluence_write",
             "confluence_delete",
+            "confluence_move",
             "confluence_download",
             "confluence_children",
             "confluence_history",
