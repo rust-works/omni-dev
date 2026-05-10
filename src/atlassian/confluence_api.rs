@@ -4532,4 +4532,64 @@ mod tests {
         let err = resolve_version("garbage", &v, 5).unwrap_err();
         assert!(err.to_string().contains("Could not parse"));
     }
+
+    #[test]
+    fn resolve_version_v_minus_with_non_numeric_suffix_rejected() {
+        // Exercises the `with_context` error path when v-N's suffix fails
+        // to parse as a u32.
+        let v = fixture_versions();
+        let err = resolve_version("v-abc", &v, 5).unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid relative version offset"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_version_v_minus_resolves_to_missing_version_errors() {
+        // Anchor (4) > offset (2), so the offset doesn't go negative — but
+        // version 2 isn't in the truncated history. Exercises the
+        // "Version N not found" path inside `offset_from`.
+        let versions = vec![
+            version_at(5, "2026-05-09T10:00:00Z"),
+            version_at(4, "2026-05-08T10:00:00Z"),
+            // v3 and v2 are absent (e.g., the cap dropped them).
+        ];
+        let err = resolve_version("v-2", &versions, 4).unwrap_err();
+        assert!(err.to_string().contains("not found"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn get_page_at_version_with_body_but_no_atlas_doc_format() {
+        // Exercises the `else { None }` arm where body is present but
+        // `atlas_doc_format` is missing.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12"))
+            .and(wiremock::matchers::query_param("version", "1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "12",
+                    "title": "T",
+                    "status": "current",
+                    "spaceId": "1",
+                    "version": {"number": 1},
+                    "body": { /* atlas_doc_format absent */ }
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"key": "S"})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        let item = api.get_page_at_version("12", 1).await.unwrap();
+        assert!(item.body_adf.is_none());
+    }
 }
