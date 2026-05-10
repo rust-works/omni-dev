@@ -1915,7 +1915,7 @@ async fn confluence_tools_success_paths_via_wiremock() -> Result<()> {
     let label_remove = client
         .call_tool(
             CallToolRequestParams::new("confluence_label_remove").with_arguments(
-                serde_json::json!({"id": "12345", "labels": ["arch"]})
+                serde_json::json!({"id": "12345", "labels": ["arch"], "confirm": true})
                     .as_object()
                     .unwrap()
                     .clone(),
