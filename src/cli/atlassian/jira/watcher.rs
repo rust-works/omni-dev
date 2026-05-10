@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::atlassian::client::{AtlassianClient, JiraWatcherList};
+use crate::cli::atlassian::confirm::{guard_destructive, GuardOptions, GuardOutcome};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -101,13 +102,35 @@ pub struct RemoveCommand {
     /// Account ID of the user to remove.
     #[arg(long)]
     pub user: String,
+
+    /// Skips the confirmation prompt.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Prints what would be removed without making any API calls.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 impl RemoveCommand {
     /// Removes the user from watchers.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        run_remove(&client, &self.key, &self.user).await
+
+        let prompt = format!("Remove watcher {} from {}? [y/N] ", self.user, self.key);
+        let dry_run_message = format!("Would remove watcher {} from {}.", self.user, self.key);
+
+        let outcome = guard_destructive(&GuardOptions {
+            prompt: &prompt,
+            dry_run_message: &dry_run_message,
+            force: self.force,
+            dry_run: self.dry_run,
+        })?;
+
+        match outcome {
+            GuardOutcome::Proceed => run_remove(&client, &self.key, &self.user).await,
+            GuardOutcome::Cancelled | GuardOutcome::DryRun => Ok(()),
+        }
     }
 }
 
@@ -379,8 +402,22 @@ mod tests {
             command: WatcherSubcommands::Remove(RemoveCommand {
                 key: "PROJ-1".to_string(),
                 user: "abc123".to_string(),
+                force: true,
+                dry_run: false,
             }),
         };
         assert!(matches!(cmd.command, WatcherSubcommands::Remove(_)));
+    }
+
+    #[test]
+    fn remove_command_dry_run_field_default_false() {
+        let cmd = RemoveCommand {
+            key: "PROJ-1".to_string(),
+            user: "abc123".to_string(),
+            force: false,
+            dry_run: false,
+        };
+        assert!(!cmd.force);
+        assert!(!cmd.dry_run);
     }
 }
