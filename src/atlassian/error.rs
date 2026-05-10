@@ -2,6 +2,8 @@
 
 use thiserror::Error;
 
+use crate::atlassian::adf_schema::AdfSchemaViolation;
+
 /// Errors that can occur during Atlassian operations.
 #[derive(Error, Debug)]
 pub enum AtlassianError {
@@ -18,6 +20,23 @@ pub enum AtlassianError {
         body: String,
     },
 
+    /// A Confluence write/update/create returned HTTP 500 and the submitted ADF
+    /// payload contains a known schema violation that is the likely cause.
+    ///
+    /// Multi-line `Display` matches the format requested in issue #715: a header
+    /// line, a `Diagnosis:` line naming the offending nesting, and an optional
+    /// `Hint:` line. The raw response body is intentionally omitted from the
+    /// user-facing message — it is already logged at `debug!` by the call site.
+    #[error("{}", format_diagnosis(diagnosis, hint.as_deref()))]
+    ApiRequestFailedWithDiagnosis {
+        /// Raw response body (kept for callers that want to log it).
+        body: String,
+        /// The first ADF schema violation found in the submitted document.
+        diagnosis: AdfSchemaViolation,
+        /// Optional human-readable suggestion for resolving the violation.
+        hint: Option<String>,
+    },
+
     /// The JFM document is invalid or malformed.
     #[error("Invalid JFM document: {0}")]
     InvalidDocument(String),
@@ -25,6 +44,21 @@ pub enum AtlassianError {
     /// An error occurred during ADF conversion.
     #[error("ADF conversion error: {0}")]
     ConversionError(String),
+}
+
+fn format_diagnosis(diagnosis: &AdfSchemaViolation, hint: Option<&str>) -> String {
+    let mut out = format!(
+        "Confluence API returned HTTP 500 (Internal Server Error)\n\
+         Diagnosis: the submitted ADF contains `{child}` nested inside `{parent}` \
+         (not allowed by Confluence's content model).",
+        child = diagnosis.child_type,
+        parent = diagnosis.parent_type,
+    );
+    if let Some(hint) = hint {
+        out.push_str("\nHint: ");
+        out.push_str(hint);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -58,5 +92,43 @@ mod tests {
     fn conversion_error_display() {
         let err = AtlassianError::ConversionError("oops".to_string());
         assert!(err.to_string().contains("oops"));
+    }
+
+    #[test]
+    fn api_request_failed_with_diagnosis_display_with_hint() {
+        let err = AtlassianError::ApiRequestFailedWithDiagnosis {
+            body: "{}".to_string(),
+            diagnosis: AdfSchemaViolation {
+                child_type: "expand".to_string(),
+                parent_type: "panel".to_string(),
+                path: vec![0, 0],
+            },
+            hint: Some(
+                "invert the nesting (panel inside expand) or make them siblings".to_string(),
+            ),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("Confluence API returned HTTP 500 (Internal Server Error)"));
+        assert!(msg.contains("Diagnosis:"));
+        assert!(msg.contains("`expand`"));
+        assert!(msg.contains("`panel`"));
+        assert!(msg.contains("Hint: invert the nesting"));
+    }
+
+    #[test]
+    fn api_request_failed_with_diagnosis_display_without_hint() {
+        let err = AtlassianError::ApiRequestFailedWithDiagnosis {
+            body: String::new(),
+            diagnosis: AdfSchemaViolation {
+                child_type: "table".to_string(),
+                parent_type: "nestedExpand".to_string(),
+                path: vec![1],
+            },
+            hint: None,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("`table`"));
+        assert!(msg.contains("`nestedExpand`"));
+        assert!(!msg.contains("Hint:"));
     }
 }
