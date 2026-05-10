@@ -156,7 +156,7 @@ pub struct ContentTerm {
 /// in arity checks once their pipeline is ready). New variants are added in
 /// later sub-PRs of #733 (marks, attributes); pattern matches should remain
 /// non-exhaustive-aware.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AdfSchemaViolation {
     /// A child node type appears under a parent that does not permit it.
     DisallowedChild {
@@ -194,17 +194,49 @@ pub enum AdfSchemaViolation {
         /// Index path from the document root to the **parent** node.
         path: Vec<usize>,
     },
+
+    /// A node's `attrs` value is missing a required field.
+    ///
+    /// Example: `panel` without `panelType`, `heading` without `level`.
+    MissingAttr {
+        /// The `node_type` whose attrs are incomplete.
+        node_type: String,
+        /// The name of the missing attribute.
+        attr_name: String,
+        /// Index path from the document root to the offending node.
+        path: Vec<usize>,
+    },
+
+    /// A node's `attrs` value has the wrong shape for a declared field.
+    ///
+    /// Examples: `panel.panelType: "purple"` (not in the enum),
+    /// `heading.level: 7` (out of range), `heading.level: "two"` (wrong
+    /// type), `embedCard.url: "not a url"` (bad format).
+    InvalidAttr {
+        /// The `node_type` whose attrs are malformed.
+        node_type: String,
+        /// The name of the offending attribute.
+        attr_name: String,
+        /// What is wrong with the value (enum / range / type / format).
+        problem: crate::atlassian::adf_attr_schema::AttrProblem,
+        /// Index path from the document root to the offending node.
+        path: Vec<usize>,
+    },
 }
 
 impl AdfSchemaViolation {
     /// Path from the document root to the violation site.
     ///
     /// For [`Self::DisallowedChild`] this is the child; for [`Self::Arity`]
-    /// this is the parent whose count is wrong.
+    /// this is the parent whose count is wrong; for [`Self::MissingAttr`]
+    /// and [`Self::InvalidAttr`] this is the node whose attrs are wrong.
     #[must_use]
     pub fn path(&self) -> &[usize] {
         match self {
-            Self::DisallowedChild { path, .. } | Self::Arity { path, .. } => path,
+            Self::DisallowedChild { path, .. }
+            | Self::Arity { path, .. }
+            | Self::MissingAttr { path, .. }
+            | Self::InvalidAttr { path, .. } => path,
         }
     }
 }
@@ -237,6 +269,23 @@ impl std::fmt::Display for AdfSchemaViolation {
                 "ADF schema violation at /{path_str}: '{parent_type}' must contain {phrasing} {atoms_str} (found {actual})",
                 phrasing = expected.phrasing(),
                 atoms_str = format_atoms(atoms),
+            ),
+            Self::MissingAttr {
+                node_type,
+                attr_name,
+                ..
+            } => write!(
+                f,
+                "ADF schema violation at /{path_str}: '{node_type}' is missing required attribute '{attr_name}'",
+            ),
+            Self::InvalidAttr {
+                node_type,
+                attr_name,
+                problem,
+                ..
+            } => write!(
+                f,
+                "ADF schema violation at /{path_str}: '{node_type}.{attr_name}' is invalid — {problem}",
             ),
         }
     }
@@ -874,6 +923,17 @@ fn walk_children(
 
         let child_type = child.node_type.as_str();
 
+        // Validate this child's attrs (per PR #733-attrs slice). Permissive
+        // on unknown node types; emits `MissingAttr` / `InvalidAttr` for
+        // declared fields. Always runs — independent of disallowed-child
+        // / arity bookkeeping.
+        crate::atlassian::adf_attr_schema::validate_attrs(
+            child_type,
+            child.attrs.as_ref(),
+            path,
+            out,
+        );
+
         if is_unsupported(child_type) {
             // Round-trip escape hatch: count toward the current term's arity
             // (so a panel containing only an `unsupportedBlock` still
@@ -970,6 +1030,36 @@ mod tests {
         node(node_type, vec![])
     }
 
+    fn with_attrs(mut n: AdfNode, attrs: serde_json::Value) -> AdfNode {
+        n.attrs = Some(attrs);
+        n
+    }
+
+    /// `panel` with a valid `panelType` so attribute validation does not
+    /// add noise to tests focused on content-model behaviour.
+    fn panel(content: Vec<AdfNode>) -> AdfNode {
+        with_attrs(
+            node("panel", content),
+            serde_json::json!({"panelType": "info"}),
+        )
+    }
+
+    /// `media` with a valid `type`.
+    fn media() -> AdfNode {
+        with_attrs(
+            leaf("media"),
+            serde_json::json!({"type": "file", "id": "x"}),
+        )
+    }
+
+    /// `layoutColumn` with a valid `width`.
+    fn layout_column(content: Vec<AdfNode>) -> AdfNode {
+        with_attrs(
+            node("layoutColumn", content),
+            serde_json::json!({"width": 33.3}),
+        )
+    }
+
     fn doc(content: Vec<AdfNode>) -> AdfDocument {
         AdfDocument {
             version: 1,
@@ -985,9 +1075,7 @@ mod tests {
                 parent_type,
                 path,
             } => (child_type.as_str(), parent_type.as_str(), path.as_slice()),
-            other @ AdfSchemaViolation::Arity { .. } => {
-                panic!("expected DisallowedChild, got {other:?}")
-            }
+            other => panic!("expected DisallowedChild, got {other:?}"),
         }
     }
 
@@ -1008,9 +1096,7 @@ mod tests {
                 *actual,
                 path.as_slice(),
             ),
-            other @ AdfSchemaViolation::DisallowedChild { .. } => {
-                panic!("expected Arity, got {other:?}")
-            }
+            other => panic!("expected Arity, got {other:?}"),
         }
     }
 
@@ -1167,10 +1253,10 @@ mod tests {
         // panel with [expand]: emits DisallowedChild for the expand AND an
         // Arity violation for the panel (panel needs 1+ valid children;
         // disallowed children do not satisfy arity).
-        let bad_panel = node(
-            "panel",
-            vec![node("expand", vec![AdfNode::paragraph(vec![])])],
-        );
+        let bad_panel = panel(vec![with_attrs(
+            node("expand", vec![AdfNode::paragraph(vec![])]),
+            serde_json::json!({"title": "x"}),
+        )]);
         let document = doc(vec![bad_panel]);
 
         let violations = validate_document(&document);
@@ -1200,7 +1286,10 @@ mod tests {
     fn validate_finds_expand_inside_table_cell() {
         let bad_cell = node(
             "tableCell",
-            vec![node("expand", vec![AdfNode::paragraph(vec![])])],
+            vec![with_attrs(
+                node("expand", vec![AdfNode::paragraph(vec![])]),
+                serde_json::json!({"title": "x"}),
+            )],
         );
         let row = node("tableRow", vec![bad_cell]);
         let table = node("table", vec![row]);
@@ -1222,10 +1311,10 @@ mod tests {
     fn validate_walks_into_nested_violations_in_document_order() {
         let document = doc(vec![
             AdfNode::paragraph(vec![leaf("rule")]),
-            node(
-                "panel",
-                vec![node("expand", vec![AdfNode::paragraph(vec![])])],
-            ),
+            panel(vec![with_attrs(
+                node("expand", vec![AdfNode::paragraph(vec![])]),
+                serde_json::json!({"title": "x"}),
+            )]),
         ]);
 
         let violations = validate_document(&document);
@@ -1309,7 +1398,7 @@ mod tests {
         // Panel contains only an unsupportedBlock: counts toward panel's
         // arity (so no Arity violation), and the wrapper is universally
         // accepted. Should validate cleanly.
-        let document = doc(vec![node("panel", vec![leaf("unsupportedBlock")])]);
+        let document = doc(vec![panel(vec![leaf("unsupportedBlock")])]);
         assert_eq!(validate_document(&document), vec![]);
     }
 
@@ -1331,7 +1420,7 @@ mod tests {
     #[test]
     fn media_single_with_two_media_flagged_as_arity_violation() {
         // mediaSingle requires exactly one media; two media → Arity (too many).
-        let media_single = node("mediaSingle", vec![leaf("media"), leaf("media")]);
+        let media_single = node("mediaSingle", vec![media(), media()]);
         let document = doc(vec![media_single]);
         let violations = validate_document(&document);
 
@@ -1370,14 +1459,14 @@ mod tests {
     fn media_single_with_media_then_caption_validates() {
         let document = doc(vec![node(
             "mediaSingle",
-            vec![leaf("media"), node("caption", vec![AdfNode::text("c")])],
+            vec![media(), node("caption", vec![AdfNode::text("c")])],
         )]);
         assert_eq!(validate_document(&document), vec![]);
     }
 
     #[test]
     fn media_single_with_just_one_media_validates() {
-        let document = doc(vec![node("mediaSingle", vec![leaf("media")])]);
+        let document = doc(vec![node("mediaSingle", vec![media()])]);
         assert_eq!(validate_document(&document), vec![]);
     }
 
@@ -1433,12 +1522,7 @@ mod tests {
 
     #[test]
     fn layout_section_with_three_columns_validates() {
-        let column = || {
-            node(
-                "layoutColumn",
-                vec![AdfNode::paragraph(vec![AdfNode::text("x")])],
-            )
-        };
+        let column = || layout_column(vec![AdfNode::paragraph(vec![AdfNode::text("x")])]);
         let document = doc(vec![node(
             "layoutSection",
             vec![column(), column(), column()],
@@ -1448,12 +1532,7 @@ mod tests {
 
     #[test]
     fn layout_section_with_four_columns_flagged_too_many() {
-        let column = || {
-            node(
-                "layoutColumn",
-                vec![AdfNode::paragraph(vec![AdfNode::text("x")])],
-            )
-        };
+        let column = || layout_column(vec![AdfNode::paragraph(vec![AdfNode::text("x")])]);
         let document = doc(vec![node(
             "layoutSection",
             vec![column(), column(), column(), column()],
@@ -1492,7 +1571,7 @@ mod tests {
 
     #[test]
     fn empty_panel_flagged_arity() {
-        let document = doc(vec![node("panel", vec![])]);
+        let document = doc(vec![panel(vec![])]);
         let violations = validate_document(&document);
         assert_eq!(violations.len(), 1, "got: {violations:?}");
         let (parent, _, expected, actual, _) = unwrap_arity(&violations[0]);
@@ -1505,18 +1584,25 @@ mod tests {
     fn unsupported_block_satisfies_parent_arity() {
         // panel + with [unsupportedBlock] → no violation (round-trip
         // preservation: the wrapper counts toward panel's arity).
-        let document = doc(vec![node("panel", vec![leaf("unsupportedBlock")])]);
+        let document = doc(vec![panel(vec![leaf("unsupportedBlock")])]);
         assert_eq!(validate_document(&document), vec![]);
     }
 
     #[test]
     fn unsupported_inline_satisfies_inline_parent_arity() {
         // taskItem is `inline*` (lenient), so this is trivially OK; the
-        // assertion is that we don't reject the unsupportedInline.
-        let document = doc(vec![node(
-            "taskList",
-            vec![node("taskItem", vec![leaf("unsupportedInline")])],
-        )]);
+        // assertion is that we don't reject the unsupportedInline. Both
+        // taskList and taskItem need a localId; taskItem also needs a
+        // state.
+        let task_item = with_attrs(
+            node("taskItem", vec![leaf("unsupportedInline")]),
+            serde_json::json!({"localId": "ti1", "state": "TODO"}),
+        );
+        let task_list = with_attrs(
+            node("taskList", vec![task_item]),
+            serde_json::json!({"localId": "tl1"}),
+        );
+        let document = doc(vec![task_list]);
         assert_eq!(validate_document(&document), vec![]);
     }
 

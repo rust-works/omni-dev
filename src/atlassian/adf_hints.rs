@@ -9,6 +9,7 @@
 //! evolve as new violation variants land — the `match` is split per variant
 //! so each sub-PR of #733 only touches the variant it owns.
 
+use crate::atlassian::adf_attr_schema::AttrProblem;
 use crate::atlassian::adf_schema::{AdfSchemaViolation, Quantifier};
 
 /// Returns a human-readable hint for the given violation, if one is known.
@@ -26,6 +27,17 @@ pub fn hint_for(violation: &AdfSchemaViolation) -> Option<&'static str> {
             actual,
             ..
         } => arity_hint(parent_type, expected, *actual),
+        AdfSchemaViolation::MissingAttr {
+            node_type,
+            attr_name,
+            ..
+        } => missing_attr_hint(node_type, attr_name),
+        AdfSchemaViolation::InvalidAttr {
+            node_type,
+            attr_name,
+            problem,
+            ..
+        } => invalid_attr_hint(node_type, attr_name, problem),
     }
 }
 
@@ -75,6 +87,50 @@ fn arity_hint(parent: &str, expected: &Quantifier, actual: usize) -> Option<&'st
         }
         ("layoutSection", Quantifier::Range(2, 3), _) => {
             Some("layoutSection accepts at most 3 columns; remove the extra layoutColumn nodes")
+        }
+        _ => None,
+    }
+}
+
+fn missing_attr_hint(node_type: &str, attr_name: &str) -> Option<&'static str> {
+    match (node_type, attr_name) {
+        ("panel", "panelType") => {
+            Some("set panelType to one of: info, note, warning, success, error, custom")
+        }
+        ("heading", "level") => Some("set level to an integer in 1..=6"),
+        ("taskItem", "state") => Some("set state to TODO or DONE"),
+        ("decisionItem", "state") => Some("set state to DECIDED or UNDECIDED"),
+        ("media", "type") => Some("set type to file, link, or external"),
+        ("status", "color") => {
+            Some("set color to one of: neutral, purple, blue, red, yellow, green")
+        }
+        (_, "localId") => {
+            Some("set localId to a unique identifier (typically a UUID) for this node")
+        }
+        _ => None,
+    }
+}
+
+fn invalid_attr_hint(
+    node_type: &str,
+    attr_name: &str,
+    problem: &AttrProblem,
+) -> Option<&'static str> {
+    match (node_type, attr_name, problem) {
+        ("panel", "panelType", AttrProblem::NotInEnum { .. }) => {
+            Some("valid panelType values are: info, note, warning, success, error, custom")
+        }
+        ("heading", "level", AttrProblem::OutOfRange { .. }) => {
+            Some("heading.level must be an integer in 1..=6")
+        }
+        ("media", "type", AttrProblem::NotInEnum { .. }) => {
+            Some("media.type must be one of: file, link, external")
+        }
+        ("layoutColumn", "width", _) => {
+            Some("layoutColumn.width must be a number in 0..=100 (percentage)")
+        }
+        (_, _, AttrProblem::BadFormat { reason }) if reason.contains("URL") => {
+            Some("URL attributes must be absolute (e.g. https://…)")
         }
         _ => None,
     }

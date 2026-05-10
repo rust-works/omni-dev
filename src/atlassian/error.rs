@@ -66,6 +66,21 @@ fn format_diagnosis(diagnosis: &AdfSchemaViolation, hint: Option<&str>) -> Strin
         AdfSchemaViolation::Arity { .. } => {
             format!("Diagnosis: the submitted ADF has an arity violation — {diagnosis}.")
         }
+        AdfSchemaViolation::MissingAttr {
+            node_type,
+            attr_name,
+            ..
+        } => format!(
+            "Diagnosis: the submitted ADF's `{node_type}` is missing required attribute `{attr_name}`."
+        ),
+        AdfSchemaViolation::InvalidAttr {
+            node_type,
+            attr_name,
+            problem,
+            ..
+        } => format!(
+            "Diagnosis: the submitted ADF's `{node_type}.{attr_name}` is invalid — {problem}."
+        ),
     };
     let mut out = format!("{header}\n{diag_line}");
     if let Some(hint) = hint {

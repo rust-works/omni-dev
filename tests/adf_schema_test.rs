@@ -5,7 +5,7 @@
 //! entry point — the same path real callers (Confluence/Jira API responses)
 //! take.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::needless_collect)]
 
 use omni_dev::atlassian::adf::AdfDocument;
 use omni_dev::atlassian::adf_schema::{
@@ -73,7 +73,7 @@ fn expand_inside_panel_is_flagged_via_public_api() {
             assert_eq!(parent_type, "panel");
             assert_eq!(path, &vec![0_usize, 0]);
         }
-        AdfSchemaViolation::Arity { .. } => unreachable!("filtered to DisallowedChild"),
+        other => unreachable!("filtered to DisallowedChild, got {other:?}"),
     }
 }
 
@@ -103,9 +103,7 @@ fn empty_bullet_list_flagged_arity_via_public_api() {
             assert_eq!(*actual, 0);
             assert_eq!(path, &vec![0_usize]);
         }
-        other @ AdfSchemaViolation::DisallowedChild { .. } => {
-            panic!("expected Arity, got {other:?}")
-        }
+        other => panic!("expected Arity, got {other:?}"),
     }
 }
 
@@ -142,7 +140,7 @@ fn media_single_with_two_media_flagged_via_public_api() {
             assert_eq!(expected, &Quantifier::Exactly(1));
             assert_eq!(*actual, 2);
         }
-        AdfSchemaViolation::DisallowedChild { .. } => unreachable!("filtered to Arity"),
+        other => unreachable!("filtered to Arity, got {other:?}"),
     }
 }
 
@@ -151,4 +149,88 @@ fn permits_child_is_callable_externally() {
     // Round-trips through the public re-export.
     assert!(permits_child("tableCell", "nestedExpand"));
     assert!(!permits_child("tableCell", "expand"));
+}
+
+#[test]
+fn invalid_panel_type_flagged_via_public_api() {
+    let json = r#"{
+        "version": 1,
+        "type": "doc",
+        "content": [
+            {
+                "type": "panel",
+                "attrs": {"panelType": "purple"},
+                "content": [{"type": "paragraph", "content": [{"type": "text", "text": "x"}]}]
+            }
+        ]
+    }"#;
+    let doc = AdfDocument::from_json_str(json).unwrap();
+    let violations = validate_document(&doc);
+    let invalid = violations
+        .iter()
+        .filter(|v| matches!(v, AdfSchemaViolation::InvalidAttr { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(invalid.len(), 1, "got: {violations:?}");
+    let _ = &invalid;
+    match invalid[0] {
+        AdfSchemaViolation::InvalidAttr {
+            node_type,
+            attr_name,
+            ..
+        } => {
+            assert_eq!(node_type, "panel");
+            assert_eq!(attr_name, "panelType");
+        }
+        other => unreachable!("filtered to InvalidAttr, got {other:?}"),
+    }
+}
+
+#[test]
+fn missing_panel_type_flagged_via_public_api() {
+    let json = r#"{
+        "version": 1,
+        "type": "doc",
+        "content": [
+            {
+                "type": "panel",
+                "content": [{"type": "paragraph", "content": [{"type": "text", "text": "x"}]}]
+            }
+        ]
+    }"#;
+    let doc = AdfDocument::from_json_str(json).unwrap();
+    let violations = validate_document(&doc);
+    let missing: Vec<&AdfSchemaViolation> = violations
+        .iter()
+        .filter(|v| matches!(v, AdfSchemaViolation::MissingAttr { .. }))
+        .collect();
+    assert_eq!(missing.len(), 1, "got: {violations:?}");
+    match missing[0] {
+        AdfSchemaViolation::MissingAttr {
+            node_type,
+            attr_name,
+            ..
+        } => {
+            assert_eq!(node_type, "panel");
+            assert_eq!(attr_name, "panelType");
+        }
+        other => unreachable!("filtered to MissingAttr, got {other:?}"),
+    }
+}
+
+#[test]
+fn heading_level_out_of_range_flagged_via_public_api() {
+    let json = r#"{
+        "version": 1,
+        "type": "doc",
+        "content": [
+            {"type": "heading", "attrs": {"level": 7}, "content": [{"type": "text", "text": "x"}]}
+        ]
+    }"#;
+    let doc = AdfDocument::from_json_str(json).unwrap();
+    let violations = validate_document(&doc);
+    let invalid: Vec<&AdfSchemaViolation> = violations
+        .iter()
+        .filter(|v| matches!(v, AdfSchemaViolation::InvalidAttr { .. }))
+        .collect();
+    assert_eq!(invalid.len(), 1, "got: {violations:?}");
 }

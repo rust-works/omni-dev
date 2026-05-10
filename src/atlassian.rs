@@ -5,6 +5,7 @@
 //! for JIRA and Confluence.
 
 pub mod adf;
+pub mod adf_attr_schema;
 pub mod adf_hints;
 pub mod adf_schema;
 pub mod adf_validated;

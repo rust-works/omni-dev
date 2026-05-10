@@ -24,7 +24,11 @@ use crate::atlassian::adf_schema::{validate_document, AdfSchemaViolation};
 
 /// One or more nesting violations discovered when validating an
 /// [`AdfDocument`] against the upstream content model.
-#[derive(Debug, Clone, PartialEq, Eq)]
+//
+// `Eq` is intentionally not derived: `AdfSchemaViolation::InvalidAttr`
+// carries an `AttrProblem` whose `OutOfRangeF` variant holds `f64`, which
+// does not implement `Eq`. `PartialEq` is sufficient for all uses.
+#[derive(Debug, Clone, PartialEq)]
 pub struct AdfValidationError {
     /// All violations found, in document order.
     pub violations: Vec<AdfSchemaViolation>,
@@ -71,6 +75,10 @@ impl std::fmt::Display for AdfValidationError {
                     out.push_str(
                         "hint: adjust the number of children to match the schema's quantifier.",
                     );
+                }
+                AdfSchemaViolation::MissingAttr { .. } | AdfSchemaViolation::InvalidAttr { .. } => {
+                    out.push_str(&format!("invalid ADF attribute — {v}.\n"));
+                    out.push_str("hint: fix the offending attribute on the node before retrying.");
                 }
             }
         }
