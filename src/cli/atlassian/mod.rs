@@ -1,6 +1,7 @@
 //! Atlassian CLI commands for JIRA and Confluence.
 
 pub(crate) mod auth;
+pub(crate) mod confirm;
 pub mod confluence;
 pub(crate) mod convert;
 pub(crate) mod format;

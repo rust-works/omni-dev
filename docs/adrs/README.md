@@ -50,3 +50,4 @@ by Michael Nygard.
 | [ADR-0024](adr-0024.md)  | ✅ Accepted   | 2026-05-10 | TTL-Bounded In-Memory Cache for Near-Static JIRA Catalogues                            |
 | [ADR-0025](adr-0025.md)  | ✅ Accepted   | 2026-05-10 | Wire ADF Schema Validator into the API Send Path via `ValidatedAdfDocument`            |
 | [ADR-0026](adr-0026.md)  | ✅ Accepted   | 2026-05-10 | Extending the ADF Validator with Quantifiers, Attributes, and Marks                    |
+| [ADR-0027](adr-0027.md)  | ✅ Accepted   | 2026-05-11 | Destructive CLI Commands Confirm by Default with --force and --dry-run Escape Hatches  |

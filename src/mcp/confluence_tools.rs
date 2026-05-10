@@ -232,12 +232,18 @@ pub struct ConfluenceLabelAddParams {
 }
 
 /// Parameters for the `confluence_label_remove` tool.
+///
+/// `confirm` must be `true` for the removal to proceed. This is the
+/// MCP-side guard for a destructive operation; the assistant must
+/// explicitly opt in.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ConfluenceLabelRemoveParams {
     /// Confluence page ID.
     pub id: String,
     /// Labels to remove from the page.
     pub labels: Vec<String>,
+    /// Must be set to `true` — destructive guard.
+    pub confirm: bool,
 }
 
 /// Parameters for the `confluence_user_search` tool.
@@ -748,9 +754,15 @@ pub async fn remove_labels_result(
     api: &ConfluenceApi,
     id: &str,
     labels: &[String],
+    confirm: bool,
 ) -> Result<String> {
     if labels.is_empty() {
         anyhow::bail!("`labels` must contain at least one label");
+    }
+    if !confirm {
+        anyhow::bail!(
+            "Refusing to remove labels from page {id}: pass `confirm: true` to authorise this destructive operation."
+        );
     }
 
     for label in labels {
@@ -1073,8 +1085,10 @@ impl OmniDevServer {
 
     /// Removes labels from a Confluence page.
     #[tool(
-        description = "Remove one or more labels from a Confluence page. Mirrors \
-                       `omni-dev atlassian confluence label remove`."
+        description = "Remove one or more labels from a Confluence page. Destructive \
+                       operation: callers must explicitly pass `confirm: true` for the \
+                       removal to proceed; otherwise the tool refuses with an error. \
+                       Mirrors `omni-dev atlassian confluence label remove`."
     )]
     pub async fn confluence_label_remove(
         &self,
@@ -1082,7 +1096,7 @@ impl OmniDevServer {
     ) -> Result<CallToolResult, McpError> {
         let (client, _url) = create_client().map_err(tool_error)?;
         let api = ConfluenceApi::new(client);
-        let yaml = remove_labels_result(&api, &params.id, &params.labels)
+        let yaml = remove_labels_result(&api, &params.id, &params.labels, params.confirm)
             .await
             .map_err(tool_error)?;
         Ok(CallToolResult::success(vec![Content::text(yaml)]))
@@ -3266,7 +3280,21 @@ mod tests {
     // ── remove_labels_result ───────────────────────────────────────
 
     #[tokio::test]
-    async fn remove_labels_result_deletes_each_label() {
+    async fn remove_labels_result_requires_confirm_true() {
+        let server = wiremock::MockServer::start().await;
+        let err = remove_labels_result(
+            &phase2d_mock_api(&server),
+            "12345",
+            &["draft".to_string()],
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("confirm: true"));
+    }
+
+    #[tokio::test]
+    async fn remove_labels_result_deletes_each_label_with_confirm() {
         let server = wiremock::MockServer::start().await;
         for label in &["draft", "old"] {
             wiremock::Mock::given(wiremock::matchers::method("DELETE"))
@@ -3283,6 +3311,7 @@ mod tests {
             &phase2d_mock_api(&server),
             "12345",
             &["draft".to_string(), "old".to_string()],
+            true,
         )
         .await
         .unwrap();
@@ -3293,7 +3322,7 @@ mod tests {
     #[tokio::test]
     async fn remove_labels_result_rejects_empty_labels() {
         let server = wiremock::MockServer::start().await;
-        let err = remove_labels_result(&phase2d_mock_api(&server), "12345", &[])
+        let err = remove_labels_result(&phase2d_mock_api(&server), "12345", &[], true)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("at least one label"));
@@ -3310,9 +3339,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = remove_labels_result(&phase2d_mock_api(&server), "12345", &["draft".to_string()])
-            .await
-            .unwrap_err();
+        let err = remove_labels_result(
+            &phase2d_mock_api(&server),
+            "12345",
+            &["draft".to_string()],
+            true,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("403"));
     }
 
