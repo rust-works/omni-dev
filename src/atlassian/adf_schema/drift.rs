@@ -1426,6 +1426,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_drift_report_from_url_errors_on_connection_refused() {
+        // Bind to find a free local port, then drop the listener so the
+        // port is no longer accepting connections. reqwest's `send().await`
+        // hits a connection-refused error, exercising the underlying error
+        // context wrapper that wiremock 200/4xx/5xx tests can't reach.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let url = format!("http://127.0.0.1:{port}/latest");
+        let err = fetch_drift_report_from_url(&url).await.unwrap_err();
+        assert!(
+            err.to_string().contains("fetching npm registry"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn fetch_drift_report_from_url_errors_on_npm_5xx() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::path("/latest"))

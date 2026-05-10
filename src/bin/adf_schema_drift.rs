@@ -224,4 +224,112 @@ mod tests {
         process_report(&report, Format::Markdown, &nested, None, &mut buf).unwrap();
         assert!(nested.join("drift-report.md").exists());
     }
+
+    #[test]
+    fn process_report_errors_when_output_dir_path_is_blocked_by_file() {
+        // Place a regular file at the path component the binary needs to
+        // create as a directory; `create_dir_all` then fails.
+        let parent = tempfile::tempdir().unwrap();
+        let blocker = parent.path().join("blocker");
+        std::fs::write(&blocker, b"not-a-directory").unwrap();
+        let blocked = blocker.join("would-be-output-dir");
+
+        let report = fixture_report(false, false);
+        let mut buf: Vec<u8> = Vec::new();
+        let err = process_report(&report, Format::Markdown, &blocked, None, &mut buf).unwrap_err();
+        assert!(
+            err.to_string().contains("creating output directory"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn process_report_errors_when_markdown_write_fails() {
+        // Pre-create `drift-report.md` as a directory so the file write fails.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("drift-report.md")).unwrap();
+
+        let report = fixture_report(false, false);
+        let mut buf: Vec<u8> = Vec::new();
+        let err =
+            process_report(&report, Format::Markdown, dir.path(), None, &mut buf).unwrap_err();
+        assert!(
+            err.to_string().contains("drift-report.md"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn process_report_errors_when_json_write_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("drift-report.json")).unwrap();
+
+        let report = fixture_report(false, false);
+        let mut buf: Vec<u8> = Vec::new();
+        let err = process_report(&report, Format::Json, dir.path(), None, &mut buf).unwrap_err();
+        assert!(
+            err.to_string().contains("drift-report.json"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn process_report_errors_when_github_output_path_is_unopenable() {
+        let parent = tempfile::tempdir().unwrap();
+        // A file whose parent is an existing regular file → can't open as
+        // a writable file (parent isn't a directory).
+        let blocker = parent.path().join("blocker");
+        std::fs::write(&blocker, b"not-a-directory").unwrap();
+        let bad_github_output = blocker.join("github_output.txt");
+
+        let report = fixture_report(false, false);
+        let mut buf: Vec<u8> = Vec::new();
+        let err = process_report(
+            &report,
+            Format::Markdown,
+            parent.path(),
+            Some(bad_github_output.to_str().unwrap()),
+            &mut buf,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("$GITHUB_OUTPUT"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// `Write` impl that always errors — covers stdout-write error contexts.
+    struct AlwaysErroringWriter;
+    impl Write for AlwaysErroringWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("boom"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn always_erroring_writer_methods_behave_as_documented() {
+        // Sanity-check the test helper itself: `write` errors, `flush` is a
+        // no-op `Ok`. Without this, `flush` would be uncovered because
+        // `process_report` uses `writeln!` (which calls `write`/`write_all`)
+        // and never explicitly flushes.
+        let mut w = AlwaysErroringWriter;
+        assert!(w.write(b"data").is_err());
+        assert!(w.flush().is_ok());
+    }
+
+    #[test]
+    fn process_report_errors_when_stdout_write_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = fixture_report(false, false);
+        let mut writer = AlwaysErroringWriter;
+        let err =
+            process_report(&report, Format::Markdown, dir.path(), None, &mut writer).unwrap_err();
+        assert!(
+            err.to_string().contains("stdout"),
+            "unexpected error: {err}"
+        );
+    }
 }
