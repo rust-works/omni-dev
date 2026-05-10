@@ -1812,11 +1812,11 @@ mod tests {
             doc_type: "doc".to_string(),
             content: vec![AdfNode {
                 node_type: "panel".to_string(),
-                attrs: None,
+                attrs: Some(serde_json::json!({"panelType": "info"})),
                 content: Some(vec![AdfNode {
                     node_type: "expand".to_string(),
-                    attrs: None,
-                    content: None,
+                    attrs: Some(serde_json::json!({"title": "details"})),
+                    content: Some(vec![AdfNode::paragraph(vec![AdfNode::text("x")])]),
                     text: None,
                     marks: None,
                     local_id: None,
