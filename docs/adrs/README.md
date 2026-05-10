@@ -46,3 +46,4 @@ by Michael Nygard.
 | [ADR-0020](adr-0020.md)  | ✅ Proposed   | 2026-04-16 | JFM — A Markdown Dialect for Bidirectional ADF Interchange                             |
 | [ADR-0021](adr-0021.md)  | ✅ Accepted   | 2026-04-18 | MCP Server via Second Binary with `rmcp`                                                |
 | [ADR-0022](adr-0022.md)  | ✅ Accepted   | 2026-05-06 | Layered Model Catalog with User and Project Overrides                                  |
+| [ADR-0023](adr-0023.md)  | ✅ Accepted   | 2026-05-10 | Data-Driven ADF Content-Model Schema and Validator                                     |
