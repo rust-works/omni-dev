@@ -277,4 +277,79 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("404"));
     }
+
+    /// Force-mode + a writer that fails on first write covers the `?`
+    /// propagation on the post-API-success writeln.
+    #[tokio::test]
+    async fn execute_with_force_propagates_writeln_error() {
+        use crate::test_support::failing_io::FailingWriter;
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let cmd = DeleteCommand {
+            key: "PROJ-1".to_string(),
+            force: true,
+            dry_run: false,
+        };
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut writer = FailingWriter;
+        let err = cmd
+            .execute_with_io(&client, &mut input, &mut writer)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated write failure"));
+    }
+
+    /// Dry-run with a failing writer covers the `?` propagation on the
+    /// guard_destructive_with_io call (its writeln returns Err).
+    #[tokio::test]
+    async fn execute_dry_run_propagates_guard_error() {
+        use crate::test_support::failing_io::FailingWriter;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(issue_body()))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let cmd = DeleteCommand {
+            key: "PROJ-1".to_string(),
+            force: false,
+            dry_run: true,
+        };
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut writer = FailingWriter;
+        let err = cmd
+            .execute_with_io(&client, &mut input, &mut writer)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated write failure"));
+    }
+
+    /// End-to-end exercise of the public `execute()` wrapper, covering
+    /// `create_client()` env-var loading and the stdin/stdout setup.
+    /// `--force` skips the prompt, so stdin is not read.
+    #[tokio::test]
+    async fn execute_with_force_drives_create_client_and_calls_delete() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        let cmd = DeleteCommand {
+            key: "PROJ-1".to_string(),
+            force: true,
+            dry_run: false,
+        };
+        cmd.execute().await.unwrap();
+    }
 }

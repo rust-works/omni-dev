@@ -218,6 +218,37 @@ mod tests {
     }
 
     #[test]
+    fn failing_writer_flush_returns_error() {
+        // Direct cover for FailingWriter::flush, which is required by the
+        // Write trait but isn't reached by guard_destructive_with_io
+        // (which always fails at the prior write!).
+        let mut writer = FailingWriter;
+        let err = std::io::Write::flush(&mut writer).unwrap_err();
+        assert!(err.to_string().contains("simulated flush failure"));
+    }
+
+    #[test]
+    fn failing_reader_read_returns_error() {
+        // Direct cover for FailingReader::read, which is required by the
+        // Read supertrait but isn't reached by BufRead::read_line in our
+        // call paths (those go through fill_buf).
+        let mut reader = FailingReader;
+        let mut buf = [0u8; 1];
+        let err = std::io::Read::read(&mut reader, &mut buf).unwrap_err();
+        assert!(err.to_string().contains("simulated read failure"));
+    }
+
+    #[test]
+    fn failing_reader_consume_is_a_noop() {
+        // Direct cover for FailingReader::consume, the BufRead-required
+        // method that our guard never invokes (read_line consumes nothing
+        // when fill_buf already errored).
+        let mut reader = FailingReader;
+        std::io::BufRead::consume(&mut reader, 0);
+        std::io::BufRead::consume(&mut reader, 5);
+    }
+
+    #[test]
     fn dry_run_propagates_writer_error() {
         let mut input = Cursor::new(Vec::<u8>::new());
         let mut writer = FailingWriter;

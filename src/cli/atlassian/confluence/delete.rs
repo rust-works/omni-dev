@@ -385,4 +385,81 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("404"));
     }
+
+    /// Force-mode + failing writer covers `?` on the post-API writeln.
+    #[tokio::test]
+    async fn execute_with_force_propagates_writeln_error() {
+        use crate::test_support::failing_io::FailingWriter;
+        let (server, api) = setup_mock().await;
+        Mock::given(method("DELETE"))
+            .and(path("/wiki/api/v2/pages/12345"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let cmd = DeleteCommand {
+            id: "12345".to_string(),
+            force: true,
+            dry_run: false,
+            purge: false,
+        };
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut writer = FailingWriter;
+        let err = cmd
+            .execute_with_io(
+                &api,
+                "https://example.atlassian.net",
+                &mut input,
+                &mut writer,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated write failure"));
+    }
+
+    /// Dry-run with a failing writer covers `?` on guard_destructive_with_io.
+    #[tokio::test]
+    async fn execute_dry_run_propagates_guard_error() {
+        use crate::test_support::failing_io::FailingWriter;
+        let (_server, api) = setup_mock().await;
+        let cmd = DeleteCommand {
+            id: "12345".to_string(),
+            force: false,
+            dry_run: true,
+            purge: false,
+        };
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut writer = FailingWriter;
+        let err = cmd
+            .execute_with_io(
+                &api,
+                "https://example.atlassian.net",
+                &mut input,
+                &mut writer,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated write failure"));
+    }
+
+    /// End-to-end exercise of the public `execute()` wrapper.
+    #[tokio::test]
+    async fn execute_with_force_drives_create_client_and_calls_delete() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/wiki/api/v2/pages/12345"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        let cmd = DeleteCommand {
+            id: "12345".to_string(),
+            force: true,
+            dry_run: false,
+            purge: false,
+        };
+        cmd.execute().await.unwrap();
+    }
 }
