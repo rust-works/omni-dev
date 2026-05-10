@@ -1,0 +1,337 @@
+//! Shared confirmation and dry-run helper for destructive Atlassian CLI commands.
+
+use std::io::{BufRead, Write};
+
+use anyhow::Result;
+
+/// Outcome of a destructive-action guard.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GuardOutcome {
+    /// Caller should proceed with the destructive operation.
+    Proceed,
+    /// User declined the prompt; the guard already printed a cancellation
+    /// notice. Caller should return `Ok(())` without performing the action.
+    Cancelled,
+    /// `--dry-run` was set; the guard already printed the preview. Caller
+    /// should return `Ok(())` without invoking any API.
+    DryRun,
+}
+
+/// Configuration for a single destructive-action guard invocation.
+pub struct GuardOptions<'a> {
+    /// The yes/no prompt shown to the user (e.g. "Delete PROJ-123 (Fix login)? [y/N] ").
+    pub prompt: &'a str,
+    /// The preview message printed when `--dry-run` is set
+    /// (e.g. "Would delete PROJ-123 (Fix login).").
+    pub dry_run_message: &'a str,
+    /// Skip the interactive prompt.
+    pub force: bool,
+    /// Print `dry_run_message` and return without prompting or calling the API.
+    pub dry_run: bool,
+}
+
+/// Guards a destructive operation, prompting on the supplied reader/writer.
+///
+/// `--dry-run` takes precedence over `--force`: a dry-run never invokes the API,
+/// even when `--force` is also set. This lets users sanity-check a scripted
+/// `--force` invocation by adding `--dry-run` without removing the force flag.
+///
+/// In production, callers pass `BufReader::new(io::stdin())` and `io::stdout()`;
+/// tests pass `Cursor` and `Vec<u8>` to drive and observe the interaction.
+pub fn guard_destructive_with_io(
+    opts: &GuardOptions<'_>,
+    reader: &mut dyn BufRead,
+    writer: &mut dyn Write,
+) -> Result<GuardOutcome> {
+    if opts.dry_run {
+        writeln!(writer, "{}", opts.dry_run_message)?;
+        return Ok(GuardOutcome::DryRun);
+    }
+
+    if opts.force {
+        return Ok(GuardOutcome::Proceed);
+    }
+
+    write!(writer, "{}", opts.prompt)?;
+    writer.flush()?;
+
+    let mut answer = String::new();
+    reader.read_line(&mut answer)?;
+    if answer.trim().eq_ignore_ascii_case("y") {
+        Ok(GuardOutcome::Proceed)
+    } else {
+        writeln!(writer, "Cancelled.")?;
+        Ok(GuardOutcome::Cancelled)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn opts<'a>(prompt: &'a str, dry_run_message: &'a str) -> GuardOptions<'a> {
+        GuardOptions {
+            prompt,
+            dry_run_message,
+            force: false,
+            dry_run: false,
+        }
+    }
+
+    // ── dry-run precedence ─────────────────────────────────────────
+
+    #[test]
+    fn dry_run_returns_dry_run_and_prints_preview() {
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        let mut o = opts("Delete? ", "Would delete X.");
+        o.dry_run = true;
+
+        let outcome = guard_destructive_with_io(&o, &mut input, &mut output).unwrap();
+        assert_eq!(outcome, GuardOutcome::DryRun);
+        assert_eq!(String::from_utf8(output).unwrap(), "Would delete X.\n");
+    }
+
+    #[test]
+    fn dry_run_wins_over_force() {
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        let mut o = opts("Delete? ", "Would delete X.");
+        o.force = true;
+        o.dry_run = true;
+
+        let outcome = guard_destructive_with_io(&o, &mut input, &mut output).unwrap();
+        assert_eq!(outcome, GuardOutcome::DryRun);
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .contains("Would delete X."));
+    }
+
+    // ── force ──────────────────────────────────────────────────────
+
+    #[test]
+    fn force_returns_proceed_without_io() {
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        let mut o = opts("Delete? ", "Would delete X.");
+        o.force = true;
+
+        let outcome = guard_destructive_with_io(&o, &mut input, &mut output).unwrap();
+        assert_eq!(outcome, GuardOutcome::Proceed);
+        assert!(output.is_empty());
+    }
+
+    // ── prompt answers ─────────────────────────────────────────────
+
+    #[test]
+    fn yes_lowercase_proceeds() {
+        let mut input = Cursor::new(b"y\n".to_vec());
+        let mut output = Vec::<u8>::new();
+        let outcome =
+            guard_destructive_with_io(&opts("Delete? ", "Would delete."), &mut input, &mut output)
+                .unwrap();
+        assert_eq!(outcome, GuardOutcome::Proceed);
+        assert_eq!(String::from_utf8(output).unwrap(), "Delete? ");
+    }
+
+    #[test]
+    fn yes_uppercase_proceeds() {
+        let mut input = Cursor::new(b"Y\n".to_vec());
+        let mut output = Vec::<u8>::new();
+        let outcome =
+            guard_destructive_with_io(&opts("Delete? ", "Would delete."), &mut input, &mut output)
+                .unwrap();
+        assert_eq!(outcome, GuardOutcome::Proceed);
+    }
+
+    #[test]
+    fn yes_with_whitespace_proceeds() {
+        let mut input = Cursor::new(b"  y  \n".to_vec());
+        let mut output = Vec::<u8>::new();
+        let outcome =
+            guard_destructive_with_io(&opts("Delete? ", "Would delete."), &mut input, &mut output)
+                .unwrap();
+        assert_eq!(outcome, GuardOutcome::Proceed);
+    }
+
+    #[test]
+    fn no_cancels_and_prints_notice() {
+        let mut input = Cursor::new(b"n\n".to_vec());
+        let mut output = Vec::<u8>::new();
+        let outcome =
+            guard_destructive_with_io(&opts("Delete? ", "Would delete."), &mut input, &mut output)
+                .unwrap();
+        assert_eq!(outcome, GuardOutcome::Cancelled);
+        assert!(String::from_utf8(output).unwrap().contains("Cancelled."));
+    }
+
+    #[test]
+    fn empty_answer_cancels() {
+        let mut input = Cursor::new(b"\n".to_vec());
+        let mut output = Vec::<u8>::new();
+        let outcome =
+            guard_destructive_with_io(&opts("Delete? ", "Would delete."), &mut input, &mut output)
+                .unwrap();
+        assert_eq!(outcome, GuardOutcome::Cancelled);
+    }
+
+    #[test]
+    fn random_text_cancels() {
+        let mut input = Cursor::new(b"maybe\n".to_vec());
+        let mut output = Vec::<u8>::new();
+        let outcome =
+            guard_destructive_with_io(&opts("Delete? ", "Would delete."), &mut input, &mut output)
+                .unwrap();
+        assert_eq!(outcome, GuardOutcome::Cancelled);
+    }
+
+    // ── error propagation paths ────────────────────────────────────
+
+    /// Writer that always fails on `write` with ErrorKind::Other.
+    struct FailingWriter;
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("simulated write failure"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("simulated flush failure"))
+        }
+    }
+
+    /// Reader that always fails on `read`.
+    struct FailingReader;
+
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("simulated read failure"))
+        }
+    }
+
+    impl std::io::BufRead for FailingReader {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            Err(std::io::Error::other("simulated read failure"))
+        }
+        fn consume(&mut self, _: usize) {}
+    }
+
+    #[test]
+    fn failing_writer_flush_returns_error() {
+        // Direct cover for FailingWriter::flush, which is required by the
+        // Write trait but isn't reached by guard_destructive_with_io
+        // (which always fails at the prior write!).
+        let mut writer = FailingWriter;
+        let err = std::io::Write::flush(&mut writer).unwrap_err();
+        assert!(err.to_string().contains("simulated flush failure"));
+    }
+
+    #[test]
+    fn failing_reader_read_returns_error() {
+        // Direct cover for FailingReader::read, which is required by the
+        // Read supertrait but isn't reached by BufRead::read_line in our
+        // call paths (those go through fill_buf).
+        let mut reader = FailingReader;
+        let mut buf = [0u8; 1];
+        let err = std::io::Read::read(&mut reader, &mut buf).unwrap_err();
+        assert!(err.to_string().contains("simulated read failure"));
+    }
+
+    #[test]
+    fn failing_reader_consume_is_a_noop() {
+        // Direct cover for FailingReader::consume, the BufRead-required
+        // method that our guard never invokes (read_line consumes nothing
+        // when fill_buf already errored).
+        let mut reader = FailingReader;
+        std::io::BufRead::consume(&mut reader, 0);
+        std::io::BufRead::consume(&mut reader, 5);
+    }
+
+    #[test]
+    fn dry_run_propagates_writer_error() {
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut writer = FailingWriter;
+        let mut o = opts("Delete? ", "Would delete.");
+        o.dry_run = true;
+        let err = guard_destructive_with_io(&o, &mut input, &mut writer).unwrap_err();
+        assert!(err.to_string().contains("simulated write failure"));
+    }
+
+    #[test]
+    fn prompt_propagates_writer_error() {
+        let mut input = Cursor::new(b"y\n".to_vec());
+        let mut writer = FailingWriter;
+        let err =
+            guard_destructive_with_io(&opts("Delete? ", "Would delete."), &mut input, &mut writer)
+                .unwrap_err();
+        assert!(err.to_string().contains("simulated"));
+    }
+
+    #[test]
+    fn prompt_propagates_reader_error() {
+        let mut reader = FailingReader;
+        let mut output = Vec::<u8>::new();
+        let err =
+            guard_destructive_with_io(&opts("Delete? ", "Would delete."), &mut reader, &mut output)
+                .unwrap_err();
+        assert!(err.to_string().contains("simulated read failure"));
+    }
+
+    #[test]
+    fn prompt_propagates_flush_error() {
+        // Writer that succeeds on `write` but fails on `flush`, so the
+        // `writer.flush()?` after the prompt write is the failure point.
+        struct FlushFailsWriter;
+        impl std::io::Write for FlushFailsWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("simulated flush failure"))
+            }
+        }
+
+        let mut input = Cursor::new(b"y\n".to_vec());
+        let mut writer = FlushFailsWriter;
+        let err =
+            guard_destructive_with_io(&opts("Delete? ", "Would delete."), &mut input, &mut writer)
+                .unwrap_err();
+        assert!(err.to_string().contains("simulated flush failure"));
+    }
+
+    #[test]
+    fn cancellation_notice_propagates_writer_error() {
+        // Writer that succeeds for the prompt write but fails on the
+        // cancellation writeln after the user types "n".
+        struct WriterFailsAfter {
+            successes_remaining: usize,
+        }
+        impl std::io::Write for WriterFailsAfter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if self.successes_remaining == 0 {
+                    Err(std::io::Error::other(
+                        "simulated cancellation write failure",
+                    ))
+                } else {
+                    self.successes_remaining -= 1;
+                    Ok(buf.len())
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut input = Cursor::new(b"n\n".to_vec());
+        let mut writer = WriterFailsAfter {
+            successes_remaining: 1,
+        };
+        let err =
+            guard_destructive_with_io(&opts("Delete? ", "Would delete."), &mut input, &mut writer)
+                .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("simulated cancellation write failure"));
+    }
+}

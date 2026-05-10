@@ -5,6 +5,8 @@ use std::io::{self, BufRead, Write};
 use anyhow::Result;
 use clap::Parser;
 
+use crate::atlassian::client::AtlassianClient;
+use crate::cli::atlassian::confirm::{guard_destructive_with_io, GuardOptions, GuardOutcome};
 use crate::cli::atlassian::helpers::create_client;
 
 /// Deletes a JIRA issue.
@@ -16,42 +18,56 @@ pub struct DeleteCommand {
     /// Skips the confirmation prompt.
     #[arg(long)]
     pub force: bool,
+
+    /// Prints what would be deleted without making any API calls.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 impl DeleteCommand {
     /// Executes the delete command.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
+        let mut reader = io::BufReader::new(io::stdin());
+        let mut writer = io::stdout();
+        self.execute_with_io(&client, &mut reader, &mut writer)
+            .await
+    }
 
-        if !self.force {
+    /// Inner form taking explicit client and IO handles, for unit tests.
+    async fn execute_with_io(
+        self,
+        client: &AtlassianClient,
+        reader: &mut (dyn BufRead + Send),
+        writer: &mut (dyn Write + Send),
+    ) -> Result<()> {
+        if !self.force || self.dry_run {
             let issue = client.get_issue(&self.key).await?;
-            let prompt = format_delete_prompt(&self.key, &issue.summary);
-            if !confirm_with_reader(&prompt, &mut io::stdin().lock())? {
-                println!("Cancelled.");
-                return Ok(());
+            let prompt = format!("Delete {} ({})? [y/N] ", self.key, issue.summary);
+            let dry_run_message = format!("Would delete {} ({}).", self.key, issue.summary);
+
+            let outcome = guard_destructive_with_io(
+                &GuardOptions {
+                    prompt: &prompt,
+                    dry_run_message: &dry_run_message,
+                    force: self.force,
+                    dry_run: self.dry_run,
+                },
+                reader,
+                writer,
+            )?;
+
+            match outcome {
+                GuardOutcome::Cancelled | GuardOutcome::DryRun => return Ok(()),
+                GuardOutcome::Proceed => {}
             }
         }
 
         client.delete_issue(&self.key).await?;
-        println!("Deleted {}.", self.key);
+        writeln!(writer, "Deleted {}.", self.key)?;
 
         Ok(())
     }
-}
-
-/// Formats the deletion confirmation prompt.
-fn format_delete_prompt(key: &str, summary: &str) -> String {
-    format!("Delete {key} ({summary})? [y/N] ")
-}
-
-/// Prompts the user for confirmation using the given reader for input.
-fn confirm_with_reader(prompt: &str, reader: &mut dyn BufRead) -> Result<bool> {
-    print!("{prompt}");
-    io::stdout().flush()?;
-
-    let mut answer = String::new();
-    reader.read_line(&mut answer)?;
-    Ok(answer.trim().eq_ignore_ascii_case("y"))
 }
 
 #[cfg(test)]
@@ -59,17 +75,30 @@ fn confirm_with_reader(prompt: &str, reader: &mut dyn BufRead) -> Result<bool> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    // ── DeleteCommand struct ───────────────────────────────────────
+    fn mock_client(base_url: &str) -> AtlassianClient {
+        AtlassianClient::new(base_url, "u@t.com", "tok").unwrap()
+    }
+
+    fn issue_body() -> serde_json::Value {
+        serde_json::json!({
+            "key": "PROJ-1",
+            "fields": {"summary": "Fix the bug"},
+        })
+    }
 
     #[test]
     fn delete_command_struct_fields() {
         let cmd = DeleteCommand {
             key: "PROJ-42".to_string(),
             force: false,
+            dry_run: false,
         };
         assert_eq!(cmd.key, "PROJ-42");
         assert!(!cmd.force);
+        assert!(!cmd.dry_run);
     }
 
     #[test]
@@ -77,66 +106,250 @@ mod tests {
         let cmd = DeleteCommand {
             key: "PROJ-1".to_string(),
             force: true,
+            dry_run: false,
         };
         assert!(cmd.force);
     }
 
-    // ── format_delete_prompt ───────────────────────────────────────
-
     #[test]
-    fn format_prompt_includes_key_and_summary() {
-        let prompt = format_delete_prompt("PROJ-123", "Fix the bug");
-        assert_eq!(prompt, "Delete PROJ-123 (Fix the bug)? [y/N] ");
+    fn delete_command_dry_run_mode() {
+        let cmd = DeleteCommand {
+            key: "PROJ-1".to_string(),
+            force: false,
+            dry_run: true,
+        };
+        assert!(cmd.dry_run);
     }
 
-    #[test]
-    fn format_prompt_with_empty_summary() {
-        let prompt = format_delete_prompt("PROJ-1", "");
-        assert_eq!(prompt, "Delete PROJ-1 ()? [y/N] ");
+    #[tokio::test]
+    async fn execute_with_force_skips_lookup_and_calls_delete() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let cmd = DeleteCommand {
+            key: "PROJ-1".to_string(),
+            force: true,
+            dry_run: false,
+        };
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Deleted PROJ-1."));
     }
 
-    #[test]
-    fn format_prompt_with_special_chars() {
-        let prompt = format_delete_prompt("PROJ-99", "Fix \"quotes\" & <angles>");
-        assert!(prompt.contains("PROJ-99"));
-        assert!(prompt.contains("Fix \"quotes\" & <angles>"));
+    #[tokio::test]
+    async fn execute_with_dry_run_does_not_call_delete() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(issue_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let cmd = DeleteCommand {
+            key: "PROJ-1".to_string(),
+            force: false,
+            dry_run: true,
+        };
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Would delete PROJ-1 (Fix the bug)."));
+        assert!(!out.contains("Deleted PROJ-1."));
     }
 
-    // ── confirm_with_reader ────────────────────────────────────────
+    #[tokio::test]
+    async fn execute_with_prompt_yes_calls_delete() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(issue_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
 
-    #[test]
-    fn confirm_yes_lowercase() {
-        let mut input = Cursor::new(b"y\n");
-        assert!(confirm_with_reader("Delete? ", &mut input).unwrap());
+        let client = mock_client(&server.uri());
+        let cmd = DeleteCommand {
+            key: "PROJ-1".to_string(),
+            force: false,
+            dry_run: false,
+        };
+        let mut input = Cursor::new(b"y\n".to_vec());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Delete PROJ-1 (Fix the bug)?"));
+        assert!(out.contains("Deleted PROJ-1."));
     }
 
-    #[test]
-    fn confirm_yes_uppercase() {
-        let mut input = Cursor::new(b"Y\n");
-        assert!(confirm_with_reader("Delete? ", &mut input).unwrap());
+    #[tokio::test]
+    async fn execute_with_prompt_no_does_not_call_delete() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(issue_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let cmd = DeleteCommand {
+            key: "PROJ-1".to_string(),
+            force: false,
+            dry_run: false,
+        };
+        let mut input = Cursor::new(b"n\n".to_vec());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Cancelled."));
+        assert!(!out.contains("Deleted PROJ-1."));
     }
 
-    #[test]
-    fn confirm_no() {
-        let mut input = Cursor::new(b"n\n");
-        assert!(!confirm_with_reader("Delete? ", &mut input).unwrap());
+    #[tokio::test]
+    async fn execute_with_force_propagates_api_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let cmd = DeleteCommand {
+            key: "PROJ-1".to_string(),
+            force: true,
+            dry_run: false,
+        };
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        let err = cmd
+            .execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("403"));
     }
 
-    #[test]
-    fn confirm_empty_is_no() {
-        let mut input = Cursor::new(b"\n");
-        assert!(!confirm_with_reader("Delete? ", &mut input).unwrap());
+    #[tokio::test]
+    async fn execute_lookup_error_aborts_before_prompt() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let cmd = DeleteCommand {
+            key: "PROJ-1".to_string(),
+            force: false,
+            dry_run: false,
+        };
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        let err = cmd
+            .execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
     }
 
-    #[test]
-    fn confirm_random_text_is_no() {
-        let mut input = Cursor::new(b"maybe\n");
-        assert!(!confirm_with_reader("Delete? ", &mut input).unwrap());
+    /// Force-mode + a writer that fails on first write covers the `?`
+    /// propagation on the post-API-success writeln.
+    #[tokio::test]
+    async fn execute_with_force_propagates_writeln_error() {
+        use crate::test_support::failing_io::FailingWriter;
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let cmd = DeleteCommand {
+            key: "PROJ-1".to_string(),
+            force: true,
+            dry_run: false,
+        };
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut writer = FailingWriter;
+        let err = cmd
+            .execute_with_io(&client, &mut input, &mut writer)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated write failure"));
     }
 
-    #[test]
-    fn confirm_yes_with_whitespace() {
-        let mut input = Cursor::new(b"  y  \n");
-        assert!(confirm_with_reader("Delete? ", &mut input).unwrap());
+    /// Dry-run with a failing writer covers the `?` propagation on the
+    /// guard_destructive_with_io call (its writeln returns Err).
+    #[tokio::test]
+    async fn execute_dry_run_propagates_guard_error() {
+        use crate::test_support::failing_io::FailingWriter;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(issue_body()))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let cmd = DeleteCommand {
+            key: "PROJ-1".to_string(),
+            force: false,
+            dry_run: true,
+        };
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut writer = FailingWriter;
+        let err = cmd
+            .execute_with_io(&client, &mut input, &mut writer)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated write failure"));
+    }
+
+    /// End-to-end exercise of the public `execute()` wrapper, covering
+    /// `create_client()` env-var loading and the stdin/stdout setup.
+    /// `--force` skips the prompt, so stdin is not read.
+    #[tokio::test]
+    async fn execute_with_force_drives_create_client_and_calls_delete() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        let cmd = DeleteCommand {
+            key: "PROJ-1".to_string(),
+            force: true,
+            dry_run: false,
+        };
+        cmd.execute().await.unwrap();
     }
 }
