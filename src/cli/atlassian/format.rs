@@ -11,6 +11,7 @@ use crate::atlassian::client::{
     JiraDevStatus, JiraDevStatusSummary, JiraProjectList, JiraSearchResult, JiraUserSearchResults,
     JiraWatcherList, JiraWorklogList,
 };
+use crate::atlassian::confluence_api::ConfluenceAttachmentPage;
 
 /// Output/input format for Atlassian content (read/write/create commands).
 #[derive(Clone, Debug, Default, ValueEnum)]
@@ -119,6 +120,12 @@ impl JsonlSerialize for ConfluenceSearchResults {
 impl JsonlSerialize for ConfluenceUserSearchResults {
     fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
         write_items_jsonl(self.users.iter(), out)
+    }
+}
+
+impl JsonlSerialize for ConfluenceAttachmentPage {
+    fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
+        write_items_jsonl(self.results.iter(), out)
     }
 }
 
@@ -576,6 +583,50 @@ mod tests {
         let out = jsonl_string(&list);
         assert_eq!(out.lines().count(), 1);
         assert!(out.contains("\"accountId\":\"u1\"") || out.contains("\"account_id\":\"u1\""));
+    }
+
+    #[test]
+    fn confluence_attachment_page_jsonl() {
+        use crate::atlassian::confluence_api::{ConfluenceAttachment, ConfluenceAttachmentPage};
+        let page = ConfluenceAttachmentPage {
+            results: vec![
+                ConfluenceAttachment {
+                    id: "a1".to_string(),
+                    title: "one.png".to_string(),
+                    media_type: Some("image/png".to_string()),
+                    file_size: Some(100),
+                    download_url: None,
+                    version: None,
+                    page_id: None,
+                    file_id: None,
+                },
+                ConfluenceAttachment {
+                    id: "a2".to_string(),
+                    title: "two.pdf".to_string(),
+                    media_type: None,
+                    file_size: None,
+                    download_url: None,
+                    version: None,
+                    page_id: None,
+                    file_id: None,
+                },
+            ],
+            next_cursor: Some("NEXT".to_string()),
+        };
+        let out = jsonl_string(&page);
+        assert_eq!(out.lines().count(), 2);
+        assert!(out.contains("\"id\":\"a1\""));
+        assert!(out.contains("\"id\":\"a2\""));
+    }
+
+    #[test]
+    fn confluence_attachment_page_jsonl_empty() {
+        use crate::atlassian::confluence_api::ConfluenceAttachmentPage;
+        let page = ConfluenceAttachmentPage {
+            results: vec![],
+            next_cursor: None,
+        };
+        assert_eq!(jsonl_string(&page), "");
     }
 
     #[test]

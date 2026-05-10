@@ -1,5 +1,6 @@
 //! Confluence CLI subcommands.
 
+pub(crate) mod attachment;
 pub(crate) mod children;
 pub(crate) mod comment;
 pub(crate) mod create;
@@ -46,6 +47,8 @@ pub enum ConfluenceSubcommands {
     Move(move_page::MoveCommand),
     /// Manages labels on Confluence pages.
     Label(label::LabelCommand),
+    /// Manages attachments on Confluence pages.
+    Attachment(attachment::AttachmentCommand),
     /// Recursively downloads a Confluence page tree.
     Download(download::DownloadCommand),
     /// Lists child pages of a Confluence page or top-level pages in a space.
@@ -67,6 +70,7 @@ impl ConfluenceCommand {
             ConfluenceSubcommands::Search(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Create(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Label(cmd) => cmd.execute().await,
+            ConfluenceSubcommands::Attachment(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Delete(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Move(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Download(cmd) => cmd.execute().await,
@@ -172,6 +176,21 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::Label(_)));
+    }
+
+    #[test]
+    fn confluence_subcommands_attachment_variant() {
+        let cmd = ConfluenceCommand {
+            command: ConfluenceSubcommands::Attachment(attachment::AttachmentCommand {
+                command: attachment::AttachmentSubcommands::List(attachment::ListCommand {
+                    page_id: "12345".to_string(),
+                    cursor: None,
+                    limit: 25,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        assert!(matches!(cmd.command, ConfluenceSubcommands::Attachment(_)));
     }
 
     #[test]
@@ -304,6 +323,30 @@ mod tests {
                 recursive: false,
                 max_depth: 0,
                 output: OutputFormat::Table,
+            }),
+        };
+        let _ = cmd.execute().await;
+
+        std::env::remove_var("ATLASSIAN_INSTANCE_URL");
+        std::env::remove_var("ATLASSIAN_EMAIL");
+        std::env::remove_var("ATLASSIAN_API_TOKEN");
+    }
+
+    /// Exercises the `Attachment` dispatch arm in `ConfluenceCommand::execute`.
+    #[tokio::test]
+    async fn confluence_command_execute_attachment_dispatch() {
+        std::env::set_var("ATLASSIAN_INSTANCE_URL", "http://127.0.0.1:1");
+        std::env::set_var("ATLASSIAN_EMAIL", "test@example.com");
+        std::env::set_var("ATLASSIAN_API_TOKEN", "fake-token");
+
+        let cmd = ConfluenceCommand {
+            command: ConfluenceSubcommands::Attachment(attachment::AttachmentCommand {
+                command: attachment::AttachmentSubcommands::List(attachment::ListCommand {
+                    page_id: "12345".to_string(),
+                    cursor: None,
+                    limit: 25,
+                    output: OutputFormat::Table,
+                }),
             }),
         };
         let _ = cmd.execute().await;

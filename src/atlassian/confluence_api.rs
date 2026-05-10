@@ -5,10 +5,12 @@
 //! number increments for optimistic locking.
 
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use tokio_util::io::ReaderStream;
 use tracing::debug;
 
 use crate::atlassian::adf::AdfDocument;
@@ -347,6 +349,101 @@ pub struct PageMetadata {
     pub title: String,
     /// Current version number, if known.
     pub current_version: Option<u32>,
+}
+
+// ── Attachments ────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ConfluenceAttachmentsResponse {
+    results: Vec<ConfluenceAttachmentEntry>,
+    #[serde(rename = "_links", default)]
+    links: Option<ConfluenceAttachmentLinks>,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceAttachmentLinks {
+    next: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceAttachmentEntry {
+    id: String,
+    title: String,
+    #[serde(rename = "mediaType", default)]
+    media_type: Option<String>,
+    #[serde(rename = "fileSize", default)]
+    file_size: Option<u64>,
+    #[serde(rename = "downloadLink", default)]
+    download_link: Option<String>,
+    #[serde(default)]
+    version: Option<ConfluenceAttachmentVersion>,
+    #[serde(rename = "pageId", default)]
+    page_id: Option<String>,
+    #[serde(rename = "fileId", default)]
+    file_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceAttachmentVersion {
+    number: u32,
+}
+
+/// An attachment on a Confluence page.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfluenceAttachment {
+    /// Attachment ID (used for delete and get).
+    pub id: String,
+    /// Display title (filename).
+    pub title: String,
+    /// MIME type, when reported by the API.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    /// File size in bytes, when reported by the API.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_size: Option<u64>,
+    /// Download URL path or absolute URL, when reported by the API.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download_url: Option<String>,
+    /// Version number, when reported by the API.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+    /// Owning page ID, when reported by the API.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_id: Option<String>,
+    /// Underlying file ID, when reported by the API.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
+}
+
+impl From<ConfluenceAttachmentEntry> for ConfluenceAttachment {
+    fn from(e: ConfluenceAttachmentEntry) -> Self {
+        Self {
+            id: e.id,
+            title: e.title,
+            media_type: e.media_type,
+            file_size: e.file_size,
+            download_url: e.download_link,
+            version: e.version.map(|v| v.number),
+            page_id: e.page_id,
+            file_id: e.file_id,
+        }
+    }
+}
+
+/// A page of attachments returned by [`ConfluenceApi::list_attachments`].
+///
+/// Pagination is *not* auto-drained: callers receive one page at a time and
+/// pass `next_cursor` back to fetch the next page. Other v2 list helpers in
+/// this module (e.g. [`ConfluenceApi::get_labels`]) auto-drain — attachments
+/// expose the cursor explicitly so MCP/CLI callers can stream very large
+/// attachment lists without buffering everything in memory.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfluenceAttachmentPage {
+    /// Attachments on this page.
+    pub results: Vec<ConfluenceAttachment>,
+    /// Opaque cursor for the next page, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 // ── Create request ─────────────────────────────────────────────────
@@ -1193,6 +1290,218 @@ impl ConfluenceApi {
             }
         }
     }
+
+    /// Uploads an attachment to a Confluence page from a local file path.
+    ///
+    /// Streams the file body — the file is never fully buffered in memory.
+    /// Sends `X-Atlassian-Token: no-check` (Atlassian convention for
+    /// state-changing multipart endpoints).
+    ///
+    /// Does not retry on 429: see [`AtlassianClient::post_multipart`].
+    pub async fn upload_attachment(
+        &self,
+        page_id: &str,
+        file_path: &Path,
+        filename: Option<&str>,
+        comment: Option<&str>,
+        minor_edit: bool,
+    ) -> Result<ConfluenceAttachment> {
+        let metadata = tokio::fs::metadata(file_path)
+            .await
+            .with_context(|| format!("Failed to read file metadata for {}", file_path.display()))?;
+        let size = metadata.len();
+        let file = tokio::fs::File::open(file_path)
+            .await
+            .with_context(|| format!("Failed to open {}", file_path.display()))?;
+
+        let resolved_name = filename
+            .map(str::to_string)
+            .or_else(|| {
+                file_path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+            })
+            .ok_or_else(|| anyhow::anyhow!("File path has no filename component"))?;
+
+        let mime = mime_guess::from_path(file_path).first_or_octet_stream();
+
+        let stream = ReaderStream::new(file);
+        let body = reqwest::Body::wrap_stream(stream);
+
+        let part = reqwest::multipart::Part::stream_with_length(body, size)
+            .file_name(resolved_name.clone())
+            .mime_str(mime.essence_str())
+            .with_context(|| format!("Invalid MIME type for {}", file_path.display()))?;
+
+        let mut form = reqwest::multipart::Form::new().part("file", part);
+        if let Some(c) = comment {
+            form = form.text("comment", c.to_string());
+        }
+        form = form.text("minorEdit", if minor_edit { "true" } else { "false" });
+
+        let url = format!(
+            "{}/wiki/api/v2/pages/{}/attachments",
+            self.client.instance_url(),
+            page_id
+        );
+
+        let response = self
+            .client
+            .post_multipart(&url, form, &[("X-Atlassian-Token", "no-check")])
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let resp: ConfluenceAttachmentsResponse = response
+            .json()
+            .await
+            .context("Failed to parse upload attachment response")?;
+
+        let entry = resp
+            .results
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Upload response contained no attachment"))?;
+        Ok(entry.into())
+    }
+
+    /// Lists attachments on a Confluence page (one page at a time).
+    ///
+    /// Unlike other v2 list helpers in this module, this does *not*
+    /// auto-drain pagination: pass [`ConfluenceAttachmentPage::next_cursor`]
+    /// back as `cursor` to fetch the next page.
+    pub async fn list_attachments(
+        &self,
+        page_id: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<ConfluenceAttachmentPage> {
+        let mut url = format!(
+            "{}/wiki/api/v2/pages/{}/attachments?limit={}",
+            self.client.instance_url(),
+            page_id,
+            limit,
+        );
+        if let Some(c) = cursor {
+            url.push_str("&cursor=");
+            url.push_str(&urlencoding(c));
+        }
+
+        let response = self
+            .client
+            .get_json(&url)
+            .await
+            .context("Failed to fetch page attachments")?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let resp: ConfluenceAttachmentsResponse = response
+            .json()
+            .await
+            .context("Failed to parse attachments response")?;
+
+        let next_cursor = resp
+            .links
+            .and_then(|l| l.next)
+            .and_then(|next_path| extract_cursor_from_next(&next_path));
+
+        let results = resp.results.into_iter().map(Into::into).collect();
+
+        Ok(ConfluenceAttachmentPage {
+            results,
+            next_cursor,
+        })
+    }
+
+    /// Deletes an attachment by ID.
+    ///
+    /// When `purge` is true, permanently purges (requires space admin);
+    /// otherwise the attachment is moved to trash.
+    pub async fn delete_attachment(&self, attachment_id: &str, purge: bool) -> Result<()> {
+        let mut url = format!(
+            "{}/wiki/api/v2/attachments/{}",
+            self.client.instance_url(),
+            attachment_id
+        );
+        if purge {
+            url.push_str("?purge=true");
+        }
+
+        let response = self.client.delete(&url).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        Ok(())
+    }
+}
+
+/// Minimal application/x-www-form-urlencoded encoder for query-param values.
+///
+/// Only escapes the small set of characters that would otherwise corrupt the
+/// query string (`& = + % # space`). Cursor values returned by Confluence are
+/// opaque base64-ish blobs so this is sufficient.
+fn urlencoding(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("%26"),
+            '=' => out.push_str("%3D"),
+            '+' => out.push_str("%2B"),
+            '%' => out.push_str("%25"),
+            '#' => out.push_str("%23"),
+            ' ' => out.push_str("%20"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Extracts the `cursor` query parameter value from a `_links.next` URL or path.
+fn extract_cursor_from_next(next: &str) -> Option<String> {
+    let query_start = next.find('?')?;
+    let query = &next[query_start + 1..];
+    for pair in query.split('&') {
+        let mut it = pair.splitn(2, '=');
+        let key = it.next()?;
+        let value = it.next().unwrap_or("");
+        if key == "cursor" {
+            return Some(percent_decode(value));
+        }
+    }
+    None
+}
+
+/// Decodes a single `%xx`-style percent-encoded string back to UTF-8.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push(((hi << 4) | lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -2696,6 +3005,22 @@ mod tests {
         );
     }
 
+    // ── attachments ───────────────────────────────────────────────
+
+    #[test]
+    fn extract_cursor_extracts_value() {
+        let next = "/wiki/api/v2/pages/12345/attachments?cursor=abc123&limit=25";
+        assert_eq!(extract_cursor_from_next(next), Some("abc123".to_string()));
+    }
+
+    #[test]
+    fn extract_cursor_returns_none_when_absent() {
+        assert_eq!(
+            extract_cursor_from_next("/wiki/api/v2/pages/12345/attachments?limit=25"),
+            None
+        );
+    }
+
     #[test]
     fn since_filter_parse_iso_date_no_time() {
         let f = SinceFilter::parse("2026-01-01").unwrap();
@@ -2707,6 +3032,14 @@ mod tests {
         assert_eq!(
             SinceFilter::parse("  7  ").unwrap(),
             SinceFilter::Version(7)
+        );
+    }
+
+    #[test]
+    fn extract_cursor_decodes_percent_encoded() {
+        assert_eq!(
+            extract_cursor_from_next("/wiki/api/v2/pages/1/attachments?cursor=foo%3Dbar"),
+            Some("foo=bar".to_string())
         );
     }
 
@@ -3187,5 +3520,353 @@ mod tests {
         let api = ConfluenceApi::new(client);
         let (versions, _) = api.list_page_versions("12", None, 5).await.unwrap();
         assert_eq!(versions.len(), 1);
+    }
+
+    #[test]
+    fn urlencoding_escapes_reserved_chars() {
+        assert_eq!(urlencoding("a=b&c+d %e#"), "a%3Db%26c%2Bd%20%25e%23");
+    }
+
+    #[tokio::test]
+    async fn upload_attachment_success() {
+        use tempfile::NamedTempFile;
+        use tokio::io::AsyncWriteExt;
+
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/attachments",
+            ))
+            .and(wiremock::matchers::header("X-Atlassian-Token", "no-check"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{
+                        "id": "att-1",
+                        "title": "hello.txt",
+                        "mediaType": "text/plain",
+                        "fileSize": 13,
+                        "downloadLink": "/download/att-1",
+                        "version": {"number": 1},
+                        "pageId": "12345",
+                        "fileId": "f-1"
+                    }]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut tmp = tokio::fs::File::from_std(NamedTempFile::new().unwrap().into_file());
+        tmp.write_all(b"hello, world!").await.unwrap();
+        tmp.flush().await.unwrap();
+
+        // Re-create a path-backed temp file (NamedTempFile after into_file would be unlinked).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hello.txt");
+        tokio::fs::write(&path, b"hello, world!").await.unwrap();
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let attachment = api
+            .upload_attachment("12345", &path, None, Some("v1"), false)
+            .await
+            .unwrap();
+
+        assert_eq!(attachment.id, "att-1");
+        assert_eq!(attachment.title, "hello.txt");
+        assert_eq!(attachment.media_type.as_deref(), Some("text/plain"));
+        assert_eq!(attachment.file_size, Some(13));
+        assert_eq!(attachment.version, Some(1));
+    }
+
+    #[tokio::test]
+    async fn upload_attachment_page_not_found() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/99999/attachments",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.bin");
+        tokio::fs::write(&path, b"x").await.unwrap();
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = api
+            .upload_attachment("99999", &path, None, None, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn upload_attachment_too_large() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/attachments",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(413).set_body_string("Request entity too large"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.bin");
+        tokio::fs::write(&path, b"x").await.unwrap();
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = api
+            .upload_attachment("12345", &path, None, None, false)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("413"));
+        assert!(msg.contains("Request entity too large"));
+    }
+
+    #[tokio::test]
+    async fn upload_attachment_overrides_filename() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/attachments",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{"id": "a", "title": "renamed.png"}]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.bin");
+        tokio::fs::write(&path, b"data").await.unwrap();
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let attachment = api
+            .upload_attachment("12345", &path, Some("renamed.png"), None, true)
+            .await
+            .unwrap();
+        assert_eq!(attachment.title, "renamed.png");
+    }
+
+    #[tokio::test]
+    async fn list_attachments_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/attachments",
+            ))
+            .and(wiremock::matchers::query_param("limit", "25"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {"id": "a1", "title": "one.png", "mediaType": "image/png", "fileSize": 100, "version": {"number": 1}},
+                        {"id": "a2", "title": "two.pdf", "mediaType": "application/pdf"}
+                    ],
+                    "_links": {"next": "/wiki/api/v2/pages/12345/attachments?cursor=NEXT&limit=25"}
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let page = api.list_attachments("12345", None, 25).await.unwrap();
+        assert_eq!(page.results.len(), 2);
+        assert_eq!(page.results[0].id, "a1");
+        assert_eq!(page.results[0].file_size, Some(100));
+        assert_eq!(page.next_cursor.as_deref(), Some("NEXT"));
+    }
+
+    #[tokio::test]
+    async fn list_attachments_no_more_pages() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/attachments",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": []
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let page = api.list_attachments("12345", None, 25).await.unwrap();
+        assert!(page.results.is_empty());
+        assert!(page.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_attachments_page_not_found() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/99999/attachments",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = api.list_attachments("99999", None, 25).await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn list_attachments_pagination_round_trip() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/attachments",
+            ))
+            .and(wiremock::matchers::query_param("cursor", "PAGE2"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{"id": "a3", "title": "three.bin"}]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let page = api
+            .list_attachments("12345", Some("PAGE2"), 25)
+            .await
+            .unwrap();
+        assert_eq!(page.results.len(), 1);
+        assert_eq!(page.results[0].id, "a3");
+    }
+
+    #[tokio::test]
+    async fn delete_attachment_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/wiki/api/v2/attachments/att-1"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        assert!(api.delete_attachment("att-1", false).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_attachment_with_purge() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/wiki/api/v2/attachments/att-1"))
+            .and(wiremock::matchers::query_param("purge", "true"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        assert!(api.delete_attachment("att-1", true).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_attachment_not_found() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/wiki/api/v2/attachments/missing"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = api.delete_attachment("missing", false).await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[test]
+    fn confluence_attachment_serialize_skips_none_fields() {
+        let attachment = ConfluenceAttachment {
+            id: "att-1".to_string(),
+            title: "x.txt".to_string(),
+            media_type: None,
+            file_size: None,
+            download_url: None,
+            version: None,
+            page_id: None,
+            file_id: None,
+        };
+        let json = serde_json::to_value(&attachment).unwrap();
+        assert_eq!(json["id"], "att-1");
+        assert_eq!(json["title"], "x.txt");
+        // Optional fields should be entirely absent (skip_serializing_if).
+        assert!(json.get("media_type").is_none());
+        assert!(json.get("file_size").is_none());
+        assert!(json.get("download_url").is_none());
+        assert!(json.get("version").is_none());
+        assert!(json.get("page_id").is_none());
+        assert!(json.get("file_id").is_none());
+    }
+
+    #[test]
+    fn confluence_attachment_serialize_includes_some_fields() {
+        let attachment = ConfluenceAttachment {
+            id: "att-1".to_string(),
+            title: "x.txt".to_string(),
+            media_type: Some("text/plain".to_string()),
+            file_size: Some(42),
+            download_url: Some("/dl".to_string()),
+            version: Some(3),
+            page_id: Some("12345".to_string()),
+            file_id: Some("f-1".to_string()),
+        };
+        let json = serde_json::to_value(&attachment).unwrap();
+        assert_eq!(json["media_type"], "text/plain");
+        assert_eq!(json["file_size"], 42);
+        assert_eq!(json["version"], 3);
+    }
+
+    #[test]
+    fn confluence_attachment_page_serialize_skips_none_cursor() {
+        let page = ConfluenceAttachmentPage {
+            results: vec![],
+            next_cursor: None,
+        };
+        let json = serde_json::to_value(&page).unwrap();
+        assert!(json.get("next_cursor").is_none());
     }
 }
