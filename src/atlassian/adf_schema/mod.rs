@@ -222,6 +222,47 @@ pub enum AdfSchemaViolation {
         /// Index path from the document root to the offending node.
         path: Vec<usize>,
     },
+
+    /// A mark appears in a context that does not permit it.
+    ///
+    /// Examples: `code` mark on text inside a `heading`, `border` mark on a
+    /// `paragraph` (block marks like `border` are tableCell-only).
+    DisallowedMark {
+        /// The `mark_type` of the offending mark.
+        mark_type: String,
+        /// The context that rejects this mark — for inline marks, the
+        /// inline-content parent (e.g. `"heading"`); for block marks, the
+        /// node whose own `marks` array contains the mark (e.g.
+        /// `"paragraph"`).
+        parent_type: String,
+        /// For inline-mark violations, the position of the inline node
+        /// within its parent. `None` for block-mark violations.
+        inline_index: Option<usize>,
+        /// Index path from the document root to the node whose marks were
+        /// being validated.
+        path: Vec<usize>,
+    },
+
+    /// A mark's `attrs` value has the wrong shape for a declared field, or
+    /// is missing a required field.
+    ///
+    /// Examples: `link.href: "not a url"` (bad format),
+    /// `subsup.type: "side"` (not in enum), `border.size: 5` (out of range
+    /// 1..=3), `link` without `href` (required field absent).
+    InvalidMarkAttr {
+        /// The `mark_type` whose attrs are malformed.
+        mark_type: String,
+        /// The name of the offending attribute.
+        attr_name: String,
+        /// What is wrong with the value.
+        problem: crate::atlassian::adf_attr_schema::AttrProblem,
+        /// The position of the mark within the node's `marks` array (for
+        /// disambiguation when a node carries multiple marks).
+        inline_index: Option<usize>,
+        /// Index path from the document root to the node whose mark is
+        /// malformed.
+        path: Vec<usize>,
+    },
 }
 
 impl AdfSchemaViolation {
@@ -236,7 +277,9 @@ impl AdfSchemaViolation {
             Self::DisallowedChild { path, .. }
             | Self::Arity { path, .. }
             | Self::MissingAttr { path, .. }
-            | Self::InvalidAttr { path, .. } => path,
+            | Self::InvalidAttr { path, .. }
+            | Self::DisallowedMark { path, .. }
+            | Self::InvalidMarkAttr { path, .. } => path,
         }
     }
 }
@@ -286,6 +329,23 @@ impl std::fmt::Display for AdfSchemaViolation {
             } => write!(
                 f,
                 "ADF schema violation at /{path_str}: '{node_type}.{attr_name}' is invalid — {problem}",
+            ),
+            Self::DisallowedMark {
+                mark_type,
+                parent_type,
+                ..
+            } => write!(
+                f,
+                "ADF schema violation at /{path_str}: '{mark_type}' mark is not permitted on '{parent_type}'",
+            ),
+            Self::InvalidMarkAttr {
+                mark_type,
+                attr_name,
+                problem,
+                ..
+            } => write!(
+                f,
+                "ADF schema violation at /{path_str}: '{mark_type}' mark's '{attr_name}' is invalid — {problem}",
             ),
         }
     }
@@ -933,6 +993,12 @@ fn walk_children(
             path,
             out,
         );
+
+        // Validate this child's marks (per PR #733-marks slice). The
+        // `parent_type` is the node enclosing `child` — it determines the
+        // inline-mark allow-list when `child` is an inline node like text.
+        // Permissive on unknown contexts.
+        crate::atlassian::adf_mark_schema::validate_marks(parent_type, child, path, out);
 
         if is_unsupported(child_type) {
             // Round-trip escape hatch: count toward the current term's arity

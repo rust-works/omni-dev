@@ -81,6 +81,21 @@ fn format_diagnosis(diagnosis: &AdfSchemaViolation, hint: Option<&str>) -> Strin
         } => format!(
             "Diagnosis: the submitted ADF's `{node_type}.{attr_name}` is invalid — {problem}."
         ),
+        AdfSchemaViolation::DisallowedMark {
+            mark_type,
+            parent_type,
+            ..
+        } => format!(
+            "Diagnosis: the submitted ADF carries a `{mark_type}` mark on `{parent_type}` which is not permitted in that context."
+        ),
+        AdfSchemaViolation::InvalidMarkAttr {
+            mark_type,
+            attr_name,
+            problem,
+            ..
+        } => format!(
+            "Diagnosis: the submitted ADF's `{mark_type}` mark has invalid `{attr_name}` — {problem}."
+        ),
     };
     let mut out = format!("{header}\n{diag_line}");
     if let Some(hint) = hint {

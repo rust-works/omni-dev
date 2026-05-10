@@ -38,6 +38,17 @@ pub fn hint_for(violation: &AdfSchemaViolation) -> Option<&'static str> {
             problem,
             ..
         } => invalid_attr_hint(node_type, attr_name, problem),
+        AdfSchemaViolation::DisallowedMark {
+            mark_type,
+            parent_type,
+            ..
+        } => disallowed_mark_hint(mark_type, parent_type),
+        AdfSchemaViolation::InvalidMarkAttr {
+            mark_type,
+            attr_name,
+            problem,
+            ..
+        } => invalid_mark_attr_hint(mark_type, attr_name, problem),
     }
 }
 
@@ -131,6 +142,51 @@ fn invalid_attr_hint(
         }
         (_, _, AttrProblem::BadFormat { reason }) if reason.contains("URL") => {
             Some("URL attributes must be absolute (e.g. https://…)")
+        }
+        _ => None,
+    }
+}
+
+fn disallowed_mark_hint(mark_type: &str, parent_type: &str) -> Option<&'static str> {
+    match (mark_type, parent_type) {
+        ("code", "heading") => {
+            Some("headings cannot carry the `code` mark — use a paragraph if you need code styling")
+        }
+        (_, "codeBlock") => Some("codeBlock text is literal and accepts no marks; remove the mark"),
+        ("border" | "backgroundColor", _)
+            if parent_type != "tableCell" && parent_type != "tableHeader" =>
+        {
+            Some("border/backgroundColor block marks are accepted on tableCell/tableHeader only")
+        }
+        ("alignment" | "indentation", _)
+            if parent_type != "paragraph" && parent_type != "heading" =>
+        {
+            Some("alignment/indentation block marks are accepted on paragraph/heading only")
+        }
+        _ => None,
+    }
+}
+
+fn invalid_mark_attr_hint(
+    mark_type: &str,
+    attr_name: &str,
+    problem: &AttrProblem,
+) -> Option<&'static str> {
+    match (mark_type, attr_name, problem) {
+        ("link", "href", AttrProblem::BadFormat { .. }) => {
+            Some("link.href must be an absolute URL (e.g. https://example.com/page)")
+        }
+        ("subsup", "type", AttrProblem::NotInEnum { .. }) => {
+            Some("subsup.type must be either 'sub' or 'sup'")
+        }
+        ("border", "size", AttrProblem::OutOfRange { .. }) => {
+            Some("border.size must be an integer in 1..=3")
+        }
+        ("indentation", "level", AttrProblem::OutOfRange { .. }) => {
+            Some("indentation.level must be an integer in 1..=6")
+        }
+        ("alignment", "align", AttrProblem::NotInEnum { .. }) => {
+            Some("alignment.align must be one of: start, end, center, right, left")
         }
         _ => None,
     }
