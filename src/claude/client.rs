@@ -1985,7 +1985,7 @@ mod tests {
         let amendment = crate::data::amendments::Amendment {
             commit: "abc123".to_string(),
             message: "feat: do thing".to_string(),
-            summary: Some("did the thing".to_string()),
+            summary: "did the thing".to_string(),
         };
         let items = vec![(amendment, "summary text".to_string())];
 
@@ -2070,7 +2070,7 @@ mod tests {
         let amendment = crate::data::amendments::Amendment {
             commit: "abc123".to_string(),
             message: "feat: do thing".to_string(),
-            summary: None,
+            summary: String::new(),
         };
         let items = vec![(amendment, "summary".to_string())];
 

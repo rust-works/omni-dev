@@ -16,16 +16,24 @@ pub struct AmendmentFile {
 }
 
 /// Individual commit amendment.
+///
+/// `summary` is force-included in `required` via the
+/// `#[schemars(extend(...))]` attribute even though `#[serde(default)]`
+/// would normally exclude it: OpenAI's strict-subset rule requires every
+/// property in `properties` to appear in `required`, while we still want
+/// graceful YAML loading for files written before the field existed.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
+#[schemars(extend("required" = ["commit", "message", "summary"]))]
 pub struct Amendment {
     /// Full 40-character SHA-1 commit hash.
     pub commit: String,
     /// New commit message.
     pub message: String,
     /// Brief summary of what this commit changes (for cross-commit coherence).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary: Option<String>,
+    /// Empty string when the model has nothing to add.
+    #[serde(default)]
+    pub summary: String,
 }
 
 impl AmendmentFile {
@@ -131,7 +139,7 @@ impl Amendment {
         Self {
             commit,
             message,
-            summary: None,
+            summary: String::new(),
         }
     }
 
@@ -249,12 +257,12 @@ mod tests {
                 Amendment {
                     commit: "a".repeat(40),
                     message: "feat(cli): add new command".to_string(),
-                    summary: Some("Adds the twiddle command".to_string()),
+                    summary: "Adds the twiddle command".to_string(),
                 },
                 Amendment {
                     commit: "b".repeat(40),
                     message: "fix(git): resolve rebase issue\n\nDetailed body here.".to_string(),
-                    summary: None,
+                    summary: String::new(),
                 },
             ],
         };

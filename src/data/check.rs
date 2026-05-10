@@ -227,8 +227,15 @@ pub struct AiCheckResponse {
 }
 
 /// Single commit check from AI response.
+///
+/// `#[schemars(extend(...))]` force-includes serde-defaulted fields in
+/// `required` so the JSON Schema satisfies OpenAI's strict-subset rule
+/// (every property in `properties` must also appear in `required`);
+/// nullability for the AI's response continues to be expressed via
+/// `Option<T>` (which schemars renders as `type: ["...", "null"]`).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
+#[schemars(extend("required" = ["commit", "passes", "issues", "suggestion", "summary"]))]
 pub struct AiCommitCheck {
     /// Commit hash (short or full).
     pub commit: String,
@@ -238,7 +245,7 @@ pub struct AiCommitCheck {
     #[serde(default)]
     pub issues: Vec<AiIssue>,
     /// Suggested message improvement.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub suggestion: Option<AiSuggestion>,
     /// Brief summary of what this commit changes (for cross-commit coherence).
     #[serde(default)]
@@ -248,6 +255,7 @@ pub struct AiCommitCheck {
 /// Issue from AI response.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
+#[schemars(extend("required" = ["reasoning", "severity", "section", "rule", "explanation"]))]
 pub struct AiIssue {
     /// Reasoning written before the verdict. Forces think-first ordering so
     /// `severity` is conditioned on fully-worked-through reasoning instead of
