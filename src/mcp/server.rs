@@ -219,6 +219,7 @@ mod tests {
             "confluence_create",
             "confluence_write",
             "confluence_delete",
+            "confluence_move",
             "confluence_download",
             "atlassian_convert",
         ] {
