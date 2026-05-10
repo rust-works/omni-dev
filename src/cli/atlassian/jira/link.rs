@@ -3,8 +3,10 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use std::io::{self, BufRead, Write};
+
 use crate::atlassian::client::{AtlassianClient, JiraIssueLink, JiraLinkType};
-use crate::cli::atlassian::confirm::{guard_destructive, GuardOptions, GuardOutcome};
+use crate::cli::atlassian::confirm::{guard_destructive_with_io, GuardOptions, GuardOutcome};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -123,19 +125,39 @@ impl RemoveLinkCommand {
     /// Removes the issue link.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
+        let mut reader = io::BufReader::new(io::stdin());
+        let mut writer = io::stdout();
+        self.execute_with_io(&client, &mut reader, &mut writer)
+            .await
+    }
 
+    /// Inner form taking explicit client and IO handles, for unit tests.
+    async fn execute_with_io(
+        self,
+        client: &AtlassianClient,
+        reader: &mut (dyn BufRead + Send),
+        writer: &mut (dyn Write + Send),
+    ) -> Result<()> {
         let prompt = format!("Remove link {}? [y/N] ", self.link_id);
         let dry_run_message = format!("Would remove link {}.", self.link_id);
 
-        let outcome = guard_destructive(&GuardOptions {
-            prompt: &prompt,
-            dry_run_message: &dry_run_message,
-            force: self.force,
-            dry_run: self.dry_run,
-        })?;
+        let outcome = guard_destructive_with_io(
+            &GuardOptions {
+                prompt: &prompt,
+                dry_run_message: &dry_run_message,
+                force: self.force,
+                dry_run: self.dry_run,
+            },
+            reader,
+            writer,
+        )?;
 
         match outcome {
-            GuardOutcome::Proceed => run_remove_link(&client, &self.link_id).await,
+            GuardOutcome::Proceed => {
+                client.remove_issue_link(&self.link_id).await?;
+                writeln!(writer, "Removed link {}.", self.link_id)?;
+                Ok(())
+            }
             GuardOutcome::Cancelled | GuardOutcome::DryRun => Ok(()),
         }
     }
@@ -196,13 +218,6 @@ async fn run_create_link(
         outward,
         link_type
     );
-    Ok(())
-}
-
-/// Removes an issue link by ID.
-async fn run_remove_link(client: &AtlassianClient, link_id: &str) -> Result<()> {
-    client.remove_issue_link(link_id).await?;
-    println!("Removed link {link_id}.");
     Ok(())
 }
 
@@ -593,20 +608,98 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_remove_link_success() {
+    async fn remove_link_execute_force_calls_api() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("DELETE"))
             .and(wiremock::matchers::path("/rest/api/3/issueLink/12345"))
             .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
             .mount(&server)
             .await;
 
         let client = mock_client(&server.uri());
-        assert!(run_remove_link(&client, "12345").await.is_ok());
+        let cmd = RemoveLinkCommand {
+            link_id: "12345".to_string(),
+            force: true,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Removed link 12345."));
     }
 
     #[tokio::test]
-    async fn run_remove_link_api_error() {
+    async fn remove_link_execute_dry_run_skips_api() {
+        let server = wiremock::MockServer::start().await;
+
+        let client = mock_client(&server.uri());
+        let cmd = RemoveLinkCommand {
+            link_id: "12345".to_string(),
+            force: false,
+            dry_run: true,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Would remove link 12345."));
+        assert!(!out.contains("Removed link"));
+    }
+
+    #[tokio::test]
+    async fn remove_link_execute_prompt_yes_calls_api() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/rest/api/3/issueLink/12345"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let cmd = RemoveLinkCommand {
+            link_id: "12345".to_string(),
+            force: false,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(b"y\n".to_vec());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Remove link 12345?"));
+        assert!(out.contains("Removed link 12345."));
+    }
+
+    #[tokio::test]
+    async fn remove_link_execute_prompt_no_skips_api() {
+        let server = wiremock::MockServer::start().await;
+
+        let client = mock_client(&server.uri());
+        let cmd = RemoveLinkCommand {
+            link_id: "12345".to_string(),
+            force: false,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(b"n\n".to_vec());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Cancelled."));
+        assert!(!out.contains("Removed link"));
+    }
+
+    #[tokio::test]
+    async fn remove_link_execute_api_error_propagates() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("DELETE"))
             .and(wiremock::matchers::path("/rest/api/3/issueLink/99999"))
@@ -615,7 +708,17 @@ mod tests {
             .await;
 
         let client = mock_client(&server.uri());
-        let err = run_remove_link(&client, "99999").await.unwrap_err();
+        let cmd = RemoveLinkCommand {
+            link_id: "99999".to_string(),
+            force: true,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        let err = cmd
+            .execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("404"));
     }
 
