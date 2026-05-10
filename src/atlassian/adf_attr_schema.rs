@@ -924,4 +924,95 @@ mod tests {
         };
         assert!(p.to_string().contains("integer"));
     }
+
+    #[test]
+    fn attr_problem_out_of_range_f_display() {
+        // Float-range Display arm — never exercised by the per-node fixture
+        // tests above because their NumRange tests trigger the message
+        // through the field validator, not directly. Cover it here.
+        let p = AttrProblem::OutOfRangeF {
+            lo: 0.0,
+            hi: 100.0,
+            actual: 200.0,
+        };
+        let s = p.to_string();
+        assert!(s.contains("200"), "got: {s}");
+        assert!(s.contains("[0, 100]"), "got: {s}");
+    }
+
+    // ── check_value: WrongType arms for every AttrType ──────────────
+    //
+    // Covers the `None =>` branch of each match in `check_value` that
+    // converts a wrongly-typed JSON value into `AttrProblem::WrongType`.
+    // Most of these aren't reachable via the per-node fixture tests
+    // because each declared field is exercised with the *correct* shape;
+    // these tests drive `check_value` directly with a deliberately
+    // wrong value.
+
+    #[test]
+    fn check_value_enum_wrong_type_for_non_string() {
+        let ty = AttrType::Enum(&["a", "b"]);
+        let p = check_value(&ty, &json!(123)).expect("should reject");
+        assert!(matches!(p, AttrProblem::WrongType { expected: "string" }));
+    }
+
+    #[test]
+    fn check_value_int_range_wrong_type_for_non_integer() {
+        let ty = AttrType::IntRange(0, 10);
+        let p = check_value(&ty, &json!("abc")).expect("should reject");
+        assert!(matches!(
+            p,
+            AttrProblem::WrongType {
+                expected: "integer"
+            }
+        ));
+    }
+
+    #[test]
+    fn check_value_num_range_wrong_type_for_non_number() {
+        let ty = AttrType::NumRange(0.0, 100.0);
+        let p = check_value(&ty, &json!("abc")).expect("should reject");
+        assert!(matches!(p, AttrProblem::WrongType { expected: "number" }));
+    }
+
+    #[test]
+    fn check_value_bool_arms() {
+        let ty = AttrType::Bool;
+        assert!(check_value(&ty, &json!(true)).is_none());
+        let p = check_value(&ty, &json!("yes")).expect("should reject");
+        assert!(matches!(p, AttrProblem::WrongType { expected: "bool" }));
+    }
+
+    #[test]
+    fn check_value_string_arms() {
+        let ty = AttrType::String;
+        assert!(check_value(&ty, &json!("hi")).is_none());
+        let p = check_value(&ty, &json!(42)).expect("should reject");
+        assert!(matches!(p, AttrProblem::WrongType { expected: "string" }));
+    }
+
+    #[test]
+    fn check_value_url_wrong_type_for_non_string() {
+        let ty = AttrType::Url;
+        let p = check_value(&ty, &json!(42)).expect("should reject");
+        assert!(matches!(p, AttrProblem::WrongType { expected: "string" }));
+    }
+
+    #[test]
+    fn check_value_object_arms() {
+        let ty = AttrType::Object;
+        assert!(check_value(&ty, &json!({"k": "v"})).is_none());
+        let p = check_value(&ty, &json!([1, 2])).expect("should reject");
+        assert!(matches!(p, AttrProblem::WrongType { expected: "object" }));
+    }
+
+    #[test]
+    fn check_value_free_accepts_anything() {
+        let ty = AttrType::Free;
+        assert!(check_value(&ty, &json!(null)).is_none());
+        assert!(check_value(&ty, &json!(42)).is_none());
+        assert!(check_value(&ty, &json!("x")).is_none());
+        assert!(check_value(&ty, &json!({"k": "v"})).is_none());
+        assert!(check_value(&ty, &json!([1, 2, 3])).is_none());
+    }
 }
