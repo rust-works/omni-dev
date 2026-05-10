@@ -1,10 +1,10 @@
 //! CLI commands for JIRA issue comments.
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::atlassian::adf::AdfDocument;
-use crate::atlassian::client::{AtlassianClient, JiraComment};
+use crate::atlassian::client::{AtlassianClient, JiraComment, JiraVisibility, JiraVisibilityType};
 use crate::atlassian::convert::{adf_to_markdown, markdown_to_adf};
 use crate::atlassian::document::JfmDocument;
 use crate::cli::atlassian::format::{output_as, ContentFormat, OutputFormat};
@@ -25,6 +25,8 @@ pub enum CommentSubcommands {
     List(ListCommand),
     /// Adds a comment to a JIRA issue.
     Add(AddCommand),
+    /// Edits an existing comment on a JIRA issue.
+    Edit(EditCommand),
 }
 
 impl CommentCommand {
@@ -33,6 +35,7 @@ impl CommentCommand {
         match self.command {
             CommentSubcommands::List(cmd) => cmd.execute().await,
             CommentSubcommands::Add(cmd) => cmd.execute().await,
+            CommentSubcommands::Edit(cmd) => cmd.execute().await,
         }
     }
 }
@@ -77,30 +80,97 @@ pub struct AddCommand {
 impl AddCommand {
     /// Reads input, converts to ADF, and posts the comment.
     pub async fn execute(self) -> Result<()> {
-        let adf = self.parse_input()?;
+        let adf = parse_comment_input(self.file.as_deref(), self.format)?;
 
         let (client, _instance_url) = create_client()?;
         run_add_comment(&client, &self.key, &adf).await
     }
+}
 
-    /// Parses the input file into an ADF document.
-    fn parse_input(&self) -> Result<AdfDocument> {
-        let input = read_input(self.file.as_deref())?;
+/// Edits an existing comment on a JIRA issue.
+#[derive(Parser)]
+pub struct EditCommand {
+    /// JIRA issue key (e.g., PROJ-123).
+    pub key: String,
 
-        match self.format {
-            ContentFormat::Jfm => {
-                // Try parsing as JFM document (with frontmatter) first,
-                // fall back to raw markdown
-                if input.starts_with("---\n") {
-                    let doc = JfmDocument::parse(&input)?;
-                    markdown_to_adf(&doc.body)
-                } else {
-                    markdown_to_adf(&input)
-                }
+    /// Comment ID to edit.
+    pub comment_id: String,
+
+    /// Input file (reads from stdin if omitted or "-").
+    pub file: Option<String>,
+
+    /// Input format.
+    #[arg(long, value_enum, default_value_t = ContentFormat::Jfm)]
+    pub format: ContentFormat,
+
+    /// Visibility restriction kind. Pair with `--visibility-value`.
+    #[arg(long, value_enum, requires = "visibility_value")]
+    pub visibility_type: Option<CliVisibilityType>,
+
+    /// Visibility group or role name. Pair with `--visibility-type`.
+    #[arg(long, requires = "visibility_type")]
+    pub visibility_value: Option<String>,
+}
+
+/// Visibility restriction kind for the CLI.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum CliVisibilityType {
+    /// Restrict to a JIRA group.
+    Group,
+    /// Restrict to a project role.
+    Role,
+}
+
+impl From<CliVisibilityType> for JiraVisibilityType {
+    fn from(value: CliVisibilityType) -> Self {
+        match value {
+            CliVisibilityType::Group => Self::Group,
+            CliVisibilityType::Role => Self::Role,
+        }
+    }
+}
+
+impl EditCommand {
+    /// Reads input, converts to ADF, and updates the comment.
+    pub async fn execute(self) -> Result<()> {
+        let adf = parse_comment_input(self.file.as_deref(), self.format)?;
+        let visibility = match (self.visibility_type, self.visibility_value) {
+            (Some(ty), Some(value)) => Some(JiraVisibility {
+                ty: ty.into(),
+                value,
+            }),
+            _ => None,
+        };
+
+        let (client, _instance_url) = create_client()?;
+        run_edit_comment(
+            &client,
+            &self.key,
+            &self.comment_id,
+            &adf,
+            visibility.as_ref(),
+        )
+        .await
+    }
+}
+
+/// Parses the input file into an ADF document.
+fn parse_comment_input(file: Option<&str>, format: ContentFormat) -> Result<AdfDocument> {
+    let input = read_input(file)?;
+
+    match format {
+        ContentFormat::Jfm => {
+            // Try parsing as JFM document (with frontmatter) first,
+            // fall back to raw markdown
+            if input.starts_with("---\n") {
+                let doc = JfmDocument::parse(&input)?;
+                markdown_to_adf(&doc.body)
+            } else {
+                markdown_to_adf(&input)
             }
-            ContentFormat::Adf => {
-                serde_json::from_str(&input).context("Failed to parse ADF JSON input")
-            }
+        }
+        ContentFormat::Adf => {
+            serde_json::from_str(&input).context("Failed to parse ADF JSON input")
         }
     }
 }
@@ -124,6 +194,24 @@ async fn run_list_comments(
 async fn run_add_comment(client: &AtlassianClient, key: &str, adf: &AdfDocument) -> Result<()> {
     client.add_comment(key, adf).await?;
     println!("Comment added to {key}.");
+    Ok(())
+}
+
+/// Updates an existing comment on an issue.
+async fn run_edit_comment(
+    client: &AtlassianClient,
+    key: &str,
+    comment_id: &str,
+    adf: &AdfDocument,
+    visibility: Option<&JiraVisibility>,
+) -> Result<()> {
+    let updated = client
+        .update_comment(key, comment_id, adf, visibility)
+        .await?;
+    println!("Comment {comment_id} updated on {key}.");
+    let yaml =
+        serde_yaml::to_string(&updated).context("Failed to serialize updated comment as YAML")?;
+    print!("{yaml}");
     Ok(())
 }
 
@@ -186,6 +274,7 @@ mod tests {
             author: author.to_string(),
             body_adf,
             created: "2026-04-01T10:30:00.000+0000".to_string(),
+            updated: None,
         }
     }
 
@@ -292,7 +381,7 @@ mod tests {
         assert_eq!(format_timestamp(""), "");
     }
 
-    // ── AddCommand::parse_input ────────────────────────────────────
+    // ── parse_comment_input ────────────────────────────────────────
 
     #[test]
     fn parse_input_raw_markdown() {
@@ -300,13 +389,8 @@ mod tests {
         let file_path = temp_dir.path().join("comment.md");
         fs::write(&file_path, "Hello **world**\n").unwrap();
 
-        let cmd = AddCommand {
-            key: "PROJ-1".to_string(),
-            file: Some(file_path.to_str().unwrap().to_string()),
-            format: ContentFormat::Jfm,
-        };
-
-        let adf = cmd.parse_input().unwrap();
+        let adf =
+            parse_comment_input(Some(file_path.to_str().unwrap()), ContentFormat::Jfm).unwrap();
         assert!(!adf.content.is_empty());
     }
 
@@ -318,13 +402,8 @@ mod tests {
             "---\ntype: jira\ninstance: https://org.atlassian.net\nkey: PROJ-1\nsummary: Test\n---\n\nComment body\n";
         fs::write(&file_path, content).unwrap();
 
-        let cmd = AddCommand {
-            key: "PROJ-1".to_string(),
-            file: Some(file_path.to_str().unwrap().to_string()),
-            format: ContentFormat::Jfm,
-        };
-
-        let adf = cmd.parse_input().unwrap();
+        let adf =
+            parse_comment_input(Some(file_path.to_str().unwrap()), ContentFormat::Jfm).unwrap();
         assert!(!adf.content.is_empty());
     }
 
@@ -335,13 +414,8 @@ mod tests {
         let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"Hello"}]}]}"#;
         fs::write(&file_path, adf_json).unwrap();
 
-        let cmd = AddCommand {
-            key: "PROJ-1".to_string(),
-            file: Some(file_path.to_str().unwrap().to_string()),
-            format: ContentFormat::Adf,
-        };
-
-        let adf = cmd.parse_input().unwrap();
+        let adf =
+            parse_comment_input(Some(file_path.to_str().unwrap()), ContentFormat::Adf).unwrap();
         assert_eq!(adf.content.len(), 1);
     }
 
@@ -351,13 +425,9 @@ mod tests {
         let file_path = temp_dir.path().join("bad.json");
         fs::write(&file_path, "not json").unwrap();
 
-        let cmd = AddCommand {
-            key: "PROJ-1".to_string(),
-            file: Some(file_path.to_str().unwrap().to_string()),
-            format: ContentFormat::Adf,
-        };
-
-        assert!(cmd.parse_input().is_err());
+        assert!(
+            parse_comment_input(Some(file_path.to_str().unwrap()), ContentFormat::Adf).is_err()
+        );
     }
 
     // ── CommentCommand dispatch ────────────────────────────────────
@@ -384,6 +454,33 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, CommentSubcommands::Add(_)));
+    }
+
+    #[test]
+    fn comment_command_edit_variant() {
+        let cmd = CommentCommand {
+            command: CommentSubcommands::Edit(EditCommand {
+                key: "PROJ-1".to_string(),
+                comment_id: "100".to_string(),
+                file: None,
+                format: ContentFormat::Jfm,
+                visibility_type: None,
+                visibility_value: None,
+            }),
+        };
+        assert!(matches!(cmd.command, CommentSubcommands::Edit(_)));
+    }
+
+    #[test]
+    fn cli_visibility_type_into_group() {
+        let mapped: JiraVisibilityType = CliVisibilityType::Group.into();
+        assert!(matches!(mapped, JiraVisibilityType::Group));
+    }
+
+    #[test]
+    fn cli_visibility_type_into_role() {
+        let mapped: JiraVisibilityType = CliVisibilityType::Role.into();
+        assert!(matches!(mapped, JiraVisibilityType::Role));
     }
 
     // ── run_list_comments / run_add_comment ────────────────────────
@@ -513,5 +610,117 @@ mod tests {
         let adf = AdfDocument::new();
         let err = run_add_comment(&client, "PROJ-1", &adf).await.unwrap_err();
         assert!(err.to_string().contains("403"));
+    }
+
+    // ── run_edit_comment ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_edit_comment_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/comment/100",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "100",
+                    "author": {"displayName": "Me"},
+                    "created": "2026-04-01T10:00:00.000+0000",
+                    "updated": "2026-05-10T12:00:00.000+0000",
+                    "body": null
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let adf = AdfDocument::new();
+        assert!(run_edit_comment(&client, "PROJ-1", "100", &adf, None)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_edit_comment_with_visibility_sends_payload() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/comment/100",
+            ))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "visibility": {"type": "role", "identifier": "Administrators"}
+            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "100",
+                    "author": {"displayName": "Me"},
+                    "created": "2026-04-01T10:00:00.000+0000",
+                    "updated": "2026-05-10T12:00:00.000+0000",
+                    "body": null
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let adf = AdfDocument::new();
+        let visibility = JiraVisibility {
+            ty: JiraVisibilityType::Role,
+            value: "Administrators".to_string(),
+        };
+        run_edit_comment(&client, "PROJ-1", "100", &adf, Some(&visibility))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_edit_comment_forbidden() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/comment/100",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "errorMessages": ["You do not have permission to edit this comment"]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let adf = AdfDocument::new();
+        let err = run_edit_comment(&client, "PROJ-1", "100", &adf, None)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("403"));
+        assert!(msg.contains("permission to edit"));
+    }
+
+    #[tokio::test]
+    async fn run_edit_comment_not_found() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/comment/9999",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "errorMessages": ["Comment not found"]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let adf = AdfDocument::new();
+        let err = run_edit_comment(&client, "PROJ-1", "9999", &adf, None)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("404"));
+        assert!(msg.contains("Comment not found"));
     }
 }
