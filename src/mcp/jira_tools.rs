@@ -369,6 +369,86 @@ pub(crate) async fn sprint_update_yaml(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Project version tools
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Parameters for the `jira_version_list` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct VersionListParams {
+    /// Project key (e.g., `PROJ`).
+    pub project: String,
+    /// Filter to only released (`true`) or only unreleased (`false`) versions.
+    /// Omit for both.
+    #[serde(default)]
+    pub released: Option<bool>,
+    /// Filter to only archived (`true`) or only non-archived (`false`)
+    /// versions. Omit for both.
+    #[serde(default)]
+    pub archived: Option<bool>,
+}
+
+/// Parameters for the `jira_version_create` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct VersionCreateParams {
+    /// Project key (e.g., `PROJ`).
+    pub project: String,
+    /// Version name (e.g., `1.0.0`).
+    pub name: String,
+    /// Version description.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Release date (ISO 8601, `YYYY-MM-DD`). Validated client-side.
+    #[serde(default)]
+    pub release_date: Option<String>,
+    /// Start date (ISO 8601, `YYYY-MM-DD`). Validated client-side.
+    #[serde(default)]
+    pub start_date: Option<String>,
+    /// Whether the version is released. Defaults to `false`.
+    #[serde(default)]
+    pub released: bool,
+    /// Whether the version is archived. Defaults to `false`.
+    #[serde(default)]
+    pub archived: bool,
+}
+
+pub(crate) async fn version_list_yaml(
+    client: &AtlassianClient,
+    project: &str,
+    released: Option<bool>,
+    archived: Option<bool>,
+) -> Result<String> {
+    let result = client
+        .get_project_versions(project, released, archived)
+        .await?;
+    serde_yaml::to_string(&result).context("Failed to serialize project versions as YAML")
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn version_create_yaml(
+    client: &AtlassianClient,
+    project: &str,
+    name: &str,
+    description: Option<&str>,
+    release_date: Option<&str>,
+    start_date: Option<&str>,
+    released: bool,
+    archived: bool,
+) -> Result<String> {
+    let version = client
+        .create_project_version(
+            project,
+            name,
+            description,
+            release_date,
+            start_date,
+            released,
+            archived,
+        )
+        .await?;
+    serde_yaml::to_string(&version).context("Failed to serialize project version as YAML")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Watcher tools
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -842,6 +922,56 @@ impl OmniDevServer {
                 params.start_date.as_deref(),
                 params.end_date.as_deref(),
                 params.goal.as_deref(),
+            )
+            .await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    // ── project versions ───────────────────────────────────────────
+
+    /// Tool: list project versions.
+    #[tool(
+        description = "List versions for a JIRA project, optionally filtered by `released` \
+                       and `archived` flags. Returns YAML. Mirrors `omni-dev atlassian jira \
+                       version list`."
+    )]
+    pub async fn jira_version_list(
+        &self,
+        Parameters(params): Parameters<VersionListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            version_list_yaml(&client, &params.project, params.released, params.archived).await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: create a project version.
+    #[tool(
+        description = "Create a new version in a JIRA project. Dates must be `YYYY-MM-DD` and \
+                       are validated client-side. Returns YAML for the created version. \
+                       Mirrors `omni-dev atlassian jira version create`."
+    )]
+    pub async fn jira_version_create(
+        &self,
+        Parameters(params): Parameters<VersionCreateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            version_create_yaml(
+                &client,
+                &params.project,
+                &params.name,
+                params.description.as_deref(),
+                params.release_date.as_deref(),
+                params.start_date.as_deref(),
+                params.released,
+                params.archived,
             )
             .await
         })
@@ -1522,6 +1652,133 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("404"));
+    }
+
+    // ── project versions ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn version_list_yaml_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/project/PROJ/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "1", "name": "1.0.0", "released": true, "archived": false}
+            ])))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = version_list_yaml(&client, "PROJ", None, None)
+            .await
+            .unwrap();
+        assert!(yaml.contains("1.0.0"));
+        assert!(yaml.contains("project_key: PROJ"));
+    }
+
+    #[tokio::test]
+    async fn version_list_yaml_filters_released() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/project/PROJ/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "1", "name": "1.0.0", "released": true, "archived": false},
+                {"id": "2", "name": "2.0.0", "released": false, "archived": false},
+            ])))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = version_list_yaml(&client, "PROJ", Some(false), None)
+            .await
+            .unwrap();
+        assert!(yaml.contains("2.0.0"));
+        assert!(!yaml.contains("1.0.0"));
+    }
+
+    #[tokio::test]
+    async fn version_list_yaml_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/project/NONE/versions"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("missing"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = version_list_yaml(&client, "NONE", None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn version_create_yaml_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/version"))
+            .and(body_json(serde_json::json!({
+                "project": "PROJ",
+                "name": "1.0.0",
+                "released": false,
+                "archived": false,
+                "releaseDate": "2026-06-01"
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": "100",
+                "name": "1.0.0",
+                "released": false,
+                "archived": false,
+                "releaseDate": "2026-06-01"
+            })))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = version_create_yaml(
+            &client,
+            "PROJ",
+            "1.0.0",
+            None,
+            Some("2026-06-01"),
+            None,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(yaml.contains("id: '100'"));
+        assert!(yaml.contains("1.0.0"));
+    }
+
+    #[tokio::test]
+    async fn version_create_yaml_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/version"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = version_create_yaml(&client, "PROJ", "1.0", None, None, None, false, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn version_create_yaml_validates_dates_client_side() {
+        let server = MockServer::start().await;
+        // No mock — request must short-circuit before HTTP.
+        let client = mock_client(&server.uri());
+        let err = version_create_yaml(
+            &client,
+            "PROJ",
+            "1.0",
+            None,
+            Some("2026/06/01"),
+            None,
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("YYYY-MM-DD"));
     }
 
     // ── watchers ───────────────────────────────────────────────────
