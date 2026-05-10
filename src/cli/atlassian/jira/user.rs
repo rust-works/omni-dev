@@ -128,9 +128,8 @@ mod tests {
     }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::Mutex;
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock()
+        crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 

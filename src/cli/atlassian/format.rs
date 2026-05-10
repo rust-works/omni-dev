@@ -8,8 +8,8 @@ use serde::Serialize;
 
 use crate::atlassian::client::{
     AgileBoardList, AgileSprintList, ConfluenceSearchResults, ConfluenceUserSearchResults,
-    JiraDevStatus, JiraDevStatusSummary, JiraProjectList, JiraSearchResult, JiraUserSearchResults,
-    JiraWatcherList, JiraWorklogList,
+    JiraDevStatus, JiraDevStatusSummary, JiraProjectList, JiraProjectVersionList, JiraSearchResult,
+    JiraUserSearchResults, JiraWatcherList, JiraWorklogList,
 };
 use crate::atlassian::confluence_api::ConfluenceAttachmentPage;
 
@@ -96,6 +96,12 @@ impl JsonlSerialize for JiraSearchResult {
 impl JsonlSerialize for JiraProjectList {
     fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
         write_items_jsonl(self.projects.iter(), out)
+    }
+}
+
+impl JsonlSerialize for JiraProjectVersionList {
+    fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
+        write_items_jsonl(self.versions.iter(), out)
     }
 }
 
@@ -214,7 +220,7 @@ mod tests {
     use super::*;
     use crate::atlassian::client::{
         AgileBoard, AgileSprint, ConfluenceSearchResult, ConfluenceUserSearchResult, JiraComment,
-        JiraDevStatusCount, JiraIssue, JiraProject, JiraUser, JiraWorklog,
+        JiraDevStatusCount, JiraIssue, JiraProject, JiraProjectVersion, JiraUser, JiraWorklog,
     };
 
     // ── ContentFormat ──────────────────────────────────────────────
@@ -434,6 +440,19 @@ mod tests {
         }
     }
 
+    fn sample_project_version(id: &str, name: &str) -> JiraProjectVersion {
+        JiraProjectVersion {
+            id: id.to_string(),
+            name: name.to_string(),
+            description: None,
+            project_key: "PROJ".to_string(),
+            released: false,
+            archived: false,
+            release_date: None,
+            start_date: None,
+        }
+    }
+
     fn sample_user(name: &str) -> JiraUser {
         JiraUser {
             account_id: name.to_string(),
@@ -540,6 +559,21 @@ mod tests {
         let out = jsonl_string(&list);
         assert_eq!(out.lines().count(), 1);
         assert!(out.contains("\"key\":\"P\""));
+    }
+
+    #[test]
+    fn jira_project_version_list_jsonl() {
+        let list = JiraProjectVersionList {
+            versions: vec![
+                sample_project_version("10", "1.0.0"),
+                sample_project_version("11", "1.1.0"),
+            ],
+            total: 2,
+        };
+        let out = jsonl_string(&list);
+        assert_eq!(out.lines().count(), 2);
+        assert!(out.contains("\"id\":\"10\""));
+        assert!(out.contains("\"id\":\"11\""));
     }
 
     #[test]

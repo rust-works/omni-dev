@@ -175,6 +175,96 @@ pub fn save_credentials(credentials: &AtlassianCredentials) -> Result<()> {
     Ok(())
 }
 
+/// Crate-internal test utilities for code that calls [`load_credentials`] /
+/// [`crate::cli::atlassian::helpers::create_client`]. Lives here because it
+/// needs the credential constants and shares process-wide env state with
+/// auth.rs's own tests — every consumer must serialise on
+/// [`AUTH_ENV_MUTEX`] to avoid racing.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+pub(crate) mod test_util {
+    use super::{ATLASSIAN_API_TOKEN, ATLASSIAN_EMAIL, ATLASSIAN_INSTANCE_URL};
+
+    /// Mutex shared by every test that mutates `HOME` and the Atlassian
+    /// credential env vars. Serialises those tests against each other so
+    /// parallel execution doesn't race on process-wide env state.
+    pub(crate) static AUTH_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard: snapshots `HOME` + every Atlassian credential env var on
+    /// construction and restores them on drop. Concentrating the save/restore
+    /// branches into one place (here) instead of inlining them in each test
+    /// keeps coverage high — every test exercises the same guard drop path.
+    pub(crate) struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        snapshot: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        pub(crate) fn take() -> Self {
+            let lock = AUTH_ENV_MUTEX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let keys = [
+                "HOME",
+                ATLASSIAN_INSTANCE_URL,
+                ATLASSIAN_EMAIL,
+                ATLASSIAN_API_TOKEN,
+            ];
+            let snapshot = keys
+                .into_iter()
+                .map(|k| (k, std::env::var(k).ok()))
+                .collect();
+            Self {
+                _lock: lock,
+                snapshot,
+            }
+        }
+
+        /// Clears the three Atlassian credential env vars and points `HOME`
+        /// at a fresh empty tempdir so `load_credentials()` returns
+        /// `CredentialsNotFound`. Useful for testing the Err propagation
+        /// path of code that calls `create_client()`.
+        pub(crate) fn clear_credentials(&self) -> tempfile::TempDir {
+            let dir = {
+                std::fs::create_dir_all("tmp").ok();
+                tempfile::TempDir::new_in("tmp").unwrap()
+            };
+            std::env::set_var("HOME", dir.path());
+            std::env::remove_var(ATLASSIAN_INSTANCE_URL);
+            std::env::remove_var(ATLASSIAN_EMAIL);
+            std::env::remove_var(ATLASSIAN_API_TOKEN);
+            dir
+        }
+
+        /// Sets the three Atlassian credential env vars to point at a wiremock
+        /// (or any HTTP) endpoint. The matching `HOME` is replaced with a
+        /// fresh tempdir so any `~/.omni-dev/settings.json` on the developer's
+        /// machine does not bleed in.
+        pub(crate) fn set_credentials(&self, instance_url: &str) -> tempfile::TempDir {
+            let dir = {
+                std::fs::create_dir_all("tmp").ok();
+                tempfile::TempDir::new_in("tmp").unwrap()
+            };
+            std::env::set_var("HOME", dir.path());
+            std::env::set_var(ATLASSIAN_INSTANCE_URL, instance_url);
+            std::env::set_var(ATLASSIAN_EMAIL, "test@example.com");
+            std::env::set_var(ATLASSIAN_API_TOKEN, "test-token");
+            dir
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.snapshot {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -245,52 +335,7 @@ mod tests {
         assert!(debug.contains("AtlassianCredentials"));
     }
 
-    /// Mutex shared by every test that mutates `HOME` and the Atlassian
-    /// credential env vars. Serialises those tests against each other so
-    /// parallel execution doesn't race on process-wide env state.
-    static AUTH_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// RAII guard: snapshots `HOME` + every Atlassian credential env var on
-    /// construction and restores them on drop. Concentrating the save/restore
-    /// branches into one place (here) instead of inlining them in each test
-    /// keeps coverage high — every test exercises the same guard drop path.
-    struct EnvGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        snapshot: Vec<(&'static str, Option<String>)>,
-    }
-
-    impl EnvGuard {
-        fn take() -> Self {
-            let lock = AUTH_ENV_MUTEX
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let keys = [
-                "HOME",
-                ATLASSIAN_INSTANCE_URL,
-                ATLASSIAN_EMAIL,
-                ATLASSIAN_API_TOKEN,
-            ];
-            let snapshot = keys
-                .into_iter()
-                .map(|k| (k, std::env::var(k).ok()))
-                .collect();
-            Self {
-                _lock: lock,
-                snapshot,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (k, v) in &self.snapshot {
-                match v {
-                    Some(val) => std::env::set_var(k, val),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
-    }
+    use super::test_util::EnvGuard;
 
     fn with_empty_home(_guard: &EnvGuard) -> tempfile::TempDir {
         let dir = {
