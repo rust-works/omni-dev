@@ -574,4 +574,31 @@ mod tests {
         };
         assert!(cmd.dry_run);
     }
+
+    #[tokio::test]
+    async fn remove_execute_force_propagates_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/label/draft",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        let api = label_api(&server);
+        let cmd = RemoveCommand {
+            id: "12345".to_string(),
+            labels: vec!["draft".to_string()],
+            force: true,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        let err = cmd
+            .execute_with_io(&api, &mut input, &mut output)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
 }
