@@ -17461,49 +17461,39 @@ mod tests {
 
     #[test]
     fn nested_expand_inside_panel() {
+        // Issue #714: the converter still produces panel→expand at the AST
+        // level (this is what users may type), but the document fails ADF
+        // schema validation, surfacing an actionable error before the API
+        // call rather than an opaque Confluence HTTP 500.
         let md = ":::panel{type=info}\n:::expand{title=\"Details\"}\nHidden content\n:::\nMore panel content\n:::";
         let adf = markdown_to_adf(md).unwrap();
 
-        // Should produce a panel node
-        assert_eq!(adf.content.len(), 1);
-        assert_eq!(adf.content[0].node_type, "panel");
-
-        // Panel should contain the expand AND "More panel content"
-        let panel_content = adf.content[0].content.as_ref().unwrap();
-        assert!(
-            panel_content.len() >= 2,
-            "Panel should contain expand + paragraph, got {} nodes",
-            panel_content.len()
-        );
+        let err = crate::atlassian::adf_validated::validate(&adf).unwrap_err();
+        assert!(err
+            .violations
+            .iter()
+            .any(|v| v.parent_type == "panel" && v.child_type == "expand"));
     }
 
     #[test]
     fn nested_expand_inside_table_cell() {
+        // Issue #714: tableCell → expand is a Confluence content-model
+        // violation. Table cells require `nestedExpand` instead. Validation
+        // catches this before the API call.
         let md = "::::table\n:::tr\n:::td\n:::expand{title=\"Details\"}\nExpand content\n:::\n:::\n:::\n::::";
         let adf = markdown_to_adf(md).unwrap();
 
-        // Should produce a table
-        assert_eq!(adf.content.len(), 1);
-        assert_eq!(adf.content[0].node_type, "table");
-
-        // Table -> row -> cell -> should contain an expand node
-        let rows = adf.content[0].content.as_ref().unwrap();
-        assert_eq!(rows.len(), 1);
-        let cells = rows[0].content.as_ref().unwrap();
-        assert_eq!(cells.len(), 1);
-        let cell_content = cells[0].content.as_ref().unwrap();
-        assert!(
-            cell_content.iter().any(|n| n.node_type == "expand"),
-            "Cell should contain an expand node, got: {:?}",
-            cell_content
-                .iter()
-                .map(|n| &n.node_type)
-                .collect::<Vec<_>>()
-        );
+        let err = crate::atlassian::adf_validated::validate(&adf).unwrap_err();
+        assert!(err
+            .violations
+            .iter()
+            .any(|v| v.parent_type == "tableCell" && v.child_type == "expand"));
     }
 
     #[test]
     fn nested_expand_inside_layout_column() {
+        // Issue #714 sanity check: `expand` inside a `layoutColumn` is
+        // legitimate per the ADF schema and must NOT trigger validation.
         let md = ":::layout\n:::column{width=100}\n:::expand{title=\"Col Expand\"}\nExpanded\n:::\n:::\n:::";
         let adf = markdown_to_adf(md).unwrap();
 
@@ -17518,6 +17508,9 @@ mod tests {
             "Column should contain an expand node, got: {:?}",
             col_content.iter().map(|n| &n.node_type).collect::<Vec<_>>()
         );
+
+        // Validation must not flag this legitimate nesting.
+        crate::atlassian::adf_validated::validate(&adf).unwrap();
     }
 
     #[test]

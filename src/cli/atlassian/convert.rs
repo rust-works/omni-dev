@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::atlassian::adf::AdfDocument;
+use crate::atlassian::adf_validated::validate;
 use crate::atlassian::convert::markdown_to_adf;
 
 /// Converts between JFM markdown and ADF JSON.
@@ -47,6 +48,13 @@ pub struct ToAdfCommand {
     /// Outputs compact JSON instead of pretty-printed.
     #[arg(long)]
     pub compact: bool,
+
+    /// Skips Confluence ADF nesting validation. By default, the converted
+    /// document is checked against the known Confluence content-model rules
+    /// (e.g., `expand` cannot appear inside `panel`); pass this flag to print
+    /// invalid ADF anyway, for inspection or debugging.
+    #[arg(long)]
+    pub no_validate: bool,
 }
 
 impl ToAdfCommand {
@@ -54,6 +62,10 @@ impl ToAdfCommand {
     pub fn execute(self) -> Result<()> {
         let input = read_input(self.file.as_deref())?;
         let doc = markdown_to_adf(&input)?;
+
+        if !self.no_validate {
+            validate(&doc)?;
+        }
 
         let json = if self.compact {
             serde_json::to_string(&doc).context("Failed to serialize ADF JSON")?
@@ -141,6 +153,7 @@ mod tests {
         let cmd = ToAdfCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             compact: false,
+            no_validate: false,
         };
         assert!(cmd.execute().is_ok());
     }
@@ -154,6 +167,47 @@ mod tests {
         let cmd = ToAdfCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             compact: true,
+            no_validate: false,
+        };
+        assert!(cmd.execute().is_ok());
+    }
+
+    #[test]
+    fn to_adf_rejects_invalid_nesting_by_default() {
+        // Issue #714: default validation should refuse to print invalid ADF.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("bad.md");
+        fs::write(
+            &file_path,
+            ":::panel{type=info}\n:::expand{title=\"x\"}\nbody\n:::\n:::",
+        )
+        .unwrap();
+
+        let cmd = ToAdfCommand {
+            file: Some(file_path.to_str().unwrap().to_string()),
+            compact: true,
+            no_validate: false,
+        };
+        let err = cmd.execute().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid ADF nesting"));
+        assert!(msg.contains("`expand` cannot be a child of `panel`"));
+    }
+
+    #[test]
+    fn to_adf_no_validate_prints_invalid_nesting() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("bad.md");
+        fs::write(
+            &file_path,
+            ":::panel{type=info}\n:::expand{title=\"x\"}\nbody\n:::\n:::",
+        )
+        .unwrap();
+
+        let cmd = ToAdfCommand {
+            file: Some(file_path.to_str().unwrap().to_string()),
+            compact: true,
+            no_validate: true,
         };
         assert!(cmd.execute().is_ok());
     }
@@ -208,6 +262,7 @@ mod tests {
             command: ConvertSubcommands::ToAdf(ToAdfCommand {
                 file: Some(file_path.to_str().unwrap().to_string()),
                 compact: false,
+                no_validate: false,
             }),
         };
         assert!(cmd.execute().is_ok());

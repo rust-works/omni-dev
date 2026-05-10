@@ -9,7 +9,7 @@ use std::pin::Pin;
 
 use anyhow::Result;
 
-use crate::atlassian::adf::AdfDocument;
+use crate::atlassian::adf_validated::ValidatedAdfDocument;
 
 /// A content item fetched from an Atlassian Cloud API.
 #[derive(Debug, Clone)]
@@ -68,10 +68,13 @@ pub trait AtlassianApi: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<ContentItem>> + Send + 'a>>;
 
     /// Updates a content item's body and optionally its title.
+    ///
+    /// `body_adf` is a [`ValidatedAdfDocument`] so the type system enforces
+    /// that callers ran nesting validation before reaching the wire.
     fn update_content<'a>(
         &'a self,
         id: &'a str,
-        body_adf: &'a AdfDocument,
+        body_adf: &'a ValidatedAdfDocument,
         title: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 

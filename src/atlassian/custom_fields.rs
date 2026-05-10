@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{anyhow, bail, Context, Result};
 
+use crate::atlassian::adf_validated::ValidatedAdfDocument;
 use crate::atlassian::client::{EditMeta, EditMetaField};
 use crate::atlassian::convert::markdown_to_adf;
 use crate::atlassian::document::CustomFieldSection;
@@ -72,8 +73,14 @@ pub fn resolve_custom_fields(
                 field.name, id
             )
         })?;
-        let value =
-            serde_json::to_value(&adf).context("Failed to serialize custom field ADF document")?;
+        let validated = ValidatedAdfDocument::try_new(adf).with_context(|| {
+            format!(
+                "Custom field '{}' ({}) failed ADF nesting validation",
+                field.name, id
+            )
+        })?;
+        let value = serde_json::to_value(&validated)
+            .context("Failed to serialize custom field ADF document")?;
         out.insert(id, value);
     }
 
@@ -479,6 +486,30 @@ mod tests {
         assert_eq!(value["type"], "doc");
         assert_eq!(value["version"], 1);
         assert!(value["content"].is_array());
+    }
+
+    #[test]
+    fn rich_text_section_with_invalid_adf_nesting_errors() {
+        // Issue #714: a section whose body produces ADF that violates
+        // Confluence's nesting constraints (here panel→expand) must be
+        // rejected with the validation context, not silently included in the
+        // payload.
+        let editmeta = meta(&[(
+            "customfield_19300",
+            "Acceptance Criteria",
+            "string",
+            Some(CUSTOM_TEXTAREA),
+        )]);
+        let sections = [CustomFieldSection {
+            name: "Acceptance Criteria".to_string(),
+            id: "customfield_19300".to_string(),
+            body: ":::panel{type=info}\n:::expand{title=\"x\"}\nbody\n:::\n:::".to_string(),
+        }];
+        let err = resolve_custom_fields(&BTreeMap::new(), &sections, &editmeta).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Acceptance Criteria"));
+        assert!(msg.contains("ADF nesting validation"));
+        assert!(msg.contains("`expand` cannot be a child of `panel`"));
     }
 
     #[test]
