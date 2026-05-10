@@ -14,38 +14,12 @@ use tokio_util::io::ReaderStream;
 use tracing::debug;
 
 use crate::atlassian::adf::AdfDocument;
+use crate::atlassian::adf_hints;
 use crate::atlassian::adf_schema;
 use crate::atlassian::adf_validated::ValidatedAdfDocument;
 use crate::atlassian::api::{AtlassianApi, ContentItem, ContentMetadata};
 use crate::atlassian::client::AtlassianClient;
 use crate::atlassian::error::AtlassianError;
-
-/// Returns a human-readable hint for resolving a known ADF nesting violation.
-///
-/// Used by [`confluence_write_error`] to enrich the diagnosis surfaced when
-/// Confluence returns HTTP 500. Returning `None` means no specific hint is
-/// known for the `(parent, child)` pair — the diagnosis line still names the
-/// violation, but no `Hint:` line is emitted.
-fn hint_for(parent: &str, child: &str) -> Option<&'static str> {
-    match (parent, child) {
-        ("panel", "expand" | "nestedExpand") => {
-            Some("invert the nesting (panel inside expand) or make them siblings")
-        }
-        ("expand", "expand" | "nestedExpand") => {
-            Some("expand cannot contain another expand; make them siblings instead")
-        }
-        ("nestedExpand", "expand" | "nestedExpand") => {
-            Some("nestedExpand cannot contain another expand; make them siblings instead")
-        }
-        ("tableCell" | "tableHeader", "expand") => {
-            Some("table cells permit nestedExpand only — replace the expand with nestedExpand")
-        }
-        ("blockquote", "expand" | "nestedExpand" | "panel" | "table") => {
-            Some("blockquote does not allow this child; move it outside the blockquote")
-        }
-        _ => None,
-    }
-}
 
 /// Builds an `anyhow::Error` for a non-success Confluence write/update/create
 /// response.
@@ -53,13 +27,13 @@ fn hint_for(parent: &str, child: &str) -> Option<&'static str> {
 /// On HTTP 500, runs [`adf_schema::validate_document`] against the submitted
 /// ADF payload and, if a violation is found, returns
 /// [`AtlassianError::ApiRequestFailedWithDiagnosis`] with the first violation
-/// and a matching hint from [`hint_for`]. All other status codes (and 500
-/// responses with no detected violation) fall back to the existing
+/// and a matching hint from [`adf_hints::hint_for`]. All other status codes
+/// (and 500 responses with no detected violation) fall back to the existing
 /// [`AtlassianError::ApiRequestFailed`] format.
 fn confluence_write_error(status: u16, body: String, body_adf: &AdfDocument) -> anyhow::Error {
     if status == 500 {
         if let Some(violation) = adf_schema::validate_document(body_adf).into_iter().next() {
-            let hint = hint_for(&violation.parent_type, &violation.child_type).map(str::to_string);
+            let hint = adf_hints::hint_for(&violation).map(str::to_string);
             return AtlassianError::ApiRequestFailedWithDiagnosis {
                 body,
                 diagnosis: violation,
@@ -1730,65 +1704,6 @@ mod tests {
             AtlassianClient::new("https://org.atlassian.net", "user@test.com", "token").unwrap();
         let api = ConfluenceApi::new(client);
         assert_eq!(api.backend_name(), "confluence");
-    }
-
-    #[test]
-    fn hint_for_panel_children() {
-        assert!(hint_for("panel", "expand")
-            .unwrap()
-            .contains("invert the nesting"));
-        assert!(hint_for("panel", "nestedExpand")
-            .unwrap()
-            .contains("invert the nesting"));
-    }
-
-    #[test]
-    fn hint_for_expand_self_nesting() {
-        assert!(hint_for("expand", "expand")
-            .unwrap()
-            .contains("expand cannot contain another expand"));
-        assert!(hint_for("expand", "nestedExpand")
-            .unwrap()
-            .contains("expand cannot contain another expand"));
-    }
-
-    #[test]
-    fn hint_for_nested_expand_self_nesting() {
-        assert!(hint_for("nestedExpand", "expand")
-            .unwrap()
-            .contains("nestedExpand cannot contain another expand"));
-        assert!(hint_for("nestedExpand", "nestedExpand")
-            .unwrap()
-            .contains("nestedExpand cannot contain another expand"));
-    }
-
-    #[test]
-    fn hint_for_table_cells() {
-        assert!(hint_for("tableCell", "expand")
-            .unwrap()
-            .contains("nestedExpand"));
-        assert!(hint_for("tableHeader", "expand")
-            .unwrap()
-            .contains("nestedExpand"));
-    }
-
-    #[test]
-    fn hint_for_blockquote_children() {
-        for child in &["expand", "nestedExpand", "panel", "table"] {
-            assert!(
-                hint_for("blockquote", child)
-                    .unwrap()
-                    .contains("blockquote does not allow this child"),
-                "missing hint for blockquote/{child}"
-            );
-        }
-    }
-
-    #[test]
-    fn hint_for_unknown_pair_returns_none() {
-        assert!(hint_for("paragraph", "text").is_none());
-        assert!(hint_for("doc", "panel").is_none());
-        assert!(hint_for("madeUp", "alsoMadeUp").is_none());
     }
 
     #[test]

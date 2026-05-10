@@ -42,25 +42,37 @@ impl std::fmt::Display for AdfValidationError {
                 out.push_str("\n\n");
             }
             let path = v
-                .path
+                .path()
                 .iter()
                 .map(usize::to_string)
                 .collect::<Vec<_>>()
                 .join("/");
-            out.push_str(&format!(
-                "invalid ADF nesting — `{}` cannot be a child of `{}` at /{}.\n",
-                v.child_type, v.parent_type, path
-            ));
-            let hint = hint_for(&v.parent_type, &v.child_type).map_or_else(
-                || {
-                    format!(
-                        "hint: restructure the document so `{}` is not a direct child of `{}`.",
-                        v.child_type, v.parent_type
-                    )
-                },
-                |h| format!("hint: {h}"),
-            );
-            out.push_str(&hint);
+            match v {
+                AdfSchemaViolation::DisallowedChild {
+                    child_type,
+                    parent_type,
+                    ..
+                } => {
+                    out.push_str(&format!(
+                        "invalid ADF nesting — `{child_type}` cannot be a child of `{parent_type}` at /{path}.\n",
+                    ));
+                    let hint = hint_for(parent_type, child_type).map_or_else(
+                        || {
+                            format!(
+                                "hint: restructure the document so `{child_type}` is not a direct child of `{parent_type}`.",
+                            )
+                        },
+                        |h| format!("hint: {h}"),
+                    );
+                    out.push_str(&hint);
+                }
+                AdfSchemaViolation::Arity { .. } => {
+                    out.push_str(&format!("invalid ADF nesting — {v}.\n"));
+                    out.push_str(
+                        "hint: adjust the number of children to match the schema's quantifier.",
+                    );
+                }
+            }
         }
         f.write_str(&out)
     }
@@ -292,15 +304,20 @@ mod tests {
 
     #[test]
     fn try_new_rejects_panel_with_expand() {
-        // Issue #714 reproducer.
+        // Issue #714 reproducer. Since arity checking landed in #733, an
+        // empty `expand` (and the panel that lacks any valid children)
+        // also generate Arity violations — assertion is on the
+        // disallowed-child case, the one the user cares about.
         let d = doc(vec![AdfNode::panel(
             "info",
             vec![AdfNode::expand(None, vec![])],
         )]);
         let err = ValidatedAdfDocument::try_new(d).unwrap_err();
-        assert_eq!(err.violations.len(), 1);
-        assert_eq!(err.violations[0].child_type, "expand");
-        assert_eq!(err.violations[0].parent_type, "panel");
+        assert!(err.violations.iter().any(|v| matches!(
+            v,
+            AdfSchemaViolation::DisallowedChild { child_type, parent_type, .. }
+                if child_type == "expand" && parent_type == "panel"
+        )));
     }
 
     #[test]
@@ -309,18 +326,20 @@ mod tests {
             AdfNode::table_cell(vec![AdfNode::expand(None, vec![])]),
         ])])]);
         let err = ValidatedAdfDocument::try_new(d).unwrap_err();
-        assert!(err
-            .violations
-            .iter()
-            .any(|v| v.child_type == "expand" && v.parent_type == "tableCell"));
+        assert!(err.violations.iter().any(|v| matches!(
+            v,
+            AdfSchemaViolation::DisallowedChild { child_type, parent_type, .. }
+                if child_type == "expand" && parent_type == "tableCell"
+        )));
     }
 
     #[test]
     fn try_new_allows_expand_inside_layout_column() {
-        let d = doc(vec![AdfNode::layout_section(vec![AdfNode::layout_column(
-            100,
-            vec![AdfNode::expand(None, vec![])],
-        )])]);
+        // layoutSection requires 2..=3 columns (Range quantifier) and the
+        // expand needs ≥1 child, so the document is composed accordingly.
+        let inner = || AdfNode::paragraph(vec![AdfNode::text("x")]);
+        let column = || AdfNode::layout_column(50, vec![AdfNode::expand(None, vec![inner()])]);
+        let d = doc(vec![AdfNode::layout_section(vec![column(), column()])]);
         assert!(ValidatedAdfDocument::try_new(d).is_ok());
     }
 
