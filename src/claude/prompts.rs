@@ -180,6 +180,30 @@ TYPE SELECTION RULES (must match the commit checker's expectations):
    - Changing doc comments or help text in source code is `refactor` or `fix`, not `docs`
 3. Before finalizing, verify: would the commit checker accept this type given the files that changed?
 
+BREAKING CHANGE DETECTION (MANDATORY):
+The commit checker enforces breaking-change markers at ERROR severity. You MUST detect breaking changes from the diff and emit BOTH markers when any of these signals appear:
+
+DIFF SIGNALS — flag as a breaking change when the diff shows ANY of:
+- A new MANDATORY parameter on a public function, public method, or pub trait method (no default, callers must update)
+- A new MANDATORY field on a public struct/enum used in a public API or serialization format
+- A removed, renamed, or re-typed public API (function, method, struct, enum variant, trait, type alias, public constant)
+- A new required CLI flag/argument, or removal/rename of an existing one
+- A change to an MCP tool schema that removes or renames a parameter, makes an optional parameter required, or changes a parameter's type
+- A change to a serialization format, file format, schema, or wire protocol that older readers cannot parse
+- A default-behavior change that breaks non-interactive callers (e.g., a command that previously ran silently now prompts by default; a default value that callers depended on changed)
+- A bumped MSRV, removed feature flag, or removed dependency that was part of the public API surface
+
+REQUIRED OUTPUTS — when ANY signal above is detected, the commit message MUST contain BOTH:
+1. A `!` immediately after the type/scope and before the colon — e.g. `feat(cli)!: change output format` or `feat(api,cli)!: drop legacy flag`
+2. A `BREAKING CHANGE:` footer (uppercase, exactly that label, followed by a colon) at the bottom of the body, separated from preceding paragraphs by a blank line, containing CONCRETE migration instructions — what callers must do, not just that something broke
+
+WRONG: `feat(cli): change output format` (missing `!` and footer despite removed flag)
+WRONG: `feat(cli)!: change output format` (has `!` but no `BREAKING CHANGE:` footer)
+WRONG: `feat(cli)!: change output format\n\nBREAKING CHANGE: output format changed` (footer is vacuous; no migration guidance)
+RIGHT: `feat(cli)!: drop --legacy-output flag\n\nBREAKING CHANGE: the --legacy-output flag has been removed. Callers should pass --format=json instead; the JSON shape is documented in docs/output-format.md.`
+
+If the diff contains NONE of the signals above, do NOT emit `!` or a `BREAKING CHANGE:` footer — these markers are reserved for actual breaking changes and devalue when applied to non-breaking commits.
+
 CRITICAL OUTPUT REQUIREMENT: Return exactly one amendment per commit in the input `commits[]` array — no more, no fewer. Count the entries in `commits[]` and produce that many amendments. Each amendment's `commit` field must match a hash that appears in the input. DO NOT invent additional amendments, duplicate a commit hash across multiple amendments, or omit any input commit. If a commit message is already perfect, include it unchanged with its original hash.
 
 CRITICAL RESPONSE FORMAT: You MUST respond with ONLY valid YAML content. Do not include any explanatory text, markdown wrappers, or code blocks. Your entire response must be parseable YAML starting immediately with "amendments:" and containing nothing else.
@@ -1571,6 +1595,50 @@ mod tests {
     fn basic_system_prompt_not_empty() {
         assert!(BASIC_SYSTEM_PROMPT.len() > 100);
         assert!(BASIC_SYSTEM_PROMPT.contains("amendments:"));
+    }
+
+    #[test]
+    fn basic_system_prompt_mentions_breaking_changes() {
+        assert!(BASIC_SYSTEM_PROMPT.contains("BREAKING CHANGE DETECTION"));
+    }
+
+    #[test]
+    fn basic_system_prompt_lists_breaking_change_signals() {
+        for signal in [
+            "MANDATORY parameter",
+            "removed, renamed",
+            "CLI flag",
+            "MCP tool schema",
+            "serialization format",
+            "default-behavior change",
+        ] {
+            assert!(
+                BASIC_SYSTEM_PROMPT.contains(signal),
+                "BASIC_SYSTEM_PROMPT missing breaking-change signal: {signal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn basic_system_prompt_requires_both_breaking_markers() {
+        assert!(
+            BASIC_SYSTEM_PROMPT.contains("`!` immediately after the type/scope"),
+            "BASIC_SYSTEM_PROMPT must require `!` after type/scope"
+        );
+        assert!(
+            BASIC_SYSTEM_PROMPT.contains("`BREAKING CHANGE:` footer"),
+            "BASIC_SYSTEM_PROMPT must require BREAKING CHANGE: footer"
+        );
+    }
+
+    #[test]
+    fn contextual_system_prompt_inherits_breaking_change_block() {
+        let context = make_context();
+        let prompt = generate_contextual_system_prompt(&context);
+        assert!(
+            prompt.contains("BREAKING CHANGE DETECTION"),
+            "contextual system prompt must inherit BREAKING CHANGE DETECTION block from BASIC_SYSTEM_PROMPT"
+        );
     }
 
     #[test]
