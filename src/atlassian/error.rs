@@ -3,6 +3,7 @@
 use thiserror::Error;
 
 use crate::atlassian::adf_schema::AdfSchemaViolation;
+use crate::atlassian::adf_validated::AdfValidationError;
 
 /// Errors that can occur during Atlassian operations.
 #[derive(Error, Debug)]
@@ -44,6 +45,10 @@ pub enum AtlassianError {
     /// An error occurred during ADF conversion.
     #[error("ADF conversion error: {0}")]
     ConversionError(String),
+
+    /// The converted ADF document violates Confluence's nesting constraints.
+    #[error("{0}")]
+    InvalidAdfNesting(#[from] AdfValidationError),
 }
 
 fn format_diagnosis(diagnosis: &AdfSchemaViolation, hint: Option<&str>) -> String {
@@ -130,5 +135,20 @@ mod tests {
         assert!(msg.contains("`table`"));
         assert!(msg.contains("`nestedExpand`"));
         assert!(!msg.contains("Hint:"));
+    }
+
+    #[test]
+    fn invalid_adf_nesting_display_includes_violations() {
+        let err = AtlassianError::InvalidAdfNesting(AdfValidationError {
+            violations: vec![AdfSchemaViolation {
+                parent_type: "panel".to_string(),
+                child_type: "expand".to_string(),
+                path: vec![0, 0],
+            }],
+        });
+        let msg = err.to_string();
+        assert!(msg.contains("invalid ADF nesting"));
+        assert!(msg.contains("`expand` cannot be a child of `panel`"));
+        assert!(msg.contains("hint: invert the nesting"));
     }
 }
