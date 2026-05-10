@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::atlassian::client::{AtlassianClient, JiraIssueLink, JiraLinkType};
+use crate::cli::atlassian::confirm::{guard_destructive, GuardOptions, GuardOutcome};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -108,13 +109,35 @@ pub struct RemoveLinkCommand {
     /// Link ID to remove.
     #[arg(long)]
     pub link_id: String,
+
+    /// Skips the confirmation prompt.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Prints what would be removed without making any API calls.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 impl RemoveLinkCommand {
     /// Removes the issue link.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        run_remove_link(&client, &self.link_id).await
+
+        let prompt = format!("Remove link {}? [y/N] ", self.link_id);
+        let dry_run_message = format!("Would remove link {}.", self.link_id);
+
+        let outcome = guard_destructive(&GuardOptions {
+            prompt: &prompt,
+            dry_run_message: &dry_run_message,
+            force: self.force,
+            dry_run: self.dry_run,
+        })?;
+
+        match outcome {
+            GuardOutcome::Proceed => run_remove_link(&client, &self.link_id).await,
+            GuardOutcome::Cancelled | GuardOutcome::DryRun => Ok(()),
+        }
     }
 }
 
@@ -405,9 +428,22 @@ mod tests {
         let cmd = LinkCommand {
             command: LinkSubcommands::Remove(RemoveLinkCommand {
                 link_id: "12345".to_string(),
+                force: true,
+                dry_run: false,
             }),
         };
         assert!(matches!(cmd.command, LinkSubcommands::Remove(_)));
+    }
+
+    #[test]
+    fn remove_link_command_dry_run_field_default_false() {
+        let cmd = RemoveLinkCommand {
+            link_id: "12345".to_string(),
+            force: false,
+            dry_run: false,
+        };
+        assert!(!cmd.force);
+        assert!(!cmd.dry_run);
     }
 
     #[test]
