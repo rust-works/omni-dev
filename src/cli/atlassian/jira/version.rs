@@ -1,0 +1,641 @@
+//! CLI commands for JIRA project versions (release versions).
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+
+use crate::atlassian::client::{AtlassianClient, JiraProjectVersionList};
+use crate::cli::atlassian::format::{output_as, OutputFormat};
+use crate::cli::atlassian::helpers::create_client;
+
+/// Manages JIRA project versions (release versions).
+#[derive(Parser)]
+pub struct VersionCommand {
+    /// The version subcommand to execute.
+    #[command(subcommand)]
+    pub command: VersionSubcommands,
+}
+
+/// Version subcommands.
+#[derive(Subcommand)]
+pub enum VersionSubcommands {
+    /// Lists versions for a project.
+    List(ListCommand),
+    /// Creates a new project version.
+    Create(CreateCommand),
+}
+
+impl VersionCommand {
+    /// Executes the version command.
+    pub async fn execute(self) -> Result<()> {
+        match self.command {
+            VersionSubcommands::List(cmd) => cmd.execute().await,
+            VersionSubcommands::Create(cmd) => cmd.execute().await,
+        }
+    }
+}
+
+/// Lists versions for a JIRA project.
+#[derive(Parser)]
+pub struct ListCommand {
+    /// Project key (e.g., "PROJ").
+    #[arg(long)]
+    pub project: String,
+
+    /// Show only released versions.
+    #[arg(long, conflicts_with = "unreleased")]
+    pub released: bool,
+
+    /// Show only unreleased versions.
+    #[arg(long, conflicts_with = "released")]
+    pub unreleased: bool,
+
+    /// Show only archived versions.
+    #[arg(long, conflicts_with = "unarchived")]
+    pub archived: bool,
+
+    /// Show only non-archived versions.
+    #[arg(long, conflicts_with = "archived")]
+    pub unarchived: bool,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
+impl ListCommand {
+    /// Fetches and displays versions.
+    pub async fn execute(self) -> Result<()> {
+        let (client, _instance_url) = create_client()?;
+        run_list_versions(
+            &client,
+            &self.project,
+            tri_state(self.released, self.unreleased),
+            tri_state(self.archived, self.unarchived),
+            &self.output,
+        )
+        .await
+    }
+}
+
+/// Creates a new version on a JIRA project.
+#[derive(Parser)]
+pub struct CreateCommand {
+    /// Project key (e.g., "PROJ").
+    #[arg(long)]
+    pub project: String,
+
+    /// Version name (e.g., "1.0.0").
+    #[arg(long)]
+    pub name: String,
+
+    /// Version description.
+    #[arg(long)]
+    pub description: Option<String>,
+
+    /// Release date (ISO 8601, "YYYY-MM-DD").
+    #[arg(long)]
+    pub release_date: Option<String>,
+
+    /// Start date (ISO 8601, "YYYY-MM-DD").
+    #[arg(long)]
+    pub start_date: Option<String>,
+
+    /// Mark the version as released.
+    #[arg(long)]
+    pub released: bool,
+
+    /// Mark the version as archived.
+    #[arg(long)]
+    pub archived: bool,
+}
+
+impl CreateCommand {
+    /// Creates the version.
+    pub async fn execute(self) -> Result<()> {
+        let (client, _instance_url) = create_client()?;
+        run_create_version(
+            &client,
+            &self.project,
+            &self.name,
+            self.description.as_deref(),
+            self.release_date.as_deref(),
+            self.start_date.as_deref(),
+            self.released,
+            self.archived,
+        )
+        .await
+    }
+}
+
+/// Folds a pair of mutually-exclusive boolean flags into a tri-state filter:
+/// `Some(true)` for the positive flag, `Some(false)` for the negative,
+/// `None` when neither was passed.
+fn tri_state(yes: bool, no: bool) -> Option<bool> {
+    match (yes, no) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    }
+}
+
+async fn run_list_versions(
+    client: &AtlassianClient,
+    project: &str,
+    released: Option<bool>,
+    archived: Option<bool>,
+    output: &OutputFormat,
+) -> Result<()> {
+    let result = client
+        .get_project_versions(project, released, archived)
+        .await?;
+    if output_as(&result, output)? {
+        return Ok(());
+    }
+    print_versions(&result);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_create_version(
+    client: &AtlassianClient,
+    project: &str,
+    name: &str,
+    description: Option<&str>,
+    release_date: Option<&str>,
+    start_date: Option<&str>,
+    released: bool,
+    archived: bool,
+) -> Result<()> {
+    let version = client
+        .create_project_version(
+            project,
+            name,
+            description,
+            release_date,
+            start_date,
+            released,
+            archived,
+        )
+        .await?;
+    println!("Created version {} (id: {}).", version.name, version.id);
+    Ok(())
+}
+
+/// Prints versions as a formatted table.
+fn print_versions(result: &JiraProjectVersionList) {
+    if result.versions.is_empty() {
+        println!("No versions found.");
+        return;
+    }
+
+    let id_width = result
+        .versions
+        .iter()
+        .map(|v| v.id.len())
+        .max()
+        .unwrap_or(2)
+        .max(2);
+    let name_width = result
+        .versions
+        .iter()
+        .map(|v| v.name.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+
+    println!(
+        "{:<id_width$}  {:<name_width$}  RELEASED  ARCHIVED  RELEASE     DESCRIPTION",
+        "ID", "NAME"
+    );
+    let desc_sep = "-".repeat(11);
+    println!(
+        "{:<id_width$}  {:<name_width$}  --------  --------  ----------  {desc_sep}",
+        "-".repeat(id_width),
+        "-".repeat(name_width),
+    );
+
+    for v in &result.versions {
+        let release = format_date(v.release_date.as_deref());
+        let description = v.description.as_deref().unwrap_or("-");
+        println!(
+            "{:<id_width$}  {:<name_width$}  {:<8}  {:<8}  {:<10}  {}",
+            v.id,
+            v.name,
+            yes_no(v.released),
+            yes_no(v.archived),
+            release,
+            description,
+        );
+    }
+}
+
+fn yes_no(b: bool) -> &'static str {
+    if b {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn format_date(date: Option<&str>) -> &str {
+    match date {
+        Some(d) if d.len() >= 10 => &d[..10],
+        Some(d) => d,
+        None => "-",
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::atlassian::client::JiraProjectVersion;
+
+    fn sample_version(
+        id: &str,
+        name: &str,
+        released: bool,
+        archived: bool,
+        release_date: Option<&str>,
+    ) -> JiraProjectVersion {
+        JiraProjectVersion {
+            id: id.to_string(),
+            name: name.to_string(),
+            description: None,
+            project_key: "PROJ".to_string(),
+            released,
+            archived,
+            release_date: release_date.map(String::from),
+            start_date: None,
+        }
+    }
+
+    fn mock_client(base_url: &str) -> AtlassianClient {
+        AtlassianClient::new(base_url, "user@test.com", "token").unwrap()
+    }
+
+    // ── tri_state ──────────────────────────────────────────────────
+
+    #[test]
+    fn tri_state_neither() {
+        assert_eq!(tri_state(false, false), None);
+    }
+
+    #[test]
+    fn tri_state_yes() {
+        assert_eq!(tri_state(true, false), Some(true));
+    }
+
+    #[test]
+    fn tri_state_no() {
+        assert_eq!(tri_state(false, true), Some(false));
+    }
+
+    #[test]
+    fn tri_state_yes_wins_when_both_set() {
+        // Clap normally rejects this via conflicts_with; defensive default.
+        assert_eq!(tri_state(true, true), Some(true));
+    }
+
+    // ── format helpers ─────────────────────────────────────────────
+
+    #[test]
+    fn yes_no_true() {
+        assert_eq!(yes_no(true), "yes");
+    }
+
+    #[test]
+    fn yes_no_false() {
+        assert_eq!(yes_no(false), "no");
+    }
+
+    #[test]
+    fn format_date_full_iso() {
+        assert_eq!(format_date(Some("2026-04-01T00:00:00.000Z")), "2026-04-01");
+    }
+
+    #[test]
+    fn format_date_just_date() {
+        assert_eq!(format_date(Some("2026-04-01")), "2026-04-01");
+    }
+
+    #[test]
+    fn format_date_short() {
+        assert_eq!(format_date(Some("2026")), "2026");
+    }
+
+    #[test]
+    fn format_date_none() {
+        assert_eq!(format_date(None), "-");
+    }
+
+    // ── print_versions ─────────────────────────────────────────────
+
+    #[test]
+    fn print_versions_empty() {
+        let result = JiraProjectVersionList {
+            versions: vec![],
+            total: 0,
+        };
+        print_versions(&result);
+    }
+
+    #[test]
+    fn print_versions_with_data() {
+        let result = JiraProjectVersionList {
+            versions: vec![
+                sample_version("10000", "1.0.0", true, false, Some("2026-04-01")),
+                sample_version("10001", "1.1.0", false, false, None),
+            ],
+            total: 2,
+        };
+        print_versions(&result);
+    }
+
+    // ── dispatch ───────────────────────────────────────────────────
+
+    #[test]
+    fn version_command_list_variant() {
+        let cmd = VersionCommand {
+            command: VersionSubcommands::List(ListCommand {
+                project: "PROJ".to_string(),
+                released: false,
+                unreleased: false,
+                archived: false,
+                unarchived: false,
+                output: OutputFormat::Table,
+            }),
+        };
+        assert!(matches!(cmd.command, VersionSubcommands::List(_)));
+    }
+
+    #[test]
+    fn version_command_create_variant() {
+        let cmd = VersionCommand {
+            command: VersionSubcommands::Create(CreateCommand {
+                project: "PROJ".to_string(),
+                name: "1.0.0".to_string(),
+                description: None,
+                release_date: None,
+                start_date: None,
+                released: false,
+                archived: false,
+            }),
+        };
+        assert!(matches!(cmd.command, VersionSubcommands::Create(_)));
+    }
+
+    // ── run_* version functions ────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_list_versions_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/project/PROJ/versions",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"id": "1", "name": "1.0", "released": true, "archived": false}
+                ])),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(
+            run_list_versions(&client, "PROJ", None, None, &OutputFormat::Table)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_list_versions_yaml_output_returns_early() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/project/PROJ/versions",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"id": "1", "name": "1.0", "released": true, "archived": false}
+                ])),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        // Yaml output path branches before print_versions, exercising the
+        // `if output_as { return Ok(()); }` early return.
+        assert!(
+            run_list_versions(&client, "PROJ", None, None, &OutputFormat::Yaml)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_list_versions_with_filter() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/project/PROJ/versions",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"id": "1", "name": "1.0", "released": true, "archived": false},
+                    {"id": "2", "name": "2.0", "released": false, "archived": false},
+                ])),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(
+            run_list_versions(&client, "PROJ", Some(true), None, &OutputFormat::Table)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_list_versions_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/project/NONE/versions",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_list_versions(&client, "NONE", None, None, &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn run_create_version_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/version"))
+            .respond_with(wiremock::ResponseTemplate::new(201).set_body_json(
+                serde_json::json!({"id": "100", "name": "1.0.0", "released": false, "archived": false}),
+            ))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(
+            run_create_version(&client, "PROJ", "1.0.0", None, None, None, false, false)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_create_version_forbidden() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/version"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_create_version(&client, "PROJ", "1.0", None, None, None, false, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn run_create_version_invalid_date() {
+        let server = wiremock::MockServer::start().await;
+        // No mock — request must short-circuit before HTTP.
+        let client = mock_client(&server.uri());
+        let err = run_create_version(
+            &client,
+            "PROJ",
+            "1.0",
+            None,
+            Some("not-a-date"),
+            None,
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("YYYY-MM-DD"));
+    }
+
+    // ── execute() integration via env-injected creds ───────────────
+    //
+    // These tests drive each `*Command::execute()` end-to-end against a
+    // wiremock server by setting `ATLASSIAN_*` env vars so `create_client()`
+    // builds a client pointed at the mock. They share a process-wide mutex
+    // (`AUTH_ENV_MUTEX`) with auth.rs tests to serialise env mutation.
+
+    use crate::atlassian::auth::test_util::EnvGuard;
+
+    #[tokio::test]
+    async fn version_command_execute_list_dispatches_through_create_client() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/project/PROJ/versions",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"id": "1", "name": "1.0", "released": false, "archived": false}
+                ])),
+            )
+            .mount(&server)
+            .await;
+
+        let guard = EnvGuard::take();
+        let _home = guard.set_credentials(&server.uri());
+
+        let cmd = VersionCommand {
+            command: VersionSubcommands::List(ListCommand {
+                project: "PROJ".to_string(),
+                released: false,
+                unreleased: false,
+                archived: false,
+                unarchived: false,
+                output: OutputFormat::Yaml,
+            }),
+        };
+        assert!(cmd.execute().await.is_ok());
+    }
+
+    /// Exercises the `?` Err path on `create_client()` in
+    /// `ListCommand::execute` by clearing all credential env vars before
+    /// calling.
+    #[tokio::test]
+    async fn list_command_execute_propagates_create_client_error() {
+        let guard = EnvGuard::take();
+        let _home = guard.clear_credentials();
+
+        let cmd = ListCommand {
+            project: "PROJ".to_string(),
+            released: false,
+            unreleased: false,
+            archived: false,
+            unarchived: false,
+            output: OutputFormat::Yaml,
+        };
+        assert!(cmd.execute().await.is_err());
+    }
+
+    /// Exercises the `?` Err path on `create_client()` in
+    /// `CreateCommand::execute` by clearing all credential env vars before
+    /// calling.
+    #[tokio::test]
+    async fn create_command_execute_propagates_create_client_error() {
+        let guard = EnvGuard::take();
+        let _home = guard.clear_credentials();
+
+        let cmd = CreateCommand {
+            project: "PROJ".to_string(),
+            name: "1.0.0".to_string(),
+            description: None,
+            release_date: None,
+            start_date: None,
+            released: false,
+            archived: false,
+        };
+        assert!(cmd.execute().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn version_command_execute_create_dispatches_through_create_client() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/version"))
+            .respond_with(wiremock::ResponseTemplate::new(201).set_body_json(
+                serde_json::json!({"id": "100", "name": "1.0.0", "released": false, "archived": false}),
+            ))
+            .mount(&server)
+            .await;
+
+        let guard = EnvGuard::take();
+        let _home = guard.set_credentials(&server.uri());
+
+        let cmd = VersionCommand {
+            command: VersionSubcommands::Create(CreateCommand {
+                project: "PROJ".to_string(),
+                name: "1.0.0".to_string(),
+                description: None,
+                release_date: None,
+                start_date: None,
+                released: false,
+                archived: false,
+            }),
+        };
+        assert!(cmd.execute().await.is_ok());
+    }
+}

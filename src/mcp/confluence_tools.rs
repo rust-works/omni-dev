@@ -1200,10 +1200,11 @@ mod tests {
 
     /// Serialize env-backed tests — `create_client()` reads process-wide
     /// environment variables, so concurrent tests would race without a lock.
+    /// Routes through the crate-wide `AUTH_ENV_MUTEX` so we don't race
+    /// against env-mutating tests in other Atlassian-touching modules.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::Mutex;
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock()
+        crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 

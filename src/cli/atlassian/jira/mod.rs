@@ -16,6 +16,7 @@ pub(crate) mod search;
 pub(crate) mod sprint;
 pub(crate) mod transition;
 pub(crate) mod user;
+pub(crate) mod version;
 pub(crate) mod watcher;
 pub(crate) mod worklog;
 pub(crate) mod write;
@@ -72,6 +73,8 @@ pub enum JiraSubcommands {
     Worklog(worklog::WorklogCommand),
     /// JIRA user operations (search by name or email).
     User(user::UserCommand),
+    /// Manages JIRA project versions (release versions).
+    Version(version::VersionCommand),
 }
 
 impl JiraCommand {
@@ -97,6 +100,7 @@ impl JiraCommand {
             JiraSubcommands::Watcher(cmd) => cmd.execute().await,
             JiraSubcommands::Worklog(cmd) => cmd.execute().await,
             JiraSubcommands::User(cmd) => cmd.execute().await,
+            JiraSubcommands::Version(cmd) => cmd.execute().await,
         }
     }
 }
@@ -365,5 +369,60 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, JiraSubcommands::User(_)));
+    }
+
+    #[test]
+    fn jira_subcommands_version_variant() {
+        let cmd = JiraCommand {
+            command: JiraSubcommands::Version(version::VersionCommand {
+                command: version::VersionSubcommands::List(version::ListCommand {
+                    project: "PROJ".to_string(),
+                    released: false,
+                    unreleased: false,
+                    archived: false,
+                    unarchived: false,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        assert!(matches!(cmd.command, JiraSubcommands::Version(_)));
+    }
+
+    /// Drives `JiraCommand::execute` end-to-end through the new `Version`
+    /// arm so the dispatch line in the match block is exercised. Other
+    /// arms remain pre-existing convention gaps.
+    #[tokio::test]
+    async fn jira_command_execute_version_arm() {
+        use crate::atlassian::auth::test_util::EnvGuard;
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/project/PROJ/versions",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"id": "1", "name": "1.0", "released": false, "archived": false}
+                ])),
+            )
+            .mount(&server)
+            .await;
+
+        let guard = EnvGuard::take();
+        let _home = guard.set_credentials(&server.uri());
+
+        let cmd = JiraCommand {
+            command: JiraSubcommands::Version(version::VersionCommand {
+                command: version::VersionSubcommands::List(version::ListCommand {
+                    project: "PROJ".to_string(),
+                    released: false,
+                    unreleased: false,
+                    archived: false,
+                    unarchived: false,
+                    output: OutputFormat::Yaml,
+                }),
+            }),
+        };
+        assert!(cmd.execute().await.is_ok());
     }
 }

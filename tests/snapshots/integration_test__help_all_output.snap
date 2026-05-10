@@ -809,6 +809,7 @@ Commands:
   watcher     Manages watchers on a JIRA issue
   worklog     Manages worklogs (time tracking) on a JIRA issue
   user        JIRA user operations (search by name or email)
+  version     Manages JIRA project versions (release versions)
   help        Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1461,6 +1462,60 @@ Options:
       --limit <LIMIT>    Maximum number of results, 0 for unlimited (default: 25) [default: 25]
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian jira version - Manages JIRA project versions (release versions)
+
+Manages JIRA project versions (release versions)
+
+Usage: version <COMMAND>
+
+Commands:
+  list    Lists versions for a project
+  create  Creates a new project version
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian jira version create - Creates a new project version
+
+Creates a new project version
+
+Usage: create [OPTIONS] --project <PROJECT> --name <NAME>
+
+Options:
+      --project <PROJECT>            Project key (e.g., "PROJ")
+      --name <NAME>                  Version name (e.g., "1.0.0")
+      --description <DESCRIPTION>    Version description
+      --release-date <RELEASE_DATE>  Release date (ISO 8601, "YYYY-MM-DD")
+      --start-date <START_DATE>      Start date (ISO 8601, "YYYY-MM-DD")
+      --released                     Mark the version as released
+      --archived                     Mark the version as archived
+  -h, --help                         Print help
+
+
+================================================================================
+
+omni-dev atlassian jira version list - Lists versions for a project
+
+Lists versions for a project
+
+Usage: list [OPTIONS] --project <PROJECT>
+
+Options:
+      --project <PROJECT>  Project key (e.g., "PROJ")
+      --released           Show only released versions
+      --unreleased         Show only unreleased versions
+      --archived           Show only archived versions
+      --unarchived         Show only non-archived versions
+  -o, --output <OUTPUT>    Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help               Print help (see more with '--help')
 
 
 ================================================================================

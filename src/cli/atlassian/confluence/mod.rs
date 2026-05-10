@@ -311,7 +311,14 @@ mod tests {
     /// downstream call is reached. The subsequent API call is allowed to
     /// fail — we only care that the dispatch line runs.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn confluence_command_execute_children_dispatch() {
+        // Routes through the crate-wide `AUTH_ENV_MUTEX` so the env-var
+        // mutation doesn't race against other Atlassian-touching tests.
+        let _lock = crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         std::env::set_var("ATLASSIAN_INSTANCE_URL", "http://127.0.0.1:1");
         std::env::set_var("ATLASSIAN_EMAIL", "test@example.com");
         std::env::set_var("ATLASSIAN_API_TOKEN", "fake-token");
