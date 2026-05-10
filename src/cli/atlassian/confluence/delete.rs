@@ -1,11 +1,13 @@
 //! CLI command for deleting Confluence pages.
 
+use std::io::{self, BufRead, Write};
+
 use anyhow::Result;
 use clap::Parser;
 
 use crate::atlassian::api::AtlassianApi;
 use crate::atlassian::confluence_api::ConfluenceApi;
-use crate::cli::atlassian::confirm::{guard_destructive, GuardOptions, GuardOutcome};
+use crate::cli::atlassian::confirm::{guard_destructive_with_io, GuardOptions, GuardOutcome};
 use crate::cli::atlassian::helpers::create_client;
 
 /// Deletes a Confluence page.
@@ -32,7 +34,20 @@ impl DeleteCommand {
     pub async fn execute(self) -> Result<()> {
         let (client, instance_url) = create_client()?;
         let api = ConfluenceApi::new(client);
+        let mut reader = io::BufReader::new(io::stdin());
+        let mut writer = io::stdout();
+        self.execute_with_io(&api, &instance_url, &mut reader, &mut writer)
+            .await
+    }
 
+    /// Inner form taking explicit API, instance URL, and IO handles, for unit tests.
+    async fn execute_with_io(
+        self,
+        api: &ConfluenceApi,
+        instance_url: &str,
+        reader: &mut (dyn BufRead + Send),
+        writer: &mut (dyn Write + Send),
+    ) -> Result<()> {
         if !self.force || self.dry_run {
             let item = api.get_content(&self.id).await?;
             let suffix = if self.purge { " (purge)" } else { "" };
@@ -40,12 +55,16 @@ impl DeleteCommand {
             let dry_run_message =
                 format!("Would delete page {} ({}){}.", self.id, item.title, suffix);
 
-            let outcome = guard_destructive(&GuardOptions {
-                prompt: &prompt,
-                dry_run_message: &dry_run_message,
-                force: self.force,
-                dry_run: self.dry_run,
-            })?;
+            let outcome = guard_destructive_with_io(
+                &GuardOptions {
+                    prompt: &prompt,
+                    dry_run_message: &dry_run_message,
+                    force: self.force,
+                    dry_run: self.dry_run,
+                },
+                reader,
+                writer,
+            )?;
 
             match outcome {
                 GuardOutcome::Cancelled | GuardOutcome::DryRun => return Ok(()),
@@ -54,7 +73,7 @@ impl DeleteCommand {
         }
 
         api.delete_page(&self.id, self.purge).await?;
-        println!("Deleted page {} from {}.", self.id, instance_url);
+        writeln!(writer, "Deleted page {} from {}.", self.id, instance_url)?;
 
         Ok(())
     }
@@ -64,6 +83,37 @@ impl DeleteCommand {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::atlassian::client::AtlassianClient;
+    use std::io::Cursor;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn setup_mock() -> (MockServer, ConfluenceApi) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/wiki/api/v2/pages/12345"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "12345",
+                "title": "Architecture Overview",
+                "status": "current",
+                "spaceId": "98765",
+                "version": {"number": 1},
+                "body": {"atlas_doc_format": {"value": "{\"version\":1,\"type\":\"doc\",\"content\":[]}"}},
+                "parentId": null
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/wiki/api/v2/spaces/98765"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"key": "ENG"})),
+            )
+            .mount(&server)
+            .await;
+        let client = AtlassianClient::new(&server.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        (server, api)
+    }
 
     #[test]
     fn delete_command_struct_fields() {
@@ -110,5 +160,169 @@ mod tests {
             purge: true,
         };
         assert!(cmd.purge);
+    }
+
+    #[tokio::test]
+    async fn execute_with_force_calls_delete() {
+        let (server, api) = setup_mock().await;
+        Mock::given(method("DELETE"))
+            .and(path("/wiki/api/v2/pages/12345"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cmd = DeleteCommand {
+            id: "12345".to_string(),
+            force: true,
+            dry_run: false,
+            purge: false,
+        };
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(
+            &api,
+            "https://example.atlassian.net",
+            &mut input,
+            &mut output,
+        )
+        .await
+        .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Deleted page 12345"));
+    }
+
+    #[tokio::test]
+    async fn execute_with_dry_run_does_not_call_delete() {
+        let (_server, api) = setup_mock().await;
+
+        let cmd = DeleteCommand {
+            id: "12345".to_string(),
+            force: false,
+            dry_run: true,
+            purge: false,
+        };
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(
+            &api,
+            "https://example.atlassian.net",
+            &mut input,
+            &mut output,
+        )
+        .await
+        .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Would delete page 12345 (Architecture Overview)."));
+        assert!(!out.contains("Deleted page 12345"));
+    }
+
+    #[tokio::test]
+    async fn execute_with_dry_run_and_purge_includes_suffix() {
+        let (_server, api) = setup_mock().await;
+
+        let cmd = DeleteCommand {
+            id: "12345".to_string(),
+            force: false,
+            dry_run: true,
+            purge: true,
+        };
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(
+            &api,
+            "https://example.atlassian.net",
+            &mut input,
+            &mut output,
+        )
+        .await
+        .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("(purge)"));
+    }
+
+    #[tokio::test]
+    async fn execute_with_prompt_yes_calls_delete() {
+        let (server, api) = setup_mock().await;
+        Mock::given(method("DELETE"))
+            .and(path("/wiki/api/v2/pages/12345"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cmd = DeleteCommand {
+            id: "12345".to_string(),
+            force: false,
+            dry_run: false,
+            purge: false,
+        };
+        let mut input = Cursor::new(b"y\n".to_vec());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(
+            &api,
+            "https://example.atlassian.net",
+            &mut input,
+            &mut output,
+        )
+        .await
+        .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Delete page 12345 (Architecture Overview)?"));
+        assert!(out.contains("Deleted page 12345"));
+    }
+
+    #[tokio::test]
+    async fn execute_with_prompt_no_does_not_call_delete() {
+        let (_server, api) = setup_mock().await;
+
+        let cmd = DeleteCommand {
+            id: "12345".to_string(),
+            force: false,
+            dry_run: false,
+            purge: false,
+        };
+        let mut input = Cursor::new(b"n\n".to_vec());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(
+            &api,
+            "https://example.atlassian.net",
+            &mut input,
+            &mut output,
+        )
+        .await
+        .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Cancelled."));
+        assert!(!out.contains("Deleted page 12345"));
+    }
+
+    #[tokio::test]
+    async fn execute_with_force_and_purge_appends_query_param() {
+        let (server, api) = setup_mock().await;
+        Mock::given(method("DELETE"))
+            .and(path("/wiki/api/v2/pages/12345"))
+            .and(query_param("purge", "true"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cmd = DeleteCommand {
+            id: "12345".to_string(),
+            force: true,
+            dry_run: false,
+            purge: true,
+        };
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(
+            &api,
+            "https://example.atlassian.net",
+            &mut input,
+            &mut output,
+        )
+        .await
+        .unwrap();
     }
 }

@@ -3,8 +3,10 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use std::io::{self, BufRead, Write};
+
 use crate::atlassian::confluence_api::{ConfluenceApi, ConfluenceLabel};
-use crate::cli::atlassian::confirm::{guard_destructive, GuardOptions, GuardOutcome};
+use crate::cli::atlassian::confirm::{guard_destructive_with_io, GuardOptions, GuardOutcome};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -129,7 +131,18 @@ impl RemoveCommand {
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
         let api = ConfluenceApi::new(client);
+        let mut reader = io::BufReader::new(io::stdin());
+        let mut writer = io::stdout();
+        self.execute_with_io(&api, &mut reader, &mut writer).await
+    }
 
+    /// Inner form taking explicit API and IO handles, for unit tests.
+    async fn execute_with_io(
+        self,
+        api: &ConfluenceApi,
+        reader: &mut (dyn BufRead + Send),
+        writer: &mut (dyn Write + Send),
+    ) -> Result<()> {
         let joined = self.labels.join(", ");
         let count = self.labels.len();
         let prompt = format!(
@@ -141,32 +154,28 @@ impl RemoveCommand {
             self.id
         );
 
-        let outcome = guard_destructive(&GuardOptions {
-            prompt: &prompt,
-            dry_run_message: &dry_run_message,
-            force: self.force,
-            dry_run: self.dry_run,
-        })?;
+        let outcome = guard_destructive_with_io(
+            &GuardOptions {
+                prompt: &prompt,
+                dry_run_message: &dry_run_message,
+                force: self.force,
+                dry_run: self.dry_run,
+            },
+            reader,
+            writer,
+        )?;
 
         match outcome {
-            GuardOutcome::Proceed => run_remove(&api, &self.id, &self.labels).await,
+            GuardOutcome::Proceed => {
+                for label in &self.labels {
+                    api.remove_label(&self.id, label).await?;
+                }
+                writeln!(writer, "Removed {} label(s) from page {}.", count, self.id)?;
+                Ok(())
+            }
             GuardOutcome::Cancelled | GuardOutcome::DryRun => Ok(()),
         }
     }
-}
-
-/// Removes labels from a page and prints confirmation.
-async fn run_remove(api: &ConfluenceApi, id: &str, labels: &[String]) -> Result<()> {
-    for label in labels {
-        api.remove_label(id, label).await?;
-    }
-    print_remove_confirmation(labels.len(), id);
-    Ok(())
-}
-
-/// Prints confirmation after removing labels.
-fn print_remove_confirmation(count: usize, id: &str) {
-    println!("Removed {count} label(s) from page {id}.");
 }
 
 /// Prints labels as a formatted table.
@@ -310,16 +319,6 @@ mod tests {
         print_add_confirmation(3, "12345");
     }
 
-    #[test]
-    fn print_remove_confirmation_single() {
-        print_remove_confirmation(1, "12345");
-    }
-
-    #[test]
-    fn print_remove_confirmation_multiple() {
-        print_remove_confirmation(2, "12345");
-    }
-
     // ── run_list (wiremock) ──────────────────────────────────
 
     #[tokio::test]
@@ -399,10 +398,16 @@ mod tests {
 
     // ── run_remove (wiremock) ─────────────────────────────────
 
-    #[tokio::test]
-    async fn run_remove_success() {
-        let server = wiremock::MockServer::start().await;
+    fn label_api(server: &wiremock::MockServer) -> ConfluenceApi {
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "u@t.com", "tok")
+                .unwrap();
+        ConfluenceApi::new(client)
+    }
 
+    #[tokio::test]
+    async fn remove_execute_force_calls_api() {
+        let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("DELETE"))
             .and(wiremock::matchers::path(
                 "/wiki/rest/api/content/12345/label/draft",
@@ -412,19 +417,25 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client =
-            crate::atlassian::client::AtlassianClient::new(&server.uri(), "u@t.com", "tok")
-                .unwrap();
-        let api = ConfluenceApi::new(client);
-        assert!(run_remove(&api, "12345", &["draft".to_string()])
+        let api = label_api(&server);
+        let cmd = RemoveCommand {
+            id: "12345".to_string(),
+            labels: vec!["draft".to_string()],
+            force: true,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&api, &mut input, &mut output)
             .await
-            .is_ok());
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Removed 1 label(s) from page 12345."));
     }
 
     #[tokio::test]
-    async fn run_remove_multiple() {
+    async fn remove_execute_force_calls_api_for_each_label() {
         let server = wiremock::MockServer::start().await;
-
         for label in &["draft", "old"] {
             wiremock::Mock::given(wiremock::matchers::method("DELETE"))
                 .and(wiremock::matchers::path(format!(
@@ -436,15 +447,93 @@ mod tests {
                 .await;
         }
 
-        let client =
-            crate::atlassian::client::AtlassianClient::new(&server.uri(), "u@t.com", "tok")
-                .unwrap();
-        let api = ConfluenceApi::new(client);
-        assert!(
-            run_remove(&api, "12345", &["draft".to_string(), "old".to_string()])
-                .await
-                .is_ok()
-        );
+        let api = label_api(&server);
+        let cmd = RemoveCommand {
+            id: "12345".to_string(),
+            labels: vec!["draft".to_string(), "old".to_string()],
+            force: true,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&api, &mut input, &mut output)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Removed 2 label(s) from page 12345."));
+    }
+
+    #[tokio::test]
+    async fn remove_execute_dry_run_skips_api_and_lists_labels() {
+        let server = wiremock::MockServer::start().await;
+        // No mocks: any API call would fail.
+
+        let api = label_api(&server);
+        let cmd = RemoveCommand {
+            id: "12345".to_string(),
+            labels: vec!["draft".to_string(), "old".to_string()],
+            force: false,
+            dry_run: true,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&api, &mut input, &mut output)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Would remove 2 label(s) from page 12345: draft, old."));
+        assert!(!out.contains("Removed"));
+    }
+
+    #[tokio::test]
+    async fn remove_execute_prompt_yes_calls_api() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/label/draft",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let api = label_api(&server);
+        let cmd = RemoveCommand {
+            id: "12345".to_string(),
+            labels: vec!["draft".to_string()],
+            force: false,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(b"y\n".to_vec());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&api, &mut input, &mut output)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Remove 1 label(s) [draft] from page 12345?"));
+        assert!(out.contains("Removed 1 label(s) from page 12345."));
+    }
+
+    #[tokio::test]
+    async fn remove_execute_prompt_no_skips_api() {
+        let server = wiremock::MockServer::start().await;
+        // No mocks: any API call would fail.
+
+        let api = label_api(&server);
+        let cmd = RemoveCommand {
+            id: "12345".to_string(),
+            labels: vec!["draft".to_string()],
+            force: false,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(b"n\n".to_vec());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&api, &mut input, &mut output)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Cancelled."));
+        assert!(!out.contains("Removed"));
     }
 
     // ── AddCommand struct ─────────────────────────────────────────

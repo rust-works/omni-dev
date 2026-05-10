@@ -3,8 +3,10 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use std::io::{self, BufRead, Write};
+
 use crate::atlassian::client::{AtlassianClient, JiraWatcherList};
-use crate::cli::atlassian::confirm::{guard_destructive, GuardOptions, GuardOutcome};
+use crate::cli::atlassian::confirm::{guard_destructive_with_io, GuardOptions, GuardOutcome};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -116,29 +118,42 @@ impl RemoveCommand {
     /// Removes the user from watchers.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
+        let mut reader = io::BufReader::new(io::stdin());
+        let mut writer = io::stdout();
+        self.execute_with_io(&client, &mut reader, &mut writer)
+            .await
+    }
 
+    /// Inner form taking explicit client and IO handles, for unit tests.
+    async fn execute_with_io(
+        self,
+        client: &AtlassianClient,
+        reader: &mut (dyn BufRead + Send),
+        writer: &mut (dyn Write + Send),
+    ) -> Result<()> {
         let prompt = format!("Remove watcher {} from {}? [y/N] ", self.user, self.key);
         let dry_run_message = format!("Would remove watcher {} from {}.", self.user, self.key);
 
-        let outcome = guard_destructive(&GuardOptions {
-            prompt: &prompt,
-            dry_run_message: &dry_run_message,
-            force: self.force,
-            dry_run: self.dry_run,
-        })?;
+        let outcome = guard_destructive_with_io(
+            &GuardOptions {
+                prompt: &prompt,
+                dry_run_message: &dry_run_message,
+                force: self.force,
+                dry_run: self.dry_run,
+            },
+            reader,
+            writer,
+        )?;
 
         match outcome {
-            GuardOutcome::Proceed => run_remove(&client, &self.key, &self.user).await,
+            GuardOutcome::Proceed => {
+                client.remove_watcher(&self.key, &self.user).await?;
+                writeln!(writer, "Removed watcher {} from {}.", self.user, self.key)?;
+                Ok(())
+            }
             GuardOutcome::Cancelled | GuardOutcome::DryRun => Ok(()),
         }
     }
-}
-
-/// Removes a watcher using the given client.
-async fn run_remove(client: &AtlassianClient, key: &str, user: &str) -> Result<()> {
-    client.remove_watcher(key, user).await?;
-    println!("Removed watcher {user} from {key}.");
-    Ok(())
 }
 
 /// Prints watchers as a formatted table.
@@ -333,45 +348,6 @@ mod tests {
         assert!(err.to_string().contains("403"));
     }
 
-    // -- run_remove -----------------------------------------------------
-
-    #[tokio::test]
-    async fn run_remove_success() {
-        let server = wiremock::MockServer::start().await;
-
-        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
-            .and(wiremock::matchers::path(
-                "/rest/api/3/issue/PROJ-1/watchers",
-            ))
-            .and(wiremock::matchers::query_param("accountId", "abc123"))
-            .respond_with(wiremock::ResponseTemplate::new(204))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let client = mock_client(&server.uri());
-        let result = run_remove(&client, "PROJ-1", "abc123").await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn run_remove_api_error() {
-        let server = wiremock::MockServer::start().await;
-
-        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
-            .and(wiremock::matchers::path(
-                "/rest/api/3/issue/PROJ-1/watchers",
-            ))
-            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let client = mock_client(&server.uri());
-        let err = run_remove(&client, "PROJ-1", "abc123").await.unwrap_err();
-        assert!(err.to_string().contains("404"));
-    }
-
     // -- dispatch -------------------------------------------------------
 
     #[test]
@@ -419,5 +395,109 @@ mod tests {
         };
         assert!(!cmd.force);
         assert!(!cmd.dry_run);
+    }
+
+    // -- RemoveCommand::execute_with_io -------------------------------
+
+    #[tokio::test]
+    async fn remove_execute_force_calls_api() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/watchers",
+            ))
+            .and(wiremock::matchers::query_param("accountId", "abc"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let cmd = RemoveCommand {
+            key: "PROJ-1".to_string(),
+            user: "abc".to_string(),
+            force: true,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Removed watcher abc from PROJ-1."));
+    }
+
+    #[tokio::test]
+    async fn remove_execute_dry_run_skips_api() {
+        let server = wiremock::MockServer::start().await;
+        // No mocks; any call would 404 (wiremock default) and surface as an error.
+
+        let client = mock_client(&server.uri());
+        let cmd = RemoveCommand {
+            key: "PROJ-1".to_string(),
+            user: "abc".to_string(),
+            force: false,
+            dry_run: true,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Would remove watcher abc from PROJ-1."));
+        assert!(!out.contains("Removed watcher"));
+    }
+
+    #[tokio::test]
+    async fn remove_execute_prompt_yes_calls_api() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/watchers",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let cmd = RemoveCommand {
+            key: "PROJ-1".to_string(),
+            user: "abc".to_string(),
+            force: false,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(b"y\n".to_vec());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Remove watcher abc from PROJ-1?"));
+        assert!(out.contains("Removed watcher abc from PROJ-1."));
+    }
+
+    #[tokio::test]
+    async fn remove_execute_prompt_no_skips_api() {
+        let server = wiremock::MockServer::start().await;
+        // No mocks; any call would surface as an error.
+
+        let client = mock_client(&server.uri());
+        let cmd = RemoveCommand {
+            key: "PROJ-1".to_string(),
+            user: "abc".to_string(),
+            force: false,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(b"n\n".to_vec());
+        let mut output = Vec::<u8>::new();
+        cmd.execute_with_io(&client, &mut input, &mut output)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Cancelled."));
+        assert!(!out.contains("Removed watcher"));
     }
 }

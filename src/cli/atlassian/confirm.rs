@@ -1,6 +1,6 @@
 //! Shared confirmation and dry-run helper for destructive Atlassian CLI commands.
 
-use std::io::{self, BufRead, Write};
+use std::io::{BufRead, Write};
 
 use anyhow::Result;
 
@@ -30,20 +30,14 @@ pub struct GuardOptions<'a> {
     pub dry_run: bool,
 }
 
-/// Guards a destructive operation, prompting on stdin/stdout as needed.
+/// Guards a destructive operation, prompting on the supplied reader/writer.
 ///
 /// `--dry-run` takes precedence over `--force`: a dry-run never invokes the API,
 /// even when `--force` is also set. This lets users sanity-check a scripted
 /// `--force` invocation by adding `--dry-run` without removing the force flag.
-pub fn guard_destructive(opts: &GuardOptions<'_>) -> Result<GuardOutcome> {
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    let mut reader = stdin.lock();
-    let mut writer = stdout.lock();
-    guard_destructive_with_io(opts, &mut reader, &mut writer)
-}
-
-/// Inner form taking explicit reader/writer for unit tests.
+///
+/// In production, callers pass `BufReader::new(io::stdin())` and `io::stdout()`;
+/// tests pass `Cursor` and `Vec<u8>` to drive and observe the interaction.
 pub fn guard_destructive_with_io(
     opts: &GuardOptions<'_>,
     reader: &mut dyn BufRead,
