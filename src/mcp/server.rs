@@ -283,6 +283,7 @@ mod tests {
             "jira_write",
             "jira_transition",
             "jira_comment",
+            "jira_comment_edit",
             "jira_link",
             "jira_dev",
             "jira_user_search",

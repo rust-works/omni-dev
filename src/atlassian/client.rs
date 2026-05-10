@@ -277,6 +277,38 @@ pub struct JiraComment {
     pub body_adf: Option<serde_json::Value>,
     /// ISO 8601 creation timestamp.
     pub created: String,
+    /// ISO 8601 last-update timestamp, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated: Option<String>,
+}
+
+/// Visibility restriction kind for a JIRA comment.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JiraVisibilityType {
+    /// Restrict to members of a JIRA group.
+    Group,
+    /// Restrict to holders of a project role.
+    Role,
+}
+
+/// Visibility restriction applied to a JIRA comment.
+#[derive(Debug, Clone)]
+pub struct JiraVisibility {
+    /// Whether the restriction targets a group or a project role.
+    pub ty: JiraVisibilityType,
+    /// Group name or project role name (sent as `identifier`).
+    pub value: String,
+}
+
+impl Serialize for JiraVisibility {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("JiraVisibility", 2)?;
+        s.serialize_field("type", &self.ty)?;
+        s.serialize_field("identifier", &self.value)?;
+        s.end()
+    }
 }
 
 /// A JIRA project.
@@ -777,6 +809,8 @@ struct JiraCommentEntry {
     author: Option<JiraCommentAuthor>,
     body: Option<serde_json::Value>,
     created: Option<String>,
+    #[serde(default)]
+    updated: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2639,6 +2673,134 @@ mod tests {
         let adf = AdfDocument::new();
         let err = client.add_comment("PROJ-1", &adf).await.unwrap_err();
         assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn update_comment_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/comment/100",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "100",
+                    "author": {"displayName": "Me"},
+                    "created": "2026-04-01T10:00:00.000+0000",
+                    "updated": "2026-05-10T12:00:00.000+0000",
+                    "body": {"type": "doc", "version": 1, "content": []}
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let adf = AdfDocument::new();
+        let comment = client
+            .update_comment("PROJ-1", "100", &adf, None)
+            .await
+            .unwrap();
+        assert_eq!(comment.id, "100");
+        assert_eq!(comment.author, "Me");
+        assert_eq!(
+            comment.updated.as_deref(),
+            Some("2026-05-10T12:00:00.000+0000")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_comment_sends_visibility() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/comment/100",
+            ))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "visibility": {"type": "role", "identifier": "Administrators"}
+            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "100",
+                    "author": {"displayName": "Me"},
+                    "created": "2026-04-01T10:00:00.000+0000",
+                    "updated": "2026-05-10T12:00:00.000+0000",
+                    "body": null
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let adf = AdfDocument::new();
+        let visibility = JiraVisibility {
+            ty: JiraVisibilityType::Role,
+            value: "Administrators".to_string(),
+        };
+        client
+            .update_comment("PROJ-1", "100", &adf, Some(&visibility))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_comment_forbidden_surfaces_jira_message() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/comment/100",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "errorMessages": ["You do not have permission to edit this comment"],
+                    "errors": {}
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let adf = AdfDocument::new();
+        let err = client
+            .update_comment("PROJ-1", "100", &adf, None)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("403"));
+        assert!(msg.contains("permission to edit"));
+    }
+
+    #[tokio::test]
+    async fn update_comment_not_found() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/comment/9999",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "errorMessages": ["Comment not found"]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let adf = AdfDocument::new();
+        let err = client
+            .update_comment("PROJ-1", "9999", &adf, None)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("404"));
+        assert!(msg.contains("Comment not found"));
     }
 
     #[tokio::test]
@@ -6182,6 +6344,7 @@ impl AtlassianClient {
                     author: c.author.and_then(|a| a.display_name).unwrap_or_default(),
                     body_adf: c.body,
                     created: c.created.unwrap_or_default(),
+                    updated: c.updated,
                 });
             }
 
@@ -6217,6 +6380,55 @@ impl AtlassianClient {
         }
 
         Ok(())
+    }
+
+    /// Updates an existing comment on a JIRA issue.
+    ///
+    /// Issues a `PUT /rest/api/3/issue/{key}/comment/{id}` with the new ADF
+    /// body and an optional visibility restriction. Returns the updated
+    /// comment as parsed from the JIRA response so callers can surface the
+    /// `updated` timestamp and any author/body changes JIRA applied.
+    pub async fn update_comment(
+        &self,
+        key: &str,
+        comment_id: &str,
+        body_adf: &AdfDocument,
+        visibility: Option<&JiraVisibility>,
+    ) -> Result<JiraComment> {
+        let url = format!(
+            "{}/rest/api/3/issue/{}/comment/{}",
+            self.instance_url, key, comment_id
+        );
+
+        let mut body = serde_json::json!({ "body": body_adf });
+        if let Some(v) = visibility {
+            body["visibility"] =
+                serde_json::to_value(v).context("Failed to serialize comment visibility")?;
+        }
+
+        let response = self.put_json(&url, &body).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let entry: JiraCommentEntry = response
+            .json()
+            .await
+            .context("Failed to parse updated comment response")?;
+
+        Ok(JiraComment {
+            id: entry.id,
+            author: entry
+                .author
+                .and_then(|a| a.display_name)
+                .unwrap_or_default(),
+            body_adf: entry.body,
+            created: entry.created.unwrap_or_default(),
+            updated: entry.updated,
+        })
     }
 
     /// Lists worklogs for a JIRA issue.
