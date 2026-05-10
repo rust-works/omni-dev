@@ -140,6 +140,55 @@ mod tests {
         }
     }
 
+    /// OpenAI strict-subset invariant: every property in `properties`
+    /// must also appear in `required`. OpenAI rejects schemas where a
+    /// property is declared but optional; nullability must be expressed
+    /// with `type: ["string", "null"]` (or equivalent) rather than by
+    /// omitting from `required`.
+    ///
+    /// Schemars 1.x does honor `Option<T>` by including the field in
+    /// `properties` and emitting a null-permissive type, but historically
+    /// some setups dropped the field from `required`. This test pins the
+    /// invariant against drift.
+    #[test]
+    fn schemas_satisfy_openai_strict_subset() {
+        for (name, getter) in ALL_SCHEMAS {
+            let value = getter();
+            assert_openai_strict_subset(value, name);
+        }
+    }
+
+    /// Recurses into every object subschema and confirms `properties`
+    /// keys are a subset of `required`.
+    fn assert_openai_strict_subset(value: &Value, name: &str) {
+        if let Some(map) = value.as_object() {
+            if let Some(props) = map.get("properties").and_then(Value::as_object) {
+                let required: std::collections::HashSet<&str> = map
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect();
+                for prop_name in props.keys() {
+                    assert!(
+                        required.contains(prop_name.as_str()),
+                        "{name}: property '{prop_name}' missing from `required` (OpenAI strict-mode \
+                         requires every property to be required; use a nullable type for optional \
+                         semantics). Schema: {value}"
+                    );
+                }
+            }
+            for (_, child) in map {
+                assert_openai_strict_subset(child, name);
+            }
+        } else if let Some(arr) = value.as_array() {
+            for item in arr {
+                assert_openai_strict_subset(item, name);
+            }
+        }
+    }
+
     /// PrContent must require both fields.
     #[test]
     fn pr_content_requires_title_and_description() {

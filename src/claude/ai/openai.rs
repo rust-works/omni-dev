@@ -9,7 +9,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
-use super::{AiClient, AiClientMetadata};
+use super::{AiClient, AiClientCapabilities, AiClientMetadata, RequestOptions};
 use crate::claude::{error::ClaudeError, model_config::get_model_registry};
 
 /// Per-request timeout used when probing a local server's loaded context
@@ -46,6 +46,34 @@ struct Message {
     content: String,
 }
 
+/// OpenAI structured-output `response_format` field.
+///
+/// Top-level shape required by the chat-completions API for JSON Schema
+/// mode (`{"type": "json_schema", "json_schema": {...}}`). Honoured by
+/// OpenAI ≥2024-08-06, LM Studio, and Ollama ≥0.5; older servers either
+/// 400 on the unknown field or silently ignore it. The
+/// [`Option`] wrapper on the parent ([`OpenAiRequest::response_format`])
+/// keeps the wire body byte-identical to today's when no schema is set.
+#[derive(Serialize, Debug)]
+struct ResponseFormatField {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    json_schema: JsonSchemaSpec,
+}
+
+/// Inner spec of an OpenAI `response_format: json_schema` envelope.
+///
+/// `name` is a label OpenAI requires but does not validate against; we
+/// always emit the literal `"response"`. `strict: true` opts into the
+/// hard-validated subset (every property required, no
+/// `additionalProperties`, no `oneOf`/`anyOf`).
+#[derive(Serialize, Debug)]
+struct JsonSchemaSpec {
+    name: &'static str,
+    strict: bool,
+    schema: serde_json::Value,
+}
+
 /// OpenAI API request body.
 #[derive(Serialize, Debug)]
 struct OpenAiRequest {
@@ -58,6 +86,8 @@ struct OpenAiRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<ResponseFormatField>,
 }
 
 /// OpenAI API response choice.
@@ -195,20 +225,16 @@ impl OpenAiAiClient {
     }
 
     /// Builds the full API URL.
-    fn get_api_url(&self) -> Result<String> {
-        let mut base = self.base_url.clone();
-
-        // Ensure base URL doesn't end with a slash
-        if base.ends_with('/') {
-            base.pop();
-        }
-
-        // Add the chat completions endpoint
+    ///
+    /// Infallible — only trims a trailing slash and concatenates the
+    /// chat-completions path. Returning `String` directly removes a
+    /// `?`-propagation site at the call site whose error branch could
+    /// never fire.
+    fn get_api_url(&self) -> String {
+        let base = self.base_url.trim_end_matches('/');
         let url = format!("{base}/v1/chat/completions");
-
         debug!(base_url = %self.base_url, full_url = %url, "Constructed OpenAI-compatible API URL");
-
-        Ok(url)
+        url
     }
 
     /// Determines if this is likely an Ollama instance.
@@ -234,6 +260,118 @@ impl OpenAiAiClient {
     /// was discovered earlier).
     pub fn set_loaded_context_length(&mut self, value: usize) {
         self.loaded_context_length = Some(value);
+    }
+
+    /// Assembles an [`OpenAiRequest`] for the given prompts and optional
+    /// `response_format`. Pure / synchronous so unit tests can assert
+    /// the wire shape without spinning an HTTP mock.
+    fn build_request(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+        response_format: Option<ResponseFormatField>,
+    ) -> OpenAiRequest {
+        let mut messages = Vec::new();
+
+        if !system_prompt.is_empty() {
+            messages.push(Message {
+                role: "system".to_string(),
+                content: system_prompt.to_string(),
+            });
+        }
+
+        messages.push(Message {
+            role: "user".to_string(),
+            content: user_prompt.to_string(),
+        });
+
+        let max_tokens = self.get_max_tokens();
+        if self.is_gpt5_series() {
+            OpenAiRequest {
+                model: self.model.clone(),
+                messages,
+                max_tokens: None,
+                max_completion_tokens: Some(max_tokens),
+                // GPT-5 / o-series only accept the default temperature (1.0).
+                temperature: None,
+                stream: false,
+                response_format,
+            }
+        } else {
+            OpenAiRequest {
+                model: self.model.clone(),
+                messages,
+                max_tokens: Some(max_tokens),
+                max_completion_tokens: None,
+                temperature: self.temperature,
+                stream: false,
+                response_format,
+            }
+        }
+    }
+
+    /// Sends `request` to the configured chat-completions endpoint and
+    /// extracts the assistant text from the first choice.
+    ///
+    /// Shared by [`send_request`](AiClient::send_request) and
+    /// [`send_request_with_options`](AiClient::send_request_with_options) so
+    /// the only difference between the two paths is whether `request` carries
+    /// a `response_format` field.
+    async fn send_inner(&self, request: OpenAiRequest) -> Result<String> {
+        debug!(
+            max_tokens = ?request.max_tokens,
+            max_completion_tokens = ?request.max_completion_tokens,
+            configured_temperature = ?self.temperature,
+            effective_temperature = ?request.temperature,
+            message_count = request.messages.len(),
+            is_gpt5_series = self.is_gpt5_series(),
+            response_format_set = request.response_format.is_some(),
+            "Built OpenAI-compatible request payload"
+        );
+
+        let api_url = self.get_api_url();
+        info!(url = %api_url, model = %self.model, "Sending request to OpenAI-compatible API");
+
+        let mut req_builder = self
+            .client
+            .post(&api_url)
+            .header("Content-Type", "application/json")
+            .json(&request);
+
+        if let Some(ref api_key) = self.api_key {
+            req_builder = req_builder.header("Authorization", format!("Bearer {api_key}"));
+        }
+
+        let response = req_builder
+            .send()
+            .await
+            .map_err(|e| ClaudeError::NetworkError(e.to_string()))?;
+
+        let response = super::check_error_response(response).await?;
+
+        let openai_response: OpenAiResponse = response
+            .json()
+            .await
+            .map_err(|e| ClaudeError::InvalidResponseFormat(e.to_string()))?;
+
+        debug!(
+            choice_count = openai_response.choices.len(),
+            model = ?openai_response.model,
+            usage = ?openai_response.usage,
+            "Received OpenAI-compatible API response"
+        );
+
+        let result = openai_response
+            .choices
+            .first()
+            .map(|choice| choice.message.content.clone())
+            .ok_or_else(|| {
+                ClaudeError::InvalidResponseFormat("No choices in response".to_string()).into()
+            });
+
+        super::log_response_success("OpenAI-compatible", &result);
+
+        result
     }
 
     /// Probes a local OpenAI-compatible server for the loaded model's
@@ -347,98 +485,45 @@ impl AiClient for OpenAiAiClient {
                 "Preparing OpenAI-compatible API request"
             );
 
-            // Build messages array with system prompt first, then user prompt
-            let mut messages = Vec::new();
+            let request = self.build_request(system_prompt, user_prompt, None);
+            self.send_inner(request).await
+        })
+    }
 
-            if !system_prompt.is_empty() {
-                messages.push(Message {
-                    role: "system".to_string(),
-                    content: system_prompt.to_string(),
-                });
-            }
+    fn capabilities(&self) -> AiClientCapabilities {
+        AiClientCapabilities {
+            supports_response_schema: true,
+        }
+    }
 
-            messages.push(Message {
-                role: "user".to_string(),
-                content: user_prompt.to_string(),
+    fn send_request_with_options<'a>(
+        &'a self,
+        system_prompt: &'a str,
+        user_prompt: &'a str,
+        options: RequestOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+        Box::pin(async move {
+            debug!(
+                system_prompt_len = system_prompt.len(),
+                user_prompt_len = user_prompt.len(),
+                has_schema = options.response_schema.is_some(),
+                model = %self.model,
+                base_url = %self.base_url,
+                is_ollama = self.is_ollama(),
+                "Preparing OpenAI-compatible API request (with options)"
+            );
+
+            let response_format = options.response_schema.map(|schema| ResponseFormatField {
+                kind: "json_schema",
+                json_schema: JsonSchemaSpec {
+                    name: "response",
+                    strict: true,
+                    schema,
+                },
             });
 
-            let max_tokens = self.get_max_tokens();
-            let request = if self.is_gpt5_series() {
-                OpenAiRequest {
-                    model: self.model.clone(),
-                    messages,
-                    max_tokens: None,
-                    max_completion_tokens: Some(max_tokens),
-                    temperature: None, // GPT-5 only supports default temperature (1.0)
-                    stream: false,
-                }
-            } else {
-                OpenAiRequest {
-                    model: self.model.clone(),
-                    messages,
-                    max_tokens: Some(max_tokens),
-                    max_completion_tokens: None,
-                    temperature: self.temperature,
-                    stream: false,
-                }
-            };
-
-            debug!(
-                max_tokens = max_tokens,
-                configured_temperature = ?self.temperature,
-                effective_temperature = ?request.temperature,
-                message_count = request.messages.len(),
-                is_gpt5_series = self.is_gpt5_series(),
-                uses_max_completion_tokens = self.is_gpt5_series(),
-                "Built OpenAI-compatible request payload"
-            );
-
-            let api_url = self.get_api_url()?;
-            info!(url = %api_url, model = %self.model, "Sending request to OpenAI-compatible API");
-
-            // Build the request
-            let mut req_builder = self
-                .client
-                .post(&api_url)
-                .header("Content-Type", "application/json")
-                .json(&request);
-
-            // Add authorization header if API key is provided
-            if let Some(ref api_key) = self.api_key {
-                req_builder = req_builder.header("Authorization", format!("Bearer {api_key}"));
-            }
-
-            let response = req_builder
-                .send()
-                .await
-                .map_err(|e| ClaudeError::NetworkError(e.to_string()))?;
-
-            let response = super::check_error_response(response).await?;
-
-            let openai_response: OpenAiResponse = response
-                .json()
-                .await
-                .map_err(|e| ClaudeError::InvalidResponseFormat(e.to_string()))?;
-
-            debug!(
-                choice_count = openai_response.choices.len(),
-                model = ?openai_response.model,
-                usage = ?openai_response.usage,
-                "Received OpenAI-compatible API response"
-            );
-
-            // Extract text content from the first choice
-            let result = openai_response
-                .choices
-                .first()
-                .map(|choice| choice.message.content.clone())
-                .ok_or_else(|| {
-                    ClaudeError::InvalidResponseFormat("No choices in response".to_string()).into()
-                });
-
-            super::log_response_success("OpenAI-compatible", &result);
-
-            result
+            let request = self.build_request(system_prompt, user_prompt, response_format);
+            self.send_inner(request).await
         })
     }
 
@@ -518,7 +603,7 @@ mod tests {
     #[test]
     fn get_api_url() {
         let client = OpenAiAiClient::new_ollama("llama2".to_string(), None, None).unwrap();
-        let url = client.get_api_url().unwrap();
+        let url = client.get_api_url();
         assert_eq!(url, "http://localhost:11434/v1/chat/completions");
     }
 
@@ -533,7 +618,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let url = client.get_api_url().unwrap();
+        let url = client.get_api_url();
         assert_eq!(url, "http://localhost:11434/v1/chat/completions");
     }
 
@@ -737,6 +822,7 @@ mod tests {
             max_completion_tokens: Some(4096),
             temperature: None,
             stream: false,
+            response_format: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -757,6 +843,7 @@ mod tests {
             max_completion_tokens: None,
             temperature: Some(0.1),
             stream: false,
+            response_format: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -765,19 +852,96 @@ mod tests {
         assert!(json.contains("\"temperature\""));
     }
 
-    /// OpenAI / Ollama backends don't expose JSON Schema enforcement
-    /// here yet, so capabilities must report `false` for both.
+    /// OpenAI / Ollama backends now route schema-bearing options through
+    /// `response_format: json_schema` on the chat-completions endpoint, so
+    /// capabilities must advertise the support to drive the dispatch in
+    /// `client.rs::send_with_optional_schema`.
     #[test]
-    fn capabilities_default_to_no_schema_support_openai() {
+    fn capabilities_advertise_response_schema_support_openai() {
         let client =
             OpenAiAiClient::new_openai("gpt-4o".to_string(), "key".to_string(), None).unwrap();
-        assert!(!client.capabilities().supports_response_schema);
+        assert!(client.capabilities().supports_response_schema);
     }
 
     #[test]
-    fn capabilities_default_to_no_schema_support_ollama() {
+    fn capabilities_advertise_response_schema_support_ollama() {
         let client = OpenAiAiClient::new_ollama("llama2".to_string(), None, None).unwrap();
-        assert!(!client.capabilities().supports_response_schema);
+        assert!(client.capabilities().supports_response_schema);
+    }
+
+    // ── build_request: response_format wiring ────────────────────────
+
+    /// Without a schema in `RequestOptions`, the serialized body must
+    /// not contain the `response_format` key. This guards the
+    /// `skip_serializing_if = "Option::is_none"` invariant — older OpenAI
+    /// servers / pre-0.5 Ollama 400 on unknown fields, so the wire body
+    /// must stay byte-identical to today's when no schema is set.
+    #[test]
+    fn build_request_omits_response_format_without_schema() {
+        let client =
+            OpenAiAiClient::new_openai("gpt-4o".to_string(), "key".to_string(), None).unwrap();
+        let request = client.build_request("sys", "user", None);
+        let body = serde_json::to_value(&request).unwrap();
+        assert!(
+            body.get("response_format").is_none(),
+            "expected response_format to be omitted, got: {body}"
+        );
+    }
+
+    /// With a schema attached, the serialized body must carry the exact
+    /// OpenAI structured-output envelope shape.
+    #[test]
+    fn build_request_embeds_response_format_with_schema_regular_model() {
+        let client =
+            OpenAiAiClient::new_openai("gpt-4o".to_string(), "key".to_string(), None).unwrap();
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "answer": { "type": "string" } },
+            "required": ["answer"],
+            "additionalProperties": false,
+        });
+        let response_format = Some(ResponseFormatField {
+            kind: "json_schema",
+            json_schema: JsonSchemaSpec {
+                name: "response",
+                strict: true,
+                schema: schema.clone(),
+            },
+        });
+        let request = client.build_request("sys", "user", response_format);
+        let body = serde_json::to_value(&request).unwrap();
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["response_format"]["json_schema"]["name"], "response");
+        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(body["response_format"]["json_schema"]["schema"], schema);
+        // Regular (non-GPT-5) path: max_tokens set, max_completion_tokens absent.
+        assert!(body.get("max_tokens").is_some());
+        assert!(body.get("max_completion_tokens").is_none());
+    }
+
+    /// `response_format` flows through identically on the GPT-5 / o1 path
+    /// (which uses `max_completion_tokens` instead of `max_tokens`).
+    #[test]
+    fn build_request_embeds_response_format_with_schema_gpt5() {
+        let client =
+            OpenAiAiClient::new_openai("gpt-5".to_string(), "key".to_string(), None).unwrap();
+        let schema = serde_json::json!({ "type": "object", "additionalProperties": false });
+        let response_format = Some(ResponseFormatField {
+            kind: "json_schema",
+            json_schema: JsonSchemaSpec {
+                name: "response",
+                strict: true,
+                schema: schema.clone(),
+            },
+        });
+        let request = client.build_request("sys", "user", response_format);
+        let body = serde_json::to_value(&request).unwrap();
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["response_format"]["json_schema"]["schema"], schema);
+        // GPT-5 path: max_completion_tokens set, max_tokens / temperature absent.
+        assert!(body.get("max_completion_tokens").is_some());
+        assert!(body.get("max_tokens").is_none());
+        assert!(body.get("temperature").is_none());
     }
 
     // ── host_root ────────────────────────────────────────────────────
@@ -1185,5 +1349,213 @@ mod tests {
         let mut client = ollama_client_pointing_at("http://127.0.0.1:1", "anything");
         let source = client.probe_loaded_context_length().await;
         assert!(source.is_none());
+    }
+
+    // ── send_request_with_options round-trip (wiremock) ──────────────
+
+    /// Stub `/v1/chat/completions` so a single request succeeds and the
+    /// recorded request body can be introspected by the caller.
+    async fn mock_chat_completion_ok(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [
+                    {
+                        "message": { "role": "assistant", "content": "ok" },
+                        "finish_reason": "stop"
+                    }
+                ],
+                "model": "test-model"
+            })))
+            .mount(server)
+            .await;
+    }
+
+    fn openai_client_pointing_at(server_uri: &str, model: &str) -> OpenAiAiClient {
+        OpenAiAiClient::new(
+            model.to_string(),
+            Some("test-key".to_string()),
+            server_uri.to_string(),
+            Some(1024),
+            Some(0.1),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// Round-trips a request through the actual `reqwest` JSON serialization
+    /// path (not just `serde_json::to_value`) and asserts the wire body
+    /// carries the OpenAI structured-output envelope. Initialises a
+    /// debug-level tracing subscriber so the `debug!` macro arguments in
+    /// `send_request_with_options` actually evaluate (otherwise the
+    /// tracing layer short-circuits at INFO level and llvm-cov sees the
+    /// argument expressions as never executed).
+    #[tokio::test]
+    async fn send_request_with_options_serializes_response_format_on_the_wire() {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_test_writer()
+            .try_init();
+
+        let server = MockServer::start().await;
+        mock_chat_completion_ok(&server).await;
+
+        let client = openai_client_pointing_at(&server.uri(), "gpt-4o");
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "answer": { "type": "string" } },
+            "required": ["answer"],
+            "additionalProperties": false,
+        });
+        let options = RequestOptions::default().with_response_schema(schema.clone());
+
+        let result = client
+            .send_request_with_options("system", "user", options)
+            .await
+            .unwrap();
+        assert_eq!(result, "ok");
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(
+            received.len(),
+            1,
+            "expected exactly one chat-completions request"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["response_format"]["json_schema"]["name"], "response");
+        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(body["response_format"]["json_schema"]["schema"], schema);
+    }
+
+    /// Companion guard: the no-options path (or empty options) must not
+    /// emit `response_format` on the wire — older Ollama / OpenAI servers
+    /// 400 on unknown fields, so the byte-for-byte default body matters.
+    #[tokio::test]
+    async fn send_request_omits_response_format_on_the_wire() {
+        let server = MockServer::start().await;
+        mock_chat_completion_ok(&server).await;
+
+        let client = openai_client_pointing_at(&server.uri(), "gpt-4o");
+        let _ = client.send_request("system", "user").await.unwrap();
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert!(
+            body.get("response_format").is_none(),
+            "expected response_format to be absent from wire body, got: {body}"
+        );
+    }
+
+    /// Empty system prompt skips the system message: the request body
+    /// carries only the user message, not a stub `system` entry. Pins the
+    /// `if !system_prompt.is_empty()` guard in `build_request`.
+    #[test]
+    fn build_request_skips_empty_system_prompt() {
+        let client =
+            OpenAiAiClient::new_openai("gpt-4o".to_string(), "key".to_string(), None).unwrap();
+        let request = client.build_request("", "user prompt", None);
+        assert_eq!(request.messages.len(), 1);
+        assert_eq!(request.messages[0].role, "user");
+        assert_eq!(request.messages[0].content, "user prompt");
+    }
+
+    /// Connection failure surfaces as `NetworkError` rather than panicking
+    /// or hanging. Pins the `map_err(NetworkError)?` branch on the
+    /// `req_builder.send()` call. Uses port 1 — the same closed-port
+    /// trick the probe tests use — so reqwest fails fast with connection
+    /// refused well before the request timeout.
+    #[tokio::test]
+    async fn send_request_propagates_network_error_on_unreachable_server() {
+        let client = openai_client_pointing_at("http://127.0.0.1:1", "gpt-4o");
+        let err = client
+            .send_request("system", "user")
+            .await
+            .expect_err("expected network error against closed port");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.to_lowercase().contains("network"),
+            "expected network-error wording in chain, got: {chain}"
+        );
+    }
+
+    /// HTTP error responses propagate through `check_error_response` as a
+    /// structured `ApiRequestFailed` rather than being misinterpreted as a
+    /// successful body. Pins the `?` branch on the `check_error_response`
+    /// call.
+    #[tokio::test]
+    async fn send_request_propagates_http_error_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("upstream boom"))
+            .mount(&server)
+            .await;
+
+        let client = openai_client_pointing_at(&server.uri(), "gpt-4o");
+        let err = client
+            .send_request("system", "user")
+            .await
+            .expect_err("expected error from 500 response");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("HTTP 500"),
+            "expected 'HTTP 500' in error chain, got: {chain}"
+        );
+    }
+
+    /// A malformed JSON body surfaces as `InvalidResponseFormat` rather
+    /// than a panic. Pins the `?` branch on `response.json().await`.
+    #[tokio::test]
+    async fn send_request_propagates_json_parse_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{not valid json"))
+            .mount(&server)
+            .await;
+
+        let client = openai_client_pointing_at(&server.uri(), "gpt-4o");
+        let err = client
+            .send_request("system", "user")
+            .await
+            .expect_err("expected error from malformed JSON body");
+        // ClaudeError::InvalidResponseFormat renders as
+        // "Invalid response format from Claude API: <inner>". The exact
+        // serde message varies; the prefix is the contract we pin.
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("Invalid response format"),
+            "expected 'Invalid response format' in error chain, got: {chain}"
+        );
+    }
+
+    /// `send_inner` returns `InvalidResponseFormat` when the API replies
+    /// with an empty `choices` array. Pins the `ok_or_else` defensive
+    /// branch — without this, a malformed upstream response would surface
+    /// as `unwrap_or_else` panicking later instead of a structured error.
+    #[tokio::test]
+    async fn send_request_errors_when_response_has_no_choices() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [],
+                "model": "test-model"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = openai_client_pointing_at(&server.uri(), "gpt-4o");
+        let err = client
+            .send_request("system", "user")
+            .await
+            .expect_err("expected error when choices array is empty");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("No choices in response"),
+            "expected 'No choices in response' in error chain, got: {chain}"
+        );
     }
 }
