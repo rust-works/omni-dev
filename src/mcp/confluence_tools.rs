@@ -293,6 +293,56 @@ pub struct ConfluenceAttachmentDeleteParams {
     pub purge: Option<bool>,
 }
 
+/// Parameters for the `confluence_compare` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceCompareParams {
+    /// Confluence page ID.
+    pub id: String,
+    /// `from` version reference. Accepts `"latest"`, `"previous"`,
+    /// `"v-N"` (e.g. `"v-2"`), a numeric version, or an ISO 8601 date.
+    /// Defaults to `"previous"`.
+    #[serde(default)]
+    pub from: Option<String>,
+    /// `to` version reference. Same accepted forms as `from`. Defaults to
+    /// `"latest"`.
+    #[serde(default)]
+    pub to: Option<String>,
+    /// Detail level: `"summary"`, `"outline"` (default), or `"full"`.
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// Top-level fields to include. Comma-separated. Accepted values:
+    /// `"body"`, `"title"`, `"labels"`, `"metadata"`. Defaults to
+    /// `"body,title,metadata"`.
+    #[serde(default)]
+    pub include: Option<String>,
+    /// Collapse runs of whitespace before diffing. Defaults to `true`.
+    #[serde(default)]
+    pub ignore_whitespace: Option<bool>,
+    /// Drop section deltas with fewer than this many characters of total
+    /// changed text. `0` (default) disables the filter.
+    #[serde(default)]
+    pub min_change_chars: Option<u32>,
+    /// Restrict to sections whose path matches one of the given strings.
+    #[serde(default)]
+    pub filter_sections: Option<Vec<String>>,
+    /// Output budget in bytes. Defaults to ~16 KiB (≈4000 tokens).
+    #[serde(default)]
+    pub budget: Option<usize>,
+}
+
+/// Parameters for the `confluence_compare_section` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceCompareSectionParams {
+    /// Cursor returned by an outline-mode `confluence_compare` call. The
+    /// cursor encodes the page ID and version pair, so this tool is
+    /// stateless across calls.
+    pub cursor: String,
+    /// Output text format: `"unified"` (default), `"side_by_side"`, or
+    /// `"markdown_inline"`.
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
 // ── Output summaries ────────────────────────────────────────────────
 
 /// Manifest summary returned by `confluence_download`.
@@ -491,6 +541,69 @@ pub async fn fetch_history_yaml(
         crate::cli::atlassian::confluence::history::fetch_history(api, page_id, since, limit)
             .await?;
     to_yaml(&history)
+}
+
+/// Builds the YAML output for the `confluence_compare` tool. Delegates to
+/// the CLI's `run_compare` so MCP and CLI share a single schema.
+pub async fn fetch_compare_yaml(
+    api: &ConfluenceApi,
+    instance_url: &str,
+    params: &ConfluenceCompareParams,
+) -> Result<String> {
+    use crate::atlassian::diff_format::DEFAULT_OUTPUT_BUDGET;
+    use crate::cli::atlassian::confluence::compare::{run_compare, CompareCommand, DetailArg};
+    use crate::cli::atlassian::format::OutputFormat;
+
+    let detail = match params.detail.as_deref() {
+        None | Some("outline") => DetailArg::Outline,
+        Some("summary") => DetailArg::Summary,
+        Some("full") => DetailArg::Full,
+        Some(other) => anyhow::bail!(
+            "Invalid detail \"{other}\"; expected \"summary\", \"outline\", or \"full\""
+        ),
+    };
+
+    let cmd = CompareCommand {
+        id: params.id.clone(),
+        from: params
+            .from
+            .clone()
+            .unwrap_or_else(|| "previous".to_string()),
+        to: params.to.clone().unwrap_or_else(|| "latest".to_string()),
+        detail,
+        include: params
+            .include
+            .clone()
+            .unwrap_or_else(|| "body,title,metadata".to_string()),
+        ignore_whitespace: params.ignore_whitespace.unwrap_or(true),
+        min_change_chars: params.min_change_chars.unwrap_or(0),
+        filter_sections: params.filter_sections.clone().unwrap_or_default(),
+        budget: params.budget.unwrap_or(DEFAULT_OUTPUT_BUDGET),
+        output: OutputFormat::Yaml,
+    };
+    let out = run_compare(api, instance_url, &cmd).await?;
+    to_yaml(&out)
+}
+
+/// Builds the text output for the `confluence_compare_section` tool.
+pub async fn fetch_compare_section_text(
+    api: &ConfluenceApi,
+    cursor: &str,
+    format: Option<&str>,
+) -> Result<String> {
+    use crate::atlassian::diff_format::{Cursor, SectionFormat};
+    use crate::cli::atlassian::confluence::compare::run_compare_section;
+
+    let cur = Cursor::decode(cursor).context("Invalid cursor")?;
+    let format = match format {
+        None | Some("unified") => SectionFormat::Unified,
+        Some("side_by_side") => SectionFormat::SideBySide,
+        Some("markdown_inline") => SectionFormat::MarkdownInline,
+        Some(other) => anyhow::bail!(
+            "Invalid format \"{other}\"; expected \"unified\", \"side_by_side\", or \"markdown_inline\""
+        ),
+    };
+    run_compare_section(api, &cur, format).await
 }
 
 /// Builds the YAML output for the `confluence_children` tool.
@@ -1056,6 +1169,50 @@ impl OmniDevServer {
                 .await
                 .map_err(tool_error)?;
         Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Diffs two versions of a Confluence page.
+    #[tool(
+        description = "Compare two versions of a Confluence page. Returns a structurally-aware \
+                       diff: walks the ADF tree, splits the document into heading-delimited \
+                       sections, and reports per-block changes rather than character-level \
+                       deltas over a serialization. \
+                       \n\nVersion refs accept \"latest\", \"previous\", \"v-N\" (e.g. \
+                       \"v-2\"), a numeric version, or an ISO 8601 date. `previous` is \
+                       relative to `to`. \
+                       \n\nDetail levels: `summary` (counts only), `outline` (default — \
+                       per-section change kind + drill-in cursors), `full` (embeds per-section \
+                       deltas, budget-truncated). \
+                       \n\nMirrors `omni-dev atlassian confluence compare run`."
+    )]
+    pub async fn confluence_compare(
+        &self,
+        Parameters(params): Parameters<ConfluenceCompareParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, instance_url) = create_client().map_err(tool_error)?;
+        let api = ConfluenceApi::new(client);
+        let yaml = fetch_compare_yaml(&api, &instance_url, &params)
+            .await
+            .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Drills into a single section diff using a cursor from a prior compare call.
+    #[tool(description = "Drill into a section diff using a cursor returned by \
+                       `confluence_compare` (outline mode). Stateless: the cursor encodes \
+                       the page ID and version pair. Output formats: \"unified\" (default), \
+                       \"side_by_side\", \"markdown_inline\". Mirrors \
+                       `omni-dev atlassian confluence compare section`.")]
+    pub async fn confluence_compare_section(
+        &self,
+        Parameters(params): Parameters<ConfluenceCompareSectionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _url) = create_client().map_err(tool_error)?;
+        let api = ConfluenceApi::new(client);
+        let text = fetch_compare_section_text(&api, &params.cursor, params.format.as_deref())
+            .await
+            .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 }
 
@@ -2414,6 +2571,11 @@ mod tests {
             "confluence_label_add",
             "confluence_label_remove",
             "confluence_user_search",
+            "confluence_attachment_upload",
+            "confluence_attachment_list",
+            "confluence_attachment_delete",
+            "confluence_compare",
+            "confluence_compare_section",
         ] {
             assert!(router.has_route(name), "missing tool: {name}");
         }
@@ -3156,5 +3318,246 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("403"));
+    }
+
+    // ── confluence_compare / confluence_compare_section ────────────
+
+    async fn mount_compare_endpoints(server: &wiremock::MockServer) {
+        // Versions list (newest-first).
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12/versions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {"number": 2, "createdAt": "2026-05-08T10:00:00Z", "authorId": "alice", "message": "v2", "minorEdit": false},
+                        {"number": 1, "createdAt": "2026-05-07T10:00:00Z", "authorId": "bob", "message": "v1", "minorEdit": false},
+                    ]
+                })),
+            )
+            .mount(server)
+            .await;
+
+        // Page at version 1.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12"))
+            .and(wiremock::matchers::query_param("version", "1"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "12",
+                "title": "Page v1",
+                "status": "current",
+                "spaceId": "98",
+                "version": {"number": 1},
+                "body": {"atlas_doc_format": {"value": r#"{"version":1,"type":"doc","content":[{"type":"heading","attrs":{"level":2},"content":[{"type":"text","text":"Background"}]},{"type":"paragraph","content":[{"type":"text","text":"version 12"}]}]}"#}}
+            })))
+            .mount(server)
+            .await;
+
+        // Page at version 2.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12"))
+            .and(wiremock::matchers::query_param("version", "2"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "12",
+                "title": "Page v2",
+                "status": "current",
+                "spaceId": "98",
+                "version": {"number": 2},
+                "body": {"atlas_doc_format": {"value": r#"{"version":1,"type":"doc","content":[{"type":"heading","attrs":{"level":2},"content":[{"type":"text","text":"Background"}]},{"type":"paragraph","content":[{"type":"text","text":"version 14"}]}]}"#}}
+            })))
+            .mount(server)
+            .await;
+
+        // Space lookup.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/98"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"key": "ENG"})),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn fetch_compare_yaml_returns_yaml() {
+        let server = wiremock::MockServer::start().await;
+        mount_compare_endpoints(&server).await;
+        let client = AtlassianClient::new(&server.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        let params = ConfluenceCompareParams {
+            id: "12".to_string(),
+            from: None,
+            to: None,
+            detail: None,
+            include: None,
+            ignore_whitespace: None,
+            min_change_chars: None,
+            filter_sections: None,
+            budget: None,
+        };
+        let yaml = fetch_compare_yaml(&api, &server.uri(), &params)
+            .await
+            .unwrap();
+        assert!(yaml.contains("page:"));
+        assert!(yaml.contains("/h2#background"));
+        assert!(yaml.contains("number: 1"));
+        assert!(yaml.contains("number: 2"));
+    }
+
+    #[tokio::test]
+    async fn fetch_compare_yaml_invalid_detail_errors() {
+        let server = wiremock::MockServer::start().await;
+        let client = AtlassianClient::new(&server.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        let params = ConfluenceCompareParams {
+            id: "12".to_string(),
+            from: None,
+            to: None,
+            detail: Some("garbage".to_string()),
+            include: None,
+            ignore_whitespace: None,
+            min_change_chars: None,
+            filter_sections: None,
+            budget: None,
+        };
+        let err = fetch_compare_yaml(&api, &server.uri(), &params)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid detail"));
+    }
+
+    #[tokio::test]
+    async fn fetch_compare_section_text_invalid_format_errors() {
+        let server = wiremock::MockServer::start().await;
+        let client = AtlassianClient::new(&server.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        // We need a valid cursor first to get past the decode step.
+        let cursor = crate::atlassian::diff_format::Cursor {
+            page_id: "12".to_string(),
+            from_v: 1,
+            to_v: 2,
+            section_path: "/h2#background".to_string(),
+        }
+        .encode()
+        .unwrap();
+        let err = fetch_compare_section_text(&api, &cursor, Some("nonsense"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid format"));
+    }
+
+    #[tokio::test]
+    async fn fetch_compare_section_text_invalid_cursor_errors() {
+        let server = wiremock::MockServer::start().await;
+        let client = AtlassianClient::new(&server.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = fetch_compare_section_text(&api, "!!!", None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid cursor"));
+    }
+
+    #[tokio::test]
+    async fn fetch_compare_section_text_returns_unified() {
+        let server = wiremock::MockServer::start().await;
+        mount_compare_endpoints(&server).await;
+        let client = AtlassianClient::new(&server.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        let cursor = crate::atlassian::diff_format::Cursor {
+            page_id: "12".to_string(),
+            from_v: 1,
+            to_v: 2,
+            section_path: "/h2#background".to_string(),
+        }
+        .encode()
+        .unwrap();
+        let text = fetch_compare_section_text(&api, &cursor, Some("unified"))
+            .await
+            .unwrap();
+        assert!(text.contains("/h2#background"));
+        assert!(text.contains("version 12"));
+        assert!(text.contains("version 14"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_compare_handler_success_via_mock() {
+        let _lock = env_lock();
+        let server = wiremock::MockServer::start().await;
+        mount_compare_endpoints(&server).await;
+        let _env = EnvGuard::set(&server.uri());
+
+        let result = make_server()
+            .confluence_compare(Parameters(ConfluenceCompareParams {
+                id: "12".to_string(),
+                from: None,
+                to: None,
+                detail: None,
+                include: None,
+                ignore_whitespace: None,
+                min_change_chars: None,
+                filter_sections: None,
+                budget: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_compare_section_handler_success_via_mock() {
+        let _lock = env_lock();
+        let server = wiremock::MockServer::start().await;
+        mount_compare_endpoints(&server).await;
+        let _env = EnvGuard::set(&server.uri());
+
+        let cursor = crate::atlassian::diff_format::Cursor {
+            page_id: "12".to_string(),
+            from_v: 1,
+            to_v: 2,
+            section_path: "/h2#background".to_string(),
+        }
+        .encode()
+        .unwrap();
+        let result = make_server()
+            .confluence_compare_section(Parameters(ConfluenceCompareSectionParams {
+                cursor,
+                format: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_compare_handler_no_credentials_returns_tool_error() {
+        let _lock = env_lock();
+        clear_env();
+        let result = make_server()
+            .confluence_compare(Parameters(ConfluenceCompareParams {
+                id: "12".to_string(),
+                from: None,
+                to: None,
+                detail: None,
+                include: None,
+                ignore_whitespace: None,
+                min_change_chars: None,
+                filter_sections: None,
+                budget: None,
+            }))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_compare_section_handler_no_credentials_returns_tool_error() {
+        let _lock = env_lock();
+        clear_env();
+        let result = make_server()
+            .confluence_compare_section(Parameters(ConfluenceCompareSectionParams {
+                cursor: "irrelevant".to_string(),
+                format: None,
+            }))
+            .await;
+        assert!(result.is_err());
     }
 }

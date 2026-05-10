@@ -1728,6 +1728,8 @@ async fn list_tools_includes_confluence_extensions() -> Result<()> {
         "confluence_attachment_upload",
         "confluence_attachment_list",
         "confluence_attachment_delete",
+        "confluence_compare",
+        "confluence_compare_section",
     ] {
         assert!(names.contains(&expected), "missing {expected}: {names:?}");
     }
@@ -2022,6 +2024,338 @@ async fn confluence_children_without_credentials_returns_error() -> Result<()> {
             "expected tool error without credentials"
         );
     }
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+// ── confluence_compare end-to-end fixture ─────────────────────────────
+
+/// Fixture covering all change kinds in one diff:
+///
+/// - **Background** — paragraph edit ("12" → "14")
+/// - **Architecture** — paragraph removed; table cell edit (with localId)
+/// - **Implementation** — wholly new section (added)
+/// - **Roadmap** — list item removed
+/// - **Code** — code block extended by one line
+///
+/// Plus title change ("Spec v0.9" → "Spec v1.0").
+fn fixture_v1_adf() -> serde_json::Value {
+    serde_json::json!({
+        "version": 1,
+        "type": "doc",
+        "content": [
+            {"type": "heading", "attrs": {"level": 2},
+             "content": [{"type": "text", "text": "Background"}]},
+            {"type": "paragraph",
+             "content": [{"type": "text", "text": "We use database version 12."}]},
+
+            {"type": "heading", "attrs": {"level": 2},
+             "content": [{"type": "text", "text": "Architecture"}]},
+            {"type": "paragraph",
+             "content": [{"type": "text", "text": "Paragraph A — to be removed."}]},
+            {"type": "paragraph",
+             "content": [{"type": "text", "text": "Paragraph B — kept."}]},
+            {"type": "table", "attrs": {"localId": "t1"},
+             "content": [
+                 {"type": "tableRow", "attrs": {"localId": "r1"},
+                  "content": [
+                      {"type": "tableCell", "attrs": {"localId": "c11"},
+                       "content": [{"type": "paragraph",
+                                    "content": [{"type": "text", "text": "alpha"}]}]},
+                      {"type": "tableCell", "attrs": {"localId": "c12"},
+                       "content": [{"type": "paragraph",
+                                    "content": [{"type": "text", "text": "beta"}]}]}
+                  ]}
+             ]},
+
+            {"type": "heading", "attrs": {"level": 2},
+             "content": [{"type": "text", "text": "Roadmap"}]},
+            {"type": "bulletList",
+             "content": [
+                 {"type": "listItem",
+                  "content": [{"type": "paragraph",
+                               "content": [{"type": "text", "text": "milestone 1"}]}]},
+                 {"type": "listItem",
+                  "content": [{"type": "paragraph",
+                               "content": [{"type": "text", "text": "milestone 2"}]}]}
+             ]},
+
+            {"type": "heading", "attrs": {"level": 2},
+             "content": [{"type": "text", "text": "Code"}]},
+            {"type": "codeBlock", "attrs": {"language": "rust"},
+             "content": [{"type": "text", "text": "fn one() {}\nfn two() {}\nfn three() {}"}]}
+        ]
+    })
+}
+
+fn fixture_v2_adf() -> serde_json::Value {
+    serde_json::json!({
+        "version": 1,
+        "type": "doc",
+        "content": [
+            {"type": "heading", "attrs": {"level": 2},
+             "content": [{"type": "text", "text": "Background"}]},
+            {"type": "paragraph",
+             "content": [{"type": "text", "text": "We use database version 14."}]},
+
+            {"type": "heading", "attrs": {"level": 2},
+             "content": [{"type": "text", "text": "Architecture"}]},
+            // Paragraph A removed.
+            {"type": "paragraph",
+             "content": [{"type": "text", "text": "Paragraph B — kept."}]},
+            {"type": "table", "attrs": {"localId": "t1"},
+             "content": [
+                 {"type": "tableRow", "attrs": {"localId": "r1"},
+                  "content": [
+                      {"type": "tableCell", "attrs": {"localId": "c11"},
+                       "content": [{"type": "paragraph",
+                                    "content": [{"type": "text", "text": "alpha"}]}]},
+                      {"type": "tableCell", "attrs": {"localId": "c12"},
+                       "content": [{"type": "paragraph",
+                                    "content": [{"type": "text", "text": "BETA"}]}]}
+                  ]}
+             ]},
+
+            {"type": "heading", "attrs": {"level": 2},
+             "content": [{"type": "text", "text": "Implementation"}]},
+            {"type": "paragraph",
+             "content": [{"type": "text", "text": "New implementation notes."}]},
+
+            {"type": "heading", "attrs": {"level": 2},
+             "content": [{"type": "text", "text": "Roadmap"}]},
+            {"type": "bulletList",
+             "content": [
+                 {"type": "listItem",
+                  "content": [{"type": "paragraph",
+                               "content": [{"type": "text", "text": "milestone 1"}]}]}
+                 // milestone 2 removed.
+             ]},
+
+            {"type": "heading", "attrs": {"level": 2},
+             "content": [{"type": "text", "text": "Code"}]},
+            {"type": "codeBlock", "attrs": {"language": "rust"},
+             "content": [{"type": "text",
+                          "text": "fn one() {}\nfn two() {}\nfn three() {}\nfn four() {}"}]}
+        ]
+    })
+}
+
+fn fixture_page_response(version: u32, title: &str, adf: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "id": "12345",
+        "title": title,
+        "status": "current",
+        "spaceId": "98",
+        "version": {"number": version},
+        "body": {
+            "atlas_doc_format": {"value": serde_json::to_string(adf).unwrap()}
+        }
+    })
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn confluence_compare_round_trip_with_fixture_page() -> Result<()> {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+
+    // Versions list (newest-first).
+    Mock::given(method("GET"))
+        .and(path("/wiki/api/v2/pages/12345/versions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": [
+                {"number": 2, "createdAt": "2026-05-09T10:00:00Z", "authorId": "alice", "message": "v1.0", "minorEdit": false},
+                {"number": 1, "createdAt": "2026-05-08T10:00:00Z", "authorId": "alice", "message": "v0.9", "minorEdit": false},
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    // Page at v1.
+    Mock::given(method("GET"))
+        .and(path("/wiki/api/v2/pages/12345"))
+        .and(query_param("version", "1"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(fixture_page_response(
+                1,
+                "Spec v0.9",
+                &fixture_v1_adf(),
+            )),
+        )
+        .mount(&server)
+        .await;
+
+    // Page at v2.
+    Mock::given(method("GET"))
+        .and(path("/wiki/api/v2/pages/12345"))
+        .and(query_param("version", "2"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(fixture_page_response(
+                2,
+                "Spec v1.0",
+                &fixture_v2_adf(),
+            )),
+        )
+        .mount(&server)
+        .await;
+
+    // Space-key resolution.
+    Mock::given(method("GET"))
+        .and(path("/wiki/api/v2/spaces/98"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"key": "ENG"})))
+        .mount(&server)
+        .await;
+
+    let _env = AtlassianEnvGuard::new(&server.uri(), "user@test.com", "token")?;
+    let (client, server_handle) = spawn_server().await;
+
+    // Outline-mode call.
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("confluence_compare").with_arguments(
+                serde_json::json!({"id": "12345", "from": "1", "to": "2"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await?;
+    assert!(!result.is_error.unwrap_or(false));
+    let yaml = confluence_tool_text(&result);
+
+    // Section-level assertions: every change kind from the fixture appears.
+    assert!(
+        yaml.contains("/h2#background"),
+        "background section missing"
+    );
+    assert!(
+        yaml.contains("/h2#architecture"),
+        "architecture section missing"
+    );
+    assert!(yaml.contains("/h2#implementation"), "added section missing");
+    assert!(yaml.contains("/h2#roadmap"), "roadmap section missing");
+    assert!(yaml.contains("/h2#code"), "code section missing");
+    // Title change.
+    assert!(yaml.contains("Spec v0.9"));
+    assert!(yaml.contains("Spec v1.0"));
+    // At least one section is `added` (Implementation) and one `modified`.
+    assert!(yaml.contains("change: added"));
+    assert!(yaml.contains("change: modified"));
+
+    // Capture the cursor for the Background section. Parse the YAML
+    // structurally so we don't trip over quoting differences.
+    let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("parse YAML output");
+    let sections = parsed
+        .get("sections")
+        .and_then(serde_yaml::Value::as_sequence)
+        .expect("sections array");
+    let cursor = sections
+        .iter()
+        .find(|s| s.get("path").and_then(|p| p.as_str()) == Some("/h2#background"))
+        .and_then(|s| s.get("cursor").and_then(|c| c.as_str()))
+        .expect("cursor for /h2#background")
+        .to_string();
+
+    let drill = client
+        .call_tool(
+            CallToolRequestParams::new("confluence_compare_section").with_arguments(
+                serde_json::json!({"cursor": cursor, "format": "unified"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await?;
+    assert!(!drill.is_error.unwrap_or(false));
+    let drill_text = confluence_tool_text(&drill);
+    assert!(drill_text.contains("/h2#background"));
+    assert!(drill_text.contains("database version 12"));
+    assert!(drill_text.contains("database version 14"));
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn confluence_compare_min_change_chars_filters_small_edits() -> Result<()> {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/wiki/api/v2/pages/12345/versions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": [
+                {"number": 2, "createdAt": "2026-05-09T10:00:00Z", "authorId": "alice", "message": "", "minorEdit": false},
+                {"number": 1, "createdAt": "2026-05-08T10:00:00Z", "authorId": "alice", "message": "", "minorEdit": false},
+            ]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/wiki/api/v2/pages/12345"))
+        .and(query_param("version", "1"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(fixture_page_response(
+                1,
+                "T",
+                &fixture_v1_adf(),
+            )),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/wiki/api/v2/pages/12345"))
+        .and(query_param("version", "2"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(fixture_page_response(
+                2,
+                "T",
+                &fixture_v2_adf(),
+            )),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/wiki/api/v2/spaces/98"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"key": "ENG"})))
+        .mount(&server)
+        .await;
+
+    let _env = AtlassianEnvGuard::new(&server.uri(), "user@test.com", "token")?;
+    let (client, server_handle) = spawn_server().await;
+
+    // Filter that drops the tiny "12" → "14" Background prose edit but
+    // keeps the section with the larger ist/code/architecture diffs.
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("confluence_compare").with_arguments(
+                serde_json::json!({
+                    "id": "12345",
+                    "from": "1",
+                    "to": "2",
+                    "min_change_chars": 200
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+        )
+        .await?;
+    assert!(!result.is_error.unwrap_or(false));
+    let yaml = confluence_tool_text(&result);
+    // Background's prose edit ("12" → "14", ~50 chars total) drops out.
+    assert!(
+        !yaml.contains("path: /h2#background"),
+        "background should be filtered: {yaml}"
+    );
 
     client.cancel().await?;
     let _ = server_handle.await;
