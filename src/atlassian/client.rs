@@ -5990,6 +5990,29 @@ impl AtlassianClient {
         unreachable!()
     }
 
+    /// Sends an authenticated POST request with a multipart body and returns the raw response.
+    ///
+    /// Does not retry on 429: a streamed multipart body cannot be replayed. Callers
+    /// that need retry must rebuild the form and call again.
+    pub async fn post_multipart(
+        &self,
+        url: &str,
+        form: reqwest::multipart::Form,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<reqwest::Response> {
+        let mut req = self
+            .client
+            .post(url)
+            .header("Authorization", &self.auth_header)
+            .multipart(form);
+        for (name, value) in extra_headers {
+            req = req.header(*name, *value);
+        }
+        req.send()
+            .await
+            .context("Failed to send multipart POST request to Atlassian API")
+    }
+
     /// Internal: GET with custom Accept header and 429 retry.
     async fn get_json_raw_accept(&self, url: &str, accept: &str) -> Result<reqwest::Response> {
         for attempt in 0..=MAX_RETRIES {

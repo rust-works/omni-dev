@@ -1725,6 +1725,9 @@ async fn list_tools_includes_confluence_extensions() -> Result<()> {
         "confluence_label_add",
         "confluence_label_remove",
         "confluence_user_search",
+        "confluence_attachment_upload",
+        "confluence_attachment_list",
+        "confluence_attachment_delete",
     ] {
         assert!(names.contains(&expected), "missing {expected}: {names:?}");
     }
@@ -1812,6 +1815,34 @@ async fn confluence_tools_success_paths_via_wiremock() -> Result<()> {
                 {"user": {"accountId": "abc", "displayName": "Alice", "email": "a@x.com"}}
             ]
         })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/wiki/api/v2/pages/12345/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": [{
+                "id": "att-1",
+                "title": "hello.txt",
+                "mediaType": "text/plain",
+                "fileSize": 13,
+                "version": {"number": 1}
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/wiki/api/v2/pages/12345/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": [{"id": "att-1", "title": "hello.txt"}]
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/wiki/api/v2/attachments/att-1"))
+        .respond_with(ResponseTemplate::new(204))
         .mount(&server)
         .await;
 
@@ -1904,6 +1935,65 @@ async fn confluence_tools_success_paths_via_wiremock() -> Result<()> {
         .await?;
     assert!(!users.is_error.unwrap_or(false));
     assert!(confluence_tool_text(&users).contains("Alice"));
+
+    let attach_dir = tempfile::tempdir()?;
+    let attach_path = attach_dir.path().join("hello.txt");
+    tokio::fs::write(&attach_path, b"hello, world!").await?;
+    let attach_path_str = attach_path.to_string_lossy().to_string();
+
+    // Upload — exercises the `Some` branch of all optional params
+    // (filename, comment, minor_edit) so coverage hits both arms of the
+    // `Option::unwrap_or(...)` calls in the tool handler.
+    let attachment_upload = client
+        .call_tool(
+            CallToolRequestParams::new("confluence_attachment_upload").with_arguments(
+                serde_json::json!({
+                    "page_id": "12345",
+                    "file_path": attach_path_str,
+                    "filename": "hello.txt",
+                    "comment": "v1",
+                    "minor_edit": true,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+        )
+        .await?;
+    assert!(!attachment_upload.is_error.unwrap_or(false));
+    assert!(confluence_tool_text(&attachment_upload).contains("att-1"));
+
+    // List — exercises the `Some` branch of `cursor` and `limit`.
+    let attachment_list = client
+        .call_tool(
+            CallToolRequestParams::new("confluence_attachment_list").with_arguments(
+                serde_json::json!({
+                    "page_id": "12345",
+                    "cursor": "PAGE2",
+                    "limit": 50,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+        )
+        .await?;
+    assert!(!attachment_list.is_error.unwrap_or(false));
+    assert!(confluence_tool_text(&attachment_list).contains("hello.txt"));
+
+    // Delete — exercises the `Some` branch of `purge`.
+    let attachment_delete = client
+        .call_tool(
+            CallToolRequestParams::new("confluence_attachment_delete").with_arguments(
+                serde_json::json!({"attachment_id": "att-1", "purge": false})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await?;
+    assert!(!attachment_delete.is_error.unwrap_or(false));
+    assert!(confluence_tool_text(&attachment_delete).contains("Deleted attachment att-1"));
 
     client.cancel().await?;
     let _ = server_handle.await;

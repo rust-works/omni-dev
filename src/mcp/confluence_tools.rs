@@ -20,7 +20,9 @@ use serde::{Deserialize, Serialize};
 use crate::atlassian::adf::AdfDocument;
 use crate::atlassian::api::{AtlassianApi, ContentItem};
 use crate::atlassian::client::AtlassianClient;
-use crate::atlassian::confluence_api::{ChildPage, ConfluenceApi, MovePosition};
+use crate::atlassian::confluence_api::{
+    ChildPage, ConfluenceApi, ConfluenceAttachmentPage, MovePosition,
+};
 use crate::atlassian::convert::markdown_to_adf;
 use crate::atlassian::document::{content_item_to_document, JfmDocument, JfmFrontmatter};
 use crate::cli::atlassian::confluence::download::{
@@ -245,6 +247,50 @@ pub struct ConfluenceUserSearchParams {
     /// Maximum number of results (0 = unlimited). Defaults to 25.
     #[serde(default)]
     pub limit: Option<u32>,
+}
+
+/// Parameters for the `confluence_attachment_upload` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceAttachmentUploadParams {
+    /// Confluence page ID to attach the file to.
+    pub page_id: String,
+    /// Local filesystem path to the file to upload. Streamed from disk
+    /// (never fully buffered in memory).
+    pub file_path: String,
+    /// Override the filename used in Confluence (defaults to the local
+    /// basename).
+    #[serde(default)]
+    pub filename: Option<String>,
+    /// Optional version comment recorded with the upload.
+    #[serde(default)]
+    pub comment: Option<String>,
+    /// Marks the upload as a minor edit. Defaults to false.
+    #[serde(default)]
+    pub minor_edit: Option<bool>,
+}
+
+/// Parameters for the `confluence_attachment_list` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceAttachmentListParams {
+    /// Confluence page ID.
+    pub page_id: String,
+    /// Pagination cursor (use `next_cursor` from a previous call).
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Maximum number of attachments per page. Defaults to 25.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// Parameters for the `confluence_attachment_delete` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceAttachmentDeleteParams {
+    /// Attachment ID.
+    pub attachment_id: String,
+    /// Permanently purge the attachment instead of moving it to trash
+    /// (requires space admin). Defaults to false.
+    #[serde(default)]
+    pub purge: Option<bool>,
 }
 
 // ── Output summaries ────────────────────────────────────────────────
@@ -614,6 +660,52 @@ pub async fn search_users_yaml(
     to_yaml(&results)
 }
 
+/// Uploads a file as an attachment and returns YAML for the resulting attachment.
+pub async fn upload_attachment_result(
+    api: &ConfluenceApi,
+    page_id: &str,
+    file_path: &str,
+    filename: Option<&str>,
+    comment: Option<&str>,
+    minor_edit: bool,
+) -> Result<String> {
+    let path = std::path::Path::new(file_path);
+    let attachment = api
+        .upload_attachment(page_id, path, filename, comment, minor_edit)
+        .await?;
+    to_yaml(&attachment)
+}
+
+/// Builds the YAML output for the `confluence_attachment_list` tool.
+pub async fn list_attachments_yaml(
+    api: &ConfluenceApi,
+    page_id: &str,
+    cursor: Option<&str>,
+    limit: u32,
+) -> Result<String> {
+    let page: ConfluenceAttachmentPage = api.list_attachments(page_id, cursor, limit).await?;
+    to_yaml(&page)
+}
+
+/// Deletes an attachment and returns a YAML confirmation.
+pub async fn delete_attachment_result(
+    api: &ConfluenceApi,
+    attachment_id: &str,
+    purge: bool,
+) -> Result<String> {
+    api.delete_attachment(attachment_id, purge).await?;
+    let result = MutationResult {
+        ok: true,
+        message: format!(
+            "Deleted attachment {attachment_id}{}.",
+            if purge { " (purged)" } else { "" }
+        ),
+        id: attachment_id,
+        labels: &[],
+    };
+    to_yaml(&result)
+}
+
 // ── Tool handlers ────────────────────────────────────────────────────
 
 #[allow(missing_docs)] // #[tool_router] generates a pub `confluence_tool_router` fn.
@@ -891,6 +983,78 @@ impl OmniDevServer {
         let yaml = search_users_yaml(&client, &params.query, params.limit.unwrap_or(25))
             .await
             .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Uploads a file as an attachment to a Confluence page.
+    #[tool(
+        description = "Upload a local file as an attachment to a Confluence page. \
+                       `file_path` is a path on the MCP server's filesystem (the file is \
+                       streamed from disk, never fully buffered). Optional `filename` \
+                       overrides the stored name; `comment` is recorded as a version note; \
+                       `minor_edit` (default false) marks the upload as minor. \
+                       Returns YAML describing the new attachment. Mirrors \
+                       `omni-dev atlassian confluence attachment upload`."
+    )]
+    pub async fn confluence_attachment_upload(
+        &self,
+        Parameters(params): Parameters<ConfluenceAttachmentUploadParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _url) = create_client().map_err(tool_error)?;
+        let api = ConfluenceApi::new(client);
+        let yaml = upload_attachment_result(
+            &api,
+            &params.page_id,
+            &params.file_path,
+            params.filename.as_deref(),
+            params.comment.as_deref(),
+            params.minor_edit.unwrap_or(false),
+        )
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Lists attachments on a Confluence page (paginated).
+    #[tool(
+        description = "List attachments on a Confluence page (one page per call). \
+                       Pass the returned `next_cursor` back as `cursor` to fetch the next \
+                       page. `limit` defaults to 25. Mirrors \
+                       `omni-dev atlassian confluence attachment list`."
+    )]
+    pub async fn confluence_attachment_list(
+        &self,
+        Parameters(params): Parameters<ConfluenceAttachmentListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _url) = create_client().map_err(tool_error)?;
+        let api = ConfluenceApi::new(client);
+        let yaml = list_attachments_yaml(
+            &api,
+            &params.page_id,
+            params.cursor.as_deref(),
+            params.limit.unwrap_or(25),
+        )
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Deletes an attachment by ID.
+    #[tool(
+        description = "Delete a Confluence attachment by ID. Set `purge: true` to \
+                       permanently purge instead of moving to trash (requires space admin). \
+                       Mirrors `omni-dev atlassian confluence attachment delete --force`."
+    )]
+    pub async fn confluence_attachment_delete(
+        &self,
+        Parameters(params): Parameters<ConfluenceAttachmentDeleteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _url) = create_client().map_err(tool_error)?;
+        let api = ConfluenceApi::new(client);
+        let yaml =
+            delete_attachment_result(&api, &params.attachment_id, params.purge.unwrap_or(false))
+                .await
+                .map_err(tool_error)?;
         Ok(CallToolResult::success(vec![Content::text(yaml)]))
     }
 }

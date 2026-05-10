@@ -144,6 +144,9 @@ mod tests {
             "confluence_label_add",
             "confluence_label_remove",
             "confluence_user_search",
+            "confluence_attachment_upload",
+            "confluence_attachment_list",
+            "confluence_attachment_delete",
         ] {
             assert!(
                 server.tool_router.has_route(name),

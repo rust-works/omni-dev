@@ -25,7 +25,7 @@ termcolor = "1.1"
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3.27"
-reqwest = { version = "0.13", features = ["json"] }
+reqwest = { version = "0.13", features = ["json", "multipart", "stream"] }
 tokio = { version = "1.52", features = ["full"] }
 thiserror = "2.0"
 async-trait = "0.1"
@@ -40,13 +40,14 @@ base64 = "0.22"
 futures = "0.3"
 rmcp = { version = "1.6", features = ["server", "transport-io", "macros"], optional = true }
 schemars = "1.2"
-tokio-util = { version = "0.7", optional = true }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
+mime_guess = "2"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["signal"] }
 
 [features]
-mcp = ["dep:rmcp", "dep:tokio-util"]
+mcp = ["dep:rmcp"]
 
 [dev-dependencies]
 tempfile = "3.27"
