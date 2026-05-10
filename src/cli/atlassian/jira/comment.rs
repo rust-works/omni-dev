@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::atlassian::adf::AdfDocument;
+use crate::atlassian::adf_validated::ValidatedAdfDocument;
 use crate::atlassian::client::{AtlassianClient, JiraComment, JiraVisibility, JiraVisibilityType};
 use crate::atlassian::convert::{adf_to_markdown, markdown_to_adf};
 use crate::atlassian::document::JfmDocument;
@@ -154,25 +155,26 @@ impl EditCommand {
     }
 }
 
-/// Parses the input file into an ADF document.
-fn parse_comment_input(file: Option<&str>, format: ContentFormat) -> Result<AdfDocument> {
+/// Parses the input file into a validated ADF document.
+fn parse_comment_input(file: Option<&str>, format: ContentFormat) -> Result<ValidatedAdfDocument> {
     let input = read_input(file)?;
 
-    match format {
+    let adf: AdfDocument = match format {
         ContentFormat::Jfm => {
             // Try parsing as JFM document (with frontmatter) first,
             // fall back to raw markdown
             if input.starts_with("---\n") {
                 let doc = JfmDocument::parse(&input)?;
-                markdown_to_adf(&doc.body)
+                markdown_to_adf(&doc.body)?
             } else {
-                markdown_to_adf(&input)
+                markdown_to_adf(&input)?
             }
         }
         ContentFormat::Adf => {
-            serde_json::from_str(&input).context("Failed to parse ADF JSON input")
+            serde_json::from_str(&input).context("Failed to parse ADF JSON input")?
         }
-    }
+    };
+    Ok(ValidatedAdfDocument::try_new(adf)?)
 }
 
 /// Fetches and displays comments for an issue.
@@ -191,7 +193,11 @@ async fn run_list_comments(
 }
 
 /// Posts a comment to an issue.
-async fn run_add_comment(client: &AtlassianClient, key: &str, adf: &AdfDocument) -> Result<()> {
+async fn run_add_comment(
+    client: &AtlassianClient,
+    key: &str,
+    adf: &ValidatedAdfDocument,
+) -> Result<()> {
     client.add_comment(key, adf).await?;
     println!("Comment added to {key}.");
     Ok(())
@@ -202,7 +208,7 @@ async fn run_edit_comment(
     client: &AtlassianClient,
     key: &str,
     comment_id: &str,
-    adf: &AdfDocument,
+    adf: &ValidatedAdfDocument,
     visibility: Option<&JiraVisibility>,
 ) -> Result<()> {
     let updated = client
@@ -430,6 +436,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parse_input_jfm_rejects_invalid_adf_nesting() {
+        // Issue #714: JFM that converts to invalid ADF (panel→expand) must
+        // be rejected at parse time, before the API call.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("bad.md");
+        fs::write(
+            &file_path,
+            ":::panel{type=info}\n:::expand{title=\"x\"}\nbody\n:::\n:::",
+        )
+        .unwrap();
+        let err =
+            parse_comment_input(Some(file_path.to_str().unwrap()), ContentFormat::Jfm).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid ADF nesting"));
+        assert!(msg.contains("`expand` cannot be a child of `panel`"));
+    }
+
     // ── CommentCommand dispatch ────────────────────────────────────
 
     #[test]
@@ -593,7 +617,7 @@ mod tests {
             .await;
 
         let client = mock_client(&server.uri());
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         assert!(run_add_comment(&client, "PROJ-1", &adf).await.is_ok());
     }
 
@@ -607,7 +631,7 @@ mod tests {
             .await;
 
         let client = mock_client(&server.uri());
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let err = run_add_comment(&client, "PROJ-1", &adf).await.unwrap_err();
         assert!(err.to_string().contains("403"));
     }
@@ -634,7 +658,7 @@ mod tests {
             .await;
 
         let client = mock_client(&server.uri());
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         assert!(run_edit_comment(&client, "PROJ-1", "100", &adf, None)
             .await
             .is_ok());
@@ -664,7 +688,7 @@ mod tests {
             .await;
 
         let client = mock_client(&server.uri());
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let visibility = JiraVisibility {
             ty: JiraVisibilityType::Role,
             value: "Administrators".to_string(),
@@ -690,7 +714,7 @@ mod tests {
             .await;
 
         let client = mock_client(&server.uri());
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let err = run_edit_comment(&client, "PROJ-1", "100", &adf, None)
             .await
             .unwrap_err();
@@ -715,7 +739,7 @@ mod tests {
             .await;
 
         let client = mock_client(&server.uri());
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let err = run_edit_comment(&client, "PROJ-1", "9999", &adf, None)
             .await
             .unwrap_err();

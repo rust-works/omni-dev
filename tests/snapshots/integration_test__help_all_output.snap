@@ -843,8 +843,9 @@ Arguments:
   [FILE]  Input file (reads from stdin if omitted or "-")
 
 Options:
-      --compact  Outputs compact JSON instead of pretty-printed
-  -h, --help     Print help
+      --compact      Outputs compact JSON instead of pretty-printed
+      --no-validate  Skips Confluence ADF nesting validation. By default, the converted document is checked against the known Confluence content-model rules (e.g., `expand` cannot appear inside `panel`); pass this flag to print invalid ADF anyway, for inspection or debugging
+  -h, --help         Print help
 
 
 ================================================================================

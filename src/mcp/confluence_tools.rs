@@ -18,6 +18,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 
 use crate::atlassian::adf::AdfDocument;
+use crate::atlassian::adf_validated::ValidatedAdfDocument;
 use crate::atlassian::api::{AtlassianApi, ContentItem};
 use crate::atlassian::client::AtlassianClient;
 use crate::atlassian::confluence_api::{
@@ -443,8 +444,11 @@ fn render_content_item(
 ///
 /// For JFM the frontmatter `title` is returned alongside; for ADF the title
 /// is empty (callers provide it separately).
-fn parse_write_content(content: &str, format: ContentFormat) -> Result<(AdfDocument, String)> {
-    match format {
+fn parse_write_content(
+    content: &str,
+    format: ContentFormat,
+) -> Result<(ValidatedAdfDocument, String)> {
+    let (adf, title): (AdfDocument, String) = match format {
         ContentFormat::Jfm => {
             // JFM inputs with frontmatter are passed as-is; inputs without
             // frontmatter are treated as raw markdown. The CLI requires
@@ -457,17 +461,18 @@ fn parse_write_content(content: &str, format: ContentFormat) -> Result<(AdfDocum
                     JfmFrontmatter::Confluence(fm) => fm.title.clone(),
                     JfmFrontmatter::Jira(fm) => fm.summary.clone(),
                 };
-                Ok((adf, title))
+                (adf, title)
             } else {
                 let adf = markdown_to_adf(content)?;
-                Ok((adf, String::new()))
+                (adf, String::new())
             }
         }
         ContentFormat::Adf => {
             let adf = AdfDocument::from_json_str(content)?;
-            Ok((adf, String::new()))
+            (adf, String::new())
         }
-    }
+    };
+    Ok((ValidatedAdfDocument::try_new(adf)?, title))
 }
 
 /// Serializes search results as YAML for the tool response body.
@@ -701,6 +706,7 @@ pub async fn list_comments_yaml(api: &ConfluenceApi, id: &str, limit: usize) -> 
 /// The markdown `content` is converted to ADF before posting.
 pub async fn add_comment_result(api: &ConfluenceApi, id: &str, content: &str) -> Result<String> {
     let adf: AdfDocument = markdown_to_adf(content).context("Failed to convert markdown to ADF")?;
+    let adf = ValidatedAdfDocument::try_new(adf)?;
     api.add_page_comment(id, &adf).await?;
 
     let result = MutationResult {
@@ -1256,6 +1262,7 @@ async fn run_confluence_create(
         ContentFormat::Jfm => markdown_to_adf(&params.content)?,
         ContentFormat::Adf => AdfDocument::from_json_str(&params.content)?,
     };
+    let adf = ValidatedAdfDocument::try_new(adf)?;
 
     let (client, _instance_url) = create_client()?;
     let api = ConfluenceApi::new(client);
@@ -1880,6 +1887,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(id, "999");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_confluence_create_rejects_invalid_adf_nesting() {
+        // Issue #714: validation runs before any HTTP call. No EnvGuard
+        // needed because the function returns before reaching create_client().
+        let params = ConfluenceCreateParams {
+            space_key: "ENG".to_string(),
+            title: "Bad".to_string(),
+            content: ":::panel{type=info}\n:::expand{title=\"x\"}\nbody\n:::\n:::".to_string(),
+            parent_id: None,
+            format: Some("jfm".to_string()),
+        };
+        let err = run_confluence_create(&params, ContentFormat::Jfm)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid ADF nesting"));
+        assert!(msg.contains("`expand` cannot be a child of `panel`"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_confluence_write_rejects_invalid_adf_nesting() {
+        // Issue #714: validation runs before any HTTP call.
+        let bad_jfm = ":::panel{type=info}\n:::expand{title=\"x\"}\nbody\n:::\n:::";
+        let err = run_confluence_write("12345", bad_jfm, ContentFormat::Jfm)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid ADF nesting"));
+        assert!(msg.contains("`expand` cannot be a child of `panel`"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3078,6 +3116,21 @@ mod tests {
         assert!(yaml.contains("ok: true"));
         assert!(yaml.contains("id: '12345'") || yaml.contains("id: \"12345\""));
         assert!(yaml.contains("Comment added"));
+    }
+
+    #[tokio::test]
+    async fn add_comment_result_rejects_invalid_adf_nesting() {
+        // Issue #714: invalid markdown body short-circuits before any HTTP
+        // call. The footer-comments mock is intentionally absent so any
+        // request would be a clear test failure.
+        let server = wiremock::MockServer::start().await;
+        let bad_jfm = ":::panel{type=info}\n:::expand{title=\"x\"}\nbody\n:::\n:::";
+        let err = add_comment_result(&phase2d_mock_api(&server), "12345", bad_jfm)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid ADF nesting"));
+        assert!(msg.contains("`expand` cannot be a child of `panel`"));
     }
 
     #[tokio::test]

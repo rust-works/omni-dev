@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::atlassian::adf::AdfDocument;
+use crate::atlassian::adf_validated::ValidatedAdfDocument;
 use crate::atlassian::confluence_api::{ConfluenceApi, ConfluenceComment};
 use crate::atlassian::convert::{adf_to_markdown, markdown_to_adf};
 use crate::atlassian::document::JfmDocument;
@@ -85,25 +86,26 @@ impl AddCommand {
         run_add_comment(&api, &self.id, &adf).await
     }
 
-    /// Parses the input file into an ADF document.
-    fn parse_input(&self) -> Result<AdfDocument> {
+    /// Parses the input file into a validated ADF document.
+    fn parse_input(&self) -> Result<ValidatedAdfDocument> {
         let input = read_input(self.file.as_deref())?;
 
-        match self.format {
+        let adf: AdfDocument = match self.format {
             ContentFormat::Jfm => {
                 // Try parsing as JFM document (with frontmatter) first,
                 // fall back to raw markdown
                 if input.starts_with("---\n") {
                     let doc = JfmDocument::parse(&input)?;
-                    markdown_to_adf(&doc.body)
+                    markdown_to_adf(&doc.body)?
                 } else {
-                    markdown_to_adf(&input)
+                    markdown_to_adf(&input)?
                 }
             }
             ContentFormat::Adf => {
-                serde_json::from_str(&input).context("Failed to parse ADF JSON input")
+                serde_json::from_str(&input).context("Failed to parse ADF JSON input")?
             }
-        }
+        };
+        Ok(ValidatedAdfDocument::try_new(adf)?)
     }
 }
 
@@ -124,7 +126,7 @@ async fn run_list_comments(
 }
 
 /// Posts a comment to a page.
-async fn run_add_comment(api: &ConfluenceApi, id: &str, adf: &AdfDocument) -> Result<()> {
+async fn run_add_comment(api: &ConfluenceApi, id: &str, adf: &ValidatedAdfDocument) -> Result<()> {
     api.add_page_comment(id, adf).await?;
     println!("Comment added to page {id}.");
     Ok(())
@@ -367,6 +369,29 @@ mod tests {
         assert!(cmd.parse_input().is_err());
     }
 
+    #[test]
+    fn parse_input_jfm_rejects_invalid_adf_nesting() {
+        // Issue #714: JFM that converts to invalid ADF (panel→expand) must
+        // be rejected at parse time, before the API call.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("bad.md");
+        fs::write(
+            &file_path,
+            ":::panel{type=info}\n:::expand{title=\"x\"}\nbody\n:::\n:::",
+        )
+        .unwrap();
+
+        let cmd = AddCommand {
+            id: "12345".to_string(),
+            file: Some(file_path.to_str().unwrap().to_string()),
+            format: ContentFormat::Jfm,
+        };
+        let err = cmd.parse_input().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid ADF nesting"));
+        assert!(msg.contains("`expand` cannot be a child of `panel`"));
+    }
+
     // ── CommentCommand dispatch ────────────────────────────────────
 
     #[test]
@@ -473,7 +498,7 @@ mod tests {
             .await;
 
         let api = mock_api(&server);
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         assert!(run_add_comment(&api, "12345", &adf).await.is_ok());
     }
 
@@ -487,7 +512,7 @@ mod tests {
             .await;
 
         let api = mock_api(&server);
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let err = run_add_comment(&api, "12345", &adf).await.unwrap_err();
         assert!(err.to_string().contains("403"));
     }

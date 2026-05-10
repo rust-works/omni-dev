@@ -15,6 +15,7 @@ use tracing::debug;
 
 use crate::atlassian::adf::AdfDocument;
 use crate::atlassian::adf_schema;
+use crate::atlassian::adf_validated::ValidatedAdfDocument;
 use crate::atlassian::api::{AtlassianApi, ContentItem, ContentMetadata};
 use crate::atlassian::client::AtlassianClient;
 use crate::atlassian::error::AtlassianError;
@@ -655,7 +656,7 @@ impl AtlassianApi for ConfluenceApi {
     fn update_content<'a>(
         &'a self,
         id: &'a str,
-        body_adf: &'a AdfDocument,
+        body_adf: &'a ValidatedAdfDocument,
         title: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
@@ -765,7 +766,7 @@ impl ConfluenceApi {
         &self,
         space_key: &str,
         title: &str,
-        body_adf: &AdfDocument,
+        body_adf: &ValidatedAdfDocument,
         parent_id: Option<&str>,
     ) -> Result<String> {
         let space_id = self.resolve_space_id(space_key).await?;
@@ -1073,7 +1074,11 @@ impl ConfluenceApi {
     }
 
     /// Adds a footer comment to a Confluence page.
-    pub async fn add_page_comment(&self, page_id: &str, body_adf: &AdfDocument) -> Result<()> {
+    pub async fn add_page_comment(
+        &self,
+        page_id: &str,
+        body_adf: &ValidatedAdfDocument,
+    ) -> Result<()> {
         let adf_json =
             serde_json::to_string(body_adf).context("Failed to serialize ADF document")?;
 
@@ -2039,7 +2044,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let result = api.update_content("12345", &adf, Some("New Title")).await;
         assert!(result.is_ok());
     }
@@ -2056,7 +2061,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let err = api.update_content("12345", &adf, None).await.unwrap_err();
         assert!(err.to_string().contains("403"));
     }
@@ -2075,7 +2080,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let adf = adf_with_panel_expand();
+        let adf = ValidatedAdfDocument::trust(adf_with_panel_expand());
         let err = api.update_content("12345", &adf, None).await.unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -2110,7 +2115,7 @@ mod tests {
             .await;
 
         // Empty (well-formed) document — no schema violations to surface.
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let err = api.update_content("12345", &adf, None).await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("HTTP 500"), "missing status in: {msg}");
@@ -2227,7 +2232,7 @@ mod tests {
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
         let api = ConfluenceApi::new(client);
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let id = api
             .create_page("ENG", "New Page", &adf, None)
             .await
@@ -2259,7 +2264,7 @@ mod tests {
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
         let api = ConfluenceApi::new(client);
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let id = api
             .create_page("ENG", "Child Page", &adf, Some("11111"))
             .await
@@ -2288,7 +2293,7 @@ mod tests {
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
         let api = ConfluenceApi::new(client);
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let err = api
             .create_page("ENG", "Fail", &adf, None)
             .await
@@ -2319,7 +2324,7 @@ mod tests {
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
         let api = ConfluenceApi::new(client);
-        let adf = adf_with_panel_expand();
+        let adf = ValidatedAdfDocument::trust(adf_with_panel_expand());
         let err = api.create_page("ENG", "Bad", &adf, None).await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("HTTP 500"), "missing status in: {msg}");
@@ -3135,7 +3140,7 @@ mod tests {
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
         let api = ConfluenceApi::new(client);
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let result = api.add_page_comment("12345", &adf).await;
         assert!(result.is_ok());
     }
@@ -3153,7 +3158,7 @@ mod tests {
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
         let api = ConfluenceApi::new(client);
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let err = api.add_page_comment("12345", &adf).await.unwrap_err();
         assert!(err.to_string().contains("403"));
     }
@@ -3173,7 +3178,7 @@ mod tests {
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
         let api = ConfluenceApi::new(client);
-        let adf = adf_with_panel_expand();
+        let adf = ValidatedAdfDocument::trust(adf_with_panel_expand());
         let err = api.add_page_comment("12345", &adf).await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("HTTP 500"), "missing status in: {msg}");

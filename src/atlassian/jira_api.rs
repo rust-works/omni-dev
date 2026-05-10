@@ -5,7 +5,7 @@ use std::pin::Pin;
 
 use anyhow::{Context, Result};
 
-use crate::atlassian::adf::AdfDocument;
+use crate::atlassian::adf_validated::ValidatedAdfDocument;
 use crate::atlassian::api::{AtlassianApi, ContentItem, ContentMetadata};
 use crate::atlassian::client::AtlassianClient;
 
@@ -51,7 +51,7 @@ impl AtlassianApi for JiraApi {
     fn update_content<'a>(
         &'a self,
         id: &'a str,
-        body_adf: &'a AdfDocument,
+        body_adf: &'a ValidatedAdfDocument,
         title: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
@@ -166,7 +166,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let adf = crate::atlassian::adf::AdfDocument::new();
+        let adf = crate::atlassian::adf_validated::ValidatedAdfDocument::empty();
         let result = api.update_content("PROJ-42", &adf, Some("New Title")).await;
         assert!(result.is_ok());
     }

@@ -7,6 +7,7 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::atlassian::adf::AdfDocument;
 use crate::atlassian::adf_schema::validate_document;
+use crate::atlassian::adf_validated::ValidatedAdfDocument;
 use crate::atlassian::api::AtlassianApi;
 use crate::atlassian::auth;
 use crate::atlassian::client::{AtlassianClient, FieldSelection};
@@ -89,7 +90,11 @@ pub async fn run_read_jira_with_fields(
     Ok(())
 }
 
-/// Parses input content and converts it to ADF, returning the document and title.
+/// Parses input content and converts it to ADF, returning the raw document
+/// and the title. Validation is intentionally *not* performed here —
+/// callers must wrap the result in [`ValidatedAdfDocument::try_new`] before
+/// sending. The dry-run path bypasses that wrapping so it can show the
+/// converted ADF *and* a violation diagnosis from [`print_dry_run`].
 pub fn prepare_write(file: Option<&str>, format: &ContentFormat) -> Result<(AdfDocument, String)> {
     let input = read_input(file)?;
 
@@ -112,6 +117,10 @@ pub fn prepare_write(file: Option<&str>, format: &ContentFormat) -> Result<(AdfD
 /// Runs the ADF schema validator over `adf` after printing the JSON output and
 /// reports any violations. Returns an error if violations are found, so the
 /// process exits non-zero — useful as a CI pre-flight check.
+///
+/// Takes a raw [`AdfDocument`] (not [`ValidatedAdfDocument`]) so callers on
+/// the dry-run path can show the ADF *and* the violation diagnosis even when
+/// the document would otherwise be rejected by [`ValidatedAdfDocument::try_new`].
 pub fn print_dry_run(id: &str, adf: &AdfDocument, title: &str) -> Result<()> {
     println!("Dry run for {id}:");
     if !title.is_empty() {
@@ -146,7 +155,7 @@ pub fn print_create_dry_run(
     project: &str,
     issue_type: &str,
     summary: &str,
-    adf: &AdfDocument,
+    adf: &ValidatedAdfDocument,
     labels: &[String],
 ) -> Result<()> {
     println!("Dry run — would create issue:");
@@ -166,7 +175,7 @@ pub fn print_create_dry_run(
 /// Confirms and pushes content to the target.
 pub async fn run_write(
     id: &str,
-    adf: &AdfDocument,
+    adf: &ValidatedAdfDocument,
     title: &str,
     force: bool,
     api: &dyn AtlassianApi,
@@ -205,7 +214,7 @@ pub async fn run_write(
 /// trait does not model custom fields or parent.
 pub async fn run_write_jira_with_resolved_fields(
     key: &str,
-    description_adf: Option<&AdfDocument>,
+    description_adf: Option<&ValidatedAdfDocument>,
     title: &str,
     parent: Option<&str>,
     force: bool,
@@ -363,6 +372,7 @@ pub async fn run_edit(id: &str, api: &dyn AtlassianApi, instance_url: &str) -> R
                         .unwrap_or_else(|e| format!("<serialization error: {e}>"));
                     tracing::trace!("ADF payload:\n{adf_json}");
                 }
+                let validated = ValidatedAdfDocument::try_new(adf)?;
 
                 let title_changed = final_doc.frontmatter.title() != original_title;
                 let title_update = if title_changed {
@@ -371,7 +381,7 @@ pub async fn run_edit(id: &str, api: &dyn AtlassianApi, instance_url: &str) -> R
                     None
                 };
 
-                api.update_content(id, &adf, title_update).await?;
+                api.update_content(id, &validated, title_update).await?;
                 println!("Updated {id} successfully.");
                 return Ok(());
             }
@@ -542,7 +552,7 @@ mod tests {
         fn update_content<'a>(
             &'a self,
             _id: &'a str,
-            _body_adf: &'a AdfDocument,
+            _body_adf: &'a ValidatedAdfDocument,
             _title: Option<&'a str>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
             *self.update_called.lock().unwrap() = true;
@@ -709,11 +719,20 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // Note: `prepare_write` deliberately returns the raw `AdfDocument`
+    // without validating, so callers on the dry-run path can show the ADF
+    // *and* a violation diagnosis from `print_dry_run` (issue #718, PR #739).
+    // Validation of bad ADF on the actual send path is exercised by:
+    //   * `ValidatedAdfDocument::try_new` unit tests in `adf_validated.rs`,
+    //   * `print_dry_run_fails_on_schema_violation` (PR #739) for the
+    //     dry-run path, and
+    //   * `run_jira_*` / `add_comment_result` MCP tests for the API path.
+
     // ── print_dry_run ──────────────────────────────────────────────
 
     #[test]
     fn print_dry_run_with_title() {
-        let adf = AdfDocument::new();
+        let adf = AdfDocument::default();
         let result = print_dry_run("PROJ-1", &adf, "My Title");
         assert!(result.is_ok());
     }
@@ -782,7 +801,7 @@ mod tests {
 
     #[test]
     fn print_dry_run_without_title() {
-        let adf = AdfDocument::new();
+        let adf = AdfDocument::default();
         let result = print_dry_run("PROJ-1", &adf, "");
         assert!(result.is_ok());
     }
@@ -919,7 +938,7 @@ mod tests {
     #[tokio::test]
     async fn run_write_force_with_title() {
         let api = MockApi::jira_issue(None);
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
 
         let result = run_write("PROJ-1", &adf, "My Title", true, &api).await;
         assert!(result.is_ok());
@@ -929,7 +948,7 @@ mod tests {
     #[tokio::test]
     async fn run_write_force_empty_title() {
         let api = MockApi::jira_issue(None);
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
 
         let result = run_write("PROJ-1", &adf, "", true, &api).await;
         assert!(result.is_ok());
@@ -940,7 +959,7 @@ mod tests {
 
     #[test]
     fn print_create_dry_run_with_labels() {
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let labels = vec!["backend".to_string(), "urgent".to_string()];
         let result = print_create_dry_run("PROJ", "Bug", "Fix login", &adf, &labels);
         assert!(result.is_ok());
@@ -948,7 +967,7 @@ mod tests {
 
     #[test]
     fn print_create_dry_run_without_labels() {
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let result = print_create_dry_run("PROJ", "Task", "Add feature", &adf, &[]);
         assert!(result.is_ok());
     }
@@ -1094,7 +1113,7 @@ mod tests {
             .await;
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let mut custom = std::collections::BTreeMap::new();
         custom.insert(
             "customfield_10001".to_string(),
@@ -1163,7 +1182,7 @@ mod tests {
             .await;
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let mut custom = std::collections::BTreeMap::new();
         custom.insert("customfield_10001".to_string(), serde_json::json!(42));
 
@@ -1175,7 +1194,7 @@ mod tests {
     #[test]
     fn print_jira_dry_run_with_scalars_and_sections() {
         use crate::atlassian::document::CustomFieldSection;
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let mut scalars = std::collections::BTreeMap::new();
         scalars.insert(
             "Planned / Unplanned Work".to_string(),
@@ -1201,7 +1220,7 @@ mod tests {
 
     #[test]
     fn print_jira_dry_run_without_extras_still_prints_description() {
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let scalars = std::collections::BTreeMap::new();
         let result = print_jira_dry_run_with_custom_fields(
             "ACCS-1",

@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use crate::atlassian::adf::AdfDocument;
+use crate::atlassian::adf_validated::ValidatedAdfDocument;
 use crate::atlassian::client::AtlassianClient;
 use crate::atlassian::convert::markdown_to_adf;
 use crate::atlassian::custom_fields::{
@@ -56,7 +57,7 @@ struct CreateParams {
     issue_type: String,
     summary: String,
     labels: Vec<String>,
-    adf: AdfDocument,
+    adf: ValidatedAdfDocument,
     custom_scalars: BTreeMap<String, serde_yaml::Value>,
     custom_sections: Vec<CustomFieldSection>,
 }
@@ -108,7 +109,7 @@ impl CreateCommand {
         let input = read_input(self.file.as_deref())?;
         let doc = JfmDocument::parse(&input)?;
         let (body_md, custom_sections) = doc.split_custom_sections();
-        let adf = markdown_to_adf(&body_md)?;
+        let adf = ValidatedAdfDocument::try_new(markdown_to_adf(&body_md)?)?;
 
         let (fm_project, fm_issue_type, fm_summary, fm_labels, fm_scalars) = match &doc.frontmatter
         {
@@ -166,6 +167,7 @@ impl CreateCommand {
         let input = read_input(self.file.as_deref())?;
         let adf: AdfDocument =
             serde_json::from_str(&input).context("Failed to parse ADF JSON input")?;
+        let adf = ValidatedAdfDocument::try_new(adf)?;
 
         let project = self
             .project
@@ -309,6 +311,30 @@ mod tests {
         assert_eq!(params.project, "NEW");
         assert_eq!(params.issue_type, "Story");
         assert_eq!(params.summary, "New Title");
+    }
+
+    #[test]
+    fn resolve_from_jfm_rejects_invalid_adf_nesting() {
+        // Issue #714: issue body that produces invalid ADF (panel→expand)
+        // must be rejected at resolve time, before the API call.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("issue.md");
+        let content = "---\ntype: jira\ninstance: https://org.atlassian.net\nkey: PROJ-1\nsummary: Bad\nproject: PROJ\nissuetype: Task\n---\n\n:::panel{type=info}\n:::expand{title=\"x\"}\nbody\n:::\n:::\n";
+        fs::write(&file_path, content).unwrap();
+
+        let cmd = CreateCommand {
+            file: Some(file_path.to_str().unwrap().to_string()),
+            format: ContentFormat::Jfm,
+            project: None,
+            r#type: None,
+            summary: None,
+            set_fields: vec![],
+            dry_run: false,
+        };
+        let err = cmd.resolve_params().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid ADF nesting"));
+        assert!(msg.contains("`expand` cannot be a child of `panel`"));
     }
 
     #[test]
@@ -495,7 +521,7 @@ mod tests {
             issue_type: "Task".to_string(),
             summary: "Test issue".to_string(),
             labels: vec![],
-            adf: AdfDocument::new(),
+            adf: ValidatedAdfDocument::empty(),
             custom_scalars: BTreeMap::new(),
             custom_sections: Vec::new(),
         }

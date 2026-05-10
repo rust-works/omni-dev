@@ -12,6 +12,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::atlassian::adf::AdfDocument;
+use crate::atlassian::adf_validated::ValidatedAdfDocument;
 use crate::atlassian::convert::adf_to_markdown;
 use crate::atlassian::error::AtlassianError;
 
@@ -2027,7 +2028,7 @@ mod tests {
             .await;
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let mut custom = std::collections::BTreeMap::new();
         custom.insert(
             "customfield_10001".to_string(),
@@ -2061,7 +2062,7 @@ mod tests {
             .await;
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let result = client
             .update_issue_with_custom_fields(
                 "ACCS-2",
@@ -2138,7 +2139,7 @@ mod tests {
             .await;
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         client.update_issue("ACCS-1", &adf, None).await.unwrap();
     }
 
@@ -2189,7 +2190,7 @@ mod tests {
             .await;
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let result = client
             .update_issue("PROJ-42", &adf, Some("New title"))
             .await;
@@ -2208,7 +2209,7 @@ mod tests {
             .await;
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let result = client.update_issue("PROJ-42", &adf, None).await;
         assert!(result.is_ok());
     }
@@ -2225,7 +2226,7 @@ mod tests {
             .await;
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let err = client
             .update_issue("PROJ-42", &adf, None)
             .await
@@ -2398,7 +2399,7 @@ mod tests {
             .await;
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let labels = vec!["backend".to_string(), "urgent".to_string()];
         let result = client
             .create_issue("PROJ", "Task", "Add feature", Some(&adf), &labels)
@@ -2746,7 +2747,7 @@ mod tests {
             .await;
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let result = client.add_comment("PROJ-1", &adf).await;
         assert!(result.is_ok());
     }
@@ -2763,7 +2764,7 @@ mod tests {
             .await;
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let err = client.add_comment("PROJ-1", &adf).await.unwrap_err();
         assert!(err.to_string().contains("403"));
     }
@@ -2790,7 +2791,7 @@ mod tests {
             .await;
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let comment = client
             .update_comment("PROJ-1", "100", &adf, None)
             .await
@@ -2828,7 +2829,7 @@ mod tests {
             .await;
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let visibility = JiraVisibility {
             ty: JiraVisibilityType::Role,
             value: "Administrators".to_string(),
@@ -2858,7 +2859,7 @@ mod tests {
             .await;
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let err = client
             .update_comment("PROJ-1", "100", &adf, None)
             .await
@@ -2886,7 +2887,7 @@ mod tests {
             .await;
 
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
-        let adf = AdfDocument::new();
+        let adf = ValidatedAdfDocument::empty();
         let err = client
             .update_comment("PROJ-1", "9999", &adf, None)
             .await
@@ -6512,7 +6513,7 @@ impl AtlassianClient {
     pub async fn update_issue(
         &self,
         key: &str,
-        description_adf: &AdfDocument,
+        description_adf: &ValidatedAdfDocument,
         summary: Option<&str>,
     ) -> Result<()> {
         self.update_issue_with_custom_fields(
@@ -6537,7 +6538,7 @@ impl AtlassianClient {
     pub async fn update_issue_with_custom_fields(
         &self,
         key: &str,
-        description_adf: Option<&AdfDocument>,
+        description_adf: Option<&ValidatedAdfDocument>,
         summary: Option<&str>,
         parent: Option<&str>,
         custom_fields: &std::collections::BTreeMap<String, serde_json::Value>,
@@ -6655,7 +6656,7 @@ impl AtlassianClient {
         project_key: &str,
         issue_type: &str,
         summary: &str,
-        description_adf: Option<&AdfDocument>,
+        description_adf: Option<&ValidatedAdfDocument>,
         labels: &[String],
     ) -> Result<JiraCreatedIssue> {
         self.create_issue_with_custom_fields(
@@ -6676,7 +6677,7 @@ impl AtlassianClient {
         project_key: &str,
         issue_type: &str,
         summary: &str,
-        description_adf: Option<&AdfDocument>,
+        description_adf: Option<&ValidatedAdfDocument>,
         labels: &[String],
         custom_fields: &std::collections::BTreeMap<String, serde_json::Value>,
     ) -> Result<JiraCreatedIssue> {
@@ -6864,7 +6865,7 @@ impl AtlassianClient {
     }
 
     /// Adds a comment to a JIRA issue.
-    pub async fn add_comment(&self, key: &str, body_adf: &AdfDocument) -> Result<()> {
+    pub async fn add_comment(&self, key: &str, body_adf: &ValidatedAdfDocument) -> Result<()> {
         let url = format!("{}/rest/api/3/issue/{}/comment", self.instance_url, key);
 
         let body = serde_json::json!({
@@ -6892,7 +6893,7 @@ impl AtlassianClient {
         &self,
         key: &str,
         comment_id: &str,
-        body_adf: &AdfDocument,
+        body_adf: &ValidatedAdfDocument,
         visibility: Option<&JiraVisibility>,
     ) -> Result<JiraComment> {
         let url = format!(
