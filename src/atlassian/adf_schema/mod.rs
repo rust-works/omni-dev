@@ -29,10 +29,23 @@
 //! "exactly one media child") are out of scope; they will be addressed in
 //! follow-up issues.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::LazyLock;
 
 use crate::atlassian::adf::{AdfDocument, AdfNode};
+
+pub mod drift;
+
+/// Crate-internal view of the schema as a `BTreeMap`, used by the drift
+/// detector to diff against an upstream-derived map of the same shape.
+#[must_use]
+pub(crate) fn local_schema_map() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
+    let mut m = BTreeMap::new();
+    for (parent, children) in ENTRIES {
+        m.insert(*parent, children.iter().copied().collect());
+    }
+    m
+}
 
 /// Pinned upstream schema version.
 ///
@@ -133,9 +146,9 @@ const FULL_INLINE_CONTENT: &[&str] = &[
 // expansion.
 
 /// Allowed-children entries, sorted alphabetically by parent.
-type Entry = (&'static str, &'static [&'static str]);
+pub(crate) type Entry = (&'static str, &'static [&'static str]);
 
-const ENTRIES: &[Entry] = &[
+pub(crate) const ENTRIES: &[Entry] = &[
     // blockTaskItem — definitions/blockTaskItem_node
     ("blockTaskItem", &["extension", "paragraph"]),
     // blockquote — definitions/blockquote_node
