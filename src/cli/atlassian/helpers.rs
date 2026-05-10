@@ -770,7 +770,13 @@ mod tests {
         let result = print_dry_run("12345", &adf, "Title");
         assert!(result.is_err());
         let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("2 violations"), "got: {err}");
+        // Two `expand` children inside a `panel` produce three violations:
+        // one DisallowedChild per expand plus one Arity for the panel
+        // (panel needs ≥1 valid block child; disallowed children don't
+        // satisfy arity). The exact count is incidental — what this test
+        // pins is the plural noun.
+        assert!(err.contains("violations"), "got: {err}");
+        assert!(!err.contains("1 violation,"), "expected plural, got: {err}");
     }
 
     #[test]

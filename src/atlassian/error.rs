@@ -25,9 +25,10 @@ pub enum AtlassianError {
     /// payload contains a known schema violation that is the likely cause.
     ///
     /// Multi-line `Display` matches the format requested in issue #715: a header
-    /// line, a `Diagnosis:` line naming the offending nesting, and an optional
-    /// `Hint:` line. The raw response body is intentionally omitted from the
-    /// user-facing message — it is already logged at `debug!` by the call site.
+    /// line, a `Diagnosis:` line naming the offending nesting or arity error,
+    /// and an optional `Hint:` line. The raw response body is intentionally
+    /// omitted from the user-facing message — it is already logged at `debug!`
+    /// by the call site.
     #[error("{}", format_diagnosis(diagnosis, hint.as_deref()))]
     ApiRequestFailedWithDiagnosis {
         /// Raw response body (kept for callers that want to log it).
@@ -52,13 +53,21 @@ pub enum AtlassianError {
 }
 
 fn format_diagnosis(diagnosis: &AdfSchemaViolation, hint: Option<&str>) -> String {
-    let mut out = format!(
-        "Confluence API returned HTTP 500 (Internal Server Error)\n\
-         Diagnosis: the submitted ADF contains `{child}` nested inside `{parent}` \
-         (not allowed by Confluence's content model).",
-        child = diagnosis.child_type,
-        parent = diagnosis.parent_type,
-    );
+    let header = "Confluence API returned HTTP 500 (Internal Server Error)";
+    let diag_line = match diagnosis {
+        AdfSchemaViolation::DisallowedChild {
+            child_type,
+            parent_type,
+            ..
+        } => format!(
+            "Diagnosis: the submitted ADF contains `{child_type}` nested inside `{parent_type}` \
+             (not allowed by Confluence's content model)."
+        ),
+        AdfSchemaViolation::Arity { .. } => {
+            format!("Diagnosis: the submitted ADF has an arity violation — {diagnosis}.")
+        }
+    };
+    let mut out = format!("{header}\n{diag_line}");
     if let Some(hint) = hint {
         out.push_str("\nHint: ");
         out.push_str(hint);
@@ -69,6 +78,7 @@ fn format_diagnosis(diagnosis: &AdfSchemaViolation, hint: Option<&str>) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::atlassian::adf_schema::Quantifier;
 
     #[test]
     fn credentials_not_found_display() {
@@ -103,7 +113,7 @@ mod tests {
     fn api_request_failed_with_diagnosis_display_with_hint() {
         let err = AtlassianError::ApiRequestFailedWithDiagnosis {
             body: "{}".to_string(),
-            diagnosis: AdfSchemaViolation {
+            diagnosis: AdfSchemaViolation::DisallowedChild {
                 child_type: "expand".to_string(),
                 parent_type: "panel".to_string(),
                 path: vec![0, 0],
@@ -124,7 +134,7 @@ mod tests {
     fn api_request_failed_with_diagnosis_display_without_hint() {
         let err = AtlassianError::ApiRequestFailedWithDiagnosis {
             body: String::new(),
-            diagnosis: AdfSchemaViolation {
+            diagnosis: AdfSchemaViolation::DisallowedChild {
                 child_type: "table".to_string(),
                 parent_type: "nestedExpand".to_string(),
                 path: vec![1],
@@ -140,7 +150,7 @@ mod tests {
     #[test]
     fn invalid_adf_nesting_display_includes_violations() {
         let err = AtlassianError::InvalidAdfNesting(AdfValidationError {
-            violations: vec![AdfSchemaViolation {
+            violations: vec![AdfSchemaViolation::DisallowedChild {
                 parent_type: "panel".to_string(),
                 child_type: "expand".to_string(),
                 path: vec![0, 0],
@@ -150,5 +160,26 @@ mod tests {
         assert!(msg.contains("invalid ADF nesting"));
         assert!(msg.contains("`expand` cannot be a child of `panel`"));
         assert!(msg.contains("hint: invert the nesting"));
+    }
+
+    #[test]
+    fn api_request_failed_with_diagnosis_display_for_arity() {
+        let err = AtlassianError::ApiRequestFailedWithDiagnosis {
+            body: String::new(),
+            diagnosis: AdfSchemaViolation::Arity {
+                parent_type: "bulletList".to_string(),
+                atoms: vec!["listItem"],
+                expected: Quantifier::OneOrMore,
+                actual: 0,
+                path: vec![1],
+            },
+            hint: Some("a list must contain at least one item".to_string()),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("Confluence API returned HTTP 500 (Internal Server Error)"));
+        assert!(msg.contains("arity violation"), "got: {msg}");
+        assert!(msg.contains("'bulletList'"), "got: {msg}");
+        assert!(msg.contains("at least one"), "got: {msg}");
+        assert!(msg.contains("Hint: a list must contain"), "got: {msg}");
     }
 }
