@@ -14,9 +14,61 @@ use tokio_util::io::ReaderStream;
 use tracing::debug;
 
 use crate::atlassian::adf::AdfDocument;
+use crate::atlassian::adf_schema;
 use crate::atlassian::api::{AtlassianApi, ContentItem, ContentMetadata};
 use crate::atlassian::client::AtlassianClient;
 use crate::atlassian::error::AtlassianError;
+
+/// Returns a human-readable hint for resolving a known ADF nesting violation.
+///
+/// Used by [`confluence_write_error`] to enrich the diagnosis surfaced when
+/// Confluence returns HTTP 500. Returning `None` means no specific hint is
+/// known for the `(parent, child)` pair — the diagnosis line still names the
+/// violation, but no `Hint:` line is emitted.
+fn hint_for(parent: &str, child: &str) -> Option<&'static str> {
+    match (parent, child) {
+        ("panel", "expand" | "nestedExpand") => {
+            Some("invert the nesting (panel inside expand) or make them siblings")
+        }
+        ("expand", "expand" | "nestedExpand") => {
+            Some("expand cannot contain another expand; make them siblings instead")
+        }
+        ("nestedExpand", "expand" | "nestedExpand") => {
+            Some("nestedExpand cannot contain another expand; make them siblings instead")
+        }
+        ("tableCell" | "tableHeader", "expand") => {
+            Some("table cells permit nestedExpand only — replace the expand with nestedExpand")
+        }
+        ("blockquote", "expand" | "nestedExpand" | "panel" | "table") => {
+            Some("blockquote does not allow this child; move it outside the blockquote")
+        }
+        _ => None,
+    }
+}
+
+/// Builds an `anyhow::Error` for a non-success Confluence write/update/create
+/// response.
+///
+/// On HTTP 500, runs [`adf_schema::validate_document`] against the submitted
+/// ADF payload and, if a violation is found, returns
+/// [`AtlassianError::ApiRequestFailedWithDiagnosis`] with the first violation
+/// and a matching hint from [`hint_for`]. All other status codes (and 500
+/// responses with no detected violation) fall back to the existing
+/// [`AtlassianError::ApiRequestFailed`] format.
+fn confluence_write_error(status: u16, body: String, body_adf: &AdfDocument) -> anyhow::Error {
+    if status == 500 {
+        if let Some(violation) = adf_schema::validate_document(body_adf).into_iter().next() {
+            let hint = hint_for(&violation.parent_type, &violation.child_type).map(str::to_string);
+            return AtlassianError::ApiRequestFailedWithDiagnosis {
+                body,
+                diagnosis: violation,
+                hint,
+            }
+            .into();
+        }
+    }
+    AtlassianError::ApiRequestFailed { status, body }.into()
+}
 
 /// Confluence Cloud REST API v2 backend.
 pub struct ConfluenceApi {
@@ -655,7 +707,8 @@ impl AtlassianApi for ConfluenceApi {
             if !response.status().is_success() {
                 let status = response.status().as_u16();
                 let body = response.text().await.unwrap_or_default();
-                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+                debug!(status, body = %body, "Confluence update_content non-success");
+                return Err(confluence_write_error(status, body, body_adf));
             }
 
             Ok(())
@@ -742,7 +795,8 @@ impl ConfluenceApi {
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+            debug!(status, body = %body, "Confluence create_page non-success");
+            return Err(confluence_write_error(status, body, body_adf));
         }
 
         let resp: ConfluenceCreateResponse = response
@@ -1042,7 +1096,8 @@ impl ConfluenceApi {
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+            debug!(status, body = %body, "Confluence add_page_comment non-success");
+            return Err(confluence_write_error(status, body, body_adf));
         }
 
         Ok(())
@@ -1673,6 +1728,65 @@ mod tests {
     }
 
     #[test]
+    fn hint_for_panel_children() {
+        assert!(hint_for("panel", "expand")
+            .unwrap()
+            .contains("invert the nesting"));
+        assert!(hint_for("panel", "nestedExpand")
+            .unwrap()
+            .contains("invert the nesting"));
+    }
+
+    #[test]
+    fn hint_for_expand_self_nesting() {
+        assert!(hint_for("expand", "expand")
+            .unwrap()
+            .contains("expand cannot contain another expand"));
+        assert!(hint_for("expand", "nestedExpand")
+            .unwrap()
+            .contains("expand cannot contain another expand"));
+    }
+
+    #[test]
+    fn hint_for_nested_expand_self_nesting() {
+        assert!(hint_for("nestedExpand", "expand")
+            .unwrap()
+            .contains("nestedExpand cannot contain another expand"));
+        assert!(hint_for("nestedExpand", "nestedExpand")
+            .unwrap()
+            .contains("nestedExpand cannot contain another expand"));
+    }
+
+    #[test]
+    fn hint_for_table_cells() {
+        assert!(hint_for("tableCell", "expand")
+            .unwrap()
+            .contains("nestedExpand"));
+        assert!(hint_for("tableHeader", "expand")
+            .unwrap()
+            .contains("nestedExpand"));
+    }
+
+    #[test]
+    fn hint_for_blockquote_children() {
+        for child in &["expand", "nestedExpand", "panel", "table"] {
+            assert!(
+                hint_for("blockquote", child)
+                    .unwrap()
+                    .contains("blockquote does not allow this child"),
+                "missing hint for blockquote/{child}"
+            );
+        }
+    }
+
+    #[test]
+    fn hint_for_unknown_pair_returns_none() {
+        assert!(hint_for("paragraph", "text").is_none());
+        assert!(hint_for("doc", "panel").is_none());
+        assert!(hint_for("madeUp", "alsoMadeUp").is_none());
+    }
+
+    #[test]
     fn confluence_page_response_deserialization() {
         let json = r#"{
             "id": "12345",
@@ -1765,6 +1879,35 @@ mod tests {
         let json = r#"{"key": "ENG"}"#;
         let space: ConfluenceSpaceResponse = serde_json::from_str(json).unwrap();
         assert_eq!(space.key, "ENG");
+    }
+
+    /// Builds a small ADF document containing `expand` nested inside `panel`,
+    /// which violates Confluence's content model and should trigger the
+    /// HTTP-500 diagnosis path. The validator emits a single violation at
+    /// path `/0/0` (`expand` is the first child of the first top-level node).
+    fn adf_with_panel_expand() -> AdfDocument {
+        use crate::atlassian::adf::AdfNode;
+        AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![AdfNode {
+                node_type: "panel".to_string(),
+                attrs: None,
+                content: Some(vec![AdfNode {
+                    node_type: "expand".to_string(),
+                    attrs: None,
+                    content: None,
+                    text: None,
+                    marks: None,
+                    local_id: None,
+                    parameters: None,
+                }]),
+                text: None,
+                marks: None,
+                local_id: None,
+                parameters: None,
+            }],
+        }
     }
 
     /// Helper to set up a wiremock server with the Confluence page and space endpoints.
@@ -1916,6 +2059,69 @@ mod tests {
         let adf = AdfDocument::new();
         let err = api.update_content("12345", &adf, None).await.unwrap_err();
         assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn update_content_500_with_panel_expand_diagnoses() {
+        use crate::atlassian::api::AtlassianApi;
+
+        let (server, api) = setup_confluence_mock().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12345"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string(
+                "{\"errors\":[{\"status\":500,\"code\":\"INTERNAL_SERVER_ERROR\"}]}",
+            ))
+            .mount(&server)
+            .await;
+
+        let adf = adf_with_panel_expand();
+        let err = api.update_content("12345", &adf, None).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Confluence API returned HTTP 500 (Internal Server Error)"),
+            "missing 500 header in: {msg}"
+        );
+        assert!(
+            msg.contains("Diagnosis:"),
+            "missing Diagnosis line in: {msg}"
+        );
+        assert!(msg.contains("`expand`"), "missing child name in: {msg}");
+        assert!(msg.contains("`panel`"), "missing parent name in: {msg}");
+        assert!(msg.contains("Hint:"), "missing Hint line in: {msg}");
+        assert!(
+            !msg.contains("INTERNAL_SERVER_ERROR"),
+            "raw response body should not be in user-facing message: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_content_500_without_violation_falls_back() {
+        use crate::atlassian::api::AtlassianApi;
+
+        let (server, api) = setup_confluence_mock().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12345"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(500).set_body_string("Internal Server Error"),
+            )
+            .mount(&server)
+            .await;
+
+        // Empty (well-formed) document — no schema violations to surface.
+        let adf = AdfDocument::new();
+        let err = api.update_content("12345", &adf, None).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("HTTP 500"), "missing status in: {msg}");
+        assert!(
+            msg.contains("Internal Server Error"),
+            "fallback should include raw body: {msg}"
+        );
+        assert!(
+            !msg.contains("Diagnosis:"),
+            "fallback should not include diagnosis: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -2088,6 +2294,42 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("400"));
+    }
+
+    #[tokio::test]
+    async fn create_page_500_with_panel_expand_diagnoses() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": [{"id": "98765"}]})),
+            )
+            .mount(&server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(500).set_body_string("Internal Server Error"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let adf = adf_with_panel_expand();
+        let err = api.create_page("ENG", "Bad", &adf, None).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("HTTP 500"), "missing status in: {msg}");
+        assert!(
+            msg.contains("Diagnosis:"),
+            "missing Diagnosis line in: {msg}"
+        );
+        assert!(msg.contains("`expand`"), "missing child name in: {msg}");
+        assert!(msg.contains("`panel`"), "missing parent name in: {msg}");
+        assert!(msg.contains("Hint:"), "missing Hint line in: {msg}");
     }
 
     #[tokio::test]
@@ -2914,6 +3156,34 @@ mod tests {
         let adf = AdfDocument::new();
         let err = api.add_page_comment("12345", &adf).await.unwrap_err();
         assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn add_page_comment_500_with_panel_expand_diagnoses() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/wiki/api/v2/footer-comments"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(500).set_body_string("Internal Server Error"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let adf = adf_with_panel_expand();
+        let err = api.add_page_comment("12345", &adf).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("HTTP 500"), "missing status in: {msg}");
+        assert!(
+            msg.contains("Diagnosis:"),
+            "missing Diagnosis line in: {msg}"
+        );
+        assert!(msg.contains("`expand`"), "missing child name in: {msg}");
+        assert!(msg.contains("`panel`"), "missing parent name in: {msg}");
+        assert!(msg.contains("Hint:"), "missing Hint line in: {msg}");
     }
 
     // ── get_labels ────────────────────────────────────────────────
