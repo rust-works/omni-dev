@@ -2587,8 +2587,8 @@ mod tests {
                 "    issues:\n",
                 "      - severity: error\n",
                 "        section: \"Subject Line\"\n",
-                "        rule: \"subject-too-long\"\n",
-                "        explanation: \"Subject exceeds 72 characters\"\n",
+                "        rule: \"imperative-mood\"\n",
+                "        explanation: \"Subject uses past tense\"\n",
                 "    suggestion:\n",
                 "      message: \"feat(test): shorter subject\"\n",
                 "      explanation: \"Shortened subject line\"\n",
@@ -2634,7 +2634,7 @@ mod tests {
         assert!(!report.commits[0].passes);
         // Dedup: both chunks report the same (rule, severity, section), so only 1 unique issue
         assert_eq!(report.commits[0].issues.len(), 1);
-        assert_eq!(report.commits[0].issues[0].rule, "subject-too-long");
+        assert_eq!(report.commits[0].issues[0].rule, "imperative-mood");
     }
 
     #[tokio::test]
@@ -2715,8 +2715,8 @@ mod tests {
                 "    issues:\n",
                 "      - severity: error\n",
                 "        section: \"Subject Line\"\n",
-                "        rule: \"subject-too-long\"\n",
-                "        explanation: \"Subject exceeds 72 characters\"\n",
+                "        rule: \"imperative-mood\"\n",
+                "        explanation: \"Subject uses past tense\"\n",
                 "      - severity: warning\n",
                 "        section: \"Content\"\n",
                 "        rule: \"body-required\"\n",
@@ -2734,7 +2734,7 @@ mod tests {
                 "    issues:\n",
                 "      - severity: error\n",
                 "        section: \"Subject Line\"\n",
-                "        rule: \"subject-too-long\"\n",
+                "        rule: \"imperative-mood\"\n",
                 "        explanation: \"Subject line is too long\"\n",
                 "      - severity: info\n",
                 "        section: \"Style\"\n",
@@ -2755,8 +2755,8 @@ mod tests {
         let report = result.unwrap();
         assert_eq!(report.commits.len(), 1);
         assert!(!report.commits[0].passes);
-        // 3 unique issues: subject-too-long, body-required, scope-suggestion
-        // (subject-too-long appears in both chunks but deduped)
+        // 3 unique issues: imperative-mood, body-required, scope-suggestion
+        // (imperative-mood appears in both chunks but deduped)
         assert_eq!(report.commits[0].issues.len(), 3);
     }
 
@@ -3689,9 +3689,9 @@ mod tests {
     /// 3. Detects that both chunks have suggestions → calls
     ///    `merge_check_chunks` for the AI reduce pass
     ///
-    /// Chunk 1 reports: `error:subject-too-long:Subject Line` +
+    /// Chunk 1 reports: `error:imperative-mood:Subject Line` +
     ///                   `warning:body-required:Content`
-    /// Chunk 2 reports: `error:subject-too-long:Subject Line` (duplicate) +
+    /// Chunk 2 reports: `error:imperative-mood:Subject Line` (duplicate) +
     ///                   `info:scope-suggestion:Style` (new)
     ///
     /// Verifies: 3 unique issues after dedup, suggestion from merge pass,
@@ -3702,7 +3702,7 @@ mod tests {
         let repo_view = make_large_diff_repo_view(&dir);
         let hash = "a".repeat(40);
 
-        // Chunk 1: error (subject-too-long) + warning (body-required) + suggestion
+        // Chunk 1: error (imperative-mood) + warning (body-required) + suggestion
         let chunk1_yaml = format!(
             concat!(
                 "checks:\n",
@@ -3711,8 +3711,8 @@ mod tests {
                 "    issues:\n",
                 "      - severity: error\n",
                 "        section: \"Subject Line\"\n",
-                "        rule: \"subject-too-long\"\n",
-                "        explanation: \"Subject exceeds 72 characters\"\n",
+                "        rule: \"imperative-mood\"\n",
+                "        explanation: \"Subject uses past tense\"\n",
                 "      - severity: warning\n",
                 "        section: \"Content\"\n",
                 "        rule: \"body-required\"\n",
@@ -3734,7 +3734,7 @@ mod tests {
                 "    issues:\n",
                 "      - severity: error\n",
                 "        section: \"Subject Line\"\n",
-                "        rule: \"subject-too-long\"\n",
+                "        rule: \"imperative-mood\"\n",
                 "        explanation: \"Subject line is way too long\"\n",
                 "      - severity: info\n",
                 "        section: \"Style\"\n",
@@ -3781,7 +3781,7 @@ mod tests {
         assert_eq!(response_handle.remaining(), 0);
 
         // Dedup: 3 unique (rule, severity, section) tuples
-        //  - subject-too-long / error / Subject Line   (appears in both → deduped)
+        //  - imperative-mood / error / Subject Line   (appears in both → deduped)
         //  - body-required    / warning / Content
         //  - scope-suggestion / info / Style
         assert_eq!(
