@@ -1251,10 +1251,7 @@ fn parse_decision_items(text: &str) -> Vec<AdfNode> {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("- <> ") {
             let inline_nodes = parse_inline(rest);
-            items.push(AdfNode::decision_item(
-                "DECIDED",
-                vec![AdfNode::paragraph(inline_nodes)],
-            ));
+            items.push(AdfNode::decision_item("DECIDED", inline_nodes));
         }
     }
     items
@@ -9426,6 +9423,21 @@ mod tests {
         let items = doc.content[0].content.as_ref().unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].attrs.as_ref().unwrap()["state"], "DECIDED");
+    }
+
+    // decisionItem is inline-only per ADF schema — its content must be
+    // text/inline nodes, not a paragraph wrapper (issue #753).
+    #[test]
+    fn decision_item_content_is_inline_not_paragraph() {
+        let md = ":::decisions\n- <> Use Rust\n:::";
+        let doc = markdown_to_adf(md).unwrap();
+        let items = doc.content[0].content.as_ref().unwrap();
+        let first_child = &items[0].content.as_ref().unwrap()[0];
+        assert_eq!(
+            first_child.node_type, "text",
+            "decisionItem must contain inline nodes directly, not a paragraph wrapper"
+        );
+        assert_eq!(first_child.text.as_deref(), Some("Use Rust"));
     }
 
     #[test]
