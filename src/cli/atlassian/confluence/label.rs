@@ -601,4 +601,78 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("403"));
     }
+
+    /// Force-mode + failing writer covers `?` on the post-API writeln.
+    #[tokio::test]
+    async fn remove_execute_force_propagates_writeln_error() {
+        use crate::test_support::failing_io::FailingWriter;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/label/draft",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let api = label_api(&server);
+        let cmd = RemoveCommand {
+            id: "12345".to_string(),
+            labels: vec!["draft".to_string()],
+            force: true,
+            dry_run: false,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut writer = FailingWriter;
+        let err = cmd
+            .execute_with_io(&api, &mut input, &mut writer)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated write failure"));
+    }
+
+    /// Dry-run with a failing writer covers `?` on guard_destructive_with_io.
+    #[tokio::test]
+    async fn remove_execute_dry_run_propagates_guard_error() {
+        use crate::test_support::failing_io::FailingWriter;
+        let server = wiremock::MockServer::start().await;
+        let api = label_api(&server);
+        let cmd = RemoveCommand {
+            id: "12345".to_string(),
+            labels: vec!["draft".to_string()],
+            force: false,
+            dry_run: true,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut writer = FailingWriter;
+        let err = cmd
+            .execute_with_io(&api, &mut input, &mut writer)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated write failure"));
+    }
+
+    /// End-to-end exercise of the public `RemoveCommand::execute()`
+    /// wrapper.
+    #[tokio::test]
+    async fn remove_execute_drives_create_client_and_calls_api() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/label/draft",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        let cmd = RemoveCommand {
+            id: "12345".to_string(),
+            labels: vec!["draft".to_string()],
+            force: true,
+            dry_run: false,
+        };
+        cmd.execute().await.unwrap();
+    }
 }
