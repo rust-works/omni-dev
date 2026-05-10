@@ -43,6 +43,9 @@ schemars = "1.2"
 similar = "2.7"
 tokio-util = { version = "0.7", features = ["codec", "io"] }
 mime_guess = "2"
+flate2 = "1"
+tar = "0.4"
+sha2 = "0.10"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["signal"] }
@@ -70,6 +73,11 @@ required-features = []
 name = "omni-dev-mcp"
 path = "src/mcp_server.rs"
 required-features = ["mcp"]
+
+[[bin]]
+name = "adf-schema-drift"
+path = "src/bin/adf_schema_drift.rs"
+required-features = []
 
 [lints.rust]
 unsafe_code = "deny"
