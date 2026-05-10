@@ -479,6 +479,24 @@ pub struct JiraTransition {
     pub id: String,
     /// Transition name (e.g., "In Progress", "Done").
     pub name: String,
+    /// Status the transition moves the issue into.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_status: Option<JiraTransitionToStatus>,
+    /// Whether executing the transition triggers a screen requiring extra fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_screen: Option<bool>,
+}
+
+/// Destination status of a JIRA workflow transition.
+#[derive(Debug, Clone, Serialize)]
+pub struct JiraTransitionToStatus {
+    /// Status ID.
+    pub id: String,
+    /// Status name (e.g., "In Progress", "Done").
+    pub name: String,
+    /// Status category key (e.g., "new", "indeterminate", "done").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
 }
 
 /// A pull request from Jira's DevStatus API.
@@ -788,6 +806,24 @@ struct JiraTransitionsResponse {
 struct JiraTransitionEntry {
     id: String,
     name: String,
+    #[serde(default)]
+    to: Option<JiraTransitionToEntry>,
+    #[serde(rename = "hasScreen", default)]
+    has_screen: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct JiraTransitionToEntry {
+    id: String,
+    name: String,
+    #[serde(rename = "statusCategory", default)]
+    status_category: Option<JiraStatusCategoryEntry>,
+}
+
+#[derive(Deserialize)]
+struct JiraStatusCategoryEntry {
+    #[serde(default)]
+    key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2853,6 +2889,59 @@ mod tests {
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
         let transitions = client.get_transitions("PROJ-1").await.unwrap();
         assert!(transitions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_transitions_rich_fields() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/transitions",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "transitions": [
+                        {
+                            "id": "21",
+                            "name": "In Progress",
+                            "hasScreen": false,
+                            "to": {
+                                "id": "3",
+                                "name": "In Progress",
+                                "statusCategory": {"key": "indeterminate"}
+                            }
+                        },
+                        {
+                            "id": "31",
+                            "name": "Done",
+                            "hasScreen": true,
+                            "to": {
+                                "id": "10000",
+                                "name": "Done",
+                                "statusCategory": {"key": "done"}
+                            }
+                        }
+                    ]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let transitions = client.get_transitions("PROJ-1").await.unwrap();
+
+        assert_eq!(transitions.len(), 2);
+        assert_eq!(transitions[0].id, "21");
+        assert_eq!(transitions[0].has_screen, Some(false));
+        let to0 = transitions[0].to_status.as_ref().unwrap();
+        assert_eq!(to0.id, "3");
+        assert_eq!(to0.name, "In Progress");
+        assert_eq!(to0.category.as_deref(), Some("indeterminate"));
+        assert_eq!(transitions[1].has_screen, Some(true));
+        let to1 = transitions[1].to_status.as_ref().unwrap();
+        assert_eq!(to1.category.as_deref(), Some("done"));
     }
 
     #[tokio::test]
@@ -6553,6 +6642,12 @@ impl AtlassianClient {
             .map(|t| JiraTransition {
                 id: t.id,
                 name: t.name,
+                to_status: t.to.map(|to| JiraTransitionToStatus {
+                    id: to.id,
+                    name: to.name,
+                    category: to.status_category.and_then(|sc| sc.key),
+                }),
+                has_screen: t.has_screen,
             })
             .collect())
     }

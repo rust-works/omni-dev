@@ -1316,14 +1316,45 @@ omni-dev atlassian jira transition - Lists or executes workflow transitions on a
 
 Lists or executes workflow transitions on a JIRA issue
 
-Usage: transition [OPTIONS] <KEY> [TRANSITION]
+Usage: transition <COMMAND>
+
+Commands:
+  list     Lists workflow transitions available from the issue's current status
+  execute  Executes a workflow transition on a JIRA issue
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian jira transition execute - Executes a workflow transition on a JIRA issue
+
+Executes a workflow transition on a JIRA issue
+
+Usage: execute <KEY> <TRANSITION>
 
 Arguments:
   <KEY>         JIRA issue key (e.g., PROJ-123)
-  [TRANSITION]  Transition name or ID to execute. Omit to list available transitions
+  <TRANSITION>  Transition name or ID to execute
 
 Options:
-      --list             Lists available transitions (same as omitting the transition argument)
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian jira transition list - Lists workflow transitions available from the issue's current status
+
+Lists workflow transitions available from the issue's current status
+
+Usage: list [OPTIONS] <KEY>
+
+Arguments:
+  <KEY>  JIRA issue key (e.g., PROJ-123)
+
+Options:
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 
