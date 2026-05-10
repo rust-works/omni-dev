@@ -15,7 +15,9 @@ use rmcp::{
 use serde::Deserialize;
 
 use crate::atlassian::adf::AdfDocument;
-use crate::atlassian::client::{AtlassianClient, JiraTransition};
+use crate::atlassian::client::{
+    AtlassianClient, JiraTransition, JiraVisibility, JiraVisibilityType,
+};
 use crate::atlassian::convert::markdown_to_adf;
 use crate::atlassian::custom_fields::apply_user_field_overrides;
 use crate::atlassian::document::{issue_to_jfm_document, JfmDocument};
@@ -152,6 +154,32 @@ pub struct JiraCommentParams {
     /// Maximum number of comments to return. `0` means unlimited.
     #[serde(default)]
     pub limit: Option<u32>,
+}
+
+/// Visibility restriction payload for the `jira_comment_edit` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct JiraVisibilityParam {
+    /// Restriction kind — `"group"` or `"role"`.
+    #[serde(rename = "type")]
+    pub ty: String,
+    /// Group name or project role name.
+    pub value: String,
+}
+
+/// Parameters for the `jira_comment_edit` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct JiraCommentEditParams {
+    /// JIRA issue key (e.g., `PROJ-123`).
+    pub key: String,
+    /// Comment ID to update.
+    pub comment_id: String,
+    /// New comment body (JFM markdown — see resource `omni-dev://specs/jfm`).
+    pub body: String,
+    /// Optional visibility restriction. Many JIRA configurations only allow
+    /// the comment author to change visibility — JIRA's response is surfaced
+    /// as-is when permission is denied.
+    #[serde(default)]
+    pub visibility: Option<JiraVisibilityParam>,
 }
 
 /// Parameters for the `jira_link` tool.
@@ -465,6 +493,36 @@ async fn run_jira_comment(
     }
 }
 
+/// Edits an existing comment on an issue.
+async fn run_jira_comment_edit(
+    client: &AtlassianClient,
+    key: &str,
+    comment_id: &str,
+    body: &str,
+    visibility: Option<&JiraVisibilityParam>,
+) -> Result<String> {
+    let adf = markdown_to_adf(body)?;
+    let visibility = visibility.map(parse_visibility).transpose()?;
+    let updated = client
+        .update_comment(key, comment_id, &adf, visibility.as_ref())
+        .await?;
+    yaml_result(&updated)
+}
+
+fn parse_visibility(param: &JiraVisibilityParam) -> Result<JiraVisibility> {
+    let ty = match param.ty.to_ascii_lowercase().as_str() {
+        "group" => JiraVisibilityType::Group,
+        "role" => JiraVisibilityType::Role,
+        other => {
+            anyhow::bail!("unknown visibility type {other:?} (expected \"group\" or \"role\")")
+        }
+    };
+    Ok(JiraVisibility {
+        ty,
+        value: param.value.clone(),
+    })
+}
+
 /// Manages issue links.
 async fn run_jira_link(
     client: &AtlassianClient,
@@ -690,6 +748,32 @@ impl OmniDevServer {
             &params.action,
             params.body.as_deref(),
             limit,
+        )
+        .await
+        .map_err(tool_error)?;
+        ok_text(text)
+    }
+
+    /// Tool: edit an existing JIRA comment.
+    #[tool(
+        description = "Edit an existing JIRA comment. `body` is JFM markdown (see resource \
+                       `omni-dev://specs/jfm`) and replaces the current comment text. Optional \
+                       `visibility = {type: \"group\"|\"role\", value: <name>}` updates the \
+                       restriction. JIRA enforces stricter permissions on edit than on add (often \
+                       only the original author can edit) — when JIRA refuses, its error message \
+                       is surfaced verbatim. Returns the updated comment metadata as YAML."
+    )]
+    pub async fn jira_comment_edit(
+        &self,
+        Parameters(params): Parameters<JiraCommentEditParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _instance_url) = create_client().map_err(tool_error)?;
+        let text = run_jira_comment_edit(
+            &client,
+            &params.key,
+            &params.comment_id,
+            &params.body,
+            params.visibility.as_ref(),
         )
         .await
         .map_err(tool_error)?;
@@ -1865,6 +1949,146 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("403"));
+    }
+
+    // ── run_jira_comment_edit ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_jira_comment_edit_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1/comment/100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "100",
+                "author": {"displayName": "Me"},
+                "created": "2026-04-01T10:00:00.000+0000",
+                "updated": "2026-05-10T12:00:00.000+0000",
+                "body": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let yaml = run_jira_comment_edit(&client, "PROJ-1", "100", "hello", None)
+            .await
+            .unwrap();
+        assert!(yaml.contains("id: '100'") || yaml.contains("id: \"100\""));
+        assert!(yaml.contains("2026-05-10T12:00:00"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_comment_edit_with_visibility() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1/comment/100"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "visibility": {"type": "group", "identifier": "jira-administrators"}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "100",
+                "author": {"displayName": "Me"},
+                "created": "2026-04-01T10:00:00.000+0000",
+                "updated": "2026-05-10T12:00:00.000+0000",
+                "body": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let visibility = JiraVisibilityParam {
+            ty: "group".to_string(),
+            value: "jira-administrators".to_string(),
+        };
+        run_jira_comment_edit(&client, "PROJ-1", "100", "hello", Some(&visibility))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_jira_comment_edit_forbidden_surfaces_jira_message() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1/comment/100"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "errorMessages": ["You do not have permission to edit this comment"]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_jira_comment_edit(&client, "PROJ-1", "100", "hello", None)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("403"));
+        assert!(msg.contains("permission to edit"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_comment_edit_not_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1/comment/9999"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "errorMessages": ["Comment not found"]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_jira_comment_edit(&client, "PROJ-1", "9999", "hello", None)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("404"));
+        assert!(msg.contains("Comment not found"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_comment_edit_unknown_visibility_type() {
+        let client = mock_client("http://127.0.0.1:1");
+        let visibility = JiraVisibilityParam {
+            ty: "user".to_string(),
+            value: "alice".to_string(),
+        };
+        let err = run_jira_comment_edit(&client, "PROJ-1", "100", "hello", Some(&visibility))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown visibility type"));
+    }
+
+    #[test]
+    fn parse_visibility_group() {
+        let v = parse_visibility(&JiraVisibilityParam {
+            ty: "group".to_string(),
+            value: "jira-users".to_string(),
+        })
+        .unwrap();
+        assert!(matches!(v.ty, JiraVisibilityType::Group));
+        assert_eq!(v.value, "jira-users");
+    }
+
+    #[test]
+    fn parse_visibility_role() {
+        let v = parse_visibility(&JiraVisibilityParam {
+            ty: "role".to_string(),
+            value: "Administrators".to_string(),
+        })
+        .unwrap();
+        assert!(matches!(v.ty, JiraVisibilityType::Role));
+        assert_eq!(v.value, "Administrators");
+    }
+
+    #[test]
+    fn parse_visibility_case_insensitive() {
+        let v = parse_visibility(&JiraVisibilityParam {
+            ty: "ROLE".to_string(),
+            value: "Administrators".to_string(),
+        })
+        .unwrap();
+        assert!(matches!(v.ty, JiraVisibilityType::Role));
     }
 
     // ── run_jira_link ──────────────────────────────────────────────────────

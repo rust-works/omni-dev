@@ -851,6 +851,7 @@ Usage: comment <COMMAND>
 Commands:
   list  Lists comments on a JIRA issue
   add   Adds a comment to a JIRA issue
+  edit  Edits an existing comment on a JIRA issue
   help  Print this message or the help of the given subcommand(s)
 
 Options:
@@ -872,6 +873,30 @@ Arguments:
 Options:
       --format <FORMAT>  Input format [default: jfm] [possible values: jfm, adf]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian jira comment edit - Edits an existing comment on a JIRA issue
+
+Edits an existing comment on a JIRA issue
+
+Usage: edit [OPTIONS] <KEY> <COMMENT_ID> [FILE]
+
+Arguments:
+  <KEY>         JIRA issue key (e.g., PROJ-123)
+  <COMMENT_ID>  Comment ID to edit
+  [FILE]        Input file (reads from stdin if omitted or "-")
+
+Options:
+      --format <FORMAT>
+          Input format [default: jfm] [possible values: jfm, adf]
+      --visibility-type <VISIBILITY_TYPE>
+          Visibility restriction kind. Pair with `--visibility-value` [possible values: group, role]
+      --visibility-value <VISIBILITY_VALUE>
+          Visibility group or role name. Pair with `--visibility-type`
+  -h, --help
+          Print help (see more with '--help')
 
 
 ================================================================================
