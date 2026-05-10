@@ -185,13 +185,18 @@ The commit checker enforces breaking-change markers at ERROR severity. You MUST 
 
 DIFF SIGNALS — flag as a breaking change when the diff shows ANY of:
 - A new MANDATORY parameter on a public function, public method, or pub trait method (no default, callers must update)
-- A new MANDATORY field on a public struct/enum used in a public API or serialization format
+- A new MANDATORY field on a public struct/enum used in a public API, params type, request/response schema, or serialization format — INCLUDING adding a new `pub` field with no `#[serde(default)]` to an existing struct
 - A removed, renamed, or re-typed public API (function, method, struct, enum variant, trait, type alias, public constant)
 - A new required CLI flag/argument, or removal/rename of an existing one
-- A change to an MCP tool schema that removes or renames a parameter, makes an optional parameter required, or changes a parameter's type
+- A change to an MCP tool schema that adds a new required parameter, removes a parameter, renames a parameter, makes an optional parameter required, or changes a parameter's type
 - A change to a serialization format, file format, schema, or wire protocol that older readers cannot parse
-- A default-behavior change that breaks non-interactive callers (e.g., a command that previously ran silently now prompts by default; a default value that callers depended on changed)
+- A default-behavior change that breaks non-interactive callers (e.g., a command that previously ran silently now prompts by default; a command that previously executed immediately now requires confirmation; a default value that callers depended on changed)
 - A bumped MSRV, removed feature flag, or removed dependency that was part of the public API surface
+
+ADDITIVE-LOOKING-BUT-BREAKING TRAP — Do NOT classify these as additive feat/fix:
+- Adding a new field to an existing params/request/config struct WITHOUT `#[serde(default)]` or `Option<…>` — this breaks every existing caller that constructs the struct, because the field is now required. Example: adding `pub confirm: bool` to `WatcherRemoveParams` makes `WatcherRemoveParams { … }` literal calls fail to compile, and JSON callers that omit `confirm` get a deserialization error. THIS IS A BREAKING CHANGE.
+- A subject like "add confirm guard" or "require confirm: true" describing a new mandatory gate is a strong textual signal that you are looking at a breaking change, even when the diff appears to "only add" code.
+- Wrapping an existing default-on operation in a confirmation prompt or a guard that aborts unless an explicit flag is set IS a breaking change for non-interactive callers, even if the new flag/parameter is technically defaulted.
 
 REQUIRED OUTPUTS — when ANY signal above is detected, the commit message MUST contain BOTH:
 1. A `!` immediately after the type/scope and before the colon — e.g. `feat(cli)!: change output format` or `feat(api,cli)!: drop legacy flag`
@@ -200,7 +205,9 @@ REQUIRED OUTPUTS — when ANY signal above is detected, the commit message MUST 
 WRONG: `feat(cli): change output format` (missing `!` and footer despite removed flag)
 WRONG: `feat(cli)!: change output format` (has `!` but no `BREAKING CHANGE:` footer)
 WRONG: `feat(cli)!: change output format\n\nBREAKING CHANGE: output format changed` (footer is vacuous; no migration guidance)
+WRONG: `feat(mcp): add confirm guard to destructive remove tools` (adds mandatory `confirm: bool` parameter to existing MCP tool params — IS a breaking change, missing both `!` and footer)
 RIGHT: `feat(cli)!: drop --legacy-output flag\n\nBREAKING CHANGE: the --legacy-output flag has been removed. Callers should pass --format=json instead; the JSON shape is documented in docs/output-format.md.`
+RIGHT: `feat(mcp)!: require confirm: true for destructive remove tools\n\nBREAKING CHANGE: jira_watcher_remove, jira_link_remove, and confluence_label_remove now require a mandatory confirm: bool parameter. Callers that omit confirm or pass confirm: false receive an error. Update all callers to include "confirm": true to preserve current behaviour.`
 
 If the diff contains NONE of the signals above, do NOT emit `!` or a `BREAKING CHANGE:` footer — these markers are reserved for actual breaking changes and devalue when applied to non-breaking commits.
 
@@ -465,7 +472,7 @@ Remember: File paths and directory names are just hints. The diff content shows 
 
 CRITICAL: Even if a commit message is perfect and needs no changes, include it in the amendments array with its current message and original hash. Do not skip any commit, and do not emit more amendments than there are commits in the input.
 
-SUMMARY FIELD: For each commit, include a `summary` field containing one sentence describing what the commit changes. Keep it factual and brief."
+SUMMARY FIELD: For each commit, include a `summary` field containing one sentence describing what the commit changes. Keep it factual and brief.{BREAKING_CHANGE_FINAL_PASS}"
     )
 }
 
@@ -557,9 +564,16 @@ pub fn generate_contextual_user_prompt(repo_yaml: &str, context: &CommitContext)
 
     prompt.push_str("\nCRITICAL: Return exactly one amendment per input commit. Even if a commit message is perfect, include it with its current message and original hash. Do not skip any commit, and do not emit more amendments than there are commits in the input.");
     prompt.push_str(SUMMARY_INSTRUCTION);
+    prompt.push_str(BREAKING_CHANGE_FINAL_PASS);
 
     prompt
 }
+
+/// Final-pass nudge appended to user prompts so the breaking-change rule is the
+/// last thing the model reads before emitting YAML. Mirrors the system-prompt
+/// `BREAKING CHANGE DETECTION` block but at the user-prompt level for recency
+/// bias — empirical fix for #744 where a system-prompt-only rule was ignored.
+const BREAKING_CHANGE_FINAL_PASS: &str = "\n\nFINAL BREAKING-CHANGE PASS (DO THIS LAST, BEFORE EMITTING YAML):\nFor each amendment you are about to emit, re-scan the diff for the breaking-change signals listed in the system prompt — especially: new required parameters/fields on existing public APIs or MCP tool params, removed/renamed public APIs, removed/renamed CLI flags, default-behavior changes that break non-interactive callers (e.g., new confirmation prompts on previously-unattended commands). If ANY signal is present, the amendment's message MUST contain BOTH `!` after the type/scope AND a `BREAKING CHANGE:` footer with concrete migration instructions. If a subject says things like \"add confirm guard\", \"require X\", \"now prompts by default\", or \"add mandatory <field>\" without a `!` and footer, you have made a mistake — fix it before emitting.";
 
 /// System prompt for PR description generation.
 pub const PR_GENERATION_SYSTEM_PROMPT: &str = r#"You are a software engineer generating pull request descriptions. You will receive git repository data and a PR template.
@@ -806,11 +820,11 @@ checks:
   - commit: "abc123..."
     passes: false
     issues:
-      - reasoning: "Subject is 85 characters, guideline caps at 72. 85 > 72, so this violates the Subject Line rule. Section 'Subject Line' maps to severity 'error'."
+      - reasoning: "Subject 'Added user endpoint' begins with 'Added', a past-tense verb. The Subject Line section requires imperative mood ('add', not 'added'/'adds'). Section 'Subject Line' maps to severity 'error'."
         severity: error
         section: "Subject Line"
-        rule: "Keep under 72 characters"
-        explanation: "Subject is 85 characters"
+        rule: "Use imperative mood"
+        explanation: "Subject uses past tense ('Added'); should use imperative ('add')"
       - reasoning: "Diff shows 142 lines changed. Body Guidelines requires a body for large changes. No body present. Section 'Content' maps to severity 'warning'."
         severity: warning
         section: "Body Guidelines"
@@ -822,7 +836,7 @@ checks:
 
         Implement POST /api/users with validation.
       explanation: |
-        - Shortened subject to under 72 chars
+        - Changed subject to imperative mood
         - Added body explaining the change
     summary: "Add REST endpoint for user creation with input validation"
 
@@ -1620,6 +1634,22 @@ mod tests {
     }
 
     #[test]
+    fn basic_system_prompt_calls_out_additive_looking_trap() {
+        // Regression for the case where twiddle classified `feat(mcp): add
+        // confirm guard` as additive even though it added a mandatory `confirm:
+        // bool` to existing param structs. The prompt must explicitly warn
+        // against treating new mandatory fields as additive.
+        assert!(
+            BASIC_SYSTEM_PROMPT.contains("ADDITIVE-LOOKING-BUT-BREAKING TRAP"),
+            "BASIC_SYSTEM_PROMPT must warn against treating new mandatory fields as additive"
+        );
+        assert!(
+            BASIC_SYSTEM_PROMPT.contains("WatcherRemoveParams"),
+            "BASIC_SYSTEM_PROMPT must include the concrete params-struct example"
+        );
+    }
+
+    #[test]
     fn basic_system_prompt_requires_both_breaking_markers() {
         assert!(
             BASIC_SYSTEM_PROMPT.contains("`!` immediately after the type/scope"),
@@ -1638,6 +1668,29 @@ mod tests {
         assert!(
             prompt.contains("BREAKING CHANGE DETECTION"),
             "contextual system prompt must inherit BREAKING CHANGE DETECTION block from BASIC_SYSTEM_PROMPT"
+        );
+    }
+
+    #[test]
+    fn basic_user_prompt_has_breaking_change_final_pass() {
+        let prompt = generate_user_prompt("commits: []");
+        assert!(
+            prompt.contains("FINAL BREAKING-CHANGE PASS"),
+            "basic user prompt must end with the breaking-change final-pass nudge"
+        );
+        assert!(
+            prompt.contains("`BREAKING CHANGE:` footer"),
+            "basic user prompt must restate the BREAKING CHANGE: footer requirement"
+        );
+    }
+
+    #[test]
+    fn contextual_user_prompt_has_breaking_change_final_pass() {
+        let context = make_context();
+        let prompt = generate_contextual_user_prompt("commits: []", &context);
+        assert!(
+            prompt.contains("FINAL BREAKING-CHANGE PASS"),
+            "contextual user prompt must end with the breaking-change final-pass nudge"
         );
     }
 

@@ -537,8 +537,8 @@ explanation: "Consider a narrower scope."
         let yaml = r#"
 severity: error
 section: "Subject Line"
-rule: "subject-too-long"
-explanation: "Subject exceeds 72 characters"
+rule: "imperative-mood"
+explanation: "Subject uses past tense"
 "#;
         let issue: AiIssue = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(issue.severity, "error");

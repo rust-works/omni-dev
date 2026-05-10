@@ -701,9 +701,9 @@ impl CommitInfoForAI {
         if let Some(caps) = SCOPE_RE.captures(&self.base.original_message) {
             let scope = caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str());
             if let Some(scope) = scope {
-                if scope.contains(',') && !scope.contains(", ") {
+                if scope.contains(',') && !scope.contains(",  ") && !scope.contains(" ,") {
                     self.pre_validated_checks.push(format!(
-                        "Scope format verified: multi-scope '{scope}' correctly uses commas without spaces"
+                        "Scope format verified: multi-scope '{scope}' uses commas with at most one trailing space"
                     ));
                 }
 
@@ -1288,6 +1288,49 @@ mod tests {
                 .iter()
                 .any(|c| c.contains("Scope validity verified")),
             "expected scope validity check for spaced multi-scope, got: {:?}",
+            info.pre_validated_checks
+        );
+        assert!(
+            info.pre_validated_checks
+                .iter()
+                .any(|c| c.contains("Scope format verified")),
+            "single-space-after-comma multi-scope should pass the format check, got: {:?}",
+            info.pre_validated_checks
+        );
+    }
+
+    #[test]
+    fn pre_validation_multi_scope_double_space_not_format_verified() {
+        let scopes = vec![
+            make_scope_def("cli", &["src/cli/**"]),
+            make_scope_def("lib", &["src/lib/**"]),
+        ];
+        let mut info = make_commit_info_for_ai("feat(cli,  lib): add something");
+        info.run_pre_validation_checks(&scopes);
+        assert!(
+            !info
+                .pre_validated_checks
+                .iter()
+                .any(|c| c.contains("Scope format verified")),
+            "double-space-after-comma must NOT be recorded as format-verified, got: {:?}",
+            info.pre_validated_checks
+        );
+    }
+
+    #[test]
+    fn pre_validation_multi_scope_space_before_comma_not_format_verified() {
+        let scopes = vec![
+            make_scope_def("cli", &["src/cli/**"]),
+            make_scope_def("lib", &["src/lib/**"]),
+        ];
+        let mut info = make_commit_info_for_ai("feat(cli ,lib): add something");
+        info.run_pre_validation_checks(&scopes);
+        assert!(
+            !info
+                .pre_validated_checks
+                .iter()
+                .any(|c| c.contains("Scope format verified")),
+            "space-before-comma must NOT be recorded as format-verified, got: {:?}",
             info.pre_validated_checks
         );
     }

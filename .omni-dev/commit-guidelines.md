@@ -21,11 +21,16 @@ This project follows conventional commit format with specific requirements.
 ```
 
 Multiple scopes are allowed when a commit spans more than one area.
-Separate scopes with a comma and no space:
+Separate scopes with a comma. An optional single space after the comma
+is permitted; both forms are accepted:
 
 ```
 <type>(<scope1>,<scope2>): <description>
+<type>(<scope1>, <scope2>): <description>
 ```
+
+Two or more spaces after a comma, or any whitespace before a comma, is
+not permitted.
 
 ## Types
 
@@ -65,7 +70,6 @@ when the commit legitimately spans multiple areas.
 
 ## Subject Line
 
-- Keep under 72 characters total
 - Use imperative mood: "add feature" not "added feature" or "adds feature"
 - Be specific: avoid vague terms like "update", "fix stuff", "changes"
 
