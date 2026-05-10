@@ -476,13 +476,28 @@ pub struct WatcherListParams {
     pub key: String,
 }
 
-/// Parameters for the `jira_watcher_add` / `jira_watcher_remove` tools.
+/// Parameters for the `jira_watcher_add` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct WatcherMutateParams {
     /// JIRA issue key (e.g., `PROJ-123`).
     pub key: String,
     /// Atlassian account ID of the user.
     pub account_id: String,
+}
+
+/// Parameters for the `jira_watcher_remove` tool.
+///
+/// `confirm` must be `true` for the removal to proceed. This is the
+/// MCP-side guard for a destructive operation; the assistant must
+/// explicitly opt in.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WatcherRemoveParams {
+    /// JIRA issue key (e.g., `PROJ-123`).
+    pub key: String,
+    /// Atlassian account ID of the user.
+    pub account_id: String,
+    /// Must be set to `true` — destructive guard.
+    pub confirm: bool,
 }
 
 pub(crate) async fn watcher_list_yaml(client: &AtlassianClient, key: &str) -> Result<String> {
@@ -503,7 +518,13 @@ pub(crate) async fn watcher_remove_yaml(
     client: &AtlassianClient,
     key: &str,
     account_id: &str,
+    confirm: bool,
 ) -> Result<String> {
+    if !confirm {
+        return Err(anyhow!(
+            "Refusing to remove watcher {account_id} from {key}: pass `confirm: true` to authorise this destructive operation."
+        ));
+    }
     client.remove_watcher(key, account_id).await?;
     serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
@@ -524,10 +545,16 @@ pub struct LinkListParams {
 pub struct LinkTypesParams {}
 
 /// Parameters for the `jira_link_remove` tool.
+///
+/// `confirm` must be `true` for the removal to proceed. This is the
+/// MCP-side guard for a destructive operation; the assistant must
+/// explicitly opt in.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LinkRemoveParams {
     /// Link ID to remove (returned by `jira_link_list`).
     pub link_id: String,
+    /// Must be set to `true` — destructive guard.
+    pub confirm: bool,
 }
 
 pub(crate) async fn link_list_yaml(client: &AtlassianClient, key: &str) -> Result<String> {
@@ -543,7 +570,16 @@ pub(crate) async fn link_types_yaml(
     serde_yaml::to_string(&*types).context("Failed to serialize link types as YAML")
 }
 
-pub(crate) async fn link_remove_yaml(client: &AtlassianClient, link_id: &str) -> Result<String> {
+pub(crate) async fn link_remove_yaml(
+    client: &AtlassianClient,
+    link_id: &str,
+    confirm: bool,
+) -> Result<String> {
+    if !confirm {
+        return Err(anyhow!(
+            "Refusing to remove link {link_id}: pass `confirm: true` to authorise this destructive operation."
+        ));
+    }
     client.remove_issue_link(link_id).await?;
     serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
@@ -1068,16 +1104,18 @@ impl OmniDevServer {
     /// Tool: remove a watcher from an issue.
     #[tool(
         description = "Remove a user (by Atlassian account ID) from the watchers of a JIRA \
-                       issue. Returns YAML `{status: ok}`. Mirrors `omni-dev atlassian jira \
-                       watcher remove`."
+                       issue. Destructive operation: callers must explicitly pass \
+                       `confirm: true` for the removal to proceed; otherwise the tool \
+                       refuses with an error. Returns YAML `{status: ok}`. Mirrors \
+                       `omni-dev atlassian jira watcher remove`."
     )]
     pub async fn jira_watcher_remove(
         &self,
-        Parameters(params): Parameters<WatcherMutateParams>,
+        Parameters(params): Parameters<WatcherRemoveParams>,
     ) -> Result<CallToolResult, McpError> {
         let yaml = (async {
             let (client, _) = create_client()?;
-            watcher_remove_yaml(&client, &params.key, &params.account_id).await
+            watcher_remove_yaml(&client, &params.key, &params.account_id, params.confirm).await
         })
         .await
         .map_err(tool_error)?;
@@ -1129,8 +1167,10 @@ impl OmniDevServer {
     /// Tool: remove an issue link by its link ID.
     #[tool(
         description = "Remove a JIRA issue link by its link ID (use `jira_link_list` or \
-                       `jira_read` to discover IDs). Returns YAML `{status: ok}`. Mirrors \
-                       `omni-dev atlassian jira link remove`."
+                       `jira_read` to discover IDs). Destructive operation: callers \
+                       must explicitly pass `confirm: true` for the removal to proceed; \
+                       otherwise the tool refuses with an error. Returns YAML \
+                       `{status: ok}`. Mirrors `omni-dev atlassian jira link remove`."
     )]
     pub async fn jira_link_remove(
         &self,
@@ -1138,7 +1178,7 @@ impl OmniDevServer {
     ) -> Result<CallToolResult, McpError> {
         let yaml = (async {
             let (client, _) = create_client()?;
-            link_remove_yaml(&client, &params.link_id).await
+            link_remove_yaml(&client, &params.link_id, params.confirm).await
         })
         .await
         .map_err(tool_error)?;
@@ -1945,7 +1985,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watcher_remove_yaml_returns_status_ok() {
+    async fn watcher_remove_yaml_requires_confirm_true() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server.uri());
+        let err = watcher_remove_yaml(&client, "PROJ-1", "abc", false)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("confirm: true"));
+    }
+
+    #[tokio::test]
+    async fn watcher_remove_yaml_with_confirm_calls_api() {
         let server = MockServer::start().await;
         Mock::given(method("DELETE"))
             .and(path("/rest/api/3/issue/PROJ-1/watchers"))
@@ -1954,7 +2005,9 @@ mod tests {
             .mount(&server)
             .await;
         let client = mock_client(&server.uri());
-        let yaml = watcher_remove_yaml(&client, "PROJ-1", "abc").await.unwrap();
+        let yaml = watcher_remove_yaml(&client, "PROJ-1", "abc", true)
+            .await
+            .unwrap();
         assert!(yaml.contains("ok"));
     }
 
@@ -1967,7 +2020,7 @@ mod tests {
             .mount(&server)
             .await;
         let client = mock_client(&server.uri());
-        let err = watcher_remove_yaml(&client, "PROJ-1", "abc")
+        let err = watcher_remove_yaml(&client, "PROJ-1", "abc", true)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("403"));
@@ -2056,7 +2109,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn link_remove_yaml_returns_status_ok() {
+    async fn link_remove_yaml_requires_confirm_true() {
+        let server = MockServer::start().await;
+        let client = mock_client(&server.uri());
+        let err = link_remove_yaml(&client, "12345", false).await.unwrap_err();
+        assert!(err.to_string().contains("confirm: true"));
+    }
+
+    #[tokio::test]
+    async fn link_remove_yaml_with_confirm_calls_api() {
         let server = MockServer::start().await;
         Mock::given(method("DELETE"))
             .and(path("/rest/api/3/issueLink/12345"))
@@ -2064,7 +2125,7 @@ mod tests {
             .mount(&server)
             .await;
         let client = mock_client(&server.uri());
-        let yaml = link_remove_yaml(&client, "12345").await.unwrap();
+        let yaml = link_remove_yaml(&client, "12345", true).await.unwrap();
         assert!(yaml.contains("ok"));
     }
 
@@ -2077,7 +2138,7 @@ mod tests {
             .mount(&server)
             .await;
         let client = mock_client(&server.uri());
-        let err = link_remove_yaml(&client, "99").await.unwrap_err();
+        let err = link_remove_yaml(&client, "99", true).await.unwrap_err();
         assert!(err.to_string().contains("404"));
     }
 
