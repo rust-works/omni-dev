@@ -331,6 +331,7 @@ async fn jira_extension_tools_route_through_mcp() -> Result<()> {
                 "watchers": [],
                 "watchCount": 0,
                 "fields": {"attachment": []},
+                "issueLinkTypes": [],
                 "total": 0,
                 "isLast": true,
                 "id": 1,
