@@ -1,7 +1,7 @@
-//! CLI command for listing and executing JIRA issue transitions.
+//! CLI commands for listing and executing JIRA issue transitions.
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 use crate::atlassian::client::{AtlassianClient, JiraTransition};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
@@ -10,59 +10,91 @@ use crate::cli::atlassian::helpers::create_client;
 /// Lists or executes workflow transitions on a JIRA issue.
 #[derive(Parser)]
 pub struct TransitionCommand {
+    /// The transition subcommand to execute.
+    #[command(subcommand)]
+    pub command: TransitionSubcommands,
+}
+
+/// Transition subcommands.
+#[derive(Subcommand)]
+pub enum TransitionSubcommands {
+    /// Lists workflow transitions available from the issue's current status.
+    List(ListCommand),
+    /// Executes a workflow transition on a JIRA issue.
+    Execute(ExecuteCommand),
+}
+
+impl TransitionCommand {
+    /// Executes the transition command.
+    pub async fn execute(self) -> Result<()> {
+        match self.command {
+            TransitionSubcommands::List(cmd) => cmd.execute().await,
+            TransitionSubcommands::Execute(cmd) => cmd.execute().await,
+        }
+    }
+}
+
+/// Lists available workflow transitions for a JIRA issue.
+#[derive(Parser)]
+pub struct ListCommand {
     /// JIRA issue key (e.g., PROJ-123).
     pub key: String,
-
-    /// Transition name or ID to execute. Omit to list available transitions.
-    pub transition: Option<String>,
-
-    /// Lists available transitions (same as omitting the transition argument).
-    #[arg(long)]
-    pub list: bool,
 
     /// Output format.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
 }
 
-impl TransitionCommand {
-    /// Executes the transition command.
+impl ListCommand {
+    /// Fetches and displays available transitions.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        run_transition(
-            &client,
-            &self.key,
-            self.transition.as_deref(),
-            self.list,
-            &self.output,
-        )
-        .await
+        run_list_transitions(&client, &self.key, &self.output).await
     }
 }
 
-/// Lists or executes a transition on an issue.
-async fn run_transition(
+/// Executes a transition on a JIRA issue.
+#[derive(Parser)]
+pub struct ExecuteCommand {
+    /// JIRA issue key (e.g., PROJ-123).
+    pub key: String,
+
+    /// Transition name or ID to execute.
+    pub transition: String,
+}
+
+impl ExecuteCommand {
+    /// Executes the transition.
+    pub async fn execute(self) -> Result<()> {
+        let (client, _instance_url) = create_client()?;
+        run_execute_transition(&client, &self.key, &self.transition).await
+    }
+}
+
+/// Lists transitions for an issue and prints them.
+async fn run_list_transitions(
     client: &AtlassianClient,
     key: &str,
-    transition: Option<&str>,
-    list: bool,
     output: &OutputFormat,
 ) -> Result<()> {
     let transitions = client.get_transitions(key).await?;
-
-    let Some(target) = transition.filter(|_| !list) else {
-        if output_as(&transitions, output)? {
-            return Ok(());
-        }
-        print_transitions(&transitions);
+    if output_as(&transitions, output)? {
         return Ok(());
-    };
+    }
+    print_transitions(&transitions);
+    Ok(())
+}
 
-    let matched = resolve_transition(target, &transitions)?;
-
+/// Resolves and executes a transition on an issue.
+async fn run_execute_transition(
+    client: &AtlassianClient,
+    key: &str,
+    transition: &str,
+) -> Result<()> {
+    let transitions = client.get_transitions(key).await?;
+    let matched = resolve_transition(transition, &transitions)?;
     client.do_transition(key, &matched.id).await?;
     println!("Transitioned {key} to \"{}\".", matched.name);
-
     Ok(())
 }
 
@@ -126,12 +158,43 @@ fn print_transitions(transitions: &[JiraTransition]) {
         .unwrap_or(2)
         .max(2);
 
-    println!("{:<id_width$}  NAME", "ID");
-    let name_sep = "-".repeat(4);
-    println!("{:<id_width$}  {name_sep}", "-".repeat(id_width));
+    let name_width = transitions
+        .iter()
+        .map(|t| t.name.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+
+    let to_status_width = transitions
+        .iter()
+        .map(|t| t.to_status.as_ref().map_or(0, |s| s.name.len()))
+        .max()
+        .unwrap_or(9)
+        .max(9);
+
+    println!(
+        "{:<id_width$}  {:<name_width$}  {:<to_status_width$}  CATEGORY",
+        "ID", "NAME", "TO STATUS"
+    );
+    println!(
+        "{}  {}  {}  {}",
+        "-".repeat(id_width),
+        "-".repeat(name_width),
+        "-".repeat(to_status_width),
+        "-".repeat(8),
+    );
 
     for t in transitions {
-        println!("{:<id_width$}  {}", t.id, t.name);
+        let to_name = t.to_status.as_ref().map_or("", |s| s.name.as_str());
+        let category = t
+            .to_status
+            .as_ref()
+            .and_then(|s| s.category.as_deref())
+            .unwrap_or("");
+        println!(
+            "{:<id_width$}  {:<name_width$}  {:<to_status_width$}  {}",
+            t.id, t.name, to_name, category,
+        );
     }
 }
 
@@ -145,14 +208,20 @@ mod tests {
             JiraTransition {
                 id: "11".to_string(),
                 name: "In Progress".to_string(),
+                to_status: None,
+                has_screen: None,
             },
             JiraTransition {
                 id: "21".to_string(),
                 name: "Done".to_string(),
+                to_status: None,
+                has_screen: None,
             },
             JiraTransition {
                 id: "31".to_string(),
                 name: "Won't Do".to_string(),
+                to_status: None,
+                has_screen: None,
             },
         ]
     }
@@ -202,10 +271,14 @@ mod tests {
             JiraTransition {
                 id: "11".to_string(),
                 name: "Done".to_string(),
+                to_status: None,
+                has_screen: None,
             },
             JiraTransition {
                 id: "21".to_string(),
                 name: "Done".to_string(),
+                to_status: None,
+                has_screen: None,
             },
         ];
         let err = resolve_transition("Done", &transitions).unwrap_err();
@@ -222,10 +295,14 @@ mod tests {
             JiraTransition {
                 id: "Done".to_string(),
                 name: "Something Else".to_string(),
+                to_status: None,
+                has_screen: None,
             },
             JiraTransition {
                 id: "99".to_string(),
                 name: "Done".to_string(),
+                to_status: None,
+                has_screen: None,
             },
         ];
         let result = resolve_transition("Done", &transitions).unwrap();
@@ -246,10 +323,42 @@ mod tests {
         print_transitions(&[]);
     }
 
-    // ── run_transition (wiremock) ────────────────────────────────────
+    #[test]
+    fn print_transitions_with_rich_to_status() {
+        let transitions = vec![
+            JiraTransition {
+                id: "21".to_string(),
+                name: "In Progress".to_string(),
+                to_status: Some(crate::atlassian::client::JiraTransitionToStatus {
+                    id: "3".to_string(),
+                    name: "In Progress".to_string(),
+                    category: Some("indeterminate".to_string()),
+                }),
+                has_screen: Some(false),
+            },
+            JiraTransition {
+                id: "31".to_string(),
+                name: "Done".to_string(),
+                to_status: Some(crate::atlassian::client::JiraTransitionToStatus {
+                    id: "10000".to_string(),
+                    name: "Done".to_string(),
+                    category: Some("done".to_string()),
+                }),
+                has_screen: Some(true),
+            },
+        ];
+        // Should not panic and exercise the Some(to_status) branches
+        print_transitions(&transitions);
+    }
+
+    // ── run_list_transitions / run_execute_transition (wiremock) ───
+
+    fn mock_client(base_url: &str) -> AtlassianClient {
+        AtlassianClient::new(base_url, "user@test.com", "token").unwrap()
+    }
 
     #[tokio::test]
-    async fn run_transition_list_mode() {
+    async fn run_list_transitions_table() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path(
@@ -267,18 +376,57 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client =
-            crate::atlassian::client::AtlassianClient::new(&server.uri(), "u@t.com", "tok")
-                .unwrap();
+        let client = mock_client(&server.uri());
         assert!(
-            run_transition(&client, "PROJ-1", None, true, &OutputFormat::Table)
+            run_list_transitions(&client, "PROJ-1", &OutputFormat::Table)
                 .await
                 .is_ok()
         );
     }
 
     #[tokio::test]
-    async fn run_transition_execute_by_name() {
+    async fn run_list_transitions_yaml() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/transitions",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "transitions": [{"id": "11", "name": "In Progress"}]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(run_list_transitions(&client, "PROJ-1", &OutputFormat::Yaml)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_list_transitions_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/NOPE-1/transitions",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_list_transitions(&client, "NOPE-1", &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn run_execute_transition_by_name() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path(
@@ -305,18 +453,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client =
-            crate::atlassian::client::AtlassianClient::new(&server.uri(), "u@t.com", "tok")
-                .unwrap();
-        assert!(
-            run_transition(&client, "PROJ-1", Some("Done"), false, &OutputFormat::Table)
-                .await
-                .is_ok()
-        );
+        let client = mock_client(&server.uri());
+        assert!(run_execute_transition(&client, "PROJ-1", "Done")
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
-    async fn run_transition_resolve_not_found() {
+    async fn run_execute_transition_resolve_not_found() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path(
@@ -331,64 +475,34 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client =
-            crate::atlassian::client::AtlassianClient::new(&server.uri(), "u@t.com", "tok")
-                .unwrap();
-        let err = run_transition(
-            &client,
-            "PROJ-1",
-            Some("Nonexistent"),
-            false,
-            &OutputFormat::Table,
-        )
-        .await
-        .unwrap_err();
+        let client = mock_client(&server.uri());
+        let err = run_execute_transition(&client, "PROJ-1", "Nonexistent")
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("No transition matching"));
     }
 
-    #[tokio::test]
-    async fn run_transition_api_error() {
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path(
-                "/rest/api/3/issue/NOPE-1/transitions",
-            ))
-            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let client =
-            crate::atlassian::client::AtlassianClient::new(&server.uri(), "u@t.com", "tok")
-                .unwrap();
-        let err = run_transition(&client, "NOPE-1", None, true, &OutputFormat::Table)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("404"));
-    }
-
-    // ── TransitionCommand struct ───────────────────────────────────
+    // ── TransitionCommand variants ─────────────────────────────────
 
     #[test]
-    fn transition_command_list_mode() {
+    fn transition_command_list_variant() {
         let cmd = TransitionCommand {
-            key: "PROJ-1".to_string(),
-            transition: None,
-            list: true,
-            output: OutputFormat::Table,
+            command: TransitionSubcommands::List(ListCommand {
+                key: "PROJ-1".to_string(),
+                output: OutputFormat::Table,
+            }),
         };
-        assert!(cmd.list);
-        assert!(cmd.transition.is_none());
+        assert!(matches!(cmd.command, TransitionSubcommands::List(_)));
     }
 
     #[test]
-    fn transition_command_execute_mode() {
+    fn transition_command_execute_variant() {
         let cmd = TransitionCommand {
-            key: "PROJ-1".to_string(),
-            transition: Some("Done".to_string()),
-            list: false,
-            output: OutputFormat::Table,
+            command: TransitionSubcommands::Execute(ExecuteCommand {
+                key: "PROJ-1".to_string(),
+                transition: "Done".to_string(),
+            }),
         };
-        assert_eq!(cmd.transition.as_deref(), Some("Done"));
+        assert!(matches!(cmd.command, TransitionSubcommands::Execute(_)));
     }
 }

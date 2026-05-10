@@ -140,6 +140,13 @@ pub struct JiraTransitionParams {
     pub list: Option<bool>,
 }
 
+/// Parameters for the `jira_transition_list` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct JiraTransitionListParams {
+    /// JIRA issue key (e.g., `PROJ-123`).
+    pub key: String,
+}
+
 /// Parameters for the `jira_comment` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct JiraCommentParams {
@@ -420,6 +427,12 @@ async fn run_jira_transition(
         name = matched.name,
         id = matched.id
     ))
+}
+
+/// Lists available transitions for an issue and returns them as YAML.
+async fn run_jira_transition_list(client: &AtlassianClient, key: &str) -> Result<String> {
+    let transitions = client.get_transitions(key).await?;
+    yaml_result(&transitions)
 }
 
 /// Resolves a transition by exact id or case-insensitive name match.
@@ -728,6 +741,25 @@ impl OmniDevServer {
         )
         .await
         .map_err(tool_error)?;
+        ok_text(text)
+    }
+
+    /// Tool: list workflow transitions available from the issue's current status.
+    #[tool(
+        description = "List the workflow transitions available from a JIRA issue's current status. \
+                       Returns YAML with `{id, name, to_status, has_screen}` for each transition. \
+                       Faster and lighter than `jira_read` when you only need the transition ids \
+                       and names to feed into `jira_transition`. Equivalent to `jira_transition` \
+                       with `list = true`, but exposed as a single-purpose tool for discoverability."
+    )]
+    pub async fn jira_transition_list(
+        &self,
+        Parameters(params): Parameters<JiraTransitionListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _instance_url) = create_client().map_err(tool_error)?;
+        let text = run_jira_transition_list(&client, &params.key)
+            .await
+            .map_err(tool_error)?;
         ok_text(text)
     }
 
@@ -1806,12 +1838,85 @@ mod tests {
         assert!(err.to_string().contains("No transition matching"));
     }
 
+    // ── run_jira_transition_list ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_jira_transition_list_happy_path() {
+        let server = MockServer::start().await;
+        mount_transitions(
+            &server,
+            "PROJ-1",
+            serde_json::json!({
+                "transitions": [
+                    {
+                        "id": "21",
+                        "name": "In Progress",
+                        "hasScreen": false,
+                        "to": {
+                            "id": "3",
+                            "name": "In Progress",
+                            "statusCategory": {"key": "indeterminate"}
+                        }
+                    },
+                    {
+                        "id": "31",
+                        "name": "Done",
+                        "hasScreen": false,
+                        "to": {
+                            "id": "10000",
+                            "name": "Done",
+                            "statusCategory": {"key": "done"}
+                        }
+                    }
+                ]
+            }),
+        )
+        .await;
+
+        let client = mock_client(&server.uri());
+        let yaml = run_jira_transition_list(&client, "PROJ-1").await.unwrap();
+        assert!(yaml.contains("In Progress"));
+        assert!(yaml.contains("Done"));
+        assert!(yaml.contains("to_status:"));
+        assert!(yaml.contains("category: indeterminate"));
+        assert!(yaml.contains("category: done"));
+        assert!(yaml.contains("has_screen: false"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_transition_list_issue_not_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/NOPE-1/transitions"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_jira_transition_list(&client, "NOPE-1")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_transition_list_empty() {
+        let server = MockServer::start().await;
+        mount_transitions(&server, "PROJ-1", serde_json::json!({"transitions": []})).await;
+
+        let client = mock_client(&server.uri());
+        let yaml = run_jira_transition_list(&client, "PROJ-1").await.unwrap();
+        assert_eq!(yaml, "[]\n");
+    }
+
     // ── resolve_transition ─────────────────────────────────────────────────
 
     fn t(id: &str, name: &str) -> JiraTransition {
         JiraTransition {
             id: id.to_string(),
             name: name.to_string(),
+            to_status: None,
+            has_screen: None,
         }
     }
 
