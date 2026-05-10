@@ -1542,6 +1542,47 @@ mod tests {
     }
 
     #[test]
+    fn table_rows_skips_non_row_children() {
+        // A table whose direct children include a non-tableRow node
+        // exercises the false branch of `if row.node_type == "tableRow"`
+        // inside `table_rows`.
+        let from = AdfNode::table(vec![
+            p("not-a-row"), // skipped by the row-type filter
+            AdfNode::table_row(vec![AdfNode::table_cell(vec![p("alpha")])]),
+        ]);
+        let to = AdfNode::table(vec![
+            p("not-a-row"),
+            AdfNode::table_row(vec![AdfNode::table_cell(vec![p("beta")])]),
+        ]);
+        let delta = diff_table(&from, &to, &DiffOptions::default()).unwrap();
+        // Inspect via the serialized form to avoid an unreachable
+        // destructuring branch — `delta` is structurally guaranteed to be
+        // `Table` by the call above.
+        let json = serde_json::to_value(&delta).unwrap();
+        assert_eq!(json["kind"], "table");
+        assert_eq!(json["cells"].as_array().unwrap().len(), 1);
+        assert_eq!(json["cells"][0]["from_text"], "alpha");
+        assert_eq!(json["cells"][0]["to_text"], "beta");
+    }
+
+    #[test]
+    fn table_rows_handles_table_with_no_content() {
+        // A `table` node with no children at all exercises the false branch
+        // of `if let Some(children)` inside `table_rows`.
+        let empty_table = AdfNode {
+            node_type: "table".to_string(),
+            attrs: None,
+            content: None,
+            text: None,
+            marks: None,
+            local_id: None,
+            parameters: None,
+        };
+        let result = diff_table(&empty_table, &empty_table, &DiffOptions::default());
+        assert!(result.is_none());
+    }
+
+    #[test]
     fn table_rows_skips_non_cell_children() {
         // A `tableRow` with a non-cell child (here a paragraph) exercises
         // the false branch of the cell-type filter inside `table_rows`.
