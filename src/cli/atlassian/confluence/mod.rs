@@ -3,6 +3,7 @@
 pub(crate) mod attachment;
 pub(crate) mod children;
 pub(crate) mod comment;
+pub(crate) mod compare;
 pub(crate) mod create;
 pub(crate) mod delete;
 pub(crate) mod download;
@@ -55,6 +56,8 @@ pub enum ConfluenceSubcommands {
     Children(children::ChildrenCommand),
     /// Lists version history (metadata) for a Confluence page.
     History(history::HistoryCommand),
+    /// Compares two versions of a Confluence page (structural diff).
+    Compare(compare::CompareCommandGroup),
     /// Confluence user operations.
     User(user::UserCommand),
 }
@@ -76,6 +79,7 @@ impl ConfluenceCommand {
             ConfluenceSubcommands::Download(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Children(cmd) => cmd.execute().await,
             ConfluenceSubcommands::History(cmd) => cmd.execute().await,
+            ConfluenceSubcommands::Compare(cmd) => cmd.execute().await,
             ConfluenceSubcommands::User(cmd) => cmd.execute().await,
         }
     }
@@ -397,5 +401,38 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::Download(_)));
+    }
+
+    /// Exercises the `Compare` dispatch arm in `ConfluenceCommand::execute`
+    /// with injected fake credentials so `create_client()` succeeds and the
+    /// downstream call is reached. The subsequent API call is allowed to
+    /// fail — we only care that the dispatch line runs.
+    #[tokio::test]
+    async fn confluence_command_execute_compare_dispatch() {
+        std::env::set_var("ATLASSIAN_INSTANCE_URL", "http://127.0.0.1:1");
+        std::env::set_var("ATLASSIAN_EMAIL", "test@example.com");
+        std::env::set_var("ATLASSIAN_API_TOKEN", "fake-token");
+
+        let cmd = ConfluenceCommand {
+            command: ConfluenceSubcommands::Compare(compare::CompareCommandGroup {
+                command: compare::CompareSubcommands::Run(compare::CompareCommand {
+                    id: "12345".to_string(),
+                    from: "previous".to_string(),
+                    to: "latest".to_string(),
+                    detail: compare::DetailArg::Outline,
+                    include: "body".to_string(),
+                    ignore_whitespace: true,
+                    min_change_chars: 0,
+                    filter_sections: Vec::new(),
+                    budget: 16384,
+                    output: OutputFormat::Yaml,
+                }),
+            }),
+        };
+        let _ = cmd.execute().await;
+
+        std::env::remove_var("ATLASSIAN_INSTANCE_URL");
+        std::env::remove_var("ATLASSIAN_EMAIL");
+        std::env::remove_var("ATLASSIAN_API_TOKEN");
     }
 }

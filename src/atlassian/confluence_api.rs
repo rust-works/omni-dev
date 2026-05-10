@@ -1445,6 +1445,72 @@ impl ConfluenceApi {
 
         Ok(())
     }
+
+    /// Fetches a Confluence page pinned to a specific version number.
+    ///
+    /// Like [`AtlassianApi::get_content`] but returns the historical
+    /// snapshot at `version` rather than the current head. Used by the
+    /// version-comparison tooling to fetch each side of the diff
+    /// independently — Confluence stores versions as immutable snapshots.
+    pub async fn get_page_at_version(&self, id: &str, version: u32) -> Result<ContentItem> {
+        let url = format!(
+            "{}/wiki/api/v2/pages/{}?body-format=atlas_doc_format&version={}",
+            self.client.instance_url(),
+            id,
+            version
+        );
+
+        let response = self
+            .client
+            .get_json(&url)
+            .await
+            .context("Failed to fetch Confluence page version")?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let page: ConfluencePageResponse = response
+            .json()
+            .await
+            .context("Failed to parse Confluence page response")?;
+
+        debug!(
+            page_id = page.id,
+            version,
+            title = page.title,
+            "Fetched Confluence page at specific version"
+        );
+
+        let body_adf = if let Some(body) = &page.body {
+            if let Some(atlas_doc) = &body.atlas_doc_format {
+                Some(
+                    serde_json::from_str(&atlas_doc.value)
+                        .context("Failed to parse ADF from Confluence body")?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let space_key = self.resolve_space_key(&page.space_id).await?;
+
+        Ok(ContentItem {
+            id: page.id,
+            title: page.title,
+            body_adf,
+            metadata: ContentMetadata::Confluence {
+                space_key,
+                status: Some(page.status),
+                version: page.version.map(|v| v.number),
+                parent_id: page.parent_id,
+            },
+        })
+    }
 }
 
 /// Minimal application/x-www-form-urlencoded encoder for query-param values.
@@ -1502,6 +1568,95 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Resolves a user-supplied version reference against a list of
+/// [`PageVersion`] records returned by [`ConfluenceApi::list_page_versions`].
+///
+/// Accepts:
+/// - `"latest"` — the newest known version (`versions[0].number`).
+/// - `"previous"` — the version immediately before `relative_to`.
+/// - `"v-N"` (e.g. `"v-2"`) — the version `relative_to - N`.
+/// - Numeric (`"5"`) — that exact version; must be present in `versions`.
+/// - ISO 8601 date — the most recent version whose `created_at <=` the
+///   given date. Detected when the input contains `-` or `T`.
+///
+/// `relative_to` anchors `"previous"` and `"v-N"`. Pass the resolved `to`
+/// version when resolving `from`, so `previous` always means "one before
+/// `to`" regardless of what `to` itself is.
+///
+/// `versions` must be ordered newest-first (the natural shape returned by
+/// `list_page_versions`).
+pub fn resolve_version(raw: &str, versions: &[PageVersion], relative_to: u32) -> Result<u32> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("version reference must not be empty");
+    }
+    if versions.is_empty() {
+        anyhow::bail!("page has no versions");
+    }
+
+    if trimmed.eq_ignore_ascii_case("latest") {
+        return Ok(versions[0].number);
+    }
+    if trimmed.eq_ignore_ascii_case("previous") {
+        return offset_from(relative_to, 1, versions);
+    }
+    if let Some(rest) = trimmed
+        .strip_prefix("v-")
+        .or_else(|| trimmed.strip_prefix("V-"))
+    {
+        let offset: u32 = rest.parse().with_context(|| {
+            format!("Invalid relative version offset \"{trimmed}\"; expected v-N with N > 0")
+        })?;
+        if offset == 0 {
+            anyhow::bail!("Relative version offset must be > 0; got \"{trimmed}\"");
+        }
+        return offset_from(relative_to, offset, versions);
+    }
+    if trimmed.chars().all(|c| c.is_ascii_digit()) {
+        let n: u32 = trimmed
+            .parse()
+            .with_context(|| format!("Invalid version number \"{trimmed}\""))?;
+        if !versions.iter().any(|v| v.number == n) {
+            anyhow::bail!("Version {n} not found in page history");
+        }
+        return Ok(n);
+    }
+    if trimmed.contains('-') || trimmed.contains('T') {
+        // ISO 8601 date: pick the latest version with created_at <= date.
+        // `versions` is newest-first, so the first match wins.
+        for v in versions {
+            if !v.created_at.is_empty() && v.created_at.as_str() <= trimmed {
+                return Ok(v.number);
+            }
+        }
+        anyhow::bail!("No version found at or before \"{trimmed}\"");
+    }
+
+    anyhow::bail!(
+        "Could not parse \"{trimmed}\" as a version reference; expected \
+         \"latest\", \"previous\", \"v-N\", a numeric version (e.g. \"5\"), \
+         or an ISO 8601 date (e.g. \"2026-01-01T00:00:00Z\")"
+    )
+}
+
+fn offset_from(anchor: u32, offset: u32, versions: &[PageVersion]) -> Result<u32> {
+    if anchor <= offset {
+        anyhow::bail!(
+            "Cannot resolve v-{offset} relative to version {anchor}: out of range \
+             (would be {} or lower)",
+            i64::from(anchor) - i64::from(offset)
+        );
+    }
+    let target = anchor - offset;
+    if !versions.iter().any(|v| v.number == target) {
+        anyhow::bail!(
+            "Version {target} not found in page history \
+             (resolved from anchor {anchor} - {offset})"
+        );
+    }
+    Ok(target)
 }
 
 #[cfg(test)]
@@ -3868,5 +4023,243 @@ mod tests {
         };
         let json = serde_json::to_value(&page).unwrap();
         assert!(json.get("next_cursor").is_none());
+    }
+
+    // ── get_page_at_version ───────────────────────────────────────
+
+    async fn mount_page_version(
+        server: &wiremock::MockServer,
+        page_id: &str,
+        version: u32,
+        adf_value: &str,
+    ) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!(
+                "/wiki/api/v2/pages/{page_id}"
+            )))
+            .and(wiremock::matchers::query_param(
+                "version",
+                version.to_string(),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": page_id,
+                    "title": format!("Page {page_id} v{version}"),
+                    "status": "current",
+                    "spaceId": "98",
+                    "version": {"number": version},
+                    "body": {
+                        "atlas_doc_format": {"value": adf_value}
+                    }
+                })),
+            )
+            .mount(server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/98"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"key": "ENG"})),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn get_page_at_version_success() {
+        use crate::atlassian::api::ContentMetadata;
+
+        let server = wiremock::MockServer::start().await;
+        mount_page_version(
+            &server,
+            "12",
+            3,
+            r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"v3"}]}]}"#,
+        )
+        .await;
+
+        let client = AtlassianClient::new(&server.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        let item = api.get_page_at_version("12", 3).await.unwrap();
+        assert_eq!(item.id, "12");
+        assert_eq!(item.title, "Page 12 v3");
+        assert!(item.body_adf.is_some());
+        match item.metadata {
+            ContentMetadata::Confluence {
+                space_key, version, ..
+            } => {
+                assert_eq!(space_key, "ENG");
+                assert_eq!(version, Some(3));
+            }
+            ContentMetadata::Jira { .. } => panic!("expected Confluence metadata"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_page_at_version_404() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12"))
+            .and(wiremock::matchers::query_param("version", "99"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = api.get_page_at_version("12", 99).await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn get_page_at_version_no_body() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12"))
+            .and(wiremock::matchers::query_param("version", "1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "12",
+                    "title": "Empty",
+                    "status": "current",
+                    "spaceId": "1",
+                    "version": {"number": 1}
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"key": "S"})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        let item = api.get_page_at_version("12", 1).await.unwrap();
+        assert!(item.body_adf.is_none());
+    }
+
+    // ── resolve_version ───────────────────────────────────────────
+
+    fn version_at(number: u32, created: &str) -> PageVersion {
+        PageVersion {
+            number,
+            created_at: created.to_string(),
+            author_id: String::new(),
+            message: String::new(),
+            minor_edit: false,
+        }
+    }
+
+    fn fixture_versions() -> Vec<PageVersion> {
+        // Newest-first.
+        vec![
+            version_at(5, "2026-05-09T10:00:00Z"),
+            version_at(4, "2026-05-08T10:00:00Z"),
+            version_at(3, "2026-05-07T10:00:00Z"),
+            version_at(2, "2026-05-06T10:00:00Z"),
+            version_at(1, "2026-05-05T10:00:00Z"),
+        ]
+    }
+
+    #[test]
+    fn resolve_version_latest() {
+        let v = fixture_versions();
+        assert_eq!(resolve_version("latest", &v, 5).unwrap(), 5);
+        assert_eq!(resolve_version("LATEST", &v, 5).unwrap(), 5);
+    }
+
+    #[test]
+    fn resolve_version_previous_relative_to_anchor() {
+        let v = fixture_versions();
+        // `previous` is relative to `relative_to`, not to head.
+        assert_eq!(resolve_version("previous", &v, 5).unwrap(), 4);
+        assert_eq!(resolve_version("previous", &v, 3).unwrap(), 2);
+    }
+
+    #[test]
+    fn resolve_version_previous_at_first_version_errors() {
+        let v = fixture_versions();
+        let err = resolve_version("previous", &v, 1).unwrap_err();
+        assert!(err.to_string().contains("out of range"));
+    }
+
+    #[test]
+    fn resolve_version_v_minus_offset() {
+        let v = fixture_versions();
+        assert_eq!(resolve_version("v-2", &v, 5).unwrap(), 3);
+        assert_eq!(resolve_version("V-1", &v, 5).unwrap(), 4);
+    }
+
+    #[test]
+    fn resolve_version_v_minus_zero_rejected() {
+        let v = fixture_versions();
+        let err = resolve_version("v-0", &v, 5).unwrap_err();
+        assert!(err.to_string().contains("> 0"));
+    }
+
+    #[test]
+    fn resolve_version_v_minus_too_deep() {
+        let v = fixture_versions();
+        let err = resolve_version("v-10", &v, 5).unwrap_err();
+        assert!(err.to_string().contains("out of range"));
+    }
+
+    #[test]
+    fn resolve_version_numeric_in_range() {
+        let v = fixture_versions();
+        assert_eq!(resolve_version("3", &v, 5).unwrap(), 3);
+    }
+
+    #[test]
+    fn resolve_version_numeric_not_present() {
+        let v = fixture_versions();
+        let err = resolve_version("99", &v, 5).unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn resolve_version_iso_picks_latest_at_or_before() {
+        let v = fixture_versions();
+        // 2026-05-08T11:00:00Z is after v4 (10:00) but before v5 (next day),
+        // so the latest version at-or-before is v4.
+        assert_eq!(resolve_version("2026-05-08T11:00:00Z", &v, 5).unwrap(), 4);
+        assert_eq!(resolve_version("2026-05-09T10:00:00Z", &v, 5).unwrap(), 5);
+        // Date-only: Confluence returns full timestamps; lexicographic
+        // compare against `2026-05-07` matches versions with empty
+        // created_at NOT, but matches v with `2026-05-07T...` only when
+        // the timestamp is `<= "2026-05-07"`. Use a clearly past value.
+        assert_eq!(resolve_version("2026-05-06", &v, 5).unwrap(), 1);
+    }
+
+    #[test]
+    fn resolve_version_iso_no_match_errors() {
+        let v = fixture_versions();
+        let err = resolve_version("2020-01-01", &v, 5).unwrap_err();
+        assert!(err.to_string().contains("at or before"));
+    }
+
+    #[test]
+    fn resolve_version_empty_versions_errors() {
+        let err = resolve_version("latest", &[], 0).unwrap_err();
+        assert!(err.to_string().contains("no versions"));
+    }
+
+    #[test]
+    fn resolve_version_empty_string_rejected() {
+        let v = fixture_versions();
+        let err = resolve_version("   ", &v, 5).unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn resolve_version_unparseable() {
+        let v = fixture_versions();
+        let err = resolve_version("garbage", &v, 5).unwrap_err();
+        assert!(err.to_string().contains("Could not parse"));
     }
 }

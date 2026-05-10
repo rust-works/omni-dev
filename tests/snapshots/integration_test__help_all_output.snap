@@ -323,6 +323,7 @@ Commands:
   download    Recursively downloads a Confluence page tree
   children    Lists child pages of a Confluence page or top-level pages in a space
   history     Lists version history (metadata) for a Confluence page
+  compare     Compares two versions of a Confluence page (structural diff)
   user        Confluence user operations
   help        Print this message or the help of the given subcommand(s)
 
@@ -469,6 +470,71 @@ Arguments:
 Options:
       --limit <LIMIT>    Maximum number of comments to display [default: 25]
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian confluence compare - Compares two versions of a Confluence page (structural diff)
+
+Compares two versions of a Confluence page (structural diff)
+
+Usage: compare <COMMAND>
+
+Commands:
+  run      Diff two versions of a Confluence page
+  section  Drill in to a section diff using a cursor from a prior `run`
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian confluence compare run - Diff two versions of a Confluence page
+
+Diff two versions of a Confluence page
+
+Usage: run [OPTIONS] <ID>
+
+Arguments:
+  <ID>  Confluence page ID
+
+Options:
+      --from <FROM>
+          `from` version reference. Accepts `latest`, `previous`, `v-N`, a numeric version, or an ISO 8601 date [default: previous]
+      --to <TO>
+          `to` version reference. Same accepted forms as `--from` [default: latest]
+      --detail <DETAIL>
+          Detail level: `summary`, `outline`, or `full` [default: outline] [possible values: summary, outline, full]
+      --include <INCLUDE>
+          Top-level fields to include. Comma-separated. Accepted values: `body`, `title`, `labels`, `metadata`. Defaults to `body,title,metadata` [default: body,title,metadata]
+      --ignore-whitespace
+          When set, runs of whitespace inside text nodes are collapsed to a single space before diffing
+      --min-change-chars <MIN_CHANGE_CHARS>
+          Drop section deltas with fewer than this many characters of total changed text. `0` disables the filter [default: 0]
+      --filter-section <FILTER_SECTIONS>
+          Restrict to sections whose path matches one of the given strings. Repeatable: `--filter-section /h2#a --filter-section /h2#b`
+      --budget <BUDGET>
+          Output budget in bytes. Defaults to ~16 KiB (≈4000 tokens) [default: 16384]
+  -o, --output <OUTPUT>
+          Output format. `yaml` is the most useful target for AI agents [default: yaml] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help
+          Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian confluence compare section - Drill in to a section diff using a cursor from a prior `run`
+
+Drill in to a section diff using a cursor from a prior `run`
+
+Usage: section [OPTIONS] --cursor <CURSOR>
+
+Options:
+      --cursor <CURSOR>  Cursor returned by an outline-mode `confluence compare` call
+      --format <FORMAT>  Output text format [default: unified] [possible values: unified, side-by-side, markdown-inline]
   -h, --help             Print help (see more with '--help')
 
 
