@@ -468,6 +468,7 @@ mod tests {
             author: "alice".to_string(),
             created: "2025-01-01T00:00:00Z".to_string(),
             body_adf: None,
+            updated: None,
         }
     }
 
