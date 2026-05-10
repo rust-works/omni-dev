@@ -7,6 +7,7 @@
 pub mod ai_tools;
 pub mod atlassian_tools;
 pub mod cancel;
+pub mod catalogue_cache;
 pub mod config_tools;
 pub mod confluence_tools;
 pub mod datadog_tools;
@@ -23,6 +24,7 @@ pub mod truncate;
 pub mod validate;
 
 pub use cancel::{cancellable, cancelled_error, spawn_blocking_cancellable};
+pub use catalogue_cache::CatalogueCache;
 pub use error::tool_error;
 pub use resources::{ResourceFormat, ResourceUri, UriParseError};
 pub use runtime::{

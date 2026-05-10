@@ -1,5 +1,7 @@
 //! MCP server setup: tool router composition and protocol capabilities.
 
+use std::sync::Arc;
+
 use rmcp::{
     handler::server::router::tool::ToolRouter,
     model::{
@@ -11,6 +13,7 @@ use rmcp::{
     tool_handler, ErrorData as McpError, RoleServer, ServerHandler,
 };
 
+use super::catalogue_cache::CatalogueCache;
 use super::resources;
 
 /// The omni-dev MCP server.
@@ -21,6 +24,10 @@ use super::resources;
 pub struct OmniDevServer {
     /// Combined tool router.
     pub tool_router: ToolRouter<Self>,
+    /// Shared TTL-bounded cache for near-static JIRA catalogue API responses.
+    /// Wrapped in `Arc` so cloning the server stays cheap (rmcp clones the
+    /// handler per request).
+    pub catalogue_cache: Arc<CatalogueCache>,
 }
 
 impl Default for OmniDevServer {
@@ -41,6 +48,7 @@ impl OmniDevServer {
                 + Self::ai_tool_router()
                 + Self::config_tool_router()
                 + Self::datadog_tool_router(),
+            catalogue_cache: Arc::new(CatalogueCache::default()),
         }
     }
 }
