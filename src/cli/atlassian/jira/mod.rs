@@ -217,6 +217,7 @@ mod tests {
             command: JiraSubcommands::Delete(delete::DeleteCommand {
                 key: "PROJ-1".to_string(),
                 force: true,
+                dry_run: false,
             }),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Delete(_)));

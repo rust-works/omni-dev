@@ -203,6 +203,7 @@ mod tests {
             command: ConfluenceSubcommands::Delete(delete::DeleteCommand {
                 id: "12345".to_string(),
                 force: true,
+                dry_run: false,
                 purge: false,
             }),
         };
