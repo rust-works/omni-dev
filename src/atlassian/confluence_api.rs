@@ -41,6 +41,13 @@ struct ConfluencePageResponse {
     body: Option<ConfluenceBody>,
     #[serde(rename = "parentId")]
     parent_id: Option<String>,
+    #[serde(default)]
+    ancestors: Vec<ConfluenceAncestorEntry>,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceAncestorEntry {
+    id: String,
 }
 
 #[derive(Deserialize)]
@@ -383,6 +390,45 @@ struct ConfluenceUpdateVersion {
     message: Option<String>,
 }
 
+// ── Move types ─────────────────────────────────────────────────────
+
+/// Position for [`ConfluenceApi::move_page`]. Same-space only —
+/// cross-space moves are not supported by the v2 API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MovePosition {
+    /// Place the page as the last child of the target (target becomes the new parent).
+    Append,
+    /// Place the page as a sibling immediately before the target.
+    Before,
+    /// Place the page as a sibling immediately after the target.
+    After,
+}
+
+impl MovePosition {
+    /// Returns the URL-path segment used by the Confluence move endpoint.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Append => "append",
+            Self::Before => "before",
+            Self::After => "after",
+        }
+    }
+}
+
+/// Updated page metadata returned by [`ConfluenceApi::move_page`].
+#[derive(Debug, Clone, Serialize)]
+pub struct MovedPage {
+    /// Page ID.
+    pub id: String,
+    /// Page title.
+    pub title: String,
+    /// New parent page ID, if the page now has a parent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    /// Ancestor page IDs from root toward the immediate parent.
+    pub ancestors: Vec<String>,
+}
+
 impl AtlassianApi for ConfluenceApi {
     fn get_content<'a>(
         &'a self,
@@ -608,6 +654,85 @@ impl ConfluenceApi {
             .context("Failed to parse Confluence create response")?;
 
         Ok(resp.id)
+    }
+
+    /// Moves or reparents a Confluence page within its current space.
+    ///
+    /// Same-space only — cross-space moves are not supported by the v2 API.
+    /// Uses the v1 move endpoint (`PUT /wiki/rest/api/content/{id}/move/{position}/{target}`),
+    /// then re-fetches the page with `?include-ancestors=true` to populate
+    /// the returned [`MovedPage`].
+    pub async fn move_page(
+        &self,
+        page_id: &str,
+        target_id: &str,
+        position: MovePosition,
+    ) -> Result<MovedPage> {
+        let url = format!(
+            "{}/wiki/rest/api/content/{}/move/{}/{}",
+            self.client.instance_url(),
+            page_id,
+            position.as_str(),
+            target_id
+        );
+
+        let response = self
+            .client
+            .put_json(&url, &serde_json::json!({}))
+            .await
+            .context("Failed to send Confluence move request")?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            if status == 403 {
+                anyhow::bail!(
+                    "Move failed: insufficient permissions to move page {page_id} \
+                     relative to target {target_id}. Confluence response: {body}"
+                );
+            }
+            if status == 404 {
+                anyhow::bail!(
+                    "Move failed: page {page_id} or target {target_id} not found, \
+                     or insufficient permissions. Confluence response: {body}"
+                );
+            }
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let page = self.fetch_page_with_ancestors(page_id).await?;
+        Ok(MovedPage {
+            id: page.id,
+            title: page.title,
+            parent_id: page.parent_id,
+            ancestors: page.ancestors.into_iter().map(|a| a.id).collect(),
+        })
+    }
+
+    /// Fetches a Confluence page with its ancestors populated.
+    async fn fetch_page_with_ancestors(&self, id: &str) -> Result<ConfluencePageResponse> {
+        let url = format!(
+            "{}/wiki/api/v2/pages/{}?include-ancestors=true",
+            self.client.instance_url(),
+            id
+        );
+
+        let response = self
+            .client
+            .get_json(&url)
+            .await
+            .context("Failed to fetch Confluence page with ancestors")?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        response
+            .json()
+            .await
+            .context("Failed to parse Confluence page response")
     }
 
     /// Deletes a Confluence page.
@@ -1570,6 +1695,224 @@ mod tests {
         let api = ConfluenceApi::new(client);
         let err = api.delete_page("12345", false).await.unwrap_err();
         assert!(err.to_string().contains("403"));
+    }
+
+    // ── move_page ──────────────────────────────────────────────────
+
+    #[test]
+    fn move_position_as_str() {
+        assert_eq!(MovePosition::Append.as_str(), "append");
+        assert_eq!(MovePosition::Before.as_str(), "before");
+        assert_eq!(MovePosition::After.as_str(), "after");
+    }
+
+    /// Mounts the post-move ancestor fetch (`GET /wiki/api/v2/pages/{id}?include-ancestors=true`).
+    async fn mount_ancestor_fetch(server: &wiremock::MockServer, id: &str, parent_id: &str) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/wiki/api/v2/pages/{id}")))
+            .and(wiremock::matchers::query_param("include-ancestors", "true"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": id,
+                    "title": "Moved Page",
+                    "status": "current",
+                    "spaceId": "98765",
+                    "parentId": parent_id,
+                    "ancestors": [
+                        {"id": "10"},
+                        {"id": parent_id}
+                    ]
+                })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn move_page_append_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/move/append/456",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"pageId": "12345"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_ancestor_fetch(&server, "12345", "456").await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let moved = api
+            .move_page("12345", "456", MovePosition::Append)
+            .await
+            .unwrap();
+        assert_eq!(moved.id, "12345");
+        assert_eq!(moved.title, "Moved Page");
+        assert_eq!(moved.parent_id.as_deref(), Some("456"));
+        assert_eq!(moved.ancestors, vec!["10".to_string(), "456".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn move_page_before_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/move/before/456",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"pageId": "12345"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_ancestor_fetch(&server, "12345", "789").await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let moved = api
+            .move_page("12345", "456", MovePosition::Before)
+            .await
+            .unwrap();
+        assert_eq!(moved.parent_id.as_deref(), Some("789"));
+    }
+
+    #[tokio::test]
+    async fn move_page_after_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/move/after/456",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"pageId": "12345"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_ancestor_fetch(&server, "12345", "789").await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let moved = api
+            .move_page("12345", "456", MovePosition::After)
+            .await
+            .unwrap();
+        assert_eq!(moved.id, "12345");
+    }
+
+    #[tokio::test]
+    async fn move_page_forbidden_surfaces_reason() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/move/append/456",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "errors": [{"detail": "User cannot move page"}]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = api
+            .move_page("12345", "456", MovePosition::Append)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("insufficient permissions"));
+        assert!(msg.contains("User cannot move page"));
+    }
+
+    #[tokio::test]
+    async fn move_page_not_found() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/99999/move/append/456",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Page not found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = api
+            .move_page("99999", "456", MovePosition::Append)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not found"));
+        assert!(msg.contains("Page not found"));
+    }
+
+    #[tokio::test]
+    async fn move_page_other_error_falls_through_to_generic() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/move/append/456",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = api
+            .move_page("12345", "456", MovePosition::Append)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("500"));
+    }
+
+    #[tokio::test]
+    async fn move_page_ancestor_fetch_failure_is_propagated() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/move/append/456",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"pageId": "12345"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12345"))
+            .and(wiremock::matchers::query_param("include-ancestors", "true"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("ancestor boom"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = api
+            .move_page("12345", "456", MovePosition::Append)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("500"));
     }
 
     #[tokio::test]

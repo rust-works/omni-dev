@@ -317,6 +317,7 @@ Commands:
   search    Searches Confluence pages using CQL
   create    Creates a new Confluence page
   delete    Deletes a Confluence page
+  move      Moves or reparents a Confluence page (same-space only)
   label     Manages labels on Confluence pages
   download  Recursively downloads a Confluence page tree
   children  Lists child pages of a Confluence page or top-level pages in a space
@@ -555,6 +556,23 @@ Arguments:
 Options:
       --labels <LABELS>  Comma-separated list of labels to remove
   -h, --help             Print help
+
+
+================================================================================
+
+omni-dev atlassian confluence move - Moves or reparents a Confluence page (same-space only)
+
+Moves or reparents a Confluence page (same-space only)
+
+Usage: move [OPTIONS] --target <TARGET> <ID>
+
+Arguments:
+  <ID>  Confluence page ID to move
+
+Options:
+      --target <TARGET>      Target page ID — new parent for `append`, or sibling reference for `before`/`after`
+      --position <POSITION>  Position relative to the target [default: append] [possible values: append, before, after]
+  -h, --help                 Print help (see more with '--help')
 
 
 ================================================================================
