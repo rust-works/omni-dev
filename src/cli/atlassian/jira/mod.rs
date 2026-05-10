@@ -184,10 +184,10 @@ mod tests {
     fn jira_subcommands_transition_variant() {
         let cmd = JiraCommand {
             command: JiraSubcommands::Transition(transition::TransitionCommand {
-                key: "PROJ-1".to_string(),
-                transition: Some("Done".to_string()),
-                list: false,
-                output: OutputFormat::Table,
+                command: transition::TransitionSubcommands::Execute(transition::ExecuteCommand {
+                    key: "PROJ-1".to_string(),
+                    transition: "Done".to_string(),
+                }),
             }),
         };
         assert!(matches!(cmd.command, JiraSubcommands::Transition(_)));
