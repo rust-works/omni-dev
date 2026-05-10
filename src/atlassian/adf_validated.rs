@@ -80,6 +80,11 @@ impl std::fmt::Display for AdfValidationError {
                     out.push_str(&format!("invalid ADF attribute — {v}.\n"));
                     out.push_str("hint: fix the offending attribute on the node before retrying.");
                 }
+                AdfSchemaViolation::DisallowedMark { .. }
+                | AdfSchemaViolation::InvalidMarkAttr { .. } => {
+                    out.push_str(&format!("invalid ADF mark — {v}.\n"));
+                    out.push_str("hint: remove or correct the offending mark before retrying.");
+                }
             }
         }
         f.write_str(&out)

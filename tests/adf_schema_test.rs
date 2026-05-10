@@ -218,6 +218,65 @@ fn missing_panel_type_flagged_via_public_api() {
 }
 
 #[test]
+fn code_mark_on_heading_text_flagged_via_public_api() {
+    let json = r#"{
+        "version": 1,
+        "type": "doc",
+        "content": [
+            {
+                "type": "heading",
+                "attrs": {"level": 2},
+                "content": [
+                    {"type": "text", "text": "hi", "marks": [{"type": "code"}]}
+                ]
+            }
+        ]
+    }"#;
+    let doc = AdfDocument::from_json_str(json).unwrap();
+    let violations = validate_document(&doc);
+    let disallowed_marks: Vec<&AdfSchemaViolation> = violations
+        .iter()
+        .filter(|v| matches!(v, AdfSchemaViolation::DisallowedMark { .. }))
+        .collect();
+    assert_eq!(disallowed_marks.len(), 1, "got: {violations:?}");
+    match disallowed_marks[0] {
+        AdfSchemaViolation::DisallowedMark {
+            mark_type,
+            parent_type,
+            ..
+        } => {
+            assert_eq!(mark_type, "code");
+            assert_eq!(parent_type, "heading");
+        }
+        other => unreachable!("filtered to DisallowedMark, got {other:?}"),
+    }
+}
+
+#[test]
+fn link_mark_with_invalid_href_flagged_via_public_api() {
+    let json = r#"{
+        "version": 1,
+        "type": "doc",
+        "content": [
+            {
+                "type": "paragraph",
+                "content": [
+                    {"type": "text", "text": "click",
+                     "marks": [{"type": "link", "attrs": {"href": "not a url"}}]}
+                ]
+            }
+        ]
+    }"#;
+    let doc = AdfDocument::from_json_str(json).unwrap();
+    let violations = validate_document(&doc);
+    let invalid_marks: Vec<&AdfSchemaViolation> = violations
+        .iter()
+        .filter(|v| matches!(v, AdfSchemaViolation::InvalidMarkAttr { .. }))
+        .collect();
+    assert_eq!(invalid_marks.len(), 1, "got: {violations:?}");
+}
+
+#[test]
 fn heading_level_out_of_range_flagged_via_public_api() {
     let json = r#"{
         "version": 1,

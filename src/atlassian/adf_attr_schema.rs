@@ -586,7 +586,13 @@ pub fn validate_attrs(
     }
 }
 
-fn check_value(ty: &AttrType, value: &Value) -> Option<AttrProblem> {
+/// Validates a single value against an [`AttrType`].
+///
+/// Returns `Some(problem)` describing what's wrong, or `None` if the value
+/// is acceptable. Public so that mark-attribute validation
+/// ([`crate::atlassian::adf_mark_schema`]) can reuse the same shape rules.
+#[must_use]
+pub fn check_value(ty: &AttrType, value: &Value) -> Option<AttrProblem> {
     match ty {
         AttrType::Enum(allowed) => match value.as_str() {
             Some(s) if allowed.contains(&s) => None,

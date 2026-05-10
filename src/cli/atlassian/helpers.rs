@@ -813,6 +813,30 @@ mod tests {
     }
 
     #[test]
+    fn print_dry_run_fails_on_disallowed_mark() {
+        // Per #733: code mark on heading text is not permitted.
+        let adf_json = r#"{
+            "version": 1,
+            "type": "doc",
+            "content": [{
+                "type": "heading",
+                "attrs": { "level": 2 },
+                "content": [
+                    { "type": "text", "text": "hi", "marks": [{"type": "code"}] }
+                ]
+            }]
+        }"#;
+        let adf = AdfDocument::from_json_str(adf_json).unwrap();
+        let result = print_dry_run("12345", &adf, "Title");
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("ADF validation failed"),
+            "expected validation failure, got: {err}"
+        );
+    }
+
+    #[test]
     fn print_dry_run_fails_on_invalid_attribute() {
         // Per #733: panelType: "purple" is not in the allowed enum.
         let adf_json = r#"{
