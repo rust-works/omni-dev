@@ -251,6 +251,30 @@ code rather than a generic HTTP failure.
 omni-dev git commit message amend amendments.yaml
 ```
 
+### 🧩 Claude Code Slash-Commands
+
+Generate ready-to-use Claude Code slash-command templates into the
+project's `.claude/commands/` directory. Each template is a self-contained
+workflow that drives a multi-step omni-dev operation from inside a Claude
+Code session.
+
+```bash
+# Generate all templates: commit-twiddle, pr-create, pr-update
+omni-dev commands generate all
+
+# Or individually
+omni-dev commands generate commit-twiddle
+omni-dev commands generate pr-create
+omni-dev commands generate pr-update
+```
+
+Each subcommand writes `.claude/commands/<name>.md`. Commit the files to
+share the workflows with collaborators — Claude Code picks them up
+automatically, so anyone in the repo can invoke `/commit-twiddle`,
+`/pr-create`, or `/pr-update` inside a Claude Code session. See the
+[user guide](docs/user-guide.md#commands-generate--generate-claude-code-slash-commands)
+for the full reference.
+
 ### 🗒️ Claude Conversation History
 
 Export your Claude Code chat history to a directory of `.jsonl` files for
@@ -317,6 +341,10 @@ source mtime alone (the rendered length differs from the source length), and
 `--prune` only deletes artifacts whose extension matches one of the formats
 listed in `--output-format`.
 
+See [docs/user-guide.md#ai-claude-history-sync--export-conversation-history](docs/user-guide.md#ai-claude-history-sync--export-conversation-history)
+for the in-depth reference, and the broader [Claude Code Integration](docs/user-guide.md#claude-code-integration)
+section for related commands (`ai chat`, `ai claude skills`).
+
 ### 🔌 MCP Server
 
 omni-dev ships an optional **Model Context Protocol** server so AI assistants
@@ -334,7 +362,7 @@ Tools cover six domains:
 | **Confluence** (13) | read/write/search/create/delete/download/children, comments, labels, user search |
 | **Atlassian shared** (2) | `atlassian_auth_status`, `atlassian_convert` (offline JFM ↔ ADF) |
 | **Datadog** (14) | metrics, monitors, dashboards, logs, events, SLOs, hosts, downtimes, metrics catalog |
-| **AI / Config** (5) | `ai_chat`, `claude_skills_*`, `config_models_show` |
+| **AI / Config** (5) | `ai_chat` (one-shot chat), `claude_skills_*` (sync / clean / status for `.claude/skills/` distribution), `config_models_show` |
 
 Resources exposed via URI templates:
 

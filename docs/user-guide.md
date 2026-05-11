@@ -9,12 +9,13 @@ intelligence.
 2. [Getting Started](#getting-started)
 3. [Core Concepts](#core-concepts)
 4. [Command Reference](#command-reference)
-5. [Atlassian Integration](#atlassian---jira-and-confluence-integration)
-6. [Datadog Integration](#datadog-integration)
-7. [Contextual Intelligence](#contextual-intelligence)
-8. [Workflows](#workflows)
-9. [Advanced Usage](#advanced-usage)
-10. [Best Practices](#best-practices)
+5. [Claude Code Integration](#claude-code-integration)
+6. [Atlassian Integration](#atlassian---jira-and-confluence-integration)
+7. [Datadog Integration](#datadog-integration)
+8. [Contextual Intelligence](#contextual-intelligence)
+9. [Workflows](#workflows)
+10. [Advanced Usage](#advanced-usage)
+11. [Best Practices](#best-practices)
 
 ## Your First Improvement
 
@@ -364,31 +365,60 @@ description: |
   error handling for edge cases.
 ```
 
-### `ai` - Assistant Commands
+## Claude Code Integration
 
-Diagnostics, history export, and skill management for Claude Code
-integrations.
+omni-dev ships a family of subcommands that integrate with [Claude
+Code](https://docs.anthropic.com/claude/docs/claude-code) — Anthropic's
+agentic coding CLI. These cover four use cases:
 
-#### `ai chat` — One-shot chat session
+- **Conversational AI** (`ai chat`) — one-shot Q&A against the configured model.
+- **Conversation history export** (`ai claude history sync`) — mirror Claude
+  Code sessions to disk for analysis or coaching workflows.
+- **Skill distribution** (`ai claude skills`) — share `.claude/skills/`
+  definitions across repositories and worktrees.
+- **Command-template generation** (`commands generate`) — bootstrap canonical
+  slash-commands into a project's `.claude/commands/` directory.
+
+All of these honour the same AI backend dispatch as the rest of omni-dev
+(see [Configuration Guide — AI Backend Selection](configuration.md#ai-backend-selection)).
+
+### `ai chat` — Conversational AI
+
+A lightweight CLI front-end for chatting with the configured Claude model.
+Use it when you want open-ended Q&A — `twiddle` is for commit-message
+amendments, `check` is for commit-message validation, `view` is for
+analysis, and `ai chat` is for everything else (a sanity check on a
+config, a rubber-duck on an error message, a quick "summarise this
+output").
+
+Each prompt is **single-turn from the model's perspective** — the CLI
+wraps an interactive loop around independent calls and does not pass prior
+turns back. The interactive UX feels like multi-turn but the model sees
+each prompt fresh. If you need true multi-turn reasoning with full
+context, use Claude Code itself.
+
+The CLI uses a hard-coded system prompt of "You are a helpful assistant.";
+MCP callers can override it via the `system_prompt` parameter (see the
+[`ai_chat`](mcp.md#ai--config-5-tools) tool entry).
 
 ```bash
-# Use the configured model
+# Start an interactive session against the configured backend
 omni-dev ai chat
 
-# Override the model for this session
+# Override the model for this session only
 omni-dev ai chat --model claude-opus-4-7
 ```
 
-Honours the same backend dispatch as the rest of omni-dev (see
-[Configuration Guide — AI Backend Selection](configuration.md#ai-backend-selection)).
+The session reads stdin one line at a time and prints the response. Type
+`Ctrl+D` (EOF) to exit.
 
-#### `ai claude history sync` — Export conversations
+### `ai claude history sync` — Export Conversation History
 
 Export Claude Code conversation history to a target directory as one
 `.jsonl` (and optionally `.md`) per chat, grouped by encoded project slug.
 Re-running is idempotent: unchanged sessions are skipped, modified sessions
 are rewritten via tempfile + rename, and source `mtime` is preserved on the
-target.
+target so downstream tooling can sort chronologically.
 
 ```bash
 # Basic export to ~/coaching/claude-history
@@ -416,23 +446,37 @@ omni-dev ai claude history sync --target ~/history --prune
 
 The export is a behavioural transcript — prompts, responses, thinking,
 tool calls, tool-result metadata, and structured agent-to-user interactions
-(`AskUserQuestion`, denials, interrupts). Sub-agent internal turns are not
-captured. See `omni-dev ai claude history sync --help` for the complete
-flag reference.
+(`AskUserQuestion`, denials, interrupts). Sub-agent internal turns, large
+tool-output sidecars, and auto-memory are deliberately excluded. See
+`omni-dev ai claude history sync --help` for the complete flag reference.
 
-#### `ai claude skills` — Worktree-aware skill distribution
+### `ai claude skills` — Distribute Skills Across Repositories
 
-Manage `.claude/skills/` symlinks and the managed `.gitignore` exclude
-block across a repository and its worktrees.
+A [Claude Code skill](https://docs.anthropic.com/claude/docs/claude-code-skills)
+is a directory under `.claude/skills/<name>/` containing a `SKILL.md`
+manifest plus any supporting files. Claude Code auto-discovers skills from
+the working directory, so the canonical pattern is to keep them in a
+project repository.
+
+When the same skill set needs to be available across multiple repositories
+or worktrees, copying becomes a maintenance burden. `ai claude skills`
+solves this by **symlinking** each `<target>/.claude/skills/<name>` to
+`<source>/.claude/skills/<name>` and adding a managed block to
+`<target>/.git/info/exclude` so git ignores the symlinks. Updates in the
+source are seen immediately by every target; `clean` removes both the
+symlinks and the exclude-block entries; `status` reports residue.
 
 ```bash
-# Sync skills from the source repo into the current dir (and all its worktrees)
+# Sync skills from the current repo into itself and all its worktrees
 omni-dev ai claude skills sync --worktrees
 
-# Sync into an explicit target
+# Sync from a canonical source into a specific target
 omni-dev ai claude skills sync --source ~/wrk/canonical --target ~/wrk/feature-branch
 
-# Inspect what `sync` left behind
+# Preview what would change
+omni-dev ai claude skills sync --source ~/wrk/canonical --target ~/wrk/feature-branch --dry-run
+
+# Inspect symlinks and exclude entries left behind by a prior sync
 omni-dev ai claude skills status
 omni-dev ai claude skills status --worktrees --format yaml
 
@@ -441,7 +485,33 @@ omni-dev ai claude skills clean --worktrees
 omni-dev ai claude skills clean --dry-run
 ```
 
-#### `ai claude cli model resolve` — Diagnostics
+**End-to-end walkthrough**:
+
+```bash
+# 1. Add a new skill in your canonical repo
+mkdir -p ~/wrk/canonical/.claude/skills/my-skill
+$EDITOR ~/wrk/canonical/.claude/skills/my-skill/SKILL.md
+
+# 2. Push it into every worktree of a downstream repo
+cd ~/wrk/downstream
+omni-dev ai claude skills sync --source ~/wrk/canonical --worktrees
+
+# 3. Verify Claude Code picks it up (the symlink appears in the listing)
+omni-dev ai claude skills status
+
+# 4. Later, when you no longer want this skill set, clean up
+omni-dev ai claude skills clean --worktrees
+```
+
+Same source and target is a no-op (the command short-circuits). The
+target's `.git/info/exclude` is the only file modified outside
+`.claude/skills/`, and the managed block is delimited so manual entries
+are preserved across syncs and cleans.
+
+See also: [`claude_skills_sync` / `claude_skills_status` / `claude_skills_clean`](mcp.md#ai--config-5-tools)
+for the MCP equivalents.
+
+### `ai claude cli model resolve` — Model Resolution Diagnostics
 
 Print how Claude Code resolves the active model in the current directory
 (useful when project / user / env settings disagree).
@@ -450,23 +520,40 @@ Print how Claude Code resolves the active model in the current directory
 omni-dev ai claude cli model resolve
 ```
 
-### `commands generate` - Command Templates
+### `commands generate` — Generate Claude Code Slash-Commands
 
-Bootstrap a project's `.omni-dev/` directory with the canonical command
-templates omni-dev expects.
+Generates [Claude Code slash-command](https://docs.anthropic.com/claude/docs/claude-code-slash-commands)
+templates into the project's `.claude/commands/` directory. Each template
+is a self-contained workflow manifest (YAML frontmatter declaring allowed
+tools, argument hints, and model selection, followed by step-by-step
+instructions) that drives a multi-step omni-dev operation from inside a
+Claude Code session.
+
+Three templates ship with omni-dev:
+
+| Subcommand | Output file | Purpose |
+|------------|-------------|---------|
+| `commit-twiddle` | `.claude/commands/commit-twiddle.md` | Invoke `omni-dev twiddle`, review the suggested amendments, apply them. |
+| `pr-create` | `.claude/commands/pr-create.md` | Run the `view` → `twiddle` → `branch create pr` pipeline end-to-end. |
+| `pr-update` | `.claude/commands/pr-update.md` | Update an existing PR's body from the current commit set. |
+| `all` | All three of the above | Bootstrap a fresh project. |
 
 ```bash
-# All templates at once
+# Bootstrap all three templates
 omni-dev commands generate all
 
-# Or individually
+# Or generate them individually
 omni-dev commands generate commit-twiddle
 omni-dev commands generate pr-create
 omni-dev commands generate pr-update
 ```
 
-Each subcommand writes a template to the standard location under
-`.omni-dev/`. Run from the repository root.
+Run from the repository root; the command will create `.claude/commands/`
+if it does not exist and writes one file per subcommand (e.g. `✅ Generated
+.claude/commands/commit-twiddle.md`). Commit the files to share the
+workflows with your team — Claude Code picks them up automatically, so
+collaborators can invoke `/commit-twiddle`, `/pr-create`, or `/pr-update`
+inside a Claude Code session with no extra setup.
 
 ### `atlassian` - JIRA and Confluence Integration
 
@@ -499,6 +586,50 @@ export ATLASSIAN_API_TOKEN=your-token
 ```
 
 Environment variables take precedence over the settings file.
+
+#### Destructive Commands
+
+> **⚠️ Destructive commands require confirmation.**
+>
+> Five Atlassian subcommands prompt for confirmation by default and refuse
+> to run unless either the user explicitly confirms (CLI) or the caller
+> opts in (MCP):
+>
+> - `omni-dev atlassian jira delete <KEY>`
+> - `omni-dev atlassian jira link remove --link-id <ID>`
+> - `omni-dev atlassian jira watcher remove --user <ACCOUNT_ID> <KEY>`
+> - `omni-dev atlassian confluence delete <ID>`
+> - `omni-dev atlassian confluence label remove --labels <LABELS> <ID>`
+>
+> **CLI behaviour.** Each command prompts on stdin:
+>
+> ```text
+> Delete PROJ-123 (Fix login)? [y/N]
+> ```
+>
+> Typing anything other than `y` (case-insensitive, whitespace-trimmed)
+> prints `Cancelled.` and exits without calling the API. Two escape
+> hatches:
+>
+> - `--force` skips the prompt — for scripts.
+> - `--dry-run` prints `Would delete PROJ-123 (Fix login).` and exits without
+>   calling the API. `--dry-run` takes precedence over `--force`, so a
+>   scripted `--force` invocation can be sanity-checked by adding
+>   `--dry-run` without removing the force flag.
+>
+> **MCP behaviour.** The matching MCP tools (`jira_delete`,
+> `jira_link_remove`, `jira_watcher_remove`, `confluence_delete`,
+> `confluence_label_remove`) require an explicit `confirm: true` parameter
+> and refuse to run otherwise:
+>
+> ```text
+> Refusing to delete PROJ-123: pass `confirm: true` to authorise this irreversible operation.
+> ```
+>
+> Interactive prompts catch human accidents; `--force` keeps scripts
+> working; `--dry-run` is a server-free preview; the MCP `confirm: true`
+> requirement gives assistants an explicit opt-in. See
+> [ADR-0027](adrs/adr-0027.md) for the full design rationale.
 
 #### JIRA: Reading and Writing Issues
 
@@ -654,19 +785,60 @@ omni-dev atlassian jira project list --limit 100
 
 #### JIRA: Fields
 
+JIRA installations are heavily customised — most real projects add custom
+fields (story points, epic links, severity, customer impact, etc.) and
+each gets an opaque ID like `customfield_10001`. The names you see in the
+JIRA web UI are display labels; the API only accepts the IDs. The `field`
+subcommand is how you discover them.
+
+A field can have different option lists per **context** (per-project,
+per-issue-type, or per-screen scoping). Most fields have exactly one
+context, in which case `field options` will auto-discover it. Fields with
+multiple contexts require `--context-id` to pick the right option set.
+
 ```bash
-# List all field definitions
+# List all field definitions (display name → customfield_NNNNN mapping)
 omni-dev atlassian jira field list
 
-# Search by name
+# Search by name (case-insensitive substring match)
 omni-dev atlassian jira field list --search "story"
+omni-dev atlassian jira field list --search "severity"
 
 # Show options for a custom field (auto-discovers context)
 omni-dev atlassian jira field options --field-id customfield_10001
 
-# Specify context explicitly
+# Specify context explicitly when the field has multiple contexts
 omni-dev atlassian jira field options --field-id customfield_10001 --context-id 12345
+
+# Machine-readable output for scripting
+omni-dev atlassian jira field list --search "epic" -o yaml
+omni-dev atlassian jira field options --field-id customfield_10001 -o json
 ```
+
+Output formats: `table` (default, human-readable), `json`, `yaml`,
+`yamls` (YAML stream), and `jsonl` (JSON Lines).
+
+**End-to-end walkthrough** — set a custom field on a new issue:
+
+```bash
+# 1. Find the field by name
+omni-dev atlassian jira field list --search "story points"
+# → customfield_10016: "Story Points"
+
+# 2. (Number fields have no options — skip step 3.)
+#    For an enum-style field, list its allowed values:
+omni-dev atlassian jira field list --search "severity"
+# → customfield_10042: "Severity"
+omni-dev atlassian jira field options --field-id customfield_10042
+# → "Low", "Medium", "High", "Critical"
+
+# 3. Pass the field ID and value when creating or writing the issue
+#    (see `jira create` / `jira write` for the syntax).
+```
+
+See also: [`jira_field_list` / `jira_field_options`](mcp.md#jira--extensions-18-tools)
+for the MCP equivalents (`search` and `field_id` parameters mirror the CLI
+flags).
 
 #### JIRA: Agile Boards
 
@@ -828,6 +1000,97 @@ version: 7
 
 Page body content here...
 ```
+
+#### Confluence: Comparing Pages
+
+Compares two versions of a Confluence page using a **structurally-aware
+diff**: the engine walks the ADF (Atlassian Document Format) tree and
+splits each version into heading-delimited sections (paths like
+`/h2#background`, `/h3#implementation`). The output describes *which
+sections* changed and *how* — not raw text deltas — which makes it
+ergonomic for AI agents and human reviewers alike.
+
+Two commands:
+
+- `omni-dev atlassian confluence compare run <PAGE_ID>` — diff two versions
+  of a page; emits a YAML envelope with per-section change summaries and
+  drill-in cursors.
+- `omni-dev atlassian confluence compare section --cursor <CURSOR>` —
+  drill into a single section using a cursor returned by `run`.
+
+**Detail levels** (`--detail`):
+
+- `summary` — aggregate counts only (sections added, modified, removed;
+  characters changed). Smallest output.
+- `outline` (default) — per-section change kind, one-line summaries, and
+  drill-in cursors for `compare section`. Ideal balance for surveying a
+  page.
+- `full` — embeds full per-section deltas. Budget-truncated if the output
+  exceeds `--budget` (default ~16 KiB ≈ 4000 tokens).
+
+**Version selectors** for `--from` and `--to`:
+
+- `latest` — the most recent version (default `--to`).
+- `previous` — the version before `--to` (default `--from`).
+- `v-N` — `N` versions back from `--to` (e.g. `v-3`).
+- A bare integer — that exact version number.
+- An ISO 8601 timestamp — the version that was current at that time.
+
+**Filtering and trimming**:
+
+- `--filter-section /h2#name` — restrict to sections matching the given
+  path. Repeatable.
+- `--min-change-chars <N>` — drop sections with fewer than `N` characters
+  of changed text. Useful for ignoring formatting-only edits.
+- `--ignore-whitespace` — collapse runs of whitespace inside text nodes
+  before diffing.
+- `--include body,title,labels,metadata` — choose which top-level fields
+  to diff. Default: `body,title,metadata` (labels and other metadata
+  excluded by default).
+- `--budget <BYTES>` — output budget. Defaults to `16384` (~16 KiB).
+
+```bash
+# Outline of changes between the previous and latest versions
+omni-dev atlassian confluence compare run 12345
+
+# Compare a specific version range
+omni-dev atlassian confluence compare run 12345 --from v-5 --to latest
+
+# Compare by date (ISO 8601)
+omni-dev atlassian confluence compare run 12345 \
+    --from 2026-01-01T00:00:00Z --to 2026-05-11T00:00:00Z
+
+# Just the totals
+omni-dev atlassian confluence compare run 12345 --detail summary
+
+# Full deltas, larger budget
+omni-dev atlassian confluence compare run 12345 --detail full --budget 65536
+
+# Restrict to specific sections and ignore whitespace
+omni-dev atlassian confluence compare run 12345 \
+    --filter-section /h2#background --filter-section /h2#design \
+    --ignore-whitespace
+
+# Drill into a single section using a cursor returned by `run`
+omni-dev atlassian confluence compare section --cursor <CURSOR> --format unified
+omni-dev atlassian confluence compare section --cursor <CURSOR> --format side-by-side
+omni-dev atlassian confluence compare section --cursor <CURSOR> --format markdown-inline
+```
+
+**End-to-end walkthrough**:
+
+```bash
+# 1. Survey the changes between previous and latest
+omni-dev atlassian confluence compare run 12345
+# → outline with per-section summaries and cursors
+
+# 2. Drill into a section flagged as modified
+omni-dev atlassian confluence compare section --cursor <CURSOR_FROM_STEP_1>
+# → unified diff for that section only
+```
+
+See also: [`confluence_compare` / `confluence_compare_section`](mcp.md#confluence-13-tools)
+for the MCP equivalents.
 
 #### Confluence: Search
 
