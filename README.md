@@ -183,9 +183,9 @@ omni-dev atlassian convert to-adf input.md
 ### 📊 Datadog Integration (read-only)
 
 Authenticate against the Datadog API and query metrics, monitors, dashboards,
-logs, events, SLOs, hosts, and downtimes. See the [Datadog section of the
-user guide](docs/user-guide.md#datadog-integration) for the full subcommand
-reference.
+logs, events, SLOs, hosts, and downtimes. See the [Datadog integration
+guide](docs/datadog.md) for the full subcommand reference, authentication
+setup, rate-limit behaviour, and troubleshooting.
 
 ```bash
 # Configure Datadog API credentials (prompts for API key, APP key, and site)
@@ -209,7 +209,8 @@ are recognised without warning. Environment variables `DATADOG_API_KEY`,
 or proxied installs, set `DATADOG_API_URL` to override the site-derived URL.
 
 All Datadog subcommands are also exposed as MCP tools (`datadog_*`) — see
-[docs/mcp.md](docs/mcp.md#datadog-14-tools).
+[docs/mcp.md](docs/mcp.md#datadog-14-tools). For the full guide covering
+every family with worked examples, see [docs/datadog.md](docs/datadog.md).
 
 ### 🎙️ Transcript Fetching
 
