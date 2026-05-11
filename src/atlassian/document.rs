@@ -253,7 +253,7 @@ fn append_custom_section(body: &mut String, field: &JiraCustomField, section_md:
 
 /// A single rich-text custom field section parsed out of a JFM body.
 ///
-/// Emitted by [`issue_to_jfm_document`] via [`append_custom_section`] and
+/// Emitted by [`issue_to_jfm_document`] via `append_custom_section` and
 /// recovered by [`JfmDocument::split_custom_sections`] so the write path
 /// can round-trip a field through `markdown_to_adf` for upload.
 #[derive(Debug, Clone, PartialEq, Eq)]

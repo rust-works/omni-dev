@@ -34,13 +34,13 @@ pub const UPSTREAM_FULL_JSON_SHA256: &str =
 /// sorted alphabetically and deduplicated. Quantifier and order information
 /// (`+`, `*`, `?`, `{n}`, `{m,n}`, sequence order) is *not* preserved here —
 /// the upstream JSON schema's `anyOf`-of-`$ref` shape does not encode it in
-/// a parseable way. See [`super::CONTENT_ENTRIES`] in
+/// a parseable way. See `super::CONTENT_ENTRIES` in
 /// `src/atlassian/adf_schema/mod.rs` for the runtime model that layers
 /// quantifier arity on top of these atoms.
 ///
 /// The unit test `generated_upstream_atoms_match_local_snapshot` in
 /// `src/atlassian/adf_schema/mod.rs` asserts that the flattened atoms from
-/// [`super::CONTENT_ENTRIES`] agree with `UPSTREAM_ENTRIES` modulo a small
+/// `super::CONTENT_ENTRIES` agree with `UPSTREAM_ENTRIES` modulo a small
 /// allowlist of documented leniency deviations.
 pub const UPSTREAM_ENTRIES: &[(&str, &[&str])] = &[
     ("blockTaskItem", &["extension", "paragraph"]),

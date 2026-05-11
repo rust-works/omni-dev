@@ -1,6 +1,6 @@
 //! `clap::ValueEnum` mirror of [`crate::transcript::format::Format`].
 //!
-//! The library [`Format`](crate::transcript::format::Format) intentionally
+//! The library [`Format`] intentionally
 //! has no `clap` dependency — that's a hard architectural rule so the
 //! `transcript` library remains reusable by non-CLI consumers. This thin
 //! enum bridges clap's argument parsing to the library type.
