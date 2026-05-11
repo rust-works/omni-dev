@@ -92,7 +92,7 @@ explicit `confirm: true`.
 | `jira_write` | Update an issue body, `parent`, `assignee`, `reporter`, or arbitrary `fields`. At least one of `content` or another field is required |
 | `jira_transition` | Apply or list workflow transitions (call with `list = true` first to discover names) |
 | `jira_comment` | Add a comment to an issue |
-| `jira_link` | Manage issue links: `create` (typed link), `parent` (set system parent), or list/remove |
+| `jira_link` | Manage issue links: `create` (typed link), `parent` (set system parent), or list/remove. `remove` requires `confirm: true` |
 | `jira_dev` | Fetch development info (commits, branches, PRs) attached to an issue |
 | `jira_user_search` | Resolve a display name or email substring to an Atlassian `accountId` (call before `jira_write` for assignee/reporter) |
 | `jira_delete` | Permanently delete an issue. Requires `confirm: true` |
@@ -106,9 +106,9 @@ listing, and changelog history.
 |--------|-------|
 | Sprints | `jira_sprint_list`, `jira_sprint_issues`, `jira_sprint_add`, `jira_sprint_create`, `jira_sprint_update` |
 | Boards | `jira_board_list`, `jira_board_issues` |
-| Watchers | `jira_watcher_list`, `jira_watcher_add`, `jira_watcher_remove` |
+| Watchers | `jira_watcher_list`, `jira_watcher_add`, `jira_watcher_remove` (requires `confirm: true`) |
 | Worklogs | `jira_worklog_list`, `jira_worklog_add` |
-| Fields | `jira_field_list`, `jira_field_options` |
+| Fields | `jira_field_list`, `jira_field_options` (custom-field discovery — see [user guide](user-guide.md#jira-fields)) |
 | Attachments | `jira_attachment_download`, `jira_attachment_images` |
 | Projects | `jira_project_list` |
 | History | `jira_changelog` |
@@ -128,8 +128,10 @@ listing, and changelog history.
 | `confluence_comment_add` | Add a comment to a page |
 | `confluence_label_list` | List labels on a page |
 | `confluence_label_add` | Add one or more labels to a page |
-| `confluence_label_remove` | Remove a label from a page |
+| `confluence_label_remove` | Remove a label from a page. Requires `confirm: true` |
 | `confluence_user_search` | Resolve a display name or email to an Atlassian `accountId` |
+| `confluence_compare` | Structural diff between two versions of a page. `detail`: `summary`, `outline` (default), or `full`. Returns drill-in cursors. See [user guide](user-guide.md#confluence-comparing-pages) |
+| `confluence_compare_section` | Drill into a single section delta via a cursor returned from `confluence_compare`. `format`: `unified`, `side-by-side`, `markdown-inline` |
 
 ### Atlassian — shared (2 tools)
 
@@ -165,10 +167,10 @@ Read-only access to Datadog v1/v2 endpoints. Authentication uses
 
 | Tool | Purpose |
 |------|---------|
-| `ai_chat` | One-shot chat with the configured Claude model |
-| `claude_skills_sync` | Push omni-dev skills into the project's `.claude/skills/` |
-| `claude_skills_clean` | Remove omni-dev-managed skills from `.claude/skills/` |
-| `claude_skills_status` | Report which omni-dev skills are present and current |
+| `ai_chat` | One-shot chat with the configured Claude model. Supports `system_prompt` override (CLI doesn't). See [user guide](user-guide.md#ai-chat--conversational-ai) |
+| `claude_skills_sync` | Push omni-dev skills into the project's `.claude/skills/` via symlinks. See [user guide](user-guide.md#ai-claude-skills--distribute-skills-across-repositories) |
+| `claude_skills_clean` | Remove omni-dev-managed skill symlinks and exclude-block entries |
+| `claude_skills_status` | Report which omni-dev skill symlinks are present and current |
 | `config_models_show` | List supported AI models and token limits |
 
 ## Resources
@@ -203,9 +205,20 @@ and `jira_attachment_download` by default.
 
 ### `confirm: true` on destructive tools
 
-`jira_delete` and `confluence_delete` refuse to run unless the caller
-explicitly passes `confirm: true`. This guards against accidental destruction
-during exploratory tool calls.
+Five destructive Atlassian tools refuse to run unless the caller explicitly
+passes `confirm: true`:
+
+- `jira_delete`
+- `jira_link_remove`
+- `jira_watcher_remove`
+- `confluence_delete`
+- `confluence_label_remove`
+
+Each returns an error message of the form `Refusing to <verb> <target>: pass
+`confirm: true` to authorise this destructive operation.` when called without
+the parameter. This guards against accidental destruction during exploratory
+tool calls. See the [Destructive Commands callout](user-guide.md#destructive-commands)
+in the user guide and [ADR-0027](adrs/adr-0027.md) for the design rationale.
 
 ### Per-call client construction
 
