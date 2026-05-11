@@ -13,6 +13,7 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 - **[Configuration Guide](configuration.md)** - Set up contextual intelligence
 - **[Local Overrides](local-overrides.md)** - Personal configuration customization
 - **[Configuration Best Practices](configuration-best-practices.md)** - Writing effective scopes and guidelines
+- **[AI Backends](ai-backends.md)** - Claude API, Claude CLI, OpenAI, Ollama, and Bedrock setup
 - **[Examples](examples.md)** - Real-world usage examples across different project types
 
 ### Atlassian Integration
@@ -94,6 +95,7 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 | Feature | Primary Documentation | Additional Resources |
 |---------|----------------------|----------------------|
 | **AI-Powered Twiddle** | [User Guide - Twiddle](user-guide.md#twiddle---ai-powered-improvement) | [Examples - Before/After](examples.md#beforeafter-showcases) |
+| **AI Backends** | [AI Backends Guide](ai-backends.md) | [README - AI backend selection](../README.md#ai-backend-selection) |
 | **Contextual Intelligence** | [Configuration Guide](configuration.md#contextual-intelligence) | [User Guide - Context](user-guide.md#contextual-intelligence) |
 | **Project Configuration** | [Configuration Guide - Setup](configuration.md#setting-up-context) | [Examples - Configurations](examples.md#project-specific-examples) |
 | **Local Overrides** | [Local Overrides Guide](local-overrides.md) | [Configuration - Local Setup](configuration.md#local-override-examples) |
