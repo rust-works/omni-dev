@@ -79,6 +79,11 @@ name = "adf-schema-drift"
 path = "src/bin/adf_schema_drift.rs"
 required-features = []
 
+[[bin]]
+name = "adf-schema-codegen"
+path = "src/bin/adf_schema_codegen.rs"
+required-features = []
+
 [lints.rust]
 unsafe_code = "deny"
 # Custom cfgs declared so `cargo check`/`cargo test` don't warn on them.

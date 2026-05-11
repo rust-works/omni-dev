@@ -44,6 +44,7 @@ use std::sync::LazyLock;
 use crate::atlassian::adf::{AdfDocument, AdfNode};
 
 pub mod drift;
+pub mod generated;
 
 /// Crate-internal view of the schema as a `BTreeMap`, used by the drift
 /// detector to diff against an upstream-derived map of the same shape.
@@ -1947,5 +1948,272 @@ mod tests {
             path: vec![6],
         };
         assert_eq!(v6.path(), &[6]);
+    }
+
+    /// Allowlist entry: `(parent, upstream_extra_atoms, local_extra_atoms,
+    /// justification)`. See [`LENIENCY_ALLOWLIST`] below.
+    type LenientEntry = (
+        &'static str,
+        &'static [&'static str],
+        &'static [&'static str],
+        &'static str,
+    );
+
+    /// Result of comparing the local and upstream atom maps.
+    #[derive(Debug, Default)]
+    struct SchemaAtomDiff {
+        /// Parents in `CONTENT_ENTRIES` but not in `UPSTREAM_ENTRIES`.
+        local_only_parents: Vec<&'static str>,
+        /// Parents in `UPSTREAM_ENTRIES` but not in `CONTENT_ENTRIES`.
+        upstream_only_parents: Vec<&'static str>,
+        /// Human-readable per-parent atom-set mismatches that are not
+        /// covered by the leniency allowlist.
+        per_parent_unexpected: Vec<String>,
+    }
+
+    impl SchemaAtomDiff {
+        fn is_clean(&self) -> bool {
+            self.local_only_parents.is_empty()
+                && self.upstream_only_parents.is_empty()
+                && self.per_parent_unexpected.is_empty()
+        }
+    }
+
+    /// Pure helper: diff two `BTreeMap<&str, BTreeSet<&str>>` views of the
+    /// schema, accounting for an allowlist of intentional leniencies.
+    ///
+    /// Extracted from `generated_upstream_atoms_match_local_snapshot` so the
+    /// failure-detection branches can be exercised by tests with synthetic
+    /// inputs (the production maps are intentionally in sync).
+    fn diff_atom_sets(
+        local: &std::collections::BTreeMap<&'static str, std::collections::BTreeSet<&'static str>>,
+        upstream: &std::collections::BTreeMap<
+            &'static str,
+            std::collections::BTreeSet<&'static str>,
+        >,
+        leniency: &[LenientEntry],
+    ) -> SchemaAtomDiff {
+        let local_parents: std::collections::BTreeSet<&'static str> =
+            local.keys().copied().collect();
+        let upstream_parents: std::collections::BTreeSet<&'static str> =
+            upstream.keys().copied().collect();
+
+        let mut diff = SchemaAtomDiff {
+            local_only_parents: local_parents
+                .difference(&upstream_parents)
+                .copied()
+                .collect(),
+            upstream_only_parents: upstream_parents
+                .difference(&local_parents)
+                .copied()
+                .collect(),
+            per_parent_unexpected: Vec::new(),
+        };
+
+        for parent in local_parents.intersection(&upstream_parents) {
+            let l = &local[parent];
+            let u = &upstream[parent];
+
+            let allowed_upstream_extra: std::collections::BTreeSet<&str> = leniency
+                .iter()
+                .filter(|(p, _, _, _)| p == parent)
+                .flat_map(|(_, ue, _, _)| ue.iter().copied())
+                .collect();
+            let allowed_local_extra: std::collections::BTreeSet<&str> = leniency
+                .iter()
+                .filter(|(p, _, _, _)| p == parent)
+                .flat_map(|(_, _, le, _)| le.iter().copied())
+                .collect();
+
+            let upstream_extra: Vec<&str> = u
+                .iter()
+                .filter(|c| !l.contains(**c) && !allowed_upstream_extra.contains(**c))
+                .copied()
+                .collect();
+            let local_extra: Vec<&str> = l
+                .iter()
+                .filter(|c| !u.contains(**c) && !allowed_local_extra.contains(**c))
+                .copied()
+                .collect();
+
+            if !upstream_extra.is_empty() || !local_extra.is_empty() {
+                diff.per_parent_unexpected.push(format!(
+                    "{parent}: upstream_only={upstream_extra:?}, local_only={local_extra:?}"
+                ));
+            }
+        }
+
+        diff
+    }
+
+    /// Intentional atom-set leniencies. Each entry is `(parent,
+    /// upstream_extra_atoms, local_extra_atoms, justification)`. Keep
+    /// synchronised with the "LENIENT" comments in [`CONTENT_ENTRIES`].
+    ///
+    /// All currently-documented leniencies are *quantifier-only* (e.g.
+    /// `block+` → `block*`), so the atom sets remain identical and this
+    /// table is empty. If a future leniency adds or drops atoms (e.g.
+    /// narrowing `listItem` to forbid `taskList`), record it here.
+    const LENIENCY_ALLOWLIST: &[LenientEntry] = &[];
+
+    /// Build the upstream `BTreeMap` view from `generated::UPSTREAM_ENTRIES`.
+    fn upstream_atom_map(
+    ) -> std::collections::BTreeMap<&'static str, std::collections::BTreeSet<&'static str>> {
+        generated::UPSTREAM_ENTRIES
+            .iter()
+            .map(|(p, children)| (*p, children.iter().copied().collect()))
+            .collect()
+    }
+
+    /// Issue #732 — the code-generated upstream-atom snapshot must agree with
+    /// the hand-maintained [`CONTENT_ENTRIES`] table (modulo a small allowlist
+    /// of intentional leniency deviations that are quantifier-only and
+    /// therefore preserve atom-set equality).
+    ///
+    /// If this test fails, either:
+    ///
+    /// - Upstream `@atlaskit/adf-schema` shipped a content-model change.
+    ///   Refresh `assets/adf-schema/full.json`, re-run
+    ///   `cargo run --bin adf-schema-codegen`, update [`CONTENT_ENTRIES`] to
+    ///   match, and bump [`SCHEMA_VERSION`] / [`UPSTREAM_TARBALL_SHA256`].
+    /// - You edited [`CONTENT_ENTRIES`] in a way that desynchronises it from
+    ///   the upstream atoms. Fix the entry, or document a new entry in
+    ///   `LENIENCY_ALLOWLIST` if the deviation is intentional.
+    #[test]
+    fn generated_upstream_atoms_match_local_snapshot() {
+        let local = local_schema_map();
+        let upstream = upstream_atom_map();
+        let diff = diff_atom_sets(&local, &upstream, LENIENCY_ALLOWLIST);
+        assert!(
+            diff.is_clean(),
+            "atom-set drift between CONTENT_ENTRIES and generated::UPSTREAM_ENTRIES:\n\
+             local_only_parents={:?}\n\
+             upstream_only_parents={:?}\n\
+             per_parent_unexpected={:?}",
+            diff.local_only_parents,
+            diff.upstream_only_parents,
+            diff.per_parent_unexpected,
+        );
+    }
+
+    #[test]
+    fn diff_atom_sets_reports_clean_when_maps_agree() {
+        let mut m: std::collections::BTreeMap<
+            &'static str,
+            std::collections::BTreeSet<&'static str>,
+        > = std::collections::BTreeMap::new();
+        m.insert("panel", ["paragraph", "heading"].into_iter().collect());
+        let diff = diff_atom_sets(&m, &m.clone(), &[]);
+        assert!(diff.is_clean());
+        assert!(diff.local_only_parents.is_empty());
+        assert!(diff.upstream_only_parents.is_empty());
+        assert!(diff.per_parent_unexpected.is_empty());
+    }
+
+    #[test]
+    fn diff_atom_sets_reports_local_only_parents() {
+        let mut local: std::collections::BTreeMap<
+            &'static str,
+            std::collections::BTreeSet<&'static str>,
+        > = std::collections::BTreeMap::new();
+        local.insert("legacyNode", std::iter::once("paragraph").collect());
+        let upstream: std::collections::BTreeMap<
+            &'static str,
+            std::collections::BTreeSet<&'static str>,
+        > = std::collections::BTreeMap::new();
+        let diff = diff_atom_sets(&local, &upstream, &[]);
+        assert!(!diff.is_clean());
+        assert_eq!(diff.local_only_parents, vec!["legacyNode"]);
+        assert!(diff.upstream_only_parents.is_empty());
+    }
+
+    #[test]
+    fn diff_atom_sets_reports_upstream_only_parents() {
+        let local: std::collections::BTreeMap<
+            &'static str,
+            std::collections::BTreeSet<&'static str>,
+        > = std::collections::BTreeMap::new();
+        let mut upstream: std::collections::BTreeMap<
+            &'static str,
+            std::collections::BTreeSet<&'static str>,
+        > = std::collections::BTreeMap::new();
+        upstream.insert("newNode", std::iter::once("paragraph").collect());
+        let diff = diff_atom_sets(&local, &upstream, &[]);
+        assert!(!diff.is_clean());
+        assert_eq!(diff.upstream_only_parents, vec!["newNode"]);
+        assert!(diff.local_only_parents.is_empty());
+    }
+
+    #[test]
+    fn diff_atom_sets_reports_unexpected_per_parent_diffs() {
+        let mut local: std::collections::BTreeMap<
+            &'static str,
+            std::collections::BTreeSet<&'static str>,
+        > = std::collections::BTreeMap::new();
+        local.insert(
+            "panel",
+            ["paragraph", "heading"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+        );
+        let mut upstream = local.clone();
+        upstream.insert("panel", ["paragraph", "blockCard"].into_iter().collect());
+        let diff = diff_atom_sets(&local, &upstream, &[]);
+        assert!(!diff.is_clean());
+        let msg = diff.per_parent_unexpected.join("\n");
+        assert!(msg.contains("panel"));
+        assert!(
+            msg.contains("blockCard"),
+            "upstream_only should mention blockCard: {msg}"
+        );
+        assert!(
+            msg.contains("heading"),
+            "local_only should mention heading: {msg}"
+        );
+    }
+
+    #[test]
+    fn diff_atom_sets_honours_leniency_allowlist() {
+        let mut local: std::collections::BTreeMap<
+            &'static str,
+            std::collections::BTreeSet<&'static str>,
+        > = std::collections::BTreeMap::new();
+        local.insert("panel", ["paragraph", "heading"].into_iter().collect());
+        let mut upstream: std::collections::BTreeMap<
+            &'static str,
+            std::collections::BTreeSet<&'static str>,
+        > = std::collections::BTreeMap::new();
+        upstream.insert("panel", ["paragraph", "blockCard"].into_iter().collect());
+        // Allowlist the exact deviation we just constructed.
+        let lenient: &[LenientEntry] = &[(
+            "panel",
+            &["blockCard"], // upstream-only
+            &["heading"],   // local-only
+            "synthetic test deviation",
+        )];
+        let diff = diff_atom_sets(&local, &upstream, lenient);
+        assert!(diff.is_clean(), "allowlist should mask the diff: {diff:?}");
+    }
+
+    #[test]
+    fn generated_provenance_matches_local_constants() {
+        assert_eq!(
+            generated::UPSTREAM_TARBALL_SHA256,
+            UPSTREAM_TARBALL_SHA256,
+            "the vendored JSON's provenance SHA must match the runtime constant; \
+             both are bumped together when the snapshot is refreshed",
+        );
+        // SCHEMA_VERSION is `<npm-version>-YYYY-MM-DD`. Strip the trailing
+        // 11-char date suffix to recover the npm version, which must match
+        // the version baked into the generated file.
+        let date_len = "-YYYY-MM-DD".len();
+        let local_npm_prefix = SCHEMA_VERSION
+            .get(..SCHEMA_VERSION.len().saturating_sub(date_len))
+            .unwrap_or(SCHEMA_VERSION);
+        assert_eq!(
+            generated::UPSTREAM_VERSION,
+            local_npm_prefix,
+            "generated UPSTREAM_VERSION must match the npm-version prefix of SCHEMA_VERSION",
+        );
     }
 }

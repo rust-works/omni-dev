@@ -325,7 +325,11 @@ pub fn diff_against_upstream_json_schema(
 ///   `properties.content` subtree (including ones nested under `allOf` to
 ///   handle defs like `mediaSingle_caption_node`), with alias definitions
 ///   flattened transitively.
-fn parse_upstream_full_json(full: &Value) -> Result<BTreeMap<String, BTreeSet<String>>> {
+///
+/// Exposed `pub` so the `adf-schema-codegen` binary (issue #732) can parse
+/// the vendored `assets/adf-schema/full.json` without copy-pasting this
+/// logic.
+pub fn parse_upstream_full_json(full: &Value) -> Result<BTreeMap<String, BTreeSet<String>>> {
     let definitions = full
         .get("definitions")
         .and_then(Value::as_object)
