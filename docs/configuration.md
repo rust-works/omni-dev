@@ -15,7 +15,7 @@ provide better commit message suggestions. Configuration happens through the
 # 1. Create configuration directory
 mkdir .omni-dev
 
-# 2. Set up Claude API key
+# 2. Authenticate (see "Authentication" section below)
 export CLAUDE_API_KEY="your-api-key-here"
 
 # 3. Create basic configuration files
@@ -445,9 +445,18 @@ Commits are validated by:
 
 ## Environment Setup
 
-### Claude API Key
+### Authentication
 
-**Required**: omni-dev needs a Claude API key for AI features.
+**Required**: omni-dev needs a Claude API key for AI features. The default
+Anthropic backend accepts any of these environment variables (checked in
+order, first match wins):
+
+- `CLAUDE_API_KEY`
+- `ANTHROPIC_API_KEY`
+- `ANTHROPIC_AUTH_TOKEN`
+
+For non-Anthropic backends (Bedrock, OpenAI, Ollama, claude-cli) see
+[AI Backend Selection](#ai-backend-selection).
 
 #### Get Your API Key
 

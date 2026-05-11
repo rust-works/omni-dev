@@ -6,6 +6,8 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 
 ### Getting Started
 
+- **[Getting Started](getting-started.md)** — start here (10-minute
+  walkthrough from install to first AI-improved commit)
 - **[README](../README.md)** - Quick overview and installation
 - **[User Guide](user-guide.md)** - Comprehensive usage guide with examples
 - **[Configuration Guide](configuration.md)** - Set up contextual intelligence
@@ -56,7 +58,7 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 ### I want to
 
 **Get started quickly**
-→ [README Quick Start](../README.md#-quick-start) → [30-Second Demo](../README.md#30-second-demo)
+→ [Getting Started](getting-started.md) → [README Quick Start](../README.md#-quick-start)
 
 **Understand all features**  
 → [User Guide](user-guide.md) → [Core Commands](user-guide.md#command-reference)
@@ -81,10 +83,11 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 ### User Journey
 
 1. **Discovery**: Start with [README](../README.md) for overview and quick installation
-2. **Learning**: Follow [User Guide](user-guide.md) for comprehensive usage
-3. **Setup**: Use [Configuration Guide](configuration.md) to set up your project
-4. **Practice**: Try [Examples](examples.md) relevant to your project type
-5. **Troubleshooting**: Reference [Troubleshooting](troubleshooting.md) when needed
+2. **First run**: Follow [Getting Started](getting-started.md) for a 10-minute walkthrough
+3. **Learning**: Continue with [User Guide](user-guide.md) for comprehensive usage
+4. **Setup**: Use [Configuration Guide](configuration.md) to set up your project
+5. **Practice**: Try [Examples](examples.md) relevant to your project type
+6. **Troubleshooting**: Reference [Troubleshooting](troubleshooting.md) when needed
 
 ### Key Features Covered
 
@@ -129,7 +132,7 @@ This documentation is maintained alongside the codebase and updated with each re
 
 **Need help choosing where to start?**
 
-- **New to omni-dev**: [README](../README.md) → [User Guide](user-guide.md)
+- **New to omni-dev**: [Getting Started](getting-started.md) → [User Guide](user-guide.md)
 - **Setting up a project**: [Configuration Guide](configuration.md)
 - **Having issues**: [Troubleshooting](troubleshooting.md)
 - **Want examples**: [Examples](examples.md)

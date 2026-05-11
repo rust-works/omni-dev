@@ -41,10 +41,12 @@ nix run github:rust-works/omni-dev
 
 # Enable binary cache for faster builds (optional)
 cachix use omni-dev
-
-# Set up Claude API key (required for AI features)
-export CLAUDE_API_KEY="your-api-key-here"
 ```
+
+**Next step:** see [Getting Started](docs/getting-started.md) — a
+10-minute walkthrough from authentication to your first AI-improved
+commit. (For just the API-key reference, see
+[Authentication](docs/configuration.md#authentication).)
 
 #### Nix Binary Cache (Optional)
 
@@ -580,6 +582,8 @@ We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.
 
 ## 📚 Documentation
 
+- **[Getting Started](docs/getting-started.md)** - 10-minute walkthrough
+  from install to first AI-improved commit (start here)
 - **[User Guide](docs/user-guide.md)** - Comprehensive usage guide with examples
 - **[Configuration Guide](docs/configuration.md)** - Set up contextual
   intelligence
@@ -593,9 +597,8 @@ We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.
 
 - **Rust**: 1.80+ (for installation from source)
 - **Claude API Key**: Required for AI-powered features
-  - Get your key from
-    [Anthropic Console](https://console.anthropic.com/)
-  - Set: `export CLAUDE_API_KEY="your-key"`
+  - See [Authentication](docs/configuration.md#authentication) for
+    setup (env var, `.env`, or CI/CD secrets)
 - **AI Model Selection**: Optional configuration for specific Claude models
   - View available models: `omni-dev config models show`
   - Configure via `~/.omni-dev/settings.json` or `ANTHROPIC_MODEL` environment variable
