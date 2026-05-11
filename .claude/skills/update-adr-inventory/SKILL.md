@@ -13,7 +13,7 @@ This skill updates the inventory table in `docs/adrs/README.md` to reflect the c
 2. **Extract** from each file:
    - **ADR number** from the filename (e.g., `adr-0003.md` -> `ADR-0003`)
    - **Title** from the `# ADR-NNNN: <Title>` heading on line 1
-   - **Status** from the `## Status` section (line after the heading, e.g., `✅ Accepted`)
+   - **Status** from the `## Status` section (line after the heading, e.g., `✅ Accepted`). If the line ends with a trailing parenthesized date (e.g., `🔄 Superseded by [ADR-0022](adr-0022.md) (2026-05-06)`), strip that trailing ` (YYYY-MM-DD)` — the supersession date already appears in the Date column. Preserve the rest verbatim, including any successor link.
 3. **Date**: Use the git log to find the commit date when the file was first added:
    ```bash
    git log --diff-filter=A --format=%as -- docs/adrs/adr-NNNN.md
@@ -36,12 +36,12 @@ The inventory table uses this structure:
 
 ### Column Details
 
-| Column | Source                              | Example                             |
-|--------|-------------------------------------|-------------------------------------|
-| ADR    | Filename, linked: `[ADR-NNNN](...)` | `[ADR-0000](adr-0000.md)`           |
-| Status | Status section with emoji prefix    | `✅ Accepted`                        |
-| Date   | Git first-commit date or today      | `2026-02-10`                        |
-| Title  | H1 heading after `ADR-NNNN: `       | `Use Architecture Decision Records` |
+| Column | Source                                      | Example                                                   |
+|--------|---------------------------------------------|-----------------------------------------------------------|
+| ADR    | Filename, linked: `[ADR-NNNN](...)`         | `[ADR-0000](adr-0000.md)`                                 |
+| Status | Status section, trailing ` (date)` stripped | `✅ Accepted` / `🔄 Superseded by [ADR-NNNN](adr-NNNN.md)`  |
+| Date   | Git first-commit date or today              | `2026-02-10`                                              |
+| Title  | H1 heading after `ADR-NNNN: `               | `Use Architecture Decision Records`                       |
 
 ## Instructions
 
