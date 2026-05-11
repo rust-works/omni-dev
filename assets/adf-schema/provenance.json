@@ -1,0 +1,8 @@
+{
+  "npm_package": "@atlaskit/adf-schema",
+  "version": "52.9.5",
+  "tarball_url": "https://registry.npmjs.org/@atlaskit/adf-schema/-/adf-schema-52.9.5.tgz",
+  "tarball_sha256": "90b9b26f5cdf6f0850cebe5cf2df7662601b249322d6bcbeead712ca018e0b56",
+  "source_path_in_tarball": "package/dist/json-schema/v1/full.json",
+  "full_json_sha256": "9c4c8237e8ecdb5088438421be2f9fc7becf1ffb6096951af4eb4d4c85a06190"
+}
