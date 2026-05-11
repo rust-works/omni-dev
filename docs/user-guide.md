@@ -5,15 +5,85 @@ intelligence.
 
 ## Table of Contents
 
-1. [Getting Started](#getting-started)
-2. [Core Concepts](#core-concepts)
-3. [Command Reference](#command-reference)
-4. [Atlassian Integration](#atlassian---jira-and-confluence-integration)
-5. [Datadog Integration](#datadog-integration)
-6. [Contextual Intelligence](#contextual-intelligence)
-7. [Workflows](#workflows)
-8. [Advanced Usage](#advanced-usage)
-9. [Best Practices](#best-practices)
+1. [Your First Improvement](#your-first-improvement)
+2. [Getting Started](#getting-started)
+3. [Core Concepts](#core-concepts)
+4. [Command Reference](#command-reference)
+5. [Atlassian Integration](#atlassian---jira-and-confluence-integration)
+6. [Datadog Integration](#datadog-integration)
+7. [Contextual Intelligence](#contextual-intelligence)
+8. [Workflows](#workflows)
+9. [Advanced Usage](#advanced-usage)
+10. [Best Practices](#best-practices)
+
+## Your First Improvement
+
+The fastest way to learn omni-dev is to run it on a throwaway commit you
+control end to end. This tutorial takes about 5 minutes in any git repo
+and walks through the three core commands — `view`, `twiddle`, `check`.
+
+First-time setup (install + auth + `.omni-dev/`) is covered in
+[Getting Started](getting-started.md). This tutorial assumes you've done
+that already.
+
+### Step 1 — Make a deliberately bad commit on a scratch branch
+
+```bash
+git checkout -b omni-dev-tutorial
+echo "" >> README.md
+git add README.md
+git commit -m "wip"
+```
+
+### Step 2 — Inspect it with `view`
+
+```bash
+omni-dev git commit message view 'HEAD~1..HEAD'
+```
+
+Expected: YAML output describing the commit, its diff, and the
+field-presence summary. Skim it — you don't have to read it all.
+
+### Step 3 — Improve it with `twiddle`
+
+```bash
+omni-dev git commit message twiddle 'HEAD~1..HEAD'
+```
+
+Expected: omni-dev prints a suggested rewritten message (something like
+`docs(readme): add trailing newline`), shows a before/after diff, and
+prompts `Apply these amendments? [y/N]`. Press `y`.
+
+### Step 4 — Verify with `git log`
+
+```bash
+git log --oneline HEAD~1..HEAD
+```
+
+Expected: the subject line is now the AI-suggested message.
+
+### Step 5 — Validate against your guidelines with `check`
+
+```bash
+omni-dev git commit message check 'HEAD~1..HEAD'
+```
+
+Expected: the check passes (exit 0). If you have project-specific scopes
+in `.omni-dev/scopes.yaml` that the suggestion didn't use, re-run
+`twiddle` — see the [Configuration Guide](configuration.md) to teach
+omni-dev about your scopes.
+
+### Cleanup
+
+```bash
+git checkout - && git branch -D omni-dev-tutorial
+```
+
+### What just happened
+
+You ran the three core commands — `view` (analyse), `twiddle` (improve),
+`check` (validate) — that together cover the full omni-dev workflow.
+Everything else in this guide builds on these three.
 
 ## Getting Started
 
@@ -25,15 +95,10 @@ intelligence.
    cargo install omni-dev
    ```
 
-2. **Set up Claude API Key**
-
-   ```bash
-   # Get your API key from https://console.anthropic.com/
-   export CLAUDE_API_KEY="your-api-key-here"
-   
-   # Add to your shell profile for persistence
-   echo 'export CLAUDE_API_KEY="your-api-key-here"' >> ~/.bashrc
-   ```
+2. **Authenticate.** By default, `export CLAUDE_API_KEY="sk-ant-..."`.
+   See [Authentication](configuration.md#authentication) for the full
+   reference (alternative env-var names, `.env` files, CI/CD secrets,
+   non-Anthropic backends).
 
 3. **Verify Installation**
 
@@ -1436,17 +1501,10 @@ omni-dev git commit message twiddle 'HEAD~5..HEAD' --use-context
 
 ### 6. API Key Security
 
-Keep your Claude API key secure:
-
-```bash
-# Use environment variables, not command line arguments
-export CLAUDE_API_KEY="sk-..."
-
-# Add to .env files (not committed to git)
-echo "CLAUDE_API_KEY=sk-..." >> .env
-
-# Don't hardcode in scripts
-```
+Keep your Claude API key in an environment variable or `.env` file;
+never in command-line arguments or scripts. See
+[Authentication](configuration.md#authentication) for the canonical
+setup guide.
 
 ### 7. Integration with Team Workflow
 
