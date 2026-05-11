@@ -40,7 +40,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use omni_dev::atlassian::adf_schema::drift::parse_upstream_full_json;
+use omni_dev::atlassian::adf_schema::drift::{hex_encode, parse_upstream_full_json};
 
 /// Sidecar provenance file. Mirrors the JSON shape of
 /// `assets/adf-schema/provenance.json`.
@@ -108,7 +108,7 @@ fn run(cli: &Cli, stderr: &mut dyn std::io::Write) -> Result<bool> {
     let provenance: Provenance = serde_json::from_slice(&provenance_bytes)
         .with_context(|| format!("parsing {}", cli.provenance.display()))?;
 
-    let computed_sha = format!("{:x}", Sha256::digest(&full_json_bytes));
+    let computed_sha = hex_encode(&Sha256::digest(&full_json_bytes));
     if computed_sha != provenance.full_json_sha256 {
         return Err(anyhow!(
             "{} SHA-256 mismatch: computed {computed_sha}, provenance says {}",
@@ -412,7 +412,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let full_json_path = dir.path().join("full.json");
         fs::write(&full_json_path, full_json).unwrap();
-        let computed_sha = format!("{:x}", Sha256::digest(full_json.as_bytes()));
+        let computed_sha = hex_encode(&Sha256::digest(full_json.as_bytes()));
 
         let provenance_path = dir.path().join("provenance.json");
         let provenance = serde_json::json!({
