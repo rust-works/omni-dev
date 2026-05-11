@@ -235,7 +235,7 @@ async fn fetch_drift_report_from_url(latest_url: &str) -> Result<DriftReport> {
         .await
         .context("reading tarball bytes")?;
 
-    let upstream_sha = format!("{:x}", Sha256::digest(&tarball_bytes));
+    let upstream_sha = hex_encode(&Sha256::digest(&tarball_bytes));
     let full_json = extract_full_json_from_tarball(&tarball_bytes)
         .context("extracting dist/json-schema/v1/full.json from tarball")?;
 
@@ -598,6 +598,22 @@ fn strip_transcription_date(s: &str) -> &str {
     } else {
         s
     }
+}
+
+/// Lower-case hex encoding of a byte slice.
+///
+/// Replaces the `format!("{:x}", Sha256::digest(...))` idiom, which broke when
+/// `sha2` 0.11 changed the digest output type to `hybrid_array::Array`, which
+/// does not implement `LowerHex`.
+#[must_use]
+pub fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 #[cfg(test)]
