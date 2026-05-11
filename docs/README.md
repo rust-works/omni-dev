@@ -39,7 +39,6 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 
 - **[Project Plan](plan/project.md)** - Technical architecture and implementation details
 - **[Twiddle Design](plan/twiddle.md)** - Complete design for the twiddle command phases
-- **[PR Creation](plan/pr-creation.md)** - Pull request creation workflow
 - **[Help All Command](plan/help-all-command.md)** - Comprehensive help system design
 - **[Config Internals](plan/config-internals.md)** - How configuration resolution works
 
