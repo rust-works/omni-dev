@@ -78,6 +78,10 @@ source ~/.bashrc  # or ~/.zshrc
 
 ## API Key Problems
 
+> For first-time setup, see
+> [Authentication](configuration.md#authentication). The errors below
+> cover failure modes after setup.
+
 ### Error: `CLAUDE_API_KEY not found`
 
 **Symptom**:
@@ -90,6 +94,9 @@ Error: Claude API key not found
 **Solutions**:
 
 1. **Set Environment Variable**
+
+   The Anthropic backend accepts any of `CLAUDE_API_KEY`,
+   `ANTHROPIC_API_KEY`, or `ANTHROPIC_AUTH_TOKEN` (first match wins).
 
    ```bash
    export CLAUDE_API_KEY="your-api-key-here"
