@@ -210,7 +210,7 @@ pub struct RequestOptions {
 }
 
 impl RequestOptions {
-    /// Returns a new [`RequestOptions`] with [`response_schema`] set.
+    /// Returns a new [`RequestOptions`] with [`Self::response_schema`] set.
     #[must_use]
     pub fn with_response_schema(mut self, schema: Value) -> Self {
         self.response_schema = Some(schema);
@@ -243,7 +243,7 @@ pub trait AiClient: Send + Sync {
     /// Sends a request with optional per-request settings.
     ///
     /// The default implementation drops `options` and dispatches via
-    /// [`send_request`]. Backends that honour any field in
+    /// [`Self::send_request`]. Backends that honour any field in
     /// [`RequestOptions`] (e.g. `response_schema`) override this method.
     /// Backends that don't honour an option must ignore it; call sites
     /// should consult [`capabilities`](Self::capabilities) before setting

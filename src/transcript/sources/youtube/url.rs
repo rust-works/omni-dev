@@ -22,7 +22,7 @@ const VIDEO_ID_LEN: usize = 11;
 /// Accepts the watch, share, shorts, and embed forms listed in the module
 /// docs, plus a bare 11-character ID that already matches the YouTube ID
 /// shape. Returns
-/// [`TranscriptError::InvalidLocator`](crate::transcript::TranscriptError::InvalidLocator)
+/// [`TranscriptError::InvalidLocator`]
 /// if `input` is neither.
 pub fn extract_video_id(input: &str) -> Result<String> {
     if is_valid_video_id(input) {

@@ -4,7 +4,7 @@
 //! external media platforms (YouTube first; Vimeo, podcasts, generic VTT/SRT
 //! URLs to follow). The [`source::TranscriptSource`] trait is the extension
 //! point — concrete sources live under [`sources`], format converters under
-//! [`format`], and shared value types ([`cue::Cue`], [`source::Transcript`])
+//! [`mod@format`], and shared value types ([`cue::Cue`], [`source::Transcript`])
 //! are reused across all sources.
 //!
 //! This module has no `clap` dependency and is reusable from other commands or

@@ -215,7 +215,7 @@ impl RepositoryView {
 
     /// Creates a minimal view containing multiple commits for batched dispatch.
     ///
-    /// Same metadata stripping as [`single_commit_view`] but with N commits.
+    /// Same metadata stripping as [`Self::single_commit_view`] but with N commits.
     /// Used by the batching system to group commits into a single AI request.
     #[must_use]
     pub(crate) fn multi_commit_view(&self, commits: &[&CommitInfo]) -> Self {
