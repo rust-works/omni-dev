@@ -390,6 +390,10 @@ pub fn generate_contextual_system_prompt(context: &CommitContext) -> String {
 
 #### 5.4. Configuration File Examples
 
+> For the full format contract — recognised fields, precedence, and validation
+> behaviour — see
+> [`omni-dev-directory.md`](../omni-dev-directory.md#file-specs).
+
 **.omni-dev/commit-guidelines.md**:
 ```markdown
 # Project Commit Guidelines

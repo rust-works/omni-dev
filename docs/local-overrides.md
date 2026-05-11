@@ -15,8 +15,10 @@ Local overrides are the highest-priority tier in the full resolution chain:
 3. `$XDG_CONFIG_HOME/omni-dev/{filename}` - XDG global config
 4. `$HOME/.omni-dev/{filename}` - Legacy global fallback
 
-See [Configuration Guide](configuration.md) for the full resolution chain
-including config directory selection (walk-up discovery, env var, CLI flag).
+See [Configuration Guide](configuration.md) for the narrative walkthrough
+and [`omni-dev-directory.md`](omni-dev-directory.md#chain-a--hierarchical-resolution)
+for the formal precedence contract, including config-directory selection
+(walk-up discovery, env var, CLI flag) and the per-file validation behaviour.
 
 ## Supported Override Files
 
