@@ -1,4 +1,4 @@
-//! YouTube [`TranscriptSource`](crate::transcript::TranscriptSource).
+//! YouTube [`TranscriptSource`].
 //!
 //! Wires the offline parsers ([`url`], [`player_response`], [`timedtext`])
 //! into a concrete [`TranscriptSource`] backed by an HTTP client. The

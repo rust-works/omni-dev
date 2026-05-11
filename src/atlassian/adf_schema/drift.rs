@@ -1,4 +1,4 @@
-//! Drift detection between the local [`CONTENT_ENTRIES`] snapshot and
+//! Drift detection between the local `CONTENT_ENTRIES` snapshot and
 //! upstream `@atlaskit/adf-schema`.
 //!
 //! Issue [#731]: a scheduled CI job downloads the latest upstream tarball,
@@ -14,7 +14,6 @@
 //! visible drift, not as a silent empty diff.
 //!
 //! [#731]: https://github.com/rust-works/omni-dev/issues/731
-//! [`CONTENT_ENTRIES`]: super::CONTENT_ENTRIES
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::Read;
@@ -29,7 +28,7 @@ use super::{local_schema_map, SCHEMA_VERSION, UPSTREAM_TARBALL_SHA256};
 /// npm registry endpoint that resolves the `latest` dist-tag for the package.
 const NPM_LATEST_URL: &str = "https://registry.npmjs.org/@atlaskit/adf-schema/latest";
 
-/// Optional env-var override for [`NPM_LATEST_URL`].
+/// Optional env-var override for `NPM_LATEST_URL`.
 ///
 /// Honoured by [`fetch_latest_drift_report`]. Used by integration tests to
 /// point the binary at a `wiremock` server, and available as an operational

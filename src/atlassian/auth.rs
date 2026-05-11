@@ -24,7 +24,7 @@ pub const ATLASSIAN_API_TOKEN: &str = "ATLASSIAN_API_TOKEN";
 /// Atlassian Cloud credentials.
 #[derive(Debug, Clone)]
 pub struct AtlassianCredentials {
-    /// Instance base URL (e.g., "https://myorg.atlassian.net").
+    /// Instance base URL (e.g., `"https://myorg.atlassian.net"`).
     pub instance_url: String,
 
     /// User email address.

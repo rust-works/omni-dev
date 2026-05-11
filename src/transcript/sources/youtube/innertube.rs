@@ -14,9 +14,9 @@
 //!
 //! These values drift over months as YouTube tightens per-client checks.
 //! When `/player` starts returning empty or refused responses for known-
-//! healthy videos, bump [`CLIENT_VERSION`] (and the matching `User-Agent`
-//! token in [`super::USER_AGENT`]) to the value currently shipped by the
-//! Oculus YouTube app, and refresh [`INNERTUBE_API_KEY`] if the
+//! healthy videos, bump `CLIENT_VERSION` (and the matching `User-Agent`
+//! token in `super::USER_AGENT`) to the value currently shipped by the
+//! Oculus YouTube app, and refresh `INNERTUBE_API_KEY` if the
 //! ANDROID-family key starts being rejected.
 
 use serde_json::json;
