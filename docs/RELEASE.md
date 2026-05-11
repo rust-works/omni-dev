@@ -12,12 +12,13 @@ The release process follows semantic versioning with **automated CI/CD**:
 3. Code quality checks
 4. Commit and push changes
 5. Create and push git tag
+6. Update the Glama listing (see [Glama Listing Update](#glama-listing-update))
 
 ### Automated Steps (CI Does)
-6. GitHub release creation
-7. Cross-platform binary builds (Linux, macOS, Windows)
-8. crates.io publication
-9. Nix binary cache publication
+7. GitHub release creation
+8. Cross-platform binary builds (Linux, macOS, Windows)
+9. crates.io publication
+10. Nix binary cache publication
 
 ## Prerequisites
 
@@ -190,9 +191,21 @@ After the automated release completes:
    - Update any version-specific documentation
    - Ensure README examples use current version
 
-2. **Announce Release** (optional):
+2. **Update the Glama Listing** (see [Glama Listing Update](#glama-listing-update))
+
+3. **Announce Release** (optional):
    - Share release notes with team
    - Update project status if needed
+
+## Glama Listing Update
+
+After the GitHub release lands, point the [Glama listing](https://glama.ai/mcp/servers/rust-works/omni-dev) at the new commit so the public listing reflects the release. This is a manual web-UI step — Glama's Docker build is pinned to a specific commit SHA and only rebuilds when that SHA is bumped.
+
+See [Glama Listing](glama-listing.md) for the full procedure, the canonical admin-form values (Build steps, CMD arguments, env-var schema), and troubleshooting. The short version:
+
+1. Run `git rev-parse --short vX.Y.Z` to get the release SHA.
+2. Paste it into **Pinned commit SHA** at <https://glama.ai/mcp/servers/rust-works/omni-dev/admin/dockerfile> and **Save**.
+3. Trigger a **build**, wait for it to go green, then trigger a **release**.
 
 ## Troubleshooting
 
