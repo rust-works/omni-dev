@@ -139,6 +139,12 @@ Documentation improvements are always welcome:
 - Improve API documentation
 - Update outdated information
 
+## Extension recipes
+
+For the three extension points most likely to come up — adding an MCP tool,
+adding an AI backend, or extending the ADF schema with a new node type —
+see [docs/contributing/](docs/contributing/) for short, worked recipes.
+
 ## Code of Conduct
 
 This project adheres to a [Code of Conduct](CODE_OF_CONDUCT.md). By participating, you are expected to uphold this code.
