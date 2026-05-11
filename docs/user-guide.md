@@ -1153,7 +1153,9 @@ mkdir .omni-dev
 
 #### 2. Define Project Scopes (`.omni-dev/scopes.yaml`)
 
-Tell omni-dev about your project's areas:
+Tell omni-dev about your project's areas. See
+[`omni-dev-directory.md`](omni-dev-directory.md#scopesyaml) for the file's
+format contract and validation behaviour.
 
 ```yaml
 scopes:
@@ -1200,7 +1202,11 @@ scopes:
 
 #### 3. Set Commit Guidelines (`.omni-dev/commit-guidelines.md`)
 
-Define your project's commit message standards:
+Define your project's commit message standards. See
+[`omni-dev-directory.md`](omni-dev-directory.md#commit-guidelinesmd) for the
+full format contract — including precedence between project-scope, user-scope,
+and global fallbacks — and the validation messages omni-dev emits on a
+malformed file.
 
 ```markdown
 # Project Commit Guidelines

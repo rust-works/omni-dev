@@ -1,6 +1,9 @@
 # Config Internals
 
-How omni-dev's configuration resolution system works, for contributors.
+How omni-dev's configuration resolution system works, for contributors. For
+the user-facing contract — the inventory of recognised `.omni-dev/` files,
+their formats, and validation behaviour — see
+[`omni-dev-directory.md`](../omni-dev-directory.md).
 
 ## Table of Contents
 

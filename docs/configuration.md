@@ -24,6 +24,12 @@ export CLAUDE_API_KEY="your-api-key-here"
 
 ## Configuration Files
 
+> See [`omni-dev-directory.md`](omni-dev-directory.md) for the formal
+> contract: the full inventory of recognised files under `.omni-dev/`, their
+> precedence rules, and the exact validation messages omni-dev emits when a
+> file is malformed. This page is the narrative walkthrough; that page is the
+> spec.
+
 ### Local Override Support
 
 All configuration files support local overrides. If a file exists in
@@ -75,7 +81,10 @@ guidance on writing effective configuration files.
 
 ### 1. Scope Definitions (`.omni-dev/scopes.yaml`)
 
-**Purpose**: Define project-specific scopes and their meanings for use in conventional commit messages.
+**Purpose**: Define project-specific scopes and their meanings for use in
+conventional commit messages. See
+[`omni-dev-directory.md`](omni-dev-directory.md#scopesyaml) for the format
+contract, required fields, and validation behaviour.
 
 #### What are Scopes?
 
@@ -282,7 +291,9 @@ scopes:
 
 ### 2. Commit Guidelines (`.omni-dev/commit-guidelines.md`)
 
-**Purpose**: Document your project's commit message conventions.
+**Purpose**: Document your project's commit message conventions. See
+[`omni-dev-directory.md`](omni-dev-directory.md#commit-guidelinesmd) for the
+file's format contract and validation behaviour.
 
 **Template**:
 
@@ -735,6 +746,10 @@ echo "See [.omni-dev/commit-guidelines.md](.omni-dev/commit-guidelines.md) for c
 echo "- [ ] Commits follow [project guidelines](.omni-dev/commit-guidelines.md)" >> .github/pull_request_template.md
 ```
 
+The format and validation contract for `.omni-dev/commit-guidelines.md`
+itself is documented in
+[`omni-dev-directory.md`](omni-dev-directory.md#commit-guidelinesmd).
+
 ### 5. Version Your Configuration
 
 Track configuration changes:
@@ -832,7 +847,7 @@ export CLAUDE_API_KEY="team-shared-key-or-individual-key"
 # 3. Test configuration
 omni-dev git commit message view HEAD --use-context
 
-# 4. Review project guidelines
+# 4. Review project guidelines (see omni-dev-directory.md for the format contract)
 cat .omni-dev/commit-guidelines.md
 ```
 
@@ -939,7 +954,9 @@ If you're currently writing commit messages manually:
 
 **Guidelines Not Loading**:
 
-1. Ensure `.omni-dev/commit-guidelines.md` exists
+1. Ensure `.omni-dev/commit-guidelines.md` exists at one of the locations
+   listed in
+   [`omni-dev-directory.md`](omni-dev-directory.md#chain-a--hierarchical-resolution)
 2. Check file permissions
 3. Verify markdown formatting
 
