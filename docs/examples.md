@@ -88,6 +88,9 @@ webapp/
 
 ### Configuration (`.omni-dev/scopes.yaml`)
 
+See [`omni-dev-directory.md`](omni-dev-directory.md#scopesyaml) for the format
+contract; the example below shows how it applies in practice.
+
 ```yaml
 scopes:
   - name: "auth"

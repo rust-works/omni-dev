@@ -368,7 +368,9 @@ Writing a commit message.
 
 Follow [`.omni-dev/commit-guidelines.md`](../.omni-dev/commit-guidelines.md) for the full
 specification including types, scopes, subject line rules, body guidelines, and breaking
-change conventions.
+change conventions. See [`omni-dev-directory.md`](omni-dev-directory.md#commit-guidelinesmd)
+for the file's format contract, validation behaviour, and how it is resolved relative to
+local overrides and the global fallback.
 
 The commit guidelines must themselves follow **Conventional Commits** and remain consistent
 with the scope definitions in `.omni-dev/scopes.yaml`:
@@ -1164,8 +1166,9 @@ After creating one or more commits and before pushing or opening a pull request.
 ### Guidance
 
 After every `git commit`, invoke the `commit-twiddle` skill to validate and fix the
-message against the guidelines in `.omni-dev/commit-guidelines.md`. The skill calls
-`omni-dev git commit message view` to analyse the commit, then
+message against the guidelines in
+[`.omni-dev/commit-guidelines.md`](omni-dev-directory.md#commit-guidelinesmd). The skill
+calls `omni-dev git commit message view` to analyse the commit, then
 `omni-dev git commit message amend` to rewrite the message if needed.
 
 **Constraints to observe:**

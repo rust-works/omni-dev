@@ -28,7 +28,7 @@ This means:
 
 ## Commit Guidelines Structure
 
-Projects define their commit guidelines in `.omni-dev/commit-guidelines.md`. The check command reads and enforces these. Guidelines should specify severity levels for violations.
+Projects define their commit guidelines in `.omni-dev/commit-guidelines.md` (see [`omni-dev-directory.md`](../omni-dev-directory.md#commit-guidelinesmd) for the format contract). The check command reads and enforces these. Guidelines should specify severity levels for violations.
 
 ### Example Commit Guidelines File
 
