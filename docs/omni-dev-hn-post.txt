@@ -1,0 +1,43 @@
+Every MCP server for Jira/Confluence I've tried - including Atlassian's own - silently destroys rich content on edit. The pattern is the same everywhere: the MCP reads a page (ADF, a JSON tree), converts it to Markdown for the LLM, the LLM rewrites it, the MCP converts back to ADF and writes. But ADF has node types Markdown doesn't have: panels, status badges, Smart Links, mentions, expand macros, decision lists, layouts. When those round-trip, every converter I've looked at just drops them with no warning.
+
+Atlassian's own bug tracker has issue #60 - "Editing content via Rovo MCP causes the loss of all ADF-rich content" - open and confirmed: https://github.com/atlassian/atlassian-mcp-server/issues/60 . Community servers (sooperset/mcp-atlassian, raalarcon, codingthefuturewithai/mcp_jira) all advertise bidirectional Markdown↔ADF; none of them validate the round-trip.
+
+omni-dev does two things differently.
+
+*JFM (JIRA-Flavoured Markdown).* CommonMark extended with a generic-directive syntax for ADF nodes that have no Markdown equivalent. The LLM authors plain Markdown with directives; the converter produces valid ADF:
+
+  :::panel{type=info}
+  This is an info panel with rich content.
+  :::
+
+  :::decisions
+  - <> Use Rust for the rewrite
+  - <> Migrate the DB in Q3
+  :::
+
+  The status is :status[In Progress]{color=yellow} as of :date[2026-05-11],
+  owned by :mention[Alice]{id=...}.
+
+Inline directives (:status[...], :mention[...], :date[...], ::card[url], :emoji:) cover the long tail of ADF inline nodes; block directives (:::panel, :::expand, :::layout, :::decisions, :::nested-expand) cover the structural ones. The full spec, including the frontmatter format, the parsing rules, the ADF↔JFM mapping tables for every supported node, and the documented round-trip non-guarantees, is linked at the bottom.
+
+*Schema-validated round-trips.* Every ADF↔JFM conversion is checked against a vendored copy of Atlassian's published ADF JSON schema. If a node can't be expressed in JFM without loss, the conversion fails loudly - you get a structured error pointing at the offending JSON path - rather than silently producing plausible-looking ADF that has lost your panel. The validator also catches ADF nesting violations (paragraph inside decisionItem, expand inside expand, layout sections inside layout sections) at conversion time, instead of waiting for the Atlassian API to reject the write.
+
+It's a regular CLI too. The round-trip story in one command:
+
+  omni-dev atlassian confluence edit <page-id>
+
+Fetches the page as JFM, drops you into $EDITOR, pushes the result back. Or split it:
+
+  omni-dev atlassian confluence read  <page-id> > page.md
+  $EDITOR page.md
+  omni-dev atlassian confluence write <page-id> page.md
+
+Same round-trip guarantees in both directions, with or without an LLM in the loop.
+
+If you're using Claude Code: there's a sandboxed claude-cli backend that runs the nested "claude -p" session with tools and MCP disabled by default, plus an optional --max-budget-usd hard cap. Useful when you want the LLM to call omni-dev tools but not the file system.
+
+Caveats: pre-1.0 (v0.26.0). ADF nodes without a JFM directive equivalent round-trip losslessly as opaque adf-unsupported JSON blocks - content survives but appears as raw JSON to the LLM rather than as ergonomic Markdown. A few converter bugs in specific nesting cases (decisionItem with paragraph children, nested expand inside panel) are tracked as open issues; the schema validator catches them at conversion time. Written in Rust.
+
+Repo:     https://github.com/rust-works/omni-dev
+Crate:    https://crates.io/crates/omni-dev
+JFM spec: https://github.com/rust-works/omni-dev/blob/main/docs/specs/jfm.md
