@@ -1029,108 +1029,31 @@ Hidden content here.
 ## Datadog Integration
 
 omni-dev exposes read-only access to the Datadog v1/v2 APIs through the
-`omni-dev datadog` command tree. Every subcommand accepts
-`-o table|json|yaml|yamls|jsonl` (default `table`).
+`omni-dev datadog` command tree. The full reference — authentication,
+every family's CLI subcommands with worked examples and sample output,
+rate-limit behaviour, and troubleshooting — lives in
+**[docs/datadog.md](datadog.md)**.
 
-### Authentication
+Quick orientation:
 
 ```bash
-# Configure credentials interactively (writes to ~/.omni-dev/settings.json)
+# One-time credential setup (writes ~/.omni-dev/settings.json)
 omni-dev datadog auth login
-
-# Verify credentials by calling /api/v1/validate
 omni-dev datadog auth status
 
-# Remove stored credentials
-omni-dev datadog auth logout
-```
-
-Environment variables override stored settings: `DATADOG_API_KEY`,
-`DATADOG_APP_KEY`, `DATADOG_SITE`. `DATADOG_SITE` defaults to
-`datadoghq.com`; `datadoghq.eu`, `us3.datadoghq.com`, `us5.datadoghq.com`,
-`ap1.datadoghq.com`, and `ddog-gov.com` are recognised. For on-prem or
-proxied installs, set `DATADOG_API_URL` to override the site-derived URL
-entirely.
-
-### Metrics
-
-```bash
-# Point-in-time timeseries query
+# Examples from the nine capability families
 omni-dev datadog metrics query --query 'avg:system.cpu.user{*}' --from 15m
-omni-dev datadog metrics query --query 'sum:requests.total{env:prod}.as_rate()' \
-  --from 1h --to now
-
-# List available metric names (optionally filtered by host or ingestion cutoff)
-omni-dev datadog metrics catalog list --host web-01
-```
-
-`--from` and `--to` accept relative shorthand (`15m`, `1h`, `2d`), the
-literal `now`, RFC 3339 timestamps, or Unix epoch seconds.
-
-### Monitors
-
-```bash
-# Filter by name / tags / monitor_tags
-omni-dev datadog monitor list --name 'API latency' --tags env:prod
-omni-dev datadog monitor list --monitor-tags team:platform --limit 50
-
-# Faceted search
-omni-dev datadog monitor search --query 'status:alert AND env:prod'
-
-# Single monitor by id
-omni-dev datadog monitor get 12345
-```
-
-### Dashboards
-
-```bash
-# List all dashboards (optionally just shared ones)
+omni-dev datadog monitor list --tags env:prod
 omni-dev datadog dashboard list
-omni-dev datadog dashboard list --filter-shared
-
-# Fetch a single dashboard's full definition
-omni-dev datadog dashboard get abc-123-xyz
-```
-
-Per-widget schemas are heterogeneous, so widgets are preserved as raw JSON
-in the response.
-
-### Logs
-
-```bash
 omni-dev datadog logs search --filter 'service:api status:error' --from 1h
-omni-dev datadog logs search --filter '@http.status_code:5*' \
-  --from 30m --limit 500 --sort timestamp-asc
-```
-
-Pagination is cursor-based (`meta.page.after`); `--limit 0` auto-paginates
-with a hard cap of 10 000 events per invocation.
-
-### Events, SLOs, hosts, downtimes
-
-```bash
-# Events stream — auto-paginates (default `--limit 100`; `0` = all up to 10 000)
-omni-dev datadog events list --filter 'service:api' --from 1h \
-  --sources kubernetes,aws --tags env:prod
-
-# Service Level Objectives — auto-paginates, hard cap 10 000
+omni-dev datadog events list --filter 'service:api' --sources kubernetes
 omni-dev datadog slo list --tags team:platform
-omni-dev datadog slo list --query 'checkout' --metrics-query 'requests'
-omni-dev datadog slo get abc123def456
-
-# Hosts last reporting since the cutoff
-omni-dev datadog hosts list --filter env:prod --limit 200
-
-# Scheduled downtimes
-omni-dev datadog downtime list
 omni-dev datadog downtime list --active-only
+omni-dev datadog hosts list --filter env:prod
 ```
-
-### MCP equivalents
 
 Every Datadog CLI subcommand has a matching `datadog_*` MCP tool — see
-[docs/mcp.md](mcp.md#datadog-14-tools). The MCP versions accept the same
-filters and emit YAML matching the CLI's `-o yaml` output.
+[docs/mcp.md](mcp.md#datadog-14-tools).
 
 ## Contextual Intelligence
 
