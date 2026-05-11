@@ -194,29 +194,52 @@ content.
 ## Content Model Constraints
 
 ADF uses a strict content model: each container node permits only a specific
-set of child node types. Atlassian's APIs reject documents that violate the
-model, often as an opaque HTTP 500 with no indication of which nesting was at
-fault. JFM directives are unaware of these rules — `:::expand` inside
-`:::panel` parses cleanly into ADF, but the API will refuse it.
+set of child node types, and each parent's content sequence is constrained by
+quantifiers (`?`, `*`, `+`, `{n}`, `{m,n}`). Atlassian's APIs reject
+documents that violate the model, often as an opaque HTTP 500 with no
+indication of which nesting was at fault. JFM directives parse permissively —
+`:::expand` inside `:::panel` produces well-formed ADF, but the API will
+refuse it.
 
 ### Source of truth
 
-The full allowed-children table for every container node is encoded in
-`src/atlassian/adf_schema.rs`, transcribed faithfully from the upstream
-`@atlaskit/adf-schema` npm package. The pinned upstream version is recorded
-in the `SCHEMA_VERSION` and `UPSTREAM_TARBALL_SHA256` constants in that file.
-Treat the module as authoritative; the prose below is illustrative.
+The full content model for every container node is encoded in
+[`src/atlassian/adf_schema/mod.rs`](../../src/atlassian/adf_schema/mod.rs),
+transcribed faithfully from the upstream `@atlaskit/adf-schema` npm package
+per [ADR-0023](../adrs/adr-0023.md). The pinned upstream version is recorded
+in the `SCHEMA_VERSION` and `UPSTREAM_TARBALL_SHA256` constants in that
+module. Treat the module as authoritative; the prose below is illustrative.
 
-Three public helpers expose the model:
+Public helpers expose the model:
 
-- `adf_schema::allowed_children(parent)` — returns the allowed direct
-  children for a parent node type, or `None` for leaf / unknown types.
+- `adf_schema::allowed_children(parent)` — returns the union of allowed
+  direct children for a parent node type, or `None` for leaf / unknown
+  types.
+- `adf_schema::content_model(parent)` — returns the full sequence of
+  quantified content terms for a parent (preserves ordering and arity).
 - `adf_schema::permits_child(parent, child)` — `true` if `child` is permitted
   as a direct child of `parent`. Permissive on unknown parents (returns
   `true`) so that future Atlassian node types do not break round-trips.
 - `adf_schema::validate_document(&doc)` — depth-first walker that returns
-  every nesting violation in document order, with `parent_type`,
-  `child_type`, and an index path from the document root.
+  every nesting **and** arity violation in document order, with
+  `parent_type`, `child_type` (or quantifier diagnostic), and an index path
+  from the document root.
+
+### Enforcement on writes
+
+The validator is wired into every JFM-driven write path so violations abort
+locally with a clear diagnosis instead of producing an opaque HTTP 500:
+
+- `adf_validated::ValidatedAdfDocument::try_new` is the only constructor for
+  the `ValidatedAdfDocument` newtype that the Confluence and JIRA write APIs
+  accept, making "I forgot to validate" a compile error.
+- `omni-dev confluence write` and `omni-dev confluence create` (and their
+  MCP tool equivalents) print every violation via the dry-run helper before
+  any network call.
+- On HTTP 500 from a Confluence write that did pass local validation, the
+  client re-runs `validate_document` against the submitted body and attaches
+  the first violation (with a hint from `adf_hints::hint_for`) to the error
+  via `AtlassianError::ApiRequestFailedWithDiagnosis`.
 
 ### Common pitfalls
 
@@ -267,21 +290,28 @@ When the desired nesting is rejected, common rewrites are:
 
 - `unsupportedBlock` and `unsupportedInline` (the runtime preservation
   wrappers behind the `adf-unsupported` fenced block) are accepted under any
-  parent by the validator, regardless of the parent's allowed-children set.
-  This preserves the round-trip guarantee for nodes the snapshot does not
-  yet model.
+  parent by the validator, regardless of the parent's allowed-children set,
+  and count toward the parent's arity. This preserves the round-trip
+  guarantee from [ADR-0020](../adrs/adr-0020.md) for nodes the snapshot
+  does not yet model.
 - Unknown parent node types are treated permissively: their subtrees are
   not walked. A future Atlassian node type therefore does not become a
   validation failure until its content model is added to the schema.
 
-### Soft-launch caveat
+### Coverage and limits
 
-The validator is library-only as of `SCHEMA_VERSION 52.9.5-2026-05-10`. The
-JFM-to-ADF converter does **not** yet reject invalid nestings before sending
-them to the API; this section is preventive guidance for authors and tools
-producing JFM. Wiring the validator into the write path is tracked
-separately, as is broader coverage (arity, mark whitelists, attribute-value
-constraints) beyond direct-child nesting.
+As of `SCHEMA_VERSION 52.9.5-2026-05-10`, the validator covers:
+
+- Allowed-children sets for every container node type.
+- Per-term quantifiers and content-term sequences (e.g. empty `bulletList`,
+  two-`media` `mediaSingle`, or a `layoutSection` with one column are all
+  reported as `AdfSchemaViolation::Arity`).
+
+Out of scope and not enforced:
+
+- Mark whitelists (which marks may apply to which nodes).
+- Attribute-value schemas (allowed values for `panel.type`, `status.color`,
+  etc.).
 
 ## Generic Directive System
 
