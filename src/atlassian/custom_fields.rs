@@ -3,7 +3,7 @@
 //!
 //! Input:
 //! - Frontmatter scalar map keyed by human name (from `custom_fields:` in JFM).
-//! - Body sections parsed via [`crate::atlassian::document::split_custom_sections`].
+//! - Body sections parsed via `crate::atlassian::document::split_custom_sections`.
 //! - [`EditMeta`] fetched for the target issue (or create target).
 //!
 //! Output: `{ field_id -> api_json }` ready to be merged into a PUT/POST.

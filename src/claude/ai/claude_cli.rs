@@ -5,10 +5,10 @@
 //! separate API key.
 //!
 //! Sandboxing:
-//! - `--tools ""` disables built-in tools (skipped when [`ALLOW_TOOLS_ENV_VAR`]
+//! - `--tools ""` disables built-in tools (skipped when `ALLOW_TOOLS_ENV_VAR`
 //!   is set).
 //! - `--strict-mcp-config` (with no accompanying `--mcp-config`) blocks MCP
-//!   server pickup from user settings (skipped when [`ALLOW_MCP_ENV_VAR`] is
+//!   server pickup from user settings (skipped when `ALLOW_MCP_ENV_VAR` is
 //!   set; the two escape hatches are independent).
 //! - `--setting-sources ""` skips user / project / local settings discovery.
 //! - `--disable-slash-commands` blocks skills.
@@ -151,7 +151,7 @@ impl ClaudeCliAiClient {
 
     /// Creates a client with explicit configuration. Primarily for tests.
     ///
-    /// `max_budget_usd` is set separately via [`with_max_budget_usd`] so
+    /// `max_budget_usd` is set separately via [`Self::with_max_budget_usd`] so
     /// that existing callers of this constructor do not need to update
     /// when new optional knobs are added.
     #[must_use]
@@ -246,7 +246,7 @@ impl ClaudeCliAiClient {
         self.build_command_with_schema(system_prompt, cwd, None)
     }
 
-    /// Variant of [`build_command`] that adds a `--json-schema <json>`
+    /// Variant of `build_command` (test-only) that adds a `--json-schema <json>`
     /// argument when `schema_json` is supplied. `claude -p` requires the
     /// schema verbatim on argv (file paths silently produce empty output);
     /// the caller is responsible for serialising the schema to a JSON
@@ -328,7 +328,7 @@ impl ClaudeCliAiClient {
             .await
     }
 
-    /// Variant of [`run`] that materialises any options on the request.
+    /// Variant of [`Self::run`] that materialises any options on the request.
     ///
     /// When `options.response_schema` is `Some`, the schema is serialised
     /// to a JSON string and passed inline via `--json-schema <json>`.
@@ -701,7 +701,7 @@ where
 /// On Unix, sends SIGKILL to the entire process group so any helpers
 /// the child forked (e.g. Node workers spawned by `claude -p`) die
 /// alongside the direct child. Pairs with the `process_group(0)` call
-/// in [`ClaudeCliAiClient::build_command`]. See issue #633.
+/// in `ClaudeCliAiClient::build_command_with_schema`. See issue #633.
 ///
 /// On non-Unix, falls back to `tokio::process::Child::kill`, which
 /// already terminates the process tree on Windows via

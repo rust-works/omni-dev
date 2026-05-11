@@ -1,5 +1,5 @@
 //! JSON renderer — pretty-printed serialisation of the full
-//! [`Transcript`](crate::transcript::source::Transcript) struct.
+//! [`Transcript`] struct.
 
 use crate::transcript::error::{Result, TranscriptError};
 use crate::transcript::source::Transcript;

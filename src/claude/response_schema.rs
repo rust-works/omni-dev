@@ -10,7 +10,7 @@
 //! 2. Add a constant identifier here and a getter that returns its
 //!    cached `serde_json::Value`.
 //! 3. The `tests::all_schemas_serialize` golden test will pick it up
-//!    automatically once it's listed in [`ALL_SCHEMAS`].
+//!    automatically once it's listed in `ALL_SCHEMAS`.
 
 use std::sync::OnceLock;
 
