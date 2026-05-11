@@ -370,6 +370,9 @@ react-app/
 scopes:
   - name: "ui"
     description: "User interface components"
+    examples:
+      - "ui: create dashboard layout with grid system"
+      - "ui: fix responsive layout issues on mobile devices"
     file_patterns:
       - "src/components/**"
       - "src/pages/**"
@@ -378,6 +381,9 @@ scopes:
 
   - name: "hooks"
     description: "React hooks and state management"
+    examples:
+      - "hooks: add useDashboardData hook for state management"
+      - "hooks: extract shared form state into useFormState"
     file_patterns:
       - "src/hooks/**"
       - "src/store/**"
@@ -385,6 +391,9 @@ scopes:
 
   - name: "services"
     description: "API services and external integrations"
+    examples:
+      - "services: add retry logic to API client"
+      - "services: integrate analytics tracking SDK"
     file_patterns:
       - "src/services/**"
       - "src/api/**"
@@ -441,13 +450,19 @@ ml-project/
 scopes:
   - name: "data"
     description: "Data processing and ETL"
+    examples:
+      - "data: implement advanced feature engineering pipeline"
+      - "data: add missing value imputation with iterative approach"
     file_patterns:
       - "src/data/**"
       - "data_pipeline/**"
       - "**/preprocessing.py"
 
   - name: "models"
-    description: "Machine learning models"  
+    description: "Machine learning models"
+    examples:
+      - "models: add Random Forest classifier with ensemble"
+      - "models: optimize hyperparameters with grid search"
     file_patterns:
       - "src/models/**"
       - "models/**"
@@ -456,6 +471,9 @@ scopes:
 
   - name: "analysis"
     description: "Data analysis and visualization"
+    examples:
+      - "analysis: add comprehensive model performance visualization"
+      - "analysis: build confusion matrix with class-wise metrics"
     file_patterns:
       - "src/analysis/**"
       - "notebooks/**"
@@ -463,6 +481,9 @@ scopes:
 
   - name: "pipeline"
     description: "ML pipeline and orchestration"
+    examples:
+      - "pipeline: add training-to-serving workflow orchestration"
+      - "pipeline: schedule periodic model retraining job"
     file_patterns:
       - "src/pipeline/**"
       - "**/workflow.py"
@@ -556,32 +577,53 @@ scopes:
   # Services
   - name: "user-service"
     description: "User management microservice"
+    examples:
+      - "user-service: add notification preferences management"
+      - "user-service: enforce email-verification on signup"
     file_patterns: ["services/user-service/**"]
 
   - name: "order-service"
     description: "Order processing microservice"
+    examples:
+      - "order-service: emit structured events for notifications"
+      - "order-service: add idempotency key handling"
     file_patterns: ["services/order-service/**"]
 
   - name: "payment-service"
     description: "Payment processing microservice"
+    examples:
+      - "payment-service: integrate Stripe webhook handler"
+      - "payment-service: add refund reconciliation job"
     file_patterns: ["services/payment-service/**"]
 
   # Frontend Apps
   - name: "admin-portal"
     description: "Administrative web interface"
+    examples:
+      - "admin-portal: add user audit log viewer"
+      - "admin-portal: improve role assignment UI"
     file_patterns: ["frontend/admin-portal/**"]
 
   - name: "customer-app"
     description: "Customer-facing web application"
+    examples:
+      - "customer-app: add real-time notification display"
+      - "customer-app: optimize first-paint for product pages"
     file_patterns: ["frontend/customer-app/**"]
 
   # Shared Infrastructure
   - name: "shared"
     description: "Shared libraries and utilities"
+    examples:
+      - "shared: add notification event types and schemas"
+      - "shared: extract common pagination helpers"
     file_patterns: ["shared/**"]
 
   - name: "infra"
     description: "Infrastructure and deployment"
+    examples:
+      - "infra: configure notification service deployment"
+      - "infra: tune autoscaling for order-service"
     file_patterns: ["infrastructure/**", "*.yaml", "Dockerfile*"]
 ```
 
@@ -865,10 +907,16 @@ Create scalable foundation for rapid iteration:
 ```yaml
 scopes:
   - name: "components"
+    description: "Reusable UI components"
+    examples: ["components: add Button variants", "components: fix Modal focus trap"]
     file_patterns: ["src/components/**/*.tsx"]
-  - name: "hooks" 
+  - name: "hooks"
+    description: "Custom React hooks"
+    examples: ["hooks: add useDebounce", "hooks: fix stale closure in useFetch"]
     file_patterns: ["src/hooks/**/*.ts"]
   - name: "pages"
+    description: "Page-level route components"
+    examples: ["pages: add settings page", "pages: improve dashboard load time"]
     file_patterns: ["src/pages/**/*.tsx"]
 ```
 
@@ -877,10 +925,16 @@ scopes:
 ```yaml
 scopes:
   - name: "api"
+    description: "DRF views and serializers"
+    examples: ["api: add user search endpoint", "api: paginate orders listing"]
     file_patterns: ["*/api/**", "*/serializers.py", "*/views.py"]
   - name: "models"
+    description: "ORM models and migrations"
+    examples: ["models: add Order.status index", "models: backfill user timezone"]
     file_patterns: ["*/models.py", "migrations/**"]
   - name: "auth"
+    description: "Authentication and permissions"
+    examples: ["auth: enforce 2FA on admin login", "auth: add per-object permissions"]
     file_patterns: ["*/authentication.py", "*/permissions.py"]
 ```
 
@@ -889,10 +943,16 @@ scopes:
 ```yaml
 scopes:
   - name: "handlers"
+    description: "HTTP route handlers"
+    examples: ["handlers: add /health endpoint", "handlers: return 422 on invalid payload"]
     file_patterns: ["src/handlers/**", "src/routes/**"]
   - name: "models"
+    description: "Domain models and schema"
+    examples: ["models: derive Serialize for User", "models: split Order into status enum"]
     file_patterns: ["src/models/**", "src/schema.rs"]
   - name: "middleware"
+    description: "Tower middleware layers"
+    examples: ["middleware: add request-id propagation", "middleware: log slow requests"]
     file_patterns: ["src/middleware/**"]
 ```
 
@@ -910,7 +970,7 @@ The key is proper configuration and understanding your project's context!
 1. **Set up project context** - Always configure `.omni-dev/scopes.yaml`
 2. **Use descriptive file patterns** - Help omni-dev understand your architecture
 3. **Tune concurrency** - Use `--concurrency` for large commit ranges
-4. **Review before applying** - Use `--save-only` for important changes
+4. **Save for review** - use `--save-only <FILE>` to write the proposed amendments to a file without applying them
 5. **Iterate and improve** - Update configuration based on results
 
 For more detailed guidance, see:
@@ -918,3 +978,18 @@ For more detailed guidance, see:
 - [User Guide](user-guide.md) - Complete usage instructions
 - [Configuration Guide](configuration.md) - Setup details
 - [Troubleshooting](troubleshooting.md) - Common issues and solutions
+
+## Last Verified
+
+*Last audited: 2026-05-11 (omni-dev v0.26.0).*
+
+- All `omni-dev` command examples in this document parse against the current
+  CLI (`omni-dev git commit message twiddle ...` with `--use-context`,
+  `--concurrency`, `--save-only`).
+- All `.omni-dev/scopes.yaml` blocks satisfy the `ScopeDefinition` schema
+  defined in [src/data/context.rs](../src/data/context.rs)
+  (`name`, `description`, `examples`, `file_patterns` — all required).
+- No AI model identifiers are referenced in this document; for the current
+  model registry run `omni-dev config models show`.
+
+When updating any example block, re-run the audit and refresh the date above.
