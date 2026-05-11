@@ -715,6 +715,10 @@ Logs go to **stderr** because stdin/stdout are reserved for MCP framing.
 
 ## `claude-cli` Backend Issues
 
+See the [AI Backends Guide](ai-backends.md) for setup, sandbox semantics, and
+the full inventory of `OMNI_DEV_CLAUDE_CLI_*` knobs. The cases below cover
+the most common runtime errors.
+
 ### Error: `the assistant tried to use a tool but tools are disabled`
 
 The `claude-cli` backend runs the nested Claude session with `--tools ""`
