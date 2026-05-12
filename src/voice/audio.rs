@@ -10,8 +10,14 @@
 //! level).
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{Sample, SampleFormat, Stream, StreamConfig};
+use ringbuf::traits::{Consumer, Producer, Split};
+use ringbuf::{HeapCons, HeapRb};
 
 /// Source of raw interleaved f32 audio samples at a fixed sample rate and
 /// channel count.
@@ -21,9 +27,13 @@ use anyhow::{Context, Result};
 /// L/R/L/R/…). `None` signals end-of-stream — the source is exhausted
 /// (file end, cpal stream stopped, …) and will not produce more samples.
 ///
-/// Implementations must be `Send` so the pipeline can drive them from a
-/// background thread.
-pub trait AudioSource: Send {
+/// The trait is intentionally not `Send`: on macOS, cpal's `Stream` is
+/// not `Send` (it holds a CoreAudio `AudioUnit` containing raw pointers),
+/// so requiring `Send` here would force `CpalAudioSource` into an
+/// awkward indirection. The capture pipeline runs synchronously on the
+/// owning thread — the cpal callback runs on cpal's own audio thread and
+/// communicates through a lock-free SPSC ring buffer.
+pub trait AudioSource {
     /// Returns the next chunk of interleaved samples, or `None` when the
     /// source is exhausted.
     fn next_chunk(&mut self) -> Option<Vec<f32>>;
@@ -133,6 +143,189 @@ fn i32_pcm_scale(bits_per_sample: u16) -> f32 {
     // declared bit depth, so the divisor is always `2^(bits-1)`.
     let shift = bits_per_sample.saturating_sub(1);
     (1u64 << shift) as f32
+}
+
+/// Maximum samples per [`AudioSource::next_chunk`] call for `CpalAudioSource`.
+/// Sized to amortise the SPSC drain cost while staying well below the
+/// resampler's chunk size (so each `next_chunk` produces at most one
+/// resampler chunk's worth of work).
+const CPAL_DRAIN_CHUNK_SAMPLES: usize = 2048;
+
+/// How long [`AudioSource::next_chunk`] sleeps when the ring buffer is
+/// empty before retrying. Short enough that ~5 s of idle silence is
+/// detected within one window (100 ms) of slack.
+const CPAL_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// One-second ring-buffer at the worst common configuration we expect
+/// (192 kHz × 8 channels). Sized in samples (not frames) because the cpal
+/// callback delivers interleaved samples.
+const CPAL_RING_CAPACITY_SAMPLES: usize = 192_000 * 8;
+
+/// Production [`AudioSource`] backed by a `cpal` input stream.
+///
+/// Opens the default input device (or the named device matching `--device`),
+/// builds a stream at the device's default config, and feeds the f32-coerced
+/// samples through a lock-free SPSC ring buffer to the consumer side. The
+/// cpal callback runs on cpal's own audio thread and must never block;
+/// resampling/idle detection/writing all happen on the consumer side.
+pub struct CpalAudioSource {
+    consumer: HeapCons<f32>,
+    sample_rate: u32,
+    channels: u16,
+    stream_error: Arc<Mutex<Option<String>>>,
+    /// Held to keep the cpal stream alive. Dropped before the writer is
+    /// finalised so all in-flight callback samples have flushed through
+    /// the ring buffer.
+    _stream: Stream,
+}
+
+impl CpalAudioSource {
+    /// Opens the default input device (or the device matching
+    /// `device_name`, if provided) and starts a stream at its native rate
+    /// and channel count.
+    ///
+    /// `device_name` matching is exact (case-sensitive) against
+    /// `Device::name()` — cpal reports platform-native names which differ
+    /// across macOS/Linux/Windows, so users get an error listing every
+    /// detected device when no match is found.
+    pub fn new(device_name: Option<&str>) -> Result<Self> {
+        let host = cpal::default_host();
+        let device = match device_name {
+            None => host
+                .default_input_device()
+                .ok_or_else(|| anyhow!("No default input device available on this host"))?,
+            Some(name) => find_input_device(&host, name)?,
+        };
+        let resolved_name = device
+            .name()
+            .unwrap_or_else(|_| "<unnamed device>".to_string());
+        let supported = device
+            .default_input_config()
+            .with_context(|| format!("Failed to query default input config for {resolved_name}"))?;
+        let sample_format = supported.sample_format();
+        let config: StreamConfig = supported.config();
+        let sample_rate = config.sample_rate.0;
+        let channels = config.channels;
+
+        let rb = HeapRb::<f32>::new(CPAL_RING_CAPACITY_SAMPLES);
+        let (mut producer, consumer) = rb.split();
+        let stream_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let error_clone = stream_error.clone();
+        let err_fn = move |err: cpal::StreamError| {
+            if let Ok(mut slot) = error_clone.lock() {
+                *slot = Some(err.to_string());
+            }
+        };
+
+        let stream = match sample_format {
+            SampleFormat::F32 => device
+                .build_input_stream(
+                    &config,
+                    move |data: &[f32], _| {
+                        producer.push_slice(data);
+                    },
+                    err_fn,
+                    None,
+                )
+                .with_context(|| format!("Failed to build f32 input stream on {resolved_name}"))?,
+            SampleFormat::I16 => device
+                .build_input_stream(
+                    &config,
+                    move |data: &[i16], _| {
+                        for sample in data {
+                            let _ = producer.try_push(sample.to_float_sample());
+                        }
+                    },
+                    err_fn,
+                    None,
+                )
+                .with_context(|| format!("Failed to build i16 input stream on {resolved_name}"))?,
+            SampleFormat::U16 => device
+                .build_input_stream(
+                    &config,
+                    move |data: &[u16], _| {
+                        for sample in data {
+                            let _ = producer.try_push(sample.to_float_sample());
+                        }
+                    },
+                    err_fn,
+                    None,
+                )
+                .with_context(|| format!("Failed to build u16 input stream on {resolved_name}"))?,
+            other => anyhow::bail!(
+                "Unsupported cpal sample format {other:?} on {resolved_name} \
+                 (only F32, I16, U16 are wired up — file an issue if you need others)"
+            ),
+        };
+        stream
+            .play()
+            .with_context(|| format!("Failed to start input stream on {resolved_name}"))?;
+
+        Ok(Self {
+            consumer,
+            sample_rate,
+            channels,
+            stream_error,
+            _stream: stream,
+        })
+    }
+
+    fn take_stream_error(&self) -> Option<String> {
+        self.stream_error.lock().ok().and_then(|mut s| s.take())
+    }
+}
+
+impl AudioSource for CpalAudioSource {
+    fn next_chunk(&mut self) -> Option<Vec<f32>> {
+        if let Some(err) = self.take_stream_error() {
+            tracing::warn!("cpal stream error: {err}");
+            return None;
+        }
+        // Poll until samples arrive — cpal callbacks deliver in bursts at
+        // the device's buffer cadence. Returning empty Vecs every poll
+        // would burn CPU on the consumer side without producing useful
+        // work.
+        let mut buf = vec![0.0_f32; CPAL_DRAIN_CHUNK_SAMPLES];
+        loop {
+            let popped = self.consumer.pop_slice(&mut buf);
+            if popped > 0 {
+                buf.truncate(popped);
+                return Some(buf);
+            }
+            if let Some(err) = self.take_stream_error() {
+                tracing::warn!("cpal stream error: {err}");
+                return None;
+            }
+            std::thread::sleep(CPAL_POLL_INTERVAL);
+        }
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+}
+
+fn find_input_device(host: &cpal::Host, name: &str) -> Result<<cpal::Host as HostTrait>::Device> {
+    let devices = host
+        .input_devices()
+        .context("Failed to enumerate input devices")?;
+    let mut available: Vec<String> = Vec::new();
+    for device in devices {
+        let device_name = device
+            .name()
+            .unwrap_or_else(|_| "<unnamed device>".to_string());
+        if device_name == name {
+            return Ok(device);
+        }
+        available.push(device_name);
+    }
+    Err(anyhow!(
+        "Input device {name:?} not found. Available: {available:?}"
+    ))
 }
 
 #[cfg(test)]
@@ -248,5 +441,37 @@ mod tests {
         assert_eq!(src.next_chunk(), Some(vec![0.2]));
         assert_eq!(src.next_chunk(), Some(vec![0.3]));
         assert!(src.next_chunk().is_none());
+    }
+
+    #[test]
+    #[ignore = "requires a working audio input device (local hardware only)"]
+    fn cpal_default_input_produces_samples() -> Result<()> {
+        let mut src = CpalAudioSource::new(None)?;
+        assert!(src.sample_rate() > 0);
+        assert!(src.channels() > 0);
+        let chunk = src
+            .next_chunk()
+            .expect("default input should produce at least one chunk");
+        assert!(!chunk.is_empty(), "default input chunk should not be empty");
+        Ok(())
+    }
+
+    #[test]
+    fn cpal_unknown_device_lists_alternatives() {
+        let result = CpalAudioSource::new(Some(
+            "this-device-name-definitely-does-not-exist-on-anyone-system",
+        ));
+        let Err(err) = result else {
+            panic!("expected unknown device to error");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not found"),
+            "error message should say 'not found': {msg}"
+        );
+        assert!(
+            msg.contains("Available"),
+            "error message should list available devices: {msg}"
+        );
     }
 }
