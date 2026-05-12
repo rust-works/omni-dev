@@ -27,6 +27,7 @@ which tags apply to the changes and search this file for those tags. Each rule h
 | Suppressing a lint or considering `unsafe`       | `code-style`, `unsafe`                   |
 | Writing or updating an ADR                       | `adrs`                                   |
 | Adding an MCP tool, resource, or param struct    | `api-design`, `module-organization`, `testing` |
+| Adding or modifying a docs/plan/ file            | `documentation`, `adrs`                  |
 | Reviewing code for style compliance              | All tags relevant to the changed code    |
 
 ---
@@ -41,7 +42,7 @@ A new convention needs to be added to this style guide.
 
 ### Guidance
 
-Assign the next sequential ID (currently next is `STYLE-0027`) and include:
+Assign the next sequential ID (currently next is `STYLE-0028`) and include:
 
 1. A **Tags** line immediately after the heading — a comma-separated list of category labels
    from the tag vocabulary below.
@@ -1373,3 +1374,40 @@ schema predictable; shared error mapping keeps diagnostics legible across
 tools; router splitting keeps modules small and testable; the paired
 unit+integration test requirement means a regression in protocol wiring is
 caught without requiring a live Claude Desktop to reproduce.
+
+---
+
+## STYLE-0027: Plan-file status header and ADR cross-links
+
+**Tags:** `documentation`, `adrs`
+
+### Situation
+
+Adding or substantially editing a file in [`docs/plan/`](plan/).
+
+### Guidance
+
+1. **Status header.** Immediately after the `# Title` heading, add a `**Status:** …` line using one of these four canonical tags:
+
+   | Tag             | Meaning                                                                                          |
+   |-----------------|--------------------------------------------------------------------------------------------------|
+   | `Built`         | The design has shipped. The doc may still be useful as a reference but is not a roadmap.         |
+   | `In Progress`   | Some phases shipped, others ongoing. Specify which phase is current.                             |
+   | `Aspirational`  | Describes intent that is not yet started or has been superseded by a different approach.         |
+   | `Historical`    | Written for context that no longer matches current architecture; kept for institutional memory.  |
+
+   A short qualifier after an em-dash (`— canonical reference`, `— Phase 3 not started`) is encouraged when it adds signal.
+
+2. **ADR cross-links.** When one or more ADRs describe the same decisions, add an `**ADRs:**` line immediately after the Status line, listing each ADR as a relative link separated by ` · ` (middle dot, surrounded by spaces). Example:
+
+   ```markdown
+   **ADRs:** [ADR-0002](../adrs/adr-0002.md) · [ADR-0014](../adrs/adr-0014.md)
+   ```
+
+3. **When to retire.** Once a plan's decisions are captured in one or more ADRs, change its status to `Built` (with ADR cross-links) or `Historical` rather than deleting it — preserving the doc keeps prior reasoning discoverable.
+
+4. **When to promote.** When a plan's high-level decisions stabilise, copy the decision and its rationale into a new ADR (see [STYLE-0022](#style-0022-adr-format)) and update the plan's status to `Built` with a cross-link.
+
+### Motivation
+
+A plan directory that mixes shipped, in-progress, and superseded content with no signalling forces every new contributor to read every file and cross-check the codebase before they can act on it. A one-line status header costs the author nothing and gives the reader an immediate orientation; ADR cross-links make the canonical decision discoverable.

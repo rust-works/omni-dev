@@ -1,5 +1,7 @@
 # Project Plan: Comprehensive Help Command (`help all`)
 
+**Status:** Built
+
 ## Overview
 Implement a `help all` subcommand that displays the complete CLI help hierarchy for omni-dev in a single output, eliminating the need to run multiple help commands.
 

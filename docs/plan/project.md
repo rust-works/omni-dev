@@ -1,5 +1,7 @@
 # Project Plan: omni-dev CLI Git Tools
 
+**Status:** Historical — describes the initial CLI design before Atlassian, MCP, and AI providers existed; kept for institutional memory.
+
 ## Overview
 
 This project implements a CLI tool that provides the functionality of the existing `.claude/commands/twiddle-msg` bash script but with a Rust-based CLI interface. The tool will support two main subcommands:

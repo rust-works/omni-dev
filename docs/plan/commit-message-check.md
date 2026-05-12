@@ -1,5 +1,7 @@
 # Plan: `omni-dev git commit message check` Command
 
+**Status:** Built
+
 ## Overview
 
 Add a new `omni-dev git commit message check` command that analyzes commit messages against the actual code changes (diffs) and **project-defined commit guidelines**, producing a report of issues without modifying any commits.
