@@ -29,14 +29,33 @@ const MAX_RETRIES: u32 = 3;
 /// Default retry delay in seconds when no `Retry-After` header is present.
 const DEFAULT_RETRY_DELAY_SECS: u64 = 2;
 
-/// HTTP client for Atlassian Cloud REST APIs.
+/// Shared HTTP client for Atlassian Cloud REST APIs.
+///
+/// Backs every JIRA, Confluence, and Agile helper exposed by this crate.
+/// Construct directly via [`AtlassianClient::new`] (instance URL + email + API
+/// token) or, more commonly, via [`AtlassianClient::from_credentials`] which
+/// accepts an [`AtlassianCredentials`](crate::atlassian::auth::AtlassianCredentials)
+/// resolved from the `ATLASSIAN_INSTANCE_URL`, `ATLASSIAN_EMAIL`, and
+/// `ATLASSIAN_API_TOKEN` environment variables (falling back to
+/// `~/.omni-dev/settings.json`) by
+/// [`load_credentials`](crate::atlassian::auth::load_credentials).
+///
+/// Authenticates every request with HTTP Basic auth: a precomputed
+/// `Authorization: Basic <base64(email:api_token)>` header is attached to all
+/// outbound calls. Requests time out after 30s and automatically retry up to
+/// three times on HTTP 429, honoring any `Retry-After` header.
 pub struct AtlassianClient {
     client: Client,
     instance_url: String,
     auth_header: String,
 }
 
-/// JIRA issue data returned from the REST API.
+/// JIRA issue data returned by `GET /rest/api/3/issue/{key}`.
+///
+/// The [`custom_fields`](Self::custom_fields) vector is selection-gated:
+/// it is empty under the default [`FieldSelection::Standard`] and only
+/// populated when the request used [`FieldSelection::Named`] or
+/// [`FieldSelection::All`].
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraIssue {
     /// Issue key (e.g., "PROJ-123").
@@ -70,6 +89,11 @@ pub struct JiraIssue {
 }
 
 /// Selector for which fields to request when fetching a JIRA issue.
+///
+/// Controls both the `fields` query parameter sent to
+/// `GET /rest/api/3/issue/{key}` and which fields end up populated on the
+/// returned [`JiraIssue`]. In particular, [`JiraIssue::custom_fields`] is only
+/// populated for [`Self::Named`] and [`Self::All`].
 #[derive(Debug, Clone, Default)]
 pub enum FieldSelection {
     /// Only the standard fields omni-dev tracks (summary, description,
@@ -87,6 +111,9 @@ pub enum FieldSelection {
 }
 
 /// A JIRA custom field value keyed by both its stable ID and human name.
+///
+/// Embedded in [`JiraIssue::custom_fields`]; populated only when the issue was
+/// fetched with [`FieldSelection::Named`] or [`FieldSelection::All`].
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraCustomField {
     /// Field ID (e.g., "customfield_19300"). Stable across renames.
@@ -143,7 +170,8 @@ impl EditMetaField {
     }
 }
 
-/// Response from the JIRA `/myself` endpoint.
+/// A JIRA user, returned by `GET /rest/api/3/myself` and embedded in
+/// [`JiraWatcherList::watchers`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JiraUser {
     /// User display name.
@@ -159,7 +187,7 @@ pub struct JiraUser {
     pub account_id: String,
 }
 
-/// Result from listing watchers on a JIRA issue.
+/// Result from `GET /rest/api/3/issue/{key}/watchers`.
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraWatcherList {
     /// Watchers on the issue.
@@ -169,7 +197,7 @@ pub struct JiraWatcherList {
     pub watch_count: u32,
 }
 
-/// Result from creating a JIRA issue via the REST API.
+/// Response from `POST /rest/api/3/issue`.
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraCreatedIssue {
     /// Issue key (e.g., "PROJ-124").
@@ -180,7 +208,10 @@ pub struct JiraCreatedIssue {
     pub self_url: String,
 }
 
-/// Result from a JIRA JQL search.
+/// Paginated result from a JQL search (`POST /rest/api/3/search/jql`).
+///
+/// `total` is the aggregate hit count across all pages; `issues` holds the
+/// hits returned by the helper (auto-paginated up to the caller's limit).
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraSearchResult {
     /// Matching issues.
@@ -190,7 +221,9 @@ pub struct JiraSearchResult {
     pub total: u32,
 }
 
-/// A Confluence search result.
+/// A single hit from a Confluence CQL search (`GET /wiki/rest/api/content/search`).
+///
+/// See [`ConfluenceSearchResults`] for the paginated wrapper.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfluenceSearchResult {
     /// Page ID.
@@ -201,7 +234,8 @@ pub struct ConfluenceSearchResult {
     pub space_key: String,
 }
 
-/// Result from a Confluence CQL search.
+/// Paginated wrapper around [`ConfluenceSearchResult`] hits from
+/// `GET /wiki/rest/api/content/search`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfluenceSearchResults {
     /// Matching pages.
@@ -210,7 +244,9 @@ pub struct ConfluenceSearchResults {
     pub total: u32,
 }
 
-/// A Confluence user in search results.
+/// A single user hit from `GET /wiki/rest/api/search/user`.
+///
+/// See [`ConfluenceUserSearchResults`] for the paginated wrapper.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfluenceUserSearchResult {
     /// Account ID (unique identifier). Absent for some user types such as
@@ -224,7 +260,8 @@ pub struct ConfluenceUserSearchResult {
     pub email: Option<String>,
 }
 
-/// Result from searching Confluence users.
+/// Paginated wrapper around [`ConfluenceUserSearchResult`] hits from
+/// `GET /wiki/rest/api/search/user`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfluenceUserSearchResults {
     /// Matching users.
@@ -233,9 +270,10 @@ pub struct ConfluenceUserSearchResults {
     pub total: u32,
 }
 
-/// A JIRA user in search results.
+/// A single user hit from `GET /rest/api/3/user/search`.
 ///
-/// JIRA's `/rest/api/3/user/search` endpoint may omit `emailAddress` and
+/// See [`JiraUserSearchResults`] for the wrapper. JIRA's
+/// `/rest/api/3/user/search` endpoint may omit `emailAddress` and
 /// `displayName` for tenants where the operating account lacks the
 /// privacy-controlled fields permission, so both are optional. `accountId`
 /// is the canonical identifier and is always present for atlassian-account
@@ -257,7 +295,11 @@ pub struct JiraUserSearchResult {
     pub account_type: Option<String>,
 }
 
-/// Result from searching JIRA users.
+/// Wrapper around [`JiraUserSearchResult`] hits from
+/// `GET /rest/api/3/user/search`.
+///
+/// Unlike the JQL search wrappers, the user-search endpoint does not return a
+/// total across all pages; `count` is therefore `users.len()`.
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraUserSearchResults {
     /// Matching users.
@@ -267,7 +309,7 @@ pub struct JiraUserSearchResults {
     pub count: u32,
 }
 
-/// A JIRA issue comment.
+/// A JIRA issue comment returned by `GET /rest/api/3/issue/{key}/comment`.
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraComment {
     /// Comment ID.
@@ -283,7 +325,11 @@ pub struct JiraComment {
     pub updated: Option<String>,
 }
 
-/// Visibility restriction kind for a JIRA comment.
+/// Visibility restriction kind sent in the body of
+/// `POST /rest/api/3/issue/{key}/comment` (and the edit endpoint).
+///
+/// Note: this is a write-path type — it is *sent* to JIRA when scoping a
+/// comment, not parsed from comment-read responses.
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JiraVisibilityType {
@@ -293,7 +339,10 @@ pub enum JiraVisibilityType {
     Role,
 }
 
-/// Visibility restriction applied to a JIRA comment.
+/// Visibility restriction applied when posting or editing a JIRA comment.
+///
+/// Serialised as the `visibility` object on the request body of
+/// `POST /rest/api/3/issue/{key}/comment` (and the edit endpoint).
 #[derive(Debug, Clone)]
 pub struct JiraVisibility {
     /// Whether the restriction targets a group or a project role.
@@ -312,7 +361,9 @@ impl Serialize for JiraVisibility {
     }
 }
 
-/// A JIRA project.
+/// A JIRA project hit from `GET /rest/api/3/project/search`.
+///
+/// See [`JiraProjectList`] for the paginated wrapper.
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraProject {
     /// Project ID.
@@ -327,7 +378,8 @@ pub struct JiraProject {
     pub lead: Option<String>,
 }
 
-/// Result from listing JIRA projects.
+/// Paginated wrapper around [`JiraProject`] hits from
+/// `GET /rest/api/3/project/search`.
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraProjectList {
     /// Projects returned.
@@ -336,7 +388,7 @@ pub struct JiraProjectList {
     pub total: u32,
 }
 
-/// A JIRA field definition.
+/// A JIRA field definition returned by `GET /rest/api/3/field`.
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraField {
     /// Field ID (e.g., "summary", "customfield_10001").
@@ -349,7 +401,8 @@ pub struct JiraField {
     pub schema_type: Option<String>,
 }
 
-/// An option value for a JIRA custom field.
+/// An option value for a single-select / multi-select JIRA custom field,
+/// returned by `GET /rest/api/3/field/{id}/context/{ctxId}/option`.
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraFieldOption {
     /// Option ID.
@@ -358,7 +411,9 @@ pub struct JiraFieldOption {
     pub value: String,
 }
 
-/// A JIRA agile board.
+/// A JIRA agile board hit from `GET /rest/agile/1.0/board`.
+///
+/// See [`AgileBoardList`] for the paginated wrapper.
 #[derive(Debug, Clone, Serialize)]
 pub struct AgileBoard {
     /// Board ID.
@@ -371,7 +426,8 @@ pub struct AgileBoard {
     pub project_key: Option<String>,
 }
 
-/// Result from listing agile boards.
+/// Paginated wrapper around [`AgileBoard`] hits from
+/// `GET /rest/agile/1.0/board`.
 #[derive(Debug, Clone, Serialize)]
 pub struct AgileBoardList {
     /// Boards returned.
@@ -380,7 +436,9 @@ pub struct AgileBoardList {
     pub total: u32,
 }
 
-/// A JIRA agile sprint.
+/// A JIRA agile sprint hit from `GET /rest/agile/1.0/board/{boardId}/sprint`.
+///
+/// See [`AgileSprintList`] for the paginated wrapper.
 #[derive(Debug, Clone, Serialize)]
 pub struct AgileSprint {
     /// Sprint ID.
@@ -397,7 +455,8 @@ pub struct AgileSprint {
     pub goal: Option<String>,
 }
 
-/// Result from listing agile sprints.
+/// Paginated wrapper around [`AgileSprint`] hits from
+/// `GET /rest/agile/1.0/board/{boardId}/sprint`.
 #[derive(Debug, Clone, Serialize)]
 pub struct AgileSprintList {
     /// Sprints returned.
@@ -406,7 +465,11 @@ pub struct AgileSprintList {
     pub total: u32,
 }
 
-/// A JIRA project version (release version).
+/// A JIRA project version (release version), returned by
+/// `GET /rest/api/3/project/{projectIdOrKey}/version` and created via
+/// `POST /rest/api/3/version`.
+///
+/// See [`JiraProjectVersionList`] for the paginated wrapper.
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraProjectVersion {
     /// Version ID.
@@ -427,7 +490,8 @@ pub struct JiraProjectVersion {
     pub start_date: Option<String>,
 }
 
-/// Result from listing JIRA project versions.
+/// Paginated wrapper around [`JiraProjectVersion`] hits from
+/// `GET /rest/api/3/project/{projectIdOrKey}/version`.
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraProjectVersionList {
     /// Versions returned.
@@ -436,7 +500,8 @@ pub struct JiraProjectVersionList {
     pub total: u32,
 }
 
-/// A JIRA issue changelog entry.
+/// A JIRA issue changelog entry, returned in the `changelog.histories` array
+/// of `GET /rest/api/3/issue/{key}?expand=changelog`.
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraChangelogEntry {
     /// Entry ID.
@@ -449,7 +514,7 @@ pub struct JiraChangelogEntry {
     pub items: Vec<JiraChangelogItem>,
 }
 
-/// A single field change in a changelog entry.
+/// A single field change embedded in a [`JiraChangelogEntry`].
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraChangelogItem {
     /// Field name that changed.
@@ -460,7 +525,7 @@ pub struct JiraChangelogItem {
     pub to_string: Option<String>,
 }
 
-/// A JIRA issue link type.
+/// A JIRA issue link type returned by `GET /rest/api/3/issueLinkType`.
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraLinkType {
     /// Link type ID.
@@ -473,7 +538,9 @@ pub struct JiraLinkType {
     pub outward: String,
 }
 
-/// A link on a JIRA issue.
+/// A link on a JIRA issue, as it appears in the `issuelinks` field of
+/// `GET /rest/api/3/issue/{key}`. Created via `POST /rest/api/3/issueLink` and
+/// removed via `DELETE /rest/api/3/issueLink/{id}`.
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraIssueLink {
     /// Link ID (used for removal).
@@ -488,7 +555,11 @@ pub struct JiraIssueLink {
     pub linked_issue_summary: String,
 }
 
-/// A JIRA issue attachment.
+/// A JIRA issue attachment, embedded in the `attachment` field of
+/// `GET /rest/api/3/issue/{key}`.
+///
+/// Uploaded via `POST /rest/api/3/issue/{key}/attachments` and removed via
+/// `DELETE /rest/api/3/attachment/{id}`.
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraAttachment {
     /// Attachment ID.
@@ -503,7 +574,9 @@ pub struct JiraAttachment {
     pub content_url: String,
 }
 
-/// A JIRA workflow transition.
+/// A JIRA workflow transition returned by
+/// `GET /rest/api/3/issue/{key}/transitions`. Executed via
+/// `POST /rest/api/3/issue/{key}/transitions`.
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraTransition {
     /// Transition ID.
@@ -518,7 +591,8 @@ pub struct JiraTransition {
     pub has_screen: Option<bool>,
 }
 
-/// Destination status of a JIRA workflow transition.
+/// Destination status of a JIRA workflow transition, embedded in
+/// [`JiraTransition::to_status`].
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraTransitionToStatus {
     /// Status ID.
@@ -530,7 +604,8 @@ pub struct JiraTransitionToStatus {
     pub category: Option<String>,
 }
 
-/// A pull request from Jira's DevStatus API.
+/// A pull request entry from Jira's DevStatus detail endpoint
+/// (`GET /rest/dev-status/1.0/issue/detail?issueId={id}&applicationType=…&dataType=pullrequest`).
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraDevPullRequest {
     /// PR identifier (e.g., "#2174").
@@ -561,7 +636,9 @@ pub struct JiraDevPullRequest {
     pub last_update: Option<String>,
 }
 
-/// A commit from Jira's DevStatus API.
+/// A commit entry from Jira's DevStatus detail endpoint
+/// (`dataType=repository`), embedded in [`JiraDevRepository::commits`] and
+/// [`JiraDevBranch::last_commit`].
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraDevCommit {
     /// Full commit SHA.
@@ -584,7 +661,8 @@ pub struct JiraDevCommit {
     pub merge: bool,
 }
 
-/// A branch from Jira's DevStatus API.
+/// A branch entry from Jira's DevStatus detail endpoint
+/// (`dataType=branch`).
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraDevBranch {
     /// Branch name.
@@ -601,7 +679,8 @@ pub struct JiraDevBranch {
     pub last_commit: Option<JiraDevCommit>,
 }
 
-/// A repository from Jira's DevStatus API.
+/// A repository entry from Jira's DevStatus detail endpoint
+/// (`dataType=repository`).
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraDevRepository {
     /// Repository name (e.g., "org/repo").
@@ -613,7 +692,11 @@ pub struct JiraDevRepository {
     pub commits: Vec<JiraDevCommit>,
 }
 
-/// Development status information for a Jira issue.
+/// Aggregated development data for a Jira issue, assembled from the DevStatus
+/// detail endpoint (`GET /rest/dev-status/1.0/issue/detail`) across the PR,
+/// branch, and repository data types.
+///
+/// See [`JiraDevStatusSummary`] for the high-level count-only summary.
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraDevStatus {
     /// Linked pull requests.
@@ -627,7 +710,9 @@ pub struct JiraDevStatus {
     pub repositories: Vec<JiraDevRepository>,
 }
 
-/// Summary counts for a category of development status.
+/// Per-category count from Jira's DevStatus summary endpoint
+/// (`GET /rest/dev-status/1.0/issue/summary?issueId={id}`). Embedded in
+/// [`JiraDevStatusSummary`].
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraDevStatusCount {
     /// Number of items.
@@ -636,7 +721,9 @@ pub struct JiraDevStatusCount {
     pub providers: Vec<String>,
 }
 
-/// High-level development status summary for a Jira issue.
+/// High-level dev-status summary from
+/// `GET /rest/dev-status/1.0/issue/summary?issueId={id}`. Count-only — use
+/// [`JiraDevStatus`] when the individual PRs / branches / repos are needed.
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraDevStatusSummary {
     /// Pull request summary.
@@ -647,7 +734,8 @@ pub struct JiraDevStatusSummary {
     pub repository: JiraDevStatusCount,
 }
 
-/// A JIRA issue worklog entry.
+/// A JIRA issue worklog entry returned by
+/// `GET /rest/api/3/issue/{key}/worklog`.
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraWorklog {
     /// Worklog ID.
@@ -665,7 +753,8 @@ pub struct JiraWorklog {
     pub comment: Option<String>,
 }
 
-/// Result from listing JIRA worklogs.
+/// Paginated wrapper around [`JiraWorklog`] entries from
+/// `GET /rest/api/3/issue/{key}/worklog`.
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraWorklogList {
     /// Worklog entries.
