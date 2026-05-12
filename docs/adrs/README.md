@@ -51,3 +51,6 @@ by Michael Nygard.
 | [ADR-0025](adr-0025.md)  | ✅ Accepted                              | 2026-05-10 | Wire ADF Schema Validator into the API Send Path via `ValidatedAdfDocument`            |
 | [ADR-0026](adr-0026.md)  | ✅ Accepted                              | 2026-05-10 | Extending the ADF Validator with Quantifiers, Attributes, and Marks                    |
 | [ADR-0027](adr-0027.md)  | ✅ Accepted                              | 2026-05-11 | Destructive CLI Commands Confirm by Default with --force and --dry-run Escape Hatches  |
+| [ADR-0028](adr-0028.md)  | ✅ Accepted                              | 2026-05-12 | Sandboxed `claude-cli` Subprocess AI Backend                                           |
+| [ADR-0029](adr-0029.md)  | ✅ Accepted                              | 2026-05-12 | JFM ↔ ADF Converter Strategy                                                           |
+| [ADR-0030](adr-0030.md)  | ✅ Accepted                              | 2026-05-12 | CLI Snapshot Golden Testing for the Help Surface                                       |
