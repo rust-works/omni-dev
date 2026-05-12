@@ -1,5 +1,8 @@
 # AI Client Architecture Plan
 
+**Status:** Built
+**ADRs:** [ADR-0002](../adrs/adr-0002.md) · [ADR-0014](../adrs/adr-0014.md)
+
 ## Overview
 
 This document outlines the plan for refactoring the Claude API client into a more abstract and flexible architecture using the `AiClient` trait. This will allow for multiple AI service implementations while maintaining a consistent interface.
