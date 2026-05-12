@@ -150,6 +150,18 @@ This skill performs the complete end-to-end release process for omni-dev, from v
     - crates.io URL
     - Changelog summary
 
+### Phase 8: Manual Glama Listing Update
+
+19. **Prompt the User to Update Glama**
+    The Glama MCP listing pins its Docker build to a specific commit SHA and only rebuilds when that SHA is bumped. This step is a web-UI action that cannot be automated from here.
+
+    Display to the user:
+    - The short release SHA: `git rev-parse --short vX.Y.Z`
+    - The admin URL: <https://glama.ai/mcp/servers/rust-works/omni-dev/admin/dockerfile>
+    - A pointer to the procedure: `docs/glama-listing.md`
+
+    Do not block on this — it's an out-of-band manual step the human performs after the automated release lands.
+
 ## Error Handling
 
 | Error                    | Action                                      |

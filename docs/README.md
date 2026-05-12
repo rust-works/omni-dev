@@ -28,6 +28,7 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 ### MCP Server
 
 - **[MCP Reference](mcp.md)** - Tool catalog, resources, and setup for Claude Desktop / Claude Code / MCP Inspector
+- **[Glama Listing](glama-listing.md)** - Admin-form configuration and per-release publication procedure for the [glama.ai](https://glama.ai/mcp/servers/rust-works/omni-dev) listing
 - **[ADR-0021](adrs/adr-0021.md)** - Architectural decision behind the second binary
 
 ### Transcript Fetching
