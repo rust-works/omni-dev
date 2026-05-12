@@ -11,4 +11,5 @@
 
 pub mod audio;
 pub mod capture;
+pub mod idle;
 pub mod wav;
