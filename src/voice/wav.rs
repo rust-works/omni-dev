@@ -1,4 +1,4 @@
-//! Mixdown, resampling, idle detection, and WAV writing.
+//! Mixdown, resampling, and WAV writing.
 //!
 //! The write-path half of the capture pipeline:
 //!
@@ -8,11 +8,20 @@
 //!    `16_000` Hz via `rubato`'s sinc interpolator. Identity-passthrough is
 //!    used when the input is already 16 kHz so the pipeline stays
 //!    bit-exact in that common case.
+//! 3. [`WavWriter`] serialises 16 kHz mono f32 to 16-bit signed PCM WAV via
+//!    `hound`, with clamp-on-cast to handle resampler overshoot at the
+//!    extremes of `[-1.0, 1.0]`.
 //!
-//! The idle detector, trailing-silence trim, and `hound` WAV writer are
-//! added incrementally in steps 4–5.
+//! Idle detection and trailing-silence trimming live in
+//! [`super::idle`] — they operate on the post-resample 16 kHz stream
+//! and are independent of the writer.
+
+use std::fs::{self, File};
+use std::io::BufWriter;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use hound::{SampleFormat, WavSpec};
 use rubato::{
     Resampler as _, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
@@ -165,6 +174,88 @@ impl Resampler {
     }
 }
 
+/// Bit depth of the output WAV (whisper.cpp convention).
+pub const OUTPUT_BITS_PER_SAMPLE: u16 = 16;
+
+/// Streaming WAV writer that accepts mono 16 kHz f32 samples and emits
+/// 16-bit signed PCM.
+///
+/// Samples are clamped into `[-1.0, 1.0]` before the cast to `i16`.
+/// [`WavWriter::finalize`] must be called to flush the header; on drop
+/// without finalisation the file is left with an invalid header (size
+/// field unwritten) — the orchestrator therefore always calls
+/// `finalize`, even on signal-driven shutdown.
+pub struct WavWriter {
+    inner: hound::WavWriter<BufWriter<File>>,
+    path: PathBuf,
+    samples_written: u64,
+}
+
+impl WavWriter {
+    /// Creates a WAV file at `path`, with parent directories created if
+    /// they do not exist. The header is written eagerly; the size field
+    /// is patched up by [`WavWriter::finalize`].
+    pub fn create(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("Failed to create parent directory {}", parent.display())
+                })?;
+            }
+        }
+        let spec = WavSpec {
+            channels: 1,
+            sample_rate: TARGET_SAMPLE_RATE,
+            bits_per_sample: OUTPUT_BITS_PER_SAMPLE,
+            sample_format: SampleFormat::Int,
+        };
+        let inner = hound::WavWriter::create(&path, spec)
+            .with_context(|| format!("Failed to create WAV file at {}", path.display()))?;
+        Ok(Self {
+            inner,
+            path,
+            samples_written: 0,
+        })
+    }
+
+    /// Writes a chunk of mono samples. Values outside `[-1.0, 1.0]` are
+    /// clamped (resampler overshoot near 0 dBFS).
+    pub fn write_samples(&mut self, samples: &[f32]) -> Result<()> {
+        for s in samples {
+            let clamped = s.clamp(-1.0, 1.0);
+            let scaled = (clamped * f32::from(i16::MAX)).round() as i16;
+            self.inner
+                .write_sample(scaled)
+                .with_context(|| format!("Failed to write sample to {}", self.path.display()))?;
+        }
+        self.samples_written += samples.len() as u64;
+        Ok(())
+    }
+
+    /// Number of samples written so far (not counting any clamped value
+    /// any differently).
+    #[must_use]
+    pub fn samples_written(&self) -> u64 {
+        self.samples_written
+    }
+
+    /// Path the WAV was created at.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Flushes the WAV header so the file is playable. Consumes `self` so
+    /// double-finalisation cannot occur. Always call this — including on
+    /// signal-driven shutdown — or the on-disk file will be malformed.
+    pub fn finalize(self) -> Result<()> {
+        self.inner
+            .finalize()
+            .with_context(|| format!("Failed to finalize WAV file at {}", self.path.display()))
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -295,6 +386,71 @@ mod tests {
                 "sample {i}: chunked={y}, one-shot={x}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn wav_writer_round_trips_samples() -> Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let path = tmp.path().join("out.wav");
+        let mut writer = WavWriter::create(&path)?;
+        let samples: Vec<f32> = (0..1000)
+            .map(|i| (TAU * 440.0 * i as f32 / 16_000.0).sin() * 0.25)
+            .collect();
+        writer.write_samples(&samples)?;
+        assert_eq!(writer.samples_written(), 1000);
+        writer.finalize()?;
+
+        let mut reader = hound::WavReader::open(&path)?;
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.sample_rate, TARGET_SAMPLE_RATE);
+        assert_eq!(spec.bits_per_sample, OUTPUT_BITS_PER_SAMPLE);
+        assert_eq!(spec.sample_format, SampleFormat::Int);
+        let decoded: Vec<f32> = reader
+            .samples::<i16>()
+            .map(|s| f32::from(s.unwrap()) / f32::from(i16::MAX))
+            .collect();
+        assert_eq!(decoded.len(), 1000);
+        // Round-trip drift bounded by 1 lsb of 16-bit quantisation.
+        for (i, (orig, got)) in samples.iter().zip(decoded.iter()).enumerate() {
+            assert!(
+                (orig - got).abs() < 1.0 / f32::from(i16::MAX),
+                "sample {i}: orig={orig}, got={got}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn wav_writer_clamps_samples_to_int_range() -> Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let path = tmp.path().join("clamp.wav");
+        let mut writer = WavWriter::create(&path)?;
+        // Values outside [-1.0, 1.0] should clamp, not wrap.
+        writer.write_samples(&[2.0, -2.0, 0.5, -0.5])?;
+        writer.finalize()?;
+
+        let mut reader = hound::WavReader::open(&path)?;
+        let decoded: Vec<i16> = reader.samples::<i16>().map(|s| s.unwrap()).collect();
+        assert_eq!(decoded[0], i16::MAX, "2.0 should clamp to i16::MAX");
+        // -1.0 * i16::MAX = -32767, not i16::MIN (-32768) — we scale by
+        // i16::MAX, not i16::MIN.abs(), so symmetric range.
+        assert_eq!(decoded[1], -i16::MAX, "-2.0 should clamp to -i16::MAX");
+        // 0.5 * 32767 ≈ 16383, with rounding.
+        assert!((decoded[2] - 16384).abs() <= 1);
+        assert!((decoded[3] + 16384).abs() <= 1);
+        Ok(())
+    }
+
+    #[test]
+    fn wav_writer_creates_parent_dirs() -> Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let nested = tmp.path().join("a").join("b").join("c");
+        let path = nested.join("nested.wav");
+        let writer = WavWriter::create(&path)?;
+        writer.finalize()?;
+        assert!(path.exists());
         Ok(())
     }
 }
