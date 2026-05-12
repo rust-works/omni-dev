@@ -318,6 +318,53 @@ fn binary_config_models_show_succeeds() {
 }
 
 #[test]
+fn binary_resources_show_jfm_succeeds() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .args(["resources", "show", "specs/jfm"])
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Byte-equality with the embedded const: catches any header drift or
+    // accidental trailing newline added by `println!` vs `print!`.
+    assert_eq!(stdout.as_ref(), omni_dev::resources::SPEC_JFM);
+}
+
+#[test]
+fn binary_resources_show_accepts_omni_dev_uri_form() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .args(["resources", "show", "omni-dev://specs/jfm"])
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.as_ref(), omni_dev::resources::SPEC_JFM);
+}
+
+#[test]
+fn binary_resources_list_includes_specs_jfm() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .args(["resources", "list"])
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.lines().any(|l| l == "specs/jfm"));
+}
+
+#[test]
+fn binary_resources_show_unknown_id_fails() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .args(["resources", "show", "specs/does-not-exist"])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown resource"), "stderr: {stderr}");
+    assert!(stderr.contains("specs/jfm"), "stderr: {stderr}");
+}
+
+#[test]
 fn binary_help_all_succeeds() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
         .arg("help-all")
