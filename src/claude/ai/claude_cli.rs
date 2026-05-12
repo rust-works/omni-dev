@@ -110,7 +110,18 @@ struct JsonOutput {
     total_cost_usd: Option<f64>,
 }
 
-/// Claude Code CLI subprocess AI client.
+/// Subprocess-based AI client that shells out to `claude -p` in a
+/// locked-down sandbox.
+///
+/// Selected by `OMNI_DEV_AI_BACKEND=claude-cli` (or `--ai-backend
+/// claude-cli`); see the module-level docs above for the full sandbox
+/// posture and the "AI Backend Dispatch" section of `CLAUDE.md` for
+/// dispatch ordering.
+///
+/// Three runtime knobs weaken or bound the sandbox:
+/// - `OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS` — re-enable nested tool use.
+/// - `OMNI_DEV_CLAUDE_CLI_ALLOW_MCP` — re-enable nested MCP server pickup.
+/// - `OMNI_DEV_CLAUDE_CLI_MAX_BUDGET_USD` — per-invocation spending cap in USD.
 pub struct ClaudeCliAiClient {
     /// Model identifier (alias like `sonnet` or full ID like
     /// `claude-sonnet-4-6`). Forwarded verbatim to `claude -p --model`.
