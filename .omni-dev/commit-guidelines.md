@@ -61,12 +61,19 @@ Required. Use scopes defined in `.omni-dev/scopes.yaml`:
 - `docs` - Documentation and planning
 - `git` - Git operations and repository analysis
 - `release` - Release process, versioning, and publishing
+- `resources` - Embedded reference content registry shared by CLI and MCP
 - `scopes` - Commit scope definitions and configuration
 - `workflows` - GitHub Actions workflow files
 
 For multi-scope commits, the scopes are correct when each listed scope
 matches at least one modified file. Do not flag scopes as incorrect
 when the commit legitimately spans multiple areas.
+
+A one-line `pub mod X;` registration added to `src/lib.rs` counts as
+part of scope `X` (or whichever scope owns the new module), not as a
+separate scope. Do not require a dedicated scope for `src/lib.rs`
+when the only change there is wiring in a new module that already has
+its own scope.
 
 ## Subject Line
 

@@ -10,6 +10,7 @@ pub mod config;
 pub mod datadog;
 pub mod git;
 pub mod help;
+pub mod resources;
 pub mod transcript;
 
 /// AI backend selector.
@@ -103,6 +104,8 @@ pub enum Commands {
     Datadog(datadog::DatadogCommand),
     /// Transcript and caption fetching from media platforms.
     Transcript(transcript::TranscriptCommand),
+    /// Embedded reference resources (specs, etc.).
+    Resources(resources::ResourcesCommand),
     /// Displays comprehensive help for all commands.
     #[command(name = "help-all")]
     HelpAll(help::HelpCommand),
@@ -150,6 +153,7 @@ impl Cli {
             Commands::Datadog(cmd) => cmd.execute().await,
             Commands::Transcript(cmd) => cmd.execute().await,
             Commands::Config(config_cmd) => config_cmd.execute(),
+            Commands::Resources(resources_cmd) => resources_cmd.execute(),
             Commands::HelpAll(help_cmd) => help_cmd.execute(),
         }
     }

@@ -23,6 +23,10 @@ scopes:
     description: "MCP server implementation and tool handlers"
     examples: ["mcp: add git_view_commits tool", "mcp: wire up stdio transport"]
     file_patterns: ["src/mcp/**", "src/mcp.rs", "src/mcp_server.rs"]
+  - name: "resources"
+    description: "Embedded reference content registry shared by CLI and MCP"
+    examples: ["resources: add jfm spec entry", "resources: extract specs into shared registry"]
+    file_patterns: ["src/resources.rs", "src/resources/**"]
   - name: "data"
     description: "Data structures and serialization"
     examples: ["data: add context structures", "data: improve YAML output"]
