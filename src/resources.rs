@@ -88,8 +88,7 @@ mod tests {
 
     #[test]
     fn ids_yields_registered_entries() {
-        let collected: Vec<&str> = ids().collect();
-        assert!(collected.contains(&"specs/jfm"));
+        assert!(ids().any(|id| id == "specs/jfm"));
     }
 
     #[test]
