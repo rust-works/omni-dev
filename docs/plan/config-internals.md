@@ -1,5 +1,8 @@
 # Config Internals
 
+**Status:** Built — canonical reference for configuration resolution.
+**ADRs:** [ADR-0005](../adrs/adr-0005.md) · [ADR-0018](../adrs/adr-0018.md) · [ADR-0019](../adrs/adr-0019.md)
+
 How omni-dev's configuration resolution system works, for contributors. For
 the user-facing contract — the inventory of recognised `.omni-dev/` files,
 their formats, and validation behaviour — see
