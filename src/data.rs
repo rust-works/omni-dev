@@ -14,7 +14,16 @@ pub use check::*;
 pub use context::*;
 pub use yaml::*;
 
-/// Complete repository view output structure, generic over commit type.
+/// Root node of the YAML output produced by `view`, `info`, `check`, and the branch
+/// subcommands.
+///
+/// Field presence is runtime-dependent: optional fields are populated only when the
+/// active command and repository state require them, and the embedded
+/// [`FieldExplanation`] reports which fields are actually present in this serialization.
+/// See [ADR-0013](../../docs/adrs/adr-0013.md) for the field-presence contract.
+///
+/// Generic over the commit type so the same shape serves both human-facing output
+/// (`CommitInfo`) and AI-facing output ([`RepositoryViewForAI`], using `CommitInfoForAI`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepositoryView<C = CommitInfo> {
     /// Version information for the omni-dev tool.
@@ -47,7 +56,12 @@ pub struct RepositoryView<C = CommitInfo> {
 /// Enhanced repository view for AI processing with full diff content.
 pub type RepositoryViewForAI = RepositoryView<CommitInfoForAI>;
 
-/// Field explanation for the YAML output.
+/// Self-describing schema metadata embedded under [`RepositoryView::explanation`].
+///
+/// Always present. Carries prose intro text plus a per-field list so an AI consumer can
+/// read a single YAML document and know what every field means and whether it is
+/// populated in this serialization. See [ADR-0013](../../docs/adrs/adr-0013.md) for the
+/// rationale.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldExplanation {
     /// Descriptive text explaining the overall structure.
@@ -56,7 +70,12 @@ pub struct FieldExplanation {
     pub fields: Vec<FieldDocumentation>,
 }
 
-/// Individual field documentation.
+/// Single entry inside [`FieldExplanation::fields`].
+///
+/// Names one YAML field path (e.g. `commits[].analysis.diff_file`), explains it, optionally
+/// links a `git` command that produces the underlying data, and carries a runtime
+/// `present` flag set by [`RepositoryView::update_field_presence`] before serialization.
+/// See [ADR-0013](../../docs/adrs/adr-0013.md).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldDocumentation {
     /// Name of the field being documented.
@@ -70,7 +89,11 @@ pub struct FieldDocumentation {
     pub present: bool,
 }
 
-/// Working directory information.
+/// Working-tree status nested under [`RepositoryView::working_directory`].
+///
+/// Always present. Mirrors `git status` at invocation time: a `clean` flag plus the list of
+/// modified or untracked files. Used by AI consumers to decide whether staged changes
+/// should influence the proposed commit message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkingDirectoryInfo {
     /// Whether the working directory has no changes.
@@ -79,7 +102,11 @@ pub struct WorkingDirectoryInfo {
     pub untracked_changes: Vec<FileStatusInfo>,
 }
 
-/// File status information for working directory.
+/// Entry in [`WorkingDirectoryInfo::untracked_changes`].
+///
+/// One per file with uncommitted or untracked changes, carrying the porcelain status
+/// flags (e.g. `"AM"`, `"??"`, `"M "`) and the repository-relative path. Sourced from
+/// `git status --porcelain`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileStatusInfo {
     /// Git status flags (e.g., "AM", "??", "M ").
@@ -88,28 +115,46 @@ pub struct FileStatusInfo {
     pub file: String,
 }
 
-/// Version information for tools and environment.
+/// Tool version metadata nested under optional [`RepositoryView::versions`].
+///
+/// Present only when the producing command opts to embed version data (the `view`
+/// command does; lightweight commands omit it). Absent in `single_commit_view` /
+/// `multi_commit_view` projections used for AI dispatch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VersionInfo {
     /// Version of the omni-dev tool.
     pub omni_dev: String,
 }
 
-/// AI-related information.
+/// AI integration metadata nested under [`RepositoryView::ai`].
+///
+/// Always present. Exposes the scratch directory path (controlled by the `AI_SCRATCH`
+/// environment variable) so downstream prompts and agents can resolve the per-commit
+/// diff files referenced from `commits[].analysis.diff_file` and `file_diffs[].diff_file`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiInfo {
     /// Path to AI scratch directory.
     pub scratch: String,
 }
 
-/// Branch information for branch-specific commands.
+/// Current-branch context nested under optional [`RepositoryView::branch_info`].
+///
+/// Present only for branch-aware commands (e.g. branch analysis / PR-message
+/// generation); absent on plain `view`. Preserved by `single_commit_view` projections
+/// because the branch name carries useful scope information for per-commit AI dispatch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BranchInfo {
     /// Current branch name.
     pub branch: String,
 }
 
-/// Pull request information.
+/// GitHub pull-request metadata. Appears as an entry in optional
+/// [`RepositoryView::branch_prs`].
+///
+/// Populated by branch-aware commands when the current branch has been pushed and the
+/// GitHub API resolves one or more PRs against it; absent on local-only branches or when
+/// the lookup fails. Field presence for the `branch_prs[].*` paths is tracked per
+/// [ADR-0013](../../docs/adrs/adr-0013.md).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PullRequest {
     /// PR number.
