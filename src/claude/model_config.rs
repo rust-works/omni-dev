@@ -1,12 +1,32 @@
 //! AI model configuration and specifications.
 //!
-//! This module provides model specifications loaded from a layered set of
-//! YAML sources: an embedded catalog (compile-time `include_str!`), an
-//! optional user-level file at `~/.omni-dev/models.yaml`, and an optional
+//! # Data model
+//!
+//! [`ModelConfiguration`] is the top-level container. It owns a
+//! <code>Vec<[ModelSpec]></code> of every known model and a
+//! <code>HashMap<String, [ProviderConfig]></code> keyed by provider name.
+//! [`ModelSpec`] records the per-model limits, generation, tier name, and
+//! any [`BetaHeader`]s that unlock enhanced limits. [`ProviderConfig`]
+//! records provider-wide settings — including a [`TierInfo`] map describing
+//! each named tier and a [`DefaultConfig`] block used as the fallback for
+//! unknown identifiers from that provider. Every entry carries a
+//! [`ModelSource`] tag identifying which layer contributed it.
+//!
+//! [`ModelRegistry`] wraps a fully merged [`ModelConfiguration`] and adds
+//! identifier-normalised lookup (so a Bedrock or AWS-direct identifier
+//! resolves to the same [`ModelSpec`] as the canonical Anthropic form).
+//!
+//! # Loader
+//!
+//! [`ModelRegistry::load`] builds the registry from a layered set of YAML
+//! sources: an embedded catalog (compile-time `include_str!`), an optional
+//! user-level file at `~/.omni-dev/models.yaml`, and an optional
 //! project-local file at `./.omni-dev/models.yaml`. Layers are deep-merged
 //! with project > user > embedded precedence; an explicit override path
 //! provided via `OMNI_DEV_MODELS_YAML` short-circuits the user/project
-//! lookup.
+//! lookup. See [ADR-0022](../../docs/adrs/adr-0022.md) for the layered
+//! loader rationale and [ADR-0011](../../docs/adrs/adr-0011.md) for the
+//! original compile-time design.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -63,7 +83,19 @@ impl std::fmt::Display for ModelSource {
     }
 }
 
-/// Beta header that unlocks enhanced model limits.
+/// HTTP header that, when sent on a request, unlocks enhanced limits for a
+/// model.
+///
+/// A [`BetaHeader`] is a leaf of a [`ModelSpec`]: it names the header to
+/// send (`key`/`value`) and records the new ceiling for [`max_output_tokens`]
+/// and/or [`input_context`] that the header makes available. An absent
+/// override field means that header does not move that limit; the model's
+/// base value still applies. Callers consult these via
+/// [`ModelRegistry::get_max_output_tokens_with_beta`] and
+/// [`ModelRegistry::get_input_context_with_beta`].
+///
+/// [`max_output_tokens`]: ModelSpec::max_output_tokens
+/// [`input_context`]: ModelSpec::input_context
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct BetaHeader {
     /// HTTP header name (e.g., "anthropic-beta").
@@ -78,7 +110,32 @@ pub struct BetaHeader {
     pub input_context: Option<usize>,
 }
 
-/// Model specification from YAML configuration.
+/// Specification for a single model: its identity, limits, tier, and any
+/// beta-header unlocks.
+///
+/// A [`ModelSpec`] is the central row of the registry. `provider` and
+/// `tier` cross-reference into a [`ProviderConfig`] (via
+/// [`ModelConfiguration::providers`] and [`ProviderConfig::tiers`]).
+/// `max_output_tokens` and `input_context` are the *base* limits; entries
+/// in `beta_headers` raise them when the corresponding HTTP header is sent.
+/// `source` is loader-populated and records which layer contributed the
+/// entry — never read from YAML.
+///
+/// # Identifier normalization
+///
+/// The same underlying model is addressable through several identifier
+/// formats depending on how the API is reached:
+///
+/// - Canonical (Anthropic direct): `claude-3-7-sonnet-20250219`
+/// - Bedrock with region prefix: `us.anthropic.claude-3-7-sonnet-20250219-v1:0`
+/// - AWS-direct without region: `anthropic.claude-3-haiku-20240307-v1:0`
+/// - Regional gateways: `eu.anthropic.claude-3-opus-20240229-v2:1`
+///
+/// All four resolve to the same [`ModelSpec`]:
+/// [`ModelRegistry::get_model_spec`] tries an exact match first, and on
+/// miss strips region/provider prefixes and version suffixes before
+/// retrying. See [ADR-0011](../../docs/adrs/adr-0011.md) for the design
+/// rationale.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ModelSpec {
     /// AI provider name (e.g., "claude").
@@ -107,7 +164,15 @@ pub struct ModelSpec {
     pub source: ModelSource,
 }
 
-/// Model tier information.
+/// Human-readable metadata for a named performance tier.
+///
+/// A tier groups models with comparable speed/capability trade-offs
+/// (e.g. `fast`, `balanced`, `flagship`). [`TierInfo`] holds only the
+/// *description* and recommended use cases — the *limits* (output tokens,
+/// input context, beta-header unlocks) live on each [`ModelSpec`], not
+/// here. [`TierInfo`] is stored in [`ProviderConfig::tiers`] keyed by tier
+/// name, and the same tier name appears on [`ModelSpec::tier`] to link a
+/// model into its tier.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct TierInfo {
     /// Human-readable description of the tier.
@@ -116,7 +181,16 @@ pub struct TierInfo {
     pub use_cases: Vec<String>,
 }
 
-/// Default fallback configuration for a provider.
+/// Provider-wide fallback limits used when a requested identifier does not
+/// match any [`ModelSpec`].
+///
+/// [`ModelRegistry::get_max_output_tokens`] and
+/// [`ModelRegistry::get_input_context`] consult these values whenever the
+/// caller passes an identifier the registry has not seen — typically a
+/// brand-new model the embedded catalog has not yet been updated for, but
+/// whose provider can still be inferred from the identifier shape. If the
+/// provider itself cannot be inferred, an ultimate hard-coded fallback in
+/// this module applies instead.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DefaultConfig {
     /// Default maximum output tokens for unknown models from this provider.
@@ -125,7 +199,17 @@ pub struct DefaultConfig {
     pub input_context: usize,
 }
 
-/// Provider-specific configuration.
+/// Per-provider settings: endpoint, default model, named tiers, and the
+/// fallback limits for unknown identifiers.
+///
+/// One [`ProviderConfig`] exists per AI vendor (Anthropic Claude, OpenAI,
+/// Bedrock, Ollama, …) and is stored in [`ModelConfiguration::providers`]
+/// keyed by provider name. `tiers` maps tier names to [`TierInfo`]
+/// descriptions; the same names appear on [`ModelSpec::tier`]. `defaults`
+/// is the per-provider [`DefaultConfig`] used as a fallback when a model
+/// identifier does not match any [`ModelSpec`]. `source` is
+/// loader-populated and records the highest-precedence layer that
+/// contributed any field to this provider block.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ProviderConfig {
     /// Human-readable provider name.
@@ -143,7 +227,18 @@ pub struct ProviderConfig {
     pub source: ModelSource,
 }
 
-/// Complete model configuration.
+/// Top-level deserialised model catalog: every known model plus every
+/// provider's settings.
+///
+/// [`ModelConfiguration`] is the result of merging the embedded
+/// `src/templates/models.yaml` with any optional user
+/// (`~/.omni-dev/models.yaml`) and project (`./.omni-dev/models.yaml`)
+/// overrides, in that precedence order. See
+/// [ADR-0022](../../docs/adrs/adr-0022.md) for the layered loader and
+/// merge semantics. The canonical entry point that produces a fully merged
+/// instance — and wraps it in lookup indices — is [`ModelRegistry::load`];
+/// the raw configuration is reachable from there via
+/// [`ModelRegistry::config`].
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ModelConfiguration {
     /// Schema version declared by the source YAML, if any.
@@ -155,7 +250,15 @@ pub struct ModelConfiguration {
     pub providers: HashMap<String, ProviderConfig>,
 }
 
-/// Model registry for looking up specifications.
+/// Indexed view over a [`ModelConfiguration`] with identifier-normalised
+/// lookup.
+///
+/// [`ModelRegistry`] owns the merged catalog and two auxiliary indices —
+/// by API identifier and by provider — populated at construction time.
+/// Construct one with [`ModelRegistry::load`], which performs the layered
+/// YAML load described on [`ModelConfiguration`]. Most callers use the
+/// process-wide singleton returned by [`get_model_registry`] rather than
+/// loading their own instance.
 pub struct ModelRegistry {
     config: ModelConfiguration,
     by_identifier: HashMap<String, ModelSpec>,
