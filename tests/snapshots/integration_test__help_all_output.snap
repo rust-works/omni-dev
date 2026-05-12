@@ -16,6 +16,7 @@ Commands:
   atlassian   Atlassian: JIRA and Confluence operations
   datadog     Datadog: read-only API operations
   transcript  Transcript and caption fetching from media platforms
+  resources   Embedded reference resources (specs, etc.)
   help-all    Displays comprehensive help for all commands
   help        Print this message or the help of the given subcommand(s)
 
@@ -2533,6 +2534,50 @@ omni-dev help-all - Displays comprehensive help for all commands
 Displays comprehensive help for all commands
 
 Usage: help-all
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev resources - Embedded reference resources (specs, etc.)
+
+Embedded reference resources (specs, etc.)
+
+Usage: resources <COMMAND>
+
+Commands:
+  show  Print the raw content of an embedded resource to stdout
+  list  List every embedded resource id, one per line
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev resources list - List every embedded resource id, one per line
+
+List every embedded resource id, one per line
+
+Usage: list
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev resources show - Print the raw content of an embedded resource to stdout
+
+Print the raw content of an embedded resource to stdout
+
+Usage: show <ID>
+
+Arguments:
+  <ID>  Resource id. Accepts `specs/jfm` or `omni-dev://specs/jfm` (the `omni-dev://` scheme is stripped before lookup)
 
 Options:
   -h, --help  Print help
