@@ -13,7 +13,12 @@ pub mod help;
 pub mod resources;
 pub mod transcript;
 
-/// AI backend selector.
+/// CLI-side selector for the AI backend dispatched by
+/// [`create_default_claude_client`][crate::claude::client::create_default_claude_client].
+///
+/// `None` (flag omitted) preserves env-var dispatch; an explicit value
+/// overrides `OMNI_DEV_AI_BACKEND`. Propagation to the env var happens
+/// in `Cli::propagate_global_flags`.
 #[derive(Clone, Copy, Debug, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 pub enum AiBackend {
@@ -25,7 +30,13 @@ pub enum AiBackend {
     ClaudeCli,
 }
 
-/// omni-dev: A comprehensive development toolkit.
+/// Top-level clap-derived CLI struct; the library entry point for embedding
+/// omni-dev programmatically.
+///
+/// Global flags (`--ai-backend`, `--claude-cli-allow-tools`,
+/// `--claude-cli-allow-mcp`, `--claude-cli-max-budget-usd`, `--models-yaml`)
+/// are propagated to environment variables read by downstream factories
+/// before dispatching to a [`Commands`] variant.
 #[derive(Parser)]
 #[command(name = "omni-dev")]
 #[command(about = "A comprehensive development toolkit", long_about = None)]
@@ -87,7 +98,11 @@ pub struct Cli {
     pub command: Commands,
 }
 
-/// Main command categories.
+/// Top-level subcommand dispatch enum.
+///
+/// Each variant wraps the subcommand-specific argument struct (e.g.
+/// [`ai::AiCommand`], [`git::GitCommand`], [`atlassian::AtlassianCommand`]);
+/// follow the variant's payload type for the per-command argument surface.
 #[derive(Subcommand)]
 pub enum Commands {
     /// AI operations.
