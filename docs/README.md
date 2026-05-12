@@ -45,10 +45,14 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 
 ### Project Planning & Architecture
 
-- **[Project Plan](plan/project.md)** - Technical architecture and implementation details
-- **[Twiddle Design](plan/twiddle.md)** - Complete design for the twiddle command phases
-- **[Help All Command](plan/help-all-command.md)** - Comprehensive help system design
-- **[Config Internals](plan/config-internals.md)** - How configuration resolution works
+Each file in [`plan/`](plan/) carries a `**Status:**` header (`Built`, `In Progress`, `Aspirational`, or `Historical`) and may cross-link the ADRs that capture its current architecture. Use a plan to **explore** a design before high-level decisions stabilise; promote it to an [ADR](adrs/README.md) once the decisions firm up; document the *current* user-facing behaviour in [user-guide.md](user-guide.md). Once a plan's decisions are fully captured by ADRs, change its status to `Built` (with ADR cross-links) or `Historical` rather than deleting it — the prior reasoning stays discoverable. See [STYLE-0027](STYLE_GUIDE.md#style-0027-plan-file-status-header-and-adr-cross-links) for the full convention.
+
+- **[Project Plan](plan/project.md)** *(Historical)* - Initial CLI architecture predating Atlassian/MCP/AI providers
+- **[Twiddle Design](plan/twiddle.md)** *(In Progress)* - Phases 1 and 2 built; Phase 3 (contextual intelligence) aspirational
+- **[Help All Command](plan/help-all-command.md)** *(Built)* - Comprehensive help system design
+- **[Config Internals](plan/config-internals.md)** *(Built, canonical reference)* - How configuration resolution works · [ADR-0005](adrs/adr-0005.md) · [ADR-0018](adrs/adr-0018.md) · [ADR-0019](adrs/adr-0019.md)
+- **[AI Client](plan/AiClient.md)** *(Built)* - Multi-provider AI abstraction · [ADR-0002](adrs/adr-0002.md) · [ADR-0014](adrs/adr-0014.md)
+- **[Commit Message Check](plan/commit-message-check.md)** *(Built)* - Non-interactive commit message validation
 
 ### Retrospectives
 

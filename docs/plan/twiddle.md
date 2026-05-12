@@ -1,5 +1,7 @@
 # Twiddle Command Implementation Plan
 
+**Status:** In Progress — Phases 1 and 2 Built; Phase 3 (contextual intelligence) Aspirational. See the **Implementation Status** section below for the current phase breakdown.
+
 ## Implementation Status
 
 **Phase 1: Core Implementation** - ✅ **COMPLETED** (2025-01-07)
