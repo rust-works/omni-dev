@@ -2,8 +2,9 @@
 //!
 //! Glues an [`AudioSource`] through the write-path stages (mixdown →
 //! resample → idle detection → trailing-silence trim → WAV write) and
-//! reports a structured [`CaptureSummary`] when done. The signal-driven
-//! termination path is wired up in step 8.
+//! reports a structured [`CaptureSummary`] when done. Signal-driven
+//! termination is wired up via [`install_ctrl_c_handler`], which the CLI
+//! entry point calls before delegating to [`run_capture`].
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -171,6 +172,25 @@ pub fn run_capture<S: AudioSource>(
 
 fn elapsed_seconds(samples_at_16k: usize) -> f32 {
     samples_at_16k as f32 / super::wav::TARGET_SAMPLE_RATE as f32
+}
+
+/// Installs a SIGINT (Ctrl-C) handler that flips the returned flag on
+/// receipt, and returns a fresh `Arc<AtomicBool>` initialised to false.
+///
+/// The flag is the one [`run_capture`] polls each iteration; flipping it
+/// causes the pipeline to terminate with [`TerminationReason::Signal`].
+/// On Unix this uses `signal-hook` (safe, no global state hijack). On
+/// Windows the same `signal-hook` API targets `SIGINT` via the
+/// console-control handler; the call is portable.
+///
+/// Safe to call once per process. A second call adds a *second* handler
+/// that also flips the flag — harmless but redundant. The capture loop
+/// already terminates on the first flip.
+pub fn install_ctrl_c_handler() -> Result<Arc<AtomicBool>> {
+    let flag = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGINT, flag.clone())
+        .context("Failed to register SIGINT handler")?;
+    Ok(flag)
 }
 
 #[cfg(test)]
