@@ -20,7 +20,7 @@ use crate::atlassian::confluence_api::ConfluenceApi;
 use crate::atlassian::document::content_item_to_document;
 use crate::atlassian::jira_api::JiraApi;
 use crate::cli::atlassian::helpers::create_client;
-use crate::mcp::specs;
+use crate::resources;
 
 /// Format suffix for a resource URI.
 ///
@@ -59,7 +59,7 @@ pub enum ResourceUri {
     },
     /// `omni-dev://specs/{name}` — embedded reference spec (e.g. `jfm`).
     Specs {
-        /// Spec identifier — see [`specs::lookup`] for the registered set.
+        /// Spec identifier — see [`crate::resources::get`] for the registered set.
         name: String,
     },
 }
@@ -163,6 +163,19 @@ fn split_suffix(rest: &str) -> (&str, ResourceFormat) {
         Some(id) => (id, ResourceFormat::Adf),
         None => (rest, ResourceFormat::Jfm),
     }
+}
+
+/// Comma-separated spec short-names (without the `specs/` prefix) for use in
+/// MCP `unknown spec` errors.
+///
+/// Why: keeps the long-standing MCP error wording (`unknown spec `nope`;
+/// known: jfm`) stable. The CLI uses [`resources::known_ids_csv`] (full ids)
+/// because its namespace is wider than just specs.
+fn specs_only_csv() -> String {
+    resources::ids()
+        .filter_map(|id| id.strip_prefix("specs/"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The static catalogue of resource templates omni-dev advertises.
@@ -299,17 +312,18 @@ pub async fn read_resource(uri: &ResourceUri, raw_uri: &str) -> Result<ReadResou
             .with_mime_type(mime)]))
         }
         ResourceUri::Specs { name } => {
-            let (text, mime) = specs::lookup(name).ok_or_else(|| {
+            let full_id = format!("specs/{name}");
+            let resource = resources::get(&full_id).ok_or_else(|| {
                 anyhow::anyhow!(
                     "unknown spec `{name}`; known: {known}",
-                    known = specs::KNOWN_SPECS,
+                    known = specs_only_csv(),
                 )
             })?;
             Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                text.to_string(),
+                resource.content.to_string(),
                 raw_uri,
             )
-            .with_mime_type(mime)]))
+            .with_mime_type(resource.mime_type)]))
         }
     }
 }
