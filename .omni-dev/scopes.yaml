@@ -43,6 +43,10 @@ scopes:
     description: "Commit scope definitions and configuration"
     examples: ["scopes: add release scope", "scopes: update file patterns"]
     file_patterns: [".omni-dev/scopes.yaml"]
+  - name: "voice"
+    description: "Voice capture, transcription, and ASR backends"
+    examples: ["voice: add Transcriber trait", "voice: wire mock backend"]
+    file_patterns: ["src/voice.rs", "src/voice/**", "src/cli/voice/**"]
   - name: "workflows"
     description: "GitHub Actions workflow files"
     examples: ["workflows: add commit check on push", "workflows: fix release permissions"]
