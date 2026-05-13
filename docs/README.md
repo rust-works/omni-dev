@@ -37,6 +37,7 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 
 ### Reference & Support
 
+- **[Shell Completion](shell-completion.md)** - Install per-shell completion scripts for `bash`, `zsh`, `fish`, `powershell`, and `elvish`
 - **[Troubleshooting](troubleshooting.md)** - Common issues and solutions  
 - **[API Documentation](https://docs.rs/omni-dev)** - Rust API reference
 - **[Changelog](../CHANGELOG.md)** - Version history and changes

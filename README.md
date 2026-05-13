@@ -65,25 +65,17 @@ nix profile install github:rust-works/omni-dev
 
 #### Shell Completion
 
-`omni-dev completions <shell>` prints a completion script to stdout.
-Supported shells: `bash`, `zsh`, `fish`, `powershell`, `elvish`.
+`omni-dev completions <shell>` prints a completion script to stdout for
+`bash`, `zsh`, `fish`, `powershell`, or `elvish`. The quickest path is bash
+per-user:
 
 ```bash
-# bash — system-wide
-omni-dev completions bash | sudo tee /etc/bash_completion.d/omni-dev > /dev/null
-
-# bash — per-user (in ~/.bashrc)
+# Add to ~/.bashrc:
 eval "$(omni-dev completions bash)"
-
-# zsh — drop into a directory on $fpath
-omni-dev completions zsh > "${fpath[1]}/_omni-dev"
-
-# fish
-omni-dev completions fish > ~/.config/fish/completions/omni-dev.fish
-
-# PowerShell (add to $PROFILE for persistence)
-omni-dev completions powershell | Out-String | Invoke-Expression
 ```
+
+See [docs/shell-completion.md](docs/shell-completion.md) for per-shell install
+recipes, the `$fpath`/`compinit` setup zsh requires, and troubleshooting.
 
 ### 🎬 See It In Action
 
