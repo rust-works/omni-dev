@@ -453,4 +453,37 @@ mod tests {
         assert!(path.exists());
         Ok(())
     }
+
+    #[test]
+    fn mono_mixdown_passes_through_zero_channels_unchanged() {
+        // channels == 0 hits the `<= 1` branch and returns the input as-is;
+        // documents the no-op behaviour rather than letting it silently
+        // change.
+        let input = vec![0.1, 0.2, 0.3];
+        assert_eq!(mono_mixdown(&input, 0), input);
+    }
+
+    #[test]
+    fn resampler_push_empty_returns_empty() -> Result<()> {
+        let mut r = Resampler::new(48_000)?;
+        let out = r.push(&[])?;
+        assert!(out.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn resampler_flush_with_no_pending_input_is_empty() -> Result<()> {
+        // Identity path: no inner resampler, flush always returns empty.
+        let mut r = Resampler::new(TARGET_SAMPLE_RATE)?;
+        assert!(r.flush()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn resampler_identity_push_empty_returns_empty() -> Result<()> {
+        let mut r = Resampler::new(TARGET_SAMPLE_RATE)?;
+        let out = r.push(&[])?;
+        assert!(out.is_empty());
+        Ok(())
+    }
 }

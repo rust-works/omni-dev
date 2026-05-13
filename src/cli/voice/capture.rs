@@ -74,18 +74,22 @@ fn default_output_path() -> Result<PathBuf> {
 }
 
 fn print_summary(summary: &CaptureSummary) {
+    eprintln!("{}", format_summary(summary));
+}
+
+fn format_summary(summary: &CaptureSummary) -> String {
     let reason = match summary.terminated_by {
         TerminationReason::Idle => "silence threshold reached",
         TerminationReason::SourceExhausted => "audio source ended",
         TerminationReason::Signal => "Ctrl-C",
     };
     let seconds = samples_to_seconds(summary.samples_written);
-    eprintln!(
+    format!(
         "Captured {seconds:.2}s ({} samples; {} trimmed; stopped: {reason}) → {}",
         summary.samples_written,
         summary.trimmed_samples,
         summary.output.display()
-    );
+    )
 }
 
 fn samples_to_seconds(samples: u64) -> f64 {
@@ -156,5 +160,61 @@ mod tests {
         assert!(s.contains("voice"));
         assert!(s.contains("captures"));
         assert!(s.ends_with(".wav"));
+    }
+
+    fn summary(reason: TerminationReason, written: u64, trimmed: u64) -> CaptureSummary {
+        CaptureSummary {
+            output: PathBuf::from("/tmp/out.wav"),
+            samples_written: written,
+            trimmed_samples: trimmed,
+            terminated_by: reason,
+        }
+    }
+
+    #[test]
+    fn format_summary_idle_termination_mentions_silence() {
+        let s = format_summary(&summary(TerminationReason::Idle, 16_000, 3_200));
+        assert!(s.contains("silence threshold reached"));
+        assert!(
+            s.contains("1.00s"),
+            "16000 samples @ 16kHz = 1.00s; got: {s}"
+        );
+        assert!(s.contains("16000 samples"));
+        assert!(s.contains("3200 trimmed"));
+        assert!(s.contains("/tmp/out.wav"));
+    }
+
+    #[test]
+    fn format_summary_signal_termination_mentions_ctrl_c() {
+        let s = format_summary(&summary(TerminationReason::Signal, 48_000, 0));
+        assert!(s.contains("Ctrl-C"));
+        assert!(
+            s.contains("3.00s"),
+            "48000 samples @ 16kHz = 3.00s; got: {s}"
+        );
+        assert!(s.contains("0 trimmed"));
+    }
+
+    #[test]
+    fn format_summary_source_exhausted_mentions_source() {
+        let s = format_summary(&summary(TerminationReason::SourceExhausted, 8_000, 0));
+        assert!(s.contains("audio source ended"));
+        assert!(s.contains("0.50s"));
+    }
+
+    #[test]
+    fn samples_to_seconds_zero_samples() {
+        assert!((samples_to_seconds(0) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn samples_to_seconds_exact_one_second() {
+        assert!((samples_to_seconds(16_000) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn samples_to_seconds_fractional() {
+        // 8000 samples @ 16kHz = 0.5s
+        assert!((samples_to_seconds(8_000) - 0.5).abs() < f64::EPSILON);
     }
 }

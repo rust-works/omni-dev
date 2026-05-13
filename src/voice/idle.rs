@@ -251,4 +251,21 @@ mod tests {
         let trimmed = trim_trailing_silence(&samples, 99);
         assert!(trimmed.is_empty());
     }
+
+    #[test]
+    fn rms_empty_samples_returns_zero() {
+        assert!((rms(&[]) - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn push_consumes_multiple_windows_in_one_call() {
+        let mut det = IdleDetector::new(1);
+        // 2.5 windows of silence in one push — should classify 2 windows
+        // immediately and buffer the 0.5-window remainder.
+        let chunk = vec![0.0_f32; WINDOW_SAMPLES * 5 / 2];
+        let classifications = det.push(&chunk);
+        assert_eq!(classifications.len(), 2);
+        assert_eq!(classifications[0], WindowClass::Silent);
+        assert_eq!(classifications[1], WindowClass::Silent);
+    }
 }

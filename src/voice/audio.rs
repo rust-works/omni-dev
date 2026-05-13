@@ -457,6 +457,59 @@ mod tests {
     }
 
     #[test]
+    fn file_source_decodes_f32_fixtures() -> Result<()> {
+        // Exercise the SampleFormat::Float branch in read_all_samples_as_f32.
+        // Most capture-side cpal configs are f32, so a fixture in that format
+        // is a realistic stand-in.
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("float.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec)?;
+        for s in [0.0_f32, 0.25, -0.25, 0.5, -0.5] {
+            writer.write_sample(s)?;
+        }
+        writer.finalize()?;
+
+        let mut src = FileAudioSource::from_path(&path, 16)?;
+        let chunk = src.next_chunk().expect("chunk");
+        assert_eq!(chunk.len(), 5);
+        assert!((chunk[0] - 0.0).abs() < 1e-6);
+        assert!((chunk[1] - 0.25).abs() < 1e-6);
+        assert!((chunk[2] + 0.25).abs() < 1e-6);
+        assert!((chunk[3] - 0.5).abs() < 1e-6);
+        assert!((chunk[4] + 0.5).abs() < 1e-6);
+        Ok(())
+    }
+
+    #[test]
+    fn file_source_open_missing_path_errors() {
+        let Err(err) = FileAudioSource::from_path("/this/path/does/not/exist.wav", 16) else {
+            panic!("expected open of missing file to error");
+        };
+        assert!(
+            err.to_string().contains("Failed to open fixture WAV"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn i32_pcm_scale_matches_bit_depth() {
+        // 16-bit: divisor is 2^15 = 32768
+        assert!((i32_pcm_scale(16) - 32768.0).abs() < f32::EPSILON);
+        // 24-bit: divisor is 2^23 = 8_388_608
+        assert!((i32_pcm_scale(24) - 8_388_608.0).abs() < f32::EPSILON);
+        // 32-bit: divisor is 2^31
+        assert!((i32_pcm_scale(32) - (1u64 << 31) as f32).abs() < f32::EPSILON);
+        // 0-bit nonsense input clamps to shift = 0, divisor = 1 (no panic)
+        assert!((i32_pcm_scale(0) - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn cpal_unknown_device_lists_alternatives() {
         let result = CpalAudioSource::new(Some(
             "this-device-name-definitely-does-not-exist-on-anyone-system",
