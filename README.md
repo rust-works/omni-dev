@@ -63,6 +63,20 @@ cachix use omni-dev
 nix profile install github:rust-works/omni-dev
 ```
 
+#### Shell Completion
+
+`omni-dev completions <shell>` prints a completion script to stdout for
+`bash`, `zsh`, `fish`, `powershell`, or `elvish`. The quickest path is bash
+per-user:
+
+```bash
+# Add to ~/.bashrc:
+eval "$(omni-dev completions bash)"
+```
+
+See [docs/shell-completion.md](docs/shell-completion.md) for per-shell install
+recipes, the `$fpath`/`compinit` setup zsh requires, and troubleshooting.
+
 ### 🎬 See It In Action
 
 [![asciicast](https://asciinema.org/a/eJJf5Aj8N26JoCaUsAFVH8dqz.svg)](https://asciinema.org/a/eJJf5Aj8N26JoCaUsAFVH8dqz)
