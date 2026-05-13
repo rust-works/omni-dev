@@ -5,6 +5,7 @@
 //! help text and parse logic local to each command.
 
 pub mod capture;
+pub mod install_model;
 pub mod reflect;
 pub mod transcribe;
 
@@ -28,6 +29,9 @@ pub enum VoiceSubcommands {
     Transcribe(transcribe::TranscribeCommand),
     /// Reflects on a transcript and emits reflection events.
     Reflect(reflect::ReflectCommand),
+    /// Downloads the Whisper tiny.en model files for the `whisper-candle`
+    /// backend into `~/.omni-dev/voice/models/whisper-tiny.en/`.
+    InstallModel(install_model::InstallModelCommand),
 }
 
 impl VoiceCommand {
@@ -41,6 +45,7 @@ impl VoiceCommand {
             VoiceSubcommands::Capture(cmd) => cmd.execute(),
             VoiceSubcommands::Transcribe(cmd) => cmd.execute(),
             VoiceSubcommands::Reflect(cmd) => cmd.execute().await,
+            VoiceSubcommands::InstallModel(cmd) => cmd.execute(),
         }
     }
 }
@@ -86,5 +91,41 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, VoiceSubcommands::Reflect(_)));
+    }
+
+    #[test]
+    fn voice_subcommands_install_model_variant() {
+        let cmd = VoiceCommand {
+            command: VoiceSubcommands::InstallModel(install_model::InstallModelCommand {
+                dest: None,
+                force: false,
+            }),
+        };
+        assert!(matches!(cmd.command, VoiceSubcommands::InstallModel(_)));
+    }
+
+    #[tokio::test]
+    async fn voice_command_dispatches_install_model_via_execute() {
+        // Drives VoiceCommand::execute through the InstallModel arm
+        // end-to-end: covers the async dispatch in cli/voice.rs and the
+        // stderr-locking wrapper in install_model::execute. Uses a
+        // pre-staged tempdir so the idempotent early-return path keeps
+        // the test off the network.
+        use crate::voice::models::REQUIRED_FILES;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        for f in REQUIRED_FILES {
+            std::fs::write(tmp.path().join(f), b"placeholder").unwrap();
+        }
+
+        let cmd = VoiceCommand {
+            command: VoiceSubcommands::InstallModel(install_model::InstallModelCommand {
+                dest: Some(tmp.path().to_path_buf()),
+                force: false,
+            }),
+        };
+        cmd.execute()
+            .await
+            .expect("install-model dispatch should succeed on pre-staged dir");
     }
 }
