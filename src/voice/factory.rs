@@ -7,8 +7,9 @@
 //! 1. `opts.backend` (set by `--backend` from the CLI in #802),
 //! 2. `OMNI_DEV_VOICE_BACKEND` (env var, with project settings.json
 //!    fallback via [`crate::utils::settings::get_env_var`]),
-//! 3. Default — currently `"mock"` because the real Whisper backend was
-//!    deferred from #801 (see [`crate::voice::backends::mock`]).
+//! 3. Default — `"mock"` until the real ASR backend has been through a
+//!    release cycle; pick `--backend whisper-candle` explicitly. See
+//!    [`crate::voice::backends::candle`] and ADR-0033.
 //!
 //! [`create_default_claude_client`]: crate::claude::client::create_default_claude_client
 
@@ -16,7 +17,9 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 
+use crate::voice::backends::candle::CandleTranscriber;
 use crate::voice::backends::mock::MockTranscriber;
+use crate::voice::models::resolve_whisper_model_dir;
 use crate::voice::transcriber::Transcriber;
 
 /// Backend-selection options carried from the CLI (or constructed
@@ -52,7 +55,13 @@ pub fn create_default_transcriber(opts: &VoiceOpts) -> Result<Box<dyn Transcribe
         "mock" => Ok(Box::new(MockTranscriber::new(
             MockTranscriber::default_script(),
         ))),
-        other => bail!("unknown voice backend: {other:?} (supported: \"mock\")"),
+        "whisper-candle" => {
+            let dir = resolve_whisper_model_dir(opts)?;
+            Ok(Box::new(CandleTranscriber::new(&dir)?))
+        }
+        other => {
+            bail!("unknown voice backend: {other:?} (supported: \"mock\", \"whisper-candle\")")
+        }
     }
 }
 
@@ -131,5 +140,27 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("klingon"), "got: {msg}");
         assert!(msg.contains("supported"), "got: {msg}");
+        assert!(msg.contains("whisper-candle"), "got: {msg}");
+    }
+
+    #[test]
+    fn whisper_candle_arm_propagates_missing_model_error() {
+        // The factory routes "whisper-candle" through CandleTranscriber::new,
+        // which calls ensure_model_present. Point --model at an empty dir
+        // and verify the install hint reaches the caller without partial
+        // initialisation.
+        let _g = env_guard();
+        std::env::remove_var("OMNI_DEV_VOICE_BACKEND");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let opts = VoiceOpts {
+            backend: Some("whisper-candle".to_string()),
+            model: Some(tmp.path().to_path_buf()),
+        };
+        let Err(err) = create_default_transcriber(&opts) else {
+            panic!("expected whisper-candle with empty model dir to error");
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no Whisper model found"), "got: {msg}");
+        assert!(msg.contains("voice install-model"), "got: {msg}");
     }
 }

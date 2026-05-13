@@ -37,10 +37,16 @@ pub struct TranscribeCommand {
     /// produce one — `transcribe` does not resample.
     pub wav: PathBuf,
 
-    /// Transcriber backend. Currently only `"mock"` is supported; a real
-    /// ASR backend is deferred (see issue #802).
+    /// Transcriber backend (`mock`, `whisper-candle`). Defaults to `mock`;
+    /// see ADR-0033 for the `whisper-candle` runtime choice.
     #[arg(long)]
     pub backend: Option<String>,
+
+    /// Path to a backend-specific model directory. For `whisper-candle`,
+    /// this overrides `OMNI_DEV_VOICE_WHISPER_MODEL` and the default at
+    /// `~/.omni-dev/voice/models/whisper-tiny.en/`. Ignored by `mock`.
+    #[arg(long)]
+    pub model: Option<PathBuf>,
 
     /// Output format. Defaults to `md` on a tty, `jsonl` when piped.
     #[arg(long, value_enum)]
@@ -90,7 +96,7 @@ impl TranscribeCommand {
     fn run<W: Write>(self, w: &mut W, format: OutputFormat) -> Result<()> {
         let opts = VoiceOpts {
             backend: self.backend,
-            model: None,
+            model: self.model,
         };
         let transcriber = create_default_transcriber(&opts)?;
         let input = VecAudioInput::from_wav_path(&self.wav, DEFAULT_CHUNK_SAMPLES)?;
@@ -123,7 +129,18 @@ mod tests {
         let cli = TestCli::try_parse_from(["test", "/tmp/x.wav"]).unwrap();
         assert_eq!(cli.transcribe.wav.to_str().unwrap(), "/tmp/x.wav");
         assert!(cli.transcribe.backend.is_none());
+        assert!(cli.transcribe.model.is_none());
         assert!(cli.transcribe.format.is_none());
+    }
+
+    #[test]
+    fn parses_model_flag() {
+        let cli =
+            TestCli::try_parse_from(["test", "/tmp/x.wav", "--model", "/opt/whisper"]).unwrap();
+        assert_eq!(
+            cli.transcribe.model.as_deref().and_then(|p| p.to_str()),
+            Some("/opt/whisper")
+        );
     }
 
     #[test]
@@ -208,6 +225,7 @@ mod tests {
         TranscribeCommand {
             wav,
             backend: backend.map(str::to_string),
+            model: None,
             format: None,
         }
     }
