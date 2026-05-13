@@ -30,6 +30,7 @@ pub mod mcp;
 pub mod resources;
 pub mod transcript;
 pub mod utils;
+pub mod voice;
 
 #[cfg(test)]
 mod test_support;

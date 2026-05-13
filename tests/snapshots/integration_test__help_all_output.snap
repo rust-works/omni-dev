@@ -16,6 +16,7 @@ Commands:
   atlassian   Atlassian: JIRA and Confluence operations
   datadog     Datadog: read-only API operations
   transcript  Transcript and caption fetching from media platforms
+  voice       Voice capture and processing operations
   resources   Embedded reference resources (specs, etc.)
   help-all    Displays comprehensive help for all commands
   help        Print this message or the help of the given subcommand(s)
@@ -2667,3 +2668,34 @@ Arguments:
 Options:
       --output <OUTPUT>  Output format [default: table] [possible values: table, json]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev voice - Voice capture and processing operations
+
+Voice capture and processing operations
+
+Usage: voice <COMMAND>
+
+Commands:
+  capture  Captures audio from a microphone to a 16 kHz mono WAV file
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev voice capture - Captures audio from a microphone to a 16 kHz mono WAV file
+
+Captures audio from a microphone to a 16 kHz mono WAV file
+
+Usage: capture [OPTIONS]
+
+Options:
+      --idle-after <IDLE_AFTER>  Stop after this many seconds of trailing silence. `0` disables auto-stop — capture runs until Ctrl-C [default: 5]
+      --output <OUTPUT>          Destination WAV path. Defaults to `~/.omni-dev/voice/captures/<UTC-timestamp>.wav`
+      --device <DEVICE>          Audio input device name. Defaults to the system default input. Matching is exact against the platform-reported device name; an unknown name errors with a list of detected devices
+  -h, --help                     Print help
