@@ -55,3 +55,4 @@ by Michael Nygard.
 | [ADR-0029](adr-0029.md)  | ✅ Accepted                              | 2026-05-12 | JFM ↔ ADF Converter Strategy                                                           |
 | [ADR-0030](adr-0030.md)  | ✅ Accepted                              | 2026-05-12 | CLI Snapshot Golden Testing for the Help Surface                                       |
 | [ADR-0031](adr-0031.md)  | ✅ Accepted                              | 2026-05-13 | AudioSource Trait Boundary for Real-Time Audio Capture Testability                     |
+| [ADR-0032](adr-0032.md)  | ✅ Accepted                              | 2026-05-13 | Separate AudioInput Trait at the Transcriber Boundary                                  |

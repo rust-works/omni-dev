@@ -51,6 +51,7 @@ rubato = "0.16"
 hound = "3.5"
 signal-hook = "0.3"
 ringbuf = "0.4"
+ulid = { version = "1", features = ["serde"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["signal"] }
