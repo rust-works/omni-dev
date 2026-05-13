@@ -14,6 +14,7 @@ pub mod backends;
 pub mod capture;
 pub mod factory;
 pub mod idle;
+pub mod render;
 pub mod transcriber;
 pub mod wav;
 
@@ -22,6 +23,7 @@ pub use capture::{
     install_ctrl_c_handler, run_capture, CaptureOpts, CaptureSummary, TerminationReason,
 };
 pub use factory::{create_default_transcriber, VoiceOpts};
+pub use render::{detect_format, render_jsonl, render_markdown, OutputFormat};
 pub use transcriber::{
     AudioChunk, AudioInput, EndpointKind, EventId, EventStream, SpeakerId, Transcriber,
     TranscriptEvent, VecAudioInput, Word,
