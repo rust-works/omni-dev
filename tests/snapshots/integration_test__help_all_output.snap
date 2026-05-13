@@ -1822,6 +1822,21 @@ Options:
 
 ================================================================================
 
+omni-dev completions - Generates shell completion scripts
+
+Generates shell completion scripts
+
+Usage: completions <SHELL>
+
+Arguments:
+  <SHELL>  Target shell (`bash`, `elvish`, `fish`, `powershell`, `zsh`) [possible values: bash, elvish, fish, powershell, zsh]
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
 omni-dev config - Configuration and model information
 
 Configuration and model information
