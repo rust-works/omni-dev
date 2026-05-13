@@ -10,6 +10,7 @@
 //! See [ADR-0031](../../docs/adrs/adr-0031.md) for the rationale.
 
 pub mod audio;
+pub mod backends;
 pub mod capture;
 pub mod idle;
 pub mod transcriber;
