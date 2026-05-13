@@ -30,6 +30,8 @@ jobs:
         toolchain: ${{ matrix.rust }}
         components: rustfmt
     - uses: Swatinem/rust-cache@v2
+    - name: Install ALSA headers for cpal
+      run: sudo apt-get update && sudo apt-get install -y libasound2-dev
     - name: Run tests
       run: |
         if [ -z "${{ matrix.features }}" ]; then
@@ -45,6 +47,8 @@ jobs:
     - uses: actions/checkout@v6
     - uses: dtolnay/rust-toolchain@stable
     - uses: Swatinem/rust-cache@v2
+    - name: Install ALSA headers for cpal
+      run: sudo apt-get update && sudo apt-get install -y libasound2-dev
     - name: Build omni-dev-mcp (release)
       run: cargo build --release --features mcp --bin omni-dev-mcp
 
@@ -73,6 +77,8 @@ jobs:
       with:
         components: clippy
     - uses: Swatinem/rust-cache@v2
+    - name: Install ALSA headers for cpal
+      run: sudo apt-get update && sudo apt-get install -y libasound2-dev
     - name: Run clippy
       run: |
         if [ -z "${{ matrix.features }}" ]; then
@@ -88,6 +94,8 @@ jobs:
     - uses: actions/checkout@v6
     - uses: dtolnay/rust-toolchain@stable
     - uses: Swatinem/rust-cache@v2
+    - name: Install ALSA headers for cpal
+      run: sudo apt-get update && sudo apt-get install -y libasound2-dev
     - name: Build docs
       run: cargo doc --no-deps --document-private-items
 
@@ -100,6 +108,8 @@ jobs:
       with:
         components: llvm-tools-preview
     - uses: Swatinem/rust-cache@v2
+    - name: Install ALSA headers for cpal
+      run: sudo apt-get update && sudo apt-get install -y libasound2-dev
     - name: Install cargo-llvm-cov
       uses: taiki-e/install-action@cargo-llvm-cov
     - name: Generate coverage report
