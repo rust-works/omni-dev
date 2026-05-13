@@ -25,19 +25,19 @@ fn deterministic_script() -> Vec<MockSegment> {
         MockSegment {
             text: "hello world".into(),
             start: Duration::from_millis(0),
-            end: Duration::from_millis(2_000),
+            end: Duration::from_secs(2),
             confidence: 0.95,
         },
         MockSegment {
             text: "this is the mock transcriber".into(),
-            start: Duration::from_millis(2_000),
+            start: Duration::from_secs(2),
             end: Duration::from_millis(5_500),
             confidence: 0.92,
         },
         MockSegment {
             text: "emitting a deterministic event sequence".into(),
             start: Duration::from_millis(5_500),
-            end: Duration::from_millis(10_000),
+            end: Duration::from_secs(10),
             confidence: 0.97,
         },
     ]

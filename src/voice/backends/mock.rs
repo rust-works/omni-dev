@@ -120,13 +120,13 @@ impl MockTranscriber {
             MockSegment {
                 text: "[mock transcriber] segment 1".to_string(),
                 start: Duration::from_millis(0),
-                end: Duration::from_millis(2_000),
+                end: Duration::from_secs(2),
                 confidence: 1.0,
             },
             MockSegment {
                 text: "[mock transcriber] segment 2".to_string(),
-                start: Duration::from_millis(2_000),
-                end: Duration::from_millis(5_000),
+                start: Duration::from_secs(2),
+                end: Duration::from_secs(5),
                 confidence: 1.0,
             },
         ]
