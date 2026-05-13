@@ -19,6 +19,8 @@
           openssl
           zlib
           libgit2
+        ] ++ lib.optionals stdenv.hostPlatform.isLinux [
+          alsa-lib
         ] ++ lib.optionals stdenv.hostPlatform.isDarwin [
           libiconv
         ];
