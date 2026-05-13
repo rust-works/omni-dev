@@ -63,6 +63,28 @@ cachix use omni-dev
 nix profile install github:rust-works/omni-dev
 ```
 
+#### Shell Completion
+
+`omni-dev completions <shell>` prints a completion script to stdout.
+Supported shells: `bash`, `zsh`, `fish`, `powershell`, `elvish`.
+
+```bash
+# bash — system-wide
+omni-dev completions bash | sudo tee /etc/bash_completion.d/omni-dev > /dev/null
+
+# bash — per-user (in ~/.bashrc)
+eval "$(omni-dev completions bash)"
+
+# zsh — drop into a directory on $fpath
+omni-dev completions zsh > "${fpath[1]}/_omni-dev"
+
+# fish
+omni-dev completions fish > ~/.config/fish/completions/omni-dev.fish
+
+# PowerShell (add to $PROFILE for persistence)
+omni-dev completions powershell | Out-String | Invoke-Expression
+```
+
 ### 🎬 See It In Action
 
 [![asciicast](https://asciinema.org/a/eJJf5Aj8N26JoCaUsAFVH8dqz.svg)](https://asciinema.org/a/eJJf5Aj8N26JoCaUsAFVH8dqz)

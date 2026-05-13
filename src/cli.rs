@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 pub mod ai;
 pub mod atlassian;
 pub mod commands;
+pub mod completions;
 pub mod config;
 pub mod datadog;
 pub mod git;
@@ -124,6 +125,9 @@ pub enum Commands {
     Voice(voice::VoiceCommand),
     /// Embedded reference resources (specs, etc.).
     Resources(resources::ResourcesCommand),
+    /// Generates shell completion scripts.
+    #[command(hide = true)]
+    Completions(completions::CompletionsCommand),
     /// Displays comprehensive help for all commands.
     #[command(name = "help-all")]
     HelpAll(help::HelpCommand),
@@ -173,6 +177,7 @@ impl Cli {
             Commands::Voice(cmd) => cmd.execute(),
             Commands::Config(config_cmd) => config_cmd.execute(),
             Commands::Resources(resources_cmd) => resources_cmd.execute(),
+            Commands::Completions(completions_cmd) => completions_cmd.execute(),
             Commands::HelpAll(help_cmd) => help_cmd.execute(),
         }
     }
