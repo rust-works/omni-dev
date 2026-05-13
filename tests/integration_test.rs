@@ -377,6 +377,71 @@ fn binary_help_all_succeeds() {
 }
 
 #[test]
+fn binary_completions_bash_succeeds() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .args(["completions", "bash"])
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("complete -F _omni-dev"),
+        "missing bash completion marker; stdout: {stdout}"
+    );
+}
+
+#[test]
+fn binary_completions_zsh_succeeds() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .args(["completions", "zsh"])
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("#compdef omni-dev"),
+        "missing zsh compdef marker; stdout: {stdout}"
+    );
+}
+
+#[test]
+fn binary_completions_fish_succeeds() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .args(["completions", "fish"])
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("complete -c omni-dev"),
+        "missing fish completion marker; stdout: {stdout}"
+    );
+}
+
+#[test]
+fn binary_completions_powershell_succeeds() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .args(["completions", "powershell"])
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Register-ArgumentCompleter"),
+        "missing PowerShell completion marker; stdout: {stdout}"
+    );
+}
+
+#[test]
+fn binary_completions_unknown_shell_fails() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .args(["completions", "banana"])
+        .output()
+        .expect("failed to run binary");
+    assert!(!output.status.success());
+}
+
+#[test]
 fn binary_git_help_succeeds() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
         .args(["git", "--help"])
