@@ -70,6 +70,7 @@ mod tests {
             command: VoiceSubcommands::Transcribe(transcribe::TranscribeCommand {
                 wav: PathBuf::from("/tmp/x.wav"),
                 backend: None,
+                model: None,
                 format: None,
             }),
         };
