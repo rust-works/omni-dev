@@ -12,9 +12,14 @@
 pub mod audio;
 pub mod capture;
 pub mod idle;
+pub mod transcriber;
 pub mod wav;
 
 pub use audio::{AudioSource, CpalAudioSource, FileAudioSource};
 pub use capture::{
     install_ctrl_c_handler, run_capture, CaptureOpts, CaptureSummary, TerminationReason,
+};
+pub use transcriber::{
+    AudioChunk, AudioInput, EndpointKind, EventId, EventStream, SpeakerId, Transcriber,
+    TranscriptEvent, VecAudioInput, Word,
 };
