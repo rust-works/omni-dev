@@ -174,7 +174,7 @@ impl Cli {
             Commands::Atlassian(cmd) => cmd.execute().await,
             Commands::Datadog(cmd) => cmd.execute().await,
             Commands::Transcript(cmd) => cmd.execute().await,
-            Commands::Voice(cmd) => cmd.execute(),
+            Commands::Voice(cmd) => cmd.execute().await,
             Commands::Config(config_cmd) => config_cmd.execute(),
             Commands::Resources(resources_cmd) => resources_cmd.execute(),
             Commands::Completions(completions_cmd) => completions_cmd.execute(),
