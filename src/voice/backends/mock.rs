@@ -14,15 +14,16 @@
 //!
 //! The `event_id` source is pluggable via [`UlidRng`] so tests can pin
 //! down deterministic ULIDs for snapshotting. Production uses
-//! [`SystemUlidRng`] (`Ulid::new()`); tests use [`CountingUlidRng`] from
-//! the same module.
+//! [`SystemUlidRng`] (`Ulid::new()`); tests use [`CountingUlidRng`]. The
+//! trait and its implementations live in [`crate::voice::det`] and are
+//! re-exported here for backwards compatibility.
 
 use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Result;
-use ulid::Ulid;
 
+pub use crate::voice::det::{CountingUlidRng, SystemUlidRng, UlidRng};
 use crate::voice::transcriber::{
     AudioInput, EndpointKind, EventId, EventStream, Transcriber, TranscriptEvent,
 };
@@ -40,50 +41,6 @@ pub struct MockSegment {
     pub end: Duration,
     /// Confidence in `[0.0, 1.0]` to attach to the emitted `Final`.
     pub confidence: f32,
-}
-
-/// Source of [`EventId`]s. Pluggable so tests can pin ULIDs while
-/// production uses real entropy.
-pub trait UlidRng: Send + Sync {
-    /// Returns the next ULID. Each call must produce a value strictly
-    /// greater than the previous one to preserve event-id monotonicity.
-    fn next_ulid(&mut self) -> Ulid;
-}
-
-/// Production RNG: defers to `Ulid::new()`.
-#[derive(Debug, Default)]
-pub struct SystemUlidRng;
-
-impl UlidRng for SystemUlidRng {
-    fn next_ulid(&mut self) -> Ulid {
-        Ulid::new()
-    }
-}
-
-/// Deterministic RNG for tests.
-///
-/// Returns `Ulid::from_parts(0, counter)` for an increasing counter
-/// starting at 1. The encoded form is lexicographically ordered, so a
-/// sequence of ULIDs from this RNG is monotonically increasing — exactly
-/// the property snapshot tests rely on.
-#[derive(Debug, Default)]
-pub struct CountingUlidRng {
-    counter: u128,
-}
-
-impl CountingUlidRng {
-    /// Builds a new counting RNG starting at zero — the first ULID it
-    /// returns has random bits `1`, the second `2`, and so on.
-    pub fn new() -> Self {
-        Self { counter: 0 }
-    }
-}
-
-impl UlidRng for CountingUlidRng {
-    fn next_ulid(&mut self) -> Ulid {
-        self.counter += 1;
-        Ulid::from_parts(0, self.counter)
-    }
 }
 
 /// A canned-script Transcriber used as a placeholder until a real ASR
@@ -305,15 +262,6 @@ mod tests {
     }
 
     #[test]
-    fn system_ulid_rng_produces_unique_values() {
-        let mut rng = SystemUlidRng;
-        let a = rng.next_ulid();
-        let b = rng.next_ulid();
-        // Different ULIDs minted milliseconds apart should not collide.
-        assert_ne!(a, b);
-    }
-
-    #[test]
     fn default_script_yields_two_segments() {
         let script = MockTranscriber::default_script();
         assert_eq!(script.len(), 2);
@@ -330,7 +278,7 @@ mod tests {
 
         struct PanickingRng;
         impl UlidRng for PanickingRng {
-            fn next_ulid(&mut self) -> Ulid {
+            fn next_ulid(&mut self) -> ulid::Ulid {
                 panic!("test-induced panic");
             }
         }
