@@ -5,6 +5,7 @@
 //! help text and parse logic local to each command.
 
 pub mod capture;
+pub mod enroll;
 pub mod install_model;
 pub mod reflect;
 pub mod review;
@@ -32,9 +33,13 @@ pub enum VoiceSubcommands {
     Reflect(reflect::ReflectCommand),
     /// Reconciles a session's events.jsonl into materialized markdown.
     Review(review::ReviewCommand),
-    /// Downloads the Whisper tiny.en model files for the `whisper-candle`
-    /// backend into `~/.omni-dev/voice/models/whisper-tiny.en/`.
+    /// Downloads the model files for a chosen variant (Whisper tiny.en
+    /// for the `whisper-candle` backend, or wespeaker for speaker
+    /// embedding) into `~/.omni-dev/voice/models/<variant>/`.
     InstallModel(install_model::InstallModelCommand),
+    /// Captures a microphone sample and persists a speaker embedding to
+    /// `~/.omni-dev/voice/speakers/<name>.json`.
+    Enroll(enroll::EnrollCommand),
 }
 
 impl VoiceCommand {
@@ -50,6 +55,7 @@ impl VoiceCommand {
             VoiceSubcommands::Reflect(cmd) => cmd.execute().await,
             VoiceSubcommands::Review(cmd) => cmd.execute(),
             VoiceSubcommands::InstallModel(cmd) => cmd.execute(),
+            VoiceSubcommands::Enroll(cmd) => cmd.execute(),
         }
     }
 }
@@ -81,6 +87,9 @@ mod tests {
                 backend: None,
                 model: None,
                 format: None,
+                speaker: None,
+                threshold: None,
+                speaker_model: None,
             }),
         };
         assert!(matches!(cmd.command, VoiceSubcommands::Transcribe(_)));
@@ -103,6 +112,7 @@ mod tests {
             command: VoiceSubcommands::InstallModel(install_model::InstallModelCommand {
                 dest: None,
                 force: false,
+                variant: install_model::Variant::WhisperTinyEn,
             }),
         };
         assert!(matches!(cmd.command, VoiceSubcommands::InstallModel(_)));
@@ -126,6 +136,7 @@ mod tests {
             command: VoiceSubcommands::InstallModel(install_model::InstallModelCommand {
                 dest: Some(tmp.path().to_path_buf()),
                 force: false,
+                variant: install_model::Variant::WhisperTinyEn,
             }),
         };
         cmd.execute()

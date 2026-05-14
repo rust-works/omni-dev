@@ -1,10 +1,17 @@
-//! Whisper model storage convention and path resolution.
+//! Model storage convention and path resolution.
 //!
-//! Centralises the three-tier priority used by both the `whisper-candle`
-//! backend (load path) and the `voice install-model` CLI (download path):
+//! Two distinct kinds of model are tracked by this module:
 //!
-//! 1. Explicit `--model <path>` on [`crate::voice::VoiceOpts`].
-//! 2. `OMNI_DEV_VOICE_WHISPER_MODEL` env var.
+//! - **Whisper ASR** (`tiny.en`), loaded by the `whisper-candle` backend.
+//! - **Wespeaker speaker embedding** (`resnet34_LM`), loaded by the
+//!   speaker-embedding subsystem added in #805 / ADR-0034.
+//!
+//! Both follow the same three-tier resolution priority:
+//!
+//! 1. Explicit `--model <path>` (Whisper) or `--speaker-model <path>`
+//!    (wespeaker) on the relevant CLI command.
+//! 2. `OMNI_DEV_VOICE_WHISPER_MODEL` / `OMNI_DEV_VOICE_SPEAKER_MODEL`
+//!    env var.
 //! 3. Default install location under the user's home directory.
 //!
 //! Sharing the helper means the install command writes to exactly the
@@ -16,6 +23,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 
 use crate::voice::VoiceOpts;
+
+// ── Whisper constants (retained for backwards compatibility) ──────────────
 
 /// HuggingFace repository identifier for the `tiny.en` Whisper variant.
 pub const MODEL_ID: &str = "openai/whisper-tiny.en";
@@ -37,9 +46,170 @@ pub const REQUIRED_FILES: &[&str] = &["config.json", "tokenizer.json", "model.sa
 /// dirs.
 pub const DEFAULT_VARIANT_DIR: &str = "whisper-tiny.en";
 
+// ── ModelSpec shape ──────────────────────────────────────────────────────
+
+/// Where the bytes of a model come from. Each variant carries the
+/// transport-specific metadata the install command needs to fetch the
+/// model exactly once and verify its integrity.
+#[derive(Debug, Clone, Copy)]
+pub enum ModelSource {
+    /// HuggingFace Hub — Whisper's distribution. The install command
+    /// uses `hf_hub::api::sync::Api` to download `required_files` at a
+    /// pinned revision.
+    HfHub {
+        /// HF repository identifier, e.g. `"openai/whisper-tiny.en"`.
+        repo_id: &'static str,
+        /// Pinned revision (branch, tag, or ref).
+        revision: &'static str,
+    },
+    /// A single signed GitHub release asset — wespeaker's distribution.
+    /// The install command downloads the asset, verifies SHA-256, and
+    /// atomically installs into `required_files[0]`.
+    HttpReleaseAsset {
+        /// Direct download URL.
+        url: &'static str,
+        /// Expected SHA-256 of the downloaded bytes (hex).
+        sha256: &'static str,
+        /// Expected size in bytes; informational, for progress messages.
+        bytes: u64,
+    },
+}
+
+/// Fully describes a model variant's storage, install transport, and CLI
+/// surface. Static lifetime: every field is `&'static str` (or
+/// `&'static [&'static str]`) so `ModelSpec` is `Copy` and `'static`.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelSpec {
+    /// CLI-facing variant identifier: `"whisper-tiny.en"` or
+    /// `"speaker-wespeaker-en"`. Matches the `--variant` value the user
+    /// passes to `voice install-model`.
+    pub variant: &'static str,
+    /// Human label used in error messages: `"Whisper"` or `"Speaker"`.
+    pub kind_label: &'static str,
+    /// Subdirectory beneath `~/.omni-dev/voice/models/` where this
+    /// model's files live.
+    pub default_subdir: &'static str,
+    /// Files that must exist in the install directory for the model to
+    /// be considered installed.
+    pub required_files: &'static [&'static str],
+    /// Environment-variable override for the install directory.
+    pub env_var: &'static str,
+    /// Recommended `install-model` invocation, used verbatim in the
+    /// `ensure_model_present` error hint.
+    pub install_command: &'static str,
+    /// CLI flag that overrides the model path on consumer commands,
+    /// e.g. `"--model"` (Whisper) or `"--speaker-model"` (wespeaker).
+    pub model_flag: &'static str,
+    /// How to fetch the bytes.
+    pub source: ModelSource,
+}
+
+impl ModelSpec {
+    /// Default install directory: `~/.omni-dev/voice/models/<default_subdir>/`.
+    ///
+    /// `None` when the user's home directory cannot be located — same
+    /// failure mode as `dirs::home_dir()`.
+    pub fn default_dir(&self) -> Option<PathBuf> {
+        dirs::home_dir().map(|home| {
+            home.join(".omni-dev")
+                .join("voice")
+                .join("models")
+                .join(self.default_subdir)
+        })
+    }
+
+    /// Resolves the install directory for this spec.
+    ///
+    /// Priority: `override_path` → env var → default. The returned path
+    /// is *not* validated for existence; pair with [`Self::ensure_present`]
+    /// for fail-fast.
+    pub fn resolve_dir(&self, override_path: Option<&Path>) -> Result<PathBuf> {
+        if let Some(p) = override_path {
+            return Ok(p.to_path_buf());
+        }
+        if let Ok(env) = crate::utils::settings::get_env_var(self.env_var) {
+            if !env.is_empty() {
+                return Ok(PathBuf::from(env));
+            }
+        }
+        self.default_dir().ok_or_else(|| {
+            anyhow!(
+                "could not determine home directory; \
+                 pass {} <path> or set {}",
+                self.model_flag,
+                self.env_var
+            )
+        })
+    }
+
+    /// Returns the absolute path of each required file inside `dir`.
+    pub fn required_files_in(&self, dir: &Path) -> Vec<PathBuf> {
+        self.required_files.iter().map(|f| dir.join(f)).collect()
+    }
+
+    /// Verifies that `dir` contains every file in `self.required_files`.
+    ///
+    /// On failure, returns the install hint shaped for this spec (the
+    /// `install_command` / `model_flag` baked into the spec).
+    pub fn ensure_present(&self, dir: &Path) -> Result<()> {
+        for file in self.required_files {
+            let path = dir.join(file);
+            if !path.is_file() {
+                return Err(anyhow!(
+                    "no {} model found at {}; \
+                     run `{}` or pass {} <path>",
+                    self.kind_label,
+                    dir.display(),
+                    self.install_command,
+                    self.model_flag,
+                ))
+                .with_context(|| format!("missing required file: {}", path.display()));
+            }
+        }
+        Ok(())
+    }
+}
+
+// ── Registered specs ──────────────────────────────────────────────────────
+
+/// Whisper `tiny.en` — production ASR runtime per ADR-0033.
+pub const WHISPER_TINY_EN: ModelSpec = ModelSpec {
+    variant: "whisper-tiny.en",
+    kind_label: "Whisper",
+    default_subdir: DEFAULT_VARIANT_DIR,
+    required_files: REQUIRED_FILES,
+    env_var: "OMNI_DEV_VOICE_WHISPER_MODEL",
+    install_command: "omni-dev voice install-model",
+    model_flag: "--model",
+    source: ModelSource::HfHub {
+        repo_id: MODEL_ID,
+        revision: REVISION,
+    },
+};
+
+/// Wespeaker `voxceleb_resnet34_LM` — production speaker-embedding
+/// runtime per ADR-0034. Not yet wired to consumers; the speaker
+/// install variant lands in a follow-up commit.
+pub const SPEAKER_WESPEAKER_EN: ModelSpec = ModelSpec {
+    variant: "speaker-wespeaker-en",
+    kind_label: "Speaker",
+    default_subdir: "wespeaker-en-voxceleb-resnet34-LM",
+    required_files: &["wespeaker_en_voxceleb_resnet34_LM.onnx"],
+    env_var: "OMNI_DEV_VOICE_SPEAKER_MODEL",
+    install_command: "omni-dev voice install-model --variant speaker-wespeaker-en",
+    model_flag: "--speaker-model",
+    source: ModelSource::HttpReleaseAsset {
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx",
+        sha256: "e9848563da86f263117134dfd7ad63c92355b37de492b55e325400c9d9c39012",
+        bytes: 26_530_550,
+    },
+};
+
+// ── Backwards-compatible Whisper helpers (thin shims) ────────────────────
+
 /// Returns the absolute path of each required model file inside `dir`.
 pub fn required_files_in(dir: &Path) -> Vec<PathBuf> {
-    REQUIRED_FILES.iter().map(|f| dir.join(f)).collect()
+    WHISPER_TINY_EN.required_files_in(dir)
 }
 
 /// Computes the default install location: `~/.omni-dev/voice/models/whisper-tiny.en/`.
@@ -47,12 +217,7 @@ pub fn required_files_in(dir: &Path) -> Vec<PathBuf> {
 /// Returns `None` only when the user's home directory cannot be located
 /// (i.e. `dirs::home_dir()` returns `None`) — vanishingly rare in practice.
 pub fn default_whisper_model_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| {
-        home.join(".omni-dev")
-            .join("voice")
-            .join("models")
-            .join(DEFAULT_VARIANT_DIR)
-    })
+    WHISPER_TINY_EN.default_dir()
 }
 
 /// Resolves the Whisper model directory for the current invocation.
@@ -61,20 +226,7 @@ pub fn default_whisper_model_dir() -> Option<PathBuf> {
 /// The returned path is *not* validated for existence; callers that need
 /// to fail-fast on missing files should pair this with [`ensure_model_present`].
 pub fn resolve_whisper_model_dir(opts: &VoiceOpts) -> Result<PathBuf> {
-    if let Some(p) = &opts.model {
-        return Ok(p.clone());
-    }
-    if let Ok(env) = crate::utils::settings::get_env_var("OMNI_DEV_VOICE_WHISPER_MODEL") {
-        if !env.is_empty() {
-            return Ok(PathBuf::from(env));
-        }
-    }
-    default_whisper_model_dir().ok_or_else(|| {
-        anyhow!(
-            "could not determine home directory; \
-             pass --model <path> or set OMNI_DEV_VOICE_WHISPER_MODEL"
-        )
-    })
+    WHISPER_TINY_EN.resolve_dir(opts.model.as_deref())
 }
 
 /// Verifies that `dir` contains every file in [`REQUIRED_FILES`].
@@ -83,18 +235,7 @@ pub fn resolve_whisper_model_dir(opts: &VoiceOpts) -> Result<PathBuf> {
 /// `"no Whisper model found at <path>; run `omni-dev voice install-model`
 /// or pass --model <path>"`.
 pub fn ensure_model_present(dir: &Path) -> Result<()> {
-    for file in REQUIRED_FILES {
-        let path = dir.join(file);
-        if !path.is_file() {
-            return Err(anyhow!(
-                "no Whisper model found at {}; \
-                 run `omni-dev voice install-model` or pass --model <path>",
-                dir.display()
-            ))
-            .with_context(|| format!("missing required file: {}", path.display()));
-        }
-    }
-    Ok(())
+    WHISPER_TINY_EN.ensure_present(dir)
 }
 
 #[cfg(test)]
@@ -187,5 +328,97 @@ mod tests {
         assert_eq!(paths[0], PathBuf::from("/x/config.json"));
         assert_eq!(paths[1], PathBuf::from("/x/tokenizer.json"));
         assert_eq!(paths[2], PathBuf::from("/x/model.safetensors"));
+    }
+
+    // ── ModelSpec-shaped API tests ──────────────────────────────────────
+
+    #[test]
+    fn speaker_spec_default_dir_ends_with_wespeaker_subdir() {
+        let dir = SPEAKER_WESPEAKER_EN.default_dir().unwrap();
+        assert!(dir.ends_with(".omni-dev/voice/models/wespeaker-en-voxceleb-resnet34-LM"));
+    }
+
+    #[test]
+    fn speaker_spec_resolve_dir_override_takes_priority() {
+        let _g = env_guard();
+        std::env::set_var("OMNI_DEV_VOICE_SPEAKER_MODEL", "/should/not/be/read");
+        let resolved = SPEAKER_WESPEAKER_EN
+            .resolve_dir(Some(Path::new("/explicit/path")))
+            .unwrap();
+        assert_eq!(resolved, PathBuf::from("/explicit/path"));
+        std::env::remove_var("OMNI_DEV_VOICE_SPEAKER_MODEL");
+    }
+
+    #[test]
+    fn speaker_spec_resolve_dir_env_var_used_when_override_absent() {
+        let _g = env_guard();
+        std::env::set_var("OMNI_DEV_VOICE_SPEAKER_MODEL", "/from/env");
+        let resolved = SPEAKER_WESPEAKER_EN.resolve_dir(None).unwrap();
+        assert_eq!(resolved, PathBuf::from("/from/env"));
+        std::env::remove_var("OMNI_DEV_VOICE_SPEAKER_MODEL");
+    }
+
+    #[test]
+    fn speaker_spec_ensure_present_errors_with_install_hint() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let err = SPEAKER_WESPEAKER_EN.ensure_present(tmp.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no Speaker model found"), "got: {msg}");
+        assert!(msg.contains("--variant speaker-wespeaker-en"), "got: {msg}");
+        assert!(msg.contains("--speaker-model"), "got: {msg}");
+        assert!(
+            msg.contains("wespeaker_en_voxceleb_resnet34_LM.onnx"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn speaker_spec_ensure_present_succeeds_when_file_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("wespeaker_en_voxceleb_resnet34_LM.onnx"),
+            b"placeholder",
+        )
+        .unwrap();
+        SPEAKER_WESPEAKER_EN.ensure_present(tmp.path()).unwrap();
+    }
+
+    #[test]
+    fn whisper_spec_required_files_matches_legacy_helper() {
+        let dir = Path::new("/x");
+        assert_eq!(
+            WHISPER_TINY_EN.required_files_in(dir),
+            required_files_in(dir)
+        );
+    }
+
+    #[test]
+    fn whisper_spec_source_carries_pinned_hf_metadata() {
+        match WHISPER_TINY_EN.source {
+            ModelSource::HfHub { repo_id, revision } => {
+                assert_eq!(repo_id, MODEL_ID);
+                assert_eq!(revision, REVISION);
+            }
+            ModelSource::HttpReleaseAsset { .. } => {
+                panic!("WHISPER_TINY_EN should be HfHub-sourced");
+            }
+        }
+    }
+
+    #[test]
+    fn speaker_spec_source_carries_pinned_release_metadata() {
+        match SPEAKER_WESPEAKER_EN.source {
+            ModelSource::HttpReleaseAsset { url, sha256, bytes } => {
+                assert!(url.contains("wespeaker_en_voxceleb_resnet34_LM.onnx"));
+                assert_eq!(
+                    sha256,
+                    "e9848563da86f263117134dfd7ad63c92355b37de492b55e325400c9d9c39012"
+                );
+                assert_eq!(bytes, 26_530_550);
+            }
+            ModelSource::HfHub { .. } => {
+                panic!("SPEAKER_WESPEAKER_EN should be HttpReleaseAsset-sourced");
+            }
+        }
     }
 }
