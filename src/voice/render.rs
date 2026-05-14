@@ -162,6 +162,104 @@ fn fmt_timestamp(d: Duration) -> String {
     format!("{h:02}:{m:02}:{s:02}")
 }
 
+// ─── Review markdown (todos.md, decisions.md) ──────────────────────────
+
+use crate::voice::events::{ItemClass, Priority};
+use crate::voice::reconcile::{ReconciledDecision, ReconciledItem};
+
+/// Renders the `todos.md` body for a `voice review` pass.
+///
+/// Items are grouped by priority (High → Normal → Low), each group as
+/// a `## <Priority> priority` section. Within a group, items are sorted
+/// by their create-event id ascending so re-renders are byte-stable.
+/// Questions render with a `- ?` prefix to distinguish them from todos.
+///
+/// An empty section header is emitted only when at least one item lives
+/// in that bucket — sparse priority levels produce a sparser file.
+#[must_use]
+pub fn render_todos_md(items: &[ReconciledItem]) -> String {
+    let mut sorted: Vec<&ReconciledItem> = items.iter().collect();
+    sorted.sort_by_key(|i| i.created_event_id);
+
+    let mut out = String::from("# Todos\n");
+    for priority in [Priority::High, Priority::Normal, Priority::Low] {
+        let bucket: Vec<&&ReconciledItem> = sorted
+            .iter()
+            .filter(|i| i.item.priority == priority)
+            .collect();
+        if bucket.is_empty() {
+            continue;
+        }
+        out.push('\n');
+        out.push_str(&format!("## {} priority\n\n", priority_label(&priority)));
+        for entry in bucket {
+            out.push_str(&render_todo_line(entry));
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn priority_label(p: &Priority) -> &'static str {
+    match p {
+        Priority::High => "High",
+        Priority::Normal => "Normal",
+        Priority::Low => "Low",
+    }
+}
+
+fn render_todo_line(entry: &ReconciledItem) -> String {
+    let prefix = match entry.item.class {
+        ItemClass::Question => "- ?",
+        _ => "- [ ]",
+    };
+    let id_short = short_id(&entry.item.id);
+    match entry.item.valid_until {
+        Some(vu) => format!(
+            "{prefix} {text} — *expires {ts}* `{id_short}`",
+            text = entry.item.text,
+            ts = vu.to_rfc3339(),
+        ),
+        None => format!("{prefix} {text} `{id_short}`", text = entry.item.text),
+    }
+}
+
+/// Renders the `decisions.md` body for a `voice review` pass.
+///
+/// Decisions sort newest-first by their create-event id. When a
+/// decision recorded alternatives, they render as an indented
+/// continuation line; otherwise the alternatives line is omitted.
+#[must_use]
+pub fn render_decisions_md(decisions: &[ReconciledDecision]) -> String {
+    let mut sorted: Vec<&ReconciledDecision> = decisions.iter().collect();
+    sorted.sort_by_key(|d| std::cmp::Reverse(d.created_event_id));
+
+    let mut out = String::from("# Decisions\n");
+    if sorted.is_empty() {
+        return out;
+    }
+    out.push('\n');
+    for entry in sorted {
+        let id_short = short_id(&entry.decision.id);
+        out.push_str(&format!(
+            "- **{text}** `{id_short}`\n",
+            text = entry.decision.text,
+        ));
+        if !entry.decision.alternatives.is_empty() {
+            out.push_str(&format!(
+                "  Alternatives considered: {}\n",
+                entry.decision.alternatives.join(", "),
+            ));
+        }
+    }
+    out
+}
+
+fn short_id(u: &ulid::Ulid) -> String {
+    let s = u.to_string();
+    s.chars().take(8).collect()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

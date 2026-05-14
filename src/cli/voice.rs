@@ -7,6 +7,7 @@
 pub mod capture;
 pub mod install_model;
 pub mod reflect;
+pub mod review;
 pub mod transcribe;
 
 use anyhow::Result;
@@ -29,6 +30,8 @@ pub enum VoiceSubcommands {
     Transcribe(transcribe::TranscribeCommand),
     /// Reflects on a transcript and emits reflection events.
     Reflect(reflect::ReflectCommand),
+    /// Reconciles a session's events.jsonl into materialized markdown.
+    Review(review::ReviewCommand),
     /// Downloads the Whisper tiny.en model files for the `whisper-candle`
     /// backend into `~/.omni-dev/voice/models/whisper-tiny.en/`.
     InstallModel(install_model::InstallModelCommand),
@@ -45,6 +48,7 @@ impl VoiceCommand {
             VoiceSubcommands::Capture(cmd) => cmd.execute(),
             VoiceSubcommands::Transcribe(cmd) => cmd.execute(),
             VoiceSubcommands::Reflect(cmd) => cmd.execute().await,
+            VoiceSubcommands::Review(cmd) => cmd.execute(),
             VoiceSubcommands::InstallModel(cmd) => cmd.execute(),
         }
     }

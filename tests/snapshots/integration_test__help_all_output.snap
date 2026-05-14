@@ -2697,6 +2697,7 @@ Commands:
   capture        Captures audio from a microphone to a 16 kHz mono WAV file
   transcribe     Transcribes a 16 kHz mono WAV file to JSONL or markdown
   reflect        Reflects on a transcript and emits reflection events
+  review         Reconciles a session's events.jsonl into materialized markdown
   install-model  Downloads the Whisper tiny.en model files for the `whisper-candle` backend into `~/.omni-dev/voice/models/whisper-tiny.en/`
   help           Print this message or the help of the given subcommand(s)
 
@@ -2747,6 +2748,22 @@ Arguments:
 Options:
       --session <SESSION>  Reflect against a named voice session under `~/.omni-dev/voice/<id>/`. Mutually exclusive with a positional transcript path
   -h, --help               Print help
+
+
+================================================================================
+
+omni-dev voice review - Reconciles a session's events.jsonl into materialized markdown
+
+Reconciles a session's events.jsonl into materialized markdown
+
+Usage: review [OPTIONS] <SESSION_ID>
+
+Arguments:
+  <SESSION_ID>  Session id under `~/.omni-dev/voice/<id>/`
+
+Options:
+      --what <WHAT>  Which artefact to materialise. `all` (default) writes both markdown files and applies the TTL pass. `transcript` renders `transcript.jsonl` to stdout instead [default: all] [possible values: transcript, todos, decisions, all]
+  -h, --help         Print help (see more with '--help')
 
 
 ================================================================================

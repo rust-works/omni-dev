@@ -278,7 +278,7 @@ fn build_event(
         ts: clock.now(),
         reflection_id: reflection_id.clone(),
         provenance: Provenance {
-            transcript_span: span.clone(),
+            transcript_span: Some(span.clone()),
             model: Some(model.to_string()),
             prompt_version: Some(prompt_version.to_string()),
         },
