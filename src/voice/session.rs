@@ -364,10 +364,10 @@ mod tests {
 
     fn provenance() -> Provenance {
         Provenance {
-            transcript_span: TranscriptSpan {
+            transcript_span: Some(TranscriptSpan {
                 start_event_id: ulid::Ulid::from_parts(0, 1),
                 end_event_id: ulid::Ulid::from_parts(0, 2),
-            },
+            }),
             model: Some("m".into()),
             prompt_version: Some("p".into()),
         }
