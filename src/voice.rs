@@ -12,9 +12,14 @@
 pub mod audio;
 pub mod backends;
 pub mod capture;
+pub mod clock;
+pub mod det;
+pub mod events;
 pub mod factory;
 pub mod idle;
+pub mod reflect;
 pub mod render;
+pub mod session;
 pub mod transcriber;
 pub mod wav;
 
@@ -22,6 +27,8 @@ pub use audio::{AudioSource, CpalAudioSource, FileAudioSource};
 pub use capture::{
     install_ctrl_c_handler, run_capture, CaptureOpts, CaptureSummary, TerminationReason,
 };
+pub use clock::{Clock, FixedClock, SystemClock};
+pub use det::{CountingUlidRng, SystemUlidRng, UlidRng};
 pub use factory::{create_default_transcriber, VoiceOpts};
 pub use render::{detect_format, render_jsonl, render_markdown, OutputFormat};
 pub use transcriber::{

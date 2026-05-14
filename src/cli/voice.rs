@@ -5,6 +5,7 @@
 //! help text and parse logic local to each command.
 
 pub mod capture;
+pub mod reflect;
 pub mod transcribe;
 
 use anyhow::Result;
@@ -25,14 +26,21 @@ pub enum VoiceSubcommands {
     Capture(capture::CaptureCommand),
     /// Transcribes a 16 kHz mono WAV file to JSONL or markdown.
     Transcribe(transcribe::TranscribeCommand),
+    /// Reflects on a transcript and emits reflection events.
+    Reflect(reflect::ReflectCommand),
 }
 
 impl VoiceCommand {
     /// Dispatches to the selected voice subcommand.
-    pub fn execute(self) -> Result<()> {
+    ///
+    /// Async because `reflect` invokes Claude via an async
+    /// [`crate::claude::ai::AiClient`]. Sync arms just `.await` an
+    /// immediately-ready value via `async {…}`.
+    pub async fn execute(self) -> Result<()> {
         match self.command {
             VoiceSubcommands::Capture(cmd) => cmd.execute(),
             VoiceSubcommands::Transcribe(cmd) => cmd.execute(),
+            VoiceSubcommands::Reflect(cmd) => cmd.execute().await,
         }
     }
 }
@@ -66,5 +74,16 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, VoiceSubcommands::Transcribe(_)));
+    }
+
+    #[test]
+    fn voice_subcommands_reflect_variant() {
+        let cmd = VoiceCommand {
+            command: VoiceSubcommands::Reflect(reflect::ReflectCommand {
+                transcript: Some(PathBuf::from("/tmp/t.jsonl")),
+                session: None,
+            }),
+        };
+        assert!(matches!(cmd.command, VoiceSubcommands::Reflect(_)));
     }
 }
