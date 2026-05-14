@@ -75,8 +75,10 @@ pub struct TranscriptSpan {
 /// What motivated an event — for audit and reconciliation.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Provenance {
-    /// Range of transcript events this reflection consumed.
-    pub transcript_span: TranscriptSpan,
+    /// Range of transcript events this reflection consumed (null for
+    /// review-emitted events, which consume no transcript).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub transcript_span: Option<TranscriptSpan>,
     /// Model identifier (null for review-emitted events).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -467,7 +469,7 @@ mod tests {
 
     fn provenance() -> Provenance {
         Provenance {
-            transcript_span: span(),
+            transcript_span: Some(span()),
             model: Some("claude-sonnet-4-6".to_string()),
             prompt_version: Some("abcd1234".to_string()),
         }
