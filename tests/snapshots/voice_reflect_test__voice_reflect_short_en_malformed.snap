@@ -1,0 +1,6 @@
+---
+source: tests/voice_reflect_test.rs
+assertion_line: 122
+expression: body
+---
+{"event_id":"<ULID>","ts":"2026-01-01T00:00:00Z","reflection_id":"<ULID>","provenance":{"transcript_span":{"start_event_id":"<ULID>","end_event_id":"<ULID>"},"model":"mock-model","prompt_version":"f497959d"},"event_type":"reflection.error","payload":{"raw_output":"events:\n  - event_type: item.update\n    payload:\n      text: \"deliberately missing item_id — should produce a single reflection.error event\"\n","error":"YAML parse failure: events[0].payload: missing field `item_id` at line 4 column 7"}}

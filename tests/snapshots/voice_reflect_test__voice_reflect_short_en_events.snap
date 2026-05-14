@@ -1,0 +1,8 @@
+---
+source: tests/voice_reflect_test.rs
+assertion_line: 102
+expression: body
+---
+{"event_id":"<ULID>","ts":"2026-01-01T00:00:00Z","reflection_id":"<ULID>","provenance":{"transcript_span":{"start_event_id":"<ULID>","end_event_id":"<ULID>"},"model":"mock-model","prompt_version":"f497959d"},"event_type":"item.create","payload":{"item_id":"<ULID>","class":"todo","text":"Wire up real ASR backend to replace mock segments","priority":"high"}}
+{"event_id":"<ULID>","ts":"2026-01-01T00:00:00Z","reflection_id":"<ULID>","provenance":{"transcript_span":{"start_event_id":"<ULID>","end_event_id":"<ULID>"},"model":"mock-model","prompt_version":"f497959d"},"event_type":"research.note","payload":{"note_id":"<ULID>","text":"Mock transcriber emits stable placeholder segments suitable for snapshot tests"}}
+{"event_id":"<ULID>","ts":"2026-01-01T00:00:00Z","reflection_id":"<ULID>","provenance":{"transcript_span":{"start_event_id":"<ULID>","end_event_id":"<ULID>"},"model":"mock-model","prompt_version":"f497959d"},"event_type":"decision.record","payload":{"decision_id":"<ULID>","text":"Use mock backend as default until candle whisper integration lands","alternatives":["whisper-rs","wait for real backend before shipping reflect"]}}
