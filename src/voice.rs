@@ -17,6 +17,7 @@ pub mod det;
 pub mod events;
 pub mod factory;
 pub mod idle;
+pub mod models;
 pub mod reflect;
 pub mod render;
 pub mod session;
