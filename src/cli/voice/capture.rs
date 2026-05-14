@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
 use clap::Parser;
 
@@ -63,14 +63,8 @@ impl CaptureCommand {
 /// Resolves the default output path used when `--output` is not supplied:
 /// `~/.omni-dev/voice/captures/<YYYYMMDDTHHMMSSZ>.wav`.
 fn default_output_path() -> Result<PathBuf> {
-    let home = dirs::home_dir()
-        .context("Failed to resolve the user's home directory for default --output path")?;
     let timestamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    Ok(home
-        .join(".omni-dev")
-        .join("voice")
-        .join("captures")
-        .join(format!("{timestamp}.wav")))
+    Ok(crate::voice::captures_dir()?.join(format!("{timestamp}.wav")))
 }
 
 fn print_summary(summary: &CaptureSummary) {
