@@ -59,6 +59,9 @@ candle-transformers = { version = "0.10", default-features = false }
 hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"] }
 tokenizers = { version = "0.22", default-features = false }
 byteorder = "1"
+tract-onnx = "0.21"
+rustfft = "6"
+ureq = "2"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["signal"] }

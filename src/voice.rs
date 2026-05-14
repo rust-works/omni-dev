@@ -16,13 +16,16 @@ pub mod clock;
 pub mod det;
 pub mod events;
 pub mod factory;
+pub mod features;
 pub mod idle;
 pub mod models;
+pub mod paths;
 pub mod reconcile;
 pub mod reflect;
 pub mod render;
 pub mod review;
 pub mod session;
+pub mod speaker;
 pub mod transcriber;
 pub mod wav;
 
@@ -33,7 +36,9 @@ pub use capture::{
 pub use clock::{Clock, FixedClock, SystemClock};
 pub use det::{CountingUlidRng, SystemUlidRng, UlidRng};
 pub use factory::{create_default_transcriber, VoiceOpts};
+pub use paths::{captures_dir, omni_dev_voice_root, speaker_file, speakers_dir};
 pub use render::{detect_format, render_jsonl, render_markdown, OutputFormat};
+pub use speaker::{cosine, l2_normalise, EnrolledSpeaker, WespeakerEmbedder, MIN_EMBED_SAMPLES};
 pub use transcriber::{
     AudioChunk, AudioInput, EndpointKind, EventId, EventStream, SpeakerId, Transcriber,
     TranscriptEvent, VecAudioInput, Word,
