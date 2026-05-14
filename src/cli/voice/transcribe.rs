@@ -9,14 +9,16 @@
 
 use std::io::IsTerminal;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 
+use crate::voice::models::SPEAKER_WESPEAKER_EN;
 use crate::voice::{
-    create_default_transcriber, detect_format, render_jsonl, render_markdown, OutputFormat,
-    VecAudioInput, VoiceOpts,
+    cosine, create_default_transcriber, detect_format, render_jsonl, render_markdown, speaker_file,
+    EnrolledSpeaker, OutputFormat, TranscriptEvent, VecAudioInput, VoiceOpts, WespeakerEmbedder,
+    MIN_EMBED_SAMPLES,
 };
 
 /// Default chunk size handed to [`VecAudioInput`]. Doesn't affect the
@@ -24,6 +26,16 @@ use crate::voice::{
 /// (#806) where ~64 ms chunks at 16 kHz keep latency low without
 /// thrashing the inference loop.
 const DEFAULT_CHUNK_SAMPLES: usize = 1024;
+
+/// Default cosine-similarity threshold for `--speaker` filtering.
+///
+/// Calibrated against
+/// [tests/fixtures/voice/two_speakers.wav](../../../tests/fixtures/voice/two_speakers.wav)
+/// in [SPIKE.md on `issue-805-spike-tract-speaker`]: within-speaker mean
+/// ≈ 0.91, cross-speaker mean ≈ 0.07. The 0.5 default sits ~0.4 above
+/// the cross-speaker max and ~0.4 below the within-speaker min, leaving
+/// comfortable margin on both sides.
+pub const DEFAULT_SPEAKER_THRESHOLD: f32 = 0.5;
 
 /// Transcribes a 16 kHz mono WAV file to JSONL or markdown.
 ///
@@ -51,6 +63,24 @@ pub struct TranscribeCommand {
     /// Output format. Defaults to `md` on a tty, `jsonl` when piped.
     #[arg(long, value_enum)]
     pub format: Option<OutputFormatArg>,
+
+    /// Enrolled speaker to filter on. Drops any `Final` event whose
+    /// segment doesn't match the enrolled embedding by cosine
+    /// similarity at or above `--threshold`.
+    #[arg(long)]
+    pub speaker: Option<String>,
+
+    /// Cosine-similarity threshold for `--speaker`. Defaults to 0.5;
+    /// see [`DEFAULT_SPEAKER_THRESHOLD`].
+    #[arg(long)]
+    pub threshold: Option<f32>,
+
+    /// Path to the wespeaker ONNX model. Overrides the default at
+    /// `~/.omni-dev/voice/models/wespeaker-en-voxceleb-resnet34-LM/` and
+    /// `OMNI_DEV_VOICE_SPEAKER_MODEL`. Ignored unless `--speaker` is
+    /// set.
+    #[arg(long)]
+    pub speaker_model: Option<PathBuf>,
 }
 
 /// `clap` value enum matching [`OutputFormat`].
@@ -75,7 +105,7 @@ impl From<OutputFormatArg> for OutputFormat {
 impl TranscribeCommand {
     /// Executes the transcribe command.
     ///
-    /// Thin shim around [`Self::run`]: locks stdout and resolves the
+    /// Thin shim around `Self::run`: locks stdout and resolves the
     /// effective format from `--format` plus tty auto-detection, then
     /// delegates to the writer-generic helper. The split keeps stdout-
     /// locking and tty-detection out of the testable business logic.
@@ -94,6 +124,18 @@ impl TranscribeCommand {
     /// (writer failures, flush failures, backend-construction failures)
     /// without spawning a subprocess.
     fn run<W: Write>(self, w: &mut W, format: OutputFormat) -> Result<()> {
+        let speaker_filter = self
+            .speaker
+            .as_deref()
+            .map(|name| {
+                SpeakerFilter::load(
+                    name,
+                    self.speaker_model.as_deref(),
+                    self.threshold.unwrap_or(DEFAULT_SPEAKER_THRESHOLD),
+                    &self.wav,
+                )
+            })
+            .transpose()?;
         let opts = VoiceOpts {
             backend: self.backend,
             model: self.model,
@@ -102,13 +144,138 @@ impl TranscribeCommand {
         let input = VecAudioInput::from_wav_path(&self.wav, DEFAULT_CHUNK_SAMPLES)?;
         let stream = transcriber.transcribe(Box::new(input))?;
 
+        // Collect the (small, batch) stream so we can fold the speaker
+        // filter over it without juggling lifetime gymnastics on the
+        // boxed event iterator.
+        let events: Vec<Result<TranscriptEvent>> = stream.collect();
+        let filtered: Vec<Result<TranscriptEvent>> = match &speaker_filter {
+            Some(f) => events
+                .into_iter()
+                .filter_map(|ev| f.transform(ev))
+                .collect(),
+            None => events,
+        };
+
         match format {
-            OutputFormat::Jsonl => render_jsonl(stream, w)?,
-            OutputFormat::Md => render_markdown(stream, w)?,
+            OutputFormat::Jsonl => render_jsonl(filtered, w)?,
+            OutputFormat::Md => render_markdown(filtered, w)?,
         }
         w.flush()?;
         Ok(())
     }
+}
+
+/// Wraps the enrolled-speaker embedding + embedder + source PCM needed
+/// to filter the `Final` event stream on a single speaker.
+struct SpeakerFilter {
+    name: String,
+    enrolled: EnrolledSpeaker,
+    embedder: WespeakerEmbedder,
+    pcm: Vec<i16>,
+    threshold: f32,
+}
+
+impl SpeakerFilter {
+    fn load(name: &str, speaker_model: Option<&Path>, threshold: f32, wav: &Path) -> Result<Self> {
+        let enrolled_path = speaker_file(name)?;
+        let enrolled = EnrolledSpeaker::load(&enrolled_path).with_context(|| {
+            format!(
+                "load enrolled speaker {} from {}",
+                name,
+                enrolled_path.display()
+            )
+        })?;
+        let dir = SPEAKER_WESPEAKER_EN.resolve_dir(speaker_model)?;
+        SPEAKER_WESPEAKER_EN.ensure_present(&dir)?;
+        let model_path = dir.join(SPEAKER_WESPEAKER_EN.required_files[0]);
+        let embedder = WespeakerEmbedder::new(&model_path)?;
+        let pcm = read_wav_pcm_16k_mono(wav)?;
+        Ok(Self {
+            name: name.to_string(),
+            enrolled,
+            embedder,
+            pcm,
+            threshold,
+        })
+    }
+
+    /// Filters a single event. Returns `Some(event)` to keep it (with
+    /// `speaker` set on `Final`) or `None` to drop it. `Partial` and
+    /// `Endpoint` events always pass through unchanged. Errors pass
+    /// through so downstream rendering can fail loudly.
+    fn transform(&self, ev: Result<TranscriptEvent>) -> Option<Result<TranscriptEvent>> {
+        let ev = match ev {
+            Ok(ev) => ev,
+            err @ Err(_) => return Some(err),
+        };
+        match ev {
+            TranscriptEvent::Final {
+                event_id,
+                text,
+                start,
+                end,
+                confidence,
+                words,
+                speaker: _,
+                revisable,
+            } => {
+                let s = (start.as_secs_f64() * 16_000.0) as usize;
+                let e = (end.as_secs_f64() * 16_000.0) as usize;
+                let lo = s.min(self.pcm.len());
+                let hi = e.min(self.pcm.len());
+                let window = &self.pcm[lo..hi.max(lo)];
+                if window.len() < MIN_EMBED_SAMPLES {
+                    // Too short for a stable embedding; conservatively drop.
+                    return None;
+                }
+                let emb = match self.embedder.embed(window) {
+                    Ok(v) => v,
+                    Err(err) => return Some(Err(err)),
+                };
+                if cosine(&emb, &self.enrolled.vector) >= self.threshold {
+                    Some(Ok(TranscriptEvent::Final {
+                        event_id,
+                        text,
+                        start,
+                        end,
+                        confidence,
+                        words,
+                        speaker: Some(self.name.clone()),
+                        revisable,
+                    }))
+                } else {
+                    None
+                }
+            }
+            other => Some(Ok(other)),
+        }
+    }
+}
+
+/// Reads a 16 kHz mono 16-bit signed PCM WAV from `path`, returning the
+/// raw samples for re-windowing by [`SpeakerFilter::transform`].
+///
+/// Delegates format validation to the same invariants
+/// [`VecAudioInput::from_wav_path`] enforces; the two paths read the
+/// file independently because the transcriber moves its input.
+fn read_wav_pcm_16k_mono(path: &Path) -> Result<Vec<i16>> {
+    let mut reader = hound::WavReader::open(path)
+        .with_context(|| format!("open WAV at {} for speaker filter", path.display()))?;
+    let spec = reader.spec();
+    if spec.sample_rate != 16_000
+        || spec.channels != 1
+        || spec.bits_per_sample != 16
+        || spec.sample_format != hound::SampleFormat::Int
+    {
+        bail!(
+            "WAV at {} must be 16 kHz mono 16-bit PCM for --speaker filtering",
+            path.display()
+        );
+    }
+    reader
+        .samples::<i16>()
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("decode PCM samples from {}", path.display()))
 }
 
 #[cfg(test)]
@@ -159,6 +326,53 @@ mod tests {
             cli.transcribe.format,
             Some(OutputFormatArg::Jsonl)
         ));
+    }
+
+    #[test]
+    fn parses_speaker_flag() {
+        let cli = TestCli::try_parse_from(["test", "/tmp/x.wav", "--speaker", "alice"]).unwrap();
+        assert_eq!(cli.transcribe.speaker.as_deref(), Some("alice"));
+        // Threshold defaults to None at parse time; the run path applies
+        // DEFAULT_SPEAKER_THRESHOLD when speaker is set and threshold is None.
+        assert!(cli.transcribe.threshold.is_none());
+    }
+
+    #[test]
+    fn parses_threshold_flag() {
+        let cli = TestCli::try_parse_from(["test", "/tmp/x.wav", "--threshold", "0.65"]).unwrap();
+        assert!((cli.transcribe.threshold.unwrap() - 0.65).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn parses_speaker_model_flag() {
+        let cli = TestCli::try_parse_from([
+            "test",
+            "/tmp/x.wav",
+            "--speaker-model",
+            "/opt/wespeaker.onnx",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.transcribe
+                .speaker_model
+                .as_deref()
+                .and_then(|p| p.to_str()),
+            Some("/opt/wespeaker.onnx")
+        );
+    }
+
+    #[test]
+    fn rejects_non_numeric_threshold() {
+        let result = TestCli::try_parse_from(["test", "/tmp/x.wav", "--threshold", "high"]);
+        assert!(result.is_err(), "non-numeric threshold should fail");
+    }
+
+    #[test]
+    fn default_speaker_threshold_is_half() {
+        assert!(
+            (DEFAULT_SPEAKER_THRESHOLD - 0.5).abs() < f32::EPSILON,
+            "default threshold must be 0.5 to match the spike-calibrated default"
+        );
     }
 
     #[test]
@@ -227,7 +441,91 @@ mod tests {
             backend: backend.map(str::to_string),
             model: None,
             format: None,
+            speaker: None,
+            threshold: None,
+            speaker_model: None,
         }
+    }
+
+    fn write_test_wav(
+        path: &std::path::Path,
+        sample_rate: u32,
+        channels: u16,
+        bits: u16,
+        format: hound::SampleFormat,
+    ) {
+        let spec = hound::WavSpec {
+            channels,
+            sample_rate,
+            bits_per_sample: bits,
+            sample_format: format,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        match format {
+            hound::SampleFormat::Int => {
+                for s in [0_i16, 1, 2, 3] {
+                    writer.write_sample(s).unwrap();
+                }
+            }
+            hound::SampleFormat::Float => {
+                writer.write_sample(0.0_f32).unwrap();
+            }
+        }
+        writer.finalize().unwrap();
+    }
+
+    #[test]
+    fn read_wav_pcm_16k_mono_accepts_valid_wav() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("ok.wav");
+        write_test_wav(&path, 16_000, 1, 16, hound::SampleFormat::Int);
+        let pcm = read_wav_pcm_16k_mono(&path).unwrap();
+        assert_eq!(pcm, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn read_wav_pcm_16k_mono_rejects_wrong_sample_rate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("44k.wav");
+        write_test_wav(&path, 44_100, 1, 16, hound::SampleFormat::Int);
+        let err = read_wav_pcm_16k_mono(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("must be 16 kHz mono 16-bit PCM"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn read_wav_pcm_16k_mono_rejects_stereo() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("stereo.wav");
+        write_test_wav(&path, 16_000, 2, 16, hound::SampleFormat::Int);
+        let err = read_wav_pcm_16k_mono(&path).unwrap_err();
+        assert!(err.to_string().contains("16 kHz mono"), "got: {err}");
+    }
+
+    #[test]
+    fn read_wav_pcm_16k_mono_rejects_wrong_bit_depth() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("24bit.wav");
+        write_test_wav(&path, 16_000, 1, 24, hound::SampleFormat::Int);
+        let err = read_wav_pcm_16k_mono(&path).unwrap_err();
+        assert!(err.to_string().contains("16 kHz mono"), "got: {err}");
+    }
+
+    #[test]
+    fn read_wav_pcm_16k_mono_rejects_float_format() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("f32.wav");
+        write_test_wav(&path, 16_000, 1, 32, hound::SampleFormat::Float);
+        let err = read_wav_pcm_16k_mono(&path).unwrap_err();
+        assert!(err.to_string().contains("16 kHz mono"), "got: {err}");
+    }
+
+    #[test]
+    fn read_wav_pcm_16k_mono_missing_file_errors() {
+        let err = read_wav_pcm_16k_mono(std::path::Path::new("/nope/missing.wav")).unwrap_err();
+        assert!(err.to_string().contains("open WAV"), "got: {err}");
     }
 
     #[test]
