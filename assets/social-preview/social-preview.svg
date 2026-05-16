@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640">
+  <!-- Background -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d1117"/>
+      <stop offset="1" stop-color="#161b22"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#f97316"/>
+      <stop offset="1" stop-color="#ef4444"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1280" height="640" fill="url(#bg)"/>
+
+  <!-- Subtle vertical divider between branding and example panel -->
+  <line x1="440" y1="80" x2="440" y2="560" stroke="#30363d" stroke-width="1"/>
+
+  <!-- ============ LEFT PANEL: branding ============ -->
+  <!-- Wordmark -->
+  <text x="60" y="220"
+        font-family="Helvetica, Arial, sans-serif"
+        font-size="76" font-weight="800"
+        fill="url(#accent)">omni-dev</text>
+
+  <!-- Tagline -->
+  <text x="60" y="280"
+        font-family="Helvetica, Arial, sans-serif"
+        font-size="26" font-weight="600"
+        fill="#e6edf3">AI git commit rewriter</text>
+  <text x="60" y="316"
+        font-family="Helvetica, Arial, sans-serif"
+        font-size="26" font-weight="600"
+        fill="#e6edf3">&amp; MCP server</text>
+
+  <!-- Decorative bullets -->
+  <text x="60" y="380"
+        font-family="Helvetica, Arial, sans-serif"
+        font-size="18" font-weight="400"
+        fill="#8b949e">Contextual · Conventional · Safe</text>
+
+  <!-- ============ RIGHT PANEL: terminal-style example ============ -->
+  <!-- Terminal frame -->
+  <rect x="480" y="80" width="740" height="460" rx="12" ry="12"
+        fill="#010409" stroke="#30363d" stroke-width="1"/>
+
+  <!-- Window dots -->
+  <circle cx="510" cy="110" r="7" fill="#f85149"/>
+  <circle cx="534" cy="110" r="7" fill="#d29922"/>
+  <circle cx="558" cy="110" r="7" fill="#3fb950"/>
+  <text x="850" y="115"
+        font-family="Menlo, Consolas, monospace"
+        font-size="13" fill="#6e7681" text-anchor="middle">git log --oneline</text>
+
+  <!-- BEFORE label -->
+  <text x="510" y="170"
+        font-family="Helvetica, Arial, sans-serif"
+        font-size="16" font-weight="700"
+        fill="#f85149" letter-spacing="2">BEFORE</text>
+
+  <!-- Before lines (messy) -->
+  <text x="510" y="206"
+        font-family="Menlo, Consolas, monospace"
+        font-size="20" fill="#8b949e">a1b2c3d</text>
+  <text x="610" y="206"
+        font-family="Menlo, Consolas, monospace"
+        font-size="20" fill="#e6edf3">fix stuff</text>
+
+  <text x="510" y="240"
+        font-family="Menlo, Consolas, monospace"
+        font-size="20" fill="#8b949e">e4f5g6h</text>
+  <text x="610" y="240"
+        font-family="Menlo, Consolas, monospace"
+        font-size="20" fill="#e6edf3">wip</text>
+
+  <text x="510" y="274"
+        font-family="Menlo, Consolas, monospace"
+        font-size="20" fill="#8b949e">i7j8k9l</text>
+  <text x="610" y="274"
+        font-family="Menlo, Consolas, monospace"
+        font-size="20" fill="#e6edf3">update files</text>
+
+  <!-- Arrow / divider -->
+  <line x1="510" y1="310" x2="1190" y2="310" stroke="#21262d" stroke-width="1"/>
+  <text x="850" y="334"
+        font-family="Helvetica, Arial, sans-serif"
+        font-size="14" fill="#6e7681" text-anchor="middle">↓  omni-dev amend  ↓</text>
+
+  <!-- AFTER label -->
+  <text x="510" y="378"
+        font-family="Helvetica, Arial, sans-serif"
+        font-size="16" font-weight="700"
+        fill="#3fb950" letter-spacing="2">AFTER</text>
+
+  <!-- After lines (polished, conventional) -->
+  <text x="510" y="414"
+        font-family="Menlo, Consolas, monospace"
+        font-size="20" fill="#8b949e">a1b2c3d</text>
+  <text x="610" y="414"
+        font-family="Menlo, Consolas, monospace"
+        font-size="20" fill="#79c0ff" font-weight="700">feat(auth):</text>
+  <text x="800" y="414"
+        font-family="Menlo, Consolas, monospace"
+        font-size="20" fill="#e6edf3">implement OAuth2 flow</text>
+
+  <text x="510" y="448"
+        font-family="Menlo, Consolas, monospace"
+        font-size="20" fill="#8b949e">e4f5g6h</text>
+  <text x="610" y="448"
+        font-family="Menlo, Consolas, monospace"
+        font-size="20" fill="#79c0ff" font-weight="700">docs(api):</text>
+  <text x="800" y="448"
+        font-family="Menlo, Consolas, monospace"
+        font-size="20" fill="#e6edf3">document endpoint schema</text>
+
+  <text x="510" y="482"
+        font-family="Menlo, Consolas, monospace"
+        font-size="20" fill="#8b949e">i7j8k9l</text>
+  <text x="610" y="482"
+        font-family="Menlo, Consolas, monospace"
+        font-size="20" fill="#79c0ff" font-weight="700">refactor(cli):</text>
+  <text x="800" y="482"
+        font-family="Menlo, Consolas, monospace"
+        font-size="20" fill="#e6edf3">extract arg parsing</text>
+
+  <!-- ============ FOOTER ============ -->
+  <line x1="60" y1="580" x2="1220" y2="580" stroke="#21262d" stroke-width="1"/>
+  <text x="60" y="610"
+        font-family="Menlo, Consolas, monospace"
+        font-size="18" fill="#e6edf3">$ cargo install omni-dev</text>
+  <text x="1220" y="610"
+        font-family="Helvetica, Arial, sans-serif"
+        font-size="16" fill="#8b949e" text-anchor="end">BSD-3-Clause  ·  Built with Rust 🦀</text>
+</svg>
