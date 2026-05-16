@@ -26,6 +26,9 @@ Before starting a release, ensure you have:
 - [ ] Commit access to the main branch
 - [ ] All tests passing locally
 - [ ] Clean working directory
+- [ ] GitHub repo description and topics still accurately describe the project
+  - Check: `gh repo view rust-works/omni-dev --json description,repositoryTopics`
+  - Update via `gh repo edit` (description) or `gh api -X PUT repos/rust-works/omni-dev/topics` (topics) if the project's scope has shifted since the last release. See [issue #831](https://github.com/rust-works/omni-dev/issues/831) for the original baseline.
 
 ## Release Steps
 
