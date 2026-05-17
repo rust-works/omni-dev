@@ -11,7 +11,7 @@ use crate::atlassian::client::{
     JiraDevStatus, JiraDevStatusSummary, JiraProjectList, JiraProjectVersionList, JiraSearchResult,
     JiraUserSearchResults, JiraWatcherList, JiraWorklogList,
 };
-use crate::atlassian::confluence_api::ConfluenceAttachmentPage;
+use crate::atlassian::confluence_api::{ConfluenceAttachmentPage, ConfluenceSpacePage};
 
 /// Output/input format for Atlassian content (read/write/create commands).
 #[derive(Clone, Debug, Default, ValueEnum)]
@@ -130,6 +130,12 @@ impl JsonlSerialize for ConfluenceUserSearchResults {
 }
 
 impl JsonlSerialize for ConfluenceAttachmentPage {
+    fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
+        write_items_jsonl(self.results.iter(), out)
+    }
+}
+
+impl JsonlSerialize for ConfluenceSpacePage {
     fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
         write_items_jsonl(self.results.iter(), out)
     }
@@ -657,6 +663,47 @@ mod tests {
     fn confluence_attachment_page_jsonl_empty() {
         use crate::atlassian::confluence_api::ConfluenceAttachmentPage;
         let page = ConfluenceAttachmentPage {
+            results: vec![],
+            next_cursor: None,
+        };
+        assert_eq!(jsonl_string(&page), "");
+    }
+
+    #[test]
+    fn confluence_space_page_jsonl() {
+        use crate::atlassian::confluence_api::{ConfluenceSpace, ConfluenceSpacePage};
+        let page = ConfluenceSpacePage {
+            results: vec![
+                ConfluenceSpace {
+                    id: "100".to_string(),
+                    key: "ENG".to_string(),
+                    name: "Engineering".to_string(),
+                    type_: "global".to_string(),
+                    status: "current".to_string(),
+                    homepage_id: Some("200".to_string()),
+                },
+                ConfluenceSpace {
+                    id: "101".to_string(),
+                    key: "OPS".to_string(),
+                    name: "Operations".to_string(),
+                    type_: "global".to_string(),
+                    status: "archived".to_string(),
+                    homepage_id: None,
+                },
+            ],
+            next_cursor: Some("NEXT".to_string()),
+        };
+        let out = jsonl_string(&page);
+        assert_eq!(out.lines().count(), 2);
+        assert!(out.contains("\"id\":\"100\""));
+        assert!(out.contains("\"key\":\"ENG\""));
+        assert!(out.contains("\"homepageId\":\"200\""));
+    }
+
+    #[test]
+    fn confluence_space_page_jsonl_empty() {
+        use crate::atlassian::confluence_api::ConfluenceSpacePage;
+        let page = ConfluenceSpacePage {
             results: vec![],
             next_cursor: None,
         };

@@ -155,6 +155,7 @@ mod tests {
             "confluence_attachment_upload",
             "confluence_attachment_list",
             "confluence_attachment_delete",
+            "confluence_space_list",
         ] {
             assert!(
                 server.tool_router.has_route(name),

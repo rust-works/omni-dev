@@ -102,13 +102,77 @@ struct ConfluenceSpaceResponse {
 }
 
 #[derive(Deserialize)]
-struct ConfluenceSpacesSearchResponse {
-    results: Vec<ConfluenceSpaceSearchEntry>,
+struct ConfluenceSpacesResponse {
+    results: Vec<ConfluenceSpaceEntry>,
+    #[serde(rename = "_links", default)]
+    links: Option<ConfluenceSpaceLinks>,
 }
 
 #[derive(Deserialize)]
-struct ConfluenceSpaceSearchEntry {
+struct ConfluenceSpaceLinks {
+    next: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceSpaceEntry {
     id: String,
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(rename = "type", default)]
+    type_: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(rename = "homepageId", default)]
+    homepage_id: Option<String>,
+}
+
+/// A Confluence space.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfluenceSpace {
+    /// Space ID.
+    pub id: String,
+    /// Space key (e.g. "ENG").
+    pub key: String,
+    /// Display name.
+    pub name: String,
+    /// Space type ("global", "personal", "collaboration", "knowledge_base").
+    #[serde(rename = "type")]
+    pub type_: String,
+    /// Status ("current" or "archived").
+    pub status: String,
+    /// Homepage page ID, when reported by the API.
+    #[serde(rename = "homepageId", skip_serializing_if = "Option::is_none")]
+    pub homepage_id: Option<String>,
+}
+
+impl From<ConfluenceSpaceEntry> for ConfluenceSpace {
+    fn from(e: ConfluenceSpaceEntry) -> Self {
+        Self {
+            id: e.id,
+            key: e.key.unwrap_or_default(),
+            name: e.name.unwrap_or_default(),
+            type_: e.type_.unwrap_or_default(),
+            status: e.status.unwrap_or_default(),
+            homepage_id: e.homepage_id,
+        }
+    }
+}
+
+/// A page of spaces returned by [`ConfluenceApi::list_spaces`].
+///
+/// Pagination is *not* auto-drained: callers receive one page at a time and
+/// pass `next_cursor` back to fetch the next page. Mirrors the
+/// [`ConfluenceAttachmentPage`] shape so MCP/CLI callers can stream large
+/// space inventories without buffering everything in memory.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfluenceSpacePage {
+    /// Spaces on this page.
+    pub results: Vec<ConfluenceSpace>,
+    /// Opaque cursor for the next page, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 // ── Children response ──────────────────────────────────────────────
@@ -706,17 +770,59 @@ impl AtlassianApi for ConfluenceApi {
 impl ConfluenceApi {
     /// Resolves a space key to a space ID via the Confluence API.
     pub async fn resolve_space_id(&self, space_key: &str) -> Result<String> {
-        let url = format!(
-            "{}/wiki/api/v2/spaces?keys={}",
+        let page = self.list_spaces(&[space_key], None, None, None, 1).await?;
+
+        page.results
+            .into_iter()
+            .next()
+            .map(|s| s.id)
+            .ok_or_else(|| anyhow::anyhow!("Space with key \"{space_key}\" not found"))
+    }
+
+    /// Lists Confluence spaces (one page at a time).
+    ///
+    /// Optional filters: `keys` (matches any of the given space keys; joined as
+    /// a single comma-separated query parameter), `type` (one of `"global"`,
+    /// `"personal"`, `"collaboration"`, `"knowledge_base"`), `status` (one of
+    /// `"current"`, `"archived"`). Pagination is *not* auto-drained: pass
+    /// [`ConfluenceSpacePage::next_cursor`] back as `cursor` to fetch the next
+    /// page.
+    pub async fn list_spaces(
+        &self,
+        keys: &[&str],
+        type_: Option<&str>,
+        status: Option<&str>,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<ConfluenceSpacePage> {
+        let mut url = format!(
+            "{}/wiki/api/v2/spaces?limit={}",
             self.client.instance_url(),
-            space_key
+            limit
         );
+        if !keys.is_empty() {
+            let joined = keys.join(",");
+            url.push_str("&keys=");
+            url.push_str(&urlencoding(&joined));
+        }
+        if let Some(t) = type_ {
+            url.push_str("&type=");
+            url.push_str(&urlencoding(t));
+        }
+        if let Some(s) = status {
+            url.push_str("&status=");
+            url.push_str(&urlencoding(s));
+        }
+        if let Some(c) = cursor {
+            url.push_str("&cursor=");
+            url.push_str(&urlencoding(c));
+        }
 
         let response = self
             .client
             .get_json(&url)
             .await
-            .context("Failed to search Confluence spaces")?;
+            .context("Failed to list Confluence spaces")?;
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
@@ -724,15 +830,22 @@ impl ConfluenceApi {
             return Err(AtlassianError::ApiRequestFailed { status, body }.into());
         }
 
-        let resp: ConfluenceSpacesSearchResponse = response
+        let resp: ConfluenceSpacesResponse = response
             .json()
             .await
             .context("Failed to parse Confluence spaces response")?;
 
-        resp.results
-            .first()
-            .map(|s| s.id.clone())
-            .ok_or_else(|| anyhow::anyhow!("Space with key \"{space_key}\" not found"))
+        let next_cursor = resp
+            .links
+            .and_then(|l| l.next)
+            .and_then(|next_path| extract_cursor_from_next(&next_path));
+
+        let results = resp.results.into_iter().map(Into::into).collect();
+
+        Ok(ConfluenceSpacePage {
+            results,
+            next_cursor,
+        })
     }
 
     /// Creates a new Confluence page.
@@ -2118,6 +2231,227 @@ mod tests {
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
         let api = ConfluenceApi::new(client);
         let err = api.resolve_space_id("ENG").await.unwrap_err();
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn list_spaces_no_filters_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces"))
+            .and(wiremock::matchers::query_param("limit", "25"))
+            .and(wiremock::matchers::query_param_is_missing("keys"))
+            .and(wiremock::matchers::query_param_is_missing("type"))
+            .and(wiremock::matchers::query_param_is_missing("status"))
+            .and(wiremock::matchers::query_param_is_missing("cursor"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {
+                            "id": "100",
+                            "key": "ENG",
+                            "name": "Engineering",
+                            "type": "global",
+                            "status": "current",
+                            "homepageId": "200"
+                        },
+                        {
+                            "id": "101",
+                            "key": "OPS",
+                            "name": "Operations",
+                            "type": "global",
+                            "status": "archived"
+                        }
+                    ]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let page = api.list_spaces(&[], None, None, None, 25).await.unwrap();
+        assert_eq!(page.results.len(), 2);
+        assert_eq!(page.results[0].id, "100");
+        assert_eq!(page.results[0].key, "ENG");
+        assert_eq!(page.results[0].name, "Engineering");
+        assert_eq!(page.results[0].type_, "global");
+        assert_eq!(page.results[0].status, "current");
+        assert_eq!(page.results[0].homepage_id.as_deref(), Some("200"));
+        assert_eq!(page.results[1].status, "archived");
+        assert!(page.results[1].homepage_id.is_none());
+        assert!(page.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_spaces_with_keys_filter() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces"))
+            .and(wiremock::matchers::query_param("keys", "ENG,DEV"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": []})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let page = api
+            .list_spaces(&["ENG", "DEV"], None, None, None, 25)
+            .await
+            .unwrap();
+        assert!(page.results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_spaces_with_type_and_status() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces"))
+            .and(wiremock::matchers::query_param("type", "global"))
+            .and(wiremock::matchers::query_param("status", "archived"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": []})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let page = api
+            .list_spaces(&[], Some("global"), Some("archived"), None, 25)
+            .await
+            .unwrap();
+        assert!(page.results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_spaces_keys_combined_with_type() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces"))
+            .and(wiremock::matchers::query_param("keys", "ENG"))
+            .and(wiremock::matchers::query_param("type", "knowledge_base"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": []})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let page = api
+            .list_spaces(&["ENG"], Some("knowledge_base"), None, None, 25)
+            .await
+            .unwrap();
+        assert!(page.results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_spaces_pagination_round_trip() {
+        let server = wiremock::MockServer::start().await;
+
+        // First page returns a _links.next pointing to cursor=PAGE2.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces"))
+            .and(wiremock::matchers::query_param_is_missing("cursor"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{
+                        "id": "1", "key": "A", "name": "A",
+                        "type": "global", "status": "current"
+                    }],
+                    "_links": {"next": "/wiki/api/v2/spaces?cursor=PAGE2&limit=25"}
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Second page (cursor=PAGE2) returns the next batch with no further next.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces"))
+            .and(wiremock::matchers::query_param("cursor", "PAGE2"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{
+                        "id": "2", "key": "B", "name": "B",
+                        "type": "global", "status": "current"
+                    }]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+
+        let first = api.list_spaces(&[], None, None, None, 25).await.unwrap();
+        assert_eq!(first.next_cursor.as_deref(), Some("PAGE2"));
+
+        let second = api
+            .list_spaces(&[], None, None, Some("PAGE2"), 25)
+            .await
+            .unwrap();
+        assert_eq!(second.results.len(), 1);
+        assert_eq!(second.results[0].id, "2");
+        assert!(second.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_spaces_homepage_id_absent() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{
+                        "id": "1", "key": "A", "name": "A",
+                        "type": "global", "status": "current"
+                    }]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let page = api.list_spaces(&[], None, None, None, 25).await.unwrap();
+        assert!(page.results[0].homepage_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_spaces_api_error_403() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = api
+            .list_spaces(&[], None, None, None, 25)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("403"));
     }
 
