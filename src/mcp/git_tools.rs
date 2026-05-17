@@ -85,6 +85,21 @@ pub struct GitTwiddleCommitsParams {
     pub repo_path: Option<String>,
 }
 
+/// Parameters for the `git_staged_commit` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GitStagedCommitParams {
+    /// When true, the generated commit message is returned without being
+    /// committed to the repository. Defaults to `false` (commit applied).
+    #[serde(default)]
+    pub print_only: bool,
+    /// Claude model override.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Path to the git repository. Defaults to the current working directory.
+    #[serde(default)]
+    pub repo_path: Option<String>,
+}
+
 /// Parameters for the `git_create_pr` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GitCreatePrParams {
@@ -207,6 +222,36 @@ impl OmniDevServer {
         )]))
     }
 
+    /// Tool: generate a commit message from staged changes and commit them.
+    #[tool(
+        description = "Generate a Conventional Commits message from the currently staged diff \
+                       and (by default) commit it via `git commit -m`. Mirrors \
+                       `omni-dev git commit message staged`. Set `print_only = true` to return \
+                       the generated message without committing."
+    )]
+    pub async fn git_staged_commit(
+        &self,
+        Parameters(params): Parameters<GitStagedCommitParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let print_only = params.print_only;
+        let model = params.model.clone();
+        params
+            .repo_path
+            .as_deref()
+            .map(validate_repo_path)
+            .transpose()?;
+        let repo_path: Option<PathBuf> = params.repo_path.as_deref().map(PathBuf::from);
+
+        let outcome =
+            crate::cli::git::run_staged(print_only, model, None, None, repo_path.as_deref())
+                .await
+                .map_err(tool_error)?;
+
+        Ok(CallToolResult::success(vec![Content::text(
+            format_staged_payload(&outcome, print_only),
+        )]))
+    }
+
     /// Tool: generate a PR title + description via the AI.
     #[tool(
         description = "Generate an AI-drafted pull request title and description for the \
@@ -287,11 +332,21 @@ fn format_twiddle_payload(outcome: &crate::cli::git::TwiddleOutcome, dry_run: bo
     )
 }
 
+/// Formats the payload returned by the `git_staged_commit` tool.
+fn format_staged_payload(outcome: &crate::cli::git::StagedOutcome, print_only: bool) -> String {
+    format!(
+        "# git_staged_commit outcome\napplied: {}\nprint_only: {}\nmessage: |\n{}",
+        outcome.applied,
+        print_only,
+        indent_for_yaml(&outcome.message),
+    )
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::cli::git::{CheckOutcome, TwiddleOutcome};
+    use crate::cli::git::{CheckOutcome, StagedOutcome, TwiddleOutcome};
 
     #[test]
     fn build_truncated_result_leaves_small_output_alone() {
@@ -394,6 +449,31 @@ mod tests {
         assert!(payload.contains("amendment_count: 0"));
     }
 
+    #[test]
+    fn format_staged_payload_applied() {
+        let outcome = StagedOutcome {
+            message: "feat(cli): add staged subcommand".to_string(),
+            applied: true,
+        };
+        let payload = format_staged_payload(&outcome, false);
+        assert!(payload.contains("applied: true"));
+        assert!(payload.contains("print_only: false"));
+        assert!(payload.contains("  feat(cli): add staged subcommand"));
+    }
+
+    #[test]
+    fn format_staged_payload_print_only() {
+        let outcome = StagedOutcome {
+            message: "fix(x): y\n\nBody.".to_string(),
+            applied: false,
+        };
+        let payload = format_staged_payload(&outcome, true);
+        assert!(payload.contains("applied: false"));
+        assert!(payload.contains("print_only: true"));
+        assert!(payload.contains("  fix(x): y"));
+        assert!(payload.contains("  Body."));
+    }
+
     // Direct MCP handler invocation — exercises parameter destructuring and
     // error wrapping without needing a full duplex client/server pair.
 
@@ -448,6 +528,24 @@ mod tests {
         };
         let err = server
             .git_twiddle_commits(Parameters(params))
+            .await
+            .unwrap_err();
+        assert!(!err.message.is_empty());
+    }
+
+    #[tokio::test]
+    async fn git_staged_commit_handler_invalid_repo_path_returns_tool_error() {
+        use crate::mcp::server::OmniDevServer;
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let server = OmniDevServer::new();
+        let params = GitStagedCommitParams {
+            print_only: true,
+            model: None,
+            repo_path: Some("/no/such/path/for/mcp/test".to_string()),
+        };
+        let err = server
+            .git_staged_commit(Parameters(params))
             .await
             .unwrap_err();
         assert!(!err.message.is_empty());
