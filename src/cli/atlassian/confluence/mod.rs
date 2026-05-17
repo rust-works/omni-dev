@@ -13,6 +13,7 @@ pub(crate) mod label;
 pub(crate) mod move_page;
 pub(crate) mod read;
 pub(crate) mod search;
+pub(crate) mod space;
 pub(crate) mod user;
 pub(crate) mod write;
 
@@ -60,6 +61,8 @@ pub enum ConfluenceSubcommands {
     Compare(compare::CompareCommandGroup),
     /// Confluence user operations.
     User(user::UserCommand),
+    /// Confluence space operations.
+    Space(space::SpaceCommand),
 }
 
 impl ConfluenceCommand {
@@ -81,6 +84,7 @@ impl ConfluenceCommand {
             ConfluenceSubcommands::History(cmd) => cmd.execute().await,
             ConfluenceSubcommands::Compare(cmd) => cmd.execute().await,
             ConfluenceSubcommands::User(cmd) => cmd.execute().await,
+            ConfluenceSubcommands::Space(cmd) => cmd.execute().await,
         }
     }
 }
@@ -257,6 +261,57 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::User(_)));
+    }
+
+    #[test]
+    fn confluence_subcommands_space_variant() {
+        let cmd = ConfluenceCommand {
+            command: ConfluenceSubcommands::Space(space::SpaceCommand {
+                command: space::SpaceSubcommands::List(space::ListCommand {
+                    keys: vec![],
+                    r#type: None,
+                    status: None,
+                    cursor: None,
+                    limit: 25,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        assert!(matches!(cmd.command, ConfluenceSubcommands::Space(_)));
+    }
+
+    /// Exercises the `Space` dispatch arm in `ConfluenceCommand::execute`
+    /// with injected fake credentials so `create_client()` succeeds and the
+    /// downstream call is reached. The subsequent API call is allowed to
+    /// fail — we only care that the dispatch line runs.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn confluence_command_execute_space_dispatch() {
+        let _lock = crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        std::env::set_var("ATLASSIAN_INSTANCE_URL", "http://127.0.0.1:1");
+        std::env::set_var("ATLASSIAN_EMAIL", "test@example.com");
+        std::env::set_var("ATLASSIAN_API_TOKEN", "fake-token");
+
+        let cmd = ConfluenceCommand {
+            command: ConfluenceSubcommands::Space(space::SpaceCommand {
+                command: space::SpaceSubcommands::List(space::ListCommand {
+                    keys: vec![],
+                    r#type: None,
+                    status: None,
+                    cursor: None,
+                    limit: 25,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        let _ = cmd.execute().await;
+
+        std::env::remove_var("ATLASSIAN_INSTANCE_URL");
+        std::env::remove_var("ATLASSIAN_EMAIL");
+        std::env::remove_var("ATLASSIAN_API_TOKEN");
     }
 
     #[test]

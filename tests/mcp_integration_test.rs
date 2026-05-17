@@ -1731,6 +1731,7 @@ async fn list_tools_includes_confluence_extensions() -> Result<()> {
         "confluence_attachment_upload",
         "confluence_attachment_list",
         "confluence_attachment_delete",
+        "confluence_space_list",
         "confluence_compare",
         "confluence_compare_section",
     ] {
