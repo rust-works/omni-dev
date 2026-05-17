@@ -584,6 +584,18 @@ pub(crate) async fn link_remove_yaml(
     serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
 
+/// Parameters for the `jira_link_remote_list` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LinkRemoteListParams {
+    /// JIRA issue key (e.g., `PROJ-123`).
+    pub key: String,
+}
+
+pub(crate) async fn link_remote_list_yaml(client: &AtlassianClient, key: &str) -> Result<String> {
+    let links = client.get_remote_issue_links(key).await?;
+    serde_yaml::to_string(&links).context("Failed to serialize remote issue links as YAML")
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Worklog tools
 // ─────────────────────────────────────────────────────────────────────────
@@ -1179,6 +1191,27 @@ impl OmniDevServer {
         let yaml = (async {
             let (client, _) = create_client()?;
             link_remove_yaml(&client, &params.link_id, params.confirm).await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: list remote (external URL) links on an issue.
+    #[tool(
+        description = "List remote (external URL) links on a JIRA issue — links pointing out \
+                       to non-JIRA resources (Confluence pages, Bitbucket PRs, external \
+                       trackers). Read-only. Returns YAML with one entry per remote link \
+                       (id, optional global_id, optional relationship, object.{url, title, \
+                       summary, icon}). Mirrors `omni-dev atlassian jira link remote list`."
+    )]
+    pub async fn jira_link_remote_list(
+        &self,
+        Parameters(params): Parameters<LinkRemoteListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            link_remote_list_yaml(&client, &params.key).await
         })
         .await
         .map_err(tool_error)?;

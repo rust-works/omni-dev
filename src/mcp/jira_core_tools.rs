@@ -193,7 +193,8 @@ pub struct JiraCommentEditParams {
 /// Parameters for the `jira_link` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct JiraLinkParams {
-    /// Action: `list`, `types`, `create`, `remove`, or `parent`.
+    /// Action: `list`, `types`, `create`, `remove`, `parent`, or
+    /// `remote_list` (read-only listing of external URL links).
     pub action: String,
     /// Issue key. Required for `list`; for `create`, this is the source
     /// (inward) issue; for `parent`, this is the child issue. Ignored for
@@ -592,8 +593,14 @@ async fn run_jira_link(
             client.set_issue_parent(child, parent_key).await?;
             Ok(format!("Set parent of {child} to {parent_key}.\n"))
         }
+        "remote_list" => {
+            let k = key
+                .ok_or_else(|| anyhow::anyhow!("`key` is required for link remote_list"))?;
+            let links = client.get_remote_issue_links(k).await?;
+            yaml_result(&links)
+        }
         other => anyhow::bail!(
-            "unknown link action {other:?} (expected \"list\", \"types\", \"create\", \"remove\", or \"parent\")"
+            "unknown link action {other:?} (expected \"list\", \"types\", \"create\", \"remove\", \"parent\", or \"remote_list\")"
         ),
     }
 }
@@ -822,7 +829,10 @@ impl OmniDevServer {
                        \"types\", \"create\" (needs `key`, `target`, `link_type`), \
                        \"remove\" (needs `link_id`), \"parent\" (needs `key` = child, \
                        `target` = parent — sets the system parent field for Epic → Story / \
-                       Story → Sub-task hierarchy, distinct from relationship links)."
+                       Story → Sub-task hierarchy, distinct from relationship links), \
+                       \"remote_list\" (needs `key` — read-only listing of external URL \
+                       links pointing out to non-JIRA resources like Confluence or \
+                       Bitbucket PRs)."
     )]
     pub async fn jira_link(
         &self,
@@ -2333,6 +2343,42 @@ mod tests {
     async fn run_jira_link_list_requires_key() {
         let client = mock_client("http://127.0.0.1:1");
         let err = run_jira_link(&client, "list", None, None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("`key` is required"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_link_remote_list_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1/remotelink"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "id": 10001,
+                    "relationship": "mentioned in",
+                    "object": {
+                        "url": "https://example.atlassian.net/wiki/page/1",
+                        "title": "Design doc"
+                    }
+                }
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = run_jira_link(&client, "remote_list", Some("PROJ-1"), None, None, None)
+            .await
+            .unwrap();
+        assert!(yaml.contains("10001"));
+        assert!(yaml.contains("mentioned in"));
+        assert!(yaml.contains("Design doc"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_link_remote_list_requires_key() {
+        let client = mock_client("http://127.0.0.1:1");
+        let err = run_jira_link(&client, "remote_list", None, None, None, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("`key` is required"));
