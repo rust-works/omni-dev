@@ -2385,6 +2385,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_jira_link_remote_list_propagates_api_errors() {
+        // Covers the `?` error branch on `client.get_remote_issue_links(k)`
+        // — Codecov flags this as a partial without an explicit failing
+        // path.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/NOPE-1/remotelink"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = run_jira_link(&client, "remote_list", Some("NOPE-1"), None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
     async fn run_jira_link_create_posts_link() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))

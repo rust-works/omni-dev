@@ -1040,6 +1040,35 @@ mod tests {
         );
     }
 
+    /// End-to-end exercise of the nested public `execute()` chain for the
+    /// remote-link `list` subcommand: outer `LinkCommand::execute` →
+    /// `RemoteLinkCommand::execute` → `ListRemoteLinksCommand::execute` →
+    /// `create_client` → API.
+    #[tokio::test]
+    async fn link_command_remote_list_execute_drives_create_client_and_calls_api() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/remotelink",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        let cmd = LinkCommand {
+            command: LinkSubcommands::Remote(RemoteLinkCommand {
+                command: RemoteLinkSubcommands::List(ListRemoteLinksCommand {
+                    key: "PROJ-1".to_string(),
+                    output: OutputFormat::Yaml,
+                }),
+            }),
+        };
+        cmd.execute().await.unwrap();
+    }
+
     #[tokio::test]
     async fn run_list_remote_links_propagates_error() {
         let server = wiremock::MockServer::start().await;

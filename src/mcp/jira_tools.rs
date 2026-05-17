@@ -2108,6 +2108,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn link_remote_list_yaml_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1/remotelink"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "id": 10001,
+                    "globalId": "system=https://example.atlassian.net/wiki&id=12345",
+                    "relationship": "mentioned in",
+                    "object": {
+                        "url": "https://example.atlassian.net/wiki/page/1",
+                        "title": "Design doc",
+                        "icon": {"url16x16": "https://example.atlassian.net/icons/page.png"}
+                    }
+                }
+            ])))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = link_remote_list_yaml(&client, "PROJ-1").await.unwrap();
+        assert!(yaml.contains("10001"));
+        assert!(yaml.contains("mentioned in"));
+        assert!(yaml.contains("Design doc"));
+        assert!(yaml.contains("global_id"));
+    }
+
+    #[tokio::test]
+    async fn link_remote_list_yaml_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/NOPE-1/remotelink"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("missing"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = link_remote_list_yaml(&client, "NOPE-1").await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
     async fn link_types_yaml_returns_yaml() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
