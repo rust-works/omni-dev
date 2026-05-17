@@ -280,6 +280,38 @@ mod tests {
         assert!(matches!(cmd.command, ConfluenceSubcommands::Space(_)));
     }
 
+    #[test]
+    fn confluence_subcommands_space_pages_variant() {
+        let pages = ConfluenceCommand {
+            command: ConfluenceSubcommands::Space(space::SpaceCommand {
+                command: space::SpaceSubcommands::Pages(space::PagesCommand {
+                    key: "ENG".to_string(),
+                    status: None,
+                    sort: None,
+                    cursor: None,
+                    limit: 25,
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        let other = ConfluenceCommand {
+            command: ConfluenceSubcommands::Read(read::ReadCommand {
+                id: "1".to_string(),
+                output: None,
+                format: ContentFormat::Jfm,
+            }),
+        };
+        // Single `matches!` site exercised against both a matching and
+        // non-matching variant so both arms are covered at the same source
+        // line (avoids the partial-branch noise of two separate sites).
+        for (expected, cmd) in [(true, pages), (false, other)] {
+            assert_eq!(
+                matches!(cmd.command, ConfluenceSubcommands::Space(_)),
+                expected
+            );
+        }
+    }
+
     /// Exercises the `Space` dispatch arm in `ConfluenceCommand::execute`
     /// with injected fake credentials so `create_client()` succeeds and the
     /// downstream call is reached. The subsequent API call is allowed to

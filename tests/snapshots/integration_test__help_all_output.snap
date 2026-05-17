@@ -763,8 +763,9 @@ Confluence space operations
 Usage: space <COMMAND>
 
 Commands:
-  list  Lists Confluence spaces
-  help  Print this message or the help of the given subcommand(s)
+  list   Lists Confluence spaces
+  pages  Enumerates pages within a Confluence space
+  help   Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
@@ -784,6 +785,26 @@ Options:
       --status <STATUS>  Filter by space status. Common values: `current`, `archived`. Passed through to the Confluence v2 API verbatim
       --cursor <CURSOR>  Pagination cursor (returned as `next_cursor` from a previous call)
       --limit <LIMIT>    Maximum number of spaces to return per page [default: 25]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian confluence space pages - Enumerates pages within a Confluence space
+
+Enumerates pages within a Confluence space
+
+Usage: pages [OPTIONS] <KEY>
+
+Arguments:
+  <KEY>  Space key whose pages to enumerate (e.g. `ENG`)
+
+Options:
+      --status <STATUS>  Filter by page status. Common values: `current`, `archived`, `draft`, `trashed`. Passed through to the Confluence v2 API verbatim
+      --sort <SORT>      Sort order. Common values: `id`, `-id`, `title`, `-title`, `created-date`, `-created-date`, `modified-date`, `-modified-date`. Passed through to the Confluence v2 API verbatim
+      --cursor <CURSOR>  Pagination cursor (returned as `next_cursor` from a previous call)
+      --limit <LIMIT>    Maximum number of pages to return per response [default: 25]
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 

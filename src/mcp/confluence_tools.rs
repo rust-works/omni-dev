@@ -23,6 +23,7 @@ use crate::atlassian::api::{AtlassianApi, ContentItem};
 use crate::atlassian::client::AtlassianClient;
 use crate::atlassian::confluence_api::{
     ChildPage, ConfluenceApi, ConfluenceAttachmentPage, ConfluenceSpacePage, MovePosition,
+    PageSummaryPage,
 };
 use crate::atlassian::convert::markdown_to_adf;
 use crate::atlassian::document::{content_item_to_document, JfmDocument, JfmFrontmatter};
@@ -319,6 +320,28 @@ pub struct ConfluenceSpaceListParams {
     #[serde(default)]
     pub cursor: Option<String>,
     /// Maximum number of spaces per page. Defaults to 25.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// Parameters for the `confluence_space_pages` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceSpacePagesParams {
+    /// Space key whose pages to enumerate (e.g. `ENG`).
+    pub space: String,
+    /// Filter by page status. Common values: `current`, `archived`, `draft`,
+    /// `trashed`. Passed through to the Confluence v2 API verbatim.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Sort order. Common values: `id`, `-id`, `title`, `-title`,
+    /// `created-date`, `-created-date`, `modified-date`, `-modified-date`.
+    /// Passed through to the Confluence v2 API verbatim.
+    #[serde(default)]
+    pub sort: Option<String>,
+    /// Pagination cursor (use `next_cursor` from a previous call).
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Maximum number of pages per response. Defaults to 25.
     #[serde(default)]
     pub limit: Option<u32>,
 }
@@ -854,6 +877,26 @@ pub async fn list_spaces_yaml(
     to_yaml(&page)
 }
 
+/// Builds the YAML output for the `confluence_space_pages` tool.
+///
+/// Resolves the space key to a space ID, then fetches one page of summary
+/// records. Pagination is not auto-drained — callers thread `next_cursor`
+/// back to fetch subsequent pages.
+pub async fn fetch_space_pages_yaml(
+    api: &ConfluenceApi,
+    space: &str,
+    status: Option<&str>,
+    sort: Option<&str>,
+    cursor: Option<&str>,
+    limit: u32,
+) -> Result<String> {
+    let space_id = api.resolve_space_id(space).await?;
+    let page: PageSummaryPage = api
+        .list_space_pages(&space_id, status, sort, cursor, limit)
+        .await?;
+    to_yaml(&page)
+}
+
 /// Deletes an attachment and returns a YAML confirmation.
 pub async fn delete_attachment_result(
     api: &ConfluenceApi,
@@ -1234,6 +1277,39 @@ impl OmniDevServer {
             &keys,
             params.r#type.as_deref(),
             params.status.as_deref(),
+            params.cursor.as_deref(),
+            params.limit.unwrap_or(25),
+        )
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Enumerates pages within a Confluence space (paginated).
+    #[tool(
+        description = "Enumerate pages within a Confluence space (one page per call). \
+                       Returns summary records: `id`, `title`, `status`, `parentId`, \
+                       `authorId`, `createdAt` — no page bodies. \
+                       Optional filters: `status` (common values: `current`, \
+                       `archived`, `draft`, `trashed`) and `sort` (common values: \
+                       `id`, `-id`, `title`, `-title`, `created-date`, \
+                       `-created-date`, `modified-date`, `-modified-date`) — both \
+                       passed through to the Confluence v2 API verbatim. Pass the \
+                       returned `next_cursor` back as `cursor` to fetch the next \
+                       page. `limit` defaults to 25. \
+                       Mirrors `omni-dev atlassian confluence space pages`."
+    )]
+    pub async fn confluence_space_pages(
+        &self,
+        Parameters(params): Parameters<ConfluenceSpacePagesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _url) = create_client().map_err(tool_error)?;
+        let api = ConfluenceApi::new(client);
+        let yaml = fetch_space_pages_yaml(
+            &api,
+            &params.space,
+            params.status.as_deref(),
+            params.sort.as_deref(),
             params.cursor.as_deref(),
             params.limit.unwrap_or(25),
         )
@@ -2477,6 +2553,209 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // ── confluence_space_pages handler / fetch_space_pages_yaml ─────
+
+    async fn mock_space_pages_endpoints(
+        srv: &wiremock::MockServer,
+        space_key: &str,
+        space_id: &str,
+        results: serde_json::Value,
+    ) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces"))
+            .and(wiremock::matchers::query_param("keys", space_key))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": [{"id": space_id}]})),
+            )
+            .mount(srv)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!(
+                "/wiki/api/v2/spaces/{space_id}/pages"
+            )))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": results})),
+            )
+            .mount(srv)
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_space_pages_yaml_returns_yaml() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        mock_space_pages_endpoints(
+            &srv,
+            "ENG",
+            "98765",
+            serde_json::json!([
+                {"id": "1", "title": "Home", "status": "current",
+                 "authorId": "u1", "createdAt": "2024-01-02T03:04:05Z"}
+            ]),
+        )
+        .await;
+        let client = AtlassianClient::new(&srv.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        let yaml = fetch_space_pages_yaml(&api, "ENG", None, None, None, 25)
+            .await
+            .unwrap();
+        assert!(yaml.contains("Home"));
+        assert!(yaml.contains("authorId: u1"));
+        assert!(yaml.contains("2024-01-02T03:04:05Z"));
+    }
+
+    /// Covers the Err branch of `resolve_space_id` inside
+    /// `fetch_space_pages_yaml` — the happy-path test above only exercises
+    /// the success branch of the `?` on the resolve call.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_space_pages_yaml_propagates_resolve_space_id_error() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": []})),
+            )
+            .mount(&srv)
+            .await;
+        let client = AtlassianClient::new(&srv.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = fetch_space_pages_yaml(&api, "NOPE", None, None, None, 25)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_space_pages_handler_success_via_mock() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        mock_space_pages_endpoints(
+            &srv,
+            "ENG",
+            "100",
+            serde_json::json!([
+                {"id": "1", "title": "Home", "status": "current",
+                 "parentId": null, "authorId": "u1",
+                 "createdAt": "2024-01-02T03:04:05Z"}
+            ]),
+        )
+        .await;
+        let _env = EnvGuard::set(&srv.uri());
+
+        let server = make_server();
+        let result = server
+            .confluence_space_pages(Parameters(ConfluenceSpacePagesParams {
+                space: "ENG".to_string(),
+                status: None,
+                sort: None,
+                cursor: None,
+                limit: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_space_pages_handler_passes_filter_query_params() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces"))
+            .and(wiremock::matchers::query_param("keys", "ENG"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": [{"id": "55"}]})),
+            )
+            .mount(&srv)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/55/pages"))
+            .and(wiremock::matchers::query_param("status", "archived"))
+            .and(wiremock::matchers::query_param("sort", "-created-date"))
+            .and(wiremock::matchers::query_param("cursor", "opaque"))
+            .and(wiremock::matchers::query_param("limit", "5"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": []})),
+            )
+            .expect(1)
+            .mount(&srv)
+            .await;
+        let _env = EnvGuard::set(&srv.uri());
+
+        let server = make_server();
+        let result = server
+            .confluence_space_pages(Parameters(ConfluenceSpacePagesParams {
+                space: "ENG".to_string(),
+                status: Some("archived".to_string()),
+                sort: Some("-created-date".to_string()),
+                cursor: Some("opaque".to_string()),
+                limit: Some(5),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_space_pages_handler_maps_api_error_to_tool_error() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": [{"id": "1"}]})),
+            )
+            .mount(&srv)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/1/pages"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&srv)
+            .await;
+        let _env = EnvGuard::set(&srv.uri());
+
+        let server = make_server();
+        let result = server
+            .confluence_space_pages(Parameters(ConfluenceSpacePagesParams {
+                space: "ENG".to_string(),
+                status: None,
+                sort: None,
+                cursor: None,
+                limit: None,
+            }))
+            .await;
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("500"),
+            "expected 500 in mapped tool error, got: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_space_pages_handler_error_path_without_credentials() {
+        let _lock = env_lock();
+        clear_env();
+        let server = make_server();
+        let result = server
+            .confluence_space_pages(Parameters(ConfluenceSpacePagesParams {
+                space: "ENG".to_string(),
+                status: None,
+                sort: None,
+                cursor: None,
+                limit: None,
+            }))
+            .await;
+        assert!(result.is_err());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn confluence_create_handler_invalid_format_returns_tool_error() {
         let server = make_server();
@@ -2848,6 +3127,7 @@ mod tests {
             "confluence_attachment_list",
             "confluence_attachment_delete",
             "confluence_space_list",
+            "confluence_space_pages",
             "confluence_compare",
             "confluence_compare_section",
         ] {
