@@ -2520,6 +2520,7 @@ Commands:
   amend    Amends commit messages based on a YAML configuration file
   twiddle  AI-powered commit message improvement using Claude
   check    Checks commit messages against guidelines without modifying them
+  staged   Generates a commit message from staged changes and commits them
   help     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -2567,6 +2568,22 @@ Options:
       --no-suggestions             Skips generating corrected message suggestions
       --twiddle                    Offers to apply suggested messages when issues are found
   -h, --help                       Print help
+
+
+================================================================================
+
+omni-dev git commit message staged - Generates a commit message from staged changes and commits them
+
+Generates a commit message from staged changes and commits them
+
+Usage: staged [OPTIONS]
+
+Options:
+      --print-only               Print the generated message to stdout instead of committing
+      --model <MODEL>            Claude API model to use (if not specified, uses settings or default)
+      --beta-header <KEY:VALUE>  Beta header to send with API requests (format: key:value). Only sent if the model supports it in the registry
+      --context-dir <DIR>        Override the context directory used to load project scopes
+  -h, --help                     Print help
 
 
 ================================================================================

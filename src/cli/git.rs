@@ -5,6 +5,7 @@ mod check;
 mod create_pr;
 pub(crate) mod formatting;
 mod info;
+mod staged;
 mod twiddle;
 mod view;
 
@@ -12,6 +13,7 @@ pub use amend::AmendCommand;
 pub use check::{run_check, CheckCommand, CheckOutcome};
 pub use create_pr::{run_create_pr, CreatePrCommand, CreatePrOutcome, PrContent};
 pub use info::{run_info, InfoCommand};
+pub use staged::{run_staged, StagedCommand, StagedOutcome};
 pub use twiddle::{run_twiddle, TwiddleCommand, TwiddleOutcome};
 pub use view::{run_view, ViewCommand};
 
@@ -145,6 +147,8 @@ pub enum MessageSubcommands {
     Twiddle(TwiddleCommand),
     /// Checks commit messages against guidelines without modifying them.
     Check(CheckCommand),
+    /// Generates a commit message from staged changes and commits them.
+    Staged(StagedCommand),
 }
 
 /// Branch operations.
@@ -206,6 +210,7 @@ impl MessageCommand {
             MessageSubcommands::Amend(amend_cmd) => amend_cmd.execute(),
             MessageSubcommands::Twiddle(twiddle_cmd) => twiddle_cmd.execute().await,
             MessageSubcommands::Check(check_cmd) => check_cmd.execute().await,
+            MessageSubcommands::Staged(staged_cmd) => staged_cmd.execute().await,
         }
     }
 }
@@ -351,6 +356,41 @@ mod tests {
         let cli = Cli::try_parse_from([
             "omni-dev", "git", "commit", "message", "check", "--strict", "--quiet", "--format",
             "json",
+        ]);
+        assert!(cli.is_ok(), "Failed to parse: {:?}", cli.err());
+    }
+
+    #[test]
+    fn cli_parses_git_commit_message_staged() {
+        let cli = Cli::try_parse_from(["omni-dev", "git", "commit", "message", "staged"]);
+        assert!(cli.is_ok(), "Failed to parse: {:?}", cli.err());
+    }
+
+    #[test]
+    fn cli_parses_git_commit_message_staged_print_only() {
+        let cli = Cli::try_parse_from([
+            "omni-dev",
+            "git",
+            "commit",
+            "message",
+            "staged",
+            "--print-only",
+        ]);
+        assert!(cli.is_ok(), "Failed to parse: {:?}", cli.err());
+    }
+
+    #[test]
+    fn cli_parses_git_commit_message_staged_with_model_and_beta() {
+        let cli = Cli::try_parse_from([
+            "omni-dev",
+            "git",
+            "commit",
+            "message",
+            "staged",
+            "--model",
+            "claude-sonnet-4-6",
+            "--beta-header",
+            "anthropic-beta:output-128k-2025-02-19",
         ]);
         assert!(cli.is_ok(), "Failed to parse: {:?}", cli.err());
     }
