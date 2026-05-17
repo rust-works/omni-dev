@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 
 use std::io::{self, BufRead, Write};
 
-use crate::atlassian::client::{AtlassianClient, JiraIssueLink, JiraLinkType};
+use crate::atlassian::client::{AtlassianClient, JiraIssueLink, JiraLinkType, JiraRemoteIssueLink};
 use crate::cli::atlassian::confirm::{guard_destructive_with_io, GuardOptions, GuardOutcome};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
@@ -31,6 +31,8 @@ pub enum LinkSubcommands {
     Remove(RemoveLinkCommand),
     /// Links an issue to an epic (sets parent).
     Epic(EpicLinkCommand),
+    /// Manages remote (external URL) issue links.
+    Remote(RemoteLinkCommand),
 }
 
 impl LinkCommand {
@@ -42,6 +44,7 @@ impl LinkCommand {
             LinkSubcommands::Create(cmd) => cmd.execute().await,
             LinkSubcommands::Remove(cmd) => cmd.execute().await,
             LinkSubcommands::Epic(cmd) => cmd.execute().await,
+            LinkSubcommands::Remote(cmd) => cmd.execute().await,
         }
     }
 }
@@ -183,6 +186,49 @@ impl EpicLinkCommand {
     }
 }
 
+/// Manages JIRA remote (external URL) issue links.
+#[derive(Parser)]
+pub struct RemoteLinkCommand {
+    /// The remote-link subcommand to execute.
+    #[command(subcommand)]
+    pub command: RemoteLinkSubcommands,
+}
+
+/// Remote link subcommands.
+#[derive(Subcommand)]
+pub enum RemoteLinkSubcommands {
+    /// Lists remote (external URL) links on a JIRA issue.
+    List(ListRemoteLinksCommand),
+}
+
+impl RemoteLinkCommand {
+    /// Executes the remote-link command.
+    pub async fn execute(self) -> Result<()> {
+        match self.command {
+            RemoteLinkSubcommands::List(cmd) => cmd.execute().await,
+        }
+    }
+}
+
+/// Lists remote (external URL) links on a JIRA issue.
+#[derive(Parser)]
+pub struct ListRemoteLinksCommand {
+    /// JIRA issue key (e.g., PROJ-123).
+    pub key: String,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
+impl ListRemoteLinksCommand {
+    /// Fetches and displays remote issue links.
+    pub async fn execute(self) -> Result<()> {
+        let (client, _instance_url) = create_client()?;
+        run_list_remote_links(&client, &self.key, &self.output).await
+    }
+}
+
 /// Fetches and displays issue links.
 async fn run_list_links(client: &AtlassianClient, key: &str, output: &OutputFormat) -> Result<()> {
     let links = client.get_issue_links(key).await?;
@@ -314,6 +360,64 @@ fn print_link_types(types: &[JiraLinkType]) {
         println!(
             "{:<id_width$}  {:<name_width$}  {:<inward_width$}  {}",
             t.id, t.name, t.inward, t.outward
+        );
+    }
+}
+
+/// Fetches and displays remote (external URL) issue links.
+async fn run_list_remote_links(
+    client: &AtlassianClient,
+    key: &str,
+    output: &OutputFormat,
+) -> Result<()> {
+    let links = client.get_remote_issue_links(key).await?;
+    if output_as(&links, output)? {
+        return Ok(());
+    }
+    print_remote_links(key, &links);
+    Ok(())
+}
+
+/// Prints remote (external URL) issue links as a formatted table.
+fn print_remote_links(key: &str, links: &[JiraRemoteIssueLink]) {
+    if links.is_empty() {
+        println!("{key}: no remote links.");
+        return;
+    }
+
+    let id_width = links.iter().map(|l| l.id.len()).max().unwrap_or(2).max(2);
+    let rel_width = links
+        .iter()
+        .map(|l| l.relationship.as_deref().unwrap_or("-").len())
+        .max()
+        .unwrap_or(12)
+        .max(12); // "RELATIONSHIP"
+    let title_width = links
+        .iter()
+        .map(|l| l.object.title.as_deref().unwrap_or("-").len())
+        .max()
+        .unwrap_or(5)
+        .max(5); // "TITLE"
+
+    println!(
+        "{:<id_width$}  {:<rel_width$}  {:<title_width$}  URL",
+        "ID", "RELATIONSHIP", "TITLE"
+    );
+    let url_sep = "-".repeat(3);
+    println!(
+        "{:<id_width$}  {:<rel_width$}  {:<title_width$}  {url_sep}",
+        "-".repeat(id_width),
+        "-".repeat(rel_width),
+        "-".repeat(title_width),
+    );
+
+    for link in links {
+        println!(
+            "{:<id_width$}  {:<rel_width$}  {:<title_width$}  {}",
+            link.id,
+            link.relationship.as_deref().unwrap_or("-"),
+            link.object.title.as_deref().unwrap_or("-"),
+            link.object.url,
         );
     }
 }
@@ -816,5 +920,142 @@ mod tests {
             dry_run: false,
         };
         cmd.execute().await.unwrap();
+    }
+
+    // ── remote links ───────────────────────────────────────────────
+
+    use crate::atlassian::client::{JiraRemoteIssueLinkIcon, JiraRemoteIssueLinkObject};
+
+    fn sample_remote_link(
+        id: &str,
+        relationship: Option<&str>,
+        url: &str,
+        title: Option<&str>,
+        icon_title: Option<&str>,
+    ) -> JiraRemoteIssueLink {
+        JiraRemoteIssueLink {
+            id: id.to_string(),
+            global_id: None,
+            relationship: relationship.map(String::from),
+            object: JiraRemoteIssueLinkObject {
+                url: url.to_string(),
+                title: title.map(String::from),
+                summary: None,
+                icon: icon_title.map(|t| JiraRemoteIssueLinkIcon {
+                    url: None,
+                    title: Some(t.to_string()),
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn print_remote_links_empty() {
+        // Just exercises the empty-print path; no panic.
+        print_remote_links("PROJ-1", &[]);
+    }
+
+    #[test]
+    fn print_remote_links_with_data() {
+        let links = vec![
+            sample_remote_link(
+                "10001",
+                Some("mentioned in"),
+                "https://example.atlassian.net/wiki/page/1",
+                Some("Design doc"),
+                Some("Confluence Page"),
+            ),
+            sample_remote_link(
+                "10002",
+                None,
+                "https://bitbucket.org/acme/repo/pull-requests/42",
+                None,
+                None,
+            ),
+        ];
+        print_remote_links("PROJ-1", &links);
+    }
+
+    #[test]
+    fn link_command_remote_variant() {
+        let cmd = LinkCommand {
+            command: LinkSubcommands::Remote(RemoteLinkCommand {
+                command: RemoteLinkSubcommands::List(ListRemoteLinksCommand {
+                    key: "PROJ-1".to_string(),
+                    output: OutputFormat::Table,
+                }),
+            }),
+        };
+        assert!(matches!(cmd.command, LinkSubcommands::Remote(_)));
+    }
+
+    #[tokio::test]
+    async fn run_list_remote_links_table_ok() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/remotelink",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {
+                        "id": 10001,
+                        "relationship": "mentioned in",
+                        "object": {
+                            "url": "https://example.atlassian.net/wiki/page/1",
+                            "title": "Design doc"
+                        }
+                    }
+                ])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(
+            run_list_remote_links(&client, "PROJ-1", &OutputFormat::Table)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_list_remote_links_yaml_ok() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/remotelink",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        assert!(
+            run_list_remote_links(&client, "PROJ-1", &OutputFormat::Yaml)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_list_remote_links_propagates_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/NOPE-1/remotelink",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let err = run_list_remote_links(&client, "NOPE-1", &OutputFormat::Table)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
     }
 }

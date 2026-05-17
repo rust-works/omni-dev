@@ -555,6 +555,56 @@ pub struct JiraIssueLink {
     pub linked_issue_summary: String,
 }
 
+/// A remote (external URL) issue link on a JIRA issue.
+///
+/// Returned by `GET /rest/api/3/issue/{issueIdOrKey}/remotelink`. These
+/// point out to non-JIRA resources (Confluence pages, Bitbucket PRs,
+/// external trackers).
+#[derive(Debug, Clone, Serialize)]
+pub struct JiraRemoteIssueLink {
+    /// Remote link ID assigned by JIRA.
+    pub id: String,
+    /// Application-defined global identifier, when the linking application
+    /// supplied one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_id: Option<String>,
+    /// Free-form description of how the issue relates to the remote object
+    /// (e.g., "mentioned in", "causes").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relationship: Option<String>,
+    /// The remote object the link points at.
+    pub object: JiraRemoteIssueLinkObject,
+}
+
+/// The remote object an entry of [`JiraRemoteIssueLink`] points at.
+#[derive(Debug, Clone, Serialize)]
+pub struct JiraRemoteIssueLinkObject {
+    /// Remote URL.
+    pub url: String,
+    /// Display title for the remote object.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Short summary text for the remote object.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Icon associated with the remote object (often labels the kind of
+    /// external target, e.g. "Confluence Page").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<JiraRemoteIssueLinkIcon>,
+}
+
+/// Icon metadata for a [`JiraRemoteIssueLinkObject`]. Mirrors the upstream
+/// `object.icon` shape, with JIRA's `url16x16` flattened to `url`.
+#[derive(Debug, Clone, Serialize)]
+pub struct JiraRemoteIssueLinkIcon {
+    /// Icon URL (from JIRA's `url16x16`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Icon title — typically the label of the external target kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
 /// A JIRA issue attachment, embedded in the `attachment` field of
 /// `GET /rest/api/3/issue/{key}`.
 ///
@@ -1188,6 +1238,35 @@ struct JiraIssueLinkIssue {
 #[derive(Deserialize)]
 struct JiraIssueLinkIssueFields {
     summary: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct JiraRemoteIssueLinkEntry {
+    id: serde_json::Value,
+    #[serde(rename = "globalId", default)]
+    global_id: Option<String>,
+    #[serde(default)]
+    relationship: Option<String>,
+    object: JiraRemoteIssueLinkObjectEntry,
+}
+
+#[derive(Deserialize)]
+struct JiraRemoteIssueLinkObjectEntry {
+    url: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    icon: Option<JiraRemoteIssueLinkIconEntry>,
+}
+
+#[derive(Deserialize)]
+struct JiraRemoteIssueLinkIconEntry {
+    #[serde(rename = "url16x16", default)]
+    url: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -4660,6 +4739,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_remote_issue_links_success() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/remotelink",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {
+                        "id": 10001,
+                        "globalId": "system=https://example.atlassian.net/wiki&id=12345",
+                        "relationship": "mentioned in",
+                        "object": {
+                            "url": "https://example.atlassian.net/wiki/spaces/X/pages/12345",
+                            "title": "Design doc",
+                            "summary": "Architecture overview",
+                            "icon": {
+                                "url16x16": "https://example.atlassian.net/icons/page.png",
+                                "title": "Confluence Page"
+                            }
+                        }
+                    },
+                    {
+                        "id": "10002",
+                        "object": {
+                            "url": "https://bitbucket.org/acme/repo/pull-requests/42"
+                        }
+                    }
+                ])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let links = client.get_remote_issue_links("PROJ-1").await.unwrap();
+
+        assert_eq!(links.len(), 2);
+
+        // First entry: full payload, numeric id normalized to string.
+        assert_eq!(links[0].id, "10001");
+        assert_eq!(
+            links[0].global_id.as_deref(),
+            Some("system=https://example.atlassian.net/wiki&id=12345")
+        );
+        assert_eq!(links[0].relationship.as_deref(), Some("mentioned in"));
+        assert_eq!(
+            links[0].object.url,
+            "https://example.atlassian.net/wiki/spaces/X/pages/12345"
+        );
+        assert_eq!(links[0].object.title.as_deref(), Some("Design doc"));
+        assert_eq!(
+            links[0].object.summary.as_deref(),
+            Some("Architecture overview")
+        );
+        let icon = links[0].object.icon.as_ref().expect("icon present");
+        assert_eq!(
+            icon.url.as_deref(),
+            Some("https://example.atlassian.net/icons/page.png")
+        );
+        assert_eq!(icon.title.as_deref(), Some("Confluence Page"));
+
+        // Second entry: minimal payload, string id, no optional fields.
+        assert_eq!(links[1].id, "10002");
+        assert!(links[1].global_id.is_none());
+        assert!(links[1].relationship.is_none());
+        assert_eq!(
+            links[1].object.url,
+            "https://bitbucket.org/acme/repo/pull-requests/42"
+        );
+        assert!(links[1].object.title.is_none());
+        assert!(links[1].object.summary.is_none());
+        assert!(links[1].object.icon.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_remote_issue_links_empty() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/remotelink",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let links = client.get_remote_issue_links("PROJ-1").await.unwrap();
+        assert!(links.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_remote_issue_links_api_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/NOPE-1/remotelink",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.get_remote_issue_links("NOPE-1").await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
     async fn get_link_types_success() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -8014,6 +8202,57 @@ impl AtlassianClient {
             }
         }
 
+        Ok(links)
+    }
+
+    /// Lists remote (external URL) issue links on a JIRA issue.
+    ///
+    /// Endpoint: `GET /rest/api/3/issue/{key}/remotelink` — returns a bare
+    /// JSON array (not a wrapped `{ links: [...] }` envelope).
+    pub async fn get_remote_issue_links(&self, key: &str) -> Result<Vec<JiraRemoteIssueLink>> {
+        let url = format!("{}/rest/api/3/issue/{}/remotelink", self.instance_url, key);
+
+        let response = self.get_json(&url).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let entries: Vec<JiraRemoteIssueLinkEntry> = response
+            .json()
+            .await
+            .context("Failed to parse remote issue links response")?;
+
+        let mut links = Vec::with_capacity(entries.len());
+        for entry in entries {
+            // JIRA returns the remote link id as a number; normalize to String
+            // so callers don't have to care about the wire shape.
+            let id = match entry.id {
+                serde_json::Value::String(s) => s,
+                serde_json::Value::Number(n) => n.to_string(),
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "unexpected remote link id type in response: {other:?}"
+                    ));
+                }
+            };
+            links.push(JiraRemoteIssueLink {
+                id,
+                global_id: entry.global_id,
+                relationship: entry.relationship,
+                object: JiraRemoteIssueLinkObject {
+                    url: entry.object.url,
+                    title: entry.object.title,
+                    summary: entry.object.summary,
+                    icon: entry.object.icon.map(|i| JiraRemoteIssueLinkIcon {
+                        url: i.url,
+                        title: i.title,
+                    }),
+                },
+            });
+        }
         Ok(links)
     }
 
