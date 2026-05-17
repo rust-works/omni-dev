@@ -260,18 +260,18 @@ mod tests {
         temp_dir
     }
 
-    fn head_message(repo_path: &std::path::Path) -> Option<String> {
-        let repo = Repository::open(repo_path).ok()?;
-        let head = repo.head().ok()?;
-        let commit = head.peel_to_commit().ok()?;
-        commit.message().map(std::string::ToString::to_string)
+    fn head_message(repo_path: &std::path::Path) -> String {
+        let repo = Repository::open(repo_path).unwrap();
+        let head = repo.head().unwrap();
+        let commit = head.peel_to_commit().unwrap();
+        commit.message().unwrap().to_string()
     }
 
-    fn head_oid(repo_path: &std::path::Path) -> Option<String> {
-        let repo = Repository::open(repo_path).ok()?;
-        let head = repo.head().ok()?;
-        let commit = head.peel_to_commit().ok()?;
-        Some(commit.id().to_string())
+    fn head_oid(repo_path: &std::path::Path) -> String {
+        let repo = Repository::open(repo_path).unwrap();
+        let head = repo.head().unwrap();
+        let commit = head.peel_to_commit().unwrap();
+        commit.id().to_string()
     }
 
     #[tokio::test]
@@ -295,7 +295,7 @@ mod tests {
         let _guard = super::super::CwdGuard::enter(temp_dir.path())
             .await
             .unwrap();
-        let head_before = head_oid(temp_dir.path()).expect("baseline commit");
+        let head_before = head_oid(temp_dir.path());
 
         let mock = ConfigurableMockAiClient::new(vec![Ok("feat(foo): add bar".to_string())]);
         let client = ClaudeClient::new(Box::new(mock));
@@ -304,7 +304,7 @@ mod tests {
         assert!(!outcome.applied, "print_only must not apply");
         assert_eq!(outcome.message, "feat(foo): add bar");
 
-        let head_after = head_oid(temp_dir.path()).expect("HEAD should still exist");
+        let head_after = head_oid(temp_dir.path());
         assert_eq!(head_before, head_after, "HEAD must be unchanged");
     }
 
@@ -314,7 +314,7 @@ mod tests {
         let _guard = super::super::CwdGuard::enter(temp_dir.path())
             .await
             .unwrap();
-        let head_before = head_oid(temp_dir.path()).expect("baseline commit");
+        let head_before = head_oid(temp_dir.path());
 
         let mock = ConfigurableMockAiClient::new(vec![Ok("feat(foo): add marker".to_string())]);
         let client = ClaudeClient::new(Box::new(mock));
@@ -322,10 +322,10 @@ mod tests {
         let outcome = run_staged_with_client(false, &[], &client).await.unwrap();
         assert!(outcome.applied, "default mode must commit");
 
-        let head_after = head_oid(temp_dir.path()).expect("HEAD after commit");
+        let head_after = head_oid(temp_dir.path());
         assert_ne!(head_before, head_after, "HEAD must advance");
 
-        let msg = head_message(temp_dir.path()).expect("commit message");
+        let msg = head_message(temp_dir.path());
         assert!(
             msg.starts_with("feat(foo): add marker"),
             "expected AI message at HEAD, got: {msg:?}"
@@ -338,7 +338,7 @@ mod tests {
         let _guard = super::super::CwdGuard::enter(temp_dir.path())
             .await
             .unwrap();
-        let head_before = head_oid(temp_dir.path()).expect("baseline commit");
+        let head_before = head_oid(temp_dir.path());
 
         // Empty response queue → mock returns Err on first call.
         let mock = ConfigurableMockAiClient::new(vec![]);
@@ -349,7 +349,7 @@ mod tests {
             .unwrap_err();
         let _ = err;
 
-        let head_after = head_oid(temp_dir.path()).expect("HEAD after failure");
+        let head_after = head_oid(temp_dir.path());
         assert_eq!(head_before, head_after, "HEAD must not advance on failure");
     }
 
@@ -393,7 +393,7 @@ mod tests {
         let _guard = super::super::CwdGuard::enter(temp_dir.path())
             .await
             .unwrap();
-        let head_before = head_oid(temp_dir.path()).expect("baseline commit");
+        let head_before = head_oid(temp_dir.path());
 
         // Install a commit-msg hook that always fails. If we go through real
         // `git commit`, the hook fires and the commit is rejected. If we
@@ -420,7 +420,7 @@ mod tests {
             "expected commit-failure error message, got: {msg}"
         );
 
-        let head_after = head_oid(temp_dir.path()).expect("HEAD after failed commit");
+        let head_after = head_oid(temp_dir.path());
         assert_eq!(
             head_before, head_after,
             "HEAD must not advance when commit-msg hook rejects"
