@@ -4832,6 +4832,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_remote_issue_links_rejects_unexpected_id_type() {
+        // Exercise the defensive `other =>` arm of the id-normalisation
+        // match. JIRA's wire contract is number-or-string; anything else
+        // should be surfaced as a clear error rather than silently
+        // accepted.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/remotelink",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {
+                        "id": null,
+                        "object": {"url": "https://example.com/x"}
+                    }
+                ])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client.get_remote_issue_links("PROJ-1").await.unwrap_err();
+        assert!(err.to_string().contains("unexpected remote link id type"));
+    }
+
+    #[tokio::test]
     async fn get_remote_issue_links_api_error() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
