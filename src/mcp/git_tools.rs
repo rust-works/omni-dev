@@ -534,6 +534,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn git_staged_commit_handler_invalid_repo_path_returns_tool_error() {
+        use crate::mcp::server::OmniDevServer;
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let server = OmniDevServer::new();
+        let params = GitStagedCommitParams {
+            print_only: true,
+            model: None,
+            repo_path: Some("/no/such/path/for/mcp/test".to_string()),
+        };
+        let err = server
+            .git_staged_commit(Parameters(params))
+            .await
+            .unwrap_err();
+        assert!(!err.message.is_empty());
+    }
+
+    #[tokio::test]
     async fn git_create_pr_handler_invalid_repo_path_returns_tool_error() {
         use crate::mcp::server::OmniDevServer;
         use rmcp::handler::server::wrapper::Parameters;

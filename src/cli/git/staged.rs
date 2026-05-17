@@ -47,34 +47,19 @@ pub struct StagedOutcome {
 impl StagedCommand {
     /// Executes the staged command.
     pub async fn execute(self) -> Result<()> {
-        if !has_staged_changes()? {
-            anyhow::bail!(
-                "no staged changes — stage files with `git add` before running this command"
-            );
-        }
-
-        let ai_info = crate::utils::check_ai_command_prerequisites(self.model.as_deref())?;
-        println!(
-            "✓ {} credentials verified (model: {})",
-            ai_info.provider, ai_info.model
-        );
-
         let beta = self
             .beta_header
             .as_deref()
             .map(parse_beta_header)
             .transpose()?;
-
-        let claude_client =
-            crate::claude::create_default_claude_client(self.model.clone(), beta).await?;
-
-        let context_dir = crate::claude::context::resolve_context_dir(self.context_dir.as_deref());
-        let valid_scopes = crate::claude::context::load_project_scopes(
-            &context_dir,
-            &std::path::PathBuf::from("."),
-        );
-
-        let _ = run_staged_with_client(self.print_only, &valid_scopes, &claude_client).await?;
+        let _ = run_staged(
+            self.print_only,
+            self.model,
+            beta,
+            self.context_dir.as_deref(),
+            None,
+        )
+        .await?;
         Ok(())
     }
 }
@@ -481,5 +466,51 @@ mod tests {
         };
         let cloned = outcome.clone();
         assert_eq!(format!("{outcome:?}"), format!("{cloned:?}"));
+    }
+
+    // Drives `StagedCommand::execute()` through its no-staged-changes bail.
+    // The command's `execute` delegates to `run_staged`, which short-circuits
+    // before any AI credential check, so this exercises the dispatch wiring
+    // without needing real AI credentials.
+    #[tokio::test]
+    async fn staged_command_execute_bails_when_nothing_staged() {
+        let temp_dir = init_empty_repo();
+        let _guard = super::super::CwdGuard::enter(temp_dir.path())
+            .await
+            .unwrap();
+        let cmd = StagedCommand {
+            print_only: true,
+            model: None,
+            beta_header: None,
+            context_dir: None,
+        };
+        let err = cmd.execute().await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.to_lowercase().contains("no staged changes"),
+            "expected 'no staged changes' error from execute(), got: {msg}"
+        );
+    }
+
+    // `execute()` parses `--beta-header` before any other work; an invalid
+    // value should error out with a clear "Invalid --beta-header" message.
+    #[tokio::test]
+    async fn staged_command_execute_rejects_malformed_beta_header() {
+        let temp_dir = init_empty_repo();
+        let _guard = super::super::CwdGuard::enter(temp_dir.path())
+            .await
+            .unwrap();
+        let cmd = StagedCommand {
+            print_only: true,
+            model: None,
+            beta_header: Some("no-colon-here".to_string()),
+            context_dir: None,
+        };
+        let err = cmd.execute().await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Invalid --beta-header"),
+            "expected beta-header parse error, got: {msg}"
+        );
     }
 }
