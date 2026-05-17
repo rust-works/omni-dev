@@ -1247,6 +1247,7 @@ Commands:
   create  Creates a link between two issues
   remove  Removes an issue link by ID
   epic    Links an issue to an epic (sets parent)
+  remote  Manages remote (external URL) issue links
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1287,6 +1288,38 @@ Options:
 omni-dev atlassian jira link list - Lists links on a JIRA issue
 
 Lists links on a JIRA issue
+
+Usage: list [OPTIONS] <KEY>
+
+Arguments:
+  <KEY>  JIRA issue key (e.g., PROJ-123)
+
+Options:
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian jira link remote - Manages remote (external URL) issue links
+
+Manages remote (external URL) issue links
+
+Usage: remote <COMMAND>
+
+Commands:
+  list  Lists remote (external URL) links on a JIRA issue
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian jira link remote list - Lists remote (external URL) links on a JIRA issue
+
+Lists remote (external URL) links on a JIRA issue
 
 Usage: list [OPTIONS] <KEY>
 
