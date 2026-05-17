@@ -11,7 +11,9 @@ use crate::atlassian::client::{
     JiraDevStatus, JiraDevStatusSummary, JiraProjectList, JiraProjectVersionList, JiraSearchResult,
     JiraUserSearchResults, JiraWatcherList, JiraWorklogList,
 };
-use crate::atlassian::confluence_api::{ConfluenceAttachmentPage, ConfluenceSpacePage};
+use crate::atlassian::confluence_api::{
+    ConfluenceAttachmentPage, ConfluenceSpacePage, PageSummaryPage,
+};
 
 /// Output/input format for Atlassian content (read/write/create commands).
 #[derive(Clone, Debug, Default, ValueEnum)]
@@ -136,6 +138,12 @@ impl JsonlSerialize for ConfluenceAttachmentPage {
 }
 
 impl JsonlSerialize for ConfluenceSpacePage {
+    fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
+        write_items_jsonl(self.results.iter(), out)
+    }
+}
+
+impl JsonlSerialize for PageSummaryPage {
     fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
         write_items_jsonl(self.results.iter(), out)
     }
