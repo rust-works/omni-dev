@@ -619,6 +619,13 @@ async fn jira_tool_handlers_round_trip_through_wiremock() -> Result<()> {
         .mount(&server)
         .await;
 
+    // jira_link_remote_list
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/issue/PROJ-1/remotelink"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .mount(&server)
+        .await;
+
     // jira_dev
     Mock::given(method("GET"))
         .and(path("/rest/dev-status/1.0/issue/summary"))
@@ -642,7 +649,7 @@ async fn jira_tool_handlers_round_trip_through_wiremock() -> Result<()> {
     let _env = AtlassianEnvGuard::new(&server.uri(), "test@test.com", "token")?;
     let (client, server_handle) = spawn_server().await;
 
-    let calls: [(&str, serde_json::Value); 8] = [
+    let calls: [(&str, serde_json::Value); 9] = [
         ("jira_read", serde_json::json!({"key": "PROJ-1"})),
         ("jira_search", serde_json::json!({"jql": "project = PROJ"})),
         (
@@ -662,6 +669,10 @@ async fn jira_tool_handlers_round_trip_through_wiremock() -> Result<()> {
             serde_json::json!({"key": "PROJ-1", "action": "list"}),
         ),
         ("jira_link", serde_json::json!({"action": "types"})),
+        (
+            "jira_link_remote_list",
+            serde_json::json!({"key": "PROJ-1"}),
+        ),
         ("jira_dev", serde_json::json!({"key": "PROJ-1"})),
     ];
 
@@ -701,6 +712,7 @@ async fn jira_tool_handlers_surface_tool_error_without_credentials() -> Result<(
         "jira_transition",
         "jira_comment",
         "jira_link",
+        "jira_link_remote_list",
         "jira_dev",
         "jira_user_search",
     ] {
