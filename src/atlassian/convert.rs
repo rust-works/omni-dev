@@ -2794,6 +2794,38 @@ pub fn adf_to_markdown_with_options(doc: &AdfDocument, opts: &RenderOptions) -> 
     Ok(output)
 }
 
+/// Flattens an ADF document to plain text by concatenating all `text` nodes.
+///
+/// Block boundaries (paragraph, heading, list item, table cell, etc.) are
+/// separated by a single space so a multi-paragraph anchor selection matches
+/// when the user copies the text without trailing/leading whitespace.
+///
+/// Used by [`crate::atlassian::confluence_api::ConfluenceApi::resolve_anchor`]
+/// to count occurrences of an inline-comment anchor on the live page body.
+#[must_use]
+pub fn adf_to_plain_text(doc: &AdfDocument) -> String {
+    let mut out = String::new();
+    for node in &doc.content {
+        collect_plain_text(node, &mut out);
+        if !out.is_empty() && !out.ends_with(' ') {
+            out.push(' ');
+        }
+    }
+    out.truncate(out.trim_end().len());
+    out
+}
+
+fn collect_plain_text(node: &AdfNode, out: &mut String) {
+    if let Some(text) = &node.text {
+        out.push_str(text);
+    }
+    if let Some(children) = &node.content {
+        for child in children {
+            collect_plain_text(child, out);
+        }
+    }
+}
+
 /// Pushes a `localId=<value>` entry to an attribute parts vec,
 /// unless `opts.strip_local_ids` is set or the value is a placeholder.
 /// Copies `localId` from parsed directive attrs to an ADF node's attrs if present.
@@ -4851,6 +4883,67 @@ fn link_href(mark: &AdfMark) -> &str {
 )]
 mod tests {
     use super::*;
+
+    // ── adf_to_plain_text tests ─────────────────────────────────────
+
+    #[test]
+    fn adf_to_plain_text_single_paragraph() {
+        let doc = markdown_to_adf("Hello world").unwrap();
+        assert_eq!(adf_to_plain_text(&doc), "Hello world");
+    }
+
+    #[test]
+    fn adf_to_plain_text_multiple_paragraphs_space_separated() {
+        let doc = markdown_to_adf("Alpha\n\nBeta").unwrap();
+        let plain = adf_to_plain_text(&doc);
+        // Blocks are space-separated so multi-paragraph anchor selections match.
+        assert!(plain.contains("Alpha"));
+        assert!(plain.contains("Beta"));
+        assert_eq!(plain, "Alpha Beta");
+    }
+
+    #[test]
+    fn adf_to_plain_text_drops_marks_but_keeps_text() {
+        let doc = markdown_to_adf("Hello **bold** world").unwrap();
+        assert_eq!(adf_to_plain_text(&doc), "Hello bold world");
+    }
+
+    #[test]
+    fn adf_to_plain_text_empty_doc() {
+        let doc = AdfDocument::new();
+        assert_eq!(adf_to_plain_text(&doc), "");
+    }
+
+    #[test]
+    fn adf_to_plain_text_leading_empty_block_emits_no_extra_space() {
+        // An empty paragraph followed by a text-bearing one must not produce
+        // a leading space — the separator logic skips when `out` is still empty.
+        let doc = AdfDocument {
+            version: 1,
+            doc_type: "doc".to_string(),
+            content: vec![
+                AdfNode {
+                    node_type: "paragraph".to_string(),
+                    attrs: None,
+                    content: Some(vec![]),
+                    text: None,
+                    marks: None,
+                    local_id: None,
+                    parameters: None,
+                },
+                AdfNode {
+                    node_type: "paragraph".to_string(),
+                    attrs: None,
+                    content: Some(vec![AdfNode::text("Hello")]),
+                    text: None,
+                    marks: None,
+                    local_id: None,
+                    parameters: None,
+                },
+            ],
+        };
+        assert_eq!(adf_to_plain_text(&doc), "Hello");
+    }
 
     // ── markdown_to_adf tests ───────────────────────────────────────
 

@@ -22,8 +22,8 @@ use crate::atlassian::adf_validated::ValidatedAdfDocument;
 use crate::atlassian::api::{AtlassianApi, ContentItem};
 use crate::atlassian::client::AtlassianClient;
 use crate::atlassian::confluence_api::{
-    ChildPage, ConfluenceApi, ConfluenceAttachmentPage, ConfluenceSpacePage, MovePosition,
-    PageSummaryPage,
+    ChildPage, CommentKind, ConfluenceApi, ConfluenceAttachmentPage, ConfluenceSpacePage,
+    MovePosition, PageSummaryPage,
 };
 use crate::atlassian::convert::markdown_to_adf;
 use crate::atlassian::document::{content_item_to_document, JfmDocument, JfmFrontmatter};
@@ -199,6 +199,10 @@ pub struct ConfluenceHistoryParams {
 pub struct ConfluenceCommentListParams {
     /// Confluence page ID.
     pub id: String,
+    /// Which kind of comments to include: `"footer"`, `"inline"`, or
+    /// `"all"` (the default — both, merged and sorted by creation time).
+    #[serde(default)]
+    pub kind: Option<String>,
     /// Maximum number of comments to return (0 = unlimited).
     #[serde(default)]
     pub limit: Option<usize>,
@@ -211,6 +215,35 @@ pub struct ConfluenceCommentAddParams {
     pub id: String,
     /// Markdown content of the comment body. Converted to ADF before posting.
     pub content: String,
+}
+
+/// Parameters for the `confluence_comment_add_inline` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceCommentAddInlineParams {
+    /// Confluence page ID.
+    pub id: String,
+    /// Markdown content of the comment body. Converted to ADF before posting.
+    pub content: String,
+    /// Exact text on the page that the comment should anchor to.
+    pub anchor_text: String,
+    /// 1-based occurrence to anchor to when `anchor_text` appears more than
+    /// once on the page. Required for ambiguous anchors; rejected if out of
+    /// range.
+    #[serde(default)]
+    pub match_index: Option<usize>,
+}
+
+/// Parameters for the `confluence_comment_replies` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceCommentRepliesParams {
+    /// Parent comment ID.
+    pub comment_id: String,
+    /// `"footer"` or `"inline"` — Confluence stores reply chains on a
+    /// kind-specific endpoint, so the caller must commit to one.
+    pub kind: String,
+    /// Maximum number of replies to return (0 = unlimited).
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 /// Parameters for the `confluence_label_list` tool.
@@ -741,19 +774,83 @@ fn populate_descendants<'a>(
     })
 }
 
+/// Which kind(s) of comments a list call should return.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CommentKindSelector {
+    /// Footer comments only.
+    Footer,
+    /// Inline comments only.
+    Inline,
+    /// Both kinds, merged and sorted by creation time.
+    All,
+}
+
+impl CommentKindSelector {
+    /// Parses the MCP `kind` string. `None` and `"all"` map to [`Self::All`].
+    pub fn parse(raw: Option<&str>) -> Result<Self> {
+        match raw.map(str::trim) {
+            None | Some("" | "all") => Ok(Self::All),
+            Some("footer") => Ok(Self::Footer),
+            Some("inline") => Ok(Self::Inline),
+            Some(other) => {
+                anyhow::bail!("`kind` must be \"footer\", \"inline\", or \"all\"; got {other:?}")
+            }
+        }
+    }
+}
+
+/// Parses the MCP `kind` string for endpoints that don't accept `"all"`
+/// (replies live on a kind-specific endpoint).
+pub fn parse_comment_kind(raw: &str) -> Result<CommentKind> {
+    match raw.trim() {
+        "footer" => Ok(CommentKind::Footer),
+        "inline" => Ok(CommentKind::Inline),
+        other => anyhow::bail!("`kind` must be \"footer\" or \"inline\"; got {other:?}"),
+    }
+}
+
 /// Builds the YAML output for the `confluence_comment_list` tool.
 ///
 /// `limit` of 0 returns every comment; otherwise the list is truncated to
 /// the requested size (matching the CLI `--limit` semantics).
-pub async fn list_comments_yaml(api: &ConfluenceApi, id: &str, limit: usize) -> Result<String> {
-    let mut comments = api.get_page_comments(id).await?;
+pub async fn list_comments_yaml(
+    api: &ConfluenceApi,
+    id: &str,
+    kind: CommentKindSelector,
+    limit: usize,
+) -> Result<String> {
+    let mut comments = match kind {
+        CommentKindSelector::Footer => api.get_page_comments(id).await?,
+        CommentKindSelector::Inline => api.get_page_inline_comments(id).await?,
+        CommentKindSelector::All => {
+            let mut footer = api.get_page_comments(id).await?;
+            let inline = api.get_page_inline_comments(id).await?;
+            footer.extend(inline);
+            footer.sort_by(|a, b| a.created.cmp(&b.created));
+            footer
+        }
+    };
     if limit > 0 {
         comments.truncate(limit);
     }
     to_yaml(&comments)
 }
 
-/// Posts a comment to a Confluence page.
+/// Builds the YAML output for the `confluence_comment_replies` tool.
+pub async fn list_comment_replies_yaml(
+    api: &ConfluenceApi,
+    comment_id: &str,
+    kind: CommentKind,
+    limit: usize,
+) -> Result<String> {
+    let mut replies = api.get_comment_replies(comment_id, kind).await?;
+    if limit > 0 {
+        replies.truncate(limit);
+    }
+    to_yaml(&replies)
+}
+
+/// Posts a footer comment to a Confluence page.
 ///
 /// The markdown `content` is converted to ADF before posting.
 pub async fn add_comment_result(api: &ConfluenceApi, id: &str, content: &str) -> Result<String> {
@@ -764,6 +861,38 @@ pub async fn add_comment_result(api: &ConfluenceApi, id: &str, content: &str) ->
     let result = MutationResult {
         ok: true,
         message: format!("Comment added to page {id}."),
+        id,
+        labels: &[],
+    };
+    to_yaml(&result)
+}
+
+/// Posts an inline (anchored) comment to a Confluence page.
+///
+/// `anchor_text` must appear at least once in the page body; for ambiguous
+/// anchors, `match_index_1based` (1-based) selects which occurrence to bind to.
+pub async fn add_inline_comment_result(
+    api: &ConfluenceApi,
+    id: &str,
+    content: &str,
+    anchor_text: &str,
+    match_index_1based: Option<usize>,
+) -> Result<String> {
+    let adf: AdfDocument = markdown_to_adf(content).context("Failed to convert markdown to ADF")?;
+    let adf = ValidatedAdfDocument::try_new(adf)?;
+    let anchor = api
+        .resolve_anchor(id, anchor_text, match_index_1based)
+        .await?;
+    api.add_inline_page_comment(id, &adf, &anchor).await?;
+
+    let result = MutationResult {
+        ok: true,
+        message: format!(
+            "Inline comment added to page {id} anchored to {:?} (occurrence {} of {}).",
+            anchor.text,
+            anchor.match_index + 1,
+            anchor.match_count
+        ),
         id,
         labels: &[],
     };
@@ -1095,28 +1224,31 @@ impl OmniDevServer {
         Ok(CallToolResult::success(vec![Content::text(yaml)]))
     }
 
-    /// Lists footer comments on a Confluence page.
-    #[tool(
-        description = "List footer comments on a Confluence page (auto-paginated). \
-                       `limit` of 0 returns every comment. Mirrors \
-                       `omni-dev atlassian confluence comment list`."
-    )]
+    /// Lists comments on a Confluence page.
+    #[tool(description = "List comments on a Confluence page (auto-paginated). \
+                       `kind` selects \"footer\", \"inline\", or \"all\" (default — \
+                       both kinds merged and sorted by creation time). `limit` of 0 \
+                       returns every comment. Mirrors \
+                       `omni-dev atlassian confluence comment list`.")]
     pub async fn confluence_comment_list(
         &self,
         Parameters(params): Parameters<ConfluenceCommentListParams>,
     ) -> Result<CallToolResult, McpError> {
         let (client, _url) = create_client().map_err(tool_error)?;
         let api = ConfluenceApi::new(client);
-        let yaml = list_comments_yaml(&api, &params.id, params.limit.unwrap_or(25))
+        let kind = CommentKindSelector::parse(params.kind.as_deref()).map_err(tool_error)?;
+        let yaml = list_comments_yaml(&api, &params.id, kind, params.limit.unwrap_or(25))
             .await
             .map_err(tool_error)?;
         Ok(CallToolResult::success(vec![Content::text(yaml)]))
     }
 
-    /// Posts a comment to a Confluence page.
+    /// Posts a footer comment to a Confluence page.
     #[tool(
-        description = "Post a markdown comment to a Confluence page. The content is \
-                       converted to ADF before posting. Mirrors \
+        description = "Post a markdown comment to a Confluence page as a page-level \
+                       footer comment. The content is converted to ADF before posting. \
+                       For inline (anchored) comments, use \
+                       `confluence_comment_add_inline`. Mirrors \
                        `omni-dev atlassian confluence comment add`."
     )]
     pub async fn confluence_comment_add(
@@ -1128,6 +1260,55 @@ impl OmniDevServer {
         let yaml = add_comment_result(&api, &params.id, &params.content)
             .await
             .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Posts an inline (anchored) comment to a Confluence page.
+    #[tool(
+        description = "Post a markdown comment anchored to a text selection on a \
+                       Confluence page. `anchor_text` must match the on-page text \
+                       exactly; if it appears multiple times, pass `match_index` \
+                       (1-based) to pick which occurrence. Errors if the anchor \
+                       does not match or `match_index` is out of range. Mirrors \
+                       `omni-dev atlassian confluence comment add-inline`."
+    )]
+    pub async fn confluence_comment_add_inline(
+        &self,
+        Parameters(params): Parameters<ConfluenceCommentAddInlineParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _url) = create_client().map_err(tool_error)?;
+        let api = ConfluenceApi::new(client);
+        let yaml = add_inline_comment_result(
+            &api,
+            &params.id,
+            &params.content,
+            &params.anchor_text,
+            params.match_index,
+        )
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Lists the replies of a Confluence comment.
+    #[tool(
+        description = "List the replies (child comments) of a Confluence comment. \
+                       `kind` must be \"footer\" or \"inline\" — Confluence stores \
+                       reply chains on kind-specific endpoints, so the caller must \
+                       commit to one. `limit` of 0 returns every reply. Mirrors \
+                       `omni-dev atlassian confluence comment replies`."
+    )]
+    pub async fn confluence_comment_replies(
+        &self,
+        Parameters(params): Parameters<ConfluenceCommentRepliesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _url) = create_client().map_err(tool_error)?;
+        let api = ConfluenceApi::new(client);
+        let kind = parse_comment_kind(&params.kind).map_err(tool_error)?;
+        let yaml =
+            list_comment_replies_yaml(&api, &params.comment_id, kind, params.limit.unwrap_or(25))
+                .await
+                .map_err(tool_error)?;
         Ok(CallToolResult::success(vec![Content::text(yaml)]))
     }
 
@@ -1578,6 +1759,83 @@ mod tests {
     fn parse_format_invalid_errors() {
         let err = parse_format(Some("xml")).unwrap_err();
         assert!(err.to_string().contains("Invalid format"));
+    }
+
+    // ── CommentKindSelector::parse ─────────────────────────────────
+
+    #[test]
+    fn comment_kind_selector_parse_default_is_all() {
+        assert_eq!(
+            CommentKindSelector::parse(None).unwrap(),
+            CommentKindSelector::All
+        );
+        assert_eq!(
+            CommentKindSelector::parse(Some("")).unwrap(),
+            CommentKindSelector::All
+        );
+        assert_eq!(
+            CommentKindSelector::parse(Some("all")).unwrap(),
+            CommentKindSelector::All
+        );
+    }
+
+    #[test]
+    fn comment_kind_selector_parse_footer() {
+        assert_eq!(
+            CommentKindSelector::parse(Some("footer")).unwrap(),
+            CommentKindSelector::Footer
+        );
+    }
+
+    #[test]
+    fn comment_kind_selector_parse_inline() {
+        assert_eq!(
+            CommentKindSelector::parse(Some("inline")).unwrap(),
+            CommentKindSelector::Inline
+        );
+    }
+
+    #[test]
+    fn comment_kind_selector_parse_invalid_errors() {
+        let err = CommentKindSelector::parse(Some("bogus")).unwrap_err();
+        assert!(err.to_string().contains("\"footer\""));
+        assert!(err.to_string().contains("bogus"));
+    }
+
+    #[test]
+    fn comment_kind_selector_parse_trims_whitespace() {
+        assert_eq!(
+            CommentKindSelector::parse(Some("  footer  ")).unwrap(),
+            CommentKindSelector::Footer
+        );
+    }
+
+    // ── parse_comment_kind ─────────────────────────────────────────
+
+    #[test]
+    fn parse_comment_kind_footer() {
+        assert_eq!(parse_comment_kind("footer").unwrap(), CommentKind::Footer);
+    }
+
+    #[test]
+    fn parse_comment_kind_inline() {
+        assert_eq!(parse_comment_kind("inline").unwrap(), CommentKind::Inline);
+    }
+
+    #[test]
+    fn parse_comment_kind_invalid_errors() {
+        let err = parse_comment_kind("all").unwrap_err();
+        // `all` is not accepted here — replies endpoints are kind-specific.
+        assert!(err.to_string().contains("\"footer\""));
+        assert!(err.to_string().contains("all"));
+    }
+
+    #[test]
+    fn parse_comment_kind_trims_whitespace() {
+        assert_eq!(
+            parse_comment_kind("  inline  ").unwrap(),
+            CommentKind::Inline
+        );
     }
 
     // ── parse_write_content ────────────────────────────────────────
@@ -3119,6 +3377,8 @@ mod tests {
             "confluence_history",
             "confluence_comment_list",
             "confluence_comment_add",
+            "confluence_comment_add_inline",
+            "confluence_comment_replies",
             "confluence_label_list",
             "confluence_label_add",
             "confluence_label_remove",
@@ -3537,9 +3797,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let yaml = list_comments_yaml(&phase2d_mock_api(&server), "12345", 25)
-            .await
-            .unwrap();
+        let yaml = list_comments_yaml(
+            &phase2d_mock_api(&server),
+            "12345",
+            CommentKindSelector::Footer,
+            25,
+        )
+        .await
+        .unwrap();
         assert!(yaml.contains("id: c1"));
         assert!(yaml.contains("alice"));
     }
@@ -3562,9 +3827,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let yaml = list_comments_yaml(&phase2d_mock_api(&server), "12345", 0)
-            .await
-            .unwrap();
+        let yaml = list_comments_yaml(
+            &phase2d_mock_api(&server),
+            "12345",
+            CommentKindSelector::Footer,
+            0,
+        )
+        .await
+        .unwrap();
         assert!(yaml.contains("id: c1"));
         assert!(yaml.contains("id: c2"));
     }
@@ -3588,9 +3858,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let yaml = list_comments_yaml(&phase2d_mock_api(&server), "12345", 1)
-            .await
-            .unwrap();
+        let yaml = list_comments_yaml(
+            &phase2d_mock_api(&server),
+            "12345",
+            CommentKindSelector::Footer,
+            1,
+        )
+        .await
+        .unwrap();
         assert!(yaml.contains("id: c1"));
         assert!(!yaml.contains("id: c2"));
     }
@@ -3606,10 +3881,124 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = list_comments_yaml(&phase2d_mock_api(&server), "99", 25)
-            .await
-            .unwrap_err();
+        let err = list_comments_yaml(
+            &phase2d_mock_api(&server),
+            "99",
+            CommentKindSelector::Footer,
+            25,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn list_comments_yaml_inline_kind_hits_inline_endpoint_only() {
+        // `Inline` must NOT hit `/footer-comments`; only `/inline-comments`.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/inline-comments",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {"id": "i1", "version": {"authorId": "bob", "createdAt": "2026-04-02T10:00:00Z"}}
+                    ]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let yaml = list_comments_yaml(
+            &phase2d_mock_api(&server),
+            "12345",
+            CommentKindSelector::Inline,
+            25,
+        )
+        .await
+        .unwrap();
+        assert!(yaml.contains("id: i1"));
+        assert!(yaml.contains("kind: inline"));
+    }
+
+    #[tokio::test]
+    async fn list_comments_yaml_all_kind_merges_and_sorts() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/footer-comments",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {"id": "f1", "version": {"authorId": "alice", "createdAt": "2026-04-02T10:00:00Z"}}
+                    ]
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/inline-comments",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {"id": "i1", "version": {"authorId": "bob", "createdAt": "2026-04-01T10:00:00Z"}}
+                    ]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let yaml = list_comments_yaml(
+            &phase2d_mock_api(&server),
+            "12345",
+            CommentKindSelector::All,
+            25,
+        )
+        .await
+        .unwrap();
+        // Inline (older) sorts before footer (newer).
+        let i_pos = yaml.find("id: i1").expect("inline comment present");
+        let f_pos = yaml.find("id: f1").expect("footer comment present");
+        assert!(
+            i_pos < f_pos,
+            "inline (older) should precede footer (newer)"
+        );
+        assert!(yaml.contains("kind: inline"));
+        assert!(yaml.contains("kind: footer"));
+    }
+
+    #[tokio::test]
+    async fn list_comment_replies_yaml_returns_yaml_sequence() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/inline-comments/parent1/children",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {"id": "r1", "version": {"authorId": "alice", "createdAt": "2026-04-01T10:00:00Z"}}
+                    ]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let yaml = list_comment_replies_yaml(
+            &phase2d_mock_api(&server),
+            "parent1",
+            CommentKind::Inline,
+            25,
+        )
+        .await
+        .unwrap();
+        assert!(yaml.contains("id: r1"));
+        assert!(yaml.contains("kind: inline"));
     }
 
     // ── add_comment_result ─────────────────────────────────────────
@@ -3662,6 +4051,129 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("403"));
+    }
+
+    // ── add_inline_comment_result ──────────────────────────────────
+
+    /// Mounts a page fetch returning a page whose body contains `anchor_text`.
+    async fn mock_page_with_anchor(server: &wiremock::MockServer, id: &str, anchor_text: &str) {
+        let adf_value = format!(
+            "{{\"version\":1,\"type\":\"doc\",\"content\":[{{\"type\":\"paragraph\",\"content\":[{{\"type\":\"text\",\"text\":{}}}]}}]}}",
+            serde_json::Value::String(anchor_text.to_string())
+        );
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/wiki/api/v2/pages/{id}")))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": id,
+                    "title": "Mock Page",
+                    "status": "current",
+                    "spaceId": "98765",
+                    "version": {"number": 1},
+                    "body": {"atlas_doc_format": {"value": adf_value}}
+                })),
+            )
+            .mount(server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/98765"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"key": "ENG"})),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn add_inline_comment_result_resolves_anchor_and_posts() {
+        let server = wiremock::MockServer::start().await;
+        mock_page_with_anchor(&server, "12345", "the anchored phrase").await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/wiki/api/v2/inline-comments"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "ic1"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let yaml = add_inline_comment_result(
+            &phase2d_mock_api(&server),
+            "12345",
+            "comment body",
+            "the anchored phrase",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(yaml.contains("ok: true"));
+        assert!(yaml.contains("Inline comment added"));
+        assert!(yaml.contains("occurrence 1 of 1"));
+    }
+
+    #[tokio::test]
+    async fn add_inline_comment_result_anchor_not_found() {
+        let server = wiremock::MockServer::start().await;
+        mock_page_with_anchor(&server, "12345", "something else entirely").await;
+
+        let err = add_inline_comment_result(
+            &phase2d_mock_api(&server),
+            "12345",
+            "body",
+            "the anchored phrase",
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn add_inline_comment_result_ambiguous_with_explicit_match_index() {
+        // Page body has the anchor twice — agent picks occurrence 2.
+        let server = wiremock::MockServer::start().await;
+        mock_page_with_anchor(&server, "12345", "phrase here and phrase again").await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/wiki/api/v2/inline-comments"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "inlineCommentProperties": {
+                    "textSelection": "phrase",
+                    "textSelectionMatchCount": 2,
+                    "textSelectionMatchIndex": 1
+                }
+            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "ic2"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let yaml = add_inline_comment_result(
+            &phase2d_mock_api(&server),
+            "12345",
+            "comment body",
+            "phrase",
+            Some(2),
+        )
+        .await
+        .unwrap();
+        assert!(yaml.contains("occurrence 2 of 2"));
+    }
+
+    #[tokio::test]
+    async fn add_inline_comment_result_rejects_invalid_adf_nesting() {
+        // Body parses to invalid ADF — short-circuits before any HTTP call.
+        let server = wiremock::MockServer::start().await;
+        let bad_jfm = ":::panel{type=info}\n:::expand{title=\"x\"}\nbody\n:::\n:::";
+        let err =
+            add_inline_comment_result(&phase2d_mock_api(&server), "12345", bad_jfm, "anchor", None)
+                .await
+                .unwrap_err();
+        assert!(err.to_string().contains("invalid ADF nesting"));
     }
 
     // ── list_labels_yaml ───────────────────────────────────────────
