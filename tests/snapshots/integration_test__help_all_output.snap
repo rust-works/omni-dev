@@ -434,9 +434,11 @@ Manages comments on a Confluence page
 Usage: comment <COMMAND>
 
 Commands:
-  list  Lists comments on a Confluence page
-  add   Adds a comment to a Confluence page
-  help  Print this message or the help of the given subcommand(s)
+  list        Lists comments on a Confluence page
+  add         Adds a footer comment to a Confluence page
+  add-inline  Adds an inline (anchored) comment to a Confluence page
+  replies     Lists the replies of a comment
+  help        Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
@@ -444,9 +446,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian confluence comment add - Adds a comment to a Confluence page
+omni-dev atlassian confluence comment add - Adds a footer comment to a Confluence page
 
-Adds a comment to a Confluence page
+Adds a footer comment to a Confluence page
 
 Usage: add [OPTIONS] <ID> [FILE]
 
@@ -461,6 +463,25 @@ Options:
 
 ================================================================================
 
+omni-dev atlassian confluence comment add-inline - Adds an inline (anchored) comment to a Confluence page
+
+Adds an inline (anchored) comment to a Confluence page
+
+Usage: add-inline [OPTIONS] --anchor-text <ANCHOR_TEXT> <ID> [FILE]
+
+Arguments:
+  <ID>    Confluence page ID
+  [FILE]  Input file (reads from stdin if omitted or "-")
+
+Options:
+      --format <FORMAT>            Input format [default: jfm] [possible values: jfm, adf]
+      --anchor-text <ANCHOR_TEXT>  Exact text on the page that the comment should anchor to
+      --match-index <MATCH_INDEX>  1-based occurrence to anchor to when `--anchor-text` appears more than once on the page. Required for ambiguous anchors; rejected if out of range
+  -h, --help                       Print help (see more with '--help')
+
+
+================================================================================
+
 omni-dev atlassian confluence comment list - Lists comments on a Confluence page
 
 Lists comments on a Confluence page
@@ -471,7 +492,26 @@ Arguments:
   <ID>  Confluence page ID
 
 Options:
+      --kind <KIND>      Which kind of comments to show [default: all] [possible values: footer, inline, all]
       --limit <LIMIT>    Maximum number of comments to display [default: 25]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian confluence comment replies - Lists the replies of a comment
+
+Lists the replies of a comment
+
+Usage: replies [OPTIONS] --kind <KIND> <ID>
+
+Arguments:
+  <ID>  Comment ID
+
+Options:
+      --kind <KIND>      Whether the parent is a footer or inline comment (the Confluence API requires this to pick the right endpoint) [possible values: footer, inline]
+      --limit <LIMIT>    Maximum number of replies to display [default: 25]
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
 

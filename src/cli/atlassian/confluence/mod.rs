@@ -100,6 +100,7 @@ mod tests {
             command: ConfluenceSubcommands::Comment(comment::CommentCommand {
                 command: comment::CommentSubcommands::List(comment::ListCommand {
                     id: "12345".to_string(),
+                    kind: comment::CommentKindFilter::All,
                     limit: 25,
                     output: OutputFormat::Table,
                 }),
