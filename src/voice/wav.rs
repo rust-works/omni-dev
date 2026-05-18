@@ -20,7 +20,7 @@ use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use hound::{SampleFormat, WavSpec};
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{
@@ -151,8 +151,9 @@ impl Resampler {
         let mut out = Vec::new();
         while inner.pending.len() >= inner.chunk_frames {
             let chunk = &inner.pending[..inner.chunk_frames];
-            let input_adapter = InterleavedSlice::new(chunk, 1, inner.chunk_frames)
-                .map_err(|e| anyhow!("Failed to wrap resampler input buffer: {e:?}"))?;
+            let Ok(input_adapter) = InterleavedSlice::new(chunk, 1, inner.chunk_frames) else {
+                unreachable!("chunk.len() == 1 * chunk_frames by construction")
+            };
             let drained = inner
                 .resampler
                 .process(&input_adapter, 0, None)
@@ -175,12 +176,15 @@ impl Resampler {
         if tail.is_empty() {
             return Ok(Vec::new());
         }
-        let input_adapter = InterleavedSlice::new(&tail, 1, tail.len())
-            .map_err(|e| anyhow!("Failed to wrap resampler flush input: {e:?}"))?;
+        let Ok(input_adapter) = InterleavedSlice::new(&tail, 1, tail.len()) else {
+            unreachable!("tail.len() == 1 * tail.len() by construction")
+        };
         let output_capacity = inner.resampler.output_frames_max();
         let mut output_buf = vec![0.0_f32; output_capacity];
-        let mut output_adapter = InterleavedSlice::new_mut(&mut output_buf, 1, output_capacity)
-            .map_err(|e| anyhow!("Failed to wrap resampler flush output: {e:?}"))?;
+        let Ok(mut output_adapter) = InterleavedSlice::new_mut(&mut output_buf, 1, output_capacity)
+        else {
+            unreachable!("output_buf.len() == 1 * output_capacity by construction")
+        };
         let indexing = Indexing {
             input_offset: 0,
             output_offset: 0,
