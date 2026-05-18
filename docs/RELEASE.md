@@ -18,7 +18,6 @@ The release process follows semantic versioning with **automated CI/CD**:
 7. GitHub release creation
 8. Cross-platform binary builds (Linux, macOS, Windows)
 9. crates.io publication
-10. Nix binary cache publication
 
 ## Prerequisites
 
@@ -145,8 +144,6 @@ Pushing a `v*` tag triggers the following automated workflows:
 - Runs clippy linting
 - Builds documentation
 - Generates code coverage
-- Builds and tests Nix package
-- Publishes to `omni-dev` Cachix binary cache
 
 ### Release Workflow (`.github/workflows/release.yml`)
 - **Creates GitHub Release**: Automatically from the tag
@@ -177,13 +174,6 @@ After pushing the tag, monitor the automated release:
    cargo search omni-dev
    # Or test installation
    cargo install omni-dev
-   ```
-
-4. **Verify Nix Binary Cache**:
-   ```bash
-   nix search github:rust-works/omni-dev
-   cachix use omni-dev
-   nix profile install github:rust-works/omni-dev
    ```
 
 ## Post-Release Tasks
@@ -260,11 +250,10 @@ The automated release pipeline requires these GitHub secrets:
 |------------------------|-------------------------------------------------------------|
 | `GITHUB_TOKEN`         | Automatically provided by GitHub Actions for release creation |
 | `CARGO_REGISTRY_TOKEN` | crates.io API token for publishing                          |
-| `CACHIX_AUTH_TOKEN`    | Cachix authentication for Nix binary cache                  |
 
 ### Workflow Files
 
-- `.github/workflows/ci.yml` - Quality checks and Nix builds
+- `.github/workflows/ci.yml` - Quality checks
 - `.github/workflows/release.yml` - Release creation and publishing
 - `.github/workflows/commit-check.yml` - PR commit message validation
 
