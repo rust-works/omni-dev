@@ -1,11 +1,13 @@
 //! CLI commands for Confluence page comments.
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::atlassian::adf::AdfDocument;
 use crate::atlassian::adf_validated::ValidatedAdfDocument;
-use crate::atlassian::confluence_api::{ConfluenceApi, ConfluenceComment};
+use crate::atlassian::confluence_api::{
+    CommentKind, ConfluenceApi, ConfluenceComment, InlineAnchor,
+};
 use crate::atlassian::convert::{adf_to_markdown, markdown_to_adf};
 use crate::atlassian::document::JfmDocument;
 use crate::cli::atlassian::format::{output_as, ContentFormat, OutputFormat};
@@ -24,8 +26,12 @@ pub struct CommentCommand {
 pub enum CommentSubcommands {
     /// Lists comments on a Confluence page.
     List(ListCommand),
-    /// Adds a comment to a Confluence page.
+    /// Adds a footer comment to a Confluence page.
     Add(AddCommand),
+    /// Adds an inline (anchored) comment to a Confluence page.
+    AddInline(AddInlineCommand),
+    /// Lists the replies of a comment.
+    Replies(RepliesCommand),
 }
 
 impl CommentCommand {
@@ -34,6 +40,42 @@ impl CommentCommand {
         match self.command {
             CommentSubcommands::List(cmd) => cmd.execute().await,
             CommentSubcommands::Add(cmd) => cmd.execute().await,
+            CommentSubcommands::AddInline(cmd) => cmd.execute().await,
+            CommentSubcommands::Replies(cmd) => cmd.execute().await,
+        }
+    }
+}
+
+/// `--kind` filter for `confluence comment list`.
+///
+/// `All` (the default) issues both the footer and inline list calls and
+/// concatenates the results so a single invocation surfaces every comment on
+/// the page.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum CommentKindFilter {
+    /// Page-level footer comments only.
+    Footer,
+    /// Inline (anchored) comments only.
+    Inline,
+    /// Both kinds, concatenated and sorted by creation time.
+    All,
+}
+
+/// `--kind` selector for `confluence comment replies` (no `All` — replies live
+/// on a kind-specific endpoint, so the caller must commit to one).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum CommentKindArg {
+    /// Replies under a footer comment.
+    Footer,
+    /// Replies under an inline comment.
+    Inline,
+}
+
+impl From<CommentKindArg> for CommentKind {
+    fn from(k: CommentKindArg) -> Self {
+        match k {
+            CommentKindArg::Footer => Self::Footer,
+            CommentKindArg::Inline => Self::Inline,
         }
     }
 }
@@ -43,6 +85,10 @@ impl CommentCommand {
 pub struct ListCommand {
     /// Confluence page ID.
     pub id: String,
+
+    /// Which kind of comments to show.
+    #[arg(long, value_enum, default_value_t = CommentKindFilter::All)]
+    pub kind: CommentKindFilter,
 
     /// Maximum number of comments to display.
     #[arg(long, default_value_t = 25)]
@@ -58,11 +104,11 @@ impl ListCommand {
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
         let api = ConfluenceApi::new(client);
-        run_list_comments(&api, &self.id, self.limit, &self.output).await
+        run_list_comments(&api, &self.id, self.kind, self.limit, &self.output).await
     }
 }
 
-/// Adds a comment to a Confluence page.
+/// Adds a footer comment to a Confluence page.
 #[derive(Parser)]
 pub struct AddCommand {
     /// Confluence page ID.
@@ -79,44 +125,124 @@ pub struct AddCommand {
 impl AddCommand {
     /// Reads input, converts to ADF, and posts the comment.
     pub async fn execute(self) -> Result<()> {
-        let adf = self.parse_input()?;
+        let adf = parse_comment_input(self.file.as_deref(), self.format)?;
 
         let (client, _instance_url) = create_client()?;
         let api = ConfluenceApi::new(client);
         run_add_comment(&api, &self.id, &adf).await
     }
+}
 
-    /// Parses the input file into a validated ADF document.
-    fn parse_input(&self) -> Result<ValidatedAdfDocument> {
-        let input = read_input(self.file.as_deref())?;
+/// Adds an inline (anchored) comment to a Confluence page.
+#[derive(Parser)]
+pub struct AddInlineCommand {
+    /// Confluence page ID.
+    pub id: String,
 
-        let adf: AdfDocument = match self.format {
-            ContentFormat::Jfm => {
-                // Try parsing as JFM document (with frontmatter) first,
-                // fall back to raw markdown
-                if input.starts_with("---\n") {
-                    let doc = JfmDocument::parse(&input)?;
-                    markdown_to_adf(&doc.body)?
-                } else {
-                    markdown_to_adf(&input)?
-                }
-            }
-            ContentFormat::Adf => {
-                serde_json::from_str(&input).context("Failed to parse ADF JSON input")?
-            }
-        };
-        Ok(ValidatedAdfDocument::try_new(adf)?)
+    /// Input file (reads from stdin if omitted or "-").
+    pub file: Option<String>,
+
+    /// Input format.
+    #[arg(long, value_enum, default_value_t = ContentFormat::Jfm)]
+    pub format: ContentFormat,
+
+    /// Exact text on the page that the comment should anchor to.
+    #[arg(long)]
+    pub anchor_text: String,
+
+    /// 1-based occurrence to anchor to when `--anchor-text` appears more than
+    /// once on the page. Required for ambiguous anchors; rejected if out of
+    /// range.
+    #[arg(long)]
+    pub match_index: Option<usize>,
+}
+
+impl AddInlineCommand {
+    /// Reads input, resolves the anchor, and posts the inline comment.
+    pub async fn execute(self) -> Result<()> {
+        let adf = parse_comment_input(self.file.as_deref(), self.format)?;
+
+        let (client, _instance_url) = create_client()?;
+        let api = ConfluenceApi::new(client);
+        let anchor = api
+            .resolve_anchor(&self.id, &self.anchor_text, self.match_index)
+            .await?;
+        run_add_inline_comment(&api, &self.id, &adf, &anchor).await
     }
+}
+
+/// Lists the replies of a comment.
+#[derive(Parser)]
+pub struct RepliesCommand {
+    /// Comment ID.
+    pub id: String,
+
+    /// Whether the parent is a footer or inline comment (the Confluence API
+    /// requires this to pick the right endpoint).
+    #[arg(long, value_enum)]
+    pub kind: CommentKindArg,
+
+    /// Maximum number of replies to display.
+    #[arg(long, default_value_t = 25)]
+    pub limit: usize,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
+impl RepliesCommand {
+    /// Fetches and displays the replies of a comment.
+    pub async fn execute(self) -> Result<()> {
+        let (client, _instance_url) = create_client()?;
+        let api = ConfluenceApi::new(client);
+        run_list_replies(&api, &self.id, self.kind.into(), self.limit, &self.output).await
+    }
+}
+
+/// Parses a comment input file (or stdin) into a validated ADF document.
+///
+/// Shared by `comment add` (footer) and `comment add-inline` so both surfaces
+/// accept the same input formats — JFM with frontmatter, raw markdown, or
+/// pre-built ADF JSON.
+fn parse_comment_input(file: Option<&str>, format: ContentFormat) -> Result<ValidatedAdfDocument> {
+    let input = read_input(file)?;
+
+    let adf: AdfDocument = match format {
+        ContentFormat::Jfm => {
+            if input.starts_with("---\n") {
+                let doc = JfmDocument::parse(&input)?;
+                markdown_to_adf(&doc.body)?
+            } else {
+                markdown_to_adf(&input)?
+            }
+        }
+        ContentFormat::Adf => {
+            serde_json::from_str(&input).context("Failed to parse ADF JSON input")?
+        }
+    };
+    Ok(ValidatedAdfDocument::try_new(adf)?)
 }
 
 /// Fetches and displays comments for a page.
 async fn run_list_comments(
     api: &ConfluenceApi,
     id: &str,
+    kind: CommentKindFilter,
     limit: usize,
     output: &OutputFormat,
 ) -> Result<()> {
-    let mut comments = api.get_page_comments(id).await?;
+    let mut comments = match kind {
+        CommentKindFilter::Footer => api.get_page_comments(id).await?,
+        CommentKindFilter::Inline => api.get_page_inline_comments(id).await?,
+        CommentKindFilter::All => {
+            let mut footer = api.get_page_comments(id).await?;
+            let inline = api.get_page_inline_comments(id).await?;
+            footer.extend(inline);
+            footer.sort_by(|a, b| a.created.cmp(&b.created));
+            footer
+        }
+    };
     comments.truncate(limit);
     if output_as(&comments, output)? {
         return Ok(());
@@ -125,10 +251,44 @@ async fn run_list_comments(
     Ok(())
 }
 
-/// Posts a comment to a page.
+/// Fetches and displays the replies of a single comment.
+async fn run_list_replies(
+    api: &ConfluenceApi,
+    comment_id: &str,
+    kind: CommentKind,
+    limit: usize,
+    output: &OutputFormat,
+) -> Result<()> {
+    let mut replies = api.get_comment_replies(comment_id, kind).await?;
+    replies.truncate(limit);
+    if output_as(&replies, output)? {
+        return Ok(());
+    }
+    print_comments(&replies);
+    Ok(())
+}
+
+/// Posts a footer comment to a page.
 async fn run_add_comment(api: &ConfluenceApi, id: &str, adf: &ValidatedAdfDocument) -> Result<()> {
     api.add_page_comment(id, adf).await?;
     println!("Comment added to page {id}.");
+    Ok(())
+}
+
+/// Posts an inline comment to a page.
+async fn run_add_inline_comment(
+    api: &ConfluenceApi,
+    id: &str,
+    adf: &ValidatedAdfDocument,
+    anchor: &InlineAnchor,
+) -> Result<()> {
+    api.add_inline_page_comment(id, adf, anchor).await?;
+    println!(
+        "Inline comment added to page {id} anchored to {:?} (occurrence {} of {}).",
+        anchor.text,
+        anchor.match_index + 1,
+        anchor.match_count
+    );
     Ok(())
 }
 
@@ -145,7 +305,10 @@ fn print_comments(comments: &[ConfluenceComment]) {
         }
 
         let timestamp = format_timestamp(&comment.created);
-        println!("--- {} | {} ---", comment.author, timestamp);
+        println!(
+            "--- {} | {} | {} ---",
+            comment.author, timestamp, comment.kind
+        );
         println!("{}", format_comment_body(&comment.body_adf));
     }
 }
@@ -180,7 +343,7 @@ fn format_timestamp(ts: &str) -> &str {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use std::fs;
@@ -193,8 +356,23 @@ mod tests {
         ConfluenceComment {
             id: id.to_string(),
             author: author.to_string(),
+            kind: CommentKind::Footer,
             body_adf,
             created: "2026-04-01T10:30:00.000Z".to_string(),
+        }
+    }
+
+    fn sample_inline_comment(
+        id: &str,
+        author: &str,
+        body_adf: Option<serde_json::Value>,
+    ) -> ConfluenceComment {
+        ConfluenceComment {
+            id: id.to_string(),
+            author: author.to_string(),
+            kind: CommentKind::Inline,
+            body_adf,
+            created: "2026-04-02T10:30:00.000Z".to_string(),
         }
     }
 
@@ -238,7 +416,7 @@ mod tests {
         });
         let comments = vec![
             sample_comment("1", "Alice", Some(adf)),
-            sample_comment("2", "Bob", None),
+            sample_inline_comment("2", "Bob", None),
         ];
         print_comments(&comments);
     }
@@ -301,7 +479,7 @@ mod tests {
         assert_eq!(format_timestamp(""), "");
     }
 
-    // ── AddCommand::parse_input ────────────────────────────────────
+    // ── parse_comment_input ────────────────────────────────────────
 
     #[test]
     fn parse_input_raw_markdown() {
@@ -309,13 +487,8 @@ mod tests {
         let file_path = temp_dir.path().join("comment.md");
         fs::write(&file_path, "Hello **world**\n").unwrap();
 
-        let cmd = AddCommand {
-            id: "12345".to_string(),
-            file: Some(file_path.to_str().unwrap().to_string()),
-            format: ContentFormat::Jfm,
-        };
-
-        let adf = cmd.parse_input().unwrap();
+        let adf =
+            parse_comment_input(Some(file_path.to_str().unwrap()), ContentFormat::Jfm).unwrap();
         assert!(!adf.content.is_empty());
     }
 
@@ -327,13 +500,8 @@ mod tests {
             "---\ntype: confluence\ninstance: https://org.atlassian.net\nid: \"12345\"\ntitle: Test\nspace_key: ENG\n---\n\nComment body\n";
         fs::write(&file_path, content).unwrap();
 
-        let cmd = AddCommand {
-            id: "12345".to_string(),
-            file: Some(file_path.to_str().unwrap().to_string()),
-            format: ContentFormat::Jfm,
-        };
-
-        let adf = cmd.parse_input().unwrap();
+        let adf =
+            parse_comment_input(Some(file_path.to_str().unwrap()), ContentFormat::Jfm).unwrap();
         assert!(!adf.content.is_empty());
     }
 
@@ -344,13 +512,8 @@ mod tests {
         let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"Hello"}]}]}"#;
         fs::write(&file_path, adf_json).unwrap();
 
-        let cmd = AddCommand {
-            id: "12345".to_string(),
-            file: Some(file_path.to_str().unwrap().to_string()),
-            format: ContentFormat::Adf,
-        };
-
-        let adf = cmd.parse_input().unwrap();
+        let adf =
+            parse_comment_input(Some(file_path.to_str().unwrap()), ContentFormat::Adf).unwrap();
         assert_eq!(adf.content.len(), 1);
     }
 
@@ -360,13 +523,9 @@ mod tests {
         let file_path = temp_dir.path().join("bad.json");
         fs::write(&file_path, "not json").unwrap();
 
-        let cmd = AddCommand {
-            id: "12345".to_string(),
-            file: Some(file_path.to_str().unwrap().to_string()),
-            format: ContentFormat::Adf,
-        };
-
-        assert!(cmd.parse_input().is_err());
+        assert!(
+            parse_comment_input(Some(file_path.to_str().unwrap()), ContentFormat::Adf).is_err()
+        );
     }
 
     #[test]
@@ -381,12 +540,8 @@ mod tests {
         )
         .unwrap();
 
-        let cmd = AddCommand {
-            id: "12345".to_string(),
-            file: Some(file_path.to_str().unwrap().to_string()),
-            format: ContentFormat::Jfm,
-        };
-        let err = cmd.parse_input().unwrap_err();
+        let err =
+            parse_comment_input(Some(file_path.to_str().unwrap()), ContentFormat::Jfm).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("invalid ADF nesting"));
         assert!(msg.contains("`expand` cannot be a child of `panel`"));
@@ -399,6 +554,7 @@ mod tests {
         let cmd = CommentCommand {
             command: CommentSubcommands::List(ListCommand {
                 id: "12345".to_string(),
+                kind: CommentKindFilter::All,
                 limit: 25,
                 output: OutputFormat::Table,
             }),
@@ -416,6 +572,47 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, CommentSubcommands::Add(_)));
+    }
+
+    #[test]
+    fn comment_command_add_inline_variant() {
+        let cmd = CommentCommand {
+            command: CommentSubcommands::AddInline(AddInlineCommand {
+                id: "12345".to_string(),
+                file: None,
+                format: ContentFormat::Jfm,
+                anchor_text: "phrase".to_string(),
+                match_index: None,
+            }),
+        };
+        assert!(matches!(cmd.command, CommentSubcommands::AddInline(_)));
+    }
+
+    #[test]
+    fn comment_command_replies_variant() {
+        let cmd = CommentCommand {
+            command: CommentSubcommands::Replies(RepliesCommand {
+                id: "abc".to_string(),
+                kind: CommentKindArg::Inline,
+                limit: 25,
+                output: OutputFormat::Table,
+            }),
+        };
+        assert!(matches!(cmd.command, CommentSubcommands::Replies(_)));
+    }
+
+    // ── CommentKindArg → CommentKind conversion ────────────────────
+
+    #[test]
+    fn comment_kind_arg_into_footer() {
+        let k: CommentKind = CommentKindArg::Footer.into();
+        assert_eq!(k, CommentKind::Footer);
+    }
+
+    #[test]
+    fn comment_kind_arg_into_inline() {
+        let k: CommentKind = CommentKindArg::Inline.into();
+        assert_eq!(k, CommentKind::Inline);
     }
 
     // ── run_list_comments / run_add_comment ────────────────────────
@@ -442,9 +639,15 @@ mod tests {
             .await;
 
         let api = mock_api(&server);
-        assert!(run_list_comments(&api, "12345", 25, &OutputFormat::Table)
-            .await
-            .is_ok());
+        assert!(run_list_comments(
+            &api,
+            "12345",
+            CommentKindFilter::Footer,
+            25,
+            &OutputFormat::Table,
+        )
+        .await
+        .is_ok());
     }
 
     #[tokio::test]
@@ -462,9 +665,15 @@ mod tests {
             .await;
 
         let api = mock_api(&server);
-        assert!(run_list_comments(&api, "12345", 25, &OutputFormat::Json)
-            .await
-            .is_ok());
+        assert!(run_list_comments(
+            &api,
+            "12345",
+            CommentKindFilter::Footer,
+            25,
+            &OutputFormat::Json,
+        )
+        .await
+        .is_ok());
     }
 
     #[tokio::test]
@@ -479,10 +688,110 @@ mod tests {
             .await;
 
         let api = mock_api(&server);
-        let err = run_list_comments(&api, "99999", 25, &OutputFormat::Table)
-            .await
-            .unwrap_err();
+        let err = run_list_comments(
+            &api,
+            "99999",
+            CommentKindFilter::Footer,
+            25,
+            &OutputFormat::Table,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn run_list_comments_inline_kind_hits_inline_endpoint() {
+        // `Inline` filter must NOT touch the footer endpoint.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/inline-comments",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": []})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let api = mock_api(&server);
+        assert!(run_list_comments(
+            &api,
+            "12345",
+            CommentKindFilter::Inline,
+            25,
+            &OutputFormat::Json,
+        )
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_list_comments_all_kind_fetches_both() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/footer-comments",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{
+                        "id": "f1",
+                        "version": {"authorId": "alice", "createdAt": "2026-04-01T10:00:00Z"}
+                    }]
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/inline-comments",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{
+                        "id": "i1",
+                        "version": {"authorId": "bob", "createdAt": "2026-04-02T10:00:00Z"}
+                    }]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let api = mock_api(&server);
+        assert!(run_list_comments(
+            &api,
+            "12345",
+            CommentKindFilter::All,
+            25,
+            &OutputFormat::Json,
+        )
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_list_replies_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/inline-comments/abc/children",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let api = mock_api(&server);
+        assert!(
+            run_list_replies(&api, "abc", CommentKind::Inline, 25, &OutputFormat::Table,)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -515,5 +824,277 @@ mod tests {
         let adf = ValidatedAdfDocument::empty();
         let err = run_add_comment(&api, "12345", &adf).await.unwrap_err();
         assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn run_add_inline_comment_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/wiki/api/v2/inline-comments"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "300"})),
+            )
+            .mount(&server)
+            .await;
+
+        let api = mock_api(&server);
+        let adf = ValidatedAdfDocument::empty();
+        let anchor = InlineAnchor {
+            text: "phrase".to_string(),
+            match_index: 0,
+            match_count: 1,
+        };
+        assert!(run_add_inline_comment(&api, "12345", &adf, &anchor)
+            .await
+            .is_ok());
+    }
+
+    // ── *Command::execute (env-mutex serialised) ───────────────────
+    //
+    // Each `*::execute()` is a thin wrapper around `create_client()` and a
+    // `run_*` helper. Exercising the `Err` propagation through `?` plus one
+    // happy-path dispatch is enough to cover the wrapper; the underlying
+    // helper logic is covered by the `run_*` tests above.
+
+    fn set_atlassian_env(uri: &str) {
+        std::env::set_var(crate::atlassian::auth::ATLASSIAN_INSTANCE_URL, uri);
+        std::env::set_var(crate::atlassian::auth::ATLASSIAN_EMAIL, "user@test.com");
+        std::env::set_var(crate::atlassian::auth::ATLASSIAN_API_TOKEN, "t");
+    }
+
+    fn clear_atlassian_env() {
+        std::env::remove_var(crate::atlassian::auth::ATLASSIAN_INSTANCE_URL);
+        std::env::remove_var(crate::atlassian::auth::ATLASSIAN_EMAIL);
+        std::env::remove_var(crate::atlassian::auth::ATLASSIAN_API_TOKEN);
+    }
+
+    #[tokio::test]
+    async fn list_command_execute_propagates_create_client_error() {
+        let guard = crate::atlassian::auth::test_util::EnvGuard::take();
+        let _home = guard.clear_credentials();
+
+        let cmd = ListCommand {
+            id: "12345".to_string(),
+            kind: CommentKindFilter::All,
+            limit: 25,
+            output: OutputFormat::Yaml,
+        };
+        assert!(cmd.execute().await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn list_command_execute_runs_through_dispatch() {
+        let _lock = crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/footer-comments",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": []})),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/inline-comments",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": []})),
+            )
+            .mount(&server)
+            .await;
+
+        set_atlassian_env(&server.uri());
+        let cmd = CommentCommand {
+            command: CommentSubcommands::List(ListCommand {
+                id: "12345".to_string(),
+                kind: CommentKindFilter::All,
+                limit: 25,
+                output: OutputFormat::Json,
+            }),
+        };
+        let result = cmd.execute().await;
+        clear_atlassian_env();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn add_command_execute_propagates_create_client_error() {
+        let guard = crate::atlassian::auth::test_util::EnvGuard::take();
+        let _home = guard.clear_credentials();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let body_path = temp_dir.path().join("body.md");
+        fs::write(&body_path, "Hello").unwrap();
+
+        let cmd = AddCommand {
+            id: "12345".to_string(),
+            file: Some(body_path.to_str().unwrap().to_string()),
+            format: ContentFormat::Jfm,
+        };
+        assert!(cmd.execute().await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn add_command_execute_runs_through_dispatch() {
+        let _lock = crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/wiki/api/v2/footer-comments"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "c9"})),
+            )
+            .mount(&server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let body_path = temp_dir.path().join("body.md");
+        fs::write(&body_path, "Hello").unwrap();
+
+        set_atlassian_env(&server.uri());
+        let cmd = CommentCommand {
+            command: CommentSubcommands::Add(AddCommand {
+                id: "12345".to_string(),
+                file: Some(body_path.to_str().unwrap().to_string()),
+                format: ContentFormat::Jfm,
+            }),
+        };
+        let result = cmd.execute().await;
+        clear_atlassian_env();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn add_inline_command_execute_propagates_create_client_error() {
+        let guard = crate::atlassian::auth::test_util::EnvGuard::take();
+        let _home = guard.clear_credentials();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let body_path = temp_dir.path().join("body.md");
+        fs::write(&body_path, "Hello").unwrap();
+
+        let cmd = AddInlineCommand {
+            id: "12345".to_string(),
+            file: Some(body_path.to_str().unwrap().to_string()),
+            format: ContentFormat::Jfm,
+            anchor_text: "phrase".to_string(),
+            match_index: None,
+        };
+        assert!(cmd.execute().await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn add_inline_command_execute_runs_through_dispatch() {
+        let _lock = crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12345"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "12345",
+                    "title": "Mock",
+                    "status": "current",
+                    "spaceId": "98",
+                    "version": {"number": 1},
+                    "body": {"atlas_doc_format": {
+                        "value": "{\"version\":1,\"type\":\"doc\",\"content\":[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"the anchor\"}]}]}"
+                    }}
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/98"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"key": "ENG"})),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/wiki/api/v2/inline-comments"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "ic1"})),
+            )
+            .mount(&server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let body_path = temp_dir.path().join("body.md");
+        fs::write(&body_path, "Inline note").unwrap();
+
+        set_atlassian_env(&server.uri());
+        let cmd = CommentCommand {
+            command: CommentSubcommands::AddInline(AddInlineCommand {
+                id: "12345".to_string(),
+                file: Some(body_path.to_str().unwrap().to_string()),
+                format: ContentFormat::Jfm,
+                anchor_text: "the anchor".to_string(),
+                match_index: None,
+            }),
+        };
+        let result = cmd.execute().await;
+        clear_atlassian_env();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn replies_command_execute_propagates_create_client_error() {
+        let guard = crate::atlassian::auth::test_util::EnvGuard::take();
+        let _home = guard.clear_credentials();
+
+        let cmd = RepliesCommand {
+            id: "abc".to_string(),
+            kind: CommentKindArg::Inline,
+            limit: 25,
+            output: OutputFormat::Yaml,
+        };
+        assert!(cmd.execute().await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replies_command_execute_runs_through_dispatch() {
+        let _lock = crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/inline-comments/abc/children",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": []})),
+            )
+            .mount(&server)
+            .await;
+
+        set_atlassian_env(&server.uri());
+        let cmd = CommentCommand {
+            command: CommentSubcommands::Replies(RepliesCommand {
+                id: "abc".to_string(),
+                kind: CommentKindArg::Inline,
+                limit: 25,
+                output: OutputFormat::Json,
+            }),
+        };
+        let result = cmd.execute().await;
+        clear_atlassian_env();
+        assert!(result.is_ok(), "{result:?}");
     }
 }
