@@ -51,7 +51,7 @@ cpal = "0.16"
 rubato = "0.16"
 hound = "3.5"
 signal-hook = "0.3"
-ringbuf = "0.4"
+ringbuf = "0.5"
 ulid = { version = "1", features = ["serde"] }
 candle-core = { version = "0.10", default-features = false }
 candle-nn = { version = "0.10", default-features = false }
