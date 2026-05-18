@@ -20,10 +20,12 @@ use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use hound::{SampleFormat, WavSpec};
+use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{
-    Resampler as _, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+    Async, FixedAsync, Indexing, Resampler as _, SincInterpolationParameters,
+    SincInterpolationType, WindowFunction,
 };
 
 /// Target sample rate for the capture pipeline (whisper.cpp convention).
@@ -75,10 +77,10 @@ pub struct Resampler {
 }
 
 struct Inner {
-    resampler: SincFixedIn<f32>,
+    resampler: Async<f32>,
     /// Pending input frames not yet large enough for one chunk.
     pending: Vec<f32>,
-    /// Required input frames per call (constant for `SincFixedIn`).
+    /// Required input frames per call (constant for fixed-input `Async`).
     chunk_frames: usize,
 }
 
@@ -104,10 +106,17 @@ impl Resampler {
             interpolation: SincInterpolationType::Linear,
             window: WindowFunction::BlackmanHarris2,
         };
-        let resampler = SincFixedIn::<f32>::new(ratio, 1.0, params, RESAMPLER_CHUNK_FRAMES, 1)
-            .with_context(|| {
-                format!("Failed to build resampler for {input_rate} Hz → {TARGET_SAMPLE_RATE} Hz")
-            })?;
+        let resampler = Async::<f32>::new_sinc(
+            ratio,
+            1.0,
+            &params,
+            RESAMPLER_CHUNK_FRAMES,
+            1,
+            FixedAsync::Input,
+        )
+        .with_context(|| {
+            format!("Failed to build resampler for {input_rate} Hz → {TARGET_SAMPLE_RATE} Hz")
+        })?;
         Ok(Self {
             input_rate,
             inner: Some(Inner {
@@ -141,14 +150,16 @@ impl Resampler {
         inner.pending.extend_from_slice(mono);
         let mut out = Vec::new();
         while inner.pending.len() >= inner.chunk_frames {
+            let chunk = &inner.pending[..inner.chunk_frames];
+            let input_adapter = InterleavedSlice::new(chunk, 1, inner.chunk_frames)
+                .map_err(|e| anyhow!("Failed to wrap resampler input buffer: {e:?}"))?;
             let drained = inner
                 .resampler
-                .process(&[&inner.pending[..inner.chunk_frames]], None)
+                .process(&input_adapter, 0, None)
                 .context("Resampler chunk processing failed")?;
             inner.pending.drain(..inner.chunk_frames);
-            if let Some(channel) = drained.into_iter().next() {
-                out.extend_from_slice(&channel);
-            }
+            // Mono → interleaved layout is just a flat Vec<f32> of samples.
+            out.extend(drained.take_data());
         }
         Ok(out)
     }
@@ -161,16 +172,27 @@ impl Resampler {
             return Ok(Vec::new());
         };
         let tail = std::mem::take(&mut inner.pending);
-        let input: Option<&[Vec<f32>]> = if tail.is_empty() {
-            None
-        } else {
-            Some(std::slice::from_ref(&tail))
+        if tail.is_empty() {
+            return Ok(Vec::new());
+        }
+        let input_adapter = InterleavedSlice::new(&tail, 1, tail.len())
+            .map_err(|e| anyhow!("Failed to wrap resampler flush input: {e:?}"))?;
+        let output_capacity = inner.resampler.output_frames_max();
+        let mut output_buf = vec![0.0_f32; output_capacity];
+        let mut output_adapter = InterleavedSlice::new_mut(&mut output_buf, 1, output_capacity)
+            .map_err(|e| anyhow!("Failed to wrap resampler flush output: {e:?}"))?;
+        let indexing = Indexing {
+            input_offset: 0,
+            output_offset: 0,
+            partial_len: Some(tail.len()),
+            active_channels_mask: None,
         };
-        let drained = inner
+        let (_in_frames, out_frames) = inner
             .resampler
-            .process_partial(input, None)
+            .process_into_buffer(&input_adapter, &mut output_adapter, Some(&indexing))
             .context("Resampler flush failed")?;
-        Ok(drained.into_iter().next().unwrap_or_default())
+        output_buf.truncate(out_frames);
+        Ok(output_buf)
     }
 }
 
