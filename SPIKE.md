@@ -119,6 +119,45 @@ Pursue **candidate 1 with algorithmic optimisations**, in priority order:
 
 **Do NOT** ship candidate 1 as-is to #806 — RTF > 1 means it cannot keep up with live input. The fallback recipe (Silero VAD + smaller window) is the actionable next step; the spike validates that candle + Whisper produces accurate (WER 7 %) deterministic transcripts on real speech, so the runtime choice is sound even though the LocalAgreement-2-as-specified algorithm is not.
 
+## Reference baseline: parakeet-mlx (NOT a candidate)
+
+> **Informational only — measured per [#856](https://github.com/rust-works/omni-dev/issues/856).** `NVIDIA Parakeet-TDT-0.6B-v2` (600 M params, English-only, MIT-licensed weights) running on Apple Silicon via the [`parakeet-mlx`](https://pypi.org/project/parakeet-mlx/) Python package. **Not a runtime candidate. Not a Rust port.** The number below establishes a reference WER ceiling for this fixture so the candidate gap is interpretable; the perf numbers are unified-memory GPU and **not directly comparable** to candidate RTF / Peak RSS.
+
+**Setup.** `parakeet-mlx==0.5.1`, `mlx==0.31.2`, host darwin/arm64 (M-series). Model staged from `mlx-community/parakeet-tdt-0.6b-v2` via HuggingFace. Harness: [`baseline/parakeet_mlx/run.py`](baseline/parakeet_mlx/run.py) (~110 lines). Repro: `cd baseline/parakeet_mlx && python3.12 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt && python run.py --fixture ../../tests/fixtures/voice/monologue_5min.wav --log events.jsonl --transcript transcript.txt`.
+
+**API tier landed: utterance-level.** `parakeet-mlx` does expose a streaming API (`model.transcribe_stream` → `StreamingParakeet.add_audio()`), but feeding it 100 ms chunks at default `context_size=(256, 256)`, `depth=1` produces unusable output on this fixture — early hypotheses commit with too-little audio context (sample emissions: `" 'Kay."`, `" Mm-hmm."`, `" Okay."`, `" Come here for me."` from audio that actually says "to his cold, precise, but admirably balanced mind"). The utterance-level `model.transcribe(path)` is what we measure. Per #856's explicit fallback: "*if the parakeet-mlx API only exposes utterance-level transcription, document and skip partial-latency comparison rather than fabricate one*."
+
+| Metric | Value | Notes |
+|---|---|---|
+| **WER** | **3.65 %** | 16 sub / 5 ins / 2 del, 631 ref words, 634 hyp words. Same `scripts/analyze.py` algorithm as candle's 7.13 %. **Directly comparable.** |
+| Time-to-final after silence | **N/A** | Utterance-level API; no streaming silence-gap signal surfaced. |
+| Partial latency P50 / P95 | **N/A** | Utterance-level API does not expose sub-utterance partials. |
+| Inference RTF (wall/audio) | 0.016 | 4.83 s wall to transcribe 300 s audio. **Informational only** — MLX-on-GPU with unified memory, *not* a CPU-on-single-thread number. |
+| Peak RSS | 724 MB (peak memory footprint 9.07 GB incl GPU buffers) | **Informational only** — unified-memory GPU path; CPU-only Rust candidates report fundamentally different numbers. |
+| Model load | 1985 ms | Includes safetensors deserialisation + MLX graph setup. (Candle's mmap'd safetensors load is 224 ms — keep in mind for steady-state vs cold-start framing.) |
+| Sentences emitted | 27 | One `final` JSONL event per `AlignedSentence` from `model.transcribe()`; mean confidence ≈ 0.95. |
+
+**Qualitative diff vs candle's transcript.** Parakeet's errors are scattered word-level differences against the (uncorrected-in-places) ground truth; candle's are noisier and include several outright hallucinations. Specifically, on the words/phrases where the two outputs *disagree* and one is correct:
+
+- **Hallucinations.** Candle produced `"a disaster of his own establishment"` (ref: `"master of his own establishment"`), `"to absorb all my intentions"` (ref: `"attentions"`), `"the science of his activity"` (ref: `"these signs of his activity"`), `"he waved me and armchair through across his case of cigars"` (ref: `"he waved me an armchair, threw across his case of cigars"`). Parakeet got every one of these right.
+- **Casing and punctuation.** Both produce cased + punctuated text. Parakeet's sentence-internal commas and semicolons track the source's prosody noticeably more accurately (e.g. `"He was, I take it, the most perfect..."` with both commas; candle drops them). Parakeet capitalises `Daily Press`, `Bohemian`; candle leaves both lowercase.
+- **Named entities.** Both got `Irene Adler`, `Baker Street`, `Holland`. Parakeet matched the ground-truth's *uncorrected* `"Tripoff murder"`, `"Tricomale"`, `"Stoti in Scarlet"` (these are reader-pronunciation artefacts captured verbatim in the expected.txt). Candle re-corrected `"Stoti"` back to `"Study"` (closer to Conan Doyle's original, *further* from the ground truth as recorded — costing candle a substitution under WER).
+- **Segmentation.** Candle's LocalAgreement-2 merger splits one source sentence across two chunks in several places (e.g. `"He was pacing the room, swiftly, eagerly, with his head sunk upon his chest"` → split at `"...eagerly. With..."`); parakeet keeps source sentences intact.
+
+The candle output is fully usable for downstream consumption (voice assistant transcription tier); parakeet's is closer to publication-grade.
+
+## Implication for the decision
+
+Parakeet's **3.65 % WER** vs candle's **7.13 %** is a **3.48-point gap** — candle is leaving ~half its error budget on the table relative to a 600 M-param reference. This is large enough that the recommendation above (ship candle + VAD optimisation) is worth re-examining along three axes, in priority order:
+
+1. **First follow-up question is *not* whether to port Parakeet to Rust.** Per #856's explicit framing: "Model size: Parakeet-TDT-0.6B-v2 is ~6× the parameter count of `whisper-tiny.en`. A large WER gap doesn't by itself justify a port — the first follow-up question is 'what does `whisper-base.en` or `small.en` look like in candle?'" That follow-up is a one-day exercise (swap the model variant in [`spike-candle-streaming`](spike-candle-streaming/), re-run the same harness, compare WER + RTF). If `whisper-base.en` closes most of the 3.5-point gap at acceptable RTF, the question is settled without any new architecture work.
+2. **If `whisper-base.en` does *not* close the gap** (e.g. lands at 5–6 % WER but still ≥ 1.5 points above parakeet) **and the product target requires < 5 % WER**, then a Parakeet-against-candle port spike becomes a real candidate for the #806 follow-up — but it's weeks-to-months of work (FastConformer encoder + TDT decoder + weight conversion + numerical-parity validation per #856's context) and competes against simpler paths (sherpa-rs if C++-freeness is relaxed for ASR per ADR-0033 amendment, or accepting 7 % WER as good enough for voice-assistant use).
+3. **If 7 % WER is acceptable for the product**, the parakeet measurement still earns its keep: it puts a hard ceiling on what the in-tree candle path can achieve, so any future "ASR feels worse than I expected" report has a calibrated reference point. **No port spike scheduled.** ADR-0035 (when written) should cite this gap explicitly so the choice is visible.
+
+The recommended next step (Silero VAD + smaller window cap from the "Recommended next step" section above) **does not change** — those address RTF, not WER. The parakeet baseline only sharpens the *quality* axis of the recommendation; the perf gates remain candle's blocker for #806.
+
+**Reproducibility envelope.** This baseline measurement is deterministic up to MLX kernel scheduling on the host GPU — re-running `run.py` produces hash-equal `transcript.txt` (verified post-run). The 3.65 % WER number can be re-derived from `events.jsonl` at any time by re-running `scripts/analyze.py` against the committed expected.txt.
+
 ## Trait fit (provisional, for candidate 1 + VAD optimisation)
 
 The chosen runtime maps onto #806's `StreamingTranscriber` trait roughly as follows. `transcribe_stream(audio: Box<dyn AsyncAudioInput>) -> Pin<Box<dyn Stream<Item = Result<TranscriptEvent>>>>` returns a stream that internally drives the candle backend. The `AsyncAudioInput::next_chunk` 100 ms chunks feed two parallel sinks: (1) the LocalAgreement-2 merger's audio window, and (2) the endpoint detector (Silero VAD per the recommendation above; falls back to silence-gap RMS via the existing [`crate::voice::idle::IdleDetector`](src/voice/idle.rs) if Silero isn't enabled). On each VAD voice-activity event the merger may run an inference; on each VAD silence-onset it flushes the residual hypothesis as `Final { revisable: true }` and emits `Endpoint { kind: SilenceGap }`. The merger's inference work runs on a dedicated tokio task (the candle `Whisper` instance lives behind the existing `Mutex` from `src/voice/backends/candle.rs`); the merger's `Partial` and `Final` emissions cross back to the trait stream via a `tokio::sync::mpsc::channel`. This pattern keeps `StreamingTranscriber::transcribe_stream`'s caller fully async while the inference itself runs on a blocking task — matching the production constraints `cpal`'s capture callback already imposes.
