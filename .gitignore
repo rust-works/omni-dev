@@ -59,3 +59,11 @@ cinema/
 /spike-*/target/
 /spike-*/Cargo.lock
 /spike-*/runs/
+
+# Issue #856 spike: parakeet-mlx baseline harness (throwaway)
+/baseline/parakeet_mlx/.venv/
+/baseline/parakeet_mlx/__pycache__/
+/baseline/parakeet_mlx/events.jsonl
+/baseline/parakeet_mlx/transcript.txt
+/baseline/parakeet_mlx/peak_rss.txt
+/baseline/parakeet_mlx/metrics.txt

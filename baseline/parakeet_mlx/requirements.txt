@@ -1,0 +1,4 @@
+parakeet-mlx==0.5.1
+soundfile~=0.13
+numpy>=2.0,<3
+python-ulid~=3.0
