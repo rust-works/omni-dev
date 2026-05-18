@@ -53,3 +53,9 @@ cinema/
 
 # Git worktrees
 /.work/
+
+# Issue #826 spike: model weights and prototype build artifacts (throwaway)
+/models/
+/spike-*/target/
+/spike-*/Cargo.lock
+/spike-*/runs/
