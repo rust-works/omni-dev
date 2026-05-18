@@ -196,15 +196,16 @@ impl CpalAudioSource {
                 .ok_or_else(|| anyhow!("No default input device available on this host"))?,
             Some(name) => find_input_device(&host, name)?,
         };
-        let resolved_name = device
-            .name()
-            .unwrap_or_else(|_| "<unnamed device>".to_string());
+        let resolved_name = device.description().map_or_else(
+            |_| "<unnamed device>".to_string(),
+            |desc| desc.name().to_string(),
+        );
         let supported = device
             .default_input_config()
             .with_context(|| format!("Failed to query default input config for {resolved_name}"))?;
         let sample_format = supported.sample_format();
         let config: StreamConfig = supported.config();
-        let sample_rate = config.sample_rate.0;
+        let sample_rate = config.sample_rate;
         let channels = config.channels;
 
         let rb = HeapRb::<f32>::new(CPAL_RING_CAPACITY_SAMPLES);
@@ -315,9 +316,10 @@ fn find_input_device(host: &cpal::Host, name: &str) -> Result<<cpal::Host as Hos
         .context("Failed to enumerate input devices")?;
     let mut available: Vec<String> = Vec::new();
     for device in devices {
-        let device_name = device
-            .name()
-            .unwrap_or_else(|_| "<unnamed device>".to_string());
+        let device_name = device.description().map_or_else(
+            |_| "<unnamed device>".to_string(),
+            |desc| desc.name().to_string(),
+        );
         if device_name == name {
             return Ok(device);
         }
