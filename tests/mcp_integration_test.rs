@@ -1802,9 +1802,58 @@ async fn confluence_tools_success_paths_via_wiremock() -> Result<()> {
         .mount(&server)
         .await;
 
+    // `confluence_comment_list` defaults to `kind: "all"` (issue #830),
+    // so the tool fetches inline comments alongside footers. The fixture
+    // returns an empty inline list — the test below only asserts a footer
+    // id, but the GET still has to resolve to a 2xx.
+    Mock::given(method("GET"))
+        .and(path("/wiki/api/v2/pages/12345/inline-comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"results": []})))
+        .mount(&server)
+        .await;
+
     Mock::given(method("POST"))
         .and(path("/wiki/api/v2/footer-comments"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "c9"})))
+        .mount(&server)
+        .await;
+
+    // Inline comment add: needs the page-fetch (for anchor resolution) plus
+    // the post endpoint. Page body contains the anchor text once.
+    Mock::given(method("GET"))
+        .and(path("/wiki/api/v2/pages/12345"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "12345",
+            "title": "Mock Page",
+            "status": "current",
+            "spaceId": "98",
+            "version": {"number": 1},
+            "body": {"atlas_doc_format": {"value":
+                "{\"version\":1,\"type\":\"doc\",\"content\":[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"anchor text\"}]}]}"
+            }}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/wiki/api/v2/spaces/98"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"key": "ENG"})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/wiki/api/v2/inline-comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "ic1"})))
+        .mount(&server)
+        .await;
+
+    // Replies endpoint for the inline kind — used to exercise the
+    // `confluence_comment_replies` tool handler.
+    Mock::given(method("GET"))
+        .and(path("/wiki/api/v2/inline-comments/parent1/children"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": [
+                {"id": "r1", "version": {"authorId": "alice", "createdAt": "2026-04-01T10:00:00Z"}}
+            ]
+        })))
         .mount(&server)
         .await;
 
@@ -1905,6 +1954,51 @@ async fn confluence_tools_success_paths_via_wiremock() -> Result<()> {
         .await?;
     assert!(!comment_add.is_error.unwrap_or(false));
     assert!(confluence_tool_text(&comment_add).contains("Comment added"));
+
+    // `kind: "footer"` exercises the non-default branch of
+    // `CommentKindSelector::parse` through the tool handler.
+    let comments_footer_only = client
+        .call_tool(
+            CallToolRequestParams::new("confluence_comment_list").with_arguments(
+                serde_json::json!({"id": "12345", "kind": "footer"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await?;
+    assert!(!comments_footer_only.is_error.unwrap_or(false));
+    assert!(confluence_tool_text(&comments_footer_only).contains("id: c1"));
+
+    let comment_add_inline = client
+        .call_tool(
+            CallToolRequestParams::new("confluence_comment_add_inline").with_arguments(
+                serde_json::json!({
+                    "id": "12345",
+                    "content": "Inline note",
+                    "anchor_text": "anchor text"
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+        )
+        .await?;
+    assert!(!comment_add_inline.is_error.unwrap_or(false));
+    assert!(confluence_tool_text(&comment_add_inline).contains("Inline comment added"));
+
+    let comment_replies = client
+        .call_tool(
+            CallToolRequestParams::new("confluence_comment_replies").with_arguments(
+                serde_json::json!({"comment_id": "parent1", "kind": "inline"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await?;
+    assert!(!comment_replies.is_error.unwrap_or(false));
+    assert!(confluence_tool_text(&comment_replies).contains("id: r1"));
 
     let labels = client
         .call_tool(

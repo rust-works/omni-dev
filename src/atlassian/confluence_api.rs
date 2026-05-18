@@ -295,6 +295,57 @@ pub struct ChildPage {
 
 // ── Comment types ─────────────────────────────────────────────────
 
+/// Distinguishes the two kinds of Confluence page comments.
+///
+/// Confluence v2 exposes footer comments (page-level discussion) and inline
+/// comments (anchored to a text selection) on separate endpoints. Tracking the
+/// kind on each [`ConfluenceComment`] lets a merged listing identify which
+/// endpoint each entry came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CommentKind {
+    /// A page-level footer comment.
+    Footer,
+    /// A comment anchored to a text selection in the page body.
+    Inline,
+}
+
+impl CommentKind {
+    /// Returns the URL segment Confluence v2 uses for this kind
+    /// (`"footer-comments"` or `"inline-comments"`).
+    #[must_use]
+    pub fn endpoint_segment(self) -> &'static str {
+        match self {
+            Self::Footer => "footer-comments",
+            Self::Inline => "inline-comments",
+        }
+    }
+}
+
+impl std::fmt::Display for CommentKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Footer => f.write_str("footer"),
+            Self::Inline => f.write_str("inline"),
+        }
+    }
+}
+
+/// Anchor metadata required when creating an inline comment.
+///
+/// Confluence's `inline-comment-properties` payload identifies which text
+/// selection on the page the comment attaches to. `match_index` is 0-based;
+/// `match_count` is the total number of occurrences of `text` on the page.
+#[derive(Debug, Clone)]
+pub struct InlineAnchor {
+    /// The selected text the comment anchors to.
+    pub text: String,
+    /// 0-based index of which occurrence on the page this comment anchors to.
+    pub match_index: usize,
+    /// Total number of occurrences of `text` on the page.
+    pub match_count: usize,
+}
+
 /// A comment on a Confluence page.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfluenceComment {
@@ -302,6 +353,8 @@ pub struct ConfluenceComment {
     pub id: String,
     /// Author display name.
     pub author: String,
+    /// Whether this is a footer or inline comment.
+    pub kind: CommentKind,
     /// Comment body as raw ADF JSON.
     pub body_adf: Option<serde_json::Value>,
     /// ISO 8601 creation timestamp.
@@ -347,6 +400,25 @@ struct ConfluenceAddCommentRequest {
     #[serde(rename = "pageId")]
     page_id: String,
     body: ConfluenceUpdateBody,
+}
+
+#[derive(Serialize)]
+struct ConfluenceAddInlineCommentRequest {
+    #[serde(rename = "pageId")]
+    page_id: String,
+    body: ConfluenceUpdateBody,
+    #[serde(rename = "inlineCommentProperties")]
+    inline_comment_properties: InlineCommentProperties,
+}
+
+#[derive(Serialize)]
+struct InlineCommentProperties {
+    #[serde(rename = "textSelection")]
+    text_selection: String,
+    #[serde(rename = "textSelectionMatchCount")]
+    text_selection_match_count: usize,
+    #[serde(rename = "textSelectionMatchIndex")]
+    text_selection_match_index: usize,
 }
 
 // ── Labels ─────────────────────────────────────────────────────────
@@ -1240,19 +1312,60 @@ impl ConfluenceApi {
 
     /// Lists footer comments on a Confluence page, handling pagination.
     pub async fn get_page_comments(&self, page_id: &str) -> Result<Vec<ConfluenceComment>> {
-        let mut all_comments = Vec::new();
-        let mut url = format!(
+        let url = format!(
             "{}/wiki/api/v2/pages/{}/footer-comments?body-format=atlas_doc_format",
             self.client.instance_url(),
             page_id
         );
+        self.fetch_comments_paginated(url, CommentKind::Footer)
+            .await
+    }
+
+    /// Lists inline comments on a Confluence page, handling pagination.
+    pub async fn get_page_inline_comments(&self, page_id: &str) -> Result<Vec<ConfluenceComment>> {
+        let url = format!(
+            "{}/wiki/api/v2/pages/{}/inline-comments?body-format=atlas_doc_format",
+            self.client.instance_url(),
+            page_id
+        );
+        self.fetch_comments_paginated(url, CommentKind::Inline)
+            .await
+    }
+
+    /// Lists the replies (child comments) of a comment.
+    ///
+    /// `kind` selects which Confluence v2 endpoint to hit: footer replies and
+    /// inline replies live on separate URLs. The returned comments are stamped
+    /// with the same `kind` as the parent — Confluence treats reply chains as
+    /// homogenous.
+    pub async fn get_comment_replies(
+        &self,
+        comment_id: &str,
+        kind: CommentKind,
+    ) -> Result<Vec<ConfluenceComment>> {
+        let url = format!(
+            "{}/wiki/api/v2/{}/{}/children?body-format=atlas_doc_format",
+            self.client.instance_url(),
+            kind.endpoint_segment(),
+            comment_id
+        );
+        self.fetch_comments_paginated(url, kind).await
+    }
+
+    /// Shared paginated GET for the comments and replies endpoints.
+    async fn fetch_comments_paginated(
+        &self,
+        mut url: String,
+        kind: CommentKind,
+    ) -> Result<Vec<ConfluenceComment>> {
+        let mut all_comments = Vec::new();
 
         loop {
             let response = self
                 .client
                 .get_json(&url)
                 .await
-                .context("Failed to fetch Confluence page comments")?;
+                .context("Failed to fetch Confluence comments")?;
 
             if !response.status().is_success() {
                 let status = response.status().as_u16();
@@ -1280,6 +1393,7 @@ impl ConfluenceApi {
                 all_comments.push(ConfluenceComment {
                     id: c.id,
                     author,
+                    kind,
                     body_adf,
                     created,
                 });
@@ -1329,6 +1443,84 @@ impl ConfluenceApi {
         }
 
         Ok(())
+    }
+
+    /// Adds an inline comment anchored to a text selection on a Confluence page.
+    ///
+    /// `anchor` is typically produced by [`Self::resolve_anchor`], which counts
+    /// occurrences on the live page and validates that a 1-based `match_index`
+    /// the user supplied is in range.
+    pub async fn add_inline_page_comment(
+        &self,
+        page_id: &str,
+        body_adf: &ValidatedAdfDocument,
+        anchor: &InlineAnchor,
+    ) -> Result<()> {
+        let adf_json =
+            serde_json::to_string(body_adf).context("Failed to serialize ADF document")?;
+
+        let request = ConfluenceAddInlineCommentRequest {
+            page_id: page_id.to_string(),
+            body: ConfluenceUpdateBody {
+                representation: "atlas_doc_format".to_string(),
+                value: adf_json,
+            },
+            inline_comment_properties: InlineCommentProperties {
+                text_selection: anchor.text.clone(),
+                text_selection_match_count: anchor.match_count,
+                text_selection_match_index: anchor.match_index,
+            },
+        };
+
+        let url = format!("{}/wiki/api/v2/inline-comments", self.client.instance_url());
+
+        let response = self
+            .client
+            .post_json(&url, &request)
+            .await
+            .context("Failed to add Confluence inline comment")?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            debug!(status, body = %body, "Confluence add_inline_page_comment non-success");
+            return Err(confluence_write_error(status, body, body_adf));
+        }
+
+        Ok(())
+    }
+
+    /// Resolves an inline-comment anchor by counting `anchor_text` occurrences
+    /// in the live page body.
+    ///
+    /// `match_index_1based` is what the user typed (1-based) and is `None` if
+    /// they omitted the flag. The returned [`InlineAnchor`] is ready to hand to
+    /// [`Self::add_inline_page_comment`].
+    ///
+    /// # Errors
+    ///
+    /// - The anchor text does not appear on the page.
+    /// - The text appears more than once and no `--match-index` was supplied.
+    /// - The supplied `--match-index` is outside `1..=match_count`.
+    pub async fn resolve_anchor(
+        &self,
+        page_id: &str,
+        anchor_text: &str,
+        match_index_1based: Option<usize>,
+    ) -> Result<InlineAnchor> {
+        let page = self.get_content(page_id).await?;
+
+        let plain = match &page.body_adf {
+            Some(adf_value) => {
+                let adf: AdfDocument = serde_json::from_value(adf_value.clone())
+                    .context("Failed to parse page ADF for anchor resolution")?;
+                crate::atlassian::convert::adf_to_plain_text(&adf)
+            }
+            None => String::new(),
+        };
+
+        let match_count = count_non_overlapping(&plain, anchor_text);
+        resolve_anchor_indices(anchor_text, match_count, match_index_1based, page_id)
     }
 
     /// Resolves a space ID to a space key via the Confluence API.
@@ -1942,6 +2134,64 @@ fn offset_from(anchor: u32, offset: u32, versions: &[PageVersion]) -> Result<u32
     Ok(target)
 }
 
+/// Counts non-overlapping occurrences of `needle` in `haystack`.
+///
+/// An empty `needle` returns 0 so anchor resolution rejects it as "not found".
+fn count_non_overlapping(haystack: &str, needle: &str) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut start = 0;
+    while let Some(pos) = haystack[start..].find(needle) {
+        count += 1;
+        start += pos + needle.len();
+    }
+    count
+}
+
+/// Picks an [`InlineAnchor`] match index given the live page's match count
+/// and the user's 1-based `--match-index` (if any).
+///
+/// See [`ConfluenceApi::resolve_anchor`] for the full anchor-resolution
+/// contract; this is the pure-logic half, factored out for direct unit
+/// testing without an HTTP fixture.
+fn resolve_anchor_indices(
+    anchor_text: &str,
+    match_count: usize,
+    match_index_1based: Option<usize>,
+    page_id: &str,
+) -> Result<InlineAnchor> {
+    if match_count == 0 {
+        anyhow::bail!(
+            "anchor text {anchor_text:?} not found on page {page_id}; \
+             cannot create inline comment"
+        );
+    }
+    let index = if let Some(i) = match_index_1based {
+        if i == 0 || i > match_count {
+            anyhow::bail!(
+                "--match-index {i} out of range; anchor text {anchor_text:?} appears \
+                 {match_count} time(s) on page {page_id} (valid range: 1..={match_count})"
+            );
+        }
+        i - 1
+    } else {
+        if match_count > 1 {
+            anyhow::bail!(
+                "anchor text {anchor_text:?} appears {match_count} times on page {page_id}; \
+                 specify --match-index <1..={match_count}> to choose which occurrence"
+            );
+        }
+        0
+    };
+    Ok(InlineAnchor {
+        text: anchor_text.to_string(),
+        match_index: index,
+        match_count,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1953,6 +2203,285 @@ mod tests {
             AtlassianClient::new("https://org.atlassian.net", "user@test.com", "token").unwrap();
         let api = ConfluenceApi::new(client);
         assert_eq!(api.backend_name(), "confluence");
+    }
+
+    // ── CommentKind ────────────────────────────────────────────────
+
+    #[test]
+    fn comment_kind_endpoint_segment() {
+        assert_eq!(CommentKind::Footer.endpoint_segment(), "footer-comments");
+        assert_eq!(CommentKind::Inline.endpoint_segment(), "inline-comments");
+    }
+
+    #[test]
+    fn comment_kind_serializes_lowercase() {
+        let footer = serde_json::to_string(&CommentKind::Footer).unwrap();
+        let inline = serde_json::to_string(&CommentKind::Inline).unwrap();
+        assert_eq!(footer, "\"footer\"");
+        assert_eq!(inline, "\"inline\"");
+    }
+
+    #[test]
+    fn comment_kind_display() {
+        assert_eq!(CommentKind::Footer.to_string(), "footer");
+        assert_eq!(CommentKind::Inline.to_string(), "inline");
+    }
+
+    // ── count_non_overlapping ──────────────────────────────────────
+
+    #[test]
+    fn count_non_overlapping_no_matches() {
+        assert_eq!(count_non_overlapping("hello world", "foo"), 0);
+    }
+
+    #[test]
+    fn count_non_overlapping_single_match() {
+        assert_eq!(count_non_overlapping("hello world", "world"), 1);
+    }
+
+    #[test]
+    fn count_non_overlapping_multiple_matches() {
+        assert_eq!(count_non_overlapping("foo bar foo baz foo", "foo"), 3);
+    }
+
+    #[test]
+    fn count_non_overlapping_is_non_overlapping() {
+        // "aa" in "aaaa" should be 2, not 3.
+        assert_eq!(count_non_overlapping("aaaa", "aa"), 2);
+    }
+
+    #[test]
+    fn count_non_overlapping_empty_needle_is_zero() {
+        // Anchor resolution must treat an empty anchor as "not found".
+        assert_eq!(count_non_overlapping("anything", ""), 0);
+    }
+
+    // ── resolve_anchor_indices ─────────────────────────────────────
+
+    #[test]
+    fn resolve_anchor_indices_not_found_errors() {
+        let err = resolve_anchor_indices("missing", 0, None, "PAGE").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not found"), "got: {msg}");
+        assert!(msg.contains("PAGE"), "got: {msg}");
+    }
+
+    #[test]
+    fn resolve_anchor_indices_unique_match_uses_zero() {
+        let a = resolve_anchor_indices("phrase", 1, None, "PAGE").unwrap();
+        assert_eq!(a.match_index, 0);
+        assert_eq!(a.match_count, 1);
+        assert_eq!(a.text, "phrase");
+    }
+
+    #[test]
+    fn resolve_anchor_indices_ambiguous_without_match_index_errors() {
+        let err = resolve_anchor_indices("phrase", 3, None, "PAGE").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("appears 3 times"), "got: {msg}");
+        assert!(msg.contains("--match-index"), "got: {msg}");
+    }
+
+    #[test]
+    fn resolve_anchor_indices_ambiguous_with_valid_match_index() {
+        let a = resolve_anchor_indices("phrase", 3, Some(2), "PAGE").unwrap();
+        assert_eq!(a.match_index, 1); // 2-based -> 1-based zero-indexed
+        assert_eq!(a.match_count, 3);
+    }
+
+    #[test]
+    fn resolve_anchor_indices_match_index_zero_rejected() {
+        let err = resolve_anchor_indices("phrase", 3, Some(0), "PAGE").unwrap_err();
+        assert!(err.to_string().contains("out of range"));
+    }
+
+    #[test]
+    fn resolve_anchor_indices_match_index_too_large_rejected() {
+        let err = resolve_anchor_indices("phrase", 3, Some(4), "PAGE").unwrap_err();
+        assert!(err.to_string().contains("out of range"));
+    }
+
+    // ── resolve_anchor (HTTP) ──────────────────────────────────────
+
+    async fn mock_page_with_text(server: &wiremock::MockServer, id: &str, text: &str) {
+        let adf_value = format!(
+            "{{\"version\":1,\"type\":\"doc\",\"content\":[{{\"type\":\"paragraph\",\"content\":[{{\"type\":\"text\",\"text\":{}}}]}}]}}",
+            serde_json::Value::String(text.to_string())
+        );
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/wiki/api/v2/pages/{id}")))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": id,
+                    "title": "Mock",
+                    "status": "current",
+                    "spaceId": "98",
+                    "version": {"number": 1},
+                    "body": {"atlas_doc_format": {"value": adf_value}}
+                })),
+            )
+            .mount(server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/98"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"key": "ENG"})),
+            )
+            .mount(server)
+            .await;
+    }
+
+    fn mock_confluence_api(server: &wiremock::MockServer) -> ConfluenceApi {
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        ConfluenceApi::new(client)
+    }
+
+    #[tokio::test]
+    async fn resolve_anchor_unique_match_succeeds() {
+        let server = wiremock::MockServer::start().await;
+        mock_page_with_text(&server, "12345", "the unique anchor phrase appears here").await;
+        let api = mock_confluence_api(&server);
+        let anchor = api
+            .resolve_anchor("12345", "the unique anchor phrase", None)
+            .await
+            .unwrap();
+        assert_eq!(anchor.match_count, 1);
+        assert_eq!(anchor.match_index, 0);
+    }
+
+    #[tokio::test]
+    async fn resolve_anchor_not_found_errors() {
+        let server = wiremock::MockServer::start().await;
+        mock_page_with_text(&server, "12345", "nothing relevant").await;
+        let api = mock_confluence_api(&server);
+        let err = api
+            .resolve_anchor("12345", "missing", None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn resolve_anchor_on_body_less_page_errors_with_not_found() {
+        // A Confluence page can come back with a null body; the resolver
+        // must treat it as plain-text "" rather than panicking.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12345"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "12345",
+                    "title": "Empty",
+                    "status": "current",
+                    "spaceId": "98",
+                    "version": {"number": 1},
+                    "body": null
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/98"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"key": "ENG"})),
+            )
+            .mount(&server)
+            .await;
+
+        let api = mock_confluence_api(&server);
+        let err = api
+            .resolve_anchor("12345", "anything", None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    // ── add_inline_page_comment ────────────────────────────────────
+
+    #[tokio::test]
+    async fn add_inline_page_comment_posts_anchor_payload() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/wiki/api/v2/inline-comments"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "pageId": "12345",
+                "inlineCommentProperties": {
+                    "textSelection": "phrase",
+                    "textSelectionMatchCount": 2,
+                    "textSelectionMatchIndex": 1
+                }
+            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "ic1"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let api = mock_confluence_api(&server);
+        let adf = ValidatedAdfDocument::empty();
+        let anchor = InlineAnchor {
+            text: "phrase".to_string(),
+            match_index: 1,
+            match_count: 2,
+        };
+        api.add_inline_page_comment("12345", &adf, &anchor)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn add_inline_page_comment_propagates_http_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/wiki/api/v2/inline-comments"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("upstream"))
+            .mount(&server)
+            .await;
+
+        let api = mock_confluence_api(&server);
+        let adf = ValidatedAdfDocument::empty();
+        let anchor = InlineAnchor {
+            text: "phrase".to_string(),
+            match_index: 0,
+            match_count: 1,
+        };
+        let err = api
+            .add_inline_page_comment("12345", &adf, &anchor)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("500"));
+    }
+
+    // ── get_comment_replies ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_comment_replies_inline_kind() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/inline-comments/abc/children",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {"id": "r1", "version": {"authorId": "alice", "createdAt": "2026-01-01T00:00:00Z"}}
+                    ]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let api = mock_confluence_api(&server);
+        let replies = api
+            .get_comment_replies("abc", CommentKind::Inline)
+            .await
+            .unwrap();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].kind, CommentKind::Inline);
     }
 
     #[test]
