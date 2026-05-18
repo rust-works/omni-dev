@@ -1,0 +1,29 @@
+[package]
+name = "spike-tract-zipformer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "spike-tract-zipformer"
+path = "src/main.rs"
+
+[[bin]]
+name = "probe-onnx-io"
+path = "src/probe.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.6", features = ["derive"] }
+hound = "3.5"
+rustfft = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tract-onnx = "0.21"
+ulid = { version = "1", features = ["serde"] }
+baseline = { path = "../baseline" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
