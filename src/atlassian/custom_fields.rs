@@ -42,10 +42,9 @@ pub fn resolve_custom_fields(
     for (key, value) in scalars {
         let (id, field) = lookup_field(editmeta, key)?;
         if field.is_adf_rich_text() {
-            bail!(
-                "Field '{}' ({}) is a rich-text field; set it via a `<!-- field: {} ({}) -->` section in the body, not as a scalar in frontmatter",
-                field.name, id, field.name, id
-            );
+            let payload = rich_text_scalar_to_api_value(value, field, &id)?;
+            out.insert(id, payload);
+            continue;
         }
         let payload = scalar_to_api_value(value, field).with_context(|| {
             format!(
@@ -138,6 +137,85 @@ fn resolve_section_field<'a>(
 
 fn looks_like_field_id(s: &str) -> bool {
     s.starts_with("customfield_") && s[12..].chars().all(|c| c.is_ascii_digit())
+}
+
+/// Converts a frontmatter / `--set-field` scalar targeting a rich-text custom
+/// field into the API JSON shape.
+///
+/// String values are treated as JFM markdown and converted to ADF (matching
+/// the contract for `content`/description and for body sections). An empty
+/// string or YAML null clears the field by emitting `null`. Non-string
+/// scalars (numbers, bools, sequences, mappings) are rejected — rich-text
+/// fields require either a JFM string or a body section.
+///
+/// Null handling is load-bearing for the CLI: `--set-field "Name="` parses
+/// the empty RHS as YAML null (not a string), so a "clear the field"
+/// invocation arrives here as `Value::Null`.
+fn rich_text_scalar_to_api_value(
+    value: &serde_yaml::Value,
+    field: &EditMetaField,
+    id: &str,
+) -> Result<serde_json::Value> {
+    let s = match value {
+        serde_yaml::Value::String(s) => s.clone(),
+        serde_yaml::Value::Null => String::new(),
+        _ => bail!(
+            "Field '{}' ({}) is a rich-text field; supply JFM markdown as a string or use a `<!-- field: {} ({}) -->` body section",
+            field.name,
+            id,
+            field.name,
+            id
+        ),
+    };
+    string_to_rich_text_api_value(&s, &field.name, id)
+}
+
+/// Shared conversion: empty → `null`; otherwise JFM → validated ADF JSON.
+fn string_to_rich_text_api_value(s: &str, field_name: &str, id: &str) -> Result<serde_json::Value> {
+    if s.is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+    let adf = markdown_to_adf(s)?;
+    let validated = ValidatedAdfDocument::try_new(adf).with_context(|| {
+        format!("Custom field '{field_name}' ({id}) failed ADF nesting validation")
+    })?;
+    serde_json::to_value(&validated).context("Failed to serialize custom field ADF document")
+}
+
+/// Applies JFM → ADF conversion in-place to string values targeting rich-text
+/// custom fields, per issue #866.
+///
+/// For each entry in `fields`:
+/// - If the key is not present in `editmeta.fields`, leave the value
+///   untouched (pass-through — the API will surface its own error).
+/// - If the resolved field is not a rich-text textarea, leave the value
+///   untouched.
+/// - If the value is a JSON object, leave it untouched (assumed to be a raw
+///   ADF document — backwards-compatible).
+/// - If the value is a JSON string, treat it as JFM markdown and convert.
+///   An empty string becomes `null`, which clears the field.
+/// - Any other value type (number/bool/array/null) is left untouched.
+///
+/// Designed for the MCP `jira_write` `fields` escape hatch: lets callers pass
+/// `"customfield_19300": "- bullet\n- bullet"` and get the right ADF on the
+/// wire without hand-crafting the document.
+pub fn convert_textarea_string_values(
+    fields: &mut BTreeMap<String, serde_json::Value>,
+    editmeta: &EditMeta,
+) -> Result<()> {
+    for (id, value) in fields.iter_mut() {
+        let Some(field) = editmeta.fields.get(id) else {
+            continue;
+        };
+        if !field.is_adf_rich_text() {
+            continue;
+        }
+        let serde_json::Value::String(s) = value else {
+            continue;
+        };
+        *value = string_to_rich_text_api_value(s, &field.name, id)?;
+    }
+    Ok(())
 }
 
 /// Dispatches a scalar YAML value to the API shape expected for a given
@@ -449,7 +527,9 @@ mod tests {
     }
 
     #[test]
-    fn scalar_to_rich_text_field_errors() {
+    fn scalar_string_to_rich_text_field_converts_jfm_to_adf() {
+        // Issue #866: a string scalar targeting a textarea custom field is
+        // treated as JFM markdown and converted to ADF.
         let editmeta = meta(&[(
             "customfield_19300",
             "Acceptance Criteria",
@@ -459,10 +539,97 @@ mod tests {
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Acceptance Criteria".to_string(),
-            serde_yaml::Value::String("just text".to_string()),
+            serde_yaml::Value::String("- one\n- two".to_string()),
+        );
+        let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
+        let value = out.get("customfield_19300").unwrap();
+        assert_eq!(value["type"], "doc");
+        assert_eq!(value["version"], 1);
+        assert!(value["content"].is_array());
+    }
+
+    #[test]
+    fn scalar_empty_string_to_rich_text_field_clears() {
+        let editmeta = meta(&[(
+            "customfield_19300",
+            "Acceptance Criteria",
+            "string",
+            Some(CUSTOM_TEXTAREA),
+        )]);
+        let mut scalars = BTreeMap::new();
+        scalars.insert(
+            "Acceptance Criteria".to_string(),
+            serde_yaml::Value::String(String::new()),
+        );
+        let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
+        assert_eq!(
+            out.get("customfield_19300").unwrap(),
+            &serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn scalar_yaml_null_to_rich_text_field_clears() {
+        // Distinct from the empty-string case: the CLI's `--set-field Name=`
+        // parses the empty RHS as YAML null (not a string), so this arm
+        // covers the production code path callers actually traverse to
+        // clear a rich-text field from the command line.
+        let editmeta = meta(&[(
+            "customfield_19300",
+            "Acceptance Criteria",
+            "string",
+            Some(CUSTOM_TEXTAREA),
+        )]);
+        let mut scalars = BTreeMap::new();
+        scalars.insert("Acceptance Criteria".to_string(), serde_yaml::Value::Null);
+        let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
+        assert_eq!(
+            out.get("customfield_19300").unwrap(),
+            &serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn scalar_non_string_to_rich_text_field_errors() {
+        // Non-string scalars (numbers, bools, mappings, sequences) targeting
+        // a rich-text field still need a body section / JFM string.
+        let editmeta = meta(&[(
+            "customfield_19300",
+            "Acceptance Criteria",
+            "string",
+            Some(CUSTOM_TEXTAREA),
+        )]);
+        let mut scalars = BTreeMap::new();
+        scalars.insert(
+            "Acceptance Criteria".to_string(),
+            serde_yaml::Value::Number(42.into()),
         );
         let err = resolve_custom_fields(&scalars, &[], &editmeta).unwrap_err();
-        assert!(err.to_string().contains("rich-text field"));
+        let msg = err.to_string();
+        assert!(msg.contains("rich-text field"), "got: {msg}");
+        assert!(msg.contains("JFM markdown"), "got: {msg}");
+    }
+
+    #[test]
+    fn scalar_string_with_invalid_adf_nesting_to_rich_text_field_errors() {
+        let editmeta = meta(&[(
+            "customfield_19300",
+            "Acceptance Criteria",
+            "string",
+            Some(CUSTOM_TEXTAREA),
+        )]);
+        let mut scalars = BTreeMap::new();
+        scalars.insert(
+            "Acceptance Criteria".to_string(),
+            serde_yaml::Value::String(
+                ":::panel{type=info}\n:::expand{title=\"x\"}\nbody\n:::\n:::".to_string(),
+            ),
+        );
+        let err = resolve_custom_fields(&scalars, &[], &editmeta).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Acceptance Criteria"));
+        assert!(msg.contains("ADF nesting validation"));
+        assert!(msg.contains("`expand` cannot be a child of `panel`"));
     }
 
     #[test]
@@ -786,5 +953,142 @@ mod tests {
         }];
         let out = resolve_custom_fields(&BTreeMap::new(), &sections, &editmeta).unwrap();
         assert!(out.contains_key("customfield_19300"));
+    }
+
+    // ── convert_textarea_string_values ────────────────────────────────
+
+    #[test]
+    fn convert_textarea_string_value_converts_to_adf() {
+        let editmeta = meta(&[(
+            "customfield_19300",
+            "Acceptance Criteria",
+            "string",
+            Some(CUSTOM_TEXTAREA),
+        )]);
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "customfield_19300".to_string(),
+            serde_json::Value::String("- one\n- two".to_string()),
+        );
+        convert_textarea_string_values(&mut fields, &editmeta).unwrap();
+        let value = fields.get("customfield_19300").unwrap();
+        assert_eq!(value["type"], "doc");
+        assert_eq!(value["version"], 1);
+        assert!(value["content"].is_array());
+    }
+
+    #[test]
+    fn convert_textarea_object_value_passes_through() {
+        let editmeta = meta(&[(
+            "customfield_19300",
+            "Acceptance Criteria",
+            "string",
+            Some(CUSTOM_TEXTAREA),
+        )]);
+        let raw_adf = serde_json::json!({
+            "version": 1,
+            "type": "doc",
+            "content": [{"type": "paragraph", "content": [{"type": "text", "text": "x"}]}]
+        });
+        let mut fields = BTreeMap::new();
+        fields.insert("customfield_19300".to_string(), raw_adf.clone());
+        convert_textarea_string_values(&mut fields, &editmeta).unwrap();
+        assert_eq!(fields.get("customfield_19300").unwrap(), &raw_adf);
+    }
+
+    #[test]
+    fn convert_textarea_empty_string_clears_field() {
+        let editmeta = meta(&[(
+            "customfield_19300",
+            "Acceptance Criteria",
+            "string",
+            Some(CUSTOM_TEXTAREA),
+        )]);
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "customfield_19300".to_string(),
+            serde_json::Value::String(String::new()),
+        );
+        convert_textarea_string_values(&mut fields, &editmeta).unwrap();
+        assert_eq!(
+            fields.get("customfield_19300").unwrap(),
+            &serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn convert_non_textarea_string_passes_through() {
+        let editmeta = meta(&[("customfield_10010", "Some Text", "string", None)]);
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "customfield_10010".to_string(),
+            serde_json::Value::String("plain".to_string()),
+        );
+        convert_textarea_string_values(&mut fields, &editmeta).unwrap();
+        assert_eq!(
+            fields.get("customfield_10010").unwrap(),
+            &serde_json::Value::String("plain".to_string())
+        );
+    }
+
+    #[test]
+    fn convert_unknown_field_passes_through() {
+        // Field id not present in editmeta — leave the value alone and let the
+        // API surface its own error.
+        let editmeta = meta(&[("customfield_OTHER", "Other", "string", None)]);
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "customfield_99999".to_string(),
+            serde_json::Value::String("- a".to_string()),
+        );
+        convert_textarea_string_values(&mut fields, &editmeta).unwrap();
+        assert_eq!(
+            fields.get("customfield_99999").unwrap(),
+            &serde_json::Value::String("- a".to_string())
+        );
+    }
+
+    #[test]
+    fn convert_textarea_non_string_non_object_passes_through() {
+        // Numbers, bools, arrays, nulls are not coerced — those are not
+        // legitimate textarea payloads and the API will tell the caller.
+        let editmeta = meta(&[(
+            "customfield_19300",
+            "Acceptance Criteria",
+            "string",
+            Some(CUSTOM_TEXTAREA),
+        )]);
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "customfield_19300".to_string(),
+            serde_json::Value::Number(42.into()),
+        );
+        convert_textarea_string_values(&mut fields, &editmeta).unwrap();
+        assert_eq!(
+            fields.get("customfield_19300").unwrap(),
+            &serde_json::Value::Number(42.into())
+        );
+    }
+
+    #[test]
+    fn convert_textarea_invalid_adf_nesting_errors() {
+        let editmeta = meta(&[(
+            "customfield_19300",
+            "Acceptance Criteria",
+            "string",
+            Some(CUSTOM_TEXTAREA),
+        )]);
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "customfield_19300".to_string(),
+            serde_json::Value::String(
+                ":::panel{type=info}\n:::expand{title=\"x\"}\nbody\n:::\n:::".to_string(),
+            ),
+        );
+        let err = convert_textarea_string_values(&mut fields, &editmeta).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Acceptance Criteria"));
+        assert!(msg.contains("ADF nesting validation"));
+        assert!(msg.contains("`expand` cannot be a child of `panel`"));
     }
 }
