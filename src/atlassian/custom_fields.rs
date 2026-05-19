@@ -17,11 +17,8 @@ use crate::atlassian::client::{EditMeta, EditMetaField};
 use crate::atlassian::convert::markdown_to_adf;
 use crate::atlassian::document::CustomFieldSection;
 
-/// Plugin type URI for the rich-text "textarea" custom field. Used as the
-/// discriminator for dispatch in tests and elsewhere that distinguishes
-/// rich-text custom fields from scalar ones.
 #[cfg(test)]
-const CUSTOM_TEXTAREA: &str = "com.atlassian.jira.plugin.system.customfieldtypes:textarea";
+use crate::atlassian::client::TEXTAREA_CUSTOM_TYPE as CUSTOM_TEXTAREA;
 
 /// Resolves a mixed set of frontmatter scalars and body sections into an
 /// API-ready custom field map keyed by stable field ID.
