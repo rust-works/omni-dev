@@ -1269,7 +1269,11 @@ impl OmniDevServer {
     /// Tool: list JIRA field definitions.
     #[tool(
         description = "List JIRA field definitions, optionally filtered by name substring. \
-                       Returns YAML. Mirrors `omni-dev atlassian jira field list`."
+                       Returns YAML. Mirrors `omni-dev atlassian jira field list`. \
+                       The `schema_type` is `\"richtext\"` for ADF-required custom fields \
+                       (e.g. Acceptance Criteria); `schema_custom`, when present, holds \
+                       the raw plugin URI (e.g. \
+                       `com.atlassian.jira.plugin.system.customfieldtypes:textarea`)."
     )]
     pub async fn jira_field_list(
         &self,
@@ -2293,7 +2297,16 @@ mod tests {
             .and(path("/rest/api/3/field"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
                 {"id": "summary", "name": "Summary", "custom": false},
-                {"id": "customfield_1", "name": "Story Points", "custom": true}
+                {"id": "customfield_1", "name": "Story Points", "custom": true},
+                {
+                    "id": "customfield_19300",
+                    "name": "Acceptance Criteria",
+                    "custom": true,
+                    "schema": {
+                        "type": "string",
+                        "custom": "com.atlassian.jira.plugin.system.customfieldtypes:textarea"
+                    }
+                }
             ])))
             .mount(&server)
             .await;
@@ -2302,6 +2315,10 @@ mod tests {
         let yaml = field_list_yaml(&client, &cache, None).await.unwrap();
         assert!(yaml.contains("Summary"));
         assert!(yaml.contains("Story Points"));
+        assert!(yaml.contains("Acceptance Criteria"));
+        assert!(yaml.contains("schema_type: richtext"));
+        assert!(yaml
+            .contains("schema_custom: com.atlassian.jira.plugin.system.customfieldtypes:textarea"));
     }
 
     #[tokio::test]

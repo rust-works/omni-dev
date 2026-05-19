@@ -189,11 +189,22 @@ mod tests {
     use super::*;
 
     fn sample_field(id: &str, name: &str, custom: bool, schema_type: Option<&str>) -> JiraField {
+        sample_field_full(id, name, custom, schema_type, None)
+    }
+
+    fn sample_field_full(
+        id: &str,
+        name: &str,
+        custom: bool,
+        schema_type: Option<&str>,
+        schema_custom: Option<&str>,
+    ) -> JiraField {
         JiraField {
             id: id.to_string(),
             name: name.to_string(),
             custom,
             schema_type: schema_type.map(String::from),
+            schema_custom: schema_custom.map(String::from),
         }
     }
 
@@ -255,6 +266,19 @@ mod tests {
     #[test]
     fn print_fields_no_schema() {
         let fields = [sample_field("labels", "Labels", false, None)];
+        let refs: Vec<&JiraField> = fields.iter().collect();
+        print_fields(&refs);
+    }
+
+    #[test]
+    fn print_fields_richtext() {
+        let fields = [sample_field_full(
+            "customfield_19300",
+            "Acceptance Criteria",
+            true,
+            Some("richtext"),
+            Some("com.atlassian.jira.plugin.system.customfieldtypes:textarea"),
+        )];
         let refs: Vec<&JiraField> = fields.iter().collect();
         print_fields(&refs);
     }
