@@ -50,7 +50,7 @@ sha2 = "0.11"
 cpal = "0.17"
 rubato = "2.0"
 hound = "3.5"
-signal-hook = "0.3"
+signal-hook = "0.4"
 ringbuf = "0.5"
 ulid = { version = "1", features = ["serde"] }
 candle-core = { version = "0.10", default-features = false }
