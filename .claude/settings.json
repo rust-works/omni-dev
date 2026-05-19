@@ -8,7 +8,9 @@
       "Bash(target/debug/deps/omni_dev:*)",
       "Bash(target/release/deps/omni_dev-*:*)",
       "Bash(target/release/deps/omni_dev:*)",
-      "Bash(git diff *)"
+      "Bash(git diff *)",
+      "Bash(ls -la /Users/jky/.claude/plans/ 2>/dev/null | head -5)",
+      "Read(//Users/jky/.claude/plans/**)"
     ]
   },
   "hooks": {

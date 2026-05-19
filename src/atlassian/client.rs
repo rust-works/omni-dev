@@ -29,6 +29,50 @@ const MAX_RETRIES: u32 = 3;
 /// Default retry delay in seconds when no `Retry-After` header is present.
 const DEFAULT_RETRY_DELAY_SECS: u64 = 2;
 
+/// JIRA's standard error envelope returned by REST API v3 on validation
+/// failures: `{ "errorMessages": [...], "errors": { "<field_id>": "<msg>" } }`.
+#[derive(serde::Deserialize)]
+struct JiraErrorEnvelope {
+    #[serde(default, rename = "errorMessages")]
+    _error_messages: Vec<String>,
+    #[serde(default)]
+    errors: std::collections::BTreeMap<String, String>,
+}
+
+/// Builds an `anyhow::Error` for a non-success JIRA write response.
+///
+/// On HTTP 400, parses `body` as JIRA's standard
+/// `{ "errorMessages": [...], "errors": {...} }` envelope and looks for
+/// per-field errors whose message indicates the field requires an ADF
+/// document (substring `"atlassian document"`, case-insensitive). When at
+/// least one such field is found, returns
+/// [`AtlassianError::JiraAdfFieldRequired`] naming the offending field
+/// IDs. All other status codes (and 400 responses with no detected
+/// ADF-required message) fall back to [`AtlassianError::ApiRequestFailed`].
+fn jira_write_error(status: u16, body: String) -> anyhow::Error {
+    if status == 400 {
+        if let Ok(parsed) = serde_json::from_str::<JiraErrorEnvelope>(&body) {
+            let needle = "atlassian document";
+            let matching: Vec<(&String, &String)> = parsed
+                .errors
+                .iter()
+                .filter(|(_, msg)| msg.to_ascii_lowercase().contains(needle))
+                .collect();
+            if !matching.is_empty() {
+                let fields: Vec<String> = matching.iter().map(|(k, _)| (*k).clone()).collect();
+                let original_message = matching[0].1.clone();
+                return AtlassianError::JiraAdfFieldRequired {
+                    fields,
+                    original_message,
+                    body,
+                }
+                .into();
+            }
+        }
+    }
+    AtlassianError::ApiRequestFailed { status, body }.into()
+}
+
 /// Shared HTTP client for Atlassian Cloud REST APIs.
 ///
 /// Backs every JIRA, Confluence, and Agile helper exposed by this crate.
@@ -6933,7 +6977,7 @@ impl AtlassianClient {
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+            return Err(jira_write_error(status, body));
         }
 
         Ok(())
