@@ -61,7 +61,7 @@ tokenizers = { version = "0.22", default-features = false }
 byteorder = "1"
 tract-onnx = "0.22"
 rustfft = "6"
-ureq = "2"
+ureq = "3"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["signal"] }
