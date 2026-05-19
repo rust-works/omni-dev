@@ -163,10 +163,7 @@ pub struct EditMetaSchema {
 impl EditMetaField {
     /// Returns `true` when the field is a rich-text (ADF) custom field.
     pub fn is_adf_rich_text(&self) -> bool {
-        matches!(
-            self.schema.custom.as_deref(),
-            Some("com.atlassian.jira.plugin.system.customfieldtypes:textarea")
-        )
+        self.schema.custom.as_deref() == Some(TEXTAREA_CUSTOM_TYPE)
     }
 }
 
@@ -388,6 +385,11 @@ pub struct JiraProjectList {
     pub total: u32,
 }
 
+/// Plugin type URI for the rich-text "textarea" custom field. Used to
+/// distinguish ADF-required custom fields from scalar ones.
+pub(crate) const TEXTAREA_CUSTOM_TYPE: &str =
+    "com.atlassian.jira.plugin.system.customfieldtypes:textarea";
+
 /// A JIRA field definition returned by `GET /rest/api/3/field`.
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraField {
@@ -397,8 +399,27 @@ pub struct JiraField {
     pub name: String,
     /// Whether this is a custom field.
     pub custom: bool,
-    /// Schema type (e.g., "string", "array", "option").
+    /// Schema type. Mostly the raw `schema.type` from the API (`"string"`,
+    /// `"array"`, `"option"`, ...). For rich-text custom fields this is
+    /// `"richtext"`, mapped from `schema.custom` so callers can detect
+    /// ADF-required fields without inspecting the plugin URI.
     pub schema_type: Option<String>,
+    /// Raw `schema.custom` plugin URI for custom fields, e.g.
+    /// `com.atlassian.jira.plugin.system.customfieldtypes:textarea`. Absent
+    /// for system fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_custom: Option<String>,
+}
+
+/// Maps a raw `(schema.type, schema.custom)` pair from the JIRA field API into
+/// the value omni-dev surfaces as `schema_type`. Rich-text custom fields are
+/// reported as `"richtext"` so callers can detect ADF-required fields without
+/// inspecting the plugin URI; all other fields pass through unchanged.
+fn map_schema_type(raw_type: Option<String>, raw_custom: Option<&str>) -> Option<String> {
+    if raw_custom == Some(TEXTAREA_CUSTOM_TYPE) {
+        return Some("richtext".to_string());
+    }
+    raw_type
 }
 
 /// An option value for a single-select / multi-select JIRA custom field,
@@ -1345,6 +1366,7 @@ struct JiraFieldEntry {
 struct JiraFieldSchema {
     #[serde(rename = "type")]
     schema_type: Option<String>,
+    custom: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -5194,7 +5216,16 @@ mod tests {
                 serde_json::json!([
                     {"id": "summary", "name": "Summary", "custom": false, "schema": {"type": "string"}},
                     {"id": "customfield_10001", "name": "Story Points", "custom": true, "schema": {"type": "number"}},
-                    {"id": "labels", "name": "Labels", "custom": false}
+                    {"id": "labels", "name": "Labels", "custom": false},
+                    {
+                        "id": "customfield_19300",
+                        "name": "Acceptance Criteria",
+                        "custom": true,
+                        "schema": {
+                            "type": "string",
+                            "custom": "com.atlassian.jira.plugin.system.customfieldtypes:textarea"
+                        }
+                    }
                 ]),
             ))
             .expect(1)
@@ -5204,14 +5235,25 @@ mod tests {
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
         let fields = client.get_fields().await.unwrap();
 
-        assert_eq!(fields.len(), 3);
+        assert_eq!(fields.len(), 4);
         assert_eq!(fields[0].id, "summary");
         assert_eq!(fields[0].name, "Summary");
         assert!(!fields[0].custom);
         assert_eq!(fields[0].schema_type.as_deref(), Some("string"));
+        assert!(fields[0].schema_custom.is_none());
         assert_eq!(fields[1].id, "customfield_10001");
         assert!(fields[1].custom);
+        assert_eq!(fields[1].schema_type.as_deref(), Some("number"));
+        assert!(fields[1].schema_custom.is_none());
         assert!(fields[2].schema_type.is_none());
+        assert!(fields[2].schema_custom.is_none());
+        assert_eq!(fields[3].id, "customfield_19300");
+        assert!(fields[3].custom);
+        assert_eq!(fields[3].schema_type.as_deref(), Some("richtext"));
+        assert_eq!(
+            fields[3].schema_custom.as_deref(),
+            Some("com.atlassian.jira.plugin.system.customfieldtypes:textarea")
+        );
     }
 
     #[tokio::test]
@@ -8654,11 +8696,18 @@ impl AtlassianClient {
 
         Ok(entries
             .into_iter()
-            .map(|f| JiraField {
-                id: f.id,
-                name: f.name,
-                custom: f.custom,
-                schema_type: f.schema.and_then(|s| s.schema_type),
+            .map(|f| {
+                let (raw_type, raw_custom) = match f.schema {
+                    Some(s) => (s.schema_type, s.custom),
+                    None => (None, None),
+                };
+                JiraField {
+                    id: f.id,
+                    name: f.name,
+                    custom: f.custom,
+                    schema_type: map_schema_type(raw_type, raw_custom.as_deref()),
+                    schema_custom: raw_custom,
+                }
             })
             .collect())
     }
