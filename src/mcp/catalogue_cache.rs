@@ -13,10 +13,16 @@
 //! unfiltered result** and applying limits/filters at the caller; this keeps
 //! the cache hit rate independent of caller arguments.
 //!
+//! Per-issue editmeta entries are cached with a shorter TTL than the
+//! catalogue slots because edit screens can change with workflow/project
+//! configuration; the cache is keyed by `(instance_url, issue_key)` and
+//! holds the write lock during fetch for single-flight semantics.
+//!
 //! [`get_fields`]: AtlassianClient::get_fields
 //! [`get_projects`]: AtlassianClient::get_projects
 //! [`get_boards`]: AtlassianClient::get_boards
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,11 +31,18 @@ use anyhow::Result;
 use tokio::sync::RwLock;
 
 use crate::atlassian::client::{
-    AgileBoardList, AtlassianClient, JiraField, JiraLinkType, JiraProjectList,
+    AgileBoardList, AtlassianClient, EditMeta, JiraField, JiraLinkType, JiraProjectList,
 };
 
 /// Default cache lifetime. Catalogue data changes rarely (admin-only).
 pub const DEFAULT_TTL: Duration = Duration::from_secs(3600);
+
+/// Cache lifetime for per-issue editmeta.
+///
+/// Shorter than [`DEFAULT_TTL`] because edit screens can change with
+/// workflow/screen configuration, but long enough to dedupe bursts of
+/// writes against the same issue.
+pub const EDITMETA_TTL: Duration = Duration::from_secs(60);
 
 /// One cached catalogue result, tagged with the JIRA instance it came from.
 struct CacheEntry<T> {
@@ -38,7 +51,8 @@ struct CacheEntry<T> {
     value: Arc<T>,
 }
 
-/// Shared cache for the four near-static JIRA catalogues.
+/// Shared cache for the four near-static JIRA catalogues plus per-issue
+/// editmeta.
 ///
 /// Cloning is cheap (wrap in `Arc<CatalogueCache>` at the owner). Each catalogue
 /// has its own `RwLock`, so contention on one does not block the others.
@@ -47,19 +61,32 @@ pub struct CatalogueCache {
     fields: RwLock<Option<CacheEntry<Vec<JiraField>>>>,
     projects: RwLock<Option<CacheEntry<JiraProjectList>>>,
     boards: RwLock<Option<CacheEntry<AgileBoardList>>>,
+    editmeta: RwLock<HashMap<String, CacheEntry<EditMeta>>>,
     ttl: Duration,
+    editmeta_ttl: Duration,
 }
 
 impl CatalogueCache {
-    /// Constructs a cache with the given entry lifetime.
+    /// Constructs a cache with the given entry lifetime for catalogue slots.
+    ///
+    /// Per-issue editmeta entries use the separate [`EDITMETA_TTL`] constant.
     #[must_use]
     pub fn new(ttl: Duration) -> Self {
+        Self::with_ttls(ttl, EDITMETA_TTL)
+    }
+
+    /// Constructs a cache with explicit catalogue and editmeta lifetimes.
+    /// Exposed primarily so tests can shorten the editmeta TTL.
+    #[must_use]
+    pub fn with_ttls(ttl: Duration, editmeta_ttl: Duration) -> Self {
         Self {
             link_types: RwLock::new(None),
             fields: RwLock::new(None),
             projects: RwLock::new(None),
             boards: RwLock::new(None),
+            editmeta: RwLock::new(HashMap::new()),
             ttl,
+            editmeta_ttl,
         }
     }
 
@@ -103,6 +130,45 @@ impl CatalogueCache {
             client.get_boards(None, None, 0).await
         })
         .await
+    }
+
+    /// Returns the cached editmeta for an issue, fetching it on miss/expiry.
+    ///
+    /// Keyed by `(instance_url, issue_key)`. The write lock on the whole map
+    /// is held during fetch — misses are infrequent and the lock contention
+    /// is bounded to a single in-flight fetch per cache.
+    pub async fn editmeta(&self, client: &AtlassianClient, key: &str) -> Result<Arc<EditMeta>> {
+        let instance_url = client.instance_url();
+
+        {
+            let guard = self.editmeta.read().await;
+            if let Some(entry) = guard.get(key) {
+                if entry.instance_url == instance_url
+                    && entry.fetched_at.elapsed() < self.editmeta_ttl
+                {
+                    return Ok(Arc::clone(&entry.value));
+                }
+            }
+        }
+
+        let mut guard = self.editmeta.write().await;
+        if let Some(entry) = guard.get(key) {
+            if entry.instance_url == instance_url && entry.fetched_at.elapsed() < self.editmeta_ttl
+            {
+                return Ok(Arc::clone(&entry.value));
+            }
+        }
+
+        let value = Arc::new(client.get_editmeta(key).await?);
+        guard.insert(
+            key.to_string(),
+            CacheEntry {
+                instance_url: instance_url.to_string(),
+                fetched_at: Instant::now(),
+                value: Arc::clone(&value),
+            },
+        );
+        Ok(value)
     }
 }
 
@@ -413,5 +479,175 @@ mod tests {
 
         assert!(cache.link_types(&client).await.is_err());
         assert!(cache.link_types(&client).await.is_err());
+    }
+
+    // ── editmeta cache ────────────────────────────────────────────────
+
+    fn editmeta_body() -> serde_json::Value {
+        serde_json::json!({
+            "fields": {
+                "customfield_19300": {
+                    "name": "Acceptance Criteria",
+                    "schema": {
+                        "type": "string",
+                        "custom": "com.atlassian.jira.plugin.system.customfieldtypes:textarea"
+                    }
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn editmeta_cached_after_first_call() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1/editmeta"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(editmeta_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let cache = CatalogueCache::new(Duration::from_secs(60));
+
+        let first = cache.editmeta(&client, "PROJ-1").await.unwrap();
+        let second = cache.editmeta(&client, "PROJ-1").await.unwrap();
+        assert!(first.fields.contains_key("customfield_19300"));
+        assert!(second.fields.contains_key("customfield_19300"));
+    }
+
+    #[tokio::test]
+    async fn editmeta_separate_keys_fetch_independently() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1/editmeta"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(editmeta_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-2/editmeta"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(editmeta_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let cache = CatalogueCache::new(Duration::from_secs(60));
+
+        let _ = cache.editmeta(&client, "PROJ-1").await.unwrap();
+        let _ = cache.editmeta(&client, "PROJ-2").await.unwrap();
+        let _ = cache.editmeta(&client, "PROJ-1").await.unwrap();
+        let _ = cache.editmeta(&client, "PROJ-2").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn editmeta_refetches_after_ttl_expiry() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1/editmeta"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(editmeta_body()))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let cache = CatalogueCache::with_ttls(Duration::from_secs(60), Duration::from_millis(20));
+
+        let _ = cache.editmeta(&client, "PROJ-1").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let _ = cache.editmeta(&client, "PROJ-1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn editmeta_refetches_when_instance_url_changes() {
+        let server_a = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1/editmeta"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(editmeta_body()))
+            .expect(1)
+            .mount(&server_a)
+            .await;
+        let server_b = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1/editmeta"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(editmeta_body()))
+            .expect(1)
+            .mount(&server_b)
+            .await;
+
+        let cache = CatalogueCache::new(Duration::from_secs(60));
+        let client_a = mock_client(&server_a.uri());
+        let client_b = mock_client(&server_b.uri());
+
+        let _ = cache.editmeta(&client_a, "PROJ-1").await.unwrap();
+        let _ = cache.editmeta(&client_b, "PROJ-1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn editmeta_does_not_populate_on_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1/editmeta"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let cache = CatalogueCache::new(Duration::from_secs(60));
+
+        assert!(cache.editmeta(&client, "PROJ-1").await.is_err());
+        assert!(cache.editmeta(&client, "PROJ-1").await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn editmeta_concurrent_refresh_shares_a_single_fetch() {
+        // Mirrors `concurrent_refresh_shares_a_single_fetch` for the
+        // editmeta slot: pre-populate with a stale entry, gate the slot
+        // under an external write lock so concurrent readers park, then
+        // drop the gate and verify only ONE network fetch happens — i.e.
+        // the second task takes the write-lock double-check path and
+        // returns the populated entry.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1/editmeta"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(editmeta_body())
+                    .set_delay(Duration::from_millis(100)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cache = Arc::new(CatalogueCache::new(Duration::from_secs(60)));
+        let url = server.uri();
+
+        let mut gate = cache.editmeta.write().await;
+        gate.insert(
+            "PROJ-1".to_string(),
+            CacheEntry {
+                instance_url: url.clone(),
+                fetched_at: Instant::now()
+                    .checked_sub(Duration::from_secs(3600 * 24))
+                    .unwrap(),
+                value: Arc::new(EditMeta::default()),
+            },
+        );
+
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let cache = Arc::clone(&cache);
+            let url = url.clone();
+            handles.push(tokio::spawn(async move {
+                let client = mock_client(&url);
+                cache.editmeta(&client, "PROJ-1").await.unwrap()
+            }));
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(gate);
+
+        for h in handles {
+            let v = h.await.unwrap();
+            assert!(v.fields.contains_key("customfield_19300"));
+        }
     }
 }

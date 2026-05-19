@@ -20,10 +20,11 @@ use crate::atlassian::client::{
     AtlassianClient, JiraTransition, JiraVisibility, JiraVisibilityType,
 };
 use crate::atlassian::convert::markdown_to_adf;
-use crate::atlassian::custom_fields::apply_user_field_overrides;
+use crate::atlassian::custom_fields::{apply_user_field_overrides, convert_textarea_string_values};
 use crate::atlassian::document::{issue_to_jfm_document, JfmDocument};
 use crate::cli::atlassian::helpers::create_client;
 
+use super::catalogue_cache::CatalogueCache;
 use super::error::tool_error;
 use super::output_file::write_to_file_yaml;
 use super::server::OmniDevServer;
@@ -113,13 +114,17 @@ pub struct JiraWriteParams {
     /// `"-1"` is JIRA automatic).
     #[serde(default)]
     pub reporter: Option<String>,
-    /// Additional `fields` keys merged into the issue update payload as-is.
+    /// Additional `fields` keys merged into the issue update payload.
     /// Keys must already be canonical JIRA field ids (e.g. `priority`,
     /// `labels`, `customfield_10010`). Values must already be in the API's
     /// JSON shape (e.g. `{"name": "High"}` for priority,
-    /// `["a", "b"]` for labels). Setting `assignee` or `reporter` here
-    /// collides with the typed parameters and is rejected — pass the typed
-    /// parameter instead.
+    /// `["a", "b"]` for labels) — with one ergonomic exception: a string
+    /// value targeting a rich-text textarea custom field (e.g.
+    /// `{"customfield_19300": "- bullet\n- bullet"}`) is auto-converted
+    /// from JFM markdown to ADF, and the empty string `""` clears such a
+    /// field. Pass a JSON object instead of a string to bypass conversion
+    /// (raw ADF). Setting `assignee` or `reporter` here collides with the
+    /// typed parameters and is rejected — pass the typed parameter instead.
     #[serde(default)]
     pub fields: Option<std::collections::BTreeMap<String, serde_json::Value>>,
 }
@@ -339,6 +344,7 @@ async fn run_jira_create(
 #[allow(clippy::too_many_arguments)]
 async fn run_jira_write(
     client: &AtlassianClient,
+    cache: &CatalogueCache,
     key: &str,
     content: Option<&str>,
     format: ReadFormat,
@@ -370,6 +376,26 @@ async fn run_jira_write(
     if let Some(extras) = extra_fields {
         for (k, v) in extras {
             merged.insert(k.clone(), v.clone());
+        }
+    }
+
+    // Issue #866: when callers supply string values for rich-text custom
+    // fields, treat them as JFM and convert to ADF before sending. The
+    // editmeta lookup is skipped entirely when no string values are present,
+    // so the existing object-payload path takes zero extra HTTP calls.
+    if merged
+        .values()
+        .any(|v| matches!(v, serde_json::Value::String(_)))
+    {
+        match cache.editmeta(client, key).await {
+            Ok(editmeta) => {
+                convert_textarea_string_values(&mut merged, &editmeta)?;
+            }
+            Err(err) => {
+                tracing::debug!(
+                    "editmeta lookup for {key} failed; passing `fields` through unchanged: {err:#}"
+                );
+            }
         }
     }
 
@@ -702,9 +728,12 @@ impl OmniDevServer {
                        JIRA automatic assignment); call `jira_user_search` first if you only \
                        have a name or email. `fields` is an escape hatch — a map of canonical \
                        JIRA field id to its API JSON value (e.g. `{\"priority\": {\"name\": \
-                       \"High\"}}`) — for fields without a typed parameter. At least one of \
-                       `content`, `parent`, `assignee`, `reporter`, or `fields` must be \
-                       supplied."
+                       \"High\"}}`) — for fields without a typed parameter. String values \
+                       targeting rich-text custom fields (e.g. Acceptance Criteria) are \
+                       auto-converted from JFM to ADF; pass the empty string `\"\"` to clear \
+                       such a field. Pass a JSON object value to bypass conversion (raw ADF). \
+                       At least one of `content`, `parent`, `assignee`, `reporter`, or \
+                       `fields` must be supplied."
     )]
     pub async fn jira_write(
         &self,
@@ -714,6 +743,7 @@ impl OmniDevServer {
         let (client, _instance_url) = create_client().map_err(tool_error)?;
         let text = run_jira_write(
             &client,
+            &self.catalogue_cache,
             &params.key,
             params.content.as_deref(),
             format,
@@ -902,6 +932,12 @@ mod tests {
 
     fn mock_client(base_url: &str) -> AtlassianClient {
         AtlassianClient::new(base_url, "user@test.com", "token").unwrap()
+    }
+
+    /// Fresh cache per test — keeps editmeta call counts deterministic and
+    /// avoids cross-test bleed.
+    fn mock_cache() -> CatalogueCache {
+        CatalogueCache::new(std::time::Duration::from_secs(60))
     }
 
     // ── ReadFormat::parse ──────────────────────────────────────────────────
@@ -1296,6 +1332,7 @@ mod tests {
         let client = mock_client(&server.uri());
         run_jira_write(
             &client,
+            &mock_cache(),
             "PROJ-1",
             Some("New body\n"),
             ReadFormat::Jfm,
@@ -1321,6 +1358,7 @@ mod tests {
         let content = "---\ntype: jira\ninstance: https://org.atlassian.net\nkey: PROJ-1\nsummary: T\n---\n\nBody\n";
         run_jira_write(
             &client,
+            &mock_cache(),
             "PROJ-1",
             Some(content),
             ReadFormat::Jfm,
@@ -1345,6 +1383,7 @@ mod tests {
         let client = mock_client(&server.uri());
         run_jira_write(
             &client,
+            &mock_cache(),
             "PROJ-1",
             Some(r#"{"version":1,"type":"doc","content":[]}"#),
             ReadFormat::Adf,
@@ -1362,6 +1401,7 @@ mod tests {
         let client = mock_client("http://127.0.0.1:1");
         let err = run_jira_write(
             &client,
+            &mock_cache(),
             "PROJ-1",
             Some("not json"),
             ReadFormat::Adf,
@@ -1381,6 +1421,7 @@ mod tests {
         let client = mock_client("http://127.0.0.1:1");
         let err = run_jira_write(
             &client,
+            &mock_cache(),
             "PROJ-1",
             Some(BAD_ADF_JFM),
             ReadFormat::Jfm,
@@ -1407,6 +1448,7 @@ mod tests {
         let client = mock_client(&server.uri());
         let err = run_jira_write(
             &client,
+            &mock_cache(),
             "PROJ-1",
             Some("Body"),
             ReadFormat::Jfm,
@@ -1444,6 +1486,7 @@ mod tests {
 
         let err = run_jira_write(
             &client,
+            &mock_cache(),
             "PROJ-1",
             None,
             ReadFormat::Jfm,
@@ -1484,6 +1527,7 @@ mod tests {
         let client = mock_client(&server.uri());
         let err = run_jira_write(
             &client,
+            &mock_cache(),
             "PROJ-1",
             Some("Body"),
             ReadFormat::Jfm,
@@ -1520,6 +1564,7 @@ mod tests {
         let client = mock_client(&server.uri());
         run_jira_write(
             &client,
+            &mock_cache(),
             "PROJ-1",
             Some(""),
             ReadFormat::Jfm,
@@ -1547,6 +1592,7 @@ mod tests {
         let client = mock_client(&server.uri());
         run_jira_write(
             &client,
+            &mock_cache(),
             "PROJ-1",
             None,
             ReadFormat::Jfm,
@@ -1574,6 +1620,7 @@ mod tests {
         let client = mock_client(&server.uri());
         run_jira_write(
             &client,
+            &mock_cache(),
             "PROJ-1",
             None,
             ReadFormat::Jfm,
@@ -1601,6 +1648,7 @@ mod tests {
         let client = mock_client(&server.uri());
         run_jira_write(
             &client,
+            &mock_cache(),
             "PROJ-1",
             None,
             ReadFormat::Jfm,
@@ -1634,6 +1682,7 @@ mod tests {
         extra.insert("labels".to_string(), serde_json::json!(["a", "b"]));
         run_jira_write(
             &client,
+            &mock_cache(),
             "PROJ-1",
             None,
             ReadFormat::Jfm,
@@ -1656,6 +1705,7 @@ mod tests {
         );
         let err = run_jira_write(
             &client,
+            &mock_cache(),
             "PROJ-1",
             None,
             ReadFormat::Jfm,
@@ -1679,6 +1729,7 @@ mod tests {
         );
         let err = run_jira_write(
             &client,
+            &mock_cache(),
             "PROJ-1",
             None,
             ReadFormat::Jfm,
@@ -1697,6 +1748,7 @@ mod tests {
         let client = mock_client("http://127.0.0.1:1");
         let err = run_jira_write(
             &client,
+            &mock_cache(),
             "PROJ-1",
             None,
             ReadFormat::Jfm,
@@ -1725,6 +1777,7 @@ mod tests {
         let client = mock_client(&server.uri());
         run_jira_write(
             &client,
+            &mock_cache(),
             "PROJ-1",
             None,
             ReadFormat::Jfm,
@@ -1762,6 +1815,7 @@ mod tests {
         let client = mock_client(&server.uri());
         run_jira_write(
             &client,
+            &mock_cache(),
             "PROJ-1",
             Some("Body"),
             ReadFormat::Jfm,
@@ -1769,6 +1823,316 @@ mod tests {
             None,
             None,
             None,
+        )
+        .await
+        .unwrap();
+    }
+
+    // ── run_jira_write: JFM→ADF for rich-text fields (issue #866) ─────────
+
+    fn editmeta_textarea_body() -> serde_json::Value {
+        serde_json::json!({
+            "fields": {
+                "customfield_19300": {
+                    "name": "Acceptance Criteria",
+                    "schema": {
+                        "type": "string",
+                        "custom": "com.atlassian.jira.plugin.system.customfieldtypes:textarea"
+                    }
+                },
+                "customfield_10010": {
+                    "name": "Plain String",
+                    "schema": {"type": "string"}
+                }
+            }
+        })
+    }
+
+    async fn mount_editmeta_textarea(server: &MockServer, key: &str) {
+        Mock::given(method("GET"))
+            .and(path(format!("/rest/api/3/issue/{key}/editmeta")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(editmeta_textarea_body()))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn run_jira_write_textarea_string_converts_to_adf() {
+        let server = MockServer::start().await;
+        mount_editmeta_textarea(&server, "PROJ-1").await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .and(body_json(serde_json::json!({
+                "fields": {
+                    "customfield_19300": {
+                        "version": 1,
+                        "type": "doc",
+                        "content": [{
+                            "type": "bulletList",
+                            "content": [
+                                {"type": "listItem", "content": [{
+                                    "type": "paragraph",
+                                    "content": [{"type": "text", "text": "one"}]
+                                }]},
+                                {"type": "listItem", "content": [{
+                                    "type": "paragraph",
+                                    "content": [{"type": "text", "text": "two"}]
+                                }]}
+                            ]
+                        }]
+                    }
+                }
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let mut extras = std::collections::BTreeMap::new();
+        extras.insert(
+            "customfield_19300".to_string(),
+            serde_json::Value::String("- one\n- two".to_string()),
+        );
+        run_jira_write(
+            &client,
+            &mock_cache(),
+            "PROJ-1",
+            None,
+            ReadFormat::Jfm,
+            None,
+            None,
+            None,
+            Some(&extras),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_jira_write_textarea_object_passes_through() {
+        // Object value should not trigger editmeta lookup at all — the
+        // prefilter only fires when at least one value is a string. We
+        // intentionally do NOT mock editmeta; if the code regresses and
+        // calls it, wiremock will surface an unmatched-request panic.
+        let raw_adf = serde_json::json!({
+            "version": 1,
+            "type": "doc",
+            "content": [{"type": "paragraph", "content": [{"type": "text", "text": "hi"}]}]
+        });
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .and(body_json(serde_json::json!({
+                "fields": {"customfield_19300": raw_adf.clone()}
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let mut extras = std::collections::BTreeMap::new();
+        extras.insert("customfield_19300".to_string(), raw_adf);
+        run_jira_write(
+            &client,
+            &mock_cache(),
+            "PROJ-1",
+            None,
+            ReadFormat::Jfm,
+            None,
+            None,
+            None,
+            Some(&extras),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_jira_write_textarea_empty_string_clears_field() {
+        let server = MockServer::start().await;
+        mount_editmeta_textarea(&server, "PROJ-1").await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .and(body_json(serde_json::json!({
+                "fields": {"customfield_19300": null}
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let mut extras = std::collections::BTreeMap::new();
+        extras.insert(
+            "customfield_19300".to_string(),
+            serde_json::Value::String(String::new()),
+        );
+        run_jira_write(
+            &client,
+            &mock_cache(),
+            "PROJ-1",
+            None,
+            ReadFormat::Jfm,
+            None,
+            None,
+            None,
+            Some(&extras),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_jira_write_non_textarea_string_passes_through() {
+        // String value targeting a non-textarea field: editmeta is consulted
+        // (lazy prefilter sees a string), confirms it's not rich-text, and
+        // the original payload is sent as-is.
+        let server = MockServer::start().await;
+        mount_editmeta_textarea(&server, "PROJ-1").await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .and(body_json(serde_json::json!({
+                "fields": {"customfield_10010": "plain text"}
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let mut extras = std::collections::BTreeMap::new();
+        extras.insert(
+            "customfield_10010".to_string(),
+            serde_json::Value::String("plain text".to_string()),
+        );
+        run_jira_write(
+            &client,
+            &mock_cache(),
+            "PROJ-1",
+            None,
+            ReadFormat::Jfm,
+            None,
+            None,
+            None,
+            Some(&extras),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_jira_write_editmeta_fetch_failure_passes_through() {
+        // editmeta returns 500 — code must fall back to passthrough and let
+        // the API surface its own error from the PUT. The PUT mock here
+        // succeeds (204), proving that the original string body reached the
+        // wire even though editmeta was unavailable.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1/editmeta"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("editmeta down"))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .and(body_json(serde_json::json!({
+                "fields": {"customfield_19300": "- one"}
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let mut extras = std::collections::BTreeMap::new();
+        extras.insert(
+            "customfield_19300".to_string(),
+            serde_json::Value::String("- one".to_string()),
+        );
+        run_jira_write(
+            &client,
+            &mock_cache(),
+            "PROJ-1",
+            None,
+            ReadFormat::Jfm,
+            None,
+            None,
+            None,
+            Some(&extras),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_jira_write_textarea_invalid_adf_nesting_errors() {
+        // Invalid ADF nesting (panel→expand) for a textarea field must
+        // short-circuit before the PUT. No PUT mock is registered.
+        let server = MockServer::start().await;
+        mount_editmeta_textarea(&server, "PROJ-1").await;
+
+        let client = mock_client(&server.uri());
+        let mut extras = std::collections::BTreeMap::new();
+        extras.insert(
+            "customfield_19300".to_string(),
+            serde_json::Value::String(BAD_ADF_JFM.to_string()),
+        );
+        let err = run_jira_write(
+            &client,
+            &mock_cache(),
+            "PROJ-1",
+            None,
+            ReadFormat::Jfm,
+            None,
+            None,
+            None,
+            Some(&extras),
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Acceptance Criteria"), "got: {msg}");
+        assert!(msg.contains("ADF nesting validation"), "got: {msg}");
+        assert!(
+            msg.contains("`expand` cannot be a child of `panel`"),
+            "got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_jira_write_unknown_field_id_passes_through() {
+        // Field id missing from editmeta — pass the value through unchanged,
+        // let the API tell the caller. Editmeta returns a non-matching
+        // schema; PUT receives the raw string.
+        let server = MockServer::start().await;
+        mount_editmeta_textarea(&server, "PROJ-1").await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .and(body_json(serde_json::json!({
+                "fields": {"customfield_99999": "some text"}
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let mut extras = std::collections::BTreeMap::new();
+        extras.insert(
+            "customfield_99999".to_string(),
+            serde_json::Value::String("some text".to_string()),
+        );
+        run_jira_write(
+            &client,
+            &mock_cache(),
+            "PROJ-1",
+            None,
+            ReadFormat::Jfm,
+            None,
+            None,
+            None,
+            Some(&extras),
         )
         .await
         .unwrap();
