@@ -50,6 +50,25 @@ pub enum AtlassianError {
     /// The converted ADF document violates Confluence's nesting constraints.
     #[error("{0}")]
     InvalidAdfNesting(#[from] AdfValidationError),
+
+    /// A JIRA write returned HTTP 400 because one or more fields require
+    /// rich-text content in ADF format (e.g. `customfield_19300`) but the
+    /// caller submitted a plain string. The multi-line `Display` matches the
+    /// format requested in issue #867: a header line naming the offending
+    /// field(s), a `To fix:` line pointing at JFM / raw-ADF inputs, and an
+    /// `Original API error:` line preserving JIRA's verbatim wording.
+    #[error("{}", format_jira_adf_field_required(fields, original_message))]
+    JiraAdfFieldRequired {
+        /// Stable JIRA field IDs (e.g. `customfield_19300`) whose error
+        /// message indicated they require an ADF document.
+        fields: Vec<String>,
+        /// Verbatim message from JIRA's `errors.<field>` entry — preserved
+        /// so the `Original API error:` line shows what JIRA actually said
+        /// (and we degrade gracefully if Atlassian changes the wording).
+        original_message: String,
+        /// Raw response body (kept for callers that want to log it).
+        body: String,
+    },
 }
 
 fn format_diagnosis(diagnosis: &AdfSchemaViolation, hint: Option<&str>) -> String {
@@ -103,6 +122,30 @@ fn format_diagnosis(diagnosis: &AdfSchemaViolation, hint: Option<&str>) -> Strin
         out.push_str(hint);
     }
     out
+}
+
+fn format_jira_adf_field_required(fields: &[String], original_message: &str) -> String {
+    let header = match fields {
+        [] => "JIRA fields require rich-text content in ADF format.".to_string(),
+        [one] => format!("Field `{one}` requires rich-text content in ADF format."),
+        many => {
+            let joined = many
+                .iter()
+                .map(|f| format!("`{f}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("Fields {joined} require rich-text content in ADF format.")
+        }
+    };
+    let hint = "\n\nTo fix: pass the value as a JFM markdown string \
+                (it will be auto-converted to ADF), or pass a raw ADF \
+                document object. See `omni-dev://specs/jfm` for JFM syntax.";
+    let original = if original_message.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nOriginal API error: \"{original_message}\"")
+    };
+    format!("{header}{hint}{original}")
 }
 
 #[cfg(test)]
@@ -291,5 +334,77 @@ mod tests {
         assert!(msg.contains("`link` mark"), "got: {msg}");
         assert!(msg.contains("`href`"), "got: {msg}");
         assert!(msg.contains("not a valid URL"), "got: {msg}");
+    }
+
+    #[test]
+    fn jira_adf_field_required_display_single_field() {
+        let err = AtlassianError::JiraAdfFieldRequired {
+            fields: vec!["customfield_19300".to_string()],
+            original_message:
+                "Operation value must be an Atlassian Document (see the Atlassian Document Format)"
+                    .to_string(),
+            body: "{}".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("Field `customfield_19300`"), "got: {msg}");
+        assert!(
+            msg.contains("requires rich-text content in ADF format"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("To fix:"), "got: {msg}");
+        assert!(msg.contains("JFM markdown"), "got: {msg}");
+        assert!(msg.contains("omni-dev://specs/jfm"), "got: {msg}");
+        assert!(msg.contains("Original API error:"), "got: {msg}");
+        assert!(
+            msg.contains("Operation value must be an Atlassian Document"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn jira_adf_field_required_display_multiple_fields() {
+        let err = AtlassianError::JiraAdfFieldRequired {
+            fields: vec![
+                "customfield_19300".to_string(),
+                "customfield_42000".to_string(),
+            ],
+            original_message: "Operation value must be an Atlassian Document".to_string(),
+            body: String::new(),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Fields `customfield_19300`, `customfield_42000`"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("require rich-text content"), "got: {msg}");
+    }
+
+    #[test]
+    fn jira_adf_field_required_display_no_fields_uses_generic_header() {
+        // The `jira_write_error` helper never constructs the variant with an
+        // empty `fields` vec, but the defensive `[]` arm of the formatter is
+        // public surface — direct construction must still render sensibly.
+        let err = AtlassianError::JiraAdfFieldRequired {
+            fields: vec![],
+            original_message: "Operation value must be an Atlassian Document".to_string(),
+            body: String::new(),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("JIRA fields require rich-text content in ADF format."),
+            "got: {msg}"
+        );
+        assert!(!msg.contains("Field `"), "got: {msg}");
+    }
+
+    #[test]
+    fn jira_adf_field_required_display_omits_original_when_empty() {
+        let err = AtlassianError::JiraAdfFieldRequired {
+            fields: vec!["customfield_19300".to_string()],
+            original_message: String::new(),
+            body: String::new(),
+        };
+        let msg = err.to_string();
+        assert!(!msg.contains("Original API error:"), "got: {msg}");
     }
 }

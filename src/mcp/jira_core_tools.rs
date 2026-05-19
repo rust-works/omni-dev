@@ -1421,6 +1421,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_jira_write_enriches_adf_required_error() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "errorMessages": [],
+            "errors": {
+                "customfield_19300": "Operation value must be an Atlassian Document (see the Atlassian Document Format)"
+            }
+        });
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(body))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+
+        let mut extras = std::collections::BTreeMap::new();
+        extras.insert(
+            "customfield_19300".to_string(),
+            serde_json::Value::String("plain string, not ADF".to_string()),
+        );
+
+        let err = run_jira_write(
+            &client,
+            "PROJ-1",
+            None,
+            ReadFormat::Jfm,
+            None,
+            None,
+            None,
+            Some(&extras),
+        )
+        .await
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("Field `customfield_19300`"), "got: {msg}");
+        assert!(
+            msg.contains("rich-text content in ADF format"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("To fix:"), "got: {msg}");
+        assert!(msg.contains("JFM markdown"), "got: {msg}");
+        assert!(msg.contains("omni-dev://specs/jfm"), "got: {msg}");
+        assert!(
+            msg.contains("Operation value must be an Atlassian Document"),
+            "got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_jira_write_falls_back_for_non_adf_400() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "errorMessages": ["Something else"],
+                "errors": {"summary": "Summary is required."}
+            })))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = run_jira_write(
+            &client,
+            "PROJ-1",
+            Some("Body"),
+            ReadFormat::Jfm,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("400"), "got: {msg}");
+        assert!(
+            !msg.contains("rich-text content in ADF format"),
+            "got: {msg}"
+        );
+    }
+
+    #[tokio::test]
     async fn run_jira_write_with_assignee_emits_account_id_payload() {
         let server = MockServer::start().await;
         Mock::given(method("PUT"))
