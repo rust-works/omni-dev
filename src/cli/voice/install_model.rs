@@ -9,7 +9,7 @@
 //! enrol time, so network failures surface explicitly when the user opts
 //! in to installing rather than silently on first use.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -205,18 +205,17 @@ fn download_release_asset<W: Write>(
     let resp = ureq::get(url)
         .call()
         .with_context(|| format!("HTTP GET {url}"))?;
-    if resp.status() != 200 {
+    let status = resp.status();
+    if !status.is_success() {
         bail!(
             "HTTP {} fetching {url}: {}",
-            resp.status(),
-            resp.status_text()
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("Unknown"),
         );
     }
-    let mut reader = resp.into_reader();
-    #[allow(clippy::cast_possible_truncation)]
-    let mut bytes = Vec::with_capacity(expected_bytes as usize);
-    reader
-        .read_to_end(&mut bytes)
+    let bytes = resp
+        .into_body()
+        .read_to_vec()
         .with_context(|| format!("read response body for {url}"))?;
 
     let actual_sha = {
