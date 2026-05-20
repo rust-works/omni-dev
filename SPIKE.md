@@ -125,7 +125,20 @@ Pursue **candidate 1 with algorithmic optimisations**, in priority order:
 
 **Setup.** `parakeet-mlx==0.5.1`, `mlx==0.31.2`, host darwin/arm64 (M-series). Model staged from `mlx-community/parakeet-tdt-0.6b-v2` via HuggingFace. Harness: [`baseline/parakeet_mlx/run.py`](baseline/parakeet_mlx/run.py) (~110 lines). Repro: `cd baseline/parakeet_mlx && python3.12 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt && python run.py --fixture ../../tests/fixtures/voice/monologue_5min.wav --log events.jsonl --transcript transcript.txt`.
 
-**API tier landed: utterance-level.** `parakeet-mlx` does expose a streaming API (`model.transcribe_stream` → `StreamingParakeet.add_audio()`), but feeding it 100 ms chunks at default `context_size=(256, 256)`, `depth=1` produces unusable output on this fixture — early hypotheses commit with too-little audio context (sample emissions: `" 'Kay."`, `" Mm-hmm."`, `" Okay."`, `" Come here for me."` from audio that actually says "to his cold, precise, but admirably balanced mind"). The utterance-level `model.transcribe(path)` is what we measure. Per #856's explicit fallback: "*if the parakeet-mlx API only exposes utterance-level transcription, document and skip partial-latency comparison rather than fabricate one*."
+**API tier landed: utterance-level.** `parakeet-mlx` exposes a streaming API (`model.transcribe_stream` → `StreamingParakeet.add_audio()`), and we [probed it](baseline/parakeet_mlx/streaming_probe.py) to settle the question. Findings on a 10 s slice of the fixture:
+
+| `chunk_ms` | `context_size` | `depth` | RTF | Output |
+|---|---|---|---|---|
+| 100 | (256, 256) | 1 | 1.92 | unusable garbage (`"Come here for sorry, but I remember like a gallon marker..."` from audio that says `"To his cold, precise, but admirably balanced mind..."`) |
+| 100 | (256, 256) | 4 | 1.88 | **same garbage** (byte-identical) |
+| 100 | (256, 256) | 24 (full encoder) | 1.84 | **same garbage** |
+| 100 | (512, 512) | 24 | 3.85 | **same garbage** |
+| 500 | (256, 256) | 1 | 0.31 | matches non-streaming transcript |
+| 500 | (256, 256) | 24 | 0.31 | matches non-streaming transcript |
+| 1000 | (256, 256) | 1 | 0.16 | matches non-streaming transcript |
+| 1000 | (256, 256) | 24 | 0.16 | matches non-streaming transcript |
+
+**Streaming is usable at chunk sizes ≥ 500 ms; broken at 100 ms regardless of `depth` or `context_size`.** Identical output across `depth=1/4/24` rules out cache-divergence as the cause — at 100 ms chunks, `add_audio()` accumulates ~1.25 encoded frames per call (10 mel frames × 1 / 8 subsampling), driving the encoder's commit logic into a regime where it produces wrong tokens regardless of attention windowing. The harness therefore uses utterance-level `model.transcribe(path)` and reports partial-latency / time-to-final as N/A *for #826's 100 ms cadence specifically* — not "API doesn't support streaming" but "API doesn't support streaming at the chunk granularity #826 measures". Per #856's explicit fallback: "*if the parakeet-mlx API only exposes utterance-level transcription, document and skip partial-latency comparison rather than fabricate one*."
 
 | Metric | Value | Notes |
 |---|---|---|

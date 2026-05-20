@@ -59,14 +59,18 @@ emitted shape conforms to
 [`scripts/analyze.py`](../../scripts/analyze.py) consumes it
 unchanged.
 
-The package also exposes a streaming API (`model.transcribe_stream`),
-but feeding it 100 ms chunks at default `context_size=(256, 256)`
-produces unusable hypotheses (committed before the model has enough
-audio context). Per the [#856 issue text](https://github.com/rust-works/omni-dev/issues/856)'s
-explicit fallback — *"if the parakeet-mlx API only exposes
+The package also exposes a streaming API (`model.transcribe_stream`).
+We probed it ([`streaming_probe.py`](streaming_probe.py)) sweeping
+`chunk_ms ∈ {100, 500, 1000}` × `depth ∈ {1, 4, 24}` × `context_size ∈
+{(256,256), (512,512)}`. **Finding: usable at chunks ≥ 500 ms; broken
+at 100 ms** (same byte-identical garbage across all depth and
+context_size settings; not a cache-divergence problem). Since #826's
+production cadence is 100 ms (matching `cpal`'s capture callback), we
+report `partial_latency` and `time_to_final` as N/A and use the
+utterance-level path. Per the [#856 issue text](https://github.com/rust-works/omni-dev/issues/856)'s
+explicit fallback: *"if the parakeet-mlx API only exposes
 utterance-level transcription, document and skip partial-latency
-comparison rather than fabricate one"* — we report `partial_latency`
-and `time_to_final` as N/A and stick to the utterance-level path.
+comparison rather than fabricate one"*.
 
 ## Files
 
