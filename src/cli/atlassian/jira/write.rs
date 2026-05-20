@@ -735,6 +735,106 @@ mod tests {
             .unwrap();
     }
 
+    // ── --set-field for rich-text custom fields (issue #866) ──────────
+
+    async fn mount_textarea_editmeta(server: &wiremock::MockServer, key: &str) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!(
+                "/rest/api/3/issue/{key}/editmeta"
+            )))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "fields": {
+                        "customfield_19300": {
+                            "name": "Acceptance Criteria",
+                            "schema": {
+                                "type": "string",
+                                "custom": "com.atlassian.jira.plugin.system.customfieldtypes:textarea"
+                            }
+                        }
+                    }
+                })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn execute_set_field_textarea_string_converts_jfm_to_adf() {
+        // Issue #866: --set-field NAME=VALUE where VALUE is a JFM string and
+        // NAME is a rich-text custom field should auto-convert to ADF rather
+        // than rejecting.
+        let server = wiremock::MockServer::start().await;
+        mount_textarea_editmeta(&server, "PROJ-1").await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "fields": {
+                    "customfield_19300": {
+                        "version": 1,
+                        "type": "doc",
+                        "content": [{
+                            "type": "paragraph",
+                            "content": [{"type": "text", "text": "hello world"}]
+                        }]
+                    }
+                }
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut c = cmd("PROJ-1");
+        c.no_content = true;
+        c.set_fields = vec!["Acceptance Criteria=hello world".to_string()];
+        c.execute_with_client(mock_client(&server.uri()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_set_field_textarea_empty_string_clears() {
+        let server = wiremock::MockServer::start().await;
+        mount_textarea_editmeta(&server, "PROJ-1").await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "fields": {"customfield_19300": null}
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut c = cmd("PROJ-1");
+        c.no_content = true;
+        c.set_fields = vec!["Acceptance Criteria=".to_string()];
+        c.execute_with_client(mock_client(&server.uri()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_set_field_textarea_non_string_errors() {
+        // `--set-field "Acceptance Criteria=42"` parses to a number. Rich-text
+        // fields don't accept non-string scalars — error message should point
+        // at the rich-text + JFM contract.
+        let server = wiremock::MockServer::start().await;
+        mount_textarea_editmeta(&server, "PROJ-1").await;
+
+        let mut c = cmd("PROJ-1");
+        c.no_content = true;
+        c.set_fields = vec!["Acceptance Criteria=42".to_string()];
+        let err = c
+            .execute_with_client(mock_client(&server.uri()))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("rich-text field"), "got: {msg}");
+        assert!(msg.contains("JFM markdown"), "got: {msg}");
+    }
+
     #[tokio::test]
     async fn execute_assignee_collision_with_set_field_errors() {
         // When --set-field assignee=... is also supplied, the typed --assignee
