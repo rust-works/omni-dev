@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Spike #871 — Parakeet Rust port feasibility</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/white.css" id="theme">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css">
+<style>
+  :root {
+    --pass: #2c7a3f;
+    --warn: #b35900;
+    --fail: #a83232;
+    --muted: #666;
+    --accent: #1d4e89;
+  }
+  .reveal { font-size: 28px; }
+  .reveal h1 { font-size: 1.6em; }
+  .reveal h2 { font-size: 1.2em; color: var(--accent); }
+  .reveal h3 { font-size: 1.0em; color: var(--accent); }
+  .reveal .subtitle { color: var(--muted); font-size: 0.7em; margin-top: 0; }
+  .reveal table { font-size: 0.62em; border-collapse: collapse; margin: 0 auto; }
+  .reveal table th, .reveal table td { padding: 6px 10px; border: 1px solid #ddd; }
+  .reveal table th { background: #f4f6f8; }
+  .reveal code, .reveal pre { font-family: "SF Mono", "Menlo", monospace; }
+  .reveal pre { font-size: 0.55em; }
+  .reveal .pass { color: var(--pass); font-weight: 600; }
+  .reveal .warn { color: var(--warn); font-weight: 600; }
+  .reveal .fail { color: var(--fail); font-weight: 600; }
+  .reveal .muted { color: var(--muted); }
+  .reveal .big-number { font-size: 2.2em; font-weight: 700; color: var(--accent); display: block; margin: 0.2em 0; }
+  .reveal .verdict { padding: 8px 16px; border-radius: 4px; display: inline-block; font-weight: 700; }
+  .reveal .verdict.go { background: #e0f0e0; color: var(--pass); }
+  .reveal .verdict.conditional { background: #fff3e0; color: var(--warn); }
+  .reveal .verdict.no { background: #fde0e0; color: var(--fail); }
+  .reveal .footer { position: absolute; bottom: 12px; left: 12px; font-size: 0.5em; color: var(--muted); }
+  .reveal .footnote { font-size: 0.55em; color: var(--muted); margin-top: 1em; }
+  .reveal ul { display: inline-block; text-align: left; }
+  .reveal li { margin: 0.3em 0; }
+  .reveal .two-col { display: flex; gap: 2em; align-items: flex-start; }
+  .reveal .two-col > div { flex: 1; }
+  .reveal .label-row td:first-child { text-align: left; font-weight: 600; }
+  .reveal .center { text-align: center; }
+</style>
+</head>
+<body>
+<div class="reveal">
+  <div class="slides">
+
+    <!-- 1. Title -->
+    <section>
+      <h1>Spike #871</h1>
+      <p class="subtitle">Can Parakeet-TDT 0.6B be ported to pure Rust + candle?</p>
+      <div style="margin-top: 1.5em;">
+        <span class="verdict conditional">GO (conditional on day-1 CPU RTF gate)</span>
+      </div>
+      <p class="footnote">
+        Branch: <code>issue-871-parakeet-rust-port-spike</code> &middot; Day 1 of a 2–3 day box &middot; <code>SPIKE.md</code> &middot; <code>COMPARISON.md</code>
+      </p>
+    </section>
+
+    <!-- 2. The gap -->
+    <section>
+      <h2>The gap that motivated this</h2>
+      <table>
+        <thead>
+          <tr><th>Path</th><th>WER on the 5-min fixture</th><th>Source</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>parakeet-tdt-0.6b-v2 (MLX fork)</td><td class="pass"><strong>3.65 %</strong></td><td>#856</td></tr>
+          <tr><td>sherpa-onnx-streaming-zipformer-en</td><td><strong>6.81 %</strong></td><td>#859</td></tr>
+          <tr><td>candle + whisper-tiny.en</td><td class="warn"><strong>7.13 %</strong></td><td>#826</td></tr>
+        </tbody>
+      </table>
+      <p>~3.5 pp on the table vs the current C++-free path.</p>
+      <p>Cheap alternatives (<code>whisper-base.en</code>; <code>sherpa-rs</code> via C++) are either unproven or violate <strong>ADR-0033's C++-freeness gate</strong>.</p>
+      <p><strong>This spike asks:</strong> is there a pure-Rust port of Parakeet that closes the gap?</p>
+    </section>
+
+    <!-- 3. What we measured -->
+    <section>
+      <h2>What we measured — 3 probes</h2>
+      <ul>
+        <li><strong>Probe 1 — Op coverage.</strong> Enumerate every op in <code>conformer.py</code>, <code>attention.py</code>, <code>rnnt.py</code>, <code>parakeet.py</code>; map each to candle.</li>
+        <li><strong>Probe 2 — Weight conversion.</strong> MLX safetensors → candle-loadable safetensors. Throwaway converter; the mapping table is the artefact.</li>
+        <li><strong>Probe 3 — Numerical parity.</strong> Encoder block-0 FFN1 sub-path: layer-by-layer MAE/max-AE between the fork and a candle stub.</li>
+      </ul>
+      <p class="footnote">Output: a go/no-go decision. <em>Not</em> the port. Encoder forward-pass parity is enough; TDT decoder + joiner are downstream.</p>
+    </section>
+
+    <!-- 4. Probe 1 — Op coverage -->
+    <section>
+      <h2>Probe 1 — Op coverage</h2>
+      <p><span class="pass">Zero blocking ops.</span> ~3 small custom helpers required.</p>
+      <table>
+        <thead><tr><th>Op family</th><th>candle status</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td>Linear, Embedding, LSTM, LayerNorm, BatchNorm</td><td class="pass">direct</td><td>candle_nn equivalents; LSTM gate order matches</td></tr>
+          <tr><td>Conv1d / Conv2d (incl. depthwise)</td><td class="pass">direct</td><td>Axis permute on load: MLX (out,…,in) → candle (out,in,…)</td></tr>
+          <tr><td>SiLU, ReLU, softmax, log_softmax, argmax</td><td class="pass">direct</td><td>Standard candle ops</td></tr>
+          <tr><td>GLU split</td><td class="pass">3 lines</td><td><code>split(axis=2); a * sigmoid(b)</code></td></tr>
+          <tr><td>Rel-pos MHA (Shaw / Transformer-XL style)</td><td class="pass">primitives present</td><td>incl. rel-shift trick; one small helper</td></tr>
+          <tr><td>STFT windowing (<code>mx.as_strided</code>)</td><td class="warn">~10-line helper</td><td><code>rustfft</code> already in tree</td></tr>
+          <tr><td>Metal kernels (<code>matmul_qk</code>, <code>matmul_pv</code>)</td><td class="muted">off path</td><td>Belong to local-attention variant; this model uses <code>self_attention_model: rel_pos</code></td></tr>
+        </tbody>
+      </table>
+      <p class="footnote">No CUDA-like custom kernels required. Earlier Metal-kernel risk was for the local-attn variant; <em>not</em> this model.</p>
+    </section>
+
+    <!-- 5. Probe 2 — Weight conversion -->
+    <section>
+      <h2>Probe 2 — Weight conversion</h2>
+      <p class="big-number">697 tensors, all <code>float32</code></p>
+      <table>
+        <thead><tr><th>Transform</th><th>Count</th><th>What</th></tr></thead>
+        <tbody>
+          <tr><td><code>identity</code></td><td class="pass"><strong>620</strong></td><td>Linear, LayerNorm γ/β, BatchNorm γ/β/running, biases, embeddings, LSTM</td></tr>
+          <tr><td><code>conv_permute</code></td><td class="pass"><strong>77</strong></td><td>Conv1d/2d axis reorder</td></tr>
+        </tbody>
+      </table>
+      <p><strong>No quantisation.</strong> MLX names already match the natural candle module tree (e.g. <code>encoder.layers.0.self_attn.linear_q.weight</code>).</p>
+      <pre><code>encoder.pre_encode.conv.0.weight                   shape=[256, 1, 3, 3]    OK
+encoder.layers.0.self_attn.linear_q.weight         shape=[1024, 1024]      OK
+encoder.layers.0.conv.depthwise_conv.weight        shape=[1024, 1, 9]      OK
+encoder.layers.0.conv.pointwise_conv1.weight       shape=[2048, 1024, 1]   OK
+decoder.prediction.embed.weight                    shape=[1025, 640]       OK
+joint.joint_net.2.weight                           shape=[1030, 640]       OK</code></pre>
+      <p class="footnote">Loaded via <code>candle_nn::VarBuilder::from_mmaped_safetensors</code>. All 7 spot-checks pass.</p>
+    </section>
+
+    <!-- 6. Probe 3 — Parity -->
+    <section>
+      <h2>Probe 3 — Numerical parity</h2>
+      <p>Block 0 FFN1 sub-path: <code>x + 0.5 · FFN1(LayerNorm(x))</code>, first 5 s of <code>short_en.wav</code>.</p>
+      <table>
+        <thead><tr><th>Checkpoint</th><th>MAE</th><th>max abs</th><th>MAE / mean(|ref|)</th></tr></thead>
+        <tbody>
+          <tr><td>After LayerNorm</td><td>4.4e-4</td><td>1.1e-2</td><td class="pass"><strong>1.4e-3</strong></td></tr>
+          <tr><td>After FFN (Linear → SiLU → Linear)</td><td>4.6e-1</td><td>4.5</td><td class="pass"><strong>1.1e-3</strong></td></tr>
+          <tr><td>After residual</td><td>2.3e-1</td><td>2.3</td><td class="pass"><strong>9.7e-4</strong></td></tr>
+        </tbody>
+      </table>
+      <p><strong>~1e-3 relative error per sub-block.</strong> Source: BLAS-level matmul rounding drift between MLX/Accelerate and candle's <code>gemm</code> — <em>not</em> a port bug.</p>
+      <p>Well inside the spike's <strong>±2 % WER bar</strong>. Greedy decode is robust to ~1 % logit perturbation.</p>
+    </section>
+
+    <!-- 7. Three-way picture -->
+    <section>
+      <h2>The bigger picture — three runtimes on one fixture</h2>
+      <table>
+        <thead><tr><th>Metric</th><th>parakeet-mlx (fork)</th><th>sherpa-onnx</th><th>candle + whisper-tiny.en</th></tr></thead>
+        <tbody>
+          <tr class="label-row"><td>WER</td><td class="pass"><strong>3.65 %</strong></td><td>6.81 %</td><td>7.13 %</td></tr>
+          <tr class="label-row"><td>Partial P95 (≈500 ms chunks)</td><td class="warn">369 ms <span class="muted">(MLX/GPU)</span></td><td class="pass"><strong>29 ms</strong></td><td class="fail">n/a (RTF > 1)</td></tr>
+          <tr class="label-row"><td>Partial P95 (100 ms chunks)</td><td class="fail">n/a — RTF 2.835</td><td class="muted">not at this cadence</td><td class="fail">n/a — RTF > 1</td></tr>
+          <tr class="label-row"><td>Model size</td><td>600 M / 2.47 GB</td><td>~70 M / ~260 MB</td><td>~39 M / ~40 MB</td></tr>
+          <tr class="label-row"><td>Platform</td><td class="fail">Apple-Silicon only</td><td class="pass">cross-platform</td><td class="pass">cross-platform</td></tr>
+          <tr class="label-row"><td>C++-free (ADR-0033)</td><td class="fail">❌ MLX/Metal</td><td class="fail">❌ sherpa C++</td><td class="pass">✅</td></tr>
+          <tr class="label-row"><td>Bundled VAD</td><td>❌</td><td class="pass">✅ Silero</td><td>❌</td></tr>
+        </tbody>
+      </table>
+      <p class="footnote">Parakeet wins WER decisively. Sherpa wins streaming-latency decisively. Whisper-tiny wins C++-freeness — the gate this spike exists to preserve.</p>
+    </section>
+
+    <!-- 8. The catch -->
+    <section>
+      <h2>The catch — CPU RTF is the open risk</h2>
+      <div class="two-col">
+        <div>
+          <p><strong>Parakeet has ~15× the parameter count of whisper-tiny.en</strong></p>
+          <ul>
+            <li>600 M params vs 39 M</li>
+            <li>2.47 GB vs ~40 MB</li>
+            <li>24-layer FastConformer (d_model 1024)</li>
+          </ul>
+        </div>
+        <div>
+          <p><strong>candle + whisper-tiny.en is already too slow on CPU</strong></p>
+          <ul>
+            <li>#826: <span class="fail">RTF 1.3 paced</span> single-thread</li>
+            <li>Falls behind realtime</li>
+            <li>Naive Parakeet on CPU plausibly lands in <span class="fail">RTF 15–25</span></li>
+          </ul>
+        </div>
+      </div>
+      <p class="footnote">The 0.016 RTF measured in #856 is <strong>MLX-on-GPU + unified memory</strong> — it does <em>not</em> predict candle-on-CPU. The spike did <em>not</em> measure runtime cost of the ported model.</p>
+    </section>
+
+    <!-- 9. Streaming numbers detail -->
+    <section>
+      <h2>Streaming-latency reality (from COMPARISON.md)</h2>
+      <p>Even on parakeet-mlx's <em>hardware-advantaged</em> path (MLX/GPU + unified memory):</p>
+      <table>
+        <thead><tr><th>Chunk cadence</th><th>parakeet-mlx RTF</th><th>parakeet-mlx P95</th><th>sherpa P95</th></tr></thead>
+        <tbody>
+          <tr><td>100 ms (#826's target)</td><td class="fail"><strong>2.835</strong></td><td class="fail">n/a — partials queue</td><td class="muted">not measured at this cadence</td></tr>
+          <tr><td>≈500 ms (sherpa's native ≈450 ms)</td><td class="warn">1.002</td><td class="warn">369 ms</td><td class="pass"><strong>29 ms</strong></td></tr>
+        </tbody>
+      </table>
+      <p>Sherpa is <strong>~12× faster on streaming</strong> at the same cadence — even comparing against GPU-accelerated parakeet.</p>
+      <p>On the candle/CPU path that the port would land in, the gap will be <em>larger</em>, not smaller.</p>
+    </section>
+
+    <!-- 10. Recommendation -->
+    <section>
+      <h2>Recommendation: <span class="verdict conditional">GO (conditional)</span></h2>
+      <p>Recommend the candle port — <strong>but gate it on a day-1 CPU RTF probe</strong>.</p>
+      <ol>
+        <li><strong>Day 1 of feature task:</strong> port encoder forward pass only, load weights, run on 5 s mel input, measure single-thread CPU RTF.</li>
+        <li>If <code>encoder_RTF &gt; 1.5</code> on single thread: <span class="fail">ABORT</span>. Fall back to sherpa-rs (waive ADR-0033) or whisper-base.en.</li>
+        <li>If <code>encoder_RTF ≤ 1.5</code>: continue with the remaining 10+ days; consider int8 quantisation + multi-thread BLAS as mitigations.</li>
+      </ol>
+      <p>Bounded discovery cost: <strong>~1 day</strong> to learn whether the rest of the port is worth doing.</p>
+    </section>
+
+    <!-- 11. Effort -->
+    <section>
+      <h2>Effort breakdown (if day-1 gate passes)</h2>
+      <table>
+        <thead><tr><th>Piece</th><th>P50</th><th>P90</th></tr></thead>
+        <tbody>
+          <tr><td>FastConformer encoder (24-layer)</td><td>4 d</td><td>7 d</td></tr>
+          <tr><td>Rel-pos attention + rel-shift</td><td>1.5 d</td><td>3 d</td></tr>
+          <tr><td>Conv module + BatchNorm</td><td>0.5 d</td><td>1 d</td></tr>
+          <tr><td>Pre-encode subsampling stack</td><td>0.5 d</td><td>1 d</td></tr>
+          <tr><td>TDT predictor (LSTM)</td><td>0.5 d</td><td>1.5 d</td></tr>
+          <tr><td>TDT joiner + greedy decode</td><td>1.25 d</td><td>2.5 d</td></tr>
+          <tr><td>Tokenizer + weight-converter polish</td><td>1 d</td><td>2.5 d</td></tr>
+          <tr><td>Mel frontend + streaming wrapper</td><td>2.5 d</td><td>5 d</td></tr>
+          <tr><td><code>voice install-model</code> integration</td><td>0.5 d</td><td>1 d</td></tr>
+          <tr><td>End-to-end WER validation (≤ 5 %)</td><td>1 d</td><td>3 d</td></tr>
+          <tr><td><strong>Total</strong></td><td class="pass"><strong>~13 days (2.5 wk)</strong></td><td class="warn"><strong>~27 days (5 wk)</strong></td></tr>
+        </tbody>
+      </table>
+      <p class="footnote">Work is dominated by mechanical replication, not by hard ML research.</p>
+    </section>
+
+    <!-- 12. What this unblocks -->
+    <section>
+      <h2>What this unblocks</h2>
+      <p><strong>#806 streaming ASR now has a real third option:</strong></p>
+      <table>
+        <thead><tr><th>Path</th><th>Cost</th><th>WER</th><th>C++-free?</th></tr></thead>
+        <tbody>
+          <tr><td>(a) candle + Whisper + Silero VAD (#826 fallback)</td><td class="pass">~1 week</td><td class="warn">~7 %</td><td class="pass">✅</td></tr>
+          <tr><td>(b) sherpa-rs (waive ADR-0033)</td><td class="pass">~zero engineering</td><td>~6.8 %</td><td class="fail">❌</td></tr>
+          <tr><td>(c) <strong>Parakeet candle port (this spike)</strong></td><td class="warn">~2.5 weeks (if day-1 gate passes)</td><td class="pass"><strong>~3.65 %</strong></td><td class="pass">✅</td></tr>
+        </tbody>
+      </table>
+      <p class="footnote">If the day-1 CPU RTF gate fails, the port degrades to a defer — and (a) or (b) become the answer.</p>
+    </section>
+
+    <!-- 13. Closing -->
+    <section>
+      <h2>Closing</h2>
+      <p><strong>The spike succeeded in the sense that matters:</strong> it produced a decision the project can act on.</p>
+      <ul>
+        <li>Op coverage, weight conversion, numerical parity: <span class="pass">all clear</span></li>
+        <li>Effort estimate: <span class="pass">bounded</span> at ~2.5 weeks P50</li>
+        <li>Open risk: <span class="warn">CPU RTF unmeasured</span> — promoted to a day-1 gate, not buried</li>
+        <li>Cross-runtime context: <span class="muted">sherpa is a real alternative if C++-freeness is negotiable</span></li>
+      </ul>
+      <p style="margin-top: 2em;">
+        Artefacts: <code>SPIKE.md</code> &middot; <code>COMPARISON.md</code> &middot; <code>spike-parakeet-rust/</code> &middot; this deck
+      </p>
+    </section>
+
+  </div>
+  <div class="footer">Spike #871 &middot; 2026-05 &middot; <code>.work/issue-871-parakeet-rust-port-spike/</code></div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+<script>
+  Reveal.initialize({
+    hash: true,
+    slideNumber: 'c/t',
+    transition: 'fade',
+    controls: true,
+    progress: true,
+    center: true,
+    plugins: [ RevealHighlight ]
+  });
+</script>
+</body>
+</html>
