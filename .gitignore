@@ -60,3 +60,11 @@ cinema/
 /spike-*/target/
 /spike-*/Cargo.lock
 /spike-*/runs/
+
+# Issue #873 spike: moonshine baseline harness per-run outputs (throwaway)
+/baseline/moonshine_mlx/.venv/
+/baseline/moonshine_mlx/__pycache__/
+/baseline/moonshine_mlx/events*.jsonl
+/baseline/moonshine_mlx/transcript*.txt
+/baseline/moonshine_mlx/peak_rss*.txt
+/baseline/moonshine_mlx/metrics*.txt
