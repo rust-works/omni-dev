@@ -70,12 +70,14 @@ jobs:
         toolchain: ${{ matrix.rust }}
         target: ${{ matrix.target }}
 
-    - name: Build release binary
-      run: cargo build --verbose --release --target ${{ matrix.target }}
+    - name: Build release binaries
+      run: cargo build --verbose --release --target ${{ matrix.target }} --features mcp --bin omni-dev --bin omni-dev-mcp
 
-    - name: Strip release binary (linux and macos)
+    - name: Strip release binaries (linux and macos)
       if: matrix.build == 'linux' || matrix.build == 'macos'
-      run: strip "target/${{ matrix.target }}/release/omni-dev"
+      run: |
+        strip "target/${{ matrix.target }}/release/omni-dev"
+        strip "target/${{ matrix.target }}/release/omni-dev-mcp"
 
     - name: Build archive
       shell: bash
@@ -84,10 +86,12 @@ jobs:
         cp LICENSE README.md archive/
         if [ "${{ matrix.build }}" = "win-msvc" ]; then
           cp "target/${{ matrix.target }}/release/omni-dev.exe" archive/
+          cp "target/${{ matrix.target }}/release/omni-dev-mcp.exe" archive/
           cd archive
           7z a "${{ matrix.archive-name }}" *
         else
           cp "target/${{ matrix.target }}/release/omni-dev" archive/
+          cp "target/${{ matrix.target }}/release/omni-dev-mcp" archive/
           cd archive
           tar czf "${{ matrix.archive-name }}" *
         fi

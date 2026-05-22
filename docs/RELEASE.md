@@ -147,9 +147,9 @@ Pushing a `v*` tag triggers the following automated workflows:
 
 ### Release Workflow (`.github/workflows/release.yml`)
 - **Creates GitHub Release**: Automatically from the tag
-- **Builds Cross-Platform Binaries**:
+- **Builds Cross-Platform Binaries** (both `omni-dev` and `omni-dev-mcp` for each target):
   - Linux (x86_64-unknown-linux-gnu)
-  - macOS (x86_64-apple-darwin)
+  - macOS (aarch64-apple-darwin)
   - Windows (x86_64-pc-windows-msvc)
 - **Uploads Release Assets**: Attaches compiled binaries to the GitHub release
 - **Publishes to crates.io**: Automatically using `CARGO_REGISTRY_TOKEN` secret
