@@ -123,12 +123,83 @@ p code, li code {
 
 .demo-caption {
   color: $muted;
-  margin-bottom: 1rem;
+  margin-bottom: 1.5rem;
 }
 
 .asciinema-player-wrap {
   border-radius: 6px;
   overflow: hidden;
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
-  margin-bottom: 2rem;
+}
+
+.demo-wide {
+  // Break out of the 760px main column so the side-by-side grid has room.
+  // Negative-margin trick: span the full viewport width while still
+  // honouring the section's own horizontal padding.
+  width: 100vw;
+  position: relative;
+  left: 50%;
+  margin-left: -50vw;
+  padding: 0 1.5rem;
+  box-sizing: border-box;
+
+  > h2,
+  > .demo-caption {
+    max-width: 1200px;
+    margin-left: auto;
+    margin-right: auto;
+  }
+}
+
+.demo-grid {
+  max-width: 1200px;
+  margin: 0 auto 2rem;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 1.5rem;
+  align-items: start;
+
+  @media (max-width: 900px) {
+    grid-template-columns: 1fr;
+  }
+}
+
+.demo-cast {
+  position: sticky;
+  top: 1rem;
+
+  @media (max-width: 900px) {
+    position: static;
+  }
+}
+
+.demo-renders {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+
+  figure {
+    margin: 0;
+
+    a {
+      display: block;
+      border-radius: 6px;
+      overflow: hidden;
+      box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+      border: 1px solid #e5e5e5;
+    }
+
+    img {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+
+    figcaption {
+      margin-top: 0.5rem;
+      font-size: 0.85rem;
+      color: $muted;
+      line-height: 1.4;
+    }
+  }
 }
