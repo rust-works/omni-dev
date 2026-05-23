@@ -32,17 +32,46 @@
   <pre><code>nix profile install github:rust-works/omni-dev</code></pre>
 </section>
 
-<section id="demo">
+<section id="demo" class="demo-wide">
   <h2>Demo: Jira + Confluence from the CLI</h2>
   <p class="demo-caption">
     File a Jira bug with a Markdown body, round-trip it back, drop a Confluence page that
     links to the ticket, and anchor an inline comment to a phrase on the page &mdash; all
     from your shell. JFM (JIRA-Flavored Markdown) is converted to Atlassian Document Format
-    end-to-end.
+    end-to-end &mdash; the cast on the left runs the CLI, the screenshots on the right are
+    the resulting Atlassian pages, untouched.
   </p>
-  <div id="demo-player" class="asciinema-player-wrap"></div>
 
-  <h2 id="demo-commits">Also: AI-driven commit-message cleanup</h2>
+  <div class="demo-grid">
+    <div class="demo-cast">
+      <div id="demo-player" class="asciinema-player-wrap"></div>
+    </div>
+
+    <div class="demo-renders">
+      <figure>
+        <a href="{{ get_url(path='screenshots/jira-issue.png') }}" target="_blank" rel="noopener">
+          <img src="{{ get_url(path='screenshots/jira-issue.png') }}" alt="Resulting Jira issue page rendered in Atlassian Cloud" loading="lazy">
+        </a>
+        <figcaption>Resulting Jira issue &mdash; headings, lists, inline code, labels, and code block rendered from the JFM source.</figcaption>
+      </figure>
+      <figure>
+        <a href="{{ get_url(path='screenshots/confluence-page.png') }}" target="_blank" rel="noopener">
+          <img src="{{ get_url(path='screenshots/confluence-page.png') }}" alt="Resulting Confluence page rendered in Atlassian Cloud" loading="lazy">
+        </a>
+        <figcaption>Resulting Confluence page &mdash; the yellow highlight on <code>/dashboard</code> is the inline-comment anchor.</figcaption>
+      </figure>
+      <figure>
+        <a href="{{ get_url(path='screenshots/confluence-inline-comment.png') }}" target="_blank" rel="noopener">
+          <img src="{{ get_url(path='screenshots/confluence-inline-comment.png') }}" alt="Confluence inline comment expanded next to the anchored text" loading="lazy">
+        </a>
+        <figcaption>Click the anchor and the inline comment opens &mdash; the body is exactly what the CLI sent.</figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<section id="demo-commits">
+  <h2>Also: AI-driven commit-message cleanup</h2>
   <pre><code># Improve commits on the current branch
 omni-dev git commit message twiddle 'origin/main..HEAD' --use-context
 
