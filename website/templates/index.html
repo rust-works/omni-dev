@@ -26,6 +26,10 @@
 
 <section id="install">
   <h2>Install</h2>
+  <p>Both the CLI and the MCP server &mdash; the latter ships behind the <code>mcp</code> feature so it picks up its <code>rmcp</code> dependencies:</p>
+  <pre><code>cargo install omni-dev --features mcp</code></pre>
+
+  <p>This installs both <code>omni-dev</code> and <code>omni-dev-mcp</code>. If you only want the CLI, drop the feature flag:</p>
   <pre><code>cargo install omni-dev</code></pre>
 
   <p>Or with Nix:</p>
