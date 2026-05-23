@@ -33,7 +33,16 @@
 </section>
 
 <section id="demo">
-  <h2>30-second demo</h2>
+  <h2>Demo: Jira + Confluence from the CLI</h2>
+  <p class="demo-caption">
+    File a Jira bug with a Markdown body, round-trip it back, drop a Confluence page that
+    links to the ticket, and anchor an inline comment to a phrase on the page &mdash; all
+    from your shell. JFM (JIRA-Flavored Markdown) is converted to Atlassian Document Format
+    end-to-end.
+  </p>
+  <div id="demo-player" class="asciinema-player-wrap"></div>
+
+  <h2 id="demo-commits">Also: AI-driven commit-message cleanup</h2>
   <pre><code># Improve commits on the current branch
 omni-dev git commit message twiddle 'origin/main..HEAD' --use-context
 
@@ -45,4 +54,14 @@ omni-dev git commit message twiddle 'origin/main..HEAD' --use-context
 # Create a PR with AI-generated description
 omni-dev git branch create pr</code></pre>
 </section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  AsciinemaPlayer.create(
+    '{{ get_url(path="demo-atlassian.cast") }}',
+    document.getElementById('demo-player'),
+    { autoPlay: true, loop: true, speed: 1, fit: 'width', poster: 'npt:0:01' }
+  );
+</script>
 {% endblock %}
