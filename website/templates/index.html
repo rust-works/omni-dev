@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+
+{% block content %}
+<header class="hero">
+  <h1>omni-dev</h1>
+  <p class="tagline">An intelligent Git commit message toolkit with AI-powered contextual intelligence.</p>
+  <p class="sub">Transform messy commit histories into professional, conventional commit formats with project-aware suggestions.</p>
+
+  <div class="cta">
+    <a class="primary" href="{{ config.extra.github_url }}">View on GitHub</a>
+    <a class="secondary" href="#install">Install</a>
+  </div>
+</header>
+
+<section id="features">
+  <h2>What it does</h2>
+  <ul class="features">
+    <li><strong>AI-powered improvement</strong> — Claude analyses diffs and suggests meaningful commit messages.</li>
+    <li><strong>Contextual awareness</strong> — understands project structure, conventions, and prior work.</li>
+    <li><strong>Safe amendments</strong> — improve single or batched commit messages with working-directory validation.</li>
+    <li><strong>PR creation</strong> — generate complete pull request descriptions in one command.</li>
+    <li><strong>Atlassian integration</strong> — read and write Jira issues and Confluence pages, with JFM ⇄ ADF conversion.</li>
+    <li><strong>MCP server</strong> — drop omni-dev's capabilities into Claude Code via the bundled MCP binary.</li>
+  </ul>
+</section>
+
+<section id="install">
+  <h2>Install</h2>
+  <pre><code>cargo install omni-dev</code></pre>
+
+  <p>Or with Nix:</p>
+  <pre><code>nix profile install github:rust-works/omni-dev</code></pre>
+</section>
+
+<section id="demo">
+  <h2>30-second demo</h2>
+  <pre><code># Improve commits on the current branch
+omni-dev git commit message twiddle 'origin/main..HEAD' --use-context
+
+# Before: "fix stuff", "wip", "update files"
+# After:  "feat(auth): implement OAuth2 authentication system"
+#         "docs(api): add comprehensive endpoint documentation"
+#         "fix(ui): resolve mobile responsive layout issues"
+
+# Create a PR with AI-generated description
+omni-dev git branch create pr</code></pre>
+</section>
+{% endblock %}
