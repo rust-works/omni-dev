@@ -15,12 +15,12 @@
 <section id="features">
   <h2>What it does</h2>
   <ul class="features">
-    <li><strong>AI-powered improvement</strong> — Claude analyses diffs and suggests meaningful commit messages.</li>
-    <li><strong>Contextual awareness</strong> — understands project structure, conventions, and prior work.</li>
-    <li><strong>Safe amendments</strong> — improve single or batched commit messages with working-directory validation.</li>
-    <li><strong>PR creation</strong> — generate complete pull request descriptions in one command.</li>
-    <li><strong>Atlassian integration</strong> — read and write Jira issues and Confluence pages, with JFM ⇄ ADF conversion.</li>
-    <li><strong>MCP server</strong> — drop omni-dev's capabilities into Claude Code via the bundled MCP binary.</li>
+    <li><strong>AI-powered improvement</strong> &mdash; Claude analyses diffs and suggests meaningful commit messages.</li>
+    <li><strong>Contextual awareness</strong> &mdash; understands project structure, conventions, and prior work.</li>
+    <li><strong>Safe amendments</strong> &mdash; improve single or batched commit messages with working-directory validation.</li>
+    <li><strong>PR creation</strong> &mdash; generate complete pull request descriptions in one command.</li>
+    <li><strong>Atlassian integration</strong> &mdash; read and write Jira issues and Confluence pages, with JFM &harr; ADF conversion.</li>
+    <li><strong>MCP server</strong> &mdash; drop omni-dev's capabilities into Claude Code via the bundled MCP binary.</li>
   </ul>
 </section>
 
@@ -33,64 +33,153 @@
 </section>
 
 <section id="demo" class="demo-wide">
-  <h2>Demo: Jira + Confluence from the CLI</h2>
+  <h2>Demo</h2>
   <p class="demo-caption">
-    File a Jira bug with a Markdown body, round-trip it back, drop a Confluence page that
-    links to the ticket, and anchor an inline comment to a phrase on the page &mdash; all
-    from your shell. JFM (JIRA-Flavored Markdown) is converted to Atlassian Document Format
-    end-to-end &mdash; the cast on the left runs the CLI, the screenshots on the right are
-    the resulting Atlassian pages, untouched.
+    Four short asciicasts &mdash; each paired with the artefact it produces.
+    The source for every cast lives at
+    <a href="https://github.com/rust-works/omni-dev-demo">rust-works/omni-dev-demo</a>.
   </p>
 
-  <div class="demo-grid">
-    <div class="demo-cast">
-      <div id="demo-player" class="asciinema-player-wrap"></div>
-    </div>
+  <div class="tabs" role="tablist" aria-label="omni-dev demos">
+    <button class="tab is-active" role="tab" id="tab-jira"       aria-selected="true"  aria-controls="panel-jira"       data-tab="jira">Jira</button>
+    <button class="tab"           role="tab" id="tab-confluence" aria-selected="false" aria-controls="panel-confluence" data-tab="confluence" tabindex="-1">Confluence</button>
+    <button class="tab"           role="tab" id="tab-pr"         aria-selected="false" aria-controls="panel-pr"         data-tab="pr"         tabindex="-1">Create PR</button>
+    <button class="tab"           role="tab" id="tab-twiddle"    aria-selected="false" aria-controls="panel-twiddle"    data-tab="twiddle"    tabindex="-1">Twiddle commits</button>
+  </div>
 
-    <div class="demo-renders">
-      <figure>
-        <a href="{{ get_url(path='screenshots/jira-issue.png') }}" target="_blank" rel="noopener">
-          <img src="{{ get_url(path='screenshots/jira-issue.png') }}" alt="Resulting Jira issue page rendered in Atlassian Cloud" loading="lazy">
-        </a>
-        <figcaption>Resulting Jira issue &mdash; headings, lists, inline code, labels, and code block rendered from the JFM source.</figcaption>
-      </figure>
-      <figure>
-        <a href="{{ get_url(path='screenshots/confluence-page.png') }}" target="_blank" rel="noopener">
-          <img src="{{ get_url(path='screenshots/confluence-page.png') }}" alt="Resulting Confluence page rendered in Atlassian Cloud" loading="lazy">
-        </a>
-        <figcaption>Resulting Confluence page &mdash; the yellow highlight on <code>/dashboard</code> is the inline-comment anchor.</figcaption>
-      </figure>
-      <figure>
-        <a href="{{ get_url(path='screenshots/confluence-inline-comment.png') }}" target="_blank" rel="noopener">
-          <img src="{{ get_url(path='screenshots/confluence-inline-comment.png') }}" alt="Confluence inline comment expanded next to the anchored text" loading="lazy">
-        </a>
-        <figcaption>Click the anchor and the inline comment opens &mdash; the body is exactly what the CLI sent.</figcaption>
-      </figure>
+  <div class="tab-panel is-active" role="tabpanel" id="panel-jira" aria-labelledby="tab-jira" data-panel="jira">
+    <p class="panel-caption">
+      A bug-report JFM file exercises nested numbered/bulleted lists, a warning panel,
+      a task list with mixed states, dates and status pills, an inline code mark, a
+      fenced JavaScript code block, a pipe table, and an expand block. One CLI call
+      creates the issue in Jira; <code>jira read</code> rolls it back to identical
+      Markdown.
+    </p>
+    <div class="demo-grid">
+      <div class="demo-cast"><div id="cast-jira" class="asciinema-player-wrap"></div></div>
+      <div class="demo-renders">
+        <figure>
+          <a href="{{ get_url(path='screenshots/jira-issue.png') }}" target="_blank" rel="noopener">
+            <img src="{{ get_url(path='screenshots/jira-issue.png') }}" alt="Resulting Jira issue page rendered in Atlassian Cloud" loading="lazy">
+          </a>
+          <figcaption>Resulting Jira issue &mdash; panel, dates, status pills, nested lists, task list, code block, table, and expand all rendered from the JFM source.</figcaption>
+        </figure>
+      </div>
     </div>
   </div>
-</section>
 
-<section id="demo-commits">
-  <h2>Also: AI-driven commit-message cleanup</h2>
-  <pre><code># Improve commits on the current branch
-omni-dev git commit message twiddle 'origin/main..HEAD' --use-context
+  <div class="tab-panel" role="tabpanel" id="panel-confluence" aria-labelledby="tab-confluence" data-panel="confluence" hidden>
+    <p class="panel-caption">
+      A Q3 priorities JFM file exercises Confluence-specific elements: a two-column
+      layout, a decision list, a nested expand block, an info panel containing a
+      warning panel, plus the inline-comment anchor that gets attached in a separate
+      CLI call.
+    </p>
+    <div class="demo-grid">
+      <div class="demo-cast"><div id="cast-confluence" class="asciinema-player-wrap"></div></div>
+      <div class="demo-renders">
+        <figure>
+          <a href="{{ get_url(path='screenshots/confluence-page.png') }}" target="_blank" rel="noopener">
+            <img src="{{ get_url(path='screenshots/confluence-page.png') }}" alt="Resulting Confluence page rendered in Atlassian Cloud" loading="lazy">
+          </a>
+          <figcaption>Resulting Confluence page &mdash; the yellow highlight on &ldquo;thundering herd&rdquo; (further down) is the inline-comment anchor from the second command.</figcaption>
+        </figure>
+      </div>
+    </div>
+  </div>
 
-# Before: "fix stuff", "wip", "update files"
-# After:  "feat(auth): implement OAuth2 authentication system"
-#         "docs(api): add comprehensive endpoint documentation"
-#         "fix(ui): resolve mobile responsive layout issues"
+  <div class="tab-panel" role="tabpanel" id="panel-pr" aria-labelledby="tab-pr" data-panel="pr" hidden>
+    <p class="panel-caption">
+      Three commits ahead of <code>main</code>. <code>omni-dev git branch create pr</code>
+      reads the commits, asks Claude for a PR title and body that summarises them,
+      pushes the branch, and opens the PR via <code>gh</code>.
+    </p>
+    <div class="demo-grid">
+      <div class="demo-cast"><div id="cast-pr" class="asciinema-player-wrap"></div></div>
+      <div class="demo-renders">
+        <figure>
+          <a href="{{ get_url(path='screenshots/pr-result.png') }}" target="_blank" rel="noopener">
+            <img src="{{ get_url(path='screenshots/pr-result.png') }}" alt="Resulting GitHub pull request page" loading="lazy">
+          </a>
+          <figcaption>Resulting PR on <a href="https://github.com/rust-works/omni-dev-demo/pull/1">rust-works/omni-dev-demo#1</a> &mdash; title and body generated from the three commits on the branch.</figcaption>
+        </figure>
+      </div>
+    </div>
+  </div>
 
-# Create a PR with AI-generated description
-omni-dev git branch create pr</code></pre>
+  <div class="tab-panel" role="tabpanel" id="panel-twiddle" aria-labelledby="tab-twiddle" data-panel="twiddle" hidden>
+    <p class="panel-caption">
+      Three deliberately messy commits (<code>wip</code>, <code>stuff</code>,
+      <code>fix</code>). <code>omni-dev commit message twiddle</code> reads each diff,
+      asks Claude for a Conventional Commits message that reflects the change, and
+      rewrites the branch via <code>git rebase</code>.
+    </p>
+    <div class="demo-grid">
+      <div class="demo-cast"><div id="cast-twiddle" class="asciinema-player-wrap"></div></div>
+      <div class="demo-renders">
+        <figure>
+          <a href="{{ get_url(path='screenshots/twiddle-result.png') }}" target="_blank" rel="noopener">
+            <img src="{{ get_url(path='screenshots/twiddle-result.png') }}" alt="GitHub commit list showing the rewritten commit messages" loading="lazy">
+          </a>
+          <figcaption>Top three commits on <a href="https://github.com/rust-works/omni-dev-demo/commits/demo/twiddle">demo/twiddle</a> after force-push &mdash; the three messy messages are gone.</figcaption>
+        </figure>
+      </div>
+    </div>
+  </div>
 </section>
 {% endblock %}
 
 {% block scripts %}
 <script>
-  AsciinemaPlayer.create(
-    '{{ get_url(path="demo-atlassian.cast") }}',
-    document.getElementById('demo-player'),
-    { autoPlay: true, loop: true, speed: 1, fit: 'width', poster: 'npt:0:01' }
-  );
+  (function () {
+    const casts = {
+      jira:       '{{ get_url(path="demo-jira.cast") }}',
+      confluence: '{{ get_url(path="demo-confluence.cast") }}',
+      pr:         '{{ get_url(path="demo-pr.cast") }}',
+      twiddle:    '{{ get_url(path="demo-twiddle.cast") }}'
+    };
+    const players = {};
+
+    function createPlayer(name) {
+      if (players[name]) return players[name];
+      players[name] = AsciinemaPlayer.create(
+        casts[name],
+        document.getElementById('cast-' + name),
+        { autoPlay: true, loop: true, speed: 1, fit: 'width', poster: 'npt:0:01' }
+      );
+      return players[name];
+    }
+
+    function activate(name) {
+      document.querySelectorAll('.tab').forEach(t => {
+        const on = t.dataset.tab === name;
+        t.classList.toggle('is-active', on);
+        t.setAttribute('aria-selected', on ? 'true' : 'false');
+        t.tabIndex = on ? 0 : -1;
+      });
+      document.querySelectorAll('.tab-panel').forEach(p => {
+        const on = p.dataset.panel === name;
+        p.classList.toggle('is-active', on);
+        if (on) { p.removeAttribute('hidden'); } else { p.setAttribute('hidden', ''); }
+      });
+      createPlayer(name);
+    }
+
+    const tabs = Array.from(document.querySelectorAll('.tab'));
+    tabs.forEach((tab, i) => {
+      tab.addEventListener('click', () => activate(tab.dataset.tab));
+      tab.addEventListener('keydown', (e) => {
+        let next = null;
+        if (e.key === 'ArrowRight') next = tabs[(i + 1) % tabs.length];
+        else if (e.key === 'ArrowLeft') next = tabs[(i - 1 + tabs.length) % tabs.length];
+        else if (e.key === 'Home') next = tabs[0];
+        else if (e.key === 'End') next = tabs[tabs.length - 1];
+        if (next) { e.preventDefault(); activate(next.dataset.tab); next.focus(); }
+      });
+    });
+
+    // Eager-init the visible (first) tab so the cast starts on load.
+    activate('jira');
+  })();
 </script>
 {% endblock %}

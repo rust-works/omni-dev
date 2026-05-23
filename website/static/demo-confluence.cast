@@ -1,0 +1,10 @@
+{"version":2,"width":100,"height":30,"timestamp":1779548848,"idle_time_limit":1.5,"command":"bash confluence/demo.sh","env":{"SHELL":"/bin/zsh"}}
+[0.009216, "o", "\u001b[1;36m$\u001b[0m head -20 page.md && echo \"... (full file in the omni-dev-demo repo)\"\r\n"]
+[0.422435, "o", "---\r\ntype: confluence\r\ninstance: https://rustworks.atlassian.net\r\nspace_key: SD\r\ntitle: Q3 platform priorities (demo)\r\n---\r\n\r\n# Q3 platform priorities\r\n\r\nOwners: @platform-team · Last reviewed :date[2026-05-22]{timestamp=1779840000000} · Status: :status[Draft]{color=blue}\r\n\r\n:::panel{type=info}\r\nThis page is the **single source of truth** for the Q3 platform roadmap. Pinned in #engineering. Update via PR to [omni-dev-demo/confluence/page.md](https://github.com/rust-works/omni-dev-demo) — every change round-trips through `omni-dev atlassian confluence write`.\r\n:::\r\n\r\n::::layout\r\n:::column\r\n## Goals\r\n\r\n1. **Cut p99 ingest latency** from 1.4s → 600ms\r\n"]
+[0.422755, "o", "... (full file in the omni-dev-demo repo)\r\n\r\n"]
+[1.857257, "o", "\u001b[1;36m$\u001b[0m PAGE=$(omni-dev atlassian confluence create page.md) && echo \"Created page $PAGE\"\r\n"]
+[3.357257, "o", "Created page 1966154\r\n\r\n"]
+[4.785597, "o", "\u001b[1;36m$\u001b[0m omni-dev atlassian confluence comment add-inline $PAGE --anchor-text \"thundering herd\" comment.md\r\n"]
+[6.238337, "o", "Inline comment added to page 1966154 anchored to \"thundering herd\" (occurrence 1 of 1).\r\n"]
+[6.244371, "o", "\r\n"]
+[7.744371, "x", "0"]
