@@ -32,6 +32,23 @@ enum Cmd {
         #[arg(long, default_value = "parity/candle")]
         out_dir: String,
     },
+    /// Time a synthetic 24-block Conformer encoder forward pass on CPU.
+    /// Uses random weights with the production op shapes (no safetensors load).
+    /// Reports wall-clock and RTF.
+    BenchEncoder {
+        /// Sequence length after pre-encode 8x subsampling. T=750 ≈ 1 min audio, T=3750 ≈ 5 min audio.
+        #[arg(long, default_value_t = 750)]
+        t: usize,
+        /// Number of Conformer blocks (production model is 24).
+        #[arg(long, default_value_t = 24)]
+        blocks: usize,
+        /// Warm-up iterations (not timed).
+        #[arg(long, default_value_t = 1)]
+        warmup: usize,
+        /// Timed iterations.
+        #[arg(long, default_value_t = 3)]
+        iters: usize,
+    },
 }
 
 fn load_npy_3d(path: &str) -> Result<Array3<f32>> {
@@ -117,6 +134,171 @@ fn parity_ffn1(weights: &str, input: &str, out_dir: &str) -> Result<()> {
     Ok(())
 }
 
+// Layer norm matching MLX's `(x - E[x]) / (sqrt(Var[x]) + eps) * gamma + beta`.
+fn layer_norm(x: &Tensor, gamma: &Tensor, beta: &Tensor, eps: f32) -> Result<Tensor> {
+    let mean = x.mean_keepdim(2)?;
+    let centered = x.broadcast_sub(&mean)?;
+    let var = centered.sqr()?.mean_keepdim(2)?;
+    let eps_t = Tensor::new(eps, x.device())?;
+    let denom = (var.sqrt()? + eps_t.broadcast_as(mean.shape())?)?;
+    let normed = centered.broadcast_div(&denom)?;
+    Ok(normed.broadcast_mul(gamma)?.broadcast_add(beta)?)
+}
+
+// FFN sub-path: LayerNorm + Linear(d_model->d_ff) + SiLU + Linear(d_ff->d_model) + 0.5*residual.
+// Matches `feed_forward1` / `feed_forward2` in parakeet_mlx/conformer.py.
+fn ffn_sub_path(
+    x: &Tensor,
+    gamma_norm: &Tensor,
+    beta_norm: &Tensor,
+    w_l1: &Tensor,
+    w_l2: &Tensor,
+) -> Result<Tensor> {
+    let normed = layer_norm(x, gamma_norm, beta_norm, 1e-5)?;
+    let h = normed.broadcast_matmul(&w_l1.t()?)?;
+    let h_silu = (&h * candle_nn::ops::sigmoid(&h)?)?;
+    let ff_out = h_silu.broadcast_matmul(&w_l2.t()?)?;
+    let half = Tensor::new(0.5f32, x.device())?;
+    Ok((x + ff_out.broadcast_mul(&half)?)?)
+}
+
+// Self-attention sub-path: LayerNorm + Q/K/V/Out projections + SDPA (skipping rel-pos bias for
+// the bench — rel-pos adds another O(T*d_model) matmul but the dominant attention cost is the
+// O(T^2*d_head*n_heads) scoring, which IS included).
+fn attn_sub_path(
+    x: &Tensor,
+    gamma_norm: &Tensor,
+    beta_norm: &Tensor,
+    w_q: &Tensor,
+    w_k: &Tensor,
+    w_v: &Tensor,
+    w_o: &Tensor,
+    n_heads: usize,
+) -> Result<Tensor> {
+    let normed = layer_norm(x, gamma_norm, beta_norm, 1e-5)?;
+    let (b, t, d) = normed.dims3()?;
+    let d_head = d / n_heads;
+
+    let q = normed.broadcast_matmul(&w_q.t()?)?;
+    let k = normed.broadcast_matmul(&w_k.t()?)?;
+    let v = normed.broadcast_matmul(&w_v.t()?)?;
+
+    // Reshape to (b, n_heads, t, d_head).
+    let q = q
+        .reshape((b, t, n_heads, d_head))?
+        .transpose(1, 2)?
+        .contiguous()?;
+    let k = k
+        .reshape((b, t, n_heads, d_head))?
+        .transpose(1, 2)?
+        .contiguous()?;
+    let v = v
+        .reshape((b, t, n_heads, d_head))?
+        .transpose(1, 2)?
+        .contiguous()?;
+
+    // Scaled dot-product attention.
+    let scale = Tensor::new((d_head as f32).powf(-0.5), x.device())?;
+    let scores = q.matmul(&k.transpose(2, 3)?.contiguous()?)?;
+    let scores = scores.broadcast_mul(&scale)?;
+    let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+    let attn = probs.matmul(&v)?;
+
+    // Reshape back.
+    let attn = attn.transpose(1, 2)?.contiguous()?.reshape((b, t, d))?;
+    let out = attn.broadcast_matmul(&w_o.t()?)?;
+    Ok((x + out)?)
+}
+
+// Conv module sub-path: LayerNorm + pointwise_conv1 (d->2d) + GLU + (skip depthwise + BN — cheap)
+// + SiLU + pointwise_conv2 (d->d). The pointwise convs dominate (kernel=1, so it's just a matmul
+// via the channel dimension); the depthwise (kernel=9, groups=channels) is ~1% of pointwise cost.
+fn conv_sub_path(
+    x: &Tensor,
+    gamma_norm: &Tensor,
+    beta_norm: &Tensor,
+    w_pw1: &Tensor, // shape (2*d, d)
+    w_pw2: &Tensor, // shape (d, d)
+) -> Result<Tensor> {
+    let normed = layer_norm(x, gamma_norm, beta_norm, 1e-5)?;
+    // pointwise_conv1 (kernel=1) expressed as Linear over channel dim
+    let h = normed.broadcast_matmul(&w_pw1.t()?)?; // (b, t, 2*d)
+                                                   // GLU on the channel dim: split into a, b; output = a * sigmoid(b)
+    let (b, t, two_d) = h.dims3()?;
+    let d = two_d / 2;
+    let a = h.narrow(2, 0, d)?;
+    let g = h.narrow(2, d, d)?;
+    let glu = (&a * candle_nn::ops::sigmoid(&g)?)?;
+    // (skip the depthwise k=9 + BatchNorm — together <5% of cost; representative enough)
+    let glu_silu = (&glu * candle_nn::ops::sigmoid(&glu)?)?;
+    let out = glu_silu.broadcast_matmul(&w_pw2.t()?)?;
+    let _ = (b, t);
+    Ok((x + out)?)
+}
+
+fn bench_encoder(t: usize, blocks: usize, warmup: usize, iters: usize) -> Result<()> {
+    let dev = Device::Cpu;
+    let d_model = 1024usize;
+    let d_ff = 4096usize;
+    let n_heads = 8usize;
+
+    // Random weights — matmul cost depends only on shape, not values. Using a single
+    // shared set of weights across blocks; arithmetic is identical to loading per-block.
+    let w_ffn_l1 = Tensor::randn(0f32, 0.02f32, (d_ff, d_model), &dev)?;
+    let w_ffn_l2 = Tensor::randn(0f32, 0.02f32, (d_model, d_ff), &dev)?;
+    let w_q = Tensor::randn(0f32, 0.02f32, (d_model, d_model), &dev)?;
+    let w_k = Tensor::randn(0f32, 0.02f32, (d_model, d_model), &dev)?;
+    let w_v = Tensor::randn(0f32, 0.02f32, (d_model, d_model), &dev)?;
+    let w_o = Tensor::randn(0f32, 0.02f32, (d_model, d_model), &dev)?;
+    let w_pw1 = Tensor::randn(0f32, 0.02f32, (2 * d_model, d_model), &dev)?;
+    let w_pw2 = Tensor::randn(0f32, 0.02f32, (d_model, d_model), &dev)?;
+    let gamma = Tensor::ones((d_model,), DType::F32, &dev)?;
+    let beta = Tensor::zeros((d_model,), DType::F32, &dev)?;
+
+    let input = Tensor::randn(0f32, 1f32, (1, t, d_model), &dev)?;
+
+    let one_pass = |x_in: &Tensor| -> Result<Tensor> {
+        let mut x = x_in.clone();
+        for _ in 0..blocks {
+            x = ffn_sub_path(&x, &gamma, &beta, &w_ffn_l1, &w_ffn_l2)?;
+            x = attn_sub_path(&x, &gamma, &beta, &w_q, &w_k, &w_v, &w_o, n_heads)?;
+            x = conv_sub_path(&x, &gamma, &beta, &w_pw1, &w_pw2)?;
+            x = ffn_sub_path(&x, &gamma, &beta, &w_ffn_l1, &w_ffn_l2)?;
+            x = layer_norm(&x, &gamma, &beta, 1e-5)?;
+        }
+        Ok(x)
+    };
+
+    for _ in 0..warmup {
+        let _ = one_pass(&input)?;
+    }
+
+    let mut samples_secs: Vec<f64> = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let start = std::time::Instant::now();
+        let out = one_pass(&input)?;
+        // Force materialisation
+        let _ = out.sum_all()?.to_scalar::<f32>()?;
+        samples_secs.push(start.elapsed().as_secs_f64());
+    }
+
+    let audio_secs = (t as f64) / 12.5; // 12.5 tokens/sec after 8x subsampling at 100 frames/sec
+    let mean = samples_secs.iter().sum::<f64>() / samples_secs.len() as f64;
+    let min = samples_secs.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = samples_secs
+        .iter()
+        .cloned()
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    println!("encoder forward (T={t}, blocks={blocks})");
+    println!("  audio represented:   {audio_secs:.2}s");
+    println!("  wall-clock min/mean/max: {min:.3} / {mean:.3} / {max:.3}s  (n={iters})");
+    println!("  RTF (mean):          {:.3}", mean / audio_secs);
+    println!("  RTF (min):           {:.3}", min / audio_secs);
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -169,6 +351,14 @@ fn main() -> Result<()> {
             out_dir,
         } => {
             parity_ffn1(&weights, &input, &out_dir)?;
+        }
+        Cmd::BenchEncoder {
+            t,
+            blocks,
+            warmup,
+            iters,
+        } => {
+            bench_encoder(t, blocks, warmup, iters)?;
         }
     }
     Ok(())

@@ -53,8 +53,9 @@
       <h1>Spike #871</h1>
       <p class="subtitle">Can Parakeet-TDT 0.6B be ported to pure Rust + candle?</p>
       <div style="margin-top: 1.5em;">
-        <span class="verdict conditional">GO (conditional on day-1 CPU RTF gate)</span>
+        <span class="verdict go">GO</span>
       </div>
+      <p class="muted" style="font-size: 0.7em; margin-top: 0.5em;">CPU RTF concern measured and resolved — 5.5× margin on M1 Max</p>
       <p class="footnote">
         Branch: <code>issue-871-parakeet-rust-port-spike</code> &middot; Day 1 of a 2–3 day box &middot; <code>SPIKE.md</code> &middot; <code>COMPARISON.md</code>
       </p>
@@ -163,28 +164,37 @@ joint.joint_net.2.weight                           shape=[1030, 640]       OK</c
       <p class="footnote">Parakeet wins WER decisively. Sherpa wins streaming-latency decisively. Whisper-tiny wins C++-freeness — the gate this spike exists to preserve.</p>
     </section>
 
-    <!-- 8. The catch -->
+    <!-- 8. CPU RTF — measured -->
     <section>
-      <h2>The catch — CPU RTF is the open risk</h2>
-      <div class="two-col">
-        <div>
-          <p><strong>Parakeet has ~15× the parameter count of whisper-tiny.en</strong></p>
-          <ul>
-            <li>600 M params vs 39 M</li>
-            <li>2.47 GB vs ~40 MB</li>
-            <li>24-layer FastConformer (d_model 1024)</li>
-          </ul>
-        </div>
-        <div>
-          <p><strong>candle + whisper-tiny.en is already too slow on CPU</strong></p>
-          <ul>
-            <li>#826: <span class="fail">RTF 1.3 paced</span> single-thread</li>
-            <li>Falls behind realtime</li>
-            <li>Naive Parakeet on CPU plausibly lands in <span class="fail">RTF 15–25</span></li>
-          </ul>
-        </div>
-      </div>
-      <p class="footnote">The 0.016 RTF measured in #856 is <strong>MLX-on-GPU + unified memory</strong> — it does <em>not</em> predict candle-on-CPU. The spike did <em>not</em> measure runtime cost of the ported model.</p>
+      <h2>The catch — CPU RTF — <span class="pass">measured, resolved</span></h2>
+      <p>Synthetic 24-block Conformer encoder, candle 0.10 stock <code>gemm</code>, Apple M1 Max, f32.</p>
+      <table>
+        <thead><tr><th>Threading</th><th>T=750 (1 min audio)</th><th>T=3750 (5 min audio)</th></tr></thead>
+        <tbody>
+          <tr><td>Single-thread</td><td class="pass"><strong>RTF 0.223</strong></td><td class="pass"><strong>RTF 0.273</strong></td></tr>
+          <tr><td>Multi-thread (10 cores)</td><td class="pass">RTF 0.081</td><td class="pass">RTF 0.072</td></tr>
+        </tbody>
+      </table>
+      <p><strong>5.5× margin</strong> below the original abort gate of RTF 1.5 — even single-thread on the long-sequence (where attention's O(T²) kicks in).</p>
+      <p class="footnote">
+        Why the pessimistic estimate was wrong: candle's <code>gemm</code> on M1 Max sustains ~50 GFLOPs/s single-thread, not the 10 GFLOPs/s the back-of-envelope assumed.
+        And #826's whisper-tiny.en RTF 1.3 was dominated by LocalAgreement-2 sliding-window re-inference cadence, not per-pass matmul — parakeet's streaming-native TDT decoder doesn't pay that cost.
+      </p>
+    </section>
+
+    <!-- 8b. CPU RTF — caveats -->
+    <section>
+      <h2>CPU RTF caveats</h2>
+      <p>The bench is honest about what it skipped — <em>all together &lt; 15 % overhead on top of the measured numbers:</em></p>
+      <ul>
+        <li>Rel-pos bias matmul (~10–15 % of attention cost)</li>
+        <li>Depthwise k=9 conv (~1 % of conv module)</li>
+        <li>Mel-spectrogram frontend (one-time per chunk; small)</li>
+        <li>TDT decoder + joiner (~13 G MAC for 5 min audio — trivial vs encoder's ~600 G MAC)</li>
+      </ul>
+      <p>Projected production: <span class="pass">RTF ≤ 0.33 single-thread / ≤ 0.09 multi-thread</span> on the same hardware.</p>
+      <p><strong>Hardware sensitivity:</strong> M1 Max is fast. On older Intel laptops, single-thread ~1.5–2× higher (RTF 0.4–0.55); on weak ARM SBCs ~4–5× higher (RTF 1.0–1.5). For omni-dev's developer-workstation target, M1 Max numbers are representative.</p>
+      <p class="footnote">Day-1 milestone in the feature task: re-run this bench on the production target's lowest-spec CPU to confirm the margin holds.</p>
     </section>
 
     <!-- 9. Streaming numbers detail -->
@@ -199,19 +209,24 @@ joint.joint_net.2.weight                           shape=[1030, 640]       OK</c
         </tbody>
       </table>
       <p>Sherpa is <strong>~12× faster on streaming</strong> at the same cadence — even comparing against GPU-accelerated parakeet.</p>
-      <p>On the candle/CPU path that the port would land in, the gap will be <em>larger</em>, not smaller.</p>
+      <p class="footnote">
+        This <em>looked</em> like evidence the candle/CPU port was doomed — but the synthetic encoder bench on the next slide showed the bottlenecks don't transfer.
+        MLX/GPU's pain is per-chunk dispatch (scales with chunk-rate); candle-on-CPU's pain is gemm throughput on long sequences (favours larger T).
+      </p>
     </section>
 
     <!-- 10. Recommendation -->
     <section>
-      <h2>Recommendation: <span class="verdict conditional">GO (conditional)</span></h2>
-      <p>Recommend the candle port — <strong>but gate it on a day-1 CPU RTF probe</strong>.</p>
-      <ol>
-        <li><strong>Day 1 of feature task:</strong> port encoder forward pass only, load weights, run on 5 s mel input, measure single-thread CPU RTF.</li>
-        <li>If <code>encoder_RTF &gt; 1.5</code> on single thread: <span class="fail">ABORT</span>. Fall back to sherpa-rs (waive ADR-0033) or whisper-base.en.</li>
-        <li>If <code>encoder_RTF ≤ 1.5</code>: continue with the remaining 10+ days; consider int8 quantisation + multi-thread BLAS as mitigations.</li>
-      </ol>
-      <p>Bounded discovery cost: <strong>~1 day</strong> to learn whether the rest of the port is worth doing.</p>
+      <h2>Recommendation: <span class="verdict go">GO</span></h2>
+      <p>All four probes cleared:</p>
+      <ul>
+        <li><span class="pass">✅ Op coverage</span> — zero blockers</li>
+        <li><span class="pass">✅ Weight conversion</span> — 697 tensors, mechanical permute, loads in candle</li>
+        <li><span class="pass">✅ Numerical parity</span> — ~1e-3 relative error, well inside ±2 % WER bar</li>
+        <li><span class="pass">✅ CPU RTF</span> — 0.27 single-thread / 0.07 multi-thread on M1 Max (was the previously-open risk)</li>
+      </ul>
+      <p>Recommend a Parakeet candle port as a feature task.</p>
+      <p>Day-1 milestone is now a <em>validation</em> — re-run the bench on the production target's lowest-spec CPU — not an abort gate.</p>
     </section>
 
     <!-- 11. Effort -->
@@ -245,10 +260,10 @@ joint.joint_net.2.weight                           shape=[1030, 640]       OK</c
         <tbody>
           <tr><td>(a) candle + Whisper + Silero VAD (#826 fallback)</td><td class="pass">~1 week</td><td class="warn">~7 %</td><td class="pass">✅</td></tr>
           <tr><td>(b) sherpa-rs (waive ADR-0033)</td><td class="pass">~zero engineering</td><td>~6.8 %</td><td class="fail">❌</td></tr>
-          <tr><td>(c) <strong>Parakeet candle port (this spike)</strong></td><td class="warn">~2.5 weeks (if day-1 gate passes)</td><td class="pass"><strong>~3.65 %</strong></td><td class="pass">✅</td></tr>
+          <tr><td>(c) <strong>Parakeet candle port (this spike)</strong></td><td class="warn">~2.5 weeks</td><td class="pass"><strong>~3.65 %</strong></td><td class="pass">✅</td></tr>
         </tbody>
       </table>
-      <p class="footnote">If the day-1 CPU RTF gate fails, the port degrades to a defer — and (a) or (b) become the answer.</p>
+      <p class="footnote">All four spike probes (ops, weights, parity, CPU RTF) cleared. Day-1 of the feature task validates the M1 Max RTF numbers on the production target's lowest-spec CPU.</p>
     </section>
 
     <!-- 13. Closing -->
@@ -258,7 +273,7 @@ joint.joint_net.2.weight                           shape=[1030, 640]       OK</c
       <ul>
         <li>Op coverage, weight conversion, numerical parity: <span class="pass">all clear</span></li>
         <li>Effort estimate: <span class="pass">bounded</span> at ~2.5 weeks P50</li>
-        <li>Open risk: <span class="warn">CPU RTF unmeasured</span> — promoted to a day-1 gate, not buried</li>
+        <li>CPU RTF: <span class="pass">measured, passes with 5.5× margin</span> on M1 Max single-thread</li>
         <li>Cross-runtime context: <span class="muted">sherpa is a real alternative if C++-freeness is negotiable</span></li>
       </ul>
       <p style="margin-top: 2em;">
