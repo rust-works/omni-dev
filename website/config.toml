@@ -1,0 +1,16 @@
+base_url = "https://omni-dev.john-ky.io"
+title = "omni-dev"
+description = "An intelligent Git commit message toolkit with AI-powered contextual intelligence."
+default_language = "en"
+compile_sass = true
+build_search_index = false
+generate_feeds = false
+
+[markdown]
+highlight_code = true
+highlight_theme = "base16-ocean-dark"
+
+[extra]
+github_url = "https://github.com/rust-works/omni-dev"
+crates_url = "https://crates.io/crates/omni-dev"
+docs_url = "https://docs.rs/omni-dev"
