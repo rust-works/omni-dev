@@ -1,0 +1,13 @@
+{"version":2,"width":100,"height":30,"timestamp":1779550855,"idle_time_limit":1.5,"command":"bash pr/demo.sh","env":{"SHELL":"/bin/zsh"}}
+[0.025028, "o", "\u001b[1;36m$\u001b[0m git log --oneline origin/main..HEAD\r\n"]
+[0.474675, "o", "6c7e5cb (HEAD -> demo/pr, origin/demo/pr) docs(webhooks): clarify dedup contract on at-least-once delivery\r\n0f200f9 feat(webhooks): adopt per-tenant token bucket at the edge\r\n"]
+[0.474696, "o", "385df9e docs(webhooks): document Q3 non-goals\r\n"]
+[0.475038, "o", "\r\n"]
+[1.975038, "o", "\u001b[1;36m$\u001b[0m omni-dev git branch create pr --auto-apply\r\n"]
+[2.952204, "o", "✓ Claude Code CLI credentials verified (model: claude-sonnet-4-6)\r\n✓ GitHub CLI verified\r\n🔄 Starting pull request creation process...\r\n"]
+[3.525054, "o", "📋 Project guidance files status:\r\n   📂 Config dir: .omni-dev (default)\r\n   🔀 PR guidelines: ❌ None found\r\n   🎯 Valid scopes: ✅ Global: /Users/jky/.omni-dev/scopes.yaml (12 scopes)\r\n   📋 PR template: ❌ None found\r\n\r\n🤖 AI Model Configuration:\r\n   📡 Model: \u001b[33mclaude-sonnet-4-6\u001b[0m\r\n   🏷️  Provider: claude\r\n   📊 Generation: 4.6\r\n   ⭐ Tier: balanced (Good balance of capability and speed)\r\n   📤 Max output tokens: 64000\r\n   📥 Input context: 200000\r\n\r\n📊 Branch Analysis:\r\n   🌿 Current branch: demo/pr\r\n   📏 Commit range: origin/main..HEAD\r\n   📝 Commits found: 3 commits\r\n\r\n🔍 Context Analysis:\r\n   📁 Valid scopes: core, cli, api, ui, db, config, deps, test, docs, ci, build, perf\r\n   🌿 Branch: Pr (feature development)\r\n   📖 Pattern: Documentation updates\r\n   📂 Files: 1 analyzed\r\n   📝 Detail level: Comprehensive (significant changes detected)\r\n\r\n🤖 Generating AI-powered PR description...\r\n"]
+[5.025054, "o", "🚀 Creating pull request (draft)...\r\n   📋 Title: docs(webhooks): document non-goals, dedup contract, and rate-limit strategy\r\n   🌿 Branch: demo/pr\r\n"]
+[6.525054, "o", "📤 Pushing branch to remote...\r\n"]
+[8.025054, "o", "🎉 Pull request created: https://github.com/rust-works/omni-dev-demo/pull/1\r\n✅ Pull request created successfully!\r\n"]
+[8.027814, "o", "\r\n"]
+[9.527814, "x", "0"]
