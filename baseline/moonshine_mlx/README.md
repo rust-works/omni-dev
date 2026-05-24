@@ -30,23 +30,31 @@ Silicon.
 
 `mlx-audio` only exposes Moonshine offline — its `Model.generate()` does
 the whole audio in one call, and the `stream: bool` parameter is dead
-code. The streaming-trained variants
-(`UsefulSensors/moonshine-streaming-{tiny,small,medium}`) live in the
-upstream `moonshine-ai/moonshine` project and are driven via the
-`useful-moonshine` package (or `transformers` directly), not `mlx-audio`.
+code. The streaming-trained variants live in the upstream
+`moonshine-ai/moonshine` project and ship via the
+[`moonshine-voice`](https://pypi.org/project/moonshine-voice/) PyPI
+package, which exposes a `Transcriber.add_audio(chunk, sample_rate)`
+push API + event-listener callbacks. `moonshine-voice` is
+ONNX-Runtime-backed (CoreML execution provider on macOS), not MLX.
 
 So we split:
 
 | File | Backend | Measures |
 |---|---|---|
 | `run.py` | `mlx-audio` (MLX/Metal) | Offline WER + load + RTF + peak RSS |
-| `run_streaming.py` | `useful-moonshine` / `transformers` (CPU/CUDA) | Streaming WER at 100/500 ms cadence; streaming-vs-offline delta; partial latency P50/P95 |
+| `run_streaming.py` | `moonshine-voice` (ONNX/CoreML on macOS) | Streaming WER at 100/500 ms cadence; streaming-vs-offline delta; partial latency P50/P95 |
 
 **Important caveat:** the streaming path is *not* MLX-accelerated. Its
 absolute latency / RTF / peak RSS are informational only and not directly
 comparable to the other MLX baselines. The streaming-vs-offline **WER
-delta** (Moonshine's load-bearing claim) is API-independent — that
+delta** (Moonshine's load-bearing claim) is runtime-independent — that
 remains the headline number.
+
+> A note on the package landscape: the earlier-named `useful-moonshine`
+> PyPI package is stale (single 2024-10-16 release, no streaming
+> variants). `useful-moonshine-onnx` exists but is an ONNX-only
+> distribution. `moonshine-voice` is the current canonical upstream
+> package and is what this harness uses.
 
 ## Setup
 

@@ -1,22 +1,18 @@
-# Pin to exact versions after first successful install on the spike host;
-# leave as floors / TBD until then.
+# Pinned to the exact versions used for the #873 measurements.
 
 # Offline path (run.py): MLX-accelerated Moonshine via mlx-audio.
-mlx-audio>=0.2
+# Note: mlx-audio's Moonshine generate() is offline-only and has no
+# streaming API; the model's encoder also caps at ~30 s input (max
+# position_embeddings = 512), so the harness chunks the audio.
+mlx-audio==0.4.3
 
-# Streaming path (run_streaming.py): upstream streaming-trained Moonshine.
-# The exact package name and version need to be confirmed against the
-# moonshine-ai/moonshine repo at install time — the streaming variants
-# ship via `useful-moonshine` or are loaded directly from HF
-# (`UsefulSensors/moonshine-streaming-medium`) with the `transformers`
-# library. Adjust the requirement below to match whatever the upstream
-# README points at.
-useful-moonshine>=0.1
-transformers>=4.46
-torch>=2.2
+# Streaming path (run_streaming.py): canonical upstream Moonshine package.
+# Ships the streaming-trained variants (Tiny/Base/Small/Medium Streaming)
+# and exposes a Transcriber(add_audio, add_listener) API. ONNX/CoreML-
+# backed on macOS, not MLX. See README.md for the runtime caveat.
+moonshine-voice==0.0.59
 
 # Shared
-soundfile~=0.13
-numpy>=2.0,<3
-python-ulid~=3.0
-huggingface_hub>=0.25
+soundfile==0.13.1
+numpy==2.4.6
+python-ulid==3.1.0

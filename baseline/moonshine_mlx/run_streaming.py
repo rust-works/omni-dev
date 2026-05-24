@@ -1,34 +1,34 @@
 #!/usr/bin/env python3
 """moonshine baseline harness (streaming) for #873.
 
-Drives **upstream streaming Moonshine** (`UsefulSensors/moonshine-streaming-*`
-via the `useful-moonshine` / `transformers` path) at a configurable chunk
-cadence, paced to simulated realtime, and emits a JSONL event log
-conforming to [`baseline/src/events.rs`](../src/events.rs).
+Drives **streaming-trained Moonshine** (`moonshine-voice` package's
+Transcriber class) at a configurable chunk cadence, paced to simulated
+realtime, and emits a JSONL event log conforming to
+[`baseline/src/events.rs`](../src/events.rs).
 
-This is the **load-bearing measurement** for #873: does Moonshine — which
-the paper claims is *trained* with sliding-window attention (a streaming-
-native architecture, not an inference-time approximation) — actually
-retain its offline WER under streaming, or does it drift in the same way
-parakeet-mlx did (#872 measured ~3 pp drift per minute of stream at
-`depth=1` because parakeet-tdt-0.6b-v2 is offline-trained)?
+This is the **load-bearing measurement** for #873: does Moonshine —
+which the paper claims is *trained* with sliding-window attention (a
+streaming-native architecture, not an inference-time approximation) —
+actually retain its offline WER under streaming, or does it drift in
+the same way parakeet-mlx did (#872 measured ~3 pp drift per minute of
+stream at `depth=1` because parakeet-tdt-0.6b-v2 is offline-trained)?
 
 ## Why not `mlx-audio`?
 
 `mlx-audio` (the library used by [`run.py`](run.py)) does not expose a
-streaming API for Moonshine at the time of writing — its `Model.generate()`
-is offline-only and the `stream: bool` parameter is dead code. The
-upstream Moonshine project (`useful-moonshine` PyPI package, GitHub
-[moonshine-ai/moonshine](https://github.com/moonshine-ai/moonshine)) ships
-streaming-trained variants on HuggingFace as `UsefulSensors/moonshine-
-streaming-{tiny,small,medium}`. We drive those here.
+streaming API for Moonshine — its `Model.generate()` is offline-only.
+The streaming-trained variants live in the upstream
+`moonshine-ai/moonshine` project and ship via `moonshine-voice`, which
+exposes a `Transcriber.add_audio(chunk, sample_rate)` push API +
+event-listener callbacks. `moonshine-voice` is ONNX-Runtime-backed
+(CoreML execution provider on macOS), not MLX.
 
 **Caveat:** unlike `run.py`, this path is *not* MLX/Metal-accelerated.
-Absolute latency numbers are therefore informational only and not
-strictly comparable to the other MLX baselines (sherpa-onnx is CPU,
-parakeet-mlx is MLX/GPU). The load-bearing claim we measure here is the
-**streaming-vs-offline WER delta** (Moonshine's promise) — that delta
-is API-independent and worth reporting even on a CPU/CUDA path.
+Absolute latency / RTF / peak RSS are therefore informational only and
+not strictly comparable to MLX-accelerated baselines. The load-bearing
+claim we measure here is the **streaming-vs-offline WER delta** — that
+delta is runtime-independent and worth reporting even on a non-MLX
+path.
 
 ## Pacing
 
@@ -36,6 +36,11 @@ The push loop sleeps so `wall_ms` catches up to `audio_ms` between
 chunks (simulated realtime). This matches the pacing used in #826's
 binaries and #856's parakeet streaming harness, so partial-latency P95
 is measured the same way across baselines.
+
+The Transcriber has an internal `update_interval` (default 0.5 s) that
+governs how often it materialises a partial. We pass
+`update_interval = chunk_ms / 1000` so partials are emitted at the same
+cadence as the push loop, matching the spike's measurement convention.
 """
 
 from __future__ import annotations
@@ -46,12 +51,10 @@ import sys
 import time
 from pathlib import Path
 
-import numpy as np
 import soundfile as sf
 import ulid
 
 SAMPLE_RATE = 16_000
-DEFAULT_MODEL = "UsefulSensors/moonshine-streaming-medium"
 
 
 def emit(log_fp, event: dict) -> None:
@@ -65,7 +68,15 @@ def main() -> int:
     ap.add_argument("--log", required=True, type=Path)
     ap.add_argument("--transcript", required=True, type=Path)
     ap.add_argument("--chunk-ms", type=int, default=100, help="Chunk cadence in milliseconds")
-    ap.add_argument("--model", default=DEFAULT_MODEL)
+    ap.add_argument(
+        "--model-arch",
+        default="MEDIUM_STREAMING",
+        help=(
+            "moonshine-voice ModelArch enum name. One of: TINY_STREAMING, "
+            "BASE_STREAMING, SMALL_STREAMING, MEDIUM_STREAMING. Default targets "
+            "Medium Streaming (245 M params, 6.65 % WER per the paper)."
+        ),
+    )
     args = ap.parse_args()
 
     audio, sr = sf.read(args.fixture, dtype="float32")
@@ -82,117 +93,131 @@ def main() -> int:
         return (time.monotonic_ns() - t0) // 1_000_000
 
     load_t0 = time.monotonic_ns()
-    # The exact streaming API on UsefulSensors/moonshine-streaming-* must be
-    # confirmed at execution time. As of writing, the upstream
-    # `useful-moonshine` package exposes `MoonshineStreaming` with a
-    # `transcribe_chunk(samples) -> str` method that returns the
-    # cumulative-best partial after each push. If the API has shifted by the
-    # time you run this, adjust the next few lines accordingly — the rest of
-    # the harness (event emission, pacing) is API-agnostic.
-    from moonshine_streaming import MoonshineStreaming  # type: ignore[import-not-found]
+    from moonshine_voice import ModelArch, Transcriber, TranscriptEventListener
+    from moonshine_voice.download import download_model_from_info, find_model_info
 
-    streamer = MoonshineStreaming.from_pretrained(args.model)
+    model_arch = ModelArch[args.model_arch]
+    model_info = find_model_info(language="en", model_arch=model_arch)
+    model_path, resolved_arch = download_model_from_info(model_info)
+    transcriber = Transcriber(
+        model_path=model_path,
+        model_arch=resolved_arch,
+        update_interval=args.chunk_ms / 1000.0,
+    )
     load_ms = (time.monotonic_ns() - load_t0) // 1_000_000
 
     log_fp = args.log.open("w")
     emit(log_fp, {"type": "model_loaded", "wall_ms": wall_ms(), "load_ms": load_ms})
 
-    last_partial_text = ""
-    audio_pushed_ms = 0
-    final_count = 0
+    state: dict = {
+        "last_partial": "",
+        "final_texts": [],
+        "audio_pushed_ms": 0,
+    }
 
-    for i in range(0, len(audio), chunk_samples):
-        chunk = audio[i : i + chunk_samples]
-        if len(chunk) == 0:
-            break
+    class EventEmitter(TranscriptEventListener):
+        def on_line_text_changed(self, event) -> None:  # type: ignore[no-untyped-def]
+            text = (event.line.text or "").strip()
+            if text and text != state["last_partial"]:
+                emit(
+                    log_fp,
+                    {
+                        "type": "partial",
+                        "wall_ms": wall_ms(),
+                        "audio_ms": state["audio_pushed_ms"],
+                        "text": text,
+                    },
+                )
+                state["last_partial"] = text
 
-        # Realtime pacing: sleep so wall_ms catches up to audio_ms.
-        target_wall_ms = audio_pushed_ms
-        actual_wall_ms = wall_ms()
-        if actual_wall_ms < target_wall_ms:
-            time.sleep((target_wall_ms - actual_wall_ms) / 1000.0)
+        def on_line_completed(self, event) -> None:  # type: ignore[no-untyped-def]
+            text = (event.line.text or "").strip()
+            if text:
+                emit(
+                    log_fp,
+                    {
+                        "type": "final",
+                        "wall_ms": wall_ms(),
+                        "audio_ms": state["audio_pushed_ms"],
+                        "event_id": str(ulid.ULID()),
+                        "text": text,
+                        "confidence": 1.0,
+                    },
+                )
+                state["final_texts"].append(text)
+                state["last_partial"] = ""
 
-        result = streamer.transcribe_chunk(chunk)
-        # Normalise: API may return either str or {"text": ..., "is_final": ...}.
-        if isinstance(result, str):
-            partial_text = result
-            is_final = False
-        else:
-            partial_text = result.get("text", "") or ""
-            is_final = bool(result.get("is_final", False))
+        def on_error(self, event) -> None:  # type: ignore[no-untyped-def]
+            print(f"transcriber error: {event}", file=sys.stderr)
 
-        audio_pushed_ms += int(len(chunk) * 1000 / sr)
+    transcriber.add_listener(EventEmitter())
+    transcriber.start()
 
-        if partial_text and partial_text != last_partial_text:
-            emit(
-                log_fp,
-                {
-                    "type": "partial",
-                    "wall_ms": wall_ms(),
-                    "audio_ms": audio_pushed_ms,
-                    "text": partial_text,
-                },
-            )
-            last_partial_text = partial_text
+    try:
+        for i in range(0, len(audio), chunk_samples):
+            chunk = audio[i : i + chunk_samples]
+            if len(chunk) == 0:
+                break
 
-        if is_final and partial_text:
-            emit(
-                log_fp,
-                {
-                    "type": "final",
-                    "wall_ms": wall_ms(),
-                    "audio_ms": audio_pushed_ms,
-                    "event_id": str(ulid.ULID()),
-                    "text": partial_text,
-                    "confidence": 1.0,
-                },
-            )
-            final_count += 1
-            last_partial_text = ""
+            target_wall_ms = state["audio_pushed_ms"]
+            actual_wall_ms = wall_ms()
+            if actual_wall_ms < target_wall_ms:
+                time.sleep((target_wall_ms - actual_wall_ms) / 1000.0)
 
-    # If the streaming API only emits running partials (no per-segment
-    # finals), promote the last partial to a single final at stream end so
-    # scripts/analyze.py has something to compute WER against.
-    if final_count == 0 and last_partial_text:
+            transcriber.add_audio(chunk.tolist(), sr)
+            state["audio_pushed_ms"] += int(len(chunk) * 1000 / sr)
+    finally:
+        transcriber.stop()
+
+    # Stream end: if the transcriber has unfinalised text in flight, promote
+    # the last partial to a final so scripts/analyze.py can compute WER over
+    # the entire stream rather than only completed lines.
+    if state["last_partial"]:
         emit(
             log_fp,
             {
                 "type": "final",
                 "wall_ms": wall_ms(),
-                "audio_ms": audio_pushed_ms,
+                "audio_ms": state["audio_pushed_ms"],
                 "event_id": str(ulid.ULID()),
-                "text": last_partial_text,
+                "text": state["last_partial"],
                 "confidence": 1.0,
             },
         )
-        final_count += 1
+        state["final_texts"].append(state["last_partial"])
+        state["last_partial"] = ""
 
     emit(
         log_fp,
         {
             "type": "endpoint",
             "wall_ms": wall_ms(),
-            "audio_ms": audio_pushed_ms,
+            "audio_ms": state["audio_pushed_ms"],
             "kind": "stream_end",
         },
     )
     emit(
         log_fp,
-        {"type": "stream_end", "wall_ms": wall_ms(), "audio_ms": audio_pushed_ms},
+        {
+            "type": "stream_end",
+            "wall_ms": wall_ms(),
+            "audio_ms": state["audio_pushed_ms"],
+        },
     )
     log_fp.close()
 
-    args.transcript.write_text(last_partial_text + "\n")
+    args.transcript.write_text(" ".join(state["final_texts"]).strip() + "\n")
 
     elapsed_ms = wall_ms()
     rtf = elapsed_ms / total_audio_ms if total_audio_ms else 0.0
+    n_chunks = len(audio) // chunk_samples + (1 if len(audio) % chunk_samples else 0)
     print(
-        f"chunks: {len(audio) // chunk_samples + (1 if len(audio) % chunk_samples else 0)}  "
+        f"chunks: {n_chunks}  "
         f"audio_ms: {total_audio_ms}  "
         f"wall_ms: {elapsed_ms}  "
         f"RTF (wall/audio): {rtf:.3f}  "
         f"load_ms: {load_ms}  "
-        f"finals: {final_count}",
+        f"finals: {len(state['final_texts'])}",
         file=sys.stderr,
     )
     return 0
