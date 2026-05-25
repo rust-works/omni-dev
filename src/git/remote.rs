@@ -21,7 +21,7 @@ impl RemoteInfo {
         let mut remotes = Vec::new();
         let remote_names = repo.remotes().context("Failed to get remote names")?;
 
-        for name in remote_names.iter().flatten() {
+        for name in remote_names.iter().flatten().flatten() {
             if let Ok(remote) = repo.find_remote(name) {
                 let uri = remote.url().unwrap_or("").to_string();
                 let main_branch = Self::detect_main_branch(repo, name)?;
@@ -42,7 +42,7 @@ impl RemoteInfo {
         // First try to get the remote HEAD reference
         let head_ref_name = format!("refs/remotes/{remote_name}/HEAD");
         if let Ok(head_ref) = repo.find_reference(&head_ref_name) {
-            if let Some(target) = head_ref.symbolic_target() {
+            if let Ok(Some(target)) = head_ref.symbolic_target() {
                 // Extract branch name from refs/remotes/origin/main
                 if let Some(branch_name) =
                     target.strip_prefix(&format!("refs/remotes/{remote_name}/"))
@@ -54,7 +54,7 @@ impl RemoteInfo {
 
         // Try using GitHub CLI for GitHub repositories
         if let Ok(remote) = repo.find_remote(remote_name) {
-            if let Some(uri) = remote.url() {
+            if let Ok(uri) = remote.url() {
                 if uri.contains("github.com") {
                     if let Ok(main_branch) = Self::get_github_default_branch(uri) {
                         return Ok(main_branch);

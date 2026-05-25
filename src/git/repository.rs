@@ -61,7 +61,7 @@ impl GitRepository {
         let mut untracked_changes = Vec::new();
 
         for entry in statuses.iter() {
-            if let Some(path) = entry.path() {
+            if let Ok(path) = entry.path() {
                 let status_flags = entry.status();
 
                 // Skip ignored files - they should not affect clean status
@@ -111,7 +111,7 @@ impl GitRepository {
     pub fn get_current_branch(&self) -> Result<String> {
         let head = self.repo.head().context("Failed to get HEAD reference")?;
 
-        if let Some(name) = head.shorthand() {
+        if let Ok(name) = head.shorthand() {
             if name != "HEAD" {
                 return Ok(name.to_string());
             }
