@@ -58,3 +58,4 @@ by Michael Nygard.
 | [ADR-0032](adr-0032.md)  | ✅ Accepted                              | 2026-05-13 | Separate AudioInput Trait at the Transcriber Boundary                                  |
 | [ADR-0033](adr-0033.md)  | ✅ Accepted                              | 2026-05-14 | `candle` as the Production ASR Runtime                                                 |
 | [ADR-0034](adr-0034.md)  | ✅ Accepted                              | 2026-05-14 | `tract-onnx` as the Speaker-Embedding Runtime                                          |
+| [ADR-0035](adr-0035.md)  | ✅ Accepted                              | 2026-05-25 | OS-Gated ASR Backends with Auto-Upgrading Defaults                                     |
