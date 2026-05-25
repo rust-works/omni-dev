@@ -1,0 +1,1217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>omni-dev Tutorial</title>
+  <style>
+    :root {
+      --bg: #fafbfc;
+      --fg: #24292f;
+      --muted: #57606a;
+      --accent: #0969da;
+      --accent-soft: #ddf4ff;
+      --border: #d0d7de;
+      --code-bg: #f6f8fa;
+      --panel-info-bg: #ddf4ff;
+      --panel-info-border: #54aeff;
+      --panel-note-bg: #fff8c5;
+      --panel-note-border: #d4a72c;
+      --panel-warn-bg: #fff1e5;
+      --panel-warn-border: #e16f24;
+      --panel-error-bg: #ffebe9;
+      --panel-error-border: #ff8182;
+      --panel-success-bg: #dafbe1;
+      --panel-success-border: #4ac26b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      color: var(--fg);
+      background: var(--bg);
+      line-height: 1.55;
+    }
+    header {
+      padding: 32px 40px 16px;
+      border-bottom: 1px solid var(--border);
+      background: white;
+    }
+    header h1 { margin: 0 0 8px; font-size: 24px; }
+    header p { margin: 0; color: var(--muted); }
+    .container { max-width: 1100px; margin: 0 auto; padding: 0 40px 80px; }
+
+    /* CSS-only tabs via radio inputs */
+    .tabs { margin-top: 24px; }
+    .tabs > input[type="radio"] { display: none; }
+    .tab-bar {
+      display: flex;
+      gap: 4px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 24px;
+      flex-wrap: wrap;
+    }
+    .tab-bar label {
+      padding: 10px 18px;
+      cursor: pointer;
+      border: 1px solid transparent;
+      border-bottom: none;
+      border-radius: 6px 6px 0 0;
+      font-weight: 500;
+      color: var(--muted);
+      margin-bottom: -1px;
+      user-select: none;
+    }
+    .tab-bar label:hover { color: var(--fg); background: #f3f4f6; }
+    .tab-content { display: none; }
+    #tab-jira:checked       ~ .tab-bar label[for="tab-jira"],
+    #tab-confluence:checked ~ .tab-bar label[for="tab-confluence"],
+    #tab-pr:checked         ~ .tab-bar label[for="tab-pr"],
+    #tab-twiddle:checked    ~ .tab-bar label[for="tab-twiddle"] {
+      background: white;
+      color: var(--accent);
+      border-color: var(--border);
+      border-bottom-color: white;
+    }
+    #tab-jira:checked       ~ #content-jira,
+    #tab-confluence:checked ~ #content-confluence,
+    #tab-pr:checked         ~ #content-pr,
+    #tab-twiddle:checked    ~ #content-twiddle { display: block; }
+
+    h2 { margin-top: 32px; font-size: 20px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+    h3 { margin-top: 24px; font-size: 16px; }
+    h4 { margin-top: 18px; font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+
+    code {
+      font-family: SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 0.88em;
+      background: var(--code-bg);
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+    pre {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px 16px;
+      overflow-x: auto;
+      font-family: SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+    pre code { background: transparent; padding: 0; font-size: inherit; }
+    .lang-tag {
+      display: inline-block;
+      font-size: 11px;
+      color: var(--muted);
+      background: #eaeef2;
+      padding: 2px 8px;
+      border-radius: 4px;
+      margin-bottom: -1px;
+      border: 1px solid var(--border);
+      border-bottom: none;
+      border-radius: 4px 4px 0 0;
+      font-family: SFMono-Regular, monospace;
+    }
+    .lang-tag + pre { border-top-left-radius: 0; margin-top: 0; }
+
+    /* Confluence-style preview panels */
+    .panel { padding: 12px 16px; border-left: 4px solid; border-radius: 4px; margin: 12px 0; }
+    .panel-info    { background: var(--panel-info-bg);    border-color: var(--panel-info-border); }
+    .panel-note    { background: var(--panel-note-bg);    border-color: var(--panel-note-border); }
+    .panel-warn    { background: var(--panel-warn-bg);    border-color: var(--panel-warn-border); }
+    .panel-error   { background: var(--panel-error-bg);   border-color: var(--panel-error-border); }
+    .panel-success { background: var(--panel-success-bg); border-color: var(--panel-success-border); }
+    .panel-title { font-weight: 600; margin-bottom: 4px; }
+
+    /* Mock JIRA/Confluence rendered preview chrome */
+    .preview {
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 16px 20px;
+      background: white;
+      margin: 12px 0 24px;
+    }
+    .preview-label {
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 10px;
+    }
+    .status-badge {
+      display: inline-block;
+      padding: 2px 10px;
+      border-radius: 12px;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .status-blue   { background: #ddf4ff; color: #0969da; }
+    .status-green  { background: #dafbe1; color: #1a7f37; }
+    .status-yellow { background: #fff8c5; color: #9a6700; }
+    .status-red    { background: #ffebe9; color: #cf222e; }
+    .status-grey   { background: #eaeef2; color: #57606a; }
+    .mention {
+      color: var(--accent);
+      background: var(--accent-soft);
+      padding: 1px 6px;
+      border-radius: 10px;
+      font-size: 0.92em;
+    }
+    .date-pill {
+      display: inline-block;
+      background: #eaeef2;
+      padding: 1px 8px;
+      border-radius: 4px;
+      font-size: 0.88em;
+    }
+
+    /* Layout sections (Confluence layout macro emulation) */
+    .layout { display: grid; gap: 16px; margin: 16px 0; }
+    .layout-2col       { grid-template-columns: 1fr 1fr; }
+    .layout-3col       { grid-template-columns: 1fr 1fr 1fr; }
+    .layout-right-sidebar { grid-template-columns: 2fr 1fr; }
+    .column { border: 1px dashed var(--border); padding: 10px 14px; border-radius: 4px; background: #fcfcfc; }
+
+    /* Expanders (mock) */
+    details.expand {
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 8px 12px;
+      margin: 8px 0;
+      background: white;
+    }
+    details.expand > summary { cursor: pointer; font-weight: 500; color: var(--accent); }
+    details.expand details.nested-expand {
+      margin: 8px 0 0 16px;
+      border-left: 2px solid var(--border);
+      padding-left: 12px;
+      background: var(--code-bg);
+    }
+
+    /* Decision lists */
+    ul.decisions { list-style: none; padding-left: 0; }
+    ul.decisions li::before {
+      content: "◇";
+      color: #8250df;
+      margin-right: 8px;
+      font-weight: bold;
+    }
+
+    /* Task lists */
+    ul.tasks { list-style: none; padding-left: 0; }
+    ul.tasks li { margin: 4px 0; }
+    ul.tasks li input[type="checkbox"] { margin-right: 8px; }
+
+    /* Tables */
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 12px 0;
+      font-size: 14px;
+    }
+    th, td {
+      border: 1px solid var(--border);
+      padding: 8px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th { background: #f6f8fa; font-weight: 600; }
+    .cell-bordered { border: 2px solid #091e42; }
+
+    /* Inline cards */
+    .inline-card {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: white;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 2px 8px;
+      font-size: 0.9em;
+      color: var(--accent);
+    }
+    .inline-card::before { content: "🔗"; font-size: 0.9em; }
+
+    /* Annotation (inline comment) */
+    .annotation {
+      background: linear-gradient(transparent 60%, #fff8c5 60%);
+      cursor: help;
+    }
+
+    /* Step blocks for tutorials */
+    .step {
+      border-left: 3px solid var(--accent);
+      padding: 4px 0 4px 16px;
+      margin: 16px 0;
+    }
+    .step-num {
+      display: inline-block;
+      background: var(--accent);
+      color: white;
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      text-align: center;
+      font-size: 12px;
+      font-weight: 600;
+      line-height: 22px;
+      margin-right: 8px;
+    }
+
+    /* Misc */
+    .muted { color: var(--muted); }
+    .keymap { font-family: monospace; background: var(--code-bg); padding: 1px 6px; border: 1px solid var(--border); border-radius: 3px; font-size: 0.9em; }
+    sub, sup { font-size: 0.75em; }
+    .colorbox { display: inline-block; width: 12px; height: 12px; border: 1px solid var(--border); vertical-align: middle; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>omni-dev — Atlassian, PRs, and commits in four tabs</h1>
+  <p>A tutorial covering the four primary omni-dev workflows. Switch tabs to navigate.</p>
+</header>
+
+<div class="container">
+  <div class="tabs">
+    <input type="radio" name="tab" id="tab-jira" checked>
+    <input type="radio" name="tab" id="tab-confluence">
+    <input type="radio" name="tab" id="tab-pr">
+    <input type="radio" name="tab" id="tab-twiddle">
+
+    <div class="tab-bar">
+      <label for="tab-jira">JIRA</label>
+      <label for="tab-confluence">Confluence</label>
+      <label for="tab-pr">Create PRs</label>
+      <label for="tab-twiddle">Twiddle commit messages</label>
+    </div>
+
+    <!-- ====================== JIRA TAB ====================== -->
+    <section class="tab-content" id="content-jira">
+      <h2>JIRA — read, write, and edit issues as local markdown</h2>
+
+      <p>
+        omni-dev exposes JIRA issues through the
+        <strong>JFM (JIRA-Flavoured Markdown)</strong> format — YAML frontmatter
+        plus a markdown body that round-trips losslessly to and from
+        Atlassian Document Format (ADF). You edit issues like normal markdown
+        files; omni-dev handles the ADF translation on push.
+      </p>
+
+      <h3>The basic loop</h3>
+
+      <div class="step">
+        <span class="step-num">1</span><strong>Authenticate</strong> once per Atlassian instance.
+        <pre>export ATLASSIAN_INSTANCE_URL="https://myorg.atlassian.net"
+export ATLASSIAN_EMAIL="me@example.com"
+export ATLASSIAN_API_TOKEN="atlassian_api_token_here"
+
+omni-dev atlassian auth status</pre>
+      </div>
+
+      <div class="step">
+        <span class="step-num">2</span><strong>Read</strong> an issue into a local <code>.md</code> file.
+        <pre>omni-dev atlassian jira read PROJ-1234 > PROJ-1234.md</pre>
+      </div>
+
+      <div class="step">
+        <span class="step-num">3</span><strong>Edit</strong> the file in your editor of choice.
+      </div>
+
+      <div class="step">
+        <span class="step-num">4</span><strong>Write</strong> it back. omni-dev validates the ADF locally before the network call, so schema violations abort with a clear diagnosis instead of a vague HTTP&nbsp;500.
+        <pre>omni-dev atlassian jira write PROJ-1234.md</pre>
+      </div>
+
+      <p>
+        For a one-shot fetch/edit/push cycle in <code>$EDITOR</code>, use the
+        <code>edit</code> subcommand:
+      </p>
+      <pre>omni-dev atlassian jira edit PROJ-1234</pre>
+
+      <h3>A realistically messy JFM issue body</h3>
+
+      <p>
+        The example below exercises most of the unusual ADF nodes JFM supports
+        — panels, expanders, nested expanders, layout sections with columns,
+        directive tables with merged cells and nested expands inside table
+        cells, decision and task lists, status pills, mentions, dates,
+        emoji, inline cards, annotations, subscript/superscript, colored
+        spans, and the <code>adf-unsupported</code> escape hatch.
+      </p>
+
+      <span class="lang-tag">markdown — PROJ-1234.md</span>
+<pre>---
+type: jira
+instance: https://myorg.atlassian.net
+key: PROJ-1234
+summary: "Migrate ingestion pipeline to streaming-Zipformer ASR"
+status: In Progress
+issue_type: Story
+assignee: Alice Smith
+priority: High
+labels:
+  - voice
+  - asr
+  - streaming
+---
+
+# Overview
+
+The ingestion service currently buffers audio for &gt;=&nbsp;30&nbsp;s before
+calling Whisper in batch mode. This issue tracks the migration to a
+streaming model — see :mention[Alice]{id=712020:abc} for the design.
+
+Status today: :status[Implementation]{color=blue}, target ship
+:date[2026-06-30]{timestamp=1782777600000}.
+
+:::panel{type=info}
+**Context.** This is the third attempt at streaming. Read the
+:card[https://myorg.atlassian.net/browse/PROJ-1100]{localId=card-1} retrospective before
+proposing new architecture changes.
+:::
+
+:::panel{type=warning}
+**Heads up.** The 5&nbsp;min monologue fixture under
+`tests/fixtures/voice/monologue_5min.wav` is licensed CC0 but is
+2&nbsp;MB — do **not** add more like it without a justification.
+:::
+
+## Layout: requirements + non-goals side by side
+
+::::layout
+:::column{width=66.66}
+### Requirements
+
+- First :status[Partial]{color=yellow} event within
+  :span[300&nbsp;ms]{color=#cf222e} of audio start.
+- Final transcript Word Error Rate &le; 7&nbsp;% on
+  CHiME-6&nbsp;eval set.
+- Memory ceiling: 512&nbsp;MB resident on the i7-1185G7&nbsp;reference
+  laptop.
+:::
+:::column{width=33.33}
+### Non-goals
+
+- Diarization (deferred to PROJ-1500).
+- On-device fine-tuning.
+- Languages other than en-US&nbsp;/&nbsp;zh-CN at v1.
+:::
+::::
+
+## Decisions
+
+:::decisions
+- &lt;&gt; Use `candle` as the production runtime (ADR-0033).
+- &lt;&gt; Defer streaming-native Zipformer until measured latency on
+  candle&nbsp;+ LocalAgreement-2 is demonstrated insufficient.
+- &lt;&gt; Keep RMS-based endpoint detection for the candle path.
+:::
+
+## Open tasks
+
+- [x] Pin the candle revision to a tagged release.
+- [x] Verify the trait shape against :card[https://github.com/rust-works/omni-dev/issues/807]{localId=task-card}.
+- [ ] Land the `FileAsyncAudioInput` harness — see expander below.
+- [ ] Snapshot the boundary-artifact test.
+
+## Implementation detail (collapsed)
+
+:::expand{title="LocalAgreement-2 pseudocode (click to expand)" localId=exp-pseudo}
+The merger keeps two recent hypotheses and emits the longest common
+prefix as a `Final { revisable: true }` event.
+
+```rust
+state:
+  window:        VecDeque&lt;i16&gt;     // sliding audio, max 30 s
+  hyp_prev:      Vec&lt;Word&gt;
+  hyp_cur:       Vec&lt;Word&gt;
+  committed_end: Duration
+```
+
+:::nested-expand{title="Why revisable: true?"}
+A later merger step may **extend** the committed text — the next two
+hypotheses can agree on more words. Downstream consumers see the
+prefix grow, never contract.
+:::
+:::
+
+## Risks (directive table — exercises colspan, borders, and nested-expand inside cells)
+
+::::table{layout=default}
+:::tr
+:::th
+Risk
+:::
+:::th
+Likelihood
+:::
+:::th
+Mitigation
+:::
+:::
+:::tr
+:::td{border-color=#091e42 border-size=2}
+**Hallucinated tail** past the 30&nbsp;s window — Whisper drifts on
+long-form audio.
+:::
+:::td
+:status[High]{color=red}
+:::
+:::td
+:::nested-expand{title="Endpoint forcing strategy"}
+On 1.5&nbsp;s of consecutive RMS&nbsp;&lt;&nbsp;&minus;40&nbsp;dBFS,
+flush the tail as `Final { revisable: true }` and emit `Endpoint
+{ kind: SilenceGap }`. Reset the window&nbsp;+&nbsp;hypotheses.
+:::
+:::
+:::
+:::tr
+:::td
+Word-timestamp drift between merger steps.
+:::
+:::td
+:status[Medium]{color=yellow}
+:::
+:::td
+Anchor `committed_end_ts` to the **last** word end of the prior
+common-prefix, never the current step.
+:::
+:::
+:::tr
+:::td{colspan=3}
+**Cross-cutting:** memory growth from un-trimmed window — see
+[the design](https://example.com/design){annotation-id=anno-7 annotation-type=inlineComment}.
+:::
+:::
+::::
+
+## Inline rich content
+
+H<sub>2</sub>O is water; E&nbsp;=&nbsp;mc<sup>2</sup>. The candidate
+:span[merger algorithm]{bg=#fff8c5} is named after :emoji{shortName=:dolphin: text="🐬"} —
+no idea why.
+
+This paragraph contains :placeholder[fill in latency number once
+measured] and a :card[https://github.com/rust-works/omni-dev/issues/806]{localId=card-806}.
+
+[This sentence carries an inline comment thread.]{annotation-id=anno-3 annotation-type=inlineComment}
+
+## Unsupported-node escape hatch
+
+ADF nodes JFM doesn&apos;t yet model round-trip through a fenced block:
+
+```adf-unsupported
+{"type":"customAtlassianNode","attrs":{"key":"value"}}
+```
+
+omni-dev preserves these byte-for-byte across read/write.
+</pre>
+
+      <h4>What the same content looks like rendered (approximate)</h4>
+
+      <div class="preview">
+        <div class="preview-label">PROJ-1234 — preview</div>
+        <h3 style="margin-top:0">Migrate ingestion pipeline to streaming-Zipformer ASR</h3>
+        <p><span class="status-badge status-blue">Implementation</span> &nbsp; target ship <span class="date-pill">2026-06-30</span></p>
+
+        <div class="panel panel-info">
+          <div class="panel-title">ℹ️ Context</div>
+          This is the third attempt at streaming. Read the
+          <span class="inline-card">PROJ-1100</span> retrospective before proposing new architecture changes.
+        </div>
+
+        <div class="panel panel-warn">
+          <div class="panel-title">⚠️ Heads up</div>
+          The 5&nbsp;min monologue fixture under <code>tests/fixtures/voice/monologue_5min.wav</code>
+          is licensed CC0 but is 2&nbsp;MB — do <strong>not</strong> add more like it without a justification.
+        </div>
+
+        <div class="layout layout-right-sidebar">
+          <div class="column">
+            <strong>Requirements</strong>
+            <ul>
+              <li>First <span class="status-badge status-yellow">Partial</span> event within
+                <span style="color:#cf222e">300&nbsp;ms</span> of audio start.</li>
+              <li>Final transcript WER ≤ 7% on CHiME-6 eval.</li>
+              <li>Memory ceiling: 512&nbsp;MB resident.</li>
+            </ul>
+          </div>
+          <div class="column">
+            <strong>Non-goals</strong>
+            <ul>
+              <li>Diarization (deferred to PROJ-1500).</li>
+              <li>On-device fine-tuning.</li>
+              <li>Languages other than en-US / zh-CN at v1.</li>
+            </ul>
+          </div>
+        </div>
+
+        <strong>Decisions</strong>
+        <ul class="decisions">
+          <li>Use <code>candle</code> as the production runtime (ADR-0033).</li>
+          <li>Defer streaming-native Zipformer until measured latency on candle + LocalAgreement-2 is demonstrated insufficient.</li>
+          <li>Keep RMS-based endpoint detection for the candle path.</li>
+        </ul>
+
+        <strong>Open tasks</strong>
+        <ul class="tasks">
+          <li><input type="checkbox" checked disabled> Pin the candle revision to a tagged release.</li>
+          <li><input type="checkbox" checked disabled> Verify the trait shape against <span class="inline-card">#807</span>.</li>
+          <li><input type="checkbox" disabled> Land the <code>FileAsyncAudioInput</code> harness.</li>
+          <li><input type="checkbox" disabled> Snapshot the boundary-artifact test.</li>
+        </ul>
+
+        <details class="expand">
+          <summary>LocalAgreement-2 pseudocode (click to expand)</summary>
+          <p>The merger keeps two recent hypotheses and emits the longest common prefix as a <code>Final { revisable: true }</code> event.</p>
+          <pre>state:
+  window:        VecDeque&lt;i16&gt;
+  hyp_prev:      Vec&lt;Word&gt;
+  hyp_cur:       Vec&lt;Word&gt;
+  committed_end: Duration</pre>
+          <details class="expand nested-expand">
+            <summary>Why revisable: true?</summary>
+            A later merger step may <strong>extend</strong> the committed text — the next two hypotheses can agree on more words. Downstream consumers see the prefix grow, never contract.
+          </details>
+        </details>
+
+        <table>
+          <thead>
+            <tr><th>Risk</th><th>Likelihood</th><th>Mitigation</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="cell-bordered"><strong>Hallucinated tail</strong> past the 30&nbsp;s window — Whisper drifts on long-form audio.</td>
+              <td><span class="status-badge status-red">High</span></td>
+              <td>
+                <details class="expand nested-expand">
+                  <summary>Endpoint forcing strategy</summary>
+                  On 1.5&nbsp;s of consecutive RMS &lt; &minus;40&nbsp;dBFS, flush the tail as <code>Final { revisable: true }</code> and emit <code>Endpoint { kind: SilenceGap }</code>. Reset the window + hypotheses.
+                </details>
+              </td>
+            </tr>
+            <tr>
+              <td>Word-timestamp drift between merger steps.</td>
+              <td><span class="status-badge status-yellow">Medium</span></td>
+              <td>Anchor <code>committed_end_ts</code> to the <strong>last</strong> word end of the prior common-prefix, never the current step.</td>
+            </tr>
+            <tr>
+              <td colspan="3"><strong>Cross-cutting:</strong> memory growth from un-trimmed window — see <span class="annotation" title="Inline comment thread">the design</span>.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <p>H<sub>2</sub>O is water; E&nbsp;=&nbsp;mc<sup>2</sup>. The candidate <span style="background:#fff8c5">merger algorithm</span> is named after 🐬 — no idea why.</p>
+
+        <p>This paragraph contains <em style="color:#57606a">[fill in latency number once measured]</em> and a <span class="inline-card">#806</span>.</p>
+
+        <p><span class="annotation" title="Inline comment thread anno-3">This sentence carries an inline comment thread.</span></p>
+      </div>
+
+      <div class="panel panel-error">
+        <div class="panel-title">❌ Schema-trap</div>
+        <code>:::expand</code> nested directly inside <code>:::panel</code>
+        parses fine in JFM but the Atlassian API will <em>reject</em> the
+        ADF. Invert the nesting (panel inside expand) or use
+        <code>:::nested-expand</code> inside table cells. omni-dev runs
+        the validator before pushing, so you&apos;ll see this locally — but
+        knowing the rule up-front saves a round-trip.
+      </div>
+
+      <h3>Other JIRA subcommands worth knowing</h3>
+
+      <table>
+        <thead><tr><th>Subcommand</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td><code>search</code></td><td>Run a JQL query, get hits as YAML.</td></tr>
+          <tr><td><code>create</code></td><td>Create an issue from a JFM file with no <code>key</code> in frontmatter.</td></tr>
+          <tr><td><code>transition</code></td><td>List or execute workflow transitions (e.g. <em>In Progress → Done</em>).</td></tr>
+          <tr><td><code>comment</code></td><td>Add, edit, list comments on an issue.</td></tr>
+          <tr><td><code>dev</code></td><td>Show linked PRs, branches, and repositories for an issue.</td></tr>
+          <tr><td><code>sprint</code></td><td>List/create/update sprints, add issues to a sprint.</td></tr>
+          <tr><td><code>link</code></td><td>Manage issue links (blocks, relates-to, duplicates, …).</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- ====================== CONFLUENCE TAB ====================== -->
+    <section class="tab-content" id="content-confluence">
+      <h2>Confluence — pages as round-trippable markdown</h2>
+
+      <p>
+        Confluence pages use the same JFM scheme as JIRA issues: YAML
+        frontmatter discriminated by <code>type: confluence</code>, plus a
+        markdown body that converts to ADF. The same set of unusual
+        ADF nodes is available, but Confluence pages tend to lean harder on
+        <strong>layout sections</strong>, <strong>media with captions</strong>,
+        <strong>inline annotations</strong> (Confluence&apos;s inline-comment
+        threads), and <strong>block/embed cards</strong>.
+      </p>
+
+      <h3>The basic loop</h3>
+      <pre>omni-dev atlassian confluence read 12345 > page.md      # pull
+$EDITOR page.md                                          # edit
+omni-dev atlassian confluence write page.md              # push</pre>
+
+      <p>
+        <code>page_id</code> in the frontmatter does the routing. Omit it
+        and use <code>create</code> instead to create a new page:
+      </p>
+      <pre>omni-dev atlassian confluence create page.md</pre>
+
+      <h3>A complex Confluence page exercising unusual nodes</h3>
+
+      <p>
+        This page exercises multi-column layouts, captioned media, inline
+        media, decision lists, task lists, nested expanders, directive
+        tables with bordered cells and per-cell <code>localId</code>s,
+        inline-comment annotations, embed&nbsp;cards, block cards,
+        emoji, status pills, dates, mentions, indented blocks,
+        text-colour and background-colour marks, subscript/superscript,
+        and the <code>adf-unsupported</code> fenced block.
+      </p>
+
+      <span class="lang-tag">markdown — page.md</span>
+<pre>---
+type: confluence
+instance: https://myorg.atlassian.net
+page_id: "98765432"
+title: "Voice Capture — Architecture Brief"
+space_key: ENG
+status: current
+version: 14
+parent_id: "12345"
+---
+
+# Voice Capture — Architecture Brief
+{align=center}
+
+::card[https://github.com/rust-works/omni-dev/issues/799]
+::embed[https://www.youtube.com/watch?v=dQw4w9WgXcQ]{width=480}
+
+:::panel{type=info}
+**Owner:** :mention[Alice Smith]{id=712020:abc accessLevel=CONTAINER} &middot;
+**Reviewers:** :mention[Bob Lee]{id=712020:def}, :mention[Carla Ng]{id=712020:ghi} &middot;
+**Last reviewed:** :date[2026-05-20]{timestamp=1779574400000}
+:::
+
+## Executive summary
+{indent=1}
+
+We propose a three-stage voice-capture pipeline: capture &rarr;
+endpointing &rarr; ASR. Stage 1 is shipped; stage 2 lands in
+:status[Q2]{color=purple}; stage 3 begins :status[Q3]{color=neutral}.
+
+[The latency budget is the load-bearing constraint.]{annotation-id=ann-budget annotation-type=inlineComment}
+
+## Three-column layout: stages of the pipeline
+
+::::layout
+:::column{width=33.33}
+### 1. Capture
+:emoji{shortName=:microphone: text="🎙️"}
+
+- 16&nbsp;kHz mono i16
+- 100&nbsp;ms chunks
+- `cpal` backend (see #807)
+:::
+:::column{width=33.33}
+### 2. Endpoint
+:emoji{shortName=:zzz: text="💤"}
+
+- 1.5&nbsp;s RMS&nbsp;&lt;&nbsp;&minus;40&nbsp;dBFS &rarr; `SilenceGap`
+- VAD-based path deferred
+:::
+:::column{width=33.34}
+### 3. ASR
+:emoji{shortName=:brain: text="🧠"}
+
+- `candle` (default)
+- `tract-onnx` (streaming spike)
+- LocalAgreement-2 merger
+:::
+::::
+
+## Captioned diagram
+
+![Pipeline overview](){type=file id=acab1234-5678-90ab-cdef-1122334455 collection=contentId-98765432 width=720 height=320}
+:::caption{localId=cap-diagram-1}
+Stage boundaries map 1:1 to crates in `src/voice/`. The dashed arrows
+show the streaming path; solid arrows show the batch fallback.
+:::
+
+The inline-media variant
+:media-inline[]{type=file id=11112222-3333-4444-5555-666677778888 collection=contentId-98765432}
+appears mid-sentence — handy for screenshots referenced inline.
+
+## Decision log
+
+:::decisions
+- &lt;&gt; **Runtime = candle** (ADR-0033, 2026-05-14). Drives all downstream
+  decisions on this page.
+- &lt;&gt; **Endpoint heuristic = silence-gap RMS.** Re-evaluate when
+  Silero VAD on `tract-onnx` is benchmarked.
+- &lt;&gt; **No diarization in v1.** Deferred to PROJ-1500.
+:::
+
+## Open work
+
+- [x] Land batch whisper-rs backend (#801).
+- [x] Land sherpa-onnx batch wrapper (#805).
+- [ ] Land streaming ASR (this issue, #806).
+- [ ] Wire `cpal` realtime input (#807).
+- [ ] Reflection-trigger heuristic.
+
+## Two-column: configuration knobs vs. defaults
+
+::::layout
+:::column{width=50}
+### Knobs
+| Knob | Type |
+| --- | --- |
+| `chunk_ms` | u32 |
+| `window_max_s` | u32 |
+| `rms_threshold_dbfs` | f32 |
+| `silence_gap_ms` | u32 |
+| `backend` | enum |
+:::
+:::column{width=50}
+### Defaults
+| Knob | Default |
+| --- | --- |
+| `chunk_ms` | 100 |
+| `window_max_s` | 30 |
+| `rms_threshold_dbfs` | -40.0 |
+| `silence_gap_ms` | 1500 |
+| `backend` | `candle` |
+:::
+::::
+
+## Latency table (directive table — captures hard breaks, colspan, nested-expand)
+
+::::table{layout=wide isNumberColumnEnabled=true}
+:::tr
+:::th
+Stage
+:::
+:::th
+Target p50
+:::
+:::th
+Target p95
+:::
+:::th
+Measured (CHiME-6)
+:::
+:::
+:::tr
+:::td
+Capture &rarr; first sample on bus
+:::
+:::td
+&lt;&nbsp;5&nbsp;ms
+:::
+:::td
+&lt;&nbsp;15&nbsp;ms
+:::
+:::td
+:status[3.1&nbsp;ms]{color=green}\
+:status[9.8&nbsp;ms]{color=green}
+:::
+:::
+:::tr
+:::td
+Endpoint detection
+:::
+:::td
+&lt;&nbsp;20&nbsp;ms
+:::
+:::td
+&lt;&nbsp;80&nbsp;ms
+:::
+:::td
+:status[12&nbsp;ms]{color=green}\
+:status[54&nbsp;ms]{color=green}
+:::
+:::
+:::tr
+:::td{border-color=#cf222e border-size=2}
+**First Partial transcript** :emoji{shortName=:warning: text="⚠️"}
+:::
+:::td
+&lt;&nbsp;300&nbsp;ms
+:::
+:::td
+&lt;&nbsp;600&nbsp;ms
+:::
+:::td
+:status[412&nbsp;ms]{color=red}\
+:status[890&nbsp;ms]{color=red}
+:::
+:::
+:::tr
+:::td{colspan=4}
+:::nested-expand{title="Why is first-Partial latency over budget?"}
+The 2&nbsp;s warm-up window dominates. Options:
+
+1. Lower the warm-up to 1&nbsp;s and accept a higher revision rate.
+2. Switch to streaming-native Zipformer (`tract-onnx` spike).
+3. Pipeline parallelism: kick off the first inference after 500&nbsp;ms.
+
+Owner: :mention[Alice Smith]{id=712020:abc}. Due
+:date[2026-06-01]{timestamp=1780617600000}.
+:::
+:::
+:::
+::::
+
+## Expander with nested expander
+
+:::expand{title="API surface (click to expand)" localId=exp-api}
+The streaming trait is the only thing downstream consumers need to
+import.
+
+```rust
+pub trait StreamingTranscriber: Send + Sync {
+    fn transcribe_stream(
+        &amp;self,
+        audio: Box&lt;dyn AsyncAudioInput&gt;,
+    ) -&gt; Pin&lt;Box&lt;dyn Stream&lt;Item = Result&lt;TranscriptEvent&gt;&gt; + Send&gt;&gt;;
+}
+```
+
+:::nested-expand{title="TranscriptEvent variants"}
+- `Partial { text, ts }` — emitted continuously, may change.
+- `Final { text, start, end, revisable }` — committed prefix.
+- `Endpoint { kind: SilenceGap | UserStop | ModelHint }` — segment boundary.
+:::
+:::
+
+## Highlights and inline marks
+
+A :span[bright callout]{color=#cf222e bg=#fff8c5} marks the
+load-bearing claim. We mix in :span[teal text]{color=#1a7f37} and
+:span[a yellow highlight]{bg=#fff8c5} to signal severity.
+
+Footnote-style :span[fn-1]{sup} sits superscript; chemical
+H:span[2]{sub}O sits subscript. The
+[entire sentence is annotated for inline comment thread]{annotation-id=ann-sentence-1 annotation-type=inlineComment}.
+
+## Embedded BigQuery extension (unsupported &mdash; round-trips verbatim)
+
+```adf-unsupported
+{"type":"bodiedExtension","attrs":{"extensionKey":"bq-query","parameters":{"sql":"SELECT 1"}},"content":[{"type":"paragraph","content":[{"type":"text","text":"placeholder"}]}]}
+```
+
+## Manual hard breaks
+
+Line one\
+line two (same paragraph as line one — that&apos;s a hardBreak)\
+line three.
+
+---
+
+&copy; ENG space. Edits via `omni-dev atlassian confluence write page.md`.
+</pre>
+
+      <h4>Approximate rendered preview</h4>
+
+      <div class="preview">
+        <div class="preview-label">page 98765432 — preview</div>
+        <h3 style="text-align:center; margin-top:0">Voice Capture — Architecture Brief</h3>
+        <p>
+          <span class="inline-card">#799 — Voice umbrella issue</span>
+          &nbsp;<span class="inline-card">YouTube embed</span>
+        </p>
+        <div class="panel panel-info">
+          <strong>Owner:</strong> <span class="mention">@Alice Smith</span> · <strong>Reviewers:</strong>
+          <span class="mention">@Bob Lee</span>, <span class="mention">@Carla Ng</span> · <strong>Last reviewed:</strong>
+          <span class="date-pill">2026-05-20</span>
+        </div>
+        <p style="margin-left: 16px">
+          We propose a three-stage voice-capture pipeline: capture → endpointing → ASR.
+          Stage 1 is shipped; stage 2 lands in <span class="status-badge" style="background:#fbefff;color:#8250df">Q2</span>;
+          stage 3 begins <span class="status-badge status-grey">Q3</span>.
+        </p>
+        <p style="margin-left: 16px"><span class="annotation" title="Inline comment thread ann-budget">The latency budget is the load-bearing constraint.</span></p>
+
+        <div class="layout layout-3col">
+          <div class="column"><strong>1. Capture 🎙️</strong><ul><li>16 kHz mono i16</li><li>100 ms chunks</li><li><code>cpal</code> backend (#807)</li></ul></div>
+          <div class="column"><strong>2. Endpoint 💤</strong><ul><li>1.5 s RMS &lt; −40 dBFS → <code>SilenceGap</code></li><li>VAD path deferred</li></ul></div>
+          <div class="column"><strong>3. ASR 🧠</strong><ul><li><code>candle</code> (default)</li><li><code>tract-onnx</code> (spike)</li><li>LocalAgreement-2</li></ul></div>
+        </div>
+
+        <figure style="margin:16px 0; border:1px dashed var(--border); padding:24px; text-align:center; background:#fcfcfc">
+          <span class="muted">[ pipeline-overview.png ]</span>
+          <figcaption class="muted" style="margin-top:8px; font-size: 13px">Stage boundaries map 1:1 to crates in <code>src/voice/</code>. Dashed = streaming, solid = batch.</figcaption>
+        </figure>
+
+        <strong>Decision log</strong>
+        <ul class="decisions">
+          <li><strong>Runtime = candle</strong> (ADR-0033, 2026-05-14).</li>
+          <li><strong>Endpoint heuristic = silence-gap RMS.</strong></li>
+          <li><strong>No diarization in v1.</strong></li>
+        </ul>
+
+        <strong>Latency table</strong>
+        <table>
+          <thead><tr><th>#</th><th>Stage</th><th>Target p50</th><th>Target p95</th><th>Measured (CHiME-6)</th></tr></thead>
+          <tbody>
+            <tr><td>1</td><td>Capture → first sample on bus</td><td>&lt; 5 ms</td><td>&lt; 15 ms</td><td><span class="status-badge status-green">3.1 ms</span><br><span class="status-badge status-green">9.8 ms</span></td></tr>
+            <tr><td>2</td><td>Endpoint detection</td><td>&lt; 20 ms</td><td>&lt; 80 ms</td><td><span class="status-badge status-green">12 ms</span><br><span class="status-badge status-green">54 ms</span></td></tr>
+            <tr><td>3</td><td class="cell-bordered"><strong>First Partial transcript</strong> ⚠️</td><td>&lt; 300 ms</td><td>&lt; 600 ms</td><td><span class="status-badge status-red">412 ms</span><br><span class="status-badge status-red">890 ms</span></td></tr>
+            <tr><td colspan="5">
+              <details class="expand nested-expand">
+                <summary>Why is first-Partial latency over budget?</summary>
+                <p>The 2 s warm-up window dominates. Options:</p>
+                <ol>
+                  <li>Lower the warm-up to 1 s and accept higher revision rate.</li>
+                  <li>Switch to streaming-native Zipformer (<code>tract-onnx</code> spike).</li>
+                  <li>Pipeline parallelism: kick off the first inference after 500 ms.</li>
+                </ol>
+                <p>Owner: <span class="mention">@Alice Smith</span>. Due <span class="date-pill">2026-06-01</span>.</p>
+              </details>
+            </td></tr>
+          </tbody>
+        </table>
+
+        <p>A <span style="color:#cf222e; background:#fff8c5">bright callout</span> marks the load-bearing claim. We mix in <span style="color:#1a7f37">teal text</span> and <span style="background:#fff8c5">a yellow highlight</span> to signal severity.</p>
+        <p>Footnote-style <sup>fn-1</sup> sits superscript; chemical H<sub>2</sub>O sits subscript.</p>
+      </div>
+
+      <div class="panel panel-note">
+        <div class="panel-title">📝 Validator-first workflow</div>
+        omni-dev runs <code>validate_document</code> against the assembled
+        ADF before sending. The most common rejection on Confluence pages
+        is <code>:::expand</code> nested directly inside a table cell —
+        use <code>:::nested-expand</code>. The schema source of truth is
+        <code>src/atlassian/adf_schema/mod.rs</code>, transcribed from the
+        upstream <code>@atlaskit/adf-schema</code> package per ADR-0023.
+      </div>
+
+      <h3>Other confluence subcommands worth knowing</h3>
+
+      <table>
+        <thead><tr><th>Subcommand</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td><code>search</code></td><td>CQL search across spaces.</td></tr>
+          <tr><td><code>children</code></td><td>List child pages of a page or top-level pages in a space.</td></tr>
+          <tr><td><code>history</code></td><td>List version-history metadata for a page.</td></tr>
+          <tr><td><code>compare</code></td><td>Structural diff between two versions of a page.</td></tr>
+          <tr><td><code>download</code></td><td>Recursively download a page tree as <code>.md</code> files.</td></tr>
+          <tr><td><code>label</code></td><td>Add/remove/list labels on a page.</td></tr>
+          <tr><td><code>attachment</code></td><td>List/upload/delete attachments on a page.</td></tr>
+          <tr><td><code>move</code></td><td>Reparent a page within the same space.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- ====================== CREATE PR TAB ====================== -->
+    <section class="tab-content" id="content-pr">
+      <h2>Create PRs — AI-generated descriptions, one command</h2>
+
+      <p>
+        <code>omni-dev git branch create pr</code> opens a pull request on the
+        current branch with an AI-generated title and body derived from the
+        commits and the diff against the base branch.
+      </p>
+
+      <h3>Typical usage</h3>
+
+      <div class="step">
+        <span class="step-num">1</span><strong>Land your commits</strong> on a feature branch.
+        <pre>git checkout -b feature/streaming-asr
+# ... commits ...
+git push -u origin feature/streaming-asr</pre>
+      </div>
+
+      <div class="step">
+        <span class="step-num">2</span><strong>Create the PR.</strong> omni-dev reads the commits, builds a prompt, and posts via the <code>gh</code> CLI.
+        <pre>omni-dev git branch create pr</pre>
+      </div>
+
+      <div class="step">
+        <span class="step-num">3</span><strong>Review.</strong> The CLI prints the generated title and body before posting; reject if unhappy.
+      </div>
+
+      <h3>Useful flags</h3>
+
+      <table>
+        <thead><tr><th>Flag</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td><code>--base &lt;branch&gt;</code></td><td>Override the auto-detected base branch.</td></tr>
+          <tr><td><code>--draft</code></td><td>Create the PR as draft.</td></tr>
+          <tr><td><code>--ai-backend claude-cli</code></td><td>Use a sandboxed nested <code>claude -p</code> session instead of the default HTTP backend. See ADR-0028.</td></tr>
+          <tr><td><code>--claude-cli-max-budget-usd 0.50</code></td><td>Cap nested-session spend per invocation.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>What feeds the prompt</h3>
+
+      <ul>
+        <li>The list of commits between <code>HEAD</code> and the base branch (subject + body).</li>
+        <li>A summarized diff (file paths, lines added/removed, and small-file content).</li>
+        <li>Optional template at <code>.omni-dev/pr-template.md</code> — used as a stylistic exemplar.</li>
+      </ul>
+
+      <div class="panel panel-info">
+        <div class="panel-title">ℹ️ Auto-detection</div>
+        Base branch defaults to whatever the local repo&apos;s default branch
+        points at (<code>origin/HEAD</code>). Set <code>--base</code> when
+        opening PRs against a non-default branch (release branches,
+        long-running feature branches).
+      </div>
+
+      <h3>End-to-end example</h3>
+
+      <pre>$ git log --oneline main..HEAD
+c5449c9 feat(voice): land streaming-ASR trait surface
+841187f feat(voice): LocalAgreement-2 merger
+728ce74 test(voice): 5-min monologue fixture
+
+$ omni-dev git branch create pr --draft
+
+  → analysing commits (3)…
+  → summarising diff (12 files, +984 −214)…
+  → calling claude (≈ $0.02)…
+
+PROPOSED TITLE
+  feat(voice): streaming ASR — trait + LocalAgreement-2 merger
+
+PROPOSED BODY (excerpt)
+  ## Summary
+  - Add StreamingTranscriber trait and AsyncAudioInput boundary
+  - Implement LocalAgreement-2 sliding-window merger for whisper backend
+  - Land 5-min monologue fixture for boundary-artifact snapshot tests
+  ## Test plan
+  - [ ] cargo test --all
+  - [ ] cargo insta review
+  - [ ] manual smoke against monologue_5min.wav
+
+Open the PR? [y/N] y
+
+✓ #890 opened: https://github.com/rust-works/omni-dev/pull/890</pre>
+
+      <div class="panel panel-warn">
+        <div class="panel-title">⚠️ Don&apos;t push empty branches</div>
+        omni-dev expects the branch to have commits and be pushed to remote
+        before <code>create pr</code> runs. Worktree workflows in particular
+        often start with an empty branch — push at least one commit first
+        or PR creation will fail.
+      </div>
+    </section>
+
+    <!-- ====================== TWIDDLE TAB ====================== -->
+    <section class="tab-content" id="content-twiddle">
+      <h2>Twiddle commit messages — AI-powered amendments</h2>
+
+      <p>
+        <code>omni-dev git commit message twiddle</code> rewrites recent
+        commit messages to comply with project guidelines while preserving
+        the commits themselves. It pairs with the
+        <a href=".omni-dev/commit-guidelines.md"><code>.omni-dev/commit-guidelines.md</code></a>
+        rules in your repo.
+      </p>
+
+      <h3>When to use it</h3>
+      <ul>
+        <li>After a flurry of work-in-progress commits with sloppy messages.</li>
+        <li>Before opening a PR, to make the log read cleanly.</li>
+        <li>After resolving rebase conflicts, when the merge-of-merge messages need cleaning.</li>
+      </ul>
+
+      <h3>The two-phase model</h3>
+
+      <div class="step">
+        <span class="step-num">1</span><strong>View</strong> — analyse commits and emit a YAML report.
+        <pre>omni-dev git commit message view HEAD~5..HEAD > commits.yaml</pre>
+      </div>
+
+      <div class="step">
+        <span class="step-num">2</span><strong>Twiddle</strong> — let the AI rewrite the messages.
+        <pre>omni-dev git commit message twiddle --range HEAD~5..HEAD</pre>
+        <p class="muted">
+          You&apos;ll be asked to confirm before any <code>git filter-branch</code>-equivalent rewrite happens.
+        </p>
+      </div>
+
+      <div class="step">
+        <span class="step-num">3</span><strong>Check</strong> — validate without rewriting (CI-friendly).
+        <pre>omni-dev git commit message check --range HEAD~5..HEAD</pre>
+      </div>
+
+      <h3>Sibling subcommands</h3>
+
+      <table>
+        <thead><tr><th>Subcommand</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td><code>view</code></td><td>Analyse commits, emit a YAML report (with field-presence tracking).</td></tr>
+          <tr><td><code>amend</code></td><td>Rewrite messages from a YAML configuration file (deterministic, no AI).</td></tr>
+          <tr><td><code>twiddle</code></td><td>AI-driven rewrite. Reads guidelines and applies them.</td></tr>
+          <tr><td><code>check</code></td><td>Validate against guidelines without modifying. Exit-codes are CI-friendly.</td></tr>
+          <tr><td><code>staged</code></td><td>Generate a commit message from currently staged changes and commit.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Worked example</h3>
+
+      <pre>$ git log --oneline -5
+c5449c9 wip
+841187f more fixes
+728ce74 fix tests
+4d1290d streaming stuff
+52ba037 initial</pre>
+
+      <pre>$ omni-dev git commit message twiddle --range HEAD~5..HEAD
+
+  → reading .omni-dev/commit-guidelines.md
+  → analysing 5 commits…
+  → calling claude…
+
+PROPOSED REWRITES
+  c5449c9 wip              →  feat(voice): wire StreamingTranscriber into create_default_transcriber
+  841187f more fixes       →  fix(voice): trim sliding window to committed_end_ts to bound memory
+  728ce74 fix tests        →  test(voice): unblock LocalAgreement-2 snapshot on the 5-min fixture
+  4d1290d streaming stuff  →  feat(voice): add LocalAgreement-2 merger skeleton + types
+  52ba037 initial          →  feat(voice): add StreamingTranscriber + AsyncAudioInput traits
+
+Apply rewrite? [y/N] y
+✓ rewrote 5 commits. Force-push with care:
+  git push --force-with-lease origin issue-806-streaming-asr</pre>
+
+      <div class="panel panel-warn">
+        <div class="panel-title">⚠️ Rewrites public history</div>
+        Twiddle changes commit SHAs. After rewriting commits that are
+        already pushed, you need a force-push (<code>--force-with-lease</code>).
+        Anyone with a local copy of the old branch must reset on top of the
+        rewritten history. Don&apos;t twiddle commits on shared long-running
+        branches (e.g. <code>main</code>, release branches).
+      </div>
+
+      <div class="panel panel-info">
+        <div class="panel-title">ℹ️ How twiddle uses commit-guidelines.md</div>
+        The contents of <code>.omni-dev/commit-guidelines.md</code> are
+        included verbatim in the prompt. The AI is asked to rewrite
+        messages so they conform — conventional-commit prefix, scope,
+        imperative mood, body lines under N characters, etc. — whilst
+        preserving the original meaning.
+      </div>
+
+      <h3>Composing with other commands</h3>
+
+      <p>
+        Twiddle plus PR creation is the canonical pre-PR cleanup:
+      </p>
+      <pre># clean up history, then open a PR with a fresh AI-generated body
+omni-dev git commit message twiddle --range HEAD~5..HEAD \
+  &amp;&amp; git push --force-with-lease \
+  &amp;&amp; omni-dev git branch create pr --draft</pre>
+    </section>
+  </div>
+</div>
+
+</body>
+</html>
