@@ -40,6 +40,10 @@ pub struct CreatePrCommand {
     /// Skip pushing the branch to remote before creating the PR.
     #[arg(long)]
     pub no_push: bool,
+
+    /// Use commit messages (not the diff) as the primary input for PR generation.
+    #[arg(long)]
+    pub from_commits: bool,
 }
 
 /// PR action choices.
@@ -694,11 +698,20 @@ impl CreatePrCommand {
         debug!("Context collection completed");
 
         // Generate AI-powered PR content with context
-        debug!("About to call Claude AI for PR content generation");
-        match claude_client
-            .generate_pr_content_with_context(repo_view, &pr_template, &context)
-            .await
-        {
+        debug!(
+            from_commits = self.from_commits,
+            "About to call Claude AI for PR content generation"
+        );
+        let ai_result = if self.from_commits {
+            claude_client
+                .generate_pr_content_with_context_from_commits(repo_view, &pr_template, &context)
+                .await
+        } else {
+            claude_client
+                .generate_pr_content_with_context(repo_view, &pr_template, &context)
+                .await
+        };
+        match ai_result {
             Ok(pr_content) => {
                 debug!(
                     ai_generated_title = %pr_content.title,
@@ -1383,6 +1396,7 @@ pub async fn run_create_pr(
         draft: false,
         context_dir: None,
         no_push: true,
+        from_commits: false,
     };
 
     let repo_view = cmd.generate_repository_view()?;
@@ -1409,10 +1423,16 @@ pub(crate) async fn run_create_pr_with_client(
         None => cmd.get_default_pr_template(),
     };
 
-    let pr_content = match claude_client
-        .generate_pr_content_with_context(repo_view, &pr_template, context)
-        .await
-    {
+    let ai_result = if cmd.from_commits {
+        claude_client
+            .generate_pr_content_with_context_from_commits(repo_view, &pr_template, context)
+            .await
+    } else {
+        claude_client
+            .generate_pr_content_with_context(repo_view, &pr_template, context)
+            .await
+    };
+    let pr_content = match ai_result {
         Ok(content) => content,
         Err(_e) => {
             let mut description = pr_template;
@@ -1472,6 +1492,7 @@ mod run_create_pr_tests {
             draft: false,
             context_dir: None,
             no_push: true,
+            from_commits: false,
         }
     }
 
@@ -1585,6 +1606,70 @@ mod run_create_pr_tests {
             outcome.description.contains("# Custom template"),
             "fallback description should include repo template: {}",
             outcome.description
+        );
+    }
+
+    #[tokio::test]
+    async fn run_create_pr_with_client_from_commits_omits_diff() {
+        // Write a recognisable diff payload so we can prove it never reaches
+        // the AI when from_commits is set.
+        let dir = tempfile::tempdir().unwrap();
+        let diff_path = dir.path().join("recognisable.diff");
+        std::fs::write(
+            &diff_path,
+            "diff --git a/x b/x\n@@ -1 +1 @@\n-old\n+UNIQUE_DIFF_MARKER\n",
+        )
+        .unwrap();
+
+        let commit = CommitInfo {
+            hash: format!("{:0>40}", 0),
+            author: "Test <test@test.com>".to_string(),
+            date: chrono::Utc::now().fixed_offset(),
+            original_message: "feat: UNIQUE_COMMIT_SUBJECT_MARKER".to_string(),
+            in_main_branches: vec![],
+            analysis: CommitAnalysis {
+                detected_type: "feat".to_string(),
+                detected_scope: String::new(),
+                proposed_message: "feat: t".to_string(),
+                file_changes: FileChanges {
+                    total_files: 1,
+                    files_added: 0,
+                    files_deleted: 0,
+                    file_list: vec![],
+                },
+                diff_summary: String::new(),
+                diff_file: diff_path.to_string_lossy().to_string(),
+                file_diffs: Vec::new(),
+            },
+        };
+        let repo_view = sample_repo_view(vec![commit], None);
+        let context = CommitContext::new();
+        let mut cmd = fresh_cmd();
+        cmd.from_commits = true;
+
+        let yaml = "title: feat: x\ndescription: y\n".to_string();
+        let mock = ConfigurableMockAiClient::new(vec![Ok(yaml)]);
+        let prompt_handle = mock.prompt_handle();
+        let client = ClaudeClient::new(Box::new(mock));
+
+        run_create_pr_with_client(&cmd, &repo_view, &context, &client)
+            .await
+            .unwrap();
+
+        let prompts = prompt_handle.prompts();
+        assert_eq!(prompts.len(), 1, "expected one AI call");
+        let (_, user_prompt) = &prompts[0];
+        assert!(
+            user_prompt.contains("UNIQUE_COMMIT_SUBJECT_MARKER"),
+            "commit subject should be in the prompt"
+        );
+        assert!(
+            !user_prompt.contains("UNIQUE_DIFF_MARKER"),
+            "diff content must NOT appear in the prompt when from_commits is set"
+        );
+        assert!(
+            !user_prompt.contains("diff --git"),
+            "diff hunks must NOT appear in the prompt when from_commits is set"
         );
     }
 
