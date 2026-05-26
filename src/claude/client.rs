@@ -175,9 +175,13 @@ impl ClaudeClient {
     /// Returns `Ok(Ok(user_prompt))` when the full diff fits,
     /// `Ok(Err(BudgetExceeded))` when it does not, or a top-level error
     /// on serialization failure.
-    fn try_full_diff_budget(
+    ///
+    /// Generic over the view type so the diff-driven path
+    /// (`RepositoryViewForAI`) and the commit-driven path
+    /// (`RepositoryViewForAiFromCommits`) can share the same budget check.
+    fn try_full_diff_budget<V: serde::Serialize>(
         &self,
-        ai_view: &RepositoryViewForAI,
+        ai_view: &V,
         system_prompt: &str,
         build_user_prompt: &(impl Fn(&str) -> String + ?Sized),
     ) -> Result<std::result::Result<String, BudgetExceeded>> {
@@ -1264,6 +1268,118 @@ impl ClaudeClient {
                 }
                 self.merge_pr_content_chunks(&per_commit_contents, pr_template)
                     .await
+            }
+        }
+    }
+
+    /// Generates AI-powered PR content from commit messages only (no diff).
+    ///
+    /// Used by `omni-dev git branch create pr --from-commits`. Builds a
+    /// payload that contains commit messages and metadata (hash, author,
+    /// date, detected type/scope) but **no diff content** — the full diff
+    /// files are never read from disk for this path. Falls back to a
+    /// per-commit split dispatch if the commit-message payload exceeds the
+    /// token budget (rare; commit messages are small).
+    pub async fn generate_pr_content_with_context_from_commits(
+        &self,
+        repo_view: &RepositoryView,
+        pr_template: &str,
+        context: &crate::data::context::CommitContext,
+    ) -> Result<crate::cli::git::PrContent> {
+        use crate::data::RepositoryViewForAiFromCommits;
+
+        let commits_view = RepositoryViewForAiFromCommits::from_repository_view(repo_view.clone());
+
+        let prompt_style = self.ai_client.get_metadata().prompt_style();
+        let system_prompt = self.adjusted_system_prompt(
+            prompts::generate_pr_system_prompt_from_commits_with_context_for_provider(
+                context,
+                prompt_style,
+            ),
+        );
+
+        let build_user_prompt = |yaml: &str| {
+            prompts::generate_pr_description_prompt_from_commits_with_context(
+                yaml,
+                pr_template,
+                context,
+            )
+        };
+
+        match self.try_full_diff_budget(&commits_view, &system_prompt, &build_user_prompt)? {
+            Ok(user_prompt) => {
+                let content = self
+                    .send_with_optional_schema(
+                        &system_prompt,
+                        &user_prompt,
+                        self.schema_if_supported(response_schema::pr_content_schema()),
+                    )
+                    .await?;
+
+                debug!(
+                    content_length = content.len(),
+                    "Received AI response for from-commits PR content"
+                );
+
+                self.parse_pr_response(&content)
+            }
+            Err(_exceeded) => {
+                let mut per_commit_contents = Vec::new();
+                for commit in &commits_view.commits {
+                    let pr = self
+                        .generate_pr_content_for_commit_from_commits(
+                            commit,
+                            &commits_view,
+                            &system_prompt,
+                            &build_user_prompt,
+                        )
+                        .await?;
+                    per_commit_contents.push(pr);
+                }
+                if per_commit_contents.len() == 1 {
+                    return per_commit_contents
+                        .into_iter()
+                        .next()
+                        .context("Per-commit PR contents unexpectedly empty");
+                }
+                self.merge_pr_content_chunks(&per_commit_contents, pr_template)
+                    .await
+            }
+        }
+    }
+
+    /// Per-commit dispatch for the `--from-commits` path.
+    ///
+    /// Builds a single-commit view of the commit-message payload and
+    /// sends it. No file-level fallback exists for this path because the
+    /// payload is already a single commit message — if it does not fit
+    /// the budget, the commit message itself is pathologically large and
+    /// we surface a clear error rather than silently truncating.
+    async fn generate_pr_content_for_commit_from_commits(
+        &self,
+        commit: &crate::data::CommitInfoFromCommits,
+        commits_view: &crate::data::RepositoryViewForAiFromCommits,
+        system_prompt: &str,
+        build_user_prompt: &(dyn Fn(&str) -> String + Sync),
+    ) -> Result<crate::cli::git::PrContent> {
+        let single_view = commits_view.single_commit_view_from_commits(commit);
+
+        match self.try_full_diff_budget(&single_view, system_prompt, build_user_prompt)? {
+            Ok(user_prompt) => {
+                let content = self
+                    .send_with_optional_schema(
+                        system_prompt,
+                        &user_prompt,
+                        self.schema_if_supported(response_schema::pr_content_schema()),
+                    )
+                    .await?;
+                self.parse_pr_response(&content)
+            }
+            Err(_exceeded) => {
+                anyhow::bail!(
+                    "Token budget exceeded for commit {} in --from-commits mode; commit message is too large to fit",
+                    &commit.hash[..8.min(commit.hash.len())]
+                )
             }
         }
     }
@@ -3276,6 +3392,394 @@ mod tests {
         let pr = result.unwrap();
         assert!(pr.title.contains("modules"));
         assert_eq!(handle.remaining(), 0, "expected all responses consumed");
+    }
+
+    #[tokio::test]
+    async fn generate_pr_content_with_context_from_commits_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_test_repo_view(&dir);
+        let context = crate::data::context::CommitContext::default();
+
+        let response = "title: \"feat: from commits\"\ndescription: \"derived from commit\"\n";
+        let client = make_configurable_client(vec![Ok(response.to_string())]);
+
+        let result = client
+            .generate_pr_content_with_context_from_commits(&repo_view, "", &context)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "PR from-commits generation failed: {:?}",
+            result.err()
+        );
+        let pr = result.unwrap();
+        assert_eq!(pr.title, "feat: from commits");
+    }
+
+    #[tokio::test]
+    async fn generate_pr_content_with_context_from_commits_omits_diff_in_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        // Write a recognisable diff payload to the diff_file so we can prove it
+        // is NOT being read into the prompt.
+        let diff_path = dir.path().join("recognisable.diff");
+        std::fs::write(
+            &diff_path,
+            "diff --git a/x b/x\n@@ -1 +1 @@\n-old\n+UNIQUE_DIFF_MARKER\n",
+        )
+        .unwrap();
+
+        // Build a repo view whose single commit's diff_file points at the
+        // marker file but whose commit message contains a distinct subject.
+        let repo_view = {
+            use crate::data::{AiInfo, FieldExplanation, WorkingDirectoryInfo};
+            use crate::git::commit::FileChanges;
+            use crate::git::{CommitAnalysis, CommitInfo};
+            crate::data::RepositoryView {
+                versions: None,
+                explanation: FieldExplanation::default(),
+                working_directory: WorkingDirectoryInfo {
+                    clean: true,
+                    untracked_changes: Vec::new(),
+                },
+                remotes: Vec::new(),
+                ai: AiInfo {
+                    scratch: String::new(),
+                },
+                branch_info: None,
+                pr_template: None,
+                pr_template_location: None,
+                branch_prs: None,
+                commits: vec![CommitInfo {
+                    hash: format!("{:0>40}", 0),
+                    author: "Test <test@test.com>".to_string(),
+                    date: chrono::Utc::now().fixed_offset(),
+                    original_message: "feat(test): UNIQUE_COMMIT_SUBJECT_MARKER".to_string(),
+                    in_main_branches: Vec::new(),
+                    analysis: CommitAnalysis {
+                        detected_type: "feat".to_string(),
+                        detected_scope: "test".to_string(),
+                        proposed_message: "feat(test): unique".to_string(),
+                        file_changes: FileChanges {
+                            total_files: 1,
+                            files_added: 1,
+                            files_deleted: 0,
+                            file_list: Vec::new(),
+                        },
+                        diff_summary: "UNIQUE_STAT_MARKER | 1 +".to_string(),
+                        diff_file: diff_path.to_string_lossy().to_string(),
+                        file_diffs: Vec::new(),
+                    },
+                }],
+            }
+        };
+        let context = crate::data::context::CommitContext::default();
+
+        let (client, _resp_handle, prompt_handle) =
+            make_configurable_client_with_prompts(vec![Ok(
+                "title: \"feat: x\"\ndescription: \"y\"\n".to_string(),
+            )]);
+
+        client
+            .generate_pr_content_with_context_from_commits(&repo_view, "", &context)
+            .await
+            .unwrap();
+
+        let prompts = prompt_handle.prompts();
+        assert_eq!(prompts.len(), 1, "expected exactly one AI call");
+        let (system_prompt, user_prompt) = &prompts[0];
+
+        // Commit narrative IS present
+        assert!(
+            user_prompt.contains("UNIQUE_COMMIT_SUBJECT_MARKER"),
+            "user prompt must include the commit subject"
+        );
+        // No diff content
+        assert!(
+            !user_prompt.contains("UNIQUE_DIFF_MARKER"),
+            "user prompt must NOT include diff content: {user_prompt}"
+        );
+        assert!(
+            !user_prompt.contains("diff --git"),
+            "user prompt must NOT include diff hunks"
+        );
+        assert!(
+            !user_prompt.contains("diff_content"),
+            "user prompt must NOT include diff_content YAML field"
+        );
+        assert!(
+            !user_prompt.contains("UNIQUE_STAT_MARKER"),
+            "user prompt must NOT include diff_summary"
+        );
+        // System prompt references commits, not diff files
+        assert!(
+            !system_prompt.contains("diff files"),
+            "system prompt must not mention diff files"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_pr_content_with_context_default_mode_includes_diff_in_prompt() {
+        // Regression test locking in the byte-identical-default guarantee:
+        // when --from-commits is OFF, the prompt MUST still contain diff content.
+        let dir = tempfile::tempdir().unwrap();
+        let repo_view = make_test_repo_view(&dir);
+        let context = crate::data::context::CommitContext::default();
+
+        let (client, _resp_handle, prompt_handle) =
+            make_configurable_client_with_prompts(vec![Ok(
+                "title: \"feat: x\"\ndescription: \"y\"\n".to_string(),
+            )]);
+
+        client
+            .generate_pr_content_with_context(&repo_view, "", &context)
+            .await
+            .unwrap();
+
+        let prompts = prompt_handle.prompts();
+        assert_eq!(prompts.len(), 1);
+        let (_system_prompt, user_prompt) = &prompts[0];
+        assert!(
+            user_prompt.contains("diff_content"),
+            "default mode must still serialise diff_content into the prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_pr_content_with_context_from_commits_multi_commit_per_commit_dispatch() {
+        // Force per-commit fallback by giving each commit a large message
+        // so the combined view busts the small (50K) context window.
+        use crate::data::{AiInfo, FieldExplanation, WorkingDirectoryInfo};
+        use crate::git::commit::FileChanges;
+        use crate::git::{CommitAnalysis, CommitInfo};
+
+        let dir = tempfile::tempdir().unwrap();
+        let make_commit = |hash: String, marker: &str, msg_size: usize| {
+            let diff_path = dir.path().join(format!("{}.diff", &hash[..4]));
+            std::fs::write(&diff_path, "+x\n").unwrap();
+            CommitInfo {
+                hash,
+                author: "Test <test@test.com>".to_string(),
+                date: chrono::Utc::now().fixed_offset(),
+                original_message: format!("feat({marker}): {}", "x".repeat(msg_size)),
+                in_main_branches: Vec::new(),
+                analysis: CommitAnalysis {
+                    detected_type: "feat".to_string(),
+                    detected_scope: marker.to_string(),
+                    proposed_message: format!("feat({marker}): t"),
+                    file_changes: FileChanges {
+                        total_files: 1,
+                        files_added: 1,
+                        files_deleted: 0,
+                        file_list: Vec::new(),
+                    },
+                    diff_summary: String::new(),
+                    diff_file: diff_path.to_string_lossy().to_string(),
+                    file_diffs: Vec::new(),
+                },
+            }
+        };
+
+        // Two commits, each with a ~80KB message → combined ~160KB chars,
+        // exceeds the 50K-context-length mock's ~20K-token input budget.
+        let repo_view = crate::data::RepositoryView {
+            versions: None,
+            explanation: FieldExplanation::default(),
+            working_directory: WorkingDirectoryInfo {
+                clean: true,
+                untracked_changes: Vec::new(),
+            },
+            remotes: Vec::new(),
+            ai: AiInfo {
+                scratch: String::new(),
+            },
+            branch_info: None,
+            pr_template: None,
+            pr_template_location: None,
+            branch_prs: None,
+            commits: vec![
+                make_commit("a".repeat(40), "a", 80_000),
+                make_commit("b".repeat(40), "b", 80_000),
+            ],
+        };
+        let context = crate::data::context::CommitContext::default();
+
+        // Full view exceeds → per-commit fallback (2 calls) → merge (1 call).
+        let (client, handle) = make_small_context_client_tracked(vec![
+            Ok(valid_pr_yaml("feat(a): a", "did a")),
+            Ok(valid_pr_yaml("feat(b): b", "did b")),
+            Ok(valid_pr_yaml("feat: a and b", "did both")),
+        ]);
+
+        let result = client
+            .generate_pr_content_with_context_from_commits(&repo_view, "", &context)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "from-commits per-commit dispatch failed: {:?}",
+            result.err()
+        );
+        let pr = result.unwrap();
+        assert!(
+            pr.title.contains("and"),
+            "unexpected merged title: {}",
+            pr.title
+        );
+        assert_eq!(handle.remaining(), 0, "expected all responses consumed");
+    }
+
+    #[tokio::test]
+    async fn generate_pr_content_with_context_from_commits_single_commit_per_commit_return() {
+        // Force per-commit fallback with a single commit whose message busts
+        // the budget on the full view but fits in the slimmer single-commit
+        // view (no envelope around it). Exercises the
+        // `per_commit_contents.len() == 1` return branch — no merge pass.
+        use crate::data::{AiInfo, FieldExplanation, WorkingDirectoryInfo};
+        use crate::git::commit::FileChanges;
+        use crate::git::{CommitAnalysis, CommitInfo};
+
+        let dir = tempfile::tempdir().unwrap();
+        let diff_path = dir.path().join("0.diff");
+        std::fs::write(&diff_path, "+x\n").unwrap();
+        let commit = CommitInfo {
+            hash: "a".repeat(40),
+            author: "Test <test@test.com>".to_string(),
+            date: chrono::Utc::now().fixed_offset(),
+            // ~80KB message → busts the 50K-context client's input budget
+            // when wrapped in the full envelope, but the slimmer single-commit
+            // view (envelope stripped) still fits with the small context.
+            original_message: format!("feat(only): {}", "x".repeat(80_000)),
+            in_main_branches: Vec::new(),
+            analysis: CommitAnalysis {
+                detected_type: "feat".to_string(),
+                detected_scope: "only".to_string(),
+                proposed_message: "feat(only): m".to_string(),
+                file_changes: FileChanges {
+                    total_files: 1,
+                    files_added: 1,
+                    files_deleted: 0,
+                    file_list: Vec::new(),
+                },
+                diff_summary: String::new(),
+                diff_file: diff_path.to_string_lossy().to_string(),
+                file_diffs: Vec::new(),
+            },
+        };
+        let repo_view = crate::data::RepositoryView {
+            versions: None,
+            explanation: FieldExplanation::default(),
+            working_directory: WorkingDirectoryInfo {
+                clean: true,
+                untracked_changes: Vec::new(),
+            },
+            remotes: Vec::new(),
+            ai: AiInfo {
+                scratch: String::new(),
+            },
+            branch_info: None,
+            pr_template: None,
+            pr_template_location: None,
+            branch_prs: None,
+            commits: vec![commit],
+        };
+        let context = crate::data::context::CommitContext::default();
+
+        // Full envelope view exceeds → per-commit dispatch (1 call) → single
+        // result returned directly, no merge.
+        let (client, handle) = make_small_context_client_tracked(vec![Ok(valid_pr_yaml(
+            "feat(only): direct return",
+            "single commit body",
+        ))]);
+
+        let result = client
+            .generate_pr_content_with_context_from_commits(&repo_view, "", &context)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "from-commits single-commit per-commit dispatch failed: {:?}",
+            result.err()
+        );
+        let pr = result.unwrap();
+        assert_eq!(pr.title, "feat(only): direct return");
+        assert_eq!(
+            handle.remaining(),
+            0,
+            "exactly one response should be consumed (no merge call)"
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_pr_content_with_context_from_commits_bails_on_oversized_single_commit() {
+        // A single commit whose own slim view still exceeds the budget triggers
+        // the bail in `generate_pr_content_for_commit_from_commits`.
+        use crate::data::{AiInfo, FieldExplanation, WorkingDirectoryInfo};
+        use crate::git::commit::FileChanges;
+        use crate::git::{CommitAnalysis, CommitInfo};
+
+        let dir = tempfile::tempdir().unwrap();
+        let diff_path = dir.path().join("0.diff");
+        std::fs::write(&diff_path, "+x\n").unwrap();
+        let commit = CommitInfo {
+            hash: "c".repeat(40),
+            author: "Test <test@test.com>".to_string(),
+            date: chrono::Utc::now().fixed_offset(),
+            // Message large enough that even the single-commit slim view
+            // overflows the 50K context window's input budget.
+            original_message: format!("feat: {}", "z".repeat(200_000)),
+            in_main_branches: Vec::new(),
+            analysis: CommitAnalysis {
+                detected_type: "feat".to_string(),
+                detected_scope: String::new(),
+                proposed_message: "feat: oversized".to_string(),
+                file_changes: FileChanges {
+                    total_files: 0,
+                    files_added: 0,
+                    files_deleted: 0,
+                    file_list: Vec::new(),
+                },
+                diff_summary: String::new(),
+                diff_file: diff_path.to_string_lossy().to_string(),
+                file_diffs: Vec::new(),
+            },
+        };
+        let repo_view = crate::data::RepositoryView {
+            versions: None,
+            explanation: FieldExplanation::default(),
+            working_directory: WorkingDirectoryInfo {
+                clean: true,
+                untracked_changes: Vec::new(),
+            },
+            remotes: Vec::new(),
+            ai: AiInfo {
+                scratch: String::new(),
+            },
+            branch_info: None,
+            pr_template: None,
+            pr_template_location: None,
+            branch_prs: None,
+            commits: vec![commit],
+        };
+        let context = crate::data::context::CommitContext::default();
+
+        // No mock responses are needed; the call should bail before making
+        // any AI request.
+        let client = make_small_context_client(Vec::new());
+
+        let result = client
+            .generate_pr_content_with_context_from_commits(&repo_view, "", &context)
+            .await;
+
+        assert!(result.is_err(), "expected bail on oversized single commit");
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("Token budget exceeded"),
+            "expected token-budget error message, got: {msg}"
+        );
+        assert!(
+            msg.contains("--from-commits"),
+            "error should reference the from-commits mode"
+        );
     }
 
     #[tokio::test]
