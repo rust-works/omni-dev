@@ -40,6 +40,7 @@ pub use paths::{captures_dir, omni_dev_voice_root, speaker_file, speakers_dir};
 pub use render::{detect_format, render_jsonl, render_markdown, OutputFormat};
 pub use speaker::{cosine, l2_normalise, EnrolledSpeaker, WespeakerEmbedder, MIN_EMBED_SAMPLES};
 pub use transcriber::{
-    AudioChunk, AudioInput, EndpointKind, EventId, EventStream, SpeakerId, Transcriber,
-    TranscriptEvent, VecAudioInput, Word,
+    AsyncAudioInput, AudioChunk, AudioInput, EndpointKind, EventId, EventStream,
+    FileAsyncAudioInput, SpeakerId, StreamingTranscriber, Transcriber, TranscriptEvent,
+    VecAudioInput, Word,
 };

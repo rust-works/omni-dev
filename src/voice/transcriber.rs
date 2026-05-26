@@ -12,9 +12,12 @@
 //! `Send`) that ASR engines consume natively. See ADR-0032 for the rationale.
 
 use std::path::Path;
+use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
+use futures::Stream;
 use serde::{Deserialize, Serialize};
 
 /// Monotonically-unique identifier for a `Final` event, used by downstream
@@ -46,6 +49,21 @@ pub trait AudioInput: Send {
     /// exhausted. Implementations may yield chunks of any size; consumers
     /// must not rely on a particular chunk boundary.
     fn next_chunk(&mut self) -> Option<AudioChunk>;
+}
+
+/// Async source of 16 kHz mono signed-PCM audio for streaming
+/// transcription. The streaming counterpart of [`AudioInput`].
+///
+/// Per #806: streaming backends pull chunks asynchronously so the call
+/// site can `await` next-chunk delivery (e.g., from a `cpal` capture
+/// channel, a file feeder with simulated realtime cadence, or a network
+/// socket) without blocking the executor.
+#[async_trait]
+pub trait AsyncAudioInput: Send {
+    /// Awaits and returns the next chunk of samples, or `None` when the
+    /// input is exhausted. Same chunk-boundary contract as
+    /// [`AudioInput::next_chunk`].
+    async fn next_chunk(&mut self) -> Option<AudioChunk>;
 }
 
 /// Stream of transcription events. A blanket impl is provided for any
@@ -159,6 +177,24 @@ pub trait Transcriber: Send + Sync {
     fn transcribe(&self, audio: Box<dyn AudioInput>) -> Result<Box<dyn EventStream>>;
 }
 
+/// Streaming counterpart of [`Transcriber`] (per #806). Drives a backend
+/// that emits `Partial`/`Final`/`Endpoint` events as audio arrives, rather
+/// than buffering the whole input before decoding.
+///
+/// `Send + Sync` matches [`Transcriber`]; per-call mutable state
+/// (LSTM hidden state, encoder cache, running normalisation stats) lives
+/// behind a `Mutex` inside the backend.
+pub trait StreamingTranscriber: Send + Sync {
+    /// Consumes an async audio input and returns a stream of transcription
+    /// events. The stream completes when the underlying input returns
+    /// `None`; the backend is expected to emit a terminal
+    /// `Endpoint { kind: StreamEnd, .. }` before completing.
+    fn transcribe_stream(
+        &self,
+        audio: Box<dyn AsyncAudioInput>,
+    ) -> Pin<Box<dyn Stream<Item = Result<TranscriptEvent>> + Send>>;
+}
+
 /// In-memory [`AudioInput`] adapter — reads a 16 kHz mono 16-bit PCM WAV
 /// from disk (or accepts an in-memory `Vec<i16>`) and yields it in fixed-
 /// size chunks.
@@ -180,36 +216,7 @@ impl VecAudioInput {
     /// pieces of `chunk_samples` samples each (last chunk may be shorter).
     /// `chunk_samples` is clamped to at least 1.
     pub fn from_wav_path(path: impl AsRef<Path>, chunk_samples: usize) -> Result<Self> {
-        let path = path.as_ref();
-        let mut reader = hound::WavReader::open(path)
-            .with_context(|| format!("Failed to open WAV at {}", path.display()))?;
-        let spec = reader.spec();
-        if spec.sample_rate != 16_000 {
-            bail!(
-                "WAV at {} must be 16000 Hz (got {}). Resample before constructing VecAudioInput.",
-                path.display(),
-                spec.sample_rate
-            );
-        }
-        if spec.channels != 1 {
-            bail!(
-                "WAV at {} must be mono (got {} channels). Mix down before constructing VecAudioInput.",
-                path.display(),
-                spec.channels
-            );
-        }
-        if spec.bits_per_sample != 16 || spec.sample_format != hound::SampleFormat::Int {
-            bail!(
-                "WAV at {} must be 16-bit signed PCM (got {}-bit {:?})",
-                path.display(),
-                spec.bits_per_sample,
-                spec.sample_format
-            );
-        }
-        let samples: Vec<i16> = reader
-            .samples::<i16>()
-            .collect::<Result<Vec<_>, _>>()
-            .with_context(|| format!("Failed to decode i16 PCM samples from {}", path.display()))?;
+        let samples = load_16k_mono_i16_wav(path.as_ref())?;
         Ok(Self::from_samples(samples, chunk_samples))
     }
 
@@ -224,8 +231,94 @@ impl VecAudioInput {
     }
 }
 
+/// Loads a 16 kHz mono 16-bit signed-PCM WAV from disk, rejecting anything
+/// else. Shared by [`VecAudioInput::from_wav_path`] and
+/// [`FileAsyncAudioInput::from_wav_path`].
+fn load_16k_mono_i16_wav(path: &Path) -> Result<Vec<i16>> {
+    let mut reader = hound::WavReader::open(path)
+        .with_context(|| format!("Failed to open WAV at {}", path.display()))?;
+    let spec = reader.spec();
+    if spec.sample_rate != 16_000 {
+        bail!(
+            "WAV at {} must be 16000 Hz (got {}). Resample before constructing the input.",
+            path.display(),
+            spec.sample_rate
+        );
+    }
+    if spec.channels != 1 {
+        bail!(
+            "WAV at {} must be mono (got {} channels). Mix down before constructing the input.",
+            path.display(),
+            spec.channels
+        );
+    }
+    if spec.bits_per_sample != 16 || spec.sample_format != hound::SampleFormat::Int {
+        bail!(
+            "WAV at {} must be 16-bit signed PCM (got {}-bit {:?})",
+            path.display(),
+            spec.bits_per_sample,
+            spec.sample_format
+        );
+    }
+    reader
+        .samples::<i16>()
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("Failed to decode i16 PCM samples from {}", path.display()))
+}
+
 impl AudioInput for VecAudioInput {
     fn next_chunk(&mut self) -> Option<AudioChunk> {
+        if self.cursor >= self.samples.len() {
+            return None;
+        }
+        let end = (self.cursor + self.chunk_samples).min(self.samples.len());
+        let chunk = self.samples[self.cursor..end].to_vec();
+        self.cursor = end;
+        Some(chunk)
+    }
+}
+
+/// Async [`AsyncAudioInput`] adapter — the streaming counterpart of
+/// [`VecAudioInput`].
+///
+/// Yields fixed-size chunks of a 16 kHz mono i16 WAV (or in-memory
+/// `Vec<i16>`) without realtime pacing — every `await` returns
+/// immediately. Used as the WAV-as-live test harness for
+/// [`StreamingTranscriber`] backends per #806.
+///
+/// Realtime pacing (sleep `chunk_samples / 16000` between yields) is out
+/// of scope for v1; live capture flows construct a different
+/// [`AsyncAudioInput`] from a `cpal` channel.
+#[derive(Debug)]
+pub struct FileAsyncAudioInput {
+    samples: Vec<i16>,
+    cursor: usize,
+    chunk_samples: usize,
+}
+
+impl FileAsyncAudioInput {
+    /// Loads a 16 kHz mono i16 PCM WAV from `path` and chunks it into
+    /// pieces of `chunk_samples` samples each (last chunk may be shorter).
+    /// `chunk_samples` is clamped to at least 1.
+    pub fn from_wav_path(path: impl AsRef<Path>, chunk_samples: usize) -> Result<Self> {
+        let samples = load_16k_mono_i16_wav(path.as_ref())?;
+        Ok(Self::from_samples(samples, chunk_samples))
+    }
+
+    /// Builds an input from an in-memory `Vec<i16>` (already 16 kHz mono).
+    /// Useful for synthesised test signals.
+    pub fn from_samples(samples: Vec<i16>, chunk_samples: usize) -> Self {
+        Self {
+            samples,
+            cursor: 0,
+            chunk_samples: chunk_samples.max(1),
+        }
+    }
+}
+
+#[async_trait]
+impl AsyncAudioInput for FileAsyncAudioInput {
+    async fn next_chunk(&mut self) -> Option<AudioChunk> {
         if self.cursor >= self.samples.len() {
             return None;
         }
@@ -408,6 +501,100 @@ mod tests {
         let bad_json = r#"{"type":"endpoint","at":"not a number","kind":"stream_end"}"#;
         let result: Result<TranscriptEvent, _> = serde_json::from_str(bad_json);
         assert!(result.is_err(), "expected deserialization to fail");
+    }
+
+    #[tokio::test]
+    async fn file_async_audio_input_chunks_in_order() {
+        let mut input = FileAsyncAudioInput::from_samples(vec![1, 2, 3, 4, 5], 2);
+        assert_eq!(input.next_chunk().await, Some(vec![1, 2]));
+        assert_eq!(input.next_chunk().await, Some(vec![3, 4]));
+        assert_eq!(input.next_chunk().await, Some(vec![5]));
+        assert_eq!(input.next_chunk().await, None);
+    }
+
+    #[tokio::test]
+    async fn file_async_audio_input_reads_16k_mono_i16_wav() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_fixture_wav(&tmp, "ok.wav", 16_000, 1, 16, &[10, 20, 30, 40]);
+        let mut input = FileAsyncAudioInput::from_wav_path(&path, 2).unwrap();
+        assert_eq!(input.next_chunk().await, Some(vec![10, 20]));
+        assert_eq!(input.next_chunk().await, Some(vec![30, 40]));
+        assert!(input.next_chunk().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn file_async_audio_input_rejects_wrong_rate() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_fixture_wav(&tmp, "44k.wav", 44_100, 1, 16, &[0, 0]);
+        let err = FileAsyncAudioInput::from_wav_path(&path, 16).unwrap_err();
+        assert!(err.to_string().contains("16000 Hz"), "got: {err}");
+    }
+
+    #[test]
+    fn streaming_transcriber_trait_object_compiles() {
+        // Proves StreamingTranscriber + AsyncAudioInput compose into a
+        // dyn-dispatch shape without depending on any backend.
+        struct NoopStreaming;
+        impl StreamingTranscriber for NoopStreaming {
+            fn transcribe_stream(
+                &self,
+                _audio: Box<dyn AsyncAudioInput>,
+            ) -> std::pin::Pin<Box<dyn futures::Stream<Item = Result<TranscriptEvent>> + Send>>
+            {
+                Box::pin(futures::stream::empty())
+            }
+        }
+        fn accepts(_t: Box<dyn StreamingTranscriber>) {}
+        accepts(Box::new(NoopStreaming));
+    }
+
+    #[tokio::test]
+    async fn streaming_transcriber_end_to_end_shape() {
+        // Drives a trivial StreamingTranscriber through the trait surface
+        // — chunk-pull → event-emit → stream-end — to lock in the contract
+        // commit-1 lands ahead of the Parakeet backend that consumes it.
+        use futures::StreamExt;
+
+        struct EchoCountStreaming;
+        impl StreamingTranscriber for EchoCountStreaming {
+            fn transcribe_stream(
+                &self,
+                mut audio: Box<dyn AsyncAudioInput>,
+            ) -> std::pin::Pin<Box<dyn futures::Stream<Item = Result<TranscriptEvent>> + Send>>
+            {
+                // Drives chunk pulls in a single future, emits one terminal
+                // Endpoint event when the input is drained. Uses
+                // `stream::once` to keep the test free of additional deps.
+                Box::pin(futures::stream::once(async move {
+                    let mut total: usize = 0;
+                    while let Some(chunk) = audio.next_chunk().await {
+                        total += chunk.len();
+                    }
+                    #[allow(clippy::cast_precision_loss)]
+                    let at = Duration::from_secs_f64(total as f64 / 16_000.0);
+                    Ok(TranscriptEvent::Endpoint {
+                        at,
+                        kind: EndpointKind::StreamEnd,
+                    })
+                }))
+            }
+        }
+
+        let backend = EchoCountStreaming;
+        let input = Box::new(FileAsyncAudioInput::from_samples(
+            vec![0_i16; 32_000],
+            8_000,
+        ));
+        let mut stream = backend.transcribe_stream(input);
+        let event = stream.next().await.expect("at least one event").unwrap();
+        assert!(matches!(
+            event,
+            TranscriptEvent::Endpoint {
+                kind: EndpointKind::StreamEnd,
+                ..
+            }
+        ));
+        assert!(stream.next().await.is_none());
     }
 
     #[test]
