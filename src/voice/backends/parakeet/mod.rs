@@ -17,6 +17,7 @@ pub mod conformer_block;
 pub mod conv_module;
 pub mod decoder;
 pub mod encoder;
+pub mod streaming;
 pub mod tokenizer;
 pub mod weights;
 
