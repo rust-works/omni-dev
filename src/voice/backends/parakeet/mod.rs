@@ -11,5 +11,7 @@
 //! Architecture rationale: ADR-0033 (candle for ASR), and the #871
 //! feasibility spike's GO recommendation.
 
+pub mod attention;
 pub mod audio;
+pub mod conv_module;
 pub mod weights;
