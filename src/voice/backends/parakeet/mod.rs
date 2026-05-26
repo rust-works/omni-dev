@@ -13,5 +13,7 @@
 
 pub mod attention;
 pub mod audio;
+pub mod conformer_block;
 pub mod conv_module;
+pub mod encoder;
 pub mod weights;
