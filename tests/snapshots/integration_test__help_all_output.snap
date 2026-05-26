@@ -2980,7 +2980,7 @@ Usage: install-model [OPTIONS]
 Options:
       --dest <DEST>        Override the install directory. Defaults to the variant's canonical location under `~/.omni-dev/voice/models/`
       --force              Re-download even if all required files are already present
-      --variant <VARIANT>  Which model variant to install. Defaults to `whisper-tiny.en` [default: whisper-tiny.en] [possible values: whisper-tiny.en, speaker-wespeaker-en]
+      --variant <VARIANT>  Which model variant to install. Defaults to `whisper-tiny.en` [default: whisper-tiny.en] [possible values: whisper-tiny.en, parakeet-tdt-0.6b-v2, speaker-wespeaker-en]
   -h, --help               Print help (see more with '--help')
 
 

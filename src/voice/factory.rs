@@ -19,7 +19,8 @@ use anyhow::{bail, Result};
 
 use crate::voice::backends::candle::CandleTranscriber;
 use crate::voice::backends::mock::MockTranscriber;
-use crate::voice::models::resolve_whisper_model_dir;
+use crate::voice::backends::parakeet::CandleParakeetTranscriber;
+use crate::voice::models::{resolve_parakeet_model_dir, resolve_whisper_model_dir};
 use crate::voice::transcriber::Transcriber;
 
 /// Backend-selection options carried from the CLI (or constructed
@@ -59,8 +60,15 @@ pub fn create_default_transcriber(opts: &VoiceOpts) -> Result<Box<dyn Transcribe
             let dir = resolve_whisper_model_dir(opts)?;
             Ok(Box::new(CandleTranscriber::new(&dir)?))
         }
+        "parakeet-tdt" => {
+            let dir = resolve_parakeet_model_dir(opts)?;
+            Ok(Box::new(CandleParakeetTranscriber::new(&dir)?))
+        }
         other => {
-            bail!("unknown voice backend: {other:?} (supported: \"mock\", \"whisper-candle\")")
+            bail!(
+                "unknown voice backend: {other:?} \
+                 (supported: \"mock\", \"whisper-candle\", \"parakeet-tdt\")"
+            )
         }
     }
 }

@@ -18,7 +18,9 @@ use clap::{Parser, ValueEnum};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use sha2::{Digest, Sha256};
 
-use crate::voice::models::{ModelSource, ModelSpec, SPEAKER_WESPEAKER_EN, WHISPER_TINY_EN};
+use crate::voice::models::{
+    ModelSource, ModelSpec, PARAKEET_TDT_0_6B_V2, SPEAKER_WESPEAKER_EN, WHISPER_TINY_EN,
+};
 
 /// Which model variant to install.
 ///
@@ -31,6 +33,12 @@ pub enum Variant {
     #[default]
     #[value(name = "whisper-tiny.en")]
     WhisperTinyEn,
+    /// NVIDIA Parakeet-TDT-0.6B-v2 — pure-Rust ASR per issue #898.
+    /// Downloads the MLX-format safetensors and runs the
+    /// `scripts/convert_parakeet_weights.py` permute pass to produce
+    /// the candle-friendly weights the backend loads.
+    #[value(name = "parakeet-tdt-0.6b-v2")]
+    ParakeetTdt06bV2,
     /// Wespeaker `resnet34_LM` English-only speaker embedding (ADR-0034).
     #[value(name = "speaker-wespeaker-en")]
     SpeakerWespeakerEn,
@@ -41,6 +49,7 @@ impl Variant {
     pub fn spec(self) -> &'static ModelSpec {
         match self {
             Self::WhisperTinyEn => &WHISPER_TINY_EN,
+            Self::ParakeetTdt06bV2 => &PARAKEET_TDT_0_6B_V2,
             Self::SpeakerWespeakerEn => &SPEAKER_WESPEAKER_EN,
         }
     }
@@ -94,6 +103,14 @@ impl InstallModelCommand {
             return Ok(());
         }
 
+        // Parakeet has a different upstream file set than the install
+        // dir's required_files (raw MLX safetensors vs. converted
+        // candle safetensors), so it gets its own install path that
+        // shells out to the Python converter after download.
+        if matches!(self.variant, Variant::ParakeetTdt06bV2) {
+            return install_parakeet(spec, &dest, w);
+        }
+
         match spec.source {
             ModelSource::HfHub { repo_id, revision } => {
                 download_hf_hub(spec, repo_id, revision, &dest, w)
@@ -103,6 +120,256 @@ impl InstallModelCommand {
             }
         }
     }
+}
+
+/// Files the Parakeet install pipeline pulls from the upstream HF repo
+/// (distinct from the spec's `required_files`, which lists what the
+/// backend expects in the dir *after* conversion). `tokenizer.json` is
+/// NOT in this list because the upstream `mlx-community/parakeet-tdt-0.6b-v2`
+/// repo doesn't ship one — the 1024-token BPE vocab is embedded in
+/// `config.json` at `joint.vocabulary`. The install pipeline synthesises
+/// a decode-only `tokenizer.json` from that vocab after download.
+const PARAKEET_UPSTREAM_FILES: &[&str] = &["config.json", "model.safetensors"];
+
+/// CC-BY-4.0 attribution written to the Parakeet model dir per the
+/// issue #898 acceptance criterion. Single source of truth; the file
+/// content is exact-match-tested in install_model's test module.
+const PARAKEET_ATTRIBUTION: &str = "\
+NVIDIA Parakeet-TDT-0.6B-v2 (mlx-community/parakeet-tdt-0.6b-v2)
+Licensed under CC-BY-4.0
+https://creativecommons.org/licenses/by/4.0/
+
+Source: https://huggingface.co/mlx-community/parakeet-tdt-0.6b-v2
+Original model: NVIDIA Corporation
+MLX port: senstella + mlx-community contributors
+Candle port: omni-dev project (issue #898)
+";
+
+/// Parakeet install: download raw MLX safetensors from HF, run the
+/// Python converter to produce `candle_weights.safetensors`, write the
+/// CC-BY-4.0 attribution file. The HF download uses the same Api the
+/// other variants do; the converter call is a `std::process::Command`
+/// because the converter lives in `scripts/` for ease of iteration
+/// independent of the Rust release cycle.
+fn install_parakeet<W: Write>(spec: &ModelSpec, dest: &Path, w: &mut W) -> Result<()> {
+    let ModelSource::HfHub { repo_id, revision } = spec.source else {
+        bail!(
+            "internal error: Parakeet variant has non-HfHub source ({:?})",
+            spec.source
+        );
+    };
+
+    writeln!(
+        w,
+        "Installing {repo_id} (revision {revision}) -> {}",
+        dest.display()
+    )?;
+    std::fs::create_dir_all(dest)
+        .with_context(|| format!("create install directory at {}", dest.display()))?;
+
+    let api = Api::new().context("initialise HuggingFace Hub client")?;
+    let repo = api.repo(Repo::with_revision(
+        repo_id.to_string(),
+        RepoType::Model,
+        revision.to_string(),
+    ));
+
+    // Download upstream files (config.json, tokenizer.json,
+    // model.safetensors) into the dest dir.
+    for file in PARAKEET_UPSTREAM_FILES {
+        let start = Instant::now();
+        write!(w, "  fetching {file}... ")?;
+        w.flush()?;
+        let downloaded = repo.get(file).with_context(|| {
+            format!(
+                "download {file} from {repo_id} (revision {revision}). \
+                 Check your network or set HTTPS_PROXY"
+            )
+        })?;
+        let target = dest.join(file);
+        atomic_install_copy(&downloaded, &target).with_context(|| {
+            format!(
+                "install {file} into {} (atomic rename failed)",
+                target.display()
+            )
+        })?;
+        let bytes = std::fs::metadata(&target).map_or(0, |m| m.len());
+        writeln!(
+            w,
+            "done ({bytes} bytes in {:.1}s)",
+            start.elapsed().as_secs_f64()
+        )?;
+    }
+
+    // Run the Python converter to produce candle_weights.safetensors.
+    let src_safetensors = dest.join("model.safetensors");
+    let out_safetensors = dest.join("candle_weights.safetensors");
+    let converter =
+        locate_parakeet_converter().context("locate scripts/convert_parakeet_weights.py")?;
+
+    write!(w, "  converting weights via {}... ", converter.display())?;
+    w.flush()?;
+    let start = Instant::now();
+    let status = std::process::Command::new(python_binary())
+        .arg(&converter)
+        .arg("--src")
+        .arg(&src_safetensors)
+        .arg("--out")
+        .arg(&out_safetensors)
+        .status()
+        .context(
+            "spawn python3 for converter. \
+             Ensure python3 + numpy + safetensors are installed: \
+             `pip install numpy safetensors`",
+        )?;
+    if !status.success() {
+        bail!(
+            "converter failed with exit code {:?}; see PARAKEET-CONVERT: log lines above",
+            status.code()
+        );
+    }
+    writeln!(w, "done ({:.1}s)", start.elapsed().as_secs_f64())?;
+
+    // Delete the raw MLX safetensors to save ~2.47 GB — the converted
+    // file is what the backend loads.
+    if let Err(e) = std::fs::remove_file(&src_safetensors) {
+        // Non-fatal: log a warning and continue.
+        writeln!(
+            w,
+            "  warning: failed to delete raw {} ({e}); leaving in place",
+            src_safetensors.display()
+        )?;
+    }
+
+    // Synthesise tokenizer.json from config.json's embedded vocab.
+    // The upstream HF repo doesn't ship tokenizer.json; the 1024-token
+    // BPE vocab lives at config.json::joint.vocabulary.
+    let config_path = dest.join("config.json");
+    let tokenizer_path = dest.join("tokenizer.json");
+    write!(w, "  writing tokenizer.json from config.json vocab... ")?;
+    w.flush()?;
+    write_tokenizer_json(&config_path, &tokenizer_path)
+        .context("synthesise tokenizer.json from config.json vocab")?;
+    let tok_bytes = std::fs::metadata(&tokenizer_path).map_or(0, |m| m.len());
+    writeln!(w, "done ({tok_bytes} bytes)")?;
+
+    // Write CC-BY-4.0 attribution.
+    let attribution_path = dest.join("ATTRIBUTION.txt");
+    atomic_install_bytes(PARAKEET_ATTRIBUTION.as_bytes(), &attribution_path)
+        .context("write Parakeet ATTRIBUTION.txt")?;
+
+    writeln!(
+        w,
+        "{} model installed at {}",
+        spec.kind_label,
+        dest.display()
+    )?;
+    Ok(())
+}
+
+/// Synthesises a decode-only HF `tokenizer.json` from the BPE vocab
+/// embedded in Parakeet's `config.json` (`joint.vocabulary` — 1024
+/// entries for v2). Decode-only is sufficient because Parakeet's TDT
+/// joiner emits token IDs; it never tokenises input text. The shape
+/// follows the HuggingFace `tokenizers` library's BPE model schema:
+///
+/// - `decoder.type = Metaspace` with replacement `▁` (U+2581) — the
+///   SentencePiece word-start marker. The decoder strips it on output,
+///   turning `["▁the", "▁cat"]` into `"the cat"`.
+/// - `model.merges = []` — merge rules are only needed for *encoding*
+///   input; the BPE model only needs the vocab to decode IDs.
+/// - `byte_fallback = false` — the 1024-token vocab covers the
+///   training corpus by construction.
+fn write_tokenizer_json(config_path: &Path, out_path: &Path) -> Result<()> {
+    let cfg_text = std::fs::read_to_string(config_path)
+        .with_context(|| format!("read {}", config_path.display()))?;
+    let cfg: serde_json::Value = serde_json::from_str(&cfg_text).context("parse config.json")?;
+    let vocab_list = cfg["joint"]["vocabulary"]
+        .as_array()
+        .context("config.json: missing joint.vocabulary array")?;
+    let vocab: serde_json::Map<String, serde_json::Value> = vocab_list
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let tok = t
+                .as_str()
+                .ok_or_else(|| anyhow!("vocab entry {i} is not a string"))?;
+            Ok::<_, anyhow::Error>((tok.to_string(), serde_json::Value::from(i)))
+        })
+        .collect::<Result<_>>()?;
+    let tok = serde_json::json!({
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": [],
+        "normalizer": null,
+        "pre_tokenizer": null,
+        "post_processor": null,
+        "decoder": {
+            "type": "Metaspace",
+            "replacement": "\u{2581}",
+            "prepend_scheme": "first",
+            "split": true,
+        },
+        "model": {
+            "type": "BPE",
+            "dropout": null,
+            "unk_token": "<unk>",
+            "continuing_subword_prefix": null,
+            "end_of_word_suffix": null,
+            "fuse_unk": false,
+            "byte_fallback": false,
+            "ignore_merges": true,
+            "vocab": vocab,
+            "merges": [],
+        },
+    });
+    let json_bytes = serde_json::to_vec(&tok).context("serialise tokenizer.json")?;
+    atomic_install_bytes(&json_bytes, out_path)
+        .with_context(|| format!("write tokenizer.json to {}", out_path.display()))
+}
+
+/// Returns the python3 binary to invoke. Honours `PYTHON` env var so a
+/// caller can pin a specific interpreter (e.g. `PYTHON=python3.11`) or
+/// point at a venv.
+fn python_binary() -> std::ffi::OsString {
+    std::env::var_os("PYTHON").unwrap_or_else(|| std::ffi::OsString::from("python3"))
+}
+
+/// Locates `scripts/convert_parakeet_weights.py` relative to the
+/// running binary or the CWD. Honours `OMNI_DEV_PARAKEET_CONVERTER`
+/// for explicit overrides (test harness / non-standard installs).
+fn locate_parakeet_converter() -> Result<PathBuf> {
+    if let Some(p) = std::env::var_os("OMNI_DEV_PARAKEET_CONVERTER") {
+        let path = PathBuf::from(p);
+        if path.is_file() {
+            return Ok(path);
+        }
+        bail!(
+            "OMNI_DEV_PARAKEET_CONVERTER points at {} which is not a file",
+            path.display()
+        );
+    }
+    // Search candidates: CWD/scripts/, exe-dir/../scripts/, exe-dir/scripts/.
+    let candidates = std::iter::once(PathBuf::from("scripts/convert_parakeet_weights.py"))
+        .chain(std::env::current_exe().ok().and_then(|exe| {
+            let dir = exe.parent()?;
+            Some(dir.join("../scripts/convert_parakeet_weights.py"))
+        }))
+        .chain(std::env::current_exe().ok().and_then(|exe| {
+            let dir = exe.parent()?;
+            Some(dir.join("scripts/convert_parakeet_weights.py"))
+        }));
+    for c in candidates {
+        if c.is_file() {
+            return Ok(c);
+        }
+    }
+    bail!(
+        "could not find scripts/convert_parakeet_weights.py. \
+         Set OMNI_DEV_PARAKEET_CONVERTER=/path/to/convert_parakeet_weights.py \
+         or run install-model from the omni-dev repo root"
+    )
 }
 
 fn all_present(spec: &ModelSpec, dir: &Path) -> bool {
@@ -539,5 +806,43 @@ mod tests {
             Variant::SpeakerWespeakerEn.spec().variant,
             SPEAKER_WESPEAKER_EN.variant
         );
+    }
+
+    #[test]
+    fn write_tokenizer_json_emits_loadable_decode_only_tokenizer() {
+        // Stage a minimal config.json with a 4-token vocab including
+        // the SentencePiece word-start marker ▁ (U+2581).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = tmp.path().join("config.json");
+        let tok = tmp.path().join("tokenizer.json");
+        std::fs::write(
+            &cfg,
+            r#"{"joint": {"vocabulary": ["<unk>", "▁the", "▁cat", "s"]}}"#,
+        )
+        .unwrap();
+
+        write_tokenizer_json(&cfg, &tok).unwrap();
+
+        // The synthesised file must load through the same `tokenizers`
+        // crate path the backend uses.
+        let loaded = tokenizers::Tokenizer::from_file(&tok).expect("tokenizer.json must load");
+        assert_eq!(loaded.get_vocab_size(false), 4);
+        // Decode an ID sequence — Metaspace decoder strips ▁ and joins
+        // with spaces, so [1, 2, 3] → "the cats".
+        let text = loaded.decode(&[1_u32, 2, 3], false).unwrap();
+        assert_eq!(text, "the cats");
+    }
+
+    #[test]
+    fn write_tokenizer_json_errors_when_vocab_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = tmp.path().join("config.json");
+        let tok = tmp.path().join("tokenizer.json");
+        std::fs::write(&cfg, r#"{"joint": {}}"#).unwrap();
+        let Err(err) = write_tokenizer_json(&cfg, &tok) else {
+            panic!("expected missing-vocab error");
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("missing joint.vocabulary"), "got: {msg}");
     }
 }

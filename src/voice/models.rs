@@ -187,6 +187,43 @@ pub const WHISPER_TINY_EN: ModelSpec = ModelSpec {
     },
 };
 
+/// Parakeet-TDT-0.6B-v2 — pure-Rust ASR backend per issue #898.
+///
+/// `required_files` lists the files the *backend* expects in the install
+/// dir after `voice install-model` has run, including the converted
+/// safetensors (`candle_weights.safetensors`), the synthesised
+/// `tokenizer.json` (emitted from `config.json::joint.vocabulary` —
+/// the upstream MLX repo doesn't ship a tokenizer file), and the
+/// `ATTRIBUTION.txt` the install pipeline writes for the model's
+/// CC-BY-4.0 licence (the source `model.safetensors` is downloaded
+/// and converted but is NOT a required-files entry — the converter's
+/// output replaces it).
+pub const PARAKEET_TDT_0_6B_V2: ModelSpec = ModelSpec {
+    variant: "parakeet-tdt-0.6b-v2",
+    kind_label: "Parakeet",
+    default_subdir: "parakeet-tdt-0.6b-v2",
+    required_files: &[
+        "config.json",
+        "tokenizer.json",
+        "candle_weights.safetensors",
+        "ATTRIBUTION.txt",
+    ],
+    env_var: "OMNI_DEV_VOICE_PARAKEET_MODEL",
+    install_command: "omni-dev voice install-model --variant parakeet-tdt-0.6b-v2",
+    model_flag: "--model",
+    source: ModelSource::HfHub {
+        repo_id: "mlx-community/parakeet-tdt-0.6b-v2",
+        revision: "main",
+    },
+};
+
+/// Resolves the Parakeet install directory for the current invocation.
+///
+/// Priority: `opts.model` → `OMNI_DEV_VOICE_PARAKEET_MODEL` → default.
+pub fn resolve_parakeet_model_dir(opts: &VoiceOpts) -> Result<PathBuf> {
+    PARAKEET_TDT_0_6B_V2.resolve_dir(opts.model.as_deref())
+}
+
 /// Wespeaker `voxceleb_resnet34_LM` — production speaker-embedding
 /// runtime per ADR-0034. Not yet wired to consumers; the speaker
 /// install variant lands in a follow-up commit.
