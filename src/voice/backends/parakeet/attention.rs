@@ -544,9 +544,16 @@ fn unfold_local_pos_scores(
 
     let device = compact.device();
 
-    // Build index tensor: indices[i, k] = clamp((k - (cached_offset + i)) + w_left,
-    // 0, win_size - 1). Out-of-window positions point to index 0 and are
-    // masked off downstream.
+    // Build index tensor mirroring MLX's `LocalRelPositionalEncoding`
+    // convention: the position-encoding table at index `j` corresponds to
+    // relative position `(w_left - j)` (positions descend from `+w_left`
+    // at j=0 to `-w_right` at j=w_left+w_right). For query position
+    // `q_pos = cached_offset + i` and key position `k`, the relative
+    // position is `(k - q_pos)`, so the pos-emb index is
+    // `w_left - (k - q_pos) = w_left + q_pos - k`.
+    //
+    // Out-of-window indices are clamped to 0 — those positions are zeroed
+    // by the local-window mask downstream.
     let mut indices = vec![0u32; s * k_len];
     #[allow(clippy::cast_possible_wrap)]
     let win_max = (win_size as i64) - 1;
@@ -557,8 +564,7 @@ fn unfold_local_pos_scores(
         let q_pos = (cached_offset + i) as i64;
         for k in 0..k_len {
             #[allow(clippy::cast_possible_wrap)]
-            let rel = (k as i64) - q_pos;
-            let idx = (rel + w_left_i).clamp(0, win_max);
+            let idx = (w_left_i + q_pos - (k as i64)).clamp(0, win_max);
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
             {
                 indices[i * k_len + k] = idx as u32;
@@ -884,8 +890,12 @@ mod tests {
 
     #[test]
     fn unfold_local_pos_scores_returns_correct_shape() {
-        // (B=1, H=1, S=3, 2w+1=5). With cached_offset=0, w_left=w_right=2,
-        // k_len=3, each (i, k) gathers from compact[i, k - 0 + 2 = k + 2 - i].
+        // (B=1, H=1, S=3, 2w+1=5). cached_offset=0, w_left=w_right=2, k_len=3.
+        // MLX `LocalRelPositionalEncoding` orders positions descending
+        // [+w_left, +(w_left-1), ..., 0, ..., -w_right], so pe[j] corresponds
+        // to relative position (w_left - j). For query at chunk-relative
+        // position i (q_pos = cached_offset + i) and key position k,
+        // rel = k - q_pos, so the pe index is (w_left - rel) = (w_left + q_pos - k).
         let compact = t(
             &[
                 10.0, 11.0, 12.0, 13.0, 14.0, // i=0
@@ -900,17 +910,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(unfolded.dims(), [1, 1, 3, 3]);
-        // i=0, k=0: idx = 0 - 0 + 2 = 2 → compact[0, 2] = 12
-        // i=0, k=1: idx = 1 - 0 + 2 = 3 → 13
-        // i=0, k=2: idx = 2 - 0 + 2 = 4 → 14
-        // i=1, k=0: idx = 0 - 1 + 2 = 1 → 21
-        // i=1, k=1: idx = 1 - 1 + 2 = 2 → 22
-        // i=1, k=2: idx = 2 - 1 + 2 = 3 → 23
-        // i=2, k=0: idx = 0 - 2 + 2 = 0 → 30
-        // i=2, k=1: idx = 1 - 2 + 2 = 1 → 31
-        // i=2, k=2: idx = 2 - 2 + 2 = 2 → 32
+        // i=0, k=0: idx = 2 + 0 - 0 = 2 → compact[0, 2] = 12
+        // i=0, k=1: idx = 2 + 0 - 1 = 1 → compact[0, 1] = 11
+        // i=0, k=2: idx = 2 + 0 - 2 = 0 → compact[0, 0] = 10
+        // i=1, k=0: idx = 2 + 1 - 0 = 3 → compact[1, 3] = 23
+        // i=1, k=1: idx = 2 + 1 - 1 = 2 → compact[1, 2] = 22
+        // i=1, k=2: idx = 2 + 1 - 2 = 1 → compact[1, 1] = 21
+        // i=2, k=0: idx = 2 + 2 - 0 = 4 → compact[2, 4] = 34
+        // i=2, k=1: idx = 2 + 2 - 1 = 3 → compact[2, 3] = 33
+        // i=2, k=2: idx = 2 + 2 - 2 = 2 → compact[2, 2] = 32
         let got: Vec<f32> = unfolded.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let expected = vec![12.0, 13.0, 14.0, 21.0, 22.0, 23.0, 30.0, 31.0, 32.0];
+        let expected = vec![12.0, 11.0, 10.0, 23.0, 22.0, 21.0, 34.0, 33.0, 32.0];
         assert_eq!(got, expected);
     }
 

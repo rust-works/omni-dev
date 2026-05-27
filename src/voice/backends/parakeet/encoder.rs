@@ -226,6 +226,99 @@ impl RelPositionalEncoding {
     }
 }
 
+/// Local-window sinusoidal positional encoding for streaming attention.
+///
+/// Mirrors `parakeet_mlx::attention::LocalRelPositionalEncoding`. Holds a
+/// precomputed table of shape `(1, left + right + 1, d_model)` covering
+/// relative positions `[+left, +left-1, ..., 0, ..., -right]` — in
+/// descending order so `pe[j]` corresponds to relative offset
+/// `(left - j)`. Used by [`RelPositionMultiHeadLocalAttention`] in place
+/// of the standard `(1, 2 * max_len - 1, d_model)` table from
+/// [`RelPositionalEncoding`].
+///
+/// The streaming wrapper passes the entire table to attention each call;
+/// no offset parameter is consumed (unlike the full-attention encoding,
+/// the local window is centred on each query intrinsically).
+pub struct LocalRelPositionalEncoding {
+    pe: Tensor,
+    d_model: usize,
+    scale: f64,
+    left_context: usize,
+    right_context: usize,
+}
+
+impl LocalRelPositionalEncoding {
+    /// Precomputes the positional encoding table on `device`. `d_model`
+    /// must be even. `context_size = (left, right)` defines the local
+    /// attention window — table length is `left + right + 1`.
+    pub fn new(
+        d_model: usize,
+        context_size: (usize, usize),
+        scale_input: bool,
+        device: &candle_core::Device,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            d_model % 2 == 0,
+            "LocalRelPositionalEncoding: d_model ({d_model}) must be even"
+        );
+        let (left_context, right_context) = context_size;
+        let n_rows = left_context + right_context + 1;
+        let half = d_model / 2;
+        let mut data = vec![0.0_f32; n_rows * d_model];
+
+        let log10000 = 10_000.0_f32.ln();
+        for row in 0..n_rows {
+            // positions descend: pe[0] @ +left, pe[n-1] @ -right.
+            #[allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
+            let pos = (left_context as i64 - row as i64) as f32;
+            for i in 0..half {
+                #[allow(clippy::cast_precision_loss)]
+                let two_i = (2 * i) as f32;
+                let div = (-two_i * log10000 / d_model as f32).exp();
+                let theta = pos * div;
+                data[row * d_model + 2 * i] = theta.sin();
+                data[row * d_model + 2 * i + 1] = theta.cos();
+            }
+        }
+        let pe = Tensor::from_vec(data, (1, n_rows, d_model), device)?;
+        #[allow(clippy::cast_precision_loss)]
+        let scale = if scale_input {
+            f64::from((d_model as f32).sqrt())
+        } else {
+            1.0
+        };
+        Ok(Self {
+            pe,
+            d_model,
+            scale,
+            left_context,
+            right_context,
+        })
+    }
+
+    /// Forward: returns `(x * scale, pos_emb)`. `pos_emb` is the full
+    /// precomputed table `(1, left + right + 1, d_model)` — every call
+    /// returns the same slice (no offset-dependence).
+    pub fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
+        let _ = x.dims3().context("local pos_enc input must be (B, T, D)")?;
+        let x_scaled = (x * self.scale)?;
+        Ok((x_scaled, self.pe.clone()))
+    }
+
+    /// Returns `(left_context, right_context)` — for callers that need
+    /// to size attention masks.
+    #[must_use]
+    pub fn context_size(&self) -> (usize, usize) {
+        (self.left_context, self.right_context)
+    }
+
+    /// Returns `d_model` (so callers can sanity-check at construction).
+    #[must_use]
+    pub fn d_model(&self) -> usize {
+        self.d_model
+    }
+}
+
 /// Depthwise-striding subsampling pre-encoder.
 ///
 /// Reduces the time axis by `subsampling_factor` (power of two) via
