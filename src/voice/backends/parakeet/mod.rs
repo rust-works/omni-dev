@@ -13,6 +13,7 @@
 
 pub mod attention;
 pub mod audio;
+pub mod cache;
 pub mod conformer_block;
 pub mod conv_module;
 pub mod decoder;
