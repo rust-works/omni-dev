@@ -46,6 +46,20 @@ pub struct ConvolutionModule {
     padding: usize,
 }
 
+impl Clone for ConvolutionModule {
+    fn clone(&self) -> Self {
+        // All inner types are Arc-backed; cloning is cheap and shares
+        // the underlying weight tensors.
+        Self {
+            pointwise_conv1: self.pointwise_conv1.clone(),
+            depthwise_conv: self.depthwise_conv.clone(),
+            batch_norm: self.batch_norm.clone(),
+            pointwise_conv2: self.pointwise_conv2.clone(),
+            padding: self.padding,
+        }
+    }
+}
+
 impl ConvolutionModule {
     /// Loads the four conv layers + BatchNorm from `vb`. `kernel_size`
     /// must be odd (so left/right padding are equal); Parakeet 0.6B v2
@@ -118,8 +132,29 @@ impl ConvolutionModule {
     }
 
     /// Forward pass on a channels-last `(batch, time, d_model)` tensor.
-    /// Returns the same shape.
+    /// Returns the same shape. Thin wrapper over [`Self::forward_with_cache`]
+    /// with no cache (symmetric zero-padding for the depthwise conv).
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_with_cache(x, None)
+    }
+
+    /// Forward pass with optional KV-cache for streaming.
+    ///
+    /// When `cache` is `Some`, the depthwise conv's symmetric zero-padding
+    /// is replaced by [`RotatingConformerCache::update_and_fetch_conv`],
+    /// which returns the input with the cached prefix prepended and
+    /// `padding` zeros suffix-appended. The cache holds the last
+    /// `padding` tokens from the previous chunk so the depthwise conv
+    /// sees continuous audio context across calls (rather than
+    /// hard-zeros at the chunk boundary).
+    ///
+    /// When `cache` is `None`, behaviour is identical to the existing
+    /// batch path: symmetric zero-padding.
+    pub fn forward_with_cache(
+        &self,
+        x: &Tensor,
+        cache: Option<&mut super::cache::RotatingConformerCache>,
+    ) -> Result<Tensor> {
         // (B, T, C) -> (B, C, T) for the convolutions.
         let x = x.transpose(1, 2)?.contiguous()?;
 
@@ -133,8 +168,20 @@ impl ConvolutionModule {
         // halves; output = a * sigmoid(b).
         let x = glu(&x, 1).context("glu split")?;
 
-        // Symmetric pad on the time axis before depthwise conv.
-        let x = pad_time(&x, self.padding).context("pad before depthwise")?;
+        // Pad the time axis. With cache: use update_and_fetch_conv,
+        // which returns channels-last (B, T + 2*pad, C) with the cached
+        // prefix prepended. Without cache: symmetric zero-pad.
+        let x = if let Some(cache) = cache {
+            // The cache operates channels-last; transpose, update, transpose back.
+            let cl = x.transpose(1, 2)?.contiguous()?; // (B, T, C)
+            let padded = cache
+                .update_and_fetch_conv(&cl, self.padding)
+                .context("update_and_fetch_conv")?;
+            padded.transpose(1, 2)?.contiguous()? // (B, C, T + 2*pad)
+        } else {
+            pad_time(&x, self.padding).context("pad before depthwise")?
+        };
+
         let x = self
             .depthwise_conv
             .forward(&x)

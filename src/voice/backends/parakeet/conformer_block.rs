@@ -20,7 +20,8 @@ use anyhow::{Context, Result};
 use candle_core::{Module, Tensor};
 use candle_nn::{ops::silu, LayerNorm, Linear, VarBuilder};
 
-use super::attention::RelPositionMultiHeadAttention;
+use super::attention::{RelPositionMultiHeadAttention, RelPositionMultiHeadLocalAttention};
+use super::cache::RotatingConformerCache;
 use super::conv_module::ConvolutionModule;
 
 /// Position-wise feed-forward sub-block. Two linear layers separated by
@@ -45,6 +46,16 @@ impl FeedForward {
         let x = self.linear1.forward(x).context("ff linear1")?;
         let x = silu(&x).context("ff silu")?;
         self.linear2.forward(&x).context("ff linear2")
+    }
+}
+
+impl Clone for FeedForward {
+    fn clone(&self) -> Self {
+        // Linear's inner Tensor is Arc-backed; clone is cheap.
+        Self {
+            linear1: self.linear1.clone(),
+            linear2: self.linear2.clone(),
+        }
     }
 }
 
@@ -127,6 +138,97 @@ impl ConformerBlock {
         // x = LN_out(x)
         let out = self.norm_out.forward(&x).context("LN_out")?;
         Ok(out)
+    }
+}
+
+/// Streaming variant of [`ConformerBlock`] using local-window attention
+/// and an optional [`RotatingConformerCache`] threaded through both the
+/// self-attention and conv-module sub-blocks.
+///
+/// Shares all weights with a full-attention `ConformerBlock` via
+/// `Arc`-backed tensor clones — `from_full` does not re-traverse the
+/// `VarBuilder`. The only field that differs is `self_attn`, which is
+/// constructed from `RelPositionMultiHeadLocalAttention::from_full`
+/// using the same Q/K/V/Pos/Out projections.
+pub struct LocalConformerBlock {
+    norm_ff1: LayerNorm,
+    ff1: FeedForward,
+    norm_self_att: LayerNorm,
+    self_attn: RelPositionMultiHeadLocalAttention,
+    norm_conv: LayerNorm,
+    conv: ConvolutionModule,
+    norm_ff2: LayerNorm,
+    ff2: FeedForward,
+    norm_out: LayerNorm,
+}
+
+impl LocalConformerBlock {
+    /// Constructs a streaming variant from a loaded `ConformerBlock`,
+    /// sharing all weight tensors via `Arc`-backed clones. The
+    /// `context_size = (left, right)` selects the local-attention window.
+    #[must_use]
+    pub fn from_full(full: &ConformerBlock, context_size: (usize, usize)) -> Self {
+        Self {
+            norm_ff1: full.norm_ff1.clone(),
+            ff1: full.ff1.clone(),
+            norm_self_att: full.norm_self_att.clone(),
+            self_attn: RelPositionMultiHeadLocalAttention::from_full(&full.self_attn, context_size),
+            norm_conv: full.norm_conv.clone(),
+            conv: full.conv.clone(),
+            norm_ff2: full.norm_ff2.clone(),
+            ff2: full.ff2.clone(),
+            norm_out: full.norm_out.clone(),
+        }
+    }
+
+    /// Streaming forward with optional per-layer cache.
+    ///
+    /// Shapes:
+    /// - `x`: `(B, S, d_model)` — typically S is small (per-chunk new frames)
+    /// - `pos_emb`: `(1, 2w+1, d_model)` from `LocalRelPositionalEncoding`
+    /// - `mask` (optional): `(B, S)` — `true` at padded query positions
+    /// - `cache` (optional): `&mut Option<RotatingConformerCache>` —
+    ///   threaded sequentially through `self_attn` then `conv`, mutated in place
+    pub fn forward_with_cache(
+        &self,
+        x: &Tensor,
+        pos_emb: &Tensor,
+        mask: Option<&Tensor>,
+        cache: &mut Option<RotatingConformerCache>,
+    ) -> Result<Tensor> {
+        // x = x + 0.5 * FF1(LN1(x))
+        let n1 = self.norm_ff1.forward(x).context("LN ff1 (local)")?;
+        let f1 = self.ff1.forward(&n1).context("ff1 (local)")?;
+        let f1_half = (f1 * 0.5_f64)?;
+        let x = (x + f1_half)?;
+
+        // x = x + Attn(LN2(x), pos_emb, mask, cache)
+        let n2 = self
+            .norm_self_att
+            .forward(&x)
+            .context("LN self_att (local)")?;
+        let attn_out = self
+            .self_attn
+            .forward(&n2, &n2, &n2, pos_emb, mask, cache.as_mut())
+            .context("self_attn (local)")?;
+        let x = (x + attn_out)?;
+
+        // x = x + Conv(LN3(x), cache)
+        let n3 = self.norm_conv.forward(&x).context("LN conv (local)")?;
+        let c = self
+            .conv
+            .forward_with_cache(&n3, cache.as_mut())
+            .context("conv (local)")?;
+        let x = (x + c)?;
+
+        // x = x + 0.5 * FF2(LN4(x))
+        let n4 = self.norm_ff2.forward(&x).context("LN ff2 (local)")?;
+        let f2 = self.ff2.forward(&n4).context("ff2 (local)")?;
+        let f2_half = (f2 * 0.5_f64)?;
+        let x = (x + f2_half)?;
+
+        // x = LN_out(x)
+        self.norm_out.forward(&x).context("LN_out (local)")
     }
 }
 
