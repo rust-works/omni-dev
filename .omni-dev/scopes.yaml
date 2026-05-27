@@ -47,6 +47,10 @@ scopes:
     description: "Commit scope definitions and configuration"
     examples: ["scopes: add release scope", "scopes: update file patterns"]
     file_patterns: [".omni-dev/scopes.yaml"]
+  - name: "scripts"
+    description: "Project scripts under scripts/ (build helpers, model converters, demo runners)"
+    examples: ["scripts: add Parakeet weight converter", "scripts: fix build.sh exit code"]
+    file_patterns: ["scripts/**"]
   - name: "voice"
     description: "Voice capture, transcription, and ASR backends"
     examples: ["voice: add Transcriber trait", "voice: wire mock backend"]
