@@ -30,6 +30,8 @@ use anyhow::{Context, Result};
 use candle_core::{Module, Tensor, D};
 use candle_nn::{ops::softmax, Linear, VarBuilder};
 
+use super::cache::RotatingConformerCache;
+
 /// Standard multi-head attention (no positional bias).
 ///
 /// Used as the constructor base for [`RelPositionMultiHeadAttention`];
@@ -291,6 +293,323 @@ impl RelPositionMultiHeadAttention {
     }
 }
 
+/// Multi-head attention with **local** relative-position windowing and
+/// optional KV-cache, used by the streaming Parakeet wrapper.
+///
+/// Same learnable parameters as [`RelPositionMultiHeadAttention`]
+/// (`linear_q/k/v/pos/out`, `pos_bias_u/v`) — constructed via
+/// [`RelPositionMultiHeadLocalAttention::from_full`], which Arc-clones the
+/// weight tensors from a loaded full-attention module. No separate weight
+/// load; both variants share the same trained parameters.
+///
+/// Differences from the full-attention variant:
+///
+/// - **Local window**: each query attends to keys in
+///   `[i - context_size.0, i + context_size.1]` (clipped to valid K
+///   range). Mirrors `parakeet_mlx::attention::RelPositionMultiHeadLocalAttention`.
+/// - **Cache support**: an optional [`RotatingConformerCache`] is updated
+///   in place per call (`cache.update_and_fetch_kv`) so the encoder
+///   processes only the new chunk's K/V each forward.
+/// - **Positional encoding**: input `pos_emb` has shape
+///   `(1 | batch, 2*w + 1, n_feat)` (where `w = max(context_size)`) —
+///   a small relative-position table from `LocalRelPositionalEncoding`
+///   rather than the `(1, 2*max_len - 1, n_feat)` table used by full
+///   attention.
+///
+/// **Implementation note**: MLX uses two Metal kernels (`matmul_qk`,
+/// `matmul_pv`) to compute the local-window matmul in a compact
+/// `(B, H, S, 2w+1)` representation. This Rust port skips the kernel
+/// optimisation and performs full attention `Q @ K^T` over the (small)
+/// `K_len = cached + S` key length, then applies an additive mask for
+/// keys outside the local window. Identical math; memory cost is
+/// `O(S × K_len)` per layer — negligible for the streaming case where
+/// `S` is a handful of new frames and `K_len <= capacity + S`.
+pub struct RelPositionMultiHeadLocalAttention {
+    base: MultiHeadAttention,
+    linear_pos: Linear,
+    pos_bias_u: Tensor,
+    pos_bias_v: Tensor,
+    /// `(left_context, right_context)` in encoder frames.
+    context_size: (usize, usize),
+}
+
+impl RelPositionMultiHeadLocalAttention {
+    /// Constructs a local-attention variant sharing weights with an
+    /// existing full-attention module. Tensors are Arc-cloned; this is
+    /// cheap and no `VarBuilder` re-traversal is performed.
+    #[must_use]
+    pub fn from_full(full: &RelPositionMultiHeadAttention, context_size: (usize, usize)) -> Self {
+        // Share each linear's weight + bias tensors (Arc-cloned internally).
+        let base = MultiHeadAttention {
+            n_head: full.base.n_head,
+            head_dim: full.base.head_dim,
+            scale: full.base.scale,
+            linear_q: full.base.linear_q.clone(),
+            linear_k: full.base.linear_k.clone(),
+            linear_v: full.base.linear_v.clone(),
+            linear_out: full.base.linear_out.clone(),
+        };
+        Self {
+            base,
+            linear_pos: full.linear_pos.clone(),
+            pos_bias_u: full.pos_bias_u.clone(),
+            pos_bias_v: full.pos_bias_v.clone(),
+            context_size,
+        }
+    }
+
+    /// Returns the `(left, right)` context window.
+    #[must_use]
+    pub fn context_size(&self) -> (usize, usize) {
+        self.context_size
+    }
+
+    /// Streaming forward with KV cache.
+    ///
+    /// Shapes:
+    /// - `q`: `(B, S, n_feat)` — typically S is small (per-chunk new frames)
+    /// - `k`, `v`: `(B, S, n_feat)` — same S as q before cache update
+    /// - `pos_emb`: `(1 | B, 2*w + 1, n_feat)` — local rel-pos table
+    /// - `mask`: optional `(B, S)` boolean — `true` = padded query
+    /// - `cache`: optional `&mut RotatingConformerCache` — if `Some`,
+    ///   K/V are extended with cached history; cache is mutated in place
+    ///
+    /// Returns `(B, S, n_feat)` (output projection applied).
+    pub fn forward(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        pos_emb: &Tensor,
+        mask: Option<&Tensor>,
+        cache: Option<&mut RotatingConformerCache>,
+    ) -> Result<Tensor> {
+        let MultiHeadAttention {
+            n_head,
+            head_dim,
+            scale,
+            ref linear_q,
+            ref linear_k,
+            ref linear_v,
+            ref linear_out,
+        } = self.base;
+
+        // 1. Project Q, K, V, P.
+        let q = linear_q.forward(q).context("project q (local)")?;
+        let k_proj = linear_k.forward(k).context("project k (local)")?;
+        let v_proj = linear_v.forward(v).context("project v (local)")?;
+        let p = self
+            .linear_pos
+            .forward(pos_emb)
+            .context("project pos_emb (local)")?;
+
+        let (batch, s, _) = q.dims3().context("q shape (local)")?;
+        let (_, _, _) = k_proj.dims3().context("k shape (local)")?;
+        let (p_batch, pos_len, _) = p.dims3().context("pos_emb shape (local)")?;
+        let w_left = self.context_size.0;
+        let w_right = self.context_size.1;
+        anyhow::ensure!(
+            pos_len == w_left + w_right + 1,
+            "pos_emb len ({pos_len}) must equal context_size.0 + context_size.1 + 1 ({})",
+            w_left + w_right + 1
+        );
+
+        // 2. Reshape Q/K/V/P to (B, H, T, D).
+        let q = q.reshape((batch, s, n_head, head_dim))?;
+        let pos_bias_u = self.pos_bias_u.reshape((1, 1, n_head, head_dim))?;
+        let pos_bias_v = self.pos_bias_v.reshape((1, 1, n_head, head_dim))?;
+        let q_u = q
+            .broadcast_add(&pos_bias_u)?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let q_v = q
+            .broadcast_add(&pos_bias_v)?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        let k_h = k_proj
+            .reshape((batch, s, n_head, head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let v_h = v_proj
+            .reshape((batch, s, n_head, head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        // 3. Update cache (if any), getting extended K/V.
+        let (cached_offset, k_extended, v_extended) = if let Some(cache_ref) = cache {
+            let cached_len = cache_ref.cached_kv_len();
+            let (k_ext, v_ext) = cache_ref.update_and_fetch_kv(&k_h, &v_h)?;
+            (cached_len, k_ext, v_ext)
+        } else {
+            (0, k_h.clone(), v_h.clone())
+        };
+        let k_len = k_extended.dim(2).context("k_extended dim 2")?;
+
+        // Broadcast pos_emb to batch if it ships with batch=1.
+        let p = if p_batch == 1 && batch > 1 {
+            p.broadcast_as((batch, pos_len, n_head * head_dim))?
+        } else {
+            anyhow::ensure!(
+                p_batch == batch,
+                "pos_emb batch ({p_batch}) must be 1 or match query batch ({batch})"
+            );
+            p
+        };
+        let p = p
+            .reshape((batch, pos_len, n_head, head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        // 4. Content scores: Q_u @ K^T → (B, H, S, K_len).
+        let content_scores =
+            q_u.matmul(&k_extended.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
+
+        // 5. Position scores in (2w+1) representation: Q_v @ P^T → (B, H, S, 2w+1).
+        let pos_scores_compact = q_v.matmul(&p.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
+
+        // 6. Unfold (B, H, S, 2w+1) → (B, H, S, K_len) by per-(i, k) index gather.
+        // For each chunk-relative query i (absolute K-position = cached_offset + i)
+        // and key k, the relative position is (k - (cached_offset + i)) and the
+        // index into the pos_emb table is (rel + w_left). Out-of-window indices
+        // are clamped to 0; the local-window mask zeros those entries below.
+        let pos_scores =
+            unfold_local_pos_scores(&pos_scores_compact, cached_offset, k_len, w_left, w_right)?;
+
+        // 7. Sum + scale.
+        let scores = ((content_scores + pos_scores)? * f64::from(scale))?;
+
+        // 8. Local-window mask: -inf at (i, k) where k is outside the window.
+        let window_bias = local_window_bias(
+            batch,
+            n_head,
+            s,
+            cached_offset,
+            k_len,
+            w_left,
+            w_right,
+            scores.dtype(),
+            scores.device(),
+        )?;
+        let scores = scores.broadcast_add(&window_bias)?;
+
+        // 9. Query-padding mask (if provided): -inf for masked queries.
+        // mask is (B, S) bool; expand to (B, 1, S, 1) and add as -inf bias.
+        let scores = if let Some(m) = mask {
+            let (b_m, s_m) = m.dims2().context("mask must be (B, S)")?;
+            anyhow::ensure!(
+                b_m == batch && s_m == s,
+                "mask shape ({b_m}, {s_m}) must be (B={batch}, S={s})"
+            );
+            let bias = (m.to_dtype(scores.dtype())?.reshape((b_m, 1, s_m, 1))? * -1.0e9_f64)?;
+            scores.broadcast_add(&bias)?
+        } else {
+            scores
+        };
+
+        // 10. Softmax + attn @ V.
+        let attn = softmax(&scores, D::Minus1).context("softmax (local)")?;
+        let out = attn.matmul(&v_extended)?;
+
+        // 11. Reshape and output projection.
+        let out = out
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((batch, s, n_head * head_dim))?;
+        linear_out
+            .forward(&out)
+            .context("output projection (local)")
+    }
+}
+
+/// Unfolds a `(B, H, S, 2w+1)` position-score tensor into the full
+/// `(B, H, S, K_len)` representation by per-(i, k) gather. Out-of-window
+/// indices are clamped to 0 — they're zeroed out by the local-window mask
+/// at the call site.
+fn unfold_local_pos_scores(
+    compact: &Tensor,
+    cached_offset: usize,
+    k_len: usize,
+    w_left: usize,
+    w_right: usize,
+) -> Result<Tensor> {
+    let (b, h, s, win_size) = compact
+        .dims4()
+        .context("unfold input must be (B, H, S, 2w+1)")?;
+    anyhow::ensure!(
+        win_size == w_left + w_right + 1,
+        "unfold: window size {win_size} != {} (w_left + w_right + 1)",
+        w_left + w_right + 1
+    );
+
+    let device = compact.device();
+
+    // Build index tensor: indices[i, k] = clamp((k - (cached_offset + i)) + w_left,
+    // 0, win_size - 1). Out-of-window positions point to index 0 and are
+    // masked off downstream.
+    let mut indices = vec![0u32; s * k_len];
+    #[allow(clippy::cast_possible_wrap)]
+    let win_max = (win_size as i64) - 1;
+    #[allow(clippy::cast_possible_wrap)]
+    let w_left_i = w_left as i64;
+    for i in 0..s {
+        #[allow(clippy::cast_possible_wrap)]
+        let q_pos = (cached_offset + i) as i64;
+        for k in 0..k_len {
+            #[allow(clippy::cast_possible_wrap)]
+            let rel = (k as i64) - q_pos;
+            let idx = (rel + w_left_i).clamp(0, win_max);
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            {
+                indices[i * k_len + k] = idx as u32;
+            }
+        }
+    }
+
+    let idx_tensor = Tensor::from_vec(indices, (1, 1, s, k_len), device)?
+        .broadcast_as((b, h, s, k_len))?
+        .contiguous()?;
+
+    compact
+        .contiguous()?
+        .gather(&idx_tensor, 3)
+        .context("gather position scores into K_len shape")
+}
+
+/// Builds an additive bias of shape `(1, 1, S, K_len)` that is `0.0` inside
+/// the local window and `-1e9` outside. Broadcast-added to scores before
+/// softmax so out-of-window keys get effectively-zero attention weight.
+fn local_window_bias(
+    _batch: usize,
+    _n_head: usize,
+    s: usize,
+    cached_offset: usize,
+    k_len: usize,
+    w_left: usize,
+    w_right: usize,
+    dtype: candle_core::DType,
+    device: &candle_core::Device,
+) -> Result<Tensor> {
+    let mut data = vec![0.0_f32; s * k_len];
+    #[allow(clippy::cast_possible_wrap)]
+    let w_left_i = w_left as i64;
+    #[allow(clippy::cast_possible_wrap)]
+    let w_right_i = w_right as i64;
+    for i in 0..s {
+        #[allow(clippy::cast_possible_wrap)]
+        let q_pos = (cached_offset + i) as i64;
+        for k in 0..k_len {
+            #[allow(clippy::cast_possible_wrap)]
+            let rel = (k as i64) - q_pos;
+            if rel < -w_left_i || rel > w_right_i {
+                data[i * k_len + k] = -1.0e9_f32;
+            }
+        }
+    }
+    let bias = Tensor::from_vec(data, (1, 1, s, k_len), device)?.to_dtype(dtype)?;
+    Ok(bias)
+}
+
 /// Relative-shift trick used by Transformer-XL-style rel-pos attention.
 ///
 /// Given `x` of shape `(B, H, T_q, pos_len)` where columns are indexed
@@ -405,6 +724,194 @@ mod tests {
             3.0, 4.0, 0.0, 5.0, 6.0, 7.0, 8.0, 0.0, 9.0, 10.0, 11.0, 12.0,
         ];
         assert_eq!(got, expected, "rel_shift output does not match hand trace");
+    }
+
+    // Helpers for local-attention smoke tests.
+
+    /// Builds a `RelPositionMultiHeadAttention` from hand-rolled weights —
+    /// no `VarBuilder` / safetensors needed. Used by the local-attn tests
+    /// below, which then `from_full` it.
+    fn make_test_full_attn(n_head: usize, head_dim: usize) -> RelPositionMultiHeadAttention {
+        let n_feat = n_head * head_dim;
+        let dev = cpu();
+        // Identity-ish weight tensors so the algorithm's structure is
+        // easier to reason about. Each linear is just `(out, in)` identity.
+        let id_w = Tensor::eye(n_feat, DType::F32, &dev).unwrap();
+        let lin = |w: Tensor| Linear::new(w, None);
+        #[allow(clippy::cast_precision_loss)]
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let base = MultiHeadAttention {
+            n_head,
+            head_dim,
+            scale,
+            linear_q: lin(id_w.clone()),
+            linear_k: lin(id_w.clone()),
+            linear_v: lin(id_w.clone()),
+            linear_out: lin(id_w.clone()),
+        };
+        let pos_bias_u = Tensor::zeros((n_head, head_dim), DType::F32, &dev).unwrap();
+        let pos_bias_v = Tensor::zeros((n_head, head_dim), DType::F32, &dev).unwrap();
+        RelPositionMultiHeadAttention {
+            base,
+            linear_pos: lin(id_w),
+            pos_bias_u,
+            pos_bias_v,
+        }
+    }
+
+    fn random_tensor(shape: &[usize], seed: u64) -> Tensor {
+        // Cheap deterministic "random": linear ramp scaled by seed.
+        let total: usize = shape.iter().product();
+        #[allow(clippy::cast_precision_loss)]
+        let data: Vec<f32> = (0..total)
+            .map(|i| (((i as u64).wrapping_mul(seed.wrapping_add(1))) % 997) as f32 / 100.0 - 5.0)
+            .collect();
+        Tensor::from_vec(data, shape, &cpu()).unwrap()
+    }
+
+    #[test]
+    fn local_attn_from_full_shares_weights() {
+        let full = make_test_full_attn(2, 4);
+        let local = RelPositionMultiHeadLocalAttention::from_full(&full, (2, 2));
+        assert_eq!(local.context_size(), (2, 2));
+        // Weight tensors are Arc-cloned; pointer-identity isn't promised by
+        // candle but the underlying storage is shared. Verify shape parity.
+        assert_eq!(
+            local.base.linear_q.weight().dims(),
+            full.base.linear_q.weight().dims()
+        );
+        assert_eq!(local.pos_bias_u.dims(), full.pos_bias_u.dims());
+    }
+
+    #[test]
+    fn local_attn_forward_no_cache_produces_correct_shape() {
+        let full = make_test_full_attn(2, 4);
+        let local = RelPositionMultiHeadLocalAttention::from_full(&full, (2, 2));
+        let n_feat = 2 * 4;
+        let s = 3;
+        let win = 2 + 2 + 1;
+        let q = random_tensor(&[1, s, n_feat], 1);
+        let k = random_tensor(&[1, s, n_feat], 2);
+        let v = random_tensor(&[1, s, n_feat], 3);
+        let pos = random_tensor(&[1, win, n_feat], 4);
+
+        let out = local.forward(&q, &k, &v, &pos, None, None).unwrap();
+        assert_eq!(out.dims(), [1, s, n_feat]);
+
+        // Output must be finite (no NaNs from softmax-of-all-inf paths).
+        let any_nan: f32 = out
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .map(|x| if x.is_nan() { 1.0 } else { 0.0 })
+            .sum();
+        assert_eq!(any_nan, 0.0, "output must not contain NaN");
+    }
+
+    #[test]
+    fn local_attn_cache_accumulates_across_calls() {
+        use super::super::cache::RotatingConformerCache;
+        let full = make_test_full_attn(2, 4);
+        let local = RelPositionMultiHeadLocalAttention::from_full(&full, (4, 4));
+        let n_feat = 2 * 4;
+        let win = 4 + 4 + 1;
+        let pos = random_tensor(&[1, win, n_feat], 4);
+
+        let mut cache = RotatingConformerCache::new(/*capacity=*/ 16, /*drop=*/ 0);
+
+        // First call: 3 new frames.
+        let q1 = random_tensor(&[1, 3, n_feat], 11);
+        let k1 = random_tensor(&[1, 3, n_feat], 12);
+        let v1 = random_tensor(&[1, 3, n_feat], 13);
+        let _ = local
+            .forward(&q1, &k1, &v1, &pos, None, Some(&mut cache))
+            .unwrap();
+        assert_eq!(
+            cache.cached_kv_len(),
+            3,
+            "after 1st call cache should hold 3"
+        );
+
+        // Second call: 2 new frames.
+        let q2 = random_tensor(&[1, 2, n_feat], 21);
+        let k2 = random_tensor(&[1, 2, n_feat], 22);
+        let v2 = random_tensor(&[1, 2, n_feat], 23);
+        let _ = local
+            .forward(&q2, &k2, &v2, &pos, None, Some(&mut cache))
+            .unwrap();
+        assert_eq!(
+            cache.cached_kv_len(),
+            5,
+            "after 2nd call cache should hold 5"
+        );
+    }
+
+    #[test]
+    fn local_attn_window_mask_zeros_out_of_window_attention() {
+        // With a tiny window (left=0, right=0), each query attends to
+        // exactly one key (itself). Output should equal V at that position
+        // (when the queries align to keys 1:1 and no cache).
+        let full = make_test_full_attn(1, 2);
+        let local = RelPositionMultiHeadLocalAttention::from_full(&full, (0, 0));
+        let n_feat = 2;
+        let s = 4;
+        let win = 1;
+        let q = random_tensor(&[1, s, n_feat], 51);
+        let k = random_tensor(&[1, s, n_feat], 52);
+        let v = random_tensor(&[1, s, n_feat], 53);
+        let pos = Tensor::zeros((1, win, n_feat), DType::F32, &cpu()).unwrap();
+
+        let out = local.forward(&q, &k, &v, &pos, None, None).unwrap();
+        assert_eq!(out.dims(), [1, s, n_feat]);
+        // With (0, 0) window, attn = softmax([single_score]) = [1.0] for
+        // each query — so attn @ V = V exactly (then post-multiplied by the
+        // identity output projection, so out = V).
+        let diff = (&out - &v).unwrap().abs().unwrap();
+        let max: f32 = diff
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            max < 1e-5,
+            "out must equal v with (0, 0) window; max diff {max}"
+        );
+    }
+
+    #[test]
+    fn unfold_local_pos_scores_returns_correct_shape() {
+        // (B=1, H=1, S=3, 2w+1=5). With cached_offset=0, w_left=w_right=2,
+        // k_len=3, each (i, k) gathers from compact[i, k - 0 + 2 = k + 2 - i].
+        let compact = t(
+            &[
+                10.0, 11.0, 12.0, 13.0, 14.0, // i=0
+                20.0, 21.0, 22.0, 23.0, 24.0, // i=1
+                30.0, 31.0, 32.0, 33.0, 34.0, // i=2
+            ],
+            (1, 1, 3, 5),
+        );
+        let unfolded = unfold_local_pos_scores(
+            &compact, /*cached_offset=*/ 0, /*k_len=*/ 3, /*w_left=*/ 2,
+            /*w_right=*/ 2,
+        )
+        .unwrap();
+        assert_eq!(unfolded.dims(), [1, 1, 3, 3]);
+        // i=0, k=0: idx = 0 - 0 + 2 = 2 → compact[0, 2] = 12
+        // i=0, k=1: idx = 1 - 0 + 2 = 3 → 13
+        // i=0, k=2: idx = 2 - 0 + 2 = 4 → 14
+        // i=1, k=0: idx = 0 - 1 + 2 = 1 → 21
+        // i=1, k=1: idx = 1 - 1 + 2 = 2 → 22
+        // i=1, k=2: idx = 2 - 1 + 2 = 3 → 23
+        // i=2, k=0: idx = 0 - 2 + 2 = 0 → 30
+        // i=2, k=1: idx = 1 - 2 + 2 = 1 → 31
+        // i=2, k=2: idx = 2 - 2 + 2 = 2 → 32
+        let got: Vec<f32> = unfolded.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let expected = vec![12.0, 13.0, 14.0, 21.0, 22.0, 23.0, 30.0, 31.0, 32.0];
+        assert_eq!(got, expected);
     }
 
     #[test]
