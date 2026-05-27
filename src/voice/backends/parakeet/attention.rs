@@ -81,7 +81,7 @@ impl MultiHeadAttention {
 ///
 /// The two-term score, `(q + pos_bias_u) @ k^T + rel_shift((q + pos_bias_v) @ p^T)`,
 /// is computed as `matrix_ac + matrix_bd` and fed pre-softmax. `matrix_bd`
-/// is the position-dependent term and goes through [`rel_shift`] to align
+/// is the position-dependent term and goes through `rel_shift` to align
 /// each query row with its corresponding key-offset slice of the
 /// positional encoding.
 pub struct RelPositionMultiHeadAttention {

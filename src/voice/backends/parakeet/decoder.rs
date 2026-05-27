@@ -380,8 +380,8 @@ impl TdtDecoder {
     ///
     /// `encoder_out` is `(1, T, encoder_hidden)`. Returns the emitted
     /// token ids in order (excluding blanks). State is fresh per call;
-    /// the streaming wrapper threads state across calls by going
-    /// through [`Self::decode_step`] (TODO once streaming.rs lands).
+    /// the streaming wrapper in `super::streaming` is responsible for
+    /// threading state across chunks.
     pub fn decode_greedy(&self, encoder_out: &Tensor) -> Result<Vec<u32>> {
         let (batch, t_frames, _) = encoder_out
             .dims3()

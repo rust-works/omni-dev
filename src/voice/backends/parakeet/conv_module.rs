@@ -12,7 +12,8 @@
 //!   [`candle_nn::Conv1d`] takes channels-first `(B, C, T)`. The forward
 //!   pass below transposes once on entry, runs all convs in channels-
 //!   first, and transposes back on exit so the calling
-//!   [`ConformerBlock`] still sees `(B, T, C)`. This matches the
+//!   [`ConformerBlock`](super::conformer_block::ConformerBlock) still
+//!   sees `(B, T, C)`. This matches the
 //!   convention the rest of the encoder expects.
 //!
 //! - **GLU axis.** MLX `nn.glu(x, axis=2)` splits the last axis (channels)
@@ -31,7 +32,8 @@ use candle_nn::{
 };
 
 /// Conformer convolution module — the `conv` block sandwiched between
-/// the two feed-forward sub-blocks in a [`ConformerBlock`].
+/// the two feed-forward sub-blocks in a
+/// [`ConformerBlock`](super::conformer_block::ConformerBlock).
 ///
 /// Inputs and outputs are `(batch, time, channels)` in channels-last
 /// layout to match the rest of the FastConformer encoder; convolutions
