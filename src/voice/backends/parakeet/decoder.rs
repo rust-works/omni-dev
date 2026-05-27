@@ -383,24 +383,64 @@ impl TdtDecoder {
     /// the streaming wrapper in `super::streaming` is responsible for
     /// threading state across chunks.
     pub fn decode_greedy(&self, encoder_out: &Tensor) -> Result<Vec<u32>> {
+        let t_frames = encoder_out
+            .dim(1)
+            .context("decode_greedy expects (1, T, encoder_hidden)")?;
+        let device = encoder_out.device();
+        let state = self
+            .predictor
+            .zero_state(1, device)
+            .context("predictor zero_state")?;
+        let (tokens, _, _) = self.decode_greedy_stateful(encoder_out, t_frames, None, state)?;
+        Ok(tokens)
+    }
+
+    /// Stateful TDT greedy decode that persists `LstmState` and `last_token`
+    /// across calls. Used by streaming, where the encoder produces
+    /// incremental frames and the decoder must resume from where the
+    /// previous chunk left off.
+    ///
+    /// Decodes the first `length` frames of `encoder_out`, threading the
+    /// supplied `last_token` and `state` through the loop. Returns the
+    /// decoded tokens, the final `last_token` (`Some(...)` if any
+    /// non-blank token was emitted; otherwise unchanged from input), and
+    /// the final `LstmState`.
+    ///
+    /// `length` must be `<= encoder_out.dim(1)`. Setting it to a value
+    /// less than the full encoder length is how the streaming wrapper
+    /// implements the finalized-vs-draft split: call once with
+    /// `length = finalized_frames` and persist the returned state, then
+    /// call again with the same state on the draft frames and discard
+    /// the result.
+    pub fn decode_greedy_stateful(
+        &self,
+        encoder_out: &Tensor,
+        length: usize,
+        last_token: Option<u32>,
+        state: LstmState,
+    ) -> Result<(Vec<u32>, Option<u32>, LstmState)> {
         let (batch, t_frames, _) = encoder_out
             .dims3()
-            .context("decode_greedy expects (1, T, encoder_hidden)")?;
+            .context("decode_greedy_stateful expects (1, T, encoder_hidden)")?;
         anyhow::ensure!(
             batch == 1,
-            "decode_greedy: batch must be 1, got {batch} — batched decode is not implemented"
+            "decode_greedy_stateful: batch must be 1, got {batch} — batched decode is not implemented"
+        );
+        anyhow::ensure!(
+            length <= t_frames,
+            "decode_greedy_stateful: length {length} > encoder frames {t_frames}"
         );
 
         let device = encoder_out.device();
         let blank_id = self.config.vocab_size as u32;
-        let mut state = self.predictor.zero_state(1, device)?;
-        let mut last_token: Option<u32> = None;
+        let mut state = state;
+        let mut last_token = last_token;
         let mut tokens: Vec<u32> = Vec::new();
 
         let mut step = 0_usize;
         let mut consecutive_zero_durations = 0_usize;
 
-        while step < t_frames {
+        while step < length {
             let (pred_out, new_state) = self
                 .predictor
                 .step(last_token, &state, device)
@@ -441,7 +481,7 @@ impl TdtDecoder {
             }
         }
 
-        Ok(tokens)
+        Ok((tokens, last_token, state))
     }
 }
 

@@ -342,6 +342,18 @@ pub struct DwStridingSubsampling {
     freq_final: usize,
 }
 
+impl Clone for DwStridingSubsampling {
+    fn clone(&self) -> Self {
+        // Conv2d and Linear hold Arc-backed Tensors; clones are cheap.
+        Self {
+            convs: self.convs.clone(),
+            out: self.out.clone(),
+            n_steps: self.n_steps,
+            freq_final: self.freq_final,
+        }
+    }
+}
+
 impl DwStridingSubsampling {
     /// Loads the conv stack and output projection from `vb`.
     pub fn load(vb: VarBuilder, cfg: &EncoderConfig) -> Result<Self> {
@@ -526,6 +538,100 @@ impl FastConformerEncoder {
             x = layer
                 .forward(&x, &pos_emb, None)
                 .with_context(|| format!("conformer layer {i}"))?;
+        }
+        Ok(x)
+    }
+
+    /// Returns the number of Conformer layers. Used by the streaming
+    /// wrapper to size the per-layer cache vector.
+    #[must_use]
+    pub fn n_layers(&self) -> usize {
+        self.layers.len()
+    }
+}
+
+/// Streaming variant of [`FastConformerEncoder`] using local-window
+/// attention + per-layer `RotatingConformerCache`.
+///
+/// Constructed from a loaded [`FastConformerEncoder`] via
+/// [`FastConformerEncoderLocal::from_full`] which Arc-clones the
+/// pre-encode subsampling, swaps the `RelPositionalEncoding` for a
+/// `LocalRelPositionalEncoding`, and constructs each layer as a
+/// `LocalConformerBlock` sharing weights with the full-attention block.
+///
+/// The streaming session holds an instance of this encoder + a
+/// `Vec<Option<RotatingConformerCache>>` (one cache per layer). The
+/// batch path keeps using the original `FastConformerEncoder`.
+pub struct FastConformerEncoderLocal {
+    pre_encode: DwStridingSubsampling,
+    pos_enc: LocalRelPositionalEncoding,
+    layers: Vec<super::conformer_block::LocalConformerBlock>,
+}
+
+impl FastConformerEncoderLocal {
+    /// Builds the streaming encoder from a loaded full-attention encoder,
+    /// sharing all weight tensors via `Arc`-cloned `Tensor` handles.
+    /// `context_size = (left, right)` configures the local-attention window.
+    pub fn from_full(
+        full: &FastConformerEncoder,
+        context_size: (usize, usize),
+        d_model: usize,
+        scale_input: bool,
+        device: &candle_core::Device,
+    ) -> Result<Self> {
+        let pos_enc = LocalRelPositionalEncoding::new(d_model, context_size, scale_input, device)
+            .context("init local positional encoding")?;
+        let layers: Vec<_> = full
+            .layers
+            .iter()
+            .map(|b| super::conformer_block::LocalConformerBlock::from_full(b, context_size))
+            .collect();
+        Ok(Self {
+            pre_encode: full.pre_encode.clone(),
+            pos_enc,
+            layers,
+        })
+    }
+
+    /// Returns the number of Conformer layers (matches the source full
+    /// encoder). Used by the streaming wrapper to size the per-layer
+    /// cache vector.
+    #[must_use]
+    pub fn n_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Streaming forward with per-layer KV caches.
+    ///
+    /// Shapes:
+    /// - `mel`: `(B, T, feat_in)` channels-last mel input
+    /// - `cache`: a slice of `Option<RotatingConformerCache>`, one entry
+    ///   per layer. Each entry is mutated in place: `None` becomes
+    ///   uninitialised cache (treated as fresh) the first time a layer is
+    ///   called with a present cache; the streaming wrapper pre-populates
+    ///   them with `Some(RotatingConformerCache::new(...))` before the
+    ///   first call.
+    ///
+    /// Returns `(B, T', d_model)` where `T' = T / subsampling_factor`.
+    pub fn forward_with_cache(
+        &self,
+        mel: &Tensor,
+        cache: &mut [Option<super::cache::RotatingConformerCache>],
+    ) -> Result<Tensor> {
+        anyhow::ensure!(
+            cache.len() == self.layers.len(),
+            "cache length ({}) must match number of layers ({})",
+            cache.len(),
+            self.layers.len()
+        );
+
+        let x = self.pre_encode.forward(mel).context("pre_encode")?;
+        let (x_scaled, pos_emb) = self.pos_enc.forward(&x).context("local pos_enc")?;
+        let mut x = x_scaled;
+        for (i, (layer, slot)) in self.layers.iter().zip(cache.iter_mut()).enumerate() {
+            x = layer
+                .forward_with_cache(&x, &pos_emb, None, slot)
+                .with_context(|| format!("local conformer layer {i}"))?;
         }
         Ok(x)
     }
