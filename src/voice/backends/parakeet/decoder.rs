@@ -376,6 +376,14 @@ impl TdtDecoder {
         })
     }
 
+    /// Accessor for the predictor sub-module. Used by the streaming
+    /// session to allocate the per-session `LstmState` via
+    /// `predictor().zero_state(...)`.
+    #[must_use]
+    pub fn predictor(&self) -> &TdtPredictor {
+        &self.predictor
+    }
+
     /// Greedy TDT decode over one batch-of-1 encoder output.
     ///
     /// `encoder_out` is `(1, T, encoder_hidden)`. Returns the emitted
