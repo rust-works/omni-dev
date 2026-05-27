@@ -67,9 +67,11 @@ pub struct EncoderConfig {
 
 /// Concrete encoder config for Parakeet-TDT-0.6B-v2.
 ///
-/// Values are hardcoded to the upstream `config.json`; if a future
-/// variant ships with different hyperparameters, build a different
-/// [`EncoderConfig`] rather than touching this constant.
+/// Kept as a documented reference and as a fallback when
+/// [`EncoderConfig::from_config_json`] can't read the installed file.
+/// The runtime load path in `mod.rs` reads `config.json` from the
+/// install dir rather than depending on this const — see
+/// [`EncoderConfig::from_config_json`] for the loader.
 pub const PARAKEET_0_6B_V2: EncoderConfig = EncoderConfig {
     feat_in: 128,
     n_layers: 24,
@@ -83,6 +85,61 @@ pub const PARAKEET_0_6B_V2: EncoderConfig = EncoderConfig {
     use_bias: false,
     xscaling: false,
 };
+
+impl EncoderConfig {
+    /// Loads encoder hyperparameters from a Parakeet `config.json` on
+    /// disk. Fields are read from `encoder.{feat_in, n_layers, d_model,
+    /// n_heads, ff_expansion_factor, subsampling_factor,
+    /// subsampling_conv_channels, conv_kernel_size}`.
+    ///
+    /// Fields not surfaced in the upstream config schema use defaults:
+    /// `use_bias = false` (all parakeet-tdt variants are unbiased; the
+    /// alternative is to introspect the safetensors for the presence
+    /// of `feed_forward1.linear1.bias`, deferred for now);
+    /// `pos_emb_max_len` and `xscaling` inherit from
+    /// [`PARAKEET_0_6B_V2`].
+    ///
+    /// Loading from disk rather than hardcoding the v2 const prevents
+    /// the bug class where a v1-trained set of constants silently
+    /// survives a v2 weight swap (the exact failure mode that produced
+    /// the `feat_in: 80 / use_bias: true / N_MELS: 80` mismatch caught
+    /// in PR review).
+    pub fn from_config_json(path: &std::path::Path) -> Result<Self> {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let cfg: serde_json::Value =
+            serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+        let enc = &cfg["encoder"];
+        anyhow::ensure!(
+            enc.is_object(),
+            "{}: missing top-level `encoder` object",
+            path.display()
+        );
+
+        let read_usize = |field: &str| -> Result<usize> {
+            enc.get(field)
+                .and_then(serde_json::Value::as_u64)
+                .map(|n| n as usize)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("{}: missing or non-integer encoder.{field}", path.display())
+                })
+        };
+
+        Ok(Self {
+            feat_in: read_usize("feat_in")?,
+            n_layers: read_usize("n_layers")?,
+            d_model: read_usize("d_model")?,
+            n_heads: read_usize("n_heads")?,
+            ff_expansion_factor: read_usize("ff_expansion_factor")?,
+            subsampling_factor: read_usize("subsampling_factor")?,
+            subsampling_conv_channels: read_usize("subsampling_conv_channels")?,
+            conv_kernel_size: read_usize("conv_kernel_size")?,
+            pos_emb_max_len: PARAKEET_0_6B_V2.pos_emb_max_len,
+            use_bias: false,
+            xscaling: PARAKEET_0_6B_V2.xscaling,
+        })
+    }
+}
 
 /// Sinusoidal relative positional encoding (Transformer-XL style).
 ///
@@ -491,5 +548,76 @@ mod tests {
         assert_eq!(c.d_model % c.n_heads, 0);
         // subsampling_factor must be a power of two.
         assert_eq!(c.subsampling_factor & (c.subsampling_factor - 1), 0);
+    }
+
+    #[test]
+    fn encoder_config_loads_from_minimal_config_json() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = tmp.path().join("config.json");
+        std::fs::write(
+            &p,
+            r#"{
+                "encoder": {
+                    "feat_in": 128,
+                    "n_layers": 24,
+                    "d_model": 1024,
+                    "n_heads": 8,
+                    "ff_expansion_factor": 4,
+                    "subsampling_factor": 8,
+                    "subsampling_conv_channels": 256,
+                    "conv_kernel_size": 9
+                }
+            }"#,
+        )
+        .unwrap();
+        let c = EncoderConfig::from_config_json(&p).unwrap();
+        assert_eq!(c.feat_in, 128);
+        assert_eq!(c.n_layers, 24);
+        assert_eq!(c.d_model, 1024);
+        assert_eq!(c.n_heads, 8);
+        assert_eq!(c.ff_expansion_factor, 4);
+        assert_eq!(c.subsampling_factor, 8);
+        assert_eq!(c.subsampling_conv_channels, 256);
+        assert_eq!(c.conv_kernel_size, 9);
+        // Inherited defaults.
+        assert_eq!(c.pos_emb_max_len, PARAKEET_0_6B_V2.pos_emb_max_len);
+        assert!(!c.use_bias);
+        assert!(!c.xscaling);
+    }
+
+    #[test]
+    fn encoder_config_errors_on_missing_encoder_section() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = tmp.path().join("config.json");
+        std::fs::write(&p, r#"{"joint": {}}"#).unwrap();
+        let Err(err) = EncoderConfig::from_config_json(&p) else {
+            panic!("expected missing-encoder error");
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("missing top-level `encoder`"), "got: {msg}");
+    }
+
+    #[test]
+    fn encoder_config_errors_on_missing_field() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = tmp.path().join("config.json");
+        // Missing `d_model`.
+        std::fs::write(&p, r#"{"encoder": {"feat_in": 128, "n_layers": 24}}"#).unwrap();
+        let Err(err) = EncoderConfig::from_config_json(&p) else {
+            panic!("expected missing-field error");
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("encoder.d_model"), "got: {msg}");
+    }
+
+    #[test]
+    fn encoder_config_errors_on_missing_file() {
+        let Err(err) =
+            EncoderConfig::from_config_json(std::path::Path::new("/nope/does/not/exist.json"))
+        else {
+            panic!("expected missing-file error");
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("read "), "got: {msg}");
     }
 }

@@ -35,7 +35,7 @@ use crate::voice::transcriber::{
 
 use self::audio::{ParakeetMel, SAMPLE_RATE};
 use self::decoder::{TdtDecoder, PARAKEET_TDT_0_6B_V2};
-use self::encoder::{FastConformerEncoder, PARAKEET_0_6B_V2};
+use self::encoder::{EncoderConfig, FastConformerEncoder};
 use self::tokenizer::ParakeetTokenizer;
 use self::weights::open_safetensors;
 
@@ -91,11 +91,27 @@ impl CandleParakeetTranscriber {
         }
         let weights_path = model_dir.join("candle_weights.safetensors");
         let tokenizer_path = model_dir.join("tokenizer.json");
+        let config_path = model_dir.join("config.json");
 
         let device = Device::Cpu;
         let vb = open_safetensors(&weights_path, &device).context("open Parakeet weights")?;
 
-        let encoder_cfg = PARAKEET_0_6B_V2;
+        // Read encoder hyperparameters from the installed config.json
+        // rather than the hardcoded PARAKEET_0_6B_V2 const. Prevents
+        // the v1-constants-survive-v2-weight-swap bug class caught in
+        // the PR review (feat_in: 80 vs 128, use_bias: true vs false).
+        let encoder_cfg = EncoderConfig::from_config_json(&config_path)
+            .context("load encoder config from config.json")?;
+        anyhow::ensure!(
+            encoder_cfg.feat_in == audio::N_MELS,
+            "encoder.feat_in ({}) doesn't match the compiled mel front-end \
+             (N_MELS = {}). This Parakeet variant uses a different mel-bin \
+             count; rebuild the backend with a matching N_MELS or install a \
+             matching variant.",
+            encoder_cfg.feat_in,
+            audio::N_MELS,
+        );
+
         let decoder_cfg = PARAKEET_TDT_0_6B_V2;
         let encoder = FastConformerEncoder::load(vb.pp("encoder"), &encoder_cfg, &device)
             .context("load Parakeet encoder")?;
