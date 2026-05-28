@@ -23,7 +23,7 @@ pub mod tokenizer;
 pub mod weights;
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -58,19 +58,16 @@ pub const REQUIRED_FILES: &[&str] = &[
 /// streaming-style state threading is the [`crate::voice::StreamingTranscriber`]
 /// impl's job.
 ///
-/// Inference state lives behind a [`Mutex`] for parity with
-/// [`crate::voice::backends::candle::CandleTranscriber`] — the
-/// [`Transcriber`] trait exposes `&self` but we want the option to
-/// extend the backend with mutable per-call state without changing the
-/// trait. Today the encoder and decoder use `&self` internally, so the
-/// lock is a no-op; keeping it makes the streaming-state migration in
-/// the next commit a one-line addition.
+/// Model components are held behind [`Arc`] so the streaming wrapper can
+/// move clones across [`tokio::task::spawn_blocking`] boundaries without
+/// holding locks across `.await` points. Inference methods take `&self`,
+/// so concurrent batch and streaming use is safe.
 pub struct CandleParakeetTranscriber {
-    encoder: Mutex<FastConformerEncoder>,
-    decoder: Mutex<TdtDecoder>,
-    tokenizer: ParakeetTokenizer,
-    mel: ParakeetMel,
-    device: Device,
+    pub(super) encoder: Arc<FastConformerEncoder>,
+    pub(super) decoder: Arc<TdtDecoder>,
+    pub(super) tokenizer: Arc<ParakeetTokenizer>,
+    pub(super) mel: Arc<ParakeetMel>,
+    pub(super) device: Device,
 }
 
 impl CandleParakeetTranscriber {
@@ -122,10 +119,10 @@ impl CandleParakeetTranscriber {
         let mel = ParakeetMel::new().context("build Parakeet mel front-end")?;
 
         Ok(Self {
-            encoder: Mutex::new(encoder),
-            decoder: Mutex::new(decoder),
-            tokenizer,
-            mel,
+            encoder: Arc::new(encoder),
+            decoder: Arc::new(decoder),
+            tokenizer: Arc::new(tokenizer),
+            mel: Arc::new(mel),
             device,
         })
     }
@@ -166,24 +163,16 @@ impl Transcriber for CandleParakeetTranscriber {
         .context("build mel tensor")?;
 
         // Encoder: (1, T, 80) -> (1, T', d_model=1024).
-        let encoder_out = {
-            let encoder = self
-                .encoder
-                .lock()
-                .map_err(|e| anyhow!("Parakeet encoder mutex poisoned: {e}"))?;
-            encoder.forward(&mel_tensor).context("encoder forward")?
-        };
+        let encoder_out = self
+            .encoder
+            .forward(&mel_tensor)
+            .context("encoder forward")?;
 
         // Decoder: greedy TDT over the encoder output -> token ids.
-        let tokens = {
-            let decoder = self
-                .decoder
-                .lock()
-                .map_err(|e| anyhow!("Parakeet decoder mutex poisoned: {e}"))?;
-            decoder
-                .decode_greedy(&encoder_out)
-                .context("decoder greedy")?
-        };
+        let tokens = self
+            .decoder
+            .decode_greedy(&encoder_out)
+            .context("decoder greedy")?;
 
         let text = self.tokenizer.decode(&tokens).context("decode tokens")?;
 

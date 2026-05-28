@@ -40,11 +40,14 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use omni_dev::voice::backends::parakeet::CandleParakeetTranscriber;
 use omni_dev::voice::models::PARAKEET_TDT_0_6B_V2;
 use omni_dev::voice::transcriber::{
-    FileAsyncAudioInput, StreamingTranscriber, Transcriber, TranscriptEvent, VecAudioInput,
+    AsyncAudioInput, AudioChunk, FileAsyncAudioInput, StreamingTranscriber, Transcriber,
+    TranscriptEvent, VecAudioInput,
 };
 
 /// Content words actually present in `monologue_5min.expected.txt`,
@@ -209,5 +212,111 @@ fn parakeet_streaming_emits_partials_on_30s_slice() {
         "expected at least 2 Partial events on a 30 s slice; got {} (events: {:?})",
         partials.len(),
         events
+    );
+}
+
+// ── AC-3d: async yield-as-you-go ────────────────────────────────────────
+
+/// `AsyncAudioInput` wrapper that injects a fixed sleep before each
+/// `next_chunk` call. Simulates a realtime audio source (cpal-like) where
+/// chunks arrive over wall-clock time rather than instantly. Used by the
+/// `..._yields_partials_during_input` test to prove that Partials are
+/// emitted *during* the stream, not in a burst at the end.
+struct SleepingAudioInput {
+    inner: FileAsyncAudioInput,
+    delay: Duration,
+    /// Stamped the first time `next_chunk` returns `None`. Lets the
+    /// test compare the first-Partial timestamp against the
+    /// input-exhausted timestamp.
+    exhausted_at: std::sync::Arc<std::sync::Mutex<Option<Instant>>>,
+}
+
+#[async_trait]
+impl AsyncAudioInput for SleepingAudioInput {
+    async fn next_chunk(&mut self) -> Option<AudioChunk> {
+        tokio::time::sleep(self.delay).await;
+        let chunk = self.inner.next_chunk().await;
+        if chunk.is_none() {
+            let mut slot = self.exhausted_at.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(Instant::now());
+            }
+        }
+        chunk
+    }
+}
+
+#[test]
+#[ignore = "requires Parakeet model on disk; run `omni-dev voice install-model --variant parakeet-tdt-0.6b-v2`"]
+fn parakeet_streaming_yields_partials_during_input() {
+    let transcriber = build_transcriber();
+    // Take 30 s of audio in 100 ms chunks (1 600 samples) so the
+    // SleepingAudioInput's delay applies 300 times.
+    let full = VecAudioInput::from_wav_path(fixture_wav(), 1024).expect("fixture should load");
+    let mut samples: Vec<i16> = Vec::new();
+    let mut iter: Box<dyn omni_dev::voice::transcriber::AudioInput> = Box::new(full);
+    let cap = 30 * 16_000;
+    while samples.len() < cap {
+        match iter.next_chunk() {
+            Some(c) => samples.extend_from_slice(&c),
+            None => break,
+        }
+    }
+    samples.truncate(cap);
+    let inner = FileAsyncAudioInput::from_samples(samples, 1_600);
+
+    // 10 ms per chunk × 300 chunks ≈ 3 s wall-clock to drain. Encoder
+    // processes a 5 s buffer ~6 times during that window, so Partials
+    // should arrive starting around T ≈ 1 s — well before T_exhausted ≈ 3 s.
+    let exhausted_at = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let async_input = SleepingAudioInput {
+        inner,
+        delay: Duration::from_millis(10),
+        exhausted_at: std::sync::Arc::clone(&exhausted_at),
+    };
+
+    // Multi-thread runtime: `spawn_blocking` needs a worker thread for the
+    // encoder/decoder forward calls while the driver awaits chunks.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    let started = Instant::now();
+    let stamped_events: Vec<(Duration, TranscriptEvent)> = rt.block_on(async {
+        use futures::StreamExt;
+        let mut stream = transcriber.transcribe_stream(Box::new(async_input));
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            out.push((
+                started.elapsed(),
+                item.expect("backend should not error mid-stream"),
+            ));
+        }
+        out
+    });
+
+    let t_exhausted = exhausted_at
+        .lock()
+        .unwrap()
+        .expect("input must have been exhausted")
+        - started;
+
+    let first_partial_at = stamped_events
+        .iter()
+        .find_map(|(t, ev)| matches!(ev, TranscriptEvent::Partial { .. }).then_some(*t))
+        .expect("expected at least one Partial event");
+
+    eprintln!("t_first_partial = {first_partial_at:?}");
+    eprintln!("t_input_exhausted = {t_exhausted:?}");
+    for (t, ev) in &stamped_events {
+        eprintln!("  t={t:?}  {ev:?}");
+    }
+
+    assert!(
+        first_partial_at < t_exhausted,
+        "Partials should arrive while the audio is still streaming, not after. \
+         first_partial = {first_partial_at:?}, input_exhausted = {t_exhausted:?}"
     );
 }
