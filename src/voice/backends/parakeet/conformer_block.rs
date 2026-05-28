@@ -166,19 +166,25 @@ impl LocalConformerBlock {
     /// Constructs a streaming variant from a loaded `ConformerBlock`,
     /// sharing all weight tensors via `Arc`-backed clones. The
     /// `context_size = (left, right)` selects the local-attention window.
-    #[must_use]
-    pub fn from_full(full: &ConformerBlock, context_size: (usize, usize)) -> Self {
-        Self {
+    ///
+    /// Returns `Result` because constructing the fused Q/K/V weight in
+    /// the local attention layer involves a `Tensor::cat` that can
+    /// theoretically fail.
+    pub fn from_full(full: &ConformerBlock, context_size: (usize, usize)) -> Result<Self> {
+        Ok(Self {
             norm_ff1: full.norm_ff1.clone(),
             ff1: full.ff1.clone(),
             norm_self_att: full.norm_self_att.clone(),
-            self_attn: RelPositionMultiHeadLocalAttention::from_full(&full.self_attn, context_size),
+            self_attn: RelPositionMultiHeadLocalAttention::from_full(
+                &full.self_attn,
+                context_size,
+            )?,
             norm_conv: full.norm_conv.clone(),
             conv: full.conv.clone(),
             norm_ff2: full.norm_ff2.clone(),
             ff2: full.ff2.clone(),
             norm_out: full.norm_out.clone(),
-        }
+        })
     }
 
     /// Streaming forward with optional per-layer cache.

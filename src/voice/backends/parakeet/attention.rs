@@ -26,11 +26,59 @@
 //! `matrix_bd` exactly where MLX's `mx.fast.scaled_dot_product_attention`
 //! takes its `mask=` argument (additive pre-softmax, not multiplicative).
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use candle_core::{Module, Tensor, D};
 use candle_nn::{ops::softmax, Linear, VarBuilder};
 
 use super::cache::RotatingConformerCache;
+
+/// Thread-local scratch caches for `unfold_local_pos_scores` and
+/// `local_window_bias`. Both functions build a small `Vec` of indices /
+/// floats on every call, then `Tensor::from_vec` + broadcast + contiguous
+/// — for a 30 s streaming test that's ~24 layers × ~20 chunks × 2 calls
+/// = ~960 redundant rebuilds of effectively-identical tensors.
+///
+/// After cache warmup (a handful of chunks), the inputs to both
+/// functions stabilise: `s` (chunk size after subsampling) is constant,
+/// `cached_offset` caps at the cache's capacity, and `(w_left, w_right,
+/// k_len, b, h)` don't change. So the index / bias tensor is the SAME
+/// across every layer × every chunk. Caching it by its parameter tuple
+/// reduces all those rebuilds to a single tensor clone (Arc-bump).
+///
+/// Cache is bounded to `MAX_CACHE_ENTRIES`; on overflow we `.clear()`.
+/// Crude but the number of distinct keys in a typical session is ~3
+/// (during warmup + steady state), so the bound is never hit in
+/// practice and the clear is rarely (if ever) triggered.
+#[derive(Eq, Hash, PartialEq, Clone, Debug)]
+struct LocalAttnScratchKey {
+    s: usize,
+    k_len: usize,
+    cached_offset: usize,
+    w_left: usize,
+    w_right: usize,
+    b: usize,
+    h: usize,
+}
+
+const MAX_CACHE_ENTRIES: usize = 32;
+
+thread_local! {
+    static UNFOLD_INDEX_CACHE: RefCell<HashMap<LocalAttnScratchKey, Tensor>> =
+        RefCell::new(HashMap::new());
+    static WINDOW_BIAS_CACHE: RefCell<HashMap<LocalAttnScratchKey, Tensor>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Cap the cache size; on overflow, drop everything. Called after every
+/// insertion; cheap because the cache is tiny in practice.
+fn maybe_evict<K, V>(map: &mut HashMap<K, V>) {
+    if map.len() > MAX_CACHE_ENTRIES {
+        map.clear();
+    }
+}
 
 /// Standard multi-head attention (no positional bias).
 ///
@@ -337,8 +385,14 @@ impl RelPositionMultiHeadLocalAttention {
     /// Constructs a local-attention variant sharing weights with an
     /// existing full-attention module. Tensors are Arc-cloned; this is
     /// cheap and no `VarBuilder` re-traversal is performed.
-    #[must_use]
-    pub fn from_full(full: &RelPositionMultiHeadAttention, context_size: (usize, usize)) -> Self {
+    ///
+    /// Returns `Result` for API stability (the caller chain treats this
+    /// as fallible because the conformer block aggregates multiple
+    /// `from_full` calls); the current body is infallible.
+    pub fn from_full(
+        full: &RelPositionMultiHeadAttention,
+        context_size: (usize, usize),
+    ) -> Result<Self> {
         // Share each linear's weight + bias tensors (Arc-cloned internally).
         let base = MultiHeadAttention {
             n_head: full.base.n_head,
@@ -349,13 +403,13 @@ impl RelPositionMultiHeadLocalAttention {
             linear_v: full.base.linear_v.clone(),
             linear_out: full.base.linear_out.clone(),
         };
-        Self {
+        Ok(Self {
             base,
             linear_pos: full.linear_pos.clone(),
             pos_bias_u: full.pos_bias_u.clone(),
             pos_bias_v: full.pos_bias_v.clone(),
             context_size,
-        }
+        })
     }
 
     /// Returns the `(left, right)` context window.
@@ -395,6 +449,12 @@ impl RelPositionMultiHeadLocalAttention {
         } = self.base;
 
         // 1. Project Q, K, V, P.
+        // (QKV-fusion was attempted as a perf optimisation but produced
+        // a regression: the narrow().contiguous() copies after the fused
+        // matmul cost more than the three separate matmuls saved. Stays
+        // with three matmuls for now; a real fusion needs to keep the
+        // output as (B, S, 3*n_feat) and reshape directly to heads
+        // without narrow+contiguous — bigger refactor, deferred.)
         let q = linear_q.forward(q).context("project q (local)")?;
         let k_proj = linear_k.forward(k).context("project k (local)")?;
         let v_proj = linear_v.forward(v).context("project v (local)")?;
@@ -543,38 +603,62 @@ fn unfold_local_pos_scores(
     );
 
     let device = compact.device();
+    let key = LocalAttnScratchKey {
+        s,
+        k_len,
+        cached_offset,
+        w_left,
+        w_right,
+        b,
+        h,
+    };
 
-    // Build index tensor mirroring MLX's `LocalRelPositionalEncoding`
-    // convention: the position-encoding table at index `j` corresponds to
-    // relative position `(w_left - j)` (positions descend from `+w_left`
-    // at j=0 to `-w_right` at j=w_left+w_right). For query position
-    // `q_pos = cached_offset + i` and key position `k`, the relative
-    // position is `(k - q_pos)`, so the pos-emb index is
-    // `w_left - (k - q_pos) = w_left + q_pos - k`.
-    //
-    // Out-of-window indices are clamped to 0 — those positions are zeroed
-    // by the local-window mask downstream.
-    let mut indices = vec![0u32; s * k_len];
-    #[allow(clippy::cast_possible_wrap)]
-    let win_max = (win_size as i64) - 1;
-    #[allow(clippy::cast_possible_wrap)]
-    let w_left_i = w_left as i64;
-    for i in 0..s {
-        #[allow(clippy::cast_possible_wrap)]
-        let q_pos = (cached_offset + i) as i64;
-        for k in 0..k_len {
+    // Reuse the cached index tensor if we've built it before with the
+    // same parameters (the common path after the cache warms up).
+    let cached = UNFOLD_INDEX_CACHE.with(|c| c.borrow().get(&key).cloned());
+    let idx_tensor = match cached {
+        Some(t) => t,
+        None => {
+            // Build index tensor mirroring MLX's `LocalRelPositionalEncoding`
+            // convention: the position-encoding table at index `j`
+            // corresponds to relative position `(w_left - j)` (positions
+            // descend from `+w_left` at j=0 to `-w_right` at
+            // j=w_left+w_right). For query position `q_pos = cached_offset
+            // + i` and key position `k`, the relative position is
+            // `(k - q_pos)`, so the pos-emb index is `w_left - (k - q_pos)
+            // = w_left + q_pos - k`.
+            //
+            // Out-of-window indices are clamped to 0 — those positions are
+            // zeroed by the local-window mask downstream.
+            let mut indices = vec![0u32; s * k_len];
             #[allow(clippy::cast_possible_wrap)]
-            let idx = (w_left_i + q_pos - (k as i64)).clamp(0, win_max);
-            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            {
-                indices[i * k_len + k] = idx as u32;
+            let win_max = (win_size as i64) - 1;
+            #[allow(clippy::cast_possible_wrap)]
+            let w_left_i = w_left as i64;
+            for i in 0..s {
+                #[allow(clippy::cast_possible_wrap)]
+                let q_pos = (cached_offset + i) as i64;
+                for k in 0..k_len {
+                    #[allow(clippy::cast_possible_wrap)]
+                    let idx = (w_left_i + q_pos - (k as i64)).clamp(0, win_max);
+                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                    {
+                        indices[i * k_len + k] = idx as u32;
+                    }
+                }
             }
-        }
-    }
 
-    let idx_tensor = Tensor::from_vec(indices, (1, 1, s, k_len), device)?
-        .broadcast_as((b, h, s, k_len))?
-        .contiguous()?;
+            let t = Tensor::from_vec(indices, (1, 1, s, k_len), device)?
+                .broadcast_as((b, h, s, k_len))?
+                .contiguous()?;
+            UNFOLD_INDEX_CACHE.with(|c| {
+                let mut m = c.borrow_mut();
+                m.insert(key, t.clone());
+                maybe_evict(&mut m);
+            });
+            t
+        }
+    };
 
     compact
         .contiguous()?
@@ -596,6 +680,32 @@ fn local_window_bias(
     dtype: candle_core::DType,
     device: &candle_core::Device,
 ) -> Result<Tensor> {
+    // Reuse the cached bias tensor when parameters match a previous
+    // build. dtype is included implicitly via the cached tensor's
+    // dtype; for our single-dtype (F32) caller this is fine, but if
+    // a future caller switches dtype the cache would need keying by
+    // dtype too.
+    let key = LocalAttnScratchKey {
+        s,
+        k_len,
+        cached_offset,
+        w_left,
+        w_right,
+        // bias broadcasts; b and h aren't part of the tensor shape.
+        // Set both to 1 to share entries across (b, h) variants.
+        b: 1,
+        h: 1,
+    };
+    let cached = WINDOW_BIAS_CACHE.with(|c| c.borrow().get(&key).cloned());
+    if let Some(t) = cached {
+        // Reuse only when the cached tensor matches the requested dtype
+        // (assume same-thread sessions stay on the same device).
+        if t.dtype() == dtype {
+            return Ok(t);
+        }
+    }
+    let _ = device; // suppress unused warning when cache hits
+
     let mut data = vec![0.0_f32; s * k_len];
     #[allow(clippy::cast_possible_wrap)]
     let w_left_i = w_left as i64;
@@ -613,6 +723,11 @@ fn local_window_bias(
         }
     }
     let bias = Tensor::from_vec(data, (1, 1, s, k_len), device)?.to_dtype(dtype)?;
+    WINDOW_BIAS_CACHE.with(|c| {
+        let mut m = c.borrow_mut();
+        m.insert(key, bias.clone());
+        maybe_evict(&mut m);
+    });
     Ok(bias)
 }
 
@@ -778,7 +893,7 @@ mod tests {
     #[test]
     fn local_attn_from_full_shares_weights() {
         let full = make_test_full_attn(2, 4);
-        let local = RelPositionMultiHeadLocalAttention::from_full(&full, (2, 2));
+        let local = RelPositionMultiHeadLocalAttention::from_full(&full, (2, 2)).unwrap();
         assert_eq!(local.context_size(), (2, 2));
         // Weight tensors are Arc-cloned; pointer-identity isn't promised by
         // candle but the underlying storage is shared. Verify shape parity.
@@ -792,7 +907,7 @@ mod tests {
     #[test]
     fn local_attn_forward_no_cache_produces_correct_shape() {
         let full = make_test_full_attn(2, 4);
-        let local = RelPositionMultiHeadLocalAttention::from_full(&full, (2, 2));
+        let local = RelPositionMultiHeadLocalAttention::from_full(&full, (2, 2)).unwrap();
         let n_feat = 2 * 4;
         let s = 3;
         let win = 2 + 2 + 1;
@@ -820,7 +935,7 @@ mod tests {
     fn local_attn_cache_accumulates_across_calls() {
         use super::super::cache::RotatingConformerCache;
         let full = make_test_full_attn(2, 4);
-        let local = RelPositionMultiHeadLocalAttention::from_full(&full, (4, 4));
+        let local = RelPositionMultiHeadLocalAttention::from_full(&full, (4, 4)).unwrap();
         let n_feat = 2 * 4;
         let win = 4 + 4 + 1;
         let pos = random_tensor(&[1, win, n_feat], 4);
@@ -857,10 +972,10 @@ mod tests {
     #[test]
     fn local_attn_window_mask_zeros_out_of_window_attention() {
         // With a tiny window (left=0, right=0), each query attends to
-        // exactly one key (itself). Output should equal V at that position
-        // (when the queries align to keys 1:1 and no cache).
+        // exactly one key (itself). With identity projections,
+        // attn @ V == V exactly.
         let full = make_test_full_attn(1, 2);
-        let local = RelPositionMultiHeadLocalAttention::from_full(&full, (0, 0));
+        let local = RelPositionMultiHeadLocalAttention::from_full(&full, (0, 0)).unwrap();
         let n_feat = 2;
         let s = 4;
         let win = 1;

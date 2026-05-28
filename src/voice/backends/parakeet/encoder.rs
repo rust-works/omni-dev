@@ -581,11 +581,15 @@ impl FastConformerEncoderLocal {
     ) -> Result<Self> {
         let pos_enc = LocalRelPositionalEncoding::new(d_model, context_size, scale_input, device)
             .context("init local positional encoding")?;
-        let layers: Vec<_> = full
+        let layers: Vec<super::conformer_block::LocalConformerBlock> = full
             .layers
             .iter()
-            .map(|b| super::conformer_block::LocalConformerBlock::from_full(b, context_size))
-            .collect();
+            .enumerate()
+            .map(|(i, b)| {
+                super::conformer_block::LocalConformerBlock::from_full(b, context_size)
+                    .with_context(|| format!("build LocalConformerBlock for layer {i}"))
+            })
+            .collect::<Result<_>>()?;
         Ok(Self {
             pre_encode: full.pre_encode.clone(),
             pos_enc,
