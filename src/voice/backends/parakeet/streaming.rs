@@ -418,7 +418,7 @@ impl<'a> StreamingSession<'a> {
 
     /// Emit the final Final + Endpoint::StreamEnd for the accumulated
     /// finalized tokens. Called when the AsyncAudioInput is exhausted.
-    fn finalize(&mut self) -> Result<Vec<TranscriptEvent>> {
+    fn finalize(&self) -> Result<Vec<TranscriptEvent>> {
         let elapsed = self.elapsed();
         let mut combined: Vec<u32> =
             Vec::with_capacity(self.finalized_tokens.len() + self.draft_tokens.len());

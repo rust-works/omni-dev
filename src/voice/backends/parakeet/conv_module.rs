@@ -141,7 +141,8 @@ impl ConvolutionModule {
     /// Forward pass with optional KV-cache for streaming.
     ///
     /// When `cache` is `Some`, the depthwise conv's symmetric zero-padding
-    /// is replaced by [`RotatingConformerCache::update_and_fetch_conv`],
+    /// is replaced by
+    /// [`super::cache::RotatingConformerCache::update_and_fetch_conv`],
     /// which returns the input with the cached prefix prepended and
     /// `padding` zeros suffix-appended. The cache holds the last
     /// `padding` tokens from the previous chunk so the depthwise conv

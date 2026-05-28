@@ -16,9 +16,10 @@
 //!    `cached_keys` holds up to `capacity` entries from prior calls.
 //! 2. Updates the cache by appending the first `S - cache_drop_size` entries
 //!    of K/V (the non-speculative prefix) and trimming the combined buffer
-//!    to at most `capacity` from the tail. `cache_drop_size = context_size.1
-//!    * depth` is the number of trailing entries we deliberately don't cache
-//!    because they may be revised on the next call.
+//!    to at most `capacity` from the tail.
+//!    `cache_drop_size = context_size.1 * depth` is the number of trailing
+//!    entries we deliberately don't cache because they may be revised on
+//!    the next call.
 //!
 //! `update_and_fetch_conv(x, padding)` where x is `(B, S, D)`:
 //!
@@ -206,7 +207,9 @@ impl RotatingConformerCache {
             if tokens_to_cache < padding {
                 // Slide existing cache: drop the first `tokens_to_cache`
                 // entries and append cache_update.
-                let current = self.conv.as_ref().expect("conv cache initialised above");
+                let current = self.conv.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("conv cache must be initialised by this point")
+                })?;
                 let kept = current
                     .narrow(1, tokens_to_cache, padding - tokens_to_cache)
                     .context("narrow existing conv cache for slide")?;
@@ -226,7 +229,10 @@ impl RotatingConformerCache {
         }
 
         // Build the output: cat([conv, x], 1) then suffix-pad with `padding` zeros.
-        let conv_ref = self.conv.as_ref().expect("conv cache initialised above");
+        let conv_ref = self
+            .conv
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("conv cache must be initialised by this point"))?;
         let prefixed = Tensor::cat(&[conv_ref, x], 1).context("cat conv cache + x")?;
         let zero_suffix =
             Tensor::zeros((b, padding, d), dtype, device).context("alloc zero suffix")?;
@@ -257,7 +263,9 @@ mod tests {
     fn ones_kv(b: usize, h: usize, s: usize, d: usize, scale: f32) -> Tensor {
         let dev = Device::Cpu;
         let total = b * h * s * d;
-        let data: Vec<f32> = (0..total).map(|i| scale + (i as f32) * 0.001).collect();
+        let data: Vec<f32> = (0..total)
+            .map(|i| (i as f32).mul_add(0.001, scale))
+            .collect();
         Tensor::from_vec(data, (b, h, s, d), &dev).unwrap()
     }
 

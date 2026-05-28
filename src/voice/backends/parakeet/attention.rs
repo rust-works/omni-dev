@@ -180,6 +180,7 @@ impl RelPositionMultiHeadAttention {
     /// `(1 | batch, pos_len, n_feat)`; `mask` (if supplied) is
     /// `(batch, t_q, t_k)` with `true` meaning *attend-to-mask*
     /// (i.e. blocked positions). Returns `(batch, t_q, n_feat)`.
+    #[allow(clippy::many_single_char_names)] // q/k/v/b/h are attention conventions
     pub fn forward(
         &self,
         q: &Tensor,
@@ -327,9 +328,9 @@ impl RelPositionMultiHeadAttention {
             out_chunks.push(out_chunk);
         }
 
-        let out = if out_chunks.len() == 1 {
+        let out = if let [single] = out_chunks.as_slice() {
             // Single-chunk fast path: skip the cat.
-            out_chunks.pop().expect("len() == 1")
+            single.clone()
         } else {
             Tensor::cat(&out_chunks, 2)?
         };
@@ -429,6 +430,7 @@ impl RelPositionMultiHeadLocalAttention {
     ///   K/V are extended with cached history; cache is mutated in place
     ///
     /// Returns `(B, S, n_feat)` (output projection applied).
+    #[allow(clippy::many_single_char_names)] // q/k/v/b/h are attention conventions
     pub fn forward(
         &self,
         q: &Tensor,
@@ -586,6 +588,7 @@ impl RelPositionMultiHeadLocalAttention {
 /// `(B, H, S, K_len)` representation by per-(i, k) gather. Out-of-window
 /// indices are clamped to 0 — they're zeroed out by the local-window mask
 /// at the call site.
+#[allow(clippy::many_single_char_names)] // b/h/s are attention conventions
 fn unfold_local_pos_scores(
     compact: &Tensor,
     cached_offset: usize,
@@ -616,9 +619,10 @@ fn unfold_local_pos_scores(
     // Reuse the cached index tensor if we've built it before with the
     // same parameters (the common path after the cache warms up).
     let cached = UNFOLD_INDEX_CACHE.with(|c| c.borrow().get(&key).cloned());
-    let idx_tensor = match cached {
-        Some(t) => t,
-        None => {
+    let idx_tensor = if let Some(t) = cached {
+        t
+    } else {
+        {
             // Build index tensor mirroring MLX's `LocalRelPositionalEncoding`
             // convention: the position-encoding table at index `j`
             // corresponds to relative position `(w_left - j)` (positions
@@ -669,6 +673,7 @@ fn unfold_local_pos_scores(
 /// Builds an additive bias of shape `(1, 1, S, K_len)` that is `0.0` inside
 /// the local window and `-1e9` outside. Broadcast-added to scores before
 /// softmax so out-of-window keys get effectively-zero attention weight.
+#[allow(clippy::too_many_arguments)]
 fn local_window_bias(
     _batch: usize,
     _n_head: usize,
@@ -928,7 +933,11 @@ mod tests {
             .iter()
             .map(|x| if x.is_nan() { 1.0 } else { 0.0 })
             .sum();
-        assert_eq!(any_nan, 0.0, "output must not contain NaN");
+        // any_nan is a sum of {0.0, 1.0} flags: exactly zero iff no NaN.
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(any_nan, 0.0, "output must not contain NaN");
+        }
     }
 
     #[test]

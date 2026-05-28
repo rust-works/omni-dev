@@ -232,7 +232,8 @@ impl RelPositionalEncoding {
 /// precomputed table of shape `(1, left + right + 1, d_model)` covering
 /// relative positions `[+left, +left-1, ..., 0, ..., -right]` — in
 /// descending order so `pe[j]` corresponds to relative offset
-/// `(left - j)`. Used by [`RelPositionMultiHeadLocalAttention`] in place
+/// `(left - j)`. Used by
+/// [`super::attention::RelPositionMultiHeadLocalAttention`] in place
 /// of the standard `(1, 2 * max_len - 1, d_model)` table from
 /// [`RelPositionalEncoding`].
 ///
