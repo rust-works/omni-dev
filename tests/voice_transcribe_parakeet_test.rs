@@ -169,7 +169,7 @@ fn parakeet_streaming_final_only_matches_batch() {
 // ── AC-3c: streaming Partials on 30 s slice ────────────────────────────
 
 #[test]
-#[ignore = "v1 streaming has no incremental Partial emission — see streaming.rs for the follow-up"]
+#[ignore = "requires Parakeet model on disk; run `omni-dev voice install-model --variant parakeet-tdt-0.6b-v2`"]
 fn parakeet_streaming_emits_partials_on_30s_slice() {
     let transcriber = build_transcriber();
     // Take just the first 30 s of the fixture by truncating samples.
@@ -206,9 +206,7 @@ fn parakeet_streaming_emits_partials_on_30s_slice() {
         .collect();
     assert!(
         partials.len() >= 2,
-        "expected at least 2 Partial events on a 30 s slice; got {} (events: {:?}). \
-         This test is currently #[ignore]'d because v1 streaming has no incremental \
-         Partial emission — see src/voice/backends/parakeet/streaming.rs.",
+        "expected at least 2 Partial events on a 30 s slice; got {} (events: {:?})",
         partials.len(),
         events
     );
