@@ -158,10 +158,40 @@ impl CandleParakeetTranscriber {
             drop_size,
         )?;
 
+        // Internal chunk-merging: per-encoder-forward overhead is largely
+        // independent of window size (the candle op count is ~constant in
+        // T, only matmul WORK grows with T), so processing larger windows
+        // amortises overhead. Buffer incoming source chunks until the
+        // accumulator reaches `INTERNAL_CHUNK_MIN_SAMPLES`, then process.
+        //
+        // Trade-off: Partial events arrive at the merged-chunk cadence
+        // (~`INTERNAL_CHUNK_MIN_SAMPLES / SAMPLE_RATE` seconds) rather
+        // than the source-chunk cadence. For the 30 s streaming test
+        // (source chunks 1.6 s, internal min 5 s), this is 6 Partials
+        // instead of 19 — still satisfies the `>= 2` assertion and
+        // amortises encoder overhead by ~3×.
+        const INTERNAL_CHUNK_MIN_SAMPLES: usize = 80_000; // 5 s @ 16 kHz
+
         let mut events: Vec<Result<TranscriptEvent>> = Vec::new();
+        let mut accumulator: Vec<i16> = Vec::with_capacity(INTERNAL_CHUNK_MIN_SAMPLES);
         for chunk in chunks {
             session.total_audio_samples += chunk.len();
-            match session.add_audio(&chunk) {
+            accumulator.extend_from_slice(&chunk);
+            if accumulator.len() < INTERNAL_CHUNK_MIN_SAMPLES {
+                continue;
+            }
+            match session.add_audio(&accumulator) {
+                Ok(es) => events.extend(es.into_iter().map(Ok)),
+                Err(e) => {
+                    events.push(Err(e));
+                    return Ok(events);
+                }
+            }
+            accumulator.clear();
+        }
+        // Process any residual samples in the accumulator (last partial chunk).
+        if !accumulator.is_empty() {
+            match session.add_audio(&accumulator) {
                 Ok(es) => events.extend(es.into_iter().map(Ok)),
                 Err(e) => {
                     events.push(Err(e));
