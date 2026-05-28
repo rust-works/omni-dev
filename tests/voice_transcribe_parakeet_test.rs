@@ -24,19 +24,18 @@
 //!   byte-equal.
 //!
 //! - **`parakeet_streaming_final_only_matches_batch`** covers AC-3b
-//!   (streaming Final-only transcript on the 5-min fixture). The v1
-//!   streaming impl drains the AsyncAudioInput and runs the batch
-//!   path under the hood, so this should be substring-equal to the
-//!   batch test's output.
+//!   (streaming Final-only transcript on the 5-min fixture). The v2
+//!   streaming impl runs an incremental local-attention + KV-cache
+//!   pipeline that emits Partials per internal-chunk and a single
+//!   Final at stream end; the summed Final text is substring-equal
+//!   to the batch transcript.
 //!
 //! - **`parakeet_streaming_emits_partials_on_30s_slice`** covers AC-3c
-//!   (representative `Partial`-event sequence). Marked
-//!   `#[ignore]` AND with a TODO pointing at the follow-up that adds
-//!   true incremental `Partial` emission. The current v1 streaming
-//!   path emits no `Partial`s (documented limitation in
-//!   `src/voice/backends/parakeet/streaming.rs`); this test will
-//!   start failing once incremental emission lands, at which point
-//!   the assertion below activates.
+//!   (representative `Partial`-event sequence). Passes under v2 —
+//!   the wrapper merges source chunks into internal 5 s chunks
+//!   (`INTERNAL_CHUNK_MIN_SAMPLES = 80_000` in `streaming.rs`) and
+//!   emits one `Partial` per internal-chunk's `add_audio` call. The
+//!   30 s slice produces ~6 Partials; the assertion is `>= 2`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
