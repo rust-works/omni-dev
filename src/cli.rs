@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 pub mod ai;
 pub mod atlassian;
+pub mod browser;
 pub mod commands;
 pub mod completions;
 pub mod config;
@@ -117,6 +118,8 @@ pub enum Commands {
     Config(config::ConfigCommand),
     /// Atlassian: JIRA and Confluence operations.
     Atlassian(atlassian::AtlassianCommand),
+    /// Browser bridge: drive authenticated requests through a browser tab.
+    Browser(browser::BrowserCommand),
     /// Datadog: read-only API operations.
     Datadog(datadog::DatadogCommand),
     /// Transcript and caption fetching from media platforms.
@@ -172,6 +175,7 @@ impl Cli {
             Commands::Git(git_cmd) => git_cmd.execute().await,
             Commands::Commands(commands_cmd) => commands_cmd.execute(),
             Commands::Atlassian(cmd) => cmd.execute().await,
+            Commands::Browser(cmd) => cmd.execute().await,
             Commands::Datadog(cmd) => cmd.execute().await,
             Commands::Transcript(cmd) => cmd.execute().await,
             Commands::Voice(cmd) => cmd.execute().await,

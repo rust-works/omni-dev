@@ -27,6 +27,9 @@ chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3.27"
 reqwest = { version = "0.13", features = ["json", "multipart", "stream"] }
 tokio = { version = "1.52", features = ["full"] }
+axum = "0.8"
+tokio-tungstenite = "0.24"
+rand = "0.8"
 thiserror = "2.0"
 async-trait = "0.1"
 regex = "1.12.3"
