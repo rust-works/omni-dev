@@ -203,6 +203,12 @@ fn print_startup(config: &BridgeConfig, token: &str) {
 
 /// Handles one inbound TCP connection on the WebSocket plane: authenticates the
 /// upgrade, registers the connection, and pumps replies into the correlator.
+//
+// `clippy::result_large_err`: the handshake callback's `Result<Response,
+// ErrorResponse>` return type is dictated by `tungstenite::accept_hdr_async`;
+// `ErrorResponse` is a large `http::Response`, but the signature is not ours to
+// change.
+#[allow(clippy::result_large_err)]
 async fn handle_ws_conn(stream: TcpStream, state: AppState) {
     use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 
