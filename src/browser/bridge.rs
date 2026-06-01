@@ -226,7 +226,7 @@ pub async fn run(mut config: BridgeConfig, token: String) -> Result<()> {
 /// Prints the bound ports, session token, and paste-ready snippet to stdout.
 fn print_startup(config: &BridgeConfig, token: &str) {
     let snippet = snippet::render(config.ws_port, token);
-    println!("omni-dev browser bridge");
+    println!("omni-dev browser bridge serve");
     println!("  control plane : http://127.0.0.1:{}", config.control_port);
     println!("  websocket     : ws://127.0.0.1:{}", config.ws_port);
     println!("  session token : {token}");
@@ -240,7 +240,7 @@ fn print_startup(config: &BridgeConfig, token: &str) {
     println!();
     println!("Then drive requests, e.g.:");
     println!(
-        "  omni-dev browser request --control-port {} --url /path",
+        "  omni-dev browser bridge request --control-port {} --url /path",
         config.control_port
     );
 }
