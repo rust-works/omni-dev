@@ -251,6 +251,11 @@ impl ParakeetMel {
         if pcm.len() < WIN_LENGTH {
             return Ok(MelFrames::empty());
         }
+        // Pre-emphasis filter `y[n] = x[n] - PREEMPH_COEFF * x[n-1]`. NeMo's
+        // `AudioToMelSpectrogramPreprocessor` applies this before STFT;
+        // matches `parakeet_mlx::audio::get_logmel_raw` at fork `32b8034`.
+        let pre = preemphasise(pcm);
+        let pcm = pre.as_slice();
         let n_frames = (pcm.len() - WIN_LENGTH) / HOP_LENGTH + 1;
         let n_freq = N_FFT / 2 + 1;
         let mut data = Vec::with_capacity(n_frames * N_MELS);
@@ -291,6 +296,25 @@ impl ParakeetMel {
             n_mels: N_MELS,
         })
     }
+}
+
+/// Pre-emphasis coefficient from NeMo's `AudioToMelSpectrogramPreprocessor`
+/// config for Parakeet-TDT-0.6B-v2 (`config.json` → `preprocessor.preemph`).
+const PREEMPH_COEFF: f32 = 0.97;
+
+/// Applies the pre-emphasis filter `y[n] = x[n] - 0.97 * x[n-1]`,
+/// preserving `y[0] = x[0]` (no `x[-1]` available). Matches
+/// `parakeet_mlx::audio::get_logmel_raw`'s preemph step.
+fn preemphasise(pcm: &[f32]) -> Vec<f32> {
+    if pcm.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(pcm.len());
+    out.push(pcm[0]);
+    for i in 1..pcm.len() {
+        out.push(PREEMPH_COEFF.mul_add(-pcm[i - 1], pcm[i]));
+    }
+    out
 }
 
 fn hann_window_padded(win_length: usize, n_fft: usize) -> Vec<f32> {
