@@ -35,6 +35,13 @@ pub struct ControlRequest {
     /// (`response.body.getReader()`) rather than buffered into one reply.
     #[serde(default)]
     pub stream: bool,
+    /// Which connected tab to route this request to: a connection id (the
+    /// canonical, always-unambiguous selector) or an `Origin` string that
+    /// uniquely matches one tab. Omitted is allowed only when exactly one tab is
+    /// connected. The `X-Omni-Bridge-Target` header takes precedence over this
+    /// field. Server-side routing only — never sent to the browser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 fn default_method() -> String {
@@ -310,14 +317,28 @@ pub struct ResponseEnvelope {
     pub encoding: Option<String>,
 }
 
+/// One connected tab, as reported by `GET /__bridge/status`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TabInfo {
+    /// Server-assigned connection id; the canonical routing selector.
+    pub id: u64,
+    /// The connecting tab's `Origin`, if it sent one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+}
+
 /// `GET /__bridge/status` response body.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StatusResponse {
-    /// Whether an authenticated browser is currently connected.
+    /// Whether at least one authenticated browser tab is currently connected.
     pub connected: bool,
-    /// The connected browser's `Origin`, if it sent one.
+    /// The connected tab's `Origin` when exactly one tab is connected; `None`
+    /// when zero or several are (ambiguous). Retained for v1 back-compat — use
+    /// [`Self::tabs`] for the full picture.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub browser_origin: Option<String>,
+    /// Every connected tab (id + origin), for routing with a `target`.
+    pub tabs: Vec<TabInfo>,
     /// Number of in-flight requests awaiting a browser reply.
     pub pending: usize,
 }
@@ -522,6 +543,7 @@ mod tests {
         let s = StatusResponse {
             connected: false,
             browser_origin: None,
+            tabs: Vec::new(),
             pending: 0,
         };
         let json = serde_json::to_string(&s).unwrap();

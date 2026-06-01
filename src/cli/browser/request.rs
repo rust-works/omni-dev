@@ -53,6 +53,12 @@ pub struct RequestCommand {
     /// long-lived endpoints.
     #[arg(long)]
     pub stream: bool,
+
+    /// Route to a specific connected tab: a connection id (from
+    /// `/__bridge/status`) or an `Origin` that uniquely matches one tab.
+    /// Required when more than one tab is connected.
+    #[arg(long, value_name = "ID|ORIGIN")]
+    pub target: Option<String>,
 }
 
 impl RequestCommand {
@@ -68,6 +74,7 @@ impl RequestCommand {
             headers,
             body,
             stream: self.stream,
+            target: self.target,
         };
 
         let endpoint = format!("http://127.0.0.1:{}/__bridge/request", self.control_port);

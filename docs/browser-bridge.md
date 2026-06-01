@@ -20,12 +20,13 @@ add-on — both planes are authenticated and default-closed. See
 2. [Quick start](#quick-start)
 3. [Talking to the control plane](#talking-to-the-control-plane)
 4. [The `request` thin client](#the-request-thin-client)
-5. [Security model](#security-model)
-6. [Flags](#flags)
-7. [Random ports](#random-ports)
-8. [Worked example: downloading Grafana / Loki logs](#worked-example-downloading-grafana--loki-logs)
-9. [WebSocket wire protocol](#websocket-wire-protocol)
-10. [Caveats](#caveats)
+5. [Routing to a specific tab](#routing-to-a-specific-tab)
+6. [Security model](#security-model)
+7. [Flags](#flags)
+8. [Random ports](#random-ports)
+9. [Worked example: downloading Grafana / Loki logs](#worked-example-downloading-grafana--loki-logs)
+10. [WebSocket wire protocol](#websocket-wire-protocol)
+11. [Caveats](#caveats)
 
 ## How it works
 
@@ -92,8 +93,8 @@ curl -H "Authorization: Bearer $T" -H "X-Omni-Bridge: 1" \
 
 | Method & path            | Purpose                                                                 |
 |--------------------------|-------------------------------------------------------------------------|
-| `GET  /__bridge/status`  | `{ "connected": bool, "browser_origin": str?, "pending": int }`         |
-| `POST /__bridge/request` | Full control. Body `{url, method, headers, body, stream?}`; returns a structured response envelope, or — when `"stream": true` — an NDJSON chunk stream (see [Streaming](#streaming-responses)). Cross-origin `url` rejected unless `--allow-origin` permits it. |
+| `GET  /__bridge/status`  | `{ "connected": bool, "browser_origin": str?, "tabs": [{id, origin?}], "pending": int }`. `tabs` lists every connected tab; `browser_origin` is the lone tab's origin (present only when exactly one is connected, for back-compat). |
+| `POST /__bridge/request` | Full control. Body `{url, method, headers, body, stream?, target?}`; returns a structured response envelope, or — when `"stream": true` — an NDJSON chunk stream (see [Streaming](#streaming-responses)). Cross-origin `url` rejected unless `--allow-origin` permits it. See [Routing to a tab](#routing-to-a-specific-tab) for `target`. |
 
 ```bash
 curl -s -H "Authorization: Bearer $T" -H "X-Omni-Bridge: 1" \
@@ -131,6 +132,56 @@ written to stdout as they arrive, and the head status is printed to stderr.
 ```bash
 omni-dev browser request --stream --url /events | your-consumer   # SSE / chunked
 ```
+
+## Routing to a specific tab
+
+Several authenticated tabs can be connected at once — paste the snippet into each
+(e.g. a Grafana tab *and* an internal admin tab). Each connection is independent:
+a new tab never evicts an existing one, and each authenticates on its own via the
+token subprotocol.
+
+`GET /__bridge/status` lists them, each with a server-assigned **connection id**
+and its `Origin`:
+
+```bash
+curl -s "${H[@]}" http://localhost:9998/__bridge/status
+# → {"connected":true,
+#    "tabs":[{"id":1,"origin":"https://grafana.internal"},
+#            {"id":2,"origin":"https://admin.internal"}],
+#    "pending":0}
+```
+
+Select which tab a request targets with either:
+
+- the **`X-Omni-Bridge-Target`** header (works on the transparent proxy *and*
+  `POST /__bridge/request`), or
+- a **`target`** field in the `POST /__bridge/request` body (or `--target` on the
+  thin client).
+
+The header takes precedence over the body field. A target is either a **connection
+id** (canonical, always unambiguous) or an **`Origin`** that uniquely matches one
+tab:
+
+```bash
+omni-dev browser request --target 2 --url /api/foo                # by id
+omni-dev browser request --target https://admin.internal --url /x # by origin
+curl "${H[@]}" -H "X-Omni-Bridge-Target: 1" http://localhost:9998/api/foo
+```
+
+Resolution rules:
+
+| Situation | Result |
+|-----------|--------|
+| No tab connected | `503` |
+| Exactly one tab, no target | Routes to it (v1 back-compat) |
+| Several tabs, no target | `409` — specify a target (the error lists the tabs) |
+| Target id / origin matches one tab | Routes to it |
+| Target id / origin matches none | `404` |
+| Target origin matches several tabs | `409` — target by connection id instead |
+
+> Requests are routed to **exactly one** tab; there is no fan-out to multiple
+> tabs. `--allow-origin` remains a single global value applied to every
+> connection (a per-origin allowlist is possible future work).
 
 ## Security model
 
@@ -196,7 +247,9 @@ bridge runs.
 
 The `request` subcommand takes `--url`, `--method` (default `GET`),
 `--header` (repeatable), `--body` (`@file` supported), `--stream` (chunk the
-response to stdout), `--control-port` (default `9998`), and `--token-file`.
+response to stdout), `--target` (route to a connection id / origin — see
+[Routing to a specific tab](#routing-to-a-specific-tab)), `--control-port`
+(default `9998`), and `--token-file`.
 
 ## Random ports
 
@@ -303,8 +356,11 @@ Rules:
 - Multiple commands may be in flight concurrently over one socket (id-keyed).
 - A command with no reply within `--request-timeout` resolves the control-plane
   request with `504 Gateway Timeout` and is dropped from `pending`.
-- Only **one authenticated** browser connection is held; an unauthenticated peer
-  cannot connect or evict it.
+- **Several authenticated** tabs may be connected at once, keyed by connection
+  id; a request routes to one of them (see
+  [Routing to a specific tab](#routing-to-a-specific-tab)). A new connection
+  never evicts an existing one, and an unauthenticated peer can neither connect
+  nor evict any of them.
 
 ## Caveats
 
@@ -319,5 +375,6 @@ Rules:
   `--max-body-bytes` (cumulative), but there is no socket-level backpressure to
   the browser's `getReader()` — a fast producer with a slow consumer is capped,
   not throttled.
-- Remaining limitations: a single browser tab and no stdin piping. Binary bodies
-  *and* streaming/chunked responses are supported (see the wire protocol above).
+- Remaining limitations: no stdin piping, and a request fans out to at most one
+  tab. Multiple concurrent tabs (with routing), binary bodies, *and*
+  streaming/chunked responses are all supported (see the wire protocol above).

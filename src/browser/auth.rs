@@ -28,6 +28,12 @@ pub const BRIDGE_HEADER: &str = "x-omni-bridge";
 /// Required value of [`BRIDGE_HEADER`].
 pub const BRIDGE_HEADER_VALUE: &str = "1";
 
+/// Optional header selecting which connected tab a control-plane request targets.
+///
+/// The value is a connection id, or an `Origin` that uniquely matches one tab. It
+/// takes precedence over a `target` body field, and is stripped before forwarding.
+pub const BRIDGE_TARGET_HEADER: &str = "x-omni-bridge-target";
+
 /// Number of random bytes behind a generated token (URL-safe base64, no pad).
 const TOKEN_BYTES: usize = 32;
 
