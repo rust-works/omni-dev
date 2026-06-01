@@ -8,6 +8,7 @@
 
   <div class="cta">
     <a class="primary" href="{{ config.extra.github_url }}">View on GitHub</a>
+    <a class="secondary" href="{{ get_url(path='tutorial.html') }}">Tutorial</a>
     <a class="secondary" href="#install">Install</a>
   </div>
 </header>
@@ -26,7 +27,11 @@
 
 <section id="install">
   <h2>Install</h2>
+  <p>CLI only:</p>
   <pre><code>cargo install omni-dev</code></pre>
+
+  <p>CLI plus the <code>omni-dev-mcp</code> server (for Claude Desktop, Claude Code, Cursor, etc.):</p>
+  <pre><code>cargo install omni-dev --features mcp</code></pre>
 
   <p>Or with Nix:</p>
   <pre><code>nix profile install github:rust-works/omni-dev</code></pre>
