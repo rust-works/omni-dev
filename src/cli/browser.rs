@@ -17,10 +17,8 @@ pub struct BrowserCommand {
 /// Browser subcommands.
 #[derive(Subcommand)]
 pub enum BrowserSubcommands {
-    /// Runs the local bridge server (WebSocket + HTTP control planes).
+    /// Bridge: run the server (`serve`) or send a request through it (`request`).
     Bridge(bridge::BridgeCommand),
-    /// Sends a request through a running bridge (thin client).
-    Request(request::RequestCommand),
 }
 
 impl BrowserCommand {
@@ -28,7 +26,6 @@ impl BrowserCommand {
     pub async fn execute(self) -> Result<()> {
         match self.command {
             BrowserSubcommands::Bridge(cmd) => cmd.execute().await,
-            BrowserSubcommands::Request(cmd) => cmd.execute().await,
         }
     }
 }

@@ -1,6 +1,6 @@
 # Browser Bridge
 
-`omni-dev browser bridge` runs a long-lived local process that lets you drive
+`omni-dev browser bridge serve` runs a long-lived local process that lets you drive
 HTTP requests **through an authenticated browser tab**. When you are
 investigating internal services (Grafana/Loki, internal dashboards, SSO-gated
 admin panels), the browser holds authenticated sessions — SSO, OAuth, session
@@ -53,7 +53,7 @@ the HTTP response.**
 1. Start the bridge:
 
    ```bash
-   omni-dev browser bridge
+   omni-dev browser bridge serve
    ```
 
    It prints the bound ports, the generated session token, and a ready-to-paste
@@ -67,7 +67,7 @@ the HTTP response.**
 
    ```bash
    export OMNI_BRIDGE_TOKEN=<token printed by the bridge>
-   omni-dev browser request --url /loki/api/v1/labels
+   omni-dev browser bridge request --url /loki/api/v1/labels
    ```
 
 The bridge works only while the tab is open and the snippet is running.
@@ -107,15 +107,15 @@ curl -s -H "Authorization: Bearer $T" -H "X-Omni-Bridge: 1" \
 
 ## The `request` thin client
 
-`omni-dev browser request` reads the token (from `OMNI_BRIDGE_TOKEN` or
+`omni-dev browser bridge request` reads the token (from `OMNI_BRIDGE_TOKEN` or
 `--token-file`), adds the required headers, POSTs to `/__bridge/request` on a
 *running* bridge, and prints the response envelope:
 
 ```bash
-omni-dev browser request --url /loki/api/v1/labels --method GET
-omni-dev browser request --url /api/foo --method POST --body @payload.json
-omni-dev browser request --control-port 9998 --url /api/foo   # custom port
-omni-dev browser request --url /api/foo --header "Accept: application/json"
+omni-dev browser bridge request --url /loki/api/v1/labels --method GET
+omni-dev browser bridge request --url /api/foo --method POST --body @payload.json
+omni-dev browser bridge request --control-port 9998 --url /api/foo   # custom port
+omni-dev browser bridge request --url /api/foo --header "Accept: application/json"
 ```
 
 `--body @file` reads the body from a file; otherwise the value is sent verbatim.
@@ -130,7 +130,7 @@ log-tail) instead of buffering the whole response: the decoded body bytes are
 written to stdout as they arrive, and the head status is printed to stderr.
 
 ```bash
-omni-dev browser request --stream --url /events | your-consumer   # SSE / chunked
+omni-dev browser bridge request --stream --url /events | your-consumer   # SSE / chunked
 ```
 
 ## Routing to a specific tab
@@ -163,8 +163,8 @@ id** (canonical, always unambiguous) or an **`Origin`** that uniquely matches on
 tab:
 
 ```bash
-omni-dev browser request --target 2 --url /api/foo                # by id
-omni-dev browser request --target https://admin.internal --url /x # by origin
+omni-dev browser bridge request --target 2 --url /api/foo                # by id
+omni-dev browser bridge request --target https://admin.internal --url /x # by origin
 curl "${H[@]}" -H "X-Omni-Bridge-Target: 1" http://localhost:9998/api/foo
 ```
 
@@ -257,7 +257,7 @@ Pass `0` to either port flag to let the OS assign a free port; the bridge reads
 back the actual port and reflects it in the printed instructions and snippet:
 
 ```bash
-omni-dev browser bridge --ws-port 0 --control-port 0
+omni-dev browser bridge serve --ws-port 0 --control-port 0
 ```
 
 This is useful when the defaults are taken, or when running several bridges.
@@ -286,7 +286,7 @@ the bridge buffers full bodies under `--request-timeout`. For genuinely streamin
 endpoints (Grafana Live, SSE, chunked APIs), opt into streaming with `--stream` /
 `?__stream=1` (see [Streaming responses](#streaming-responses)) instead of
 paginating. The `POST /api/ds/query` form is also supported via
-`omni-dev browser request --method POST`.
+`omni-dev browser bridge request --method POST`.
 
 A canonical drain loop using the `request` thin client and `jq` (the bridge
 prints the response envelope as JSON; the upstream body is the envelope's
@@ -299,7 +299,7 @@ END=$(date +%s)000000000   # now, in nanoseconds
 LIMIT=5000
 
 while :; do
-  page=$(omni-dev browser request \
+  page=$(omni-dev browser bridge request \
     --url "/api/datasources/proxy/uid/${DS_UID}/loki/api/v1/query_range?query=${QUERY}&end=${END}&limit=${LIMIT}&direction=backward")
 
   # The upstream JSON is the envelope's `body` string; parse it once.
