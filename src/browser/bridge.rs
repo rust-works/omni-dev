@@ -517,6 +517,9 @@ async fn proxy_handler(State(state): State<AppState>, request: Request) -> Respo
         // The transparent proxy has no per-request override channel; cross-origin
         // proxying is governed solely by the `serve --allow-origin` global.
         allow_origin: None,
+        // The transparent proxy has no per-request credentials control; it keeps
+        // the snippet default (`include`), matching pre-credentials behavior.
+        credentials: None,
     };
 
     if stream {
@@ -749,6 +752,7 @@ async fn dispatch(
         headers: req.headers,
         body: req.body,
         stream: false,
+        credentials: req.credentials,
     };
     let frame = match serde_json::to_string(&command) {
         Ok(f) => f,
@@ -901,6 +905,7 @@ async fn start_stream(
         headers: req.headers,
         body: req.body,
         stream: true,
+        credentials: req.credentials,
     };
     let frame = match serde_json::to_string(&command) {
         Ok(f) => f,
@@ -1312,6 +1317,7 @@ mod tests {
             stream: false,
             target: None,
             allow_origin: None,
+            credentials: None,
         }
     }
 

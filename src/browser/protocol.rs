@@ -50,6 +50,10 @@ pub struct ControlRequest {
     /// the browser.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_origin: Option<String>,
+    /// Fetch credentials mode (`include` | `omit` | `same-origin`). Absent means
+    /// the browser snippet defaults to `include`, preserving v1 behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<String>,
 }
 
 fn default_method() -> String {
@@ -83,6 +87,10 @@ pub struct Command {
     /// from the wire when `false` for back-compat with buffered clients.
     #[serde(default, skip_serializing_if = "is_false")]
     pub stream: bool,
+    /// Fetch credentials mode (`include` | `omit` | `same-origin`), or `null`
+    /// to let the browser snippet default to `include`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<String>,
 }
 
 /// Server → browser cancellation frame.
@@ -376,6 +384,7 @@ mod tests {
             stream: false,
             target: None,
             allow_origin: None,
+            credentials: None,
         };
         // Back-compat: an absent override is not serialised, so the wire body
         // stays byte-identical to a pre-feature client's.
@@ -401,6 +410,7 @@ mod tests {
             headers: BTreeMap::new(),
             body: None,
             stream: false,
+            credentials: None,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(!json.contains('\n'));
@@ -419,6 +429,7 @@ mod tests {
             headers: BTreeMap::new(),
             body: None,
             stream: true,
+            credentials: None,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"stream\":true"));
@@ -500,6 +511,45 @@ mod tests {
             let back: StreamLine = serde_json::from_str(json).unwrap();
             assert_eq!(back, line);
         }
+    }
+
+    #[test]
+    fn control_request_defaults_credentials_to_none() {
+        let req: ControlRequest = serde_json::from_str(r#"{"url":"/x"}"#).unwrap();
+        assert!(req.credentials.is_none());
+    }
+
+    #[test]
+    fn control_request_omits_credentials_when_absent() {
+        let req = ControlRequest {
+            url: "/x".to_string(),
+            method: "GET".to_string(),
+            headers: BTreeMap::new(),
+            body: None,
+            stream: false,
+            target: None,
+            allow_origin: None,
+            credentials: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("credentials"));
+    }
+
+    #[test]
+    fn command_serializes_credentials_when_present() {
+        let cmd = Command {
+            id: 1,
+            url: "/x".to_string(),
+            method: "GET".to_string(),
+            headers: BTreeMap::new(),
+            body: None,
+            stream: false,
+            credentials: Some("omit".to_string()),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains(r#""credentials":"omit""#));
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(cmd, back);
     }
 
     #[test]

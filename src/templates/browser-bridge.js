@@ -39,7 +39,7 @@
           method: cmd.method || 'GET',
           headers: cmd.headers || {},
           body: cmd.body || undefined,
-          credentials: 'include',
+          credentials: cmd.credentials || 'include',
         });
         const headers = {};
         resp.headers.forEach((v, k) => { headers[k] = v; });
