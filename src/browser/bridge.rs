@@ -785,7 +785,13 @@ async fn dispatch(
                 if decoded_len > state.config.max_body_bytes {
                     return Err((
                         StatusCode::BAD_GATEWAY,
-                        "browser response body exceeds --max-body-bytes".to_string(),
+                        format!(
+                            "browser response body is {decoded_len} bytes, exceeding the \
+                             --max-body-bytes limit of {} bytes; page the request to fetch \
+                             less per call (e.g. narrow the time range or lower a `limit`/page \
+                             size) or raise --max-body-bytes",
+                            state.config.max_body_bytes
+                        ),
                     ));
                 }
                 Ok(ResponseEnvelope {
