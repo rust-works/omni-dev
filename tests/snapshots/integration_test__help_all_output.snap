@@ -1926,6 +1926,7 @@ Options:
       --body <BODY>                  Request body. Prefix with `@` to read from a file (e.g. `@payload.json`)
       --control-port <CONTROL_PORT>  Control-plane port of the running bridge [default: 9998]
       --token-file <PATH>            Read the session token from this `0600` file instead of the environment
+      --stream                       Stream the response: print body chunks to stdout as they arrive instead of buffering the whole response into one envelope. Use for SSE / chunked / long-lived endpoints
   -h, --help                         Print help
 
 

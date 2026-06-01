@@ -44,4 +44,12 @@ mod tests {
         assert!(out.contains("base64"));
         assert!(out.contains("btoa"));
     }
+
+    #[test]
+    fn render_includes_streaming() {
+        let out = render(9999, "t");
+        assert!(out.contains("getReader"));
+        assert!(out.contains("activeStreams"));
+        assert!(out.contains("cancel"));
+    }
 }
