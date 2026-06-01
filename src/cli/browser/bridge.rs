@@ -211,6 +211,7 @@ mod tests {
                 stream: false,
                 target: None,
                 allow_origin: None,
+                credentials: None,
             }),
         };
         assert!(cmd.execute().await.is_err());
