@@ -28,6 +28,14 @@ use omni_dev::browser::{self, BridgeConfig};
 static START_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn start_bridge(allow_origin: Option<String>, timeout: Duration) -> (u16, u16, String) {
+    start_bridge_with(allow_origin, timeout, 1024 * 1024).await
+}
+
+async fn start_bridge_with(
+    allow_origin: Option<String>,
+    timeout: Duration,
+    max_body_bytes: usize,
+) -> (u16, u16, String) {
     let _guard = START_LOCK.lock().await;
 
     // Reserve two OS-assigned ports, then hand them to the bridge. The lock
@@ -45,7 +53,7 @@ async fn start_bridge(allow_origin: Option<String>, timeout: Duration) -> (u16, 
         control_port,
         request_timeout: timeout,
         allow_origin,
-        max_body_bytes: 1024 * 1024,
+        max_body_bytes,
         max_concurrent: 64,
     };
     let token_clone = token.clone();
@@ -389,6 +397,123 @@ async fn proxy_forwards_method_and_headers() {
         .unwrap();
     let text = resp.text().await.unwrap();
     assert_eq!(text, "POST accept=application/json");
+}
+
+/// Eight bytes (a PNG magic number) and their standard-base64 encoding. Used to
+/// assert binary bodies survive the bridge byte-for-byte.
+const BINARY_BYTES: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+const BINARY_B64: &str = "iVBORw0KGgo=";
+
+/// Connects a fake browser that replies to every command with a base64-tagged
+/// binary body (`content-type: image/png`). Returns its task handle.
+fn spawn_binary_browser(ws_port: u16, token: String) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let uri = format!("ws://127.0.0.1:{ws_port}/").parse().unwrap();
+        let request = ClientRequestBuilder::new(uri).with_sub_protocol(&token);
+        let (ws, _r) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let (mut sink, mut stream) = ws.split();
+        while let Some(Ok(Message::Text(txt))) = stream.next().await {
+            let cmd: Value = serde_json::from_str(&txt).unwrap();
+            let resp = serde_json::json!({
+                "id": cmd["id"].as_u64().unwrap(),
+                "status": 200,
+                "headers": {"content-type": "image/png"},
+                "body": BINARY_B64,
+                "encoding": "base64",
+            });
+            sink.send(Message::Text(resp.to_string())).await.unwrap();
+        }
+    })
+}
+
+#[tokio::test]
+async fn transparent_proxy_decodes_base64_to_raw_bytes() {
+    let (control_port, ws_port, token) = start_bridge(None, Duration::from_secs(5)).await;
+    let _browser = spawn_binary_browser(ws_port, token.clone());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (http, base, tok) = client(control_port, &token);
+
+    let resp = http
+        .get(format!("{base}/render/panel.png"))
+        .bearer_auth(&tok)
+        .header("x-omni-bridge", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "image/png",
+        "content-type is forwarded for binary bodies"
+    );
+    let bytes = resp.bytes().await.unwrap();
+    assert_eq!(
+        bytes.as_ref(),
+        BINARY_BYTES,
+        "proxy must hand curl the decoded raw bytes"
+    );
+}
+
+#[tokio::test]
+async fn bridge_request_returns_base64_envelope() {
+    let (control_port, ws_port, token) = start_bridge(None, Duration::from_secs(5)).await;
+    let _browser = spawn_binary_browser(ws_port, token.clone());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (http, base, tok) = client(control_port, &token);
+
+    let resp = http
+        .post(format!("{base}/__bridge/request"))
+        .bearer_auth(&tok)
+        .header("x-omni-bridge", "1")
+        .json(&serde_json::json!({"url": "/render/panel.png", "method": "GET"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let env: Value = resp.json().await.unwrap();
+    // The full-fidelity endpoint returns the envelope as-is; the caller decodes.
+    assert_eq!(env["status"], 200);
+    assert_eq!(env["encoding"], "base64");
+    assert_eq!(env["body"], BINARY_B64);
+}
+
+#[tokio::test]
+async fn oversized_decoded_binary_body_is_rejected() {
+    // max-body-bytes accounting is against the *decoded* size. The cap (200) sits
+    // above the small request JSON (so the request-body limit doesn't fire first)
+    // but below the decoded response: "iVBO" is the base64 of a 3-byte group, so
+    // repeating it 100× decodes to 300 bytes — comfortably over the cap.
+    let (control_port, ws_port, token) = start_bridge_with(None, Duration::from_secs(5), 200).await;
+    let token2 = token.clone();
+    let _browser = tokio::spawn(async move {
+        let uri = format!("ws://127.0.0.1:{ws_port}/").parse().unwrap();
+        let request = ClientRequestBuilder::new(uri).with_sub_protocol(&token2);
+        let (ws, _r) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let (mut sink, mut stream) = ws.split();
+        while let Some(Ok(Message::Text(txt))) = stream.next().await {
+            let cmd: Value = serde_json::from_str(&txt).unwrap();
+            let resp = serde_json::json!({
+                "id": cmd["id"].as_u64().unwrap(),
+                "status": 200,
+                "headers": {"content-type": "image/png"},
+                "body": "iVBO".repeat(100),
+                "encoding": "base64",
+            });
+            sink.send(Message::Text(resp.to_string())).await.unwrap();
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (http, base, tok) = client(control_port, &token);
+
+    let resp = http
+        .post(format!("{base}/__bridge/request"))
+        .bearer_auth(&tok)
+        .header("x-omni-bridge", "1")
+        .json(&serde_json::json!({"url": "/x.png", "method": "GET"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 502);
 }
 
 /// Drives the real `omni-dev browser request` thin client against a running
