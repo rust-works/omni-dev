@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **SSH Remotes Work for `git branch create pr`** ([#903](https://github.com/rust-works/omni-dev/issues/903)): Remote git operations no longer depend on libgit2's network transport, which the vendored libgit2 inside released binaries lacks a reliable SSH implementation for — causing `omni-dev git branch create pr` (and any remote operation) to fail on SSH remotes (`git@github.com:…`) with `unsupported URL protocol; class=Net (12)` even though the user's `git`, SSH keys, and network were all fine. Both affected operations in `src/git/repository.rs` now shell out to the user's `git` CLI via a new private `GitRepository::run_git` helper: `push_branch` runs `git push --set-upstream <remote> <branch>` (recording the tracking branch in the same step) and `branch_exists_on_remote` runs `git ls-remote --heads <remote> <branch>`, comparing the returned ref column exactly against `refs/heads/<branch>` to avoid the tail-glob false positives `git ls-remote`'s pattern matching would otherwise produce (e.g. `team/<branch>` matching `<branch>`). This delegates all URL-scheme and authentication handling (ssh-agent, `~/.ssh/config`, credential helpers) to `git`, matching the project's existing "favour the git CLI" guidance and the user's manual workflow. The now-obsolete libgit2 credential-callback machinery (`make_auth_callbacks`, `get_ssh_identity_for_host`, `format_auth_error`, `extract_hostname_from_git_url`, the `MAX_AUTH_ATTEMPTS` constant) and the `ssh2-config` dependency are removed. Covered by four new unit tests exercising push + presence/absence detection and the exact-ref-match guard against a local bare remote.
+
 ## [0.27.0] - 2026-05-23
 
 ### Added
