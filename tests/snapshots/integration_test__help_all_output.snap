@@ -1913,12 +1913,13 @@ Options:
       --method <METHOD>              HTTP method [default: GET]
       --header <NAME: VALUE>         Request header as `Name: Value`. May be repeated
       --body <BODY>                  Request body. Prefix with `@` to read from a file (e.g. `@payload.json`)
+      --credentials <CREDENTIALS>    Fetch credentials mode. Defaults to `include` (cookies/auth sent). Use `omit` to read a wildcard-CORS cross-origin response (e.g. a public CDN asset), which a credentialed request cannot read [possible values: include, omit, same-origin]
       --control-port <CONTROL_PORT>  Control-plane port of the running bridge [default: 9998]
       --token-file <PATH>            Read the session token from this `0600` file instead of the environment
       --stream                       Stream the response: print body chunks to stdout as they arrive instead of buffering the whole response into one envelope. Use for SSE / chunked / long-lived endpoints
       --target <ID|ORIGIN>           Route to a specific connected tab: a connection id (from `/__bridge/status`) or an `Origin` that uniquely matches one tab. Required when more than one tab is connected
       --allow-origin <URL>           Permit a cross-origin outbound URL for this request only (e.g. `https://static.xx.fbcdn.net`). Takes precedence over the bridge's `serve --allow-origin` for this request's outbound-URL check, and does not affect the tab's WebSocket connection. Omit for same-origin (relative) requests
-  -h, --help                         Print help
+  -h, --help                         Print help (see more with '--help')
 
 
 ================================================================================
