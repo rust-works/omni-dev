@@ -1,17 +1,10 @@
 //! Git repository operations.
 
-use std::io::BufReader;
-use std::path::PathBuf;
-
 use anyhow::{Context, Result};
 use git2::{Repository, Status};
-use ssh2_config::{ParseRule, SshConfig};
 use tracing::{debug, error, info};
 
 use crate::git::CommitInfo;
-
-/// Maximum credential callback attempts before giving up.
-const MAX_AUTH_ATTEMPTS: u32 = 3;
 
 /// Git repository wrapper.
 pub struct GitRepository {
@@ -263,169 +256,27 @@ fn format_status_flags(flags: Status) -> String {
     status
 }
 
-/// Extracts hostname from a git URL (e.g., "git@github.com:user/repo.git" -> "github.com").
-fn extract_hostname_from_git_url(url: &str) -> Option<String> {
-    if let Some(ssh_url) = url.strip_prefix("git@") {
-        // SSH URL format: git@hostname:path
-        ssh_url.split(':').next().map(str::to_string)
-    } else if let Some(https_url) = url.strip_prefix("https://") {
-        // HTTPS URL format: https://hostname/path
-        https_url.split('/').next().map(str::to_string)
-    } else if let Some(http_url) = url.strip_prefix("http://") {
-        // HTTP URL format: http://hostname/path
-        http_url.split('/').next().map(str::to_string)
-    } else {
-        None
-    }
-}
-
-/// Returns the SSH identity file for a given host from SSH config.
-fn get_ssh_identity_for_host(hostname: &str) -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let ssh_config_path = PathBuf::from(&home).join(".ssh/config");
-
-    if !ssh_config_path.exists() {
-        debug!("SSH config file not found at: {:?}", ssh_config_path);
-        return None;
-    }
-
-    // Open and parse the SSH config file
-    let file = std::fs::File::open(&ssh_config_path).ok()?;
-    let mut reader = BufReader::new(file);
-
-    let config = SshConfig::default()
-        .parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS)
-        .ok()?;
-
-    // Query the config for the specific host
-    let params = config.query(hostname);
-
-    // Get the identity file from the config
-    if let Some(identity_files) = &params.identity_file {
-        if let Some(first_identity) = identity_files.first() {
-            // Expand ~ to home directory
-            let identity_str = first_identity.to_string_lossy();
-            let identity_path = identity_str.replace('~', &home);
-            let path = PathBuf::from(identity_path);
-
-            if path.exists() {
-                debug!("Found SSH key for host '{}': {:?}", hostname, path);
-                return Some(path);
-            }
-            debug!("SSH key specified in config but not found: {:?}", path);
-        }
-    }
-
-    None
-}
-
-/// Creates `RemoteCallbacks` with SSH credential resolution for the given hostname.
-///
-/// Tries credentials in order: SSH config identity → SSH agent → default key
-/// locations (`~/.ssh/id_ed25519`, `~/.ssh/id_rsa`). Bails after
-/// [`MAX_AUTH_ATTEMPTS`] to prevent infinite callback loops.
-fn make_auth_callbacks(hostname: String) -> git2::RemoteCallbacks<'static> {
-    let mut callbacks = git2::RemoteCallbacks::new();
-    let mut auth_attempts: u32 = 0;
-
-    callbacks.credentials(move |url, username_from_url, allowed_types| {
-        auth_attempts += 1;
-        debug!(
-            "Credential callback attempt {} - URL: {}, Username: {:?}, Allowed types: {:?}",
-            auth_attempts, url, username_from_url, allowed_types
-        );
-
-        if auth_attempts > MAX_AUTH_ATTEMPTS {
-            error!(
-                "Too many authentication attempts ({}), giving up",
-                auth_attempts
-            );
-            return Err(git2::Error::from_str(
-                "Authentication failed after multiple attempts",
-            ));
-        }
-
-        let username = username_from_url.unwrap_or("git");
-
-        if allowed_types.contains(git2::CredentialType::SSH_KEY) {
-            // Try SSH config identity first — avoids agent returning OK with no valid keys
-            if let Some(ssh_key_path) = get_ssh_identity_for_host(&hostname) {
-                let pub_key_path = ssh_key_path.with_extension("pub");
-                debug!("Trying SSH key from config: {:?}", ssh_key_path);
-
-                match git2::Cred::ssh_key(username, Some(&pub_key_path), &ssh_key_path, None) {
-                    Ok(cred) => {
-                        debug!(
-                            "Successfully loaded SSH key from config: {:?}",
-                            ssh_key_path
-                        );
-                        return Ok(cred);
-                    }
-                    Err(e) => {
-                        debug!("Failed to load SSH key from config: {}", e);
-                    }
-                }
-            }
-
-            // Only try SSH agent on first attempt
-            if auth_attempts == 1 {
-                match git2::Cred::ssh_key_from_agent(username) {
-                    Ok(cred) => {
-                        debug!("SSH agent credentials obtained (attempt {})", auth_attempts);
-                        return Ok(cred);
-                    }
-                    Err(e) => {
-                        debug!("SSH agent failed: {}, trying default keys", e);
-                    }
-                }
-            }
-
-            // Try default SSH key locations as fallback
-            let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
-            let ssh_keys = [
-                format!("{home}/.ssh/id_ed25519"),
-                format!("{home}/.ssh/id_rsa"),
-            ];
-
-            for key_path in &ssh_keys {
-                let key_path = PathBuf::from(key_path);
-                if key_path.exists() {
-                    let pub_key_path = key_path.with_extension("pub");
-                    debug!("Trying default SSH key: {:?}", key_path);
-
-                    match git2::Cred::ssh_key(username, Some(&pub_key_path), &key_path, None) {
-                        Ok(cred) => {
-                            debug!("Successfully loaded SSH key from {:?}", key_path);
-                            return Ok(cred);
-                        }
-                        Err(e) => debug!("Failed to load SSH key from {:?}: {}", key_path, e),
-                    }
-                }
-            }
-        }
-
-        debug!("Falling back to default credentials");
-        git2::Cred::default()
-    });
-
-    callbacks
-}
-
-/// Formats a user-friendly SSH authentication error message with troubleshooting steps.
-fn format_auth_error(operation: &str, error: &git2::Error) -> String {
-    if error.message().contains("authentication") || error.message().contains("SSH") {
-        format!(
-            "Failed to {operation}: {error}. \n\nTroubleshooting steps:\n\
-            1. Check if your SSH key is loaded: ssh-add -l\n\
-            2. Test GitHub SSH connection: ssh -T git@github.com\n\
-            3. Use GitHub CLI auth instead: gh auth setup-git",
-        )
-    } else {
-        format!("Failed to {operation}: {error}")
-    }
-}
-
 impl GitRepository {
+    /// Runs a `git` CLI subcommand in the repository's working directory.
+    ///
+    /// Remote operations shell out to the user's `git` rather than using
+    /// libgit2's network transport so they work across all URL schemes (SSH,
+    /// HTTPS) and honour the user's existing authentication configuration
+    /// (`ssh-agent`, `~/.ssh/config`, credential helpers). The vendored libgit2
+    /// lacks a reliable SSH transport on some platforms. See issue #903.
+    fn run_git(&self, args: &[&str]) -> Result<std::process::Output> {
+        let workdir = self
+            .repo
+            .workdir()
+            .context("Cannot run git command: repository has no working directory")?;
+
+        std::process::Command::new("git")
+            .current_dir(workdir)
+            .args(args)
+            .output()
+            .context("Failed to execute git command")
+    }
+
     /// Pushes the current branch to remote.
     pub fn push_branch(&self, branch_name: &str, remote_name: &str) -> Result<()> {
         info!(
@@ -433,75 +284,25 @@ impl GitRepository {
             branch_name, remote_name
         );
 
-        // Get remote
-        debug!("Finding remote '{}'", remote_name);
-        let mut remote = self
-            .repo
-            .find_remote(remote_name)
-            .context("Failed to find remote")?;
+        // Shell out to `git push` so the push works across all URL schemes and
+        // uses the user's configured authentication. `--set-upstream` records
+        // the tracking branch in the same step. See [`Self::run_git`].
+        debug!("Pushing via git CLI to '{}'", remote_name);
+        let output = self.run_git(&["push", "--set-upstream", remote_name, branch_name])?;
 
-        let remote_url = remote.url().unwrap_or("<unknown>");
-        debug!("Remote URL: {}", remote_url);
-
-        // Set up refspec for push
-        let refspec = format!("refs/heads/{branch_name}:refs/heads/{branch_name}");
-        debug!("Using refspec: {}", refspec);
-
-        // Extract hostname from remote URL for SSH config lookup
-        let hostname =
-            extract_hostname_from_git_url(remote_url).unwrap_or("github.com".to_string());
-        debug!(
-            "Extracted hostname '{}' from URL '{}'",
-            hostname, remote_url
-        );
-
-        // Push with authentication callbacks
-        let mut push_options = git2::PushOptions::new();
-        let callbacks = make_auth_callbacks(hostname);
-        push_options.remote_callbacks(callbacks);
-
-        // Perform the push
-        debug!("Attempting to push to remote...");
-        match remote.push(&[&refspec], Some(&mut push_options)) {
-            Ok(()) => {
-                info!(
-                    "Successfully pushed branch '{}' to remote '{}'",
-                    branch_name, remote_name
-                );
-
-                // Set upstream branch after successful push
-                debug!("Setting upstream branch for '{}'", branch_name);
-                match self.repo.find_branch(branch_name, git2::BranchType::Local) {
-                    Ok(mut branch) => {
-                        let remote_ref = format!("{remote_name}/{branch_name}");
-                        match branch.set_upstream(Some(&remote_ref)) {
-                            Ok(()) => {
-                                info!(
-                                    "Successfully set upstream to '{}'/{}",
-                                    remote_name, branch_name
-                                );
-                            }
-                            Err(e) => {
-                                // Log but don't fail - the push succeeded
-                                error!("Failed to set upstream branch: {}", e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        // Log but don't fail - the push succeeded
-                        error!("Failed to find local branch to set upstream: {}", e);
-                    }
-                }
-
-                Ok(())
-            }
-            Err(e) => {
-                error!("Failed to push branch: {}", e);
-                Err(anyhow::anyhow!(format_auth_error(
-                    "push branch to remote",
-                    &e
-                )))
-            }
+        if output.status.success() {
+            info!(
+                "Successfully pushed branch '{}' to remote '{}'",
+                branch_name, remote_name
+            );
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = stderr.trim();
+            error!("Failed to push branch: {}", stderr);
+            anyhow::bail!(
+                "Failed to push branch '{branch_name}' to remote '{remote_name}': {stderr}"
+            )
         }
     }
 
@@ -512,95 +313,50 @@ impl GitRepository {
             branch_name, remote_name
         );
 
-        let remote = self
-            .repo
-            .find_remote(remote_name)
-            .context("Failed to find remote")?;
+        // Query the remote via `git ls-remote` so the lookup works across all
+        // URL schemes and uses the user's configured authentication. See
+        // [`Self::run_git`].
+        debug!("Listing remote refs via git CLI from '{}'", remote_name);
+        let output = self.run_git(&["ls-remote", "--heads", remote_name, branch_name])?;
 
-        let remote_url = remote.url().unwrap_or("<unknown>");
-        debug!("Remote URL: {}", remote_url);
-
-        // Extract hostname from remote URL for SSH config lookup
-        let hostname =
-            extract_hostname_from_git_url(remote_url).unwrap_or("github.com".to_string());
-        debug!(
-            "Extracted hostname '{}' from URL '{}'",
-            hostname, remote_url
-        );
-
-        // Connect to remote to get refs
-        let mut remote = remote;
-        let callbacks = make_auth_callbacks(hostname);
-
-        debug!("Attempting to connect to remote...");
-        match remote.connect_auth(git2::Direction::Fetch, Some(callbacks), None) {
-            Ok(_) => debug!("Successfully connected to remote"),
-            Err(e) => {
-                error!("Failed to connect to remote: {}", e);
-                return Err(anyhow::anyhow!(format_auth_error("connect to remote", &e)));
-            }
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = stderr.trim();
+            error!("Failed to list remote refs: {}", stderr);
+            anyhow::bail!(
+                "Failed to check remote '{remote_name}' for branch '{branch_name}': {stderr}"
+            )
         }
 
-        // Check if the remote branch exists
-        debug!("Listing remote refs...");
-        let refs = remote.list()?;
+        // `git ls-remote --heads <remote> <branch>` emits one `<sha>\t<ref>`
+        // line per matching head. The branch argument is a glob pattern that
+        // matches on the ref tail, so compare the ref column exactly to avoid
+        // false positives like `refs/heads/foo/<branch>`.
         let remote_branch_ref = format!("refs/heads/{branch_name}");
-        debug!("Looking for remote branch ref: {}", remote_branch_ref);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let exists = stdout
+            .lines()
+            .filter_map(|line| line.split('\t').nth(1))
+            .any(|reference| reference == remote_branch_ref);
 
-        for remote_head in refs {
-            debug!("Found remote ref: {}", remote_head.name());
-            if remote_head.name() == remote_branch_ref {
-                info!(
-                    "Branch '{}' exists on remote '{}'",
-                    branch_name, remote_name
-                );
-                return Ok(true);
-            }
+        if exists {
+            info!(
+                "Branch '{}' exists on remote '{}'",
+                branch_name, remote_name
+            );
+        } else {
+            info!(
+                "Branch '{}' does not exist on remote '{}'",
+                branch_name, remote_name
+            );
         }
-
-        info!(
-            "Branch '{}' does not exist on remote '{}'",
-            branch_name, remote_name
-        );
-        Ok(false)
+        Ok(exists)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── extract_hostname_from_git_url ──────────────────────────────
-
-    #[test]
-    fn hostname_from_ssh_url() {
-        let hostname = extract_hostname_from_git_url("git@github.com:user/repo.git");
-        assert_eq!(hostname, Some("github.com".to_string()));
-    }
-
-    #[test]
-    fn hostname_from_https_url() {
-        let hostname = extract_hostname_from_git_url("https://github.com/user/repo.git");
-        assert_eq!(hostname, Some("github.com".to_string()));
-    }
-
-    #[test]
-    fn hostname_from_http_url() {
-        let hostname = extract_hostname_from_git_url("http://gitlab.com/user/repo.git");
-        assert_eq!(hostname, Some("gitlab.com".to_string()));
-    }
-
-    #[test]
-    fn hostname_from_unknown_scheme() {
-        let hostname = extract_hostname_from_git_url("ftp://example.com/repo");
-        assert_eq!(hostname, None);
-    }
-
-    #[test]
-    fn hostname_from_ssh_custom_host() {
-        let hostname = extract_hostname_from_git_url("git@gitlab.example.com:org/project.git");
-        assert_eq!(hostname, Some("gitlab.example.com".to_string()));
-    }
 
     // ── format_status_flags ────────────────────────────────────────
 
@@ -644,24 +400,6 @@ mod tests {
     fn status_flags_empty() {
         let status = format_status_flags(Status::empty());
         assert_eq!(status, "  ");
-    }
-
-    // ── format_auth_error ──────────────────────────────────────────
-
-    #[test]
-    fn auth_error_with_ssh_message() {
-        let error = git2::Error::from_str("SSH authentication failed");
-        let msg = format_auth_error("push", &error);
-        assert!(msg.contains("Troubleshooting steps"));
-        assert!(msg.contains("ssh-add -l"));
-    }
-
-    #[test]
-    fn auth_error_without_auth_message() {
-        let error = git2::Error::from_str("network timeout");
-        let msg = format_auth_error("fetch", &error);
-        assert!(msg.contains("Failed to fetch"));
-        assert!(!msg.contains("Troubleshooting"));
     }
 
     // ── GitRepository with temp repo ───────────────────────────────
@@ -716,5 +454,99 @@ mod tests {
         let repo = GitRepository::open_at(temp_dir.path())?;
         assert!(repo.is_working_directory_clean()?);
         Ok(())
+    }
+
+    // ── remote operations via the git CLI (issue #903) ─────────────
+
+    /// Runs `git` in `dir` with a deterministic identity, asserting success.
+    #[allow(clippy::unwrap_used)]
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args([
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                // Disable signing so the tests stay hermetic regardless of the
+                // developer's global `commit.gpgsign` / `tag.gpgsign` config —
+                // GPG signing also races under parallel test execution.
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "tag.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "git {args:?} failed: {stderr}");
+    }
+
+    /// Builds a work repo with one commit on `feature-branch` and a bare
+    /// `origin` remote it can push to. Both temp dirs are returned so the
+    /// caller keeps them alive for the duration of the test.
+    #[allow(clippy::unwrap_used)]
+    fn repo_with_bare_remote() -> (tempfile::TempDir, tempfile::TempDir, GitRepository) {
+        let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
+        std::fs::create_dir_all(&tmp_root).unwrap();
+        let bare = tempfile::tempdir_in(&tmp_root).unwrap();
+        git_in(bare.path(), &["init", "--bare"]);
+
+        let work = init_tmp_repo();
+        std::fs::write(work.path().join("file.txt"), "content").unwrap();
+        git_in(work.path(), &["checkout", "-b", "feature-branch"]);
+        git_in(work.path(), &["add", "."]);
+        git_in(work.path(), &["commit", "-m", "initial"]);
+        git_in(
+            work.path(),
+            &["remote", "add", "origin", bare.path().to_str().unwrap()],
+        );
+
+        let repo = GitRepository::open_at(work.path()).unwrap();
+        (work, bare, repo)
+    }
+
+    #[test]
+    fn branch_absent_on_remote_before_push() -> Result<()> {
+        let (_work, _bare, repo) = repo_with_bare_remote();
+        assert!(!repo.branch_exists_on_remote("feature-branch", "origin")?);
+        Ok(())
+    }
+
+    #[test]
+    fn push_branch_then_present_on_remote() -> Result<()> {
+        let (_work, _bare, repo) = repo_with_bare_remote();
+        repo.push_branch("feature-branch", "origin")?;
+        assert!(repo.branch_exists_on_remote("feature-branch", "origin")?);
+        assert!(!repo.branch_exists_on_remote("absent-branch", "origin")?);
+        Ok(())
+    }
+
+    #[test]
+    fn branch_exists_requires_exact_ref_match() -> Result<()> {
+        // `git ls-remote <branch>` matches on the ref tail, so a sibling like
+        // `team/feature-branch` would glob-match `feature-branch`. The exact
+        // ref comparison must reject it as a false positive.
+        let (work, _bare, repo) = repo_with_bare_remote();
+        git_in(work.path(), &["checkout", "-b", "team/feature-branch"]);
+        repo.push_branch("team/feature-branch", "origin")?;
+        assert!(repo.branch_exists_on_remote("team/feature-branch", "origin")?);
+        assert!(!repo.branch_exists_on_remote("feature-branch", "origin")?);
+        Ok(())
+    }
+
+    #[test]
+    fn push_branch_reports_failure_for_unknown_remote() {
+        let (_work, _bare, repo) = repo_with_bare_remote();
+        let result = repo.push_branch("feature-branch", "nonexistent");
+        assert!(matches!(&result, Err(e) if e.to_string().contains("Failed to push branch")));
+    }
+
+    #[test]
+    fn branch_exists_reports_failure_for_unknown_remote() {
+        let (_work, _bare, repo) = repo_with_bare_remote();
+        let result = repo.branch_exists_on_remote("feature-branch", "nonexistent");
+        assert!(matches!(&result, Err(e) if e.to_string().contains("Failed to check remote")));
     }
 }
