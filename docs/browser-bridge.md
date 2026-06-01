@@ -288,6 +288,41 @@ endpoints (Grafana Live, SSE, chunked APIs), opt into streaming with `--stream` 
 paginating. The `POST /api/ds/query` form is also supported via
 `omni-dev browser request --method POST`.
 
+A canonical drain loop using the `request` thin client and `jq` (the bridge
+prints the response envelope as JSON; the upstream body is the envelope's
+`body`):
+
+```bash
+DS_UID=<loki-datasource-uid>
+QUERY='{app="foo"}|="error"'
+END=$(date +%s)000000000   # now, in nanoseconds
+LIMIT=5000
+
+while :; do
+  page=$(omni-dev browser request \
+    --url "/api/datasources/proxy/uid/${DS_UID}/loki/api/v1/query_range?query=${QUERY}&end=${END}&limit=${LIMIT}&direction=backward")
+
+  # The upstream JSON is the envelope's `body` string; parse it once.
+  body=$(printf '%s' "$page" | jq -r '.body')
+
+  # Stop when the page returns no log entries.
+  rows=$(printf '%s' "$body" | jq '[.data.result[].values[]] | length')
+  [ "$rows" -eq 0 ] && break
+
+  printf '%s\n' "$body"   # collect / process this page
+
+  # Oldest timestamp on this page (ns) becomes the next `end`, minus 1ns so we
+  # don't re-fetch the boundary entry.
+  oldest=$(printf '%s' "$body" | jq -r '[.data.result[].values[][0] | tonumber] | min')
+  END=$((oldest - 1))
+done
+```
+
+Each page must still fit under `--max-body-bytes`. If a single page trips the
+over-limit error, it tells you exactly what to do: lower `--limit`/narrow the
+window so each page is smaller, or raise `--max-body-bytes` to accept a larger
+page.
+
 ## WebSocket wire protocol
 
 Newline-free JSON frames, correlated by a monotonic integer `id`.
