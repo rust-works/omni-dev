@@ -9,8 +9,12 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use futures::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::net::TcpListener;
@@ -36,48 +40,67 @@ async fn start_bridge_with(
     timeout: Duration,
     max_body_bytes: usize,
 ) -> (u16, u16, String) {
-    let _guard = START_LOCK.lock().await;
-
-    // Reserve two OS-assigned ports, then hand them to the bridge. The lock
-    // above closes the reserve→rebind race that this drop-then-bind creates.
-    let c = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-    let w = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-    let control_port = c.local_addr().unwrap().port();
-    let ws_port = w.local_addr().unwrap().port();
-    drop(c);
-    drop(w);
-
     let token = "test-token-abcdef".to_string();
-    let config = BridgeConfig {
-        ws_port,
-        control_port,
-        request_timeout: timeout,
-        allow_origin,
-        max_body_bytes,
-        max_concurrent: 64,
-    };
-    let token_clone = token.clone();
-    tokio::spawn(async move {
-        let _ = browser::run(config, token_clone).await;
-    });
 
-    // Wait until BOTH planes accept connections before releasing the lock.
-    wait_until_listening(control_port).await;
-    wait_until_listening(ws_port).await;
-    (control_port, ws_port, token)
+    // The reserve→drop→rebind dance below has an inherent race: between dropping a
+    // reserved ephemeral port and the bridge rebinding it, another concurrently
+    // running test's client socket can squat it, and the bridge then fails to bind
+    // (fail-closed → `run` returns immediately). Rather than wait out a fixed
+    // timeout and panic, detect that case directly — the spawned `run` future only
+    // completes when binding failed — and retry with fresh ports.
+    for _ in 0..20 {
+        let _guard = START_LOCK.lock().await;
+
+        let c = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let w = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let control_port = c.local_addr().unwrap().port();
+        let ws_port = w.local_addr().unwrap().port();
+        drop(c);
+        drop(w);
+
+        let config = BridgeConfig {
+            ws_port,
+            control_port,
+            request_timeout: timeout,
+            allow_origin: allow_origin.clone(),
+            max_body_bytes,
+            max_concurrent: 64,
+        };
+        let token_clone = token.clone();
+        let mut handle = tokio::spawn(async move { browser::run(config, token_clone).await });
+
+        // Race "both planes accept" against "`run` returned" (a bind failure). A
+        // successful bind keeps `run` serving forever, so only the listening
+        // branch can complete; a failed bind completes the handle → retry.
+        let up = tokio::select! {
+            ok = both_listening(control_port, ws_port) => ok,
+            _ = &mut handle => false,
+        };
+        if up {
+            return (control_port, ws_port, token);
+        }
+        // Bridge failed to bind a squatted port; drop the lock and try again.
+    }
+    panic!("could not start a bridge on free ports after 20 attempts");
 }
 
-async fn wait_until_listening(port: u16) {
+/// Resolves `true` once both planes accept connections. Bounded so a wedged
+/// plane can't hang the `select!` in `start_bridge_with` forever.
+async fn both_listening(control_port: u16, ws_port: u16) -> bool {
+    wait_until_listening(control_port).await && wait_until_listening(ws_port).await
+}
+
+async fn wait_until_listening(port: u16) -> bool {
     for _ in 0..100 {
         if tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .is_ok()
         {
-            return;
+            return true;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!("bridge plane never came up on port {port}");
+    false
 }
 
 /// A fake browser: connects, presents the token subprotocol, and (optionally)
@@ -552,6 +575,537 @@ async fn unsupported_encoding_is_rejected() {
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 502);
+}
+
+/// Connects a fake browser that, on a `stream: true` command, emits a head frame
+/// then one base64 chunk frame per `chunks` entry (sleeping `delay` between them)
+/// then a `done` frame. A `cancel` frame from the server flips `cancelled` and
+/// stops further chunks — modelling `reader.cancel()`.
+///
+/// The WebSocket connect is `await`ed before the read loop is spawned, so the
+/// browser is guaranteed connected once this returns (matching
+/// `FakeBrowser::connect`), avoiding a connect/dispatch race.
+async fn spawn_stream_browser(
+    ws_port: u16,
+    token: String,
+    chunks: Vec<Vec<u8>>,
+    delay: Duration,
+    cancelled: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    let uri = format!("ws://127.0.0.1:{ws_port}/").parse().unwrap();
+    let request = ClientRequestBuilder::new(uri).with_sub_protocol(&token);
+    let (ws, _r) = tokio_tungstenite::connect_async(request).await.unwrap();
+    tokio::spawn(async move {
+        let (sink, mut stream) = ws.split();
+        let sink = Arc::new(tokio::sync::Mutex::new(sink));
+        while let Some(Ok(Message::Text(txt))) = stream.next().await {
+            let cmd: Value = serde_json::from_str(&txt).unwrap();
+            if cmd["cancel"].as_bool() == Some(true) {
+                cancelled.store(true, Ordering::SeqCst);
+                continue;
+            }
+            let id = cmd["id"].as_u64().unwrap();
+            let sink = sink.clone();
+            let chunks = chunks.clone();
+            let cancelled = cancelled.clone();
+            tokio::spawn(async move {
+                let head = serde_json::json!({
+                    "id": id, "status": 200,
+                    "headers": {"content-type": "text/event-stream"}, "stream": true,
+                });
+                sink.lock()
+                    .await
+                    .send(Message::Text(head.to_string()))
+                    .await
+                    .ok();
+                for (seq, chunk) in chunks.iter().enumerate() {
+                    if cancelled.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let frame =
+                        serde_json::json!({"id": id, "seq": seq, "chunk": BASE64.encode(chunk)});
+                    if sink
+                        .lock()
+                        .await
+                        .send(Message::Text(frame.to_string()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(delay).await;
+                }
+                let done = serde_json::json!({"id": id, "done": true});
+                sink.lock()
+                    .await
+                    .send(Message::Text(done.to_string()))
+                    .await
+                    .ok();
+            });
+        }
+    })
+}
+
+#[tokio::test]
+async fn transparent_proxy_streams_chunks_as_raw_body() {
+    let (control_port, ws_port, token) = start_bridge(None, Duration::from_secs(5)).await;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let _browser = spawn_stream_browser(
+        ws_port,
+        token.clone(),
+        vec![b"data: 1\n\n".to_vec(), b"data: 2\n\n".to_vec()],
+        Duration::from_millis(10),
+        cancelled,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (http, base, tok) = client(control_port, &token);
+
+    let resp = http
+        .get(format!("{base}/events?__stream=1"))
+        .bearer_auth(&tok)
+        .header("x-omni-bridge", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "text/event-stream"
+    );
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(
+        body.as_ref(),
+        b"data: 1\n\ndata: 2\n\n",
+        "proxy must reassemble decoded chunks into the raw body"
+    );
+}
+
+#[tokio::test]
+async fn bridge_request_streams_ndjson() {
+    let (control_port, ws_port, token) = start_bridge(None, Duration::from_secs(5)).await;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let _browser = spawn_stream_browser(
+        ws_port,
+        token.clone(),
+        vec![b"hello ".to_vec(), b"world".to_vec()],
+        Duration::from_millis(10),
+        cancelled,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (http, base, tok) = client(control_port, &token);
+
+    let resp = http
+        .post(format!("{base}/__bridge/request"))
+        .bearer_auth(&tok)
+        .header("x-omni-bridge", "1")
+        .json(&serde_json::json!({"url": "/events", "method": "GET", "stream": true}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/x-ndjson"
+    );
+    let text = resp.text().await.unwrap();
+    let lines: Vec<Value> = text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    // Head line, two chunk lines, a done line.
+    assert_eq!(lines[0]["status"], 200);
+    assert_eq!(lines[1]["seq"], 0);
+    let mut reassembled = Vec::new();
+    for line in lines.iter().filter(|l| l.get("chunk").is_some()) {
+        reassembled.extend(BASE64.decode(line["chunk"].as_str().unwrap()).unwrap());
+    }
+    assert_eq!(reassembled, b"hello world");
+    assert_eq!(lines.last().unwrap()["done"], true);
+}
+
+#[tokio::test]
+async fn streaming_cumulative_cap_aborts_and_cancels() {
+    // Cap at 300 decoded bytes; the browser offers 3×200-byte chunks. Chunk 1 (200)
+    // passes, chunk 2 (cumulative 400) trips the cap → the server aborts and sends
+    // a cancel frame the browser records.
+    let (control_port, ws_port, token) = start_bridge_with(None, Duration::from_secs(5), 300).await;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let _browser = spawn_stream_browser(
+        ws_port,
+        token.clone(),
+        vec![vec![b'a'; 200], vec![b'b'; 200], vec![b'c'; 200]],
+        Duration::from_millis(50),
+        cancelled.clone(),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (http, base, tok) = client(control_port, &token);
+
+    let resp = http
+        .get(format!("{base}/big?__stream=1"))
+        .bearer_auth(&tok)
+        .header("x-omni-bridge", "1")
+        .send()
+        .await
+        .unwrap();
+    let body = resp.bytes().await.unwrap();
+    // Only the first chunk made it through before the cap aborted the stream.
+    assert_eq!(body.len(), 200, "stream truncated at the cumulative cap");
+
+    // The browser is told to cancel its reader.
+    for _ in 0..50 {
+        if cancelled.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        cancelled.load(Ordering::SeqCst),
+        "browser must receive a cancel frame when the cap aborts the stream"
+    );
+}
+
+#[tokio::test]
+async fn streaming_idle_timeout_ends_stream() {
+    // Idle timeout (request_timeout) of 250ms; the browser stalls 1s between
+    // chunks, so the stream ends after the first chunk and the browser is cancelled.
+    let (control_port, ws_port, token) = start_bridge(None, Duration::from_millis(250)).await;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let _browser = spawn_stream_browser(
+        ws_port,
+        token.clone(),
+        vec![b"first".to_vec(), b"second".to_vec()],
+        Duration::from_secs(1),
+        cancelled.clone(),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (http, base, tok) = client(control_port, &token);
+
+    let resp = http
+        .get(format!("{base}/slow?__stream=1"))
+        .bearer_auth(&tok)
+        .header("x-omni-bridge", "1")
+        .send()
+        .await
+        .unwrap();
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(body.as_ref(), b"first", "stream ends at the idle timeout");
+    for _ in 0..50 {
+        if cancelled.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(cancelled.load(Ordering::SeqCst), "idle timeout must cancel");
+}
+
+#[tokio::test]
+async fn cli_request_client_streams() {
+    let (control_port, ws_port, token) = start_bridge(None, Duration::from_secs(5)).await;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let _browser = spawn_stream_browser(
+        ws_port,
+        token.clone(),
+        vec![b"chunk-one ".to_vec(), b"chunk-two".to_vec()],
+        Duration::from_millis(10),
+        cancelled,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let bin = env!("CARGO_BIN_EXE_omni-dev");
+    let out = tokio::process::Command::new(bin)
+        .args([
+            "browser",
+            "request",
+            "--stream",
+            "--control-port",
+            &control_port.to_string(),
+            "--url",
+            "/events",
+        ])
+        .env("OMNI_BRIDGE_TOKEN", &token)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "client exited non-zero: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // With --stream the decoded body bytes go straight to stdout, in order.
+    assert_eq!(out.stdout, b"chunk-one chunk-two");
+}
+
+/// Connects a fake browser that, for each command, replies with the supplied
+/// `frames` verbatim — with each frame's `id` overwritten to match the command —
+/// then stops. Lets a test script abnormal stream sequences (error head, chunk
+/// before head, invalid base64, stray head). The connect is `await`ed.
+async fn spawn_templated_browser(
+    ws_port: u16,
+    token: String,
+    frames: Vec<Value>,
+) -> tokio::task::JoinHandle<()> {
+    let uri = format!("ws://127.0.0.1:{ws_port}/").parse().unwrap();
+    let request = ClientRequestBuilder::new(uri).with_sub_protocol(&token);
+    let (ws, _r) = tokio_tungstenite::connect_async(request).await.unwrap();
+    tokio::spawn(async move {
+        let (mut sink, mut stream) = ws.split();
+        while let Some(Ok(Message::Text(txt))) = stream.next().await {
+            let cmd: Value = serde_json::from_str(&txt).unwrap();
+            if cmd["cancel"].as_bool() == Some(true) {
+                continue;
+            }
+            let id = cmd["id"].as_u64().unwrap();
+            for frame in &frames {
+                let mut frame = frame.clone();
+                frame["id"] = Value::from(id);
+                sink.send(Message::Text(frame.to_string())).await.ok();
+            }
+        }
+    })
+}
+
+#[tokio::test]
+async fn streaming_proxy_no_browser_returns_503() {
+    // No browser connected → the streaming proxy path fails closed with 503.
+    let (control_port, _ws_port, token) = start_bridge(None, Duration::from_secs(5)).await;
+    let (http, base, tok) = client(control_port, &token);
+    let resp = http
+        .get(format!("{base}/events?__stream=1"))
+        .bearer_auth(&tok)
+        .header("x-omni-bridge", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 503);
+}
+
+#[tokio::test]
+async fn streaming_request_cross_origin_url_rejected() {
+    // An absolute (cross-origin) URL on a streaming request is rejected (403)
+    // with no --allow-origin, exactly as for a buffered request.
+    let (control_port, ws_port, token) = start_bridge(None, Duration::from_secs(5)).await;
+    let _browser = FakeBrowser::connect(ws_port, &token, false).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (http, base, tok) = client(control_port, &token);
+    let resp = http
+        .post(format!("{base}/__bridge/request"))
+        .bearer_auth(&tok)
+        .header("x-omni-bridge", "1")
+        .json(&serde_json::json!({"url": "https://evil.test/x", "method": "GET", "stream": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 403);
+}
+
+#[tokio::test]
+async fn streaming_request_invalid_header_rejected() {
+    // A header value containing CR/LF is rejected (400) on the streaming path.
+    let (control_port, ws_port, token) = start_bridge(None, Duration::from_secs(5)).await;
+    let _browser = FakeBrowser::connect(ws_port, &token, false).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (http, base, tok) = client(control_port, &token);
+    let resp = http
+        .post(format!("{base}/__bridge/request"))
+        .bearer_auth(&tok)
+        .header("x-omni-bridge", "1")
+        .json(&serde_json::json!({
+            "url": "/events", "method": "GET", "stream": true,
+            "headers": {"X-Bad": "a\r\nInjected: 1"}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+}
+
+#[tokio::test]
+async fn streaming_browser_error_head_returns_502() {
+    // The browser's first frame is an error → 502 Bad Gateway.
+    let (control_port, ws_port, token) = start_bridge(None, Duration::from_secs(5)).await;
+    let _browser = spawn_templated_browser(
+        ws_port,
+        token.clone(),
+        vec![serde_json::json!({"error": "fetch blew up"})],
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (http, base, tok) = client(control_port, &token);
+    let resp = http
+        .get(format!("{base}/events?__stream=1"))
+        .bearer_auth(&tok)
+        .header("x-omni-bridge", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 502);
+}
+
+#[tokio::test]
+async fn streaming_chunk_before_head_returns_502() {
+    // A body chunk before the head frame is a protocol violation → 502.
+    let (control_port, ws_port, token) = start_bridge(None, Duration::from_secs(5)).await;
+    let _browser = spawn_templated_browser(
+        ws_port,
+        token.clone(),
+        vec![serde_json::json!({"seq": 0, "chunk": "aGk="})],
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (http, base, tok) = client(control_port, &token);
+    let resp = http
+        .get(format!("{base}/events?__stream=1"))
+        .bearer_auth(&tok)
+        .header("x-omni-bridge", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 502);
+}
+
+#[tokio::test]
+async fn streaming_start_idle_timeout_returns_504() {
+    // The browser connects but never sends a head → the start-of-stream idle
+    // timeout fires, returning 504 and cancelling the browser.
+    let (control_port, ws_port, token) = start_bridge(None, Duration::from_millis(250)).await;
+    let _browser = FakeBrowser::connect(ws_port, &token, false).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (http, base, tok) = client(control_port, &token);
+    let resp = http
+        .get(format!("{base}/events?__stream=1"))
+        .bearer_auth(&tok)
+        .header("x-omni-bridge", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 504);
+}
+
+#[tokio::test]
+async fn streaming_invalid_base64_chunk_truncates_body() {
+    // A head then an undecodable base64 chunk aborts the stream: the body is empty
+    // and the browser is told to cancel.
+    let (control_port, ws_port, token) = start_bridge(None, Duration::from_secs(5)).await;
+    let _browser = spawn_templated_browser(
+        ws_port,
+        token.clone(),
+        vec![
+            serde_json::json!({"status": 200, "headers": {}, "stream": true}),
+            serde_json::json!({"seq": 0, "chunk": "@@@ not base64 @@@"}),
+            serde_json::json!({"done": true}),
+        ],
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (http, base, tok) = client(control_port, &token);
+    let resp = http
+        .get(format!("{base}/events?__stream=1"))
+        .bearer_auth(&tok)
+        .header("x-omni-bridge", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert!(
+        resp.bytes().await.unwrap().is_empty(),
+        "an undecodable chunk aborts the stream before any body bytes"
+    );
+}
+
+#[tokio::test]
+async fn streaming_stray_head_after_first_is_ignored() {
+    // A second head frame mid-stream is ignored; the body is just the real chunk.
+    let (control_port, ws_port, token) = start_bridge(None, Duration::from_secs(5)).await;
+    let _browser = spawn_templated_browser(
+        ws_port,
+        token.clone(),
+        vec![
+            serde_json::json!({"status": 200, "headers": {}, "stream": true}),
+            serde_json::json!({"status": 200, "headers": {}, "stream": true}),
+            serde_json::json!({"seq": 0, "chunk": BASE64.encode("payload")}),
+            serde_json::json!({"done": true}),
+        ],
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (http, base, tok) = client(control_port, &token);
+    let resp = http
+        .get(format!("{base}/events?__stream=1"))
+        .bearer_auth(&tok)
+        .header("x-omni-bridge", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"payload");
+}
+
+#[tokio::test]
+async fn bridge_survives_unparseable_browser_frame() {
+    // A non-JSON frame is logged and dropped; a subsequent valid reply still
+    // correlates, proving the reader loop survives the garbage.
+    let (control_port, ws_port, token) = start_bridge(None, Duration::from_secs(5)).await;
+    let uri = format!("ws://127.0.0.1:{ws_port}/").parse().unwrap();
+    let request = ClientRequestBuilder::new(uri).with_sub_protocol(token.as_str());
+    let (ws, _r) = tokio_tungstenite::connect_async(request).await.unwrap();
+    tokio::spawn(async move {
+        let (mut sink, mut stream) = ws.split();
+        // Send garbage first, then a well-formed reply to each command.
+        sink.send(Message::Text("not json at all".into()))
+            .await
+            .ok();
+        while let Some(Ok(Message::Text(txt))) = stream.next().await {
+            let cmd: Value = serde_json::from_str(&txt).unwrap();
+            let resp = serde_json::json!({
+                "id": cmd["id"].as_u64().unwrap(), "status": 200,
+                "headers": {"content-type": "text/plain"}, "body": "ok",
+            });
+            sink.send(Message::Text(resp.to_string())).await.ok();
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (http, base, tok) = client(control_port, &token);
+    let resp = http
+        .post(format!("{base}/__bridge/request"))
+        .bearer_auth(&tok)
+        .header("x-omni-bridge", "1")
+        .json(&serde_json::json!({"url": "/x", "method": "GET"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let env: Value = resp.json().await.unwrap();
+    assert_eq!(env["body"], "ok");
+}
+
+/// The `--stream` thin client surfaces a non-2xx bridge response as a non-zero
+/// exit (here: no browser connected → 503).
+#[tokio::test]
+async fn cli_request_client_stream_reports_error() {
+    let (control_port, _ws_port, token) = start_bridge(None, Duration::from_secs(5)).await;
+    let bin = env!("CARGO_BIN_EXE_omni-dev");
+    let out = tokio::process::Command::new(bin)
+        .args([
+            "browser",
+            "request",
+            "--stream",
+            "--control-port",
+            &control_port.to_string(),
+            "--url",
+            "/events",
+        ])
+        .env("OMNI_BRIDGE_TOKEN", &token)
+        .output()
+        .await
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("503"), "stderr was: {stderr}");
 }
 
 /// Drives the real `omni-dev browser request` thin client against a running
