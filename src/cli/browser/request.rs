@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use futures::StreamExt as _;
 
 use crate::browser::auth;
@@ -16,6 +16,35 @@ use crate::browser::protocol::{ControlRequest, ResponseEnvelope, StreamLine};
 
 /// Default control-plane port (matches `bridge`'s default).
 const DEFAULT_CONTROL_PORT: u16 = 9998;
+
+/// Fetch credentials mode forwarded to the browser `fetch()`.
+///
+/// Mirrors the Fetch API's `credentials` option. `Include` (the default)
+/// preserves pre-credentials behavior; `Omit` is required to read a
+/// wildcard-CORS (`Access-Control-Allow-Origin: *`) cross-origin response, which
+/// the browser refuses to expose to a credentialed request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Credentials {
+    /// Send cookies/auth on every request (default; correct for same-origin APIs).
+    Include,
+    /// Send no credentials; required for wildcard-CORS cross-origin assets.
+    Omit,
+    /// Send credentials only on same-origin requests (browser `fetch` default).
+    SameOrigin,
+}
+
+impl Credentials {
+    /// The wire value the browser snippet passes to `fetch()`'s `credentials`,
+    /// owned so it can be mapped straight into the optional request field.
+    fn to_fetch_value(self) -> String {
+        match self {
+            Self::Include => "include",
+            Self::Omit => "omit",
+            Self::SameOrigin => "same-origin",
+        }
+        .to_string()
+    }
+}
 
 /// Sends a request through a running bridge and prints the response.
 ///
@@ -39,6 +68,12 @@ pub struct RequestCommand {
     /// Request body. Prefix with `@` to read from a file (e.g. `@payload.json`).
     #[arg(long)]
     pub body: Option<String>,
+
+    /// Fetch credentials mode. Defaults to `include` (cookies/auth sent). Use
+    /// `omit` to read a wildcard-CORS cross-origin response (e.g. a public CDN
+    /// asset), which a credentialed request cannot read.
+    #[arg(long, value_enum)]
+    pub credentials: Option<Credentials>,
 
     /// Control-plane port of the running bridge.
     #[arg(long, default_value_t = DEFAULT_CONTROL_PORT)]
@@ -84,6 +119,7 @@ impl RequestCommand {
             stream: self.stream,
             target: self.target,
             allow_origin: self.allow_origin,
+            credentials: self.credentials.map(Credentials::to_fetch_value),
         };
 
         let endpoint = format!("http://127.0.0.1:{}/__bridge/request", self.control_port);
@@ -215,6 +251,45 @@ mod tests {
     #[test]
     fn parse_headers_rejects_crlf() {
         assert!(parse_headers(&["X: a\r\nEvil: y".to_string()]).is_err());
+    }
+
+    #[test]
+    fn credentials_defaults_to_none() {
+        let cmd = RequestCommand::try_parse_from(["request", "--url", "/x"]).unwrap();
+        assert!(cmd.credentials.is_none());
+    }
+
+    #[test]
+    fn credentials_parses_each_mode() {
+        for (arg, expected) in [
+            ("include", Credentials::Include),
+            ("omit", Credentials::Omit),
+            ("same-origin", Credentials::SameOrigin),
+        ] {
+            let cmd =
+                RequestCommand::try_parse_from(["request", "--url", "/x", "--credentials", arg])
+                    .unwrap();
+            assert_eq!(cmd.credentials, Some(expected));
+        }
+    }
+
+    #[test]
+    fn credentials_rejects_invalid_value() {
+        assert!(RequestCommand::try_parse_from([
+            "request",
+            "--url",
+            "/x",
+            "--credentials",
+            "bogus"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn credentials_maps_to_fetch_wire_value() {
+        assert_eq!(Credentials::Include.to_fetch_value(), "include");
+        assert_eq!(Credentials::Omit.to_fetch_value(), "omit");
+        assert_eq!(Credentials::SameOrigin.to_fetch_value(), "same-origin");
     }
 
     #[test]

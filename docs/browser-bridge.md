@@ -94,7 +94,7 @@ curl -H "Authorization: Bearer $T" -H "X-Omni-Bridge: 1" \
 | Method & path            | Purpose                                                                 |
 |--------------------------|-------------------------------------------------------------------------|
 | `GET  /__bridge/status`  | `{ "connected": bool, "browser_origin": str?, "tabs": [{id, origin?}], "pending": int }`. `tabs` lists every connected tab; `browser_origin` is the lone tab's origin (present only when exactly one is connected, for back-compat). |
-| `POST /__bridge/request` | Full control. Body `{url, method, headers, body, stream?, target?, allow_origin?}`; returns a structured response envelope, or — when `"stream": true` — an NDJSON chunk stream (see [Streaming](#streaming-responses)). Cross-origin `url` rejected unless `serve --allow-origin` or the per-request `allow_origin` permits it (see [Outbound request scope](#outbound-request-scope-default-closed)). See [Routing to a tab](#routing-to-a-specific-tab) for `target`. |
+| `POST /__bridge/request` | Full control. Body `{url, method, headers, body, stream?, target?, allow_origin?, credentials?}`; returns a structured response envelope, or — when `"stream": true` — an NDJSON chunk stream (see [Streaming](#streaming-responses)). Cross-origin `url` rejected unless `serve --allow-origin` or the per-request `allow_origin` permits it (see [Outbound request scope](#outbound-request-scope-default-closed)). See [Routing to a tab](#routing-to-a-specific-tab) for `target`. |
 
 ```bash
 curl -s -H "Authorization: Bearer $T" -H "X-Omni-Bridge: 1" \
@@ -116,9 +116,18 @@ omni-dev browser bridge request --url /loki/api/v1/labels --method GET
 omni-dev browser bridge request --url /api/foo --method POST --body @payload.json
 omni-dev browser bridge request --control-port 9998 --url /api/foo   # custom port
 omni-dev browser bridge request --url /api/foo --header "Accept: application/json"
+omni-dev browser bridge request --url https://cdn.example.com/x.js --credentials omit
 ```
 
 `--body @file` reads the body from a file; otherwise the value is sent verbatim.
+
+`--credentials <include|omit|same-origin>` sets the browser `fetch()` credentials
+mode (default `include`, unchanged). Use `omit` to read a wildcard-CORS
+(`Access-Control-Allow-Origin: *`) cross-origin response — e.g. a public CDN
+asset — which the browser refuses to expose to a credentialed request. **`omit`
+sends no cookies, so never use it for a cross-origin endpoint that needs the
+user's session: the request would be unauthenticated.** Pair with `--allow-origin`
+to permit the cross-origin target.
 
 Binary responses (images, gzipped blobs, file downloads) come back in the
 envelope as a base64 string with `"encoding": "base64"`; the caller decodes it.
@@ -258,9 +267,10 @@ bridge runs.
 | `--token-file <PATH>` | — | Read the session token from this `0600` file instead of generating one. |
 
 The `request` subcommand takes `--url`, `--method` (default `GET`),
-`--header` (repeatable), `--body` (`@file` supported), `--stream` (chunk the
-response to stdout), `--target` (route to a connection id / origin — see
-[Routing to a specific tab](#routing-to-a-specific-tab)), `--allow-origin`
+`--header` (repeatable), `--body` (`@file` supported),
+`--credentials <include|omit|same-origin>` (default `include`), `--stream`
+(chunk the response to stdout), `--target` (route to a connection id / origin —
+see [Routing to a specific tab](#routing-to-a-specific-tab)), `--allow-origin`
 (permit a cross-origin outbound URL for this request only — see
 [Outbound request scope](#outbound-request-scope-default-closed)),
 `--control-port` (default `9998`), and `--token-file`.
