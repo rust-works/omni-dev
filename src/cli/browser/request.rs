@@ -1,4 +1,4 @@
-//! `omni-dev browser request` — a thin client that sends a request through a
+//! `omni-dev browser bridge request` — a thin client that sends a request through a
 //! running bridge, injecting the required auth headers itself.
 
 use std::collections::BTreeMap;
