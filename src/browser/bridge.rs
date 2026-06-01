@@ -24,6 +24,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use futures::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
@@ -539,8 +541,30 @@ async fn dispatch(
                 status,
                 headers,
                 body,
+                encoding,
             } => {
-                if body.len() > state.config.max_body_bytes {
+                // Size is accounted against the *decoded* body. For base64 that
+                // means decoding here to learn the true byte length; the envelope
+                // still carries the base64 string (the caller / proxy decodes).
+                let decoded_len = match encoding.as_deref() {
+                    None => body.len(),
+                    Some("base64") => match BASE64.decode(body.as_bytes()) {
+                        Ok(bytes) => bytes.len(),
+                        Err(_) => {
+                            return Err((
+                                StatusCode::BAD_GATEWAY,
+                                "browser sent an invalid base64 body".to_string(),
+                            ))
+                        }
+                    },
+                    Some(other) => {
+                        return Err((
+                            StatusCode::BAD_GATEWAY,
+                            format!("browser sent an unsupported body encoding: {other}"),
+                        ))
+                    }
+                };
+                if decoded_len > state.config.max_body_bytes {
                     return Err((
                         StatusCode::BAD_GATEWAY,
                         "browser response body exceeds --max-body-bytes".to_string(),
@@ -551,6 +575,7 @@ async fn dispatch(
                     status,
                     headers,
                     body,
+                    encoding,
                 })
             }
             ReplyOutcome::Error(msg) => Err((
@@ -573,14 +598,25 @@ async fn dispatch(
 }
 
 /// Renders a browser response envelope as the transparent-proxy HTTP response.
+///
+/// A base64-tagged body is decoded back to raw bytes so a `curl` client gets the
+/// original bytes (image, gzip blob, …); the base64 is validated in `dispatch`,
+/// but a decode failure here still fails closed with `502`.
 fn envelope_to_response(env: ResponseEnvelope) -> Response {
     let status = StatusCode::from_u16(env.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut builder = Response::builder().status(status);
     if let Some(ct) = env.headers.get("content-type") {
         builder = builder.header(header::CONTENT_TYPE, ct);
     }
+    let body = match env.encoding.as_deref() {
+        Some("base64") => match BASE64.decode(env.body.as_bytes()) {
+            Ok(bytes) => Body::from(bytes),
+            Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+        },
+        _ => Body::from(env.body),
+    };
     builder
-        .body(Body::from(env.body))
+        .body(body)
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 
@@ -599,6 +635,7 @@ mod tests {
             status: Some(200),
             headers: None,
             body: Some("ok".into()),
+            encoding: None,
             error: None,
         });
         assert_eq!(c.pending_count(), 0);
@@ -637,6 +674,32 @@ mod tests {
             out.get("accept").map(String::as_str),
             Some("application/json")
         );
+    }
+
+    #[test]
+    fn envelope_to_response_passes_text_body_through() {
+        let env = ResponseEnvelope {
+            id: 1,
+            status: 200,
+            headers: BTreeMap::new(),
+            body: "hello".into(),
+            encoding: None,
+        };
+        assert_eq!(envelope_to_response(env).status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn envelope_to_response_rejects_invalid_base64() {
+        // `dispatch` validates base64 before this runs, so this path is only
+        // reachable defensively — assert it still fails closed with 502.
+        let env = ResponseEnvelope {
+            id: 1,
+            status: 200,
+            headers: BTreeMap::new(),
+            body: "not valid base64 @@@".into(),
+            encoding: Some("base64".into()),
+        };
+        assert_eq!(envelope_to_response(env).status(), StatusCode::BAD_GATEWAY);
     }
 
     use futures::FutureExt;
