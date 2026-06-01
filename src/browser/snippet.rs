@@ -36,4 +36,12 @@ mod tests {
         let out = render(40000, "t");
         assert!(out.contains("const PORT = 40000"));
     }
+
+    #[test]
+    fn render_includes_binary_body_handling() {
+        let out = render(9999, "t");
+        assert!(out.contains("arrayBuffer"));
+        assert!(out.contains("base64"));
+        assert!(out.contains("btoa"));
+    }
 }
