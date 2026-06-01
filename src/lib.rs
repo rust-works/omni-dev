@@ -20,6 +20,7 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod atlassian;
+pub mod browser;
 pub mod claude;
 pub mod cli;
 pub mod data;

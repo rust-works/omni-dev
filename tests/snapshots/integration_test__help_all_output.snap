@@ -14,6 +14,7 @@ Commands:
   commands    Command template management
   config      Configuration and model information
   atlassian   Atlassian: JIRA and Confluence operations
+  browser     Browser bridge: drive authenticated requests through a browser tab
   datadog     Datadog: read-only API operations
   transcript  Transcript and caption fetching from media platforms
   voice       Voice capture and processing operations
@@ -1864,6 +1865,68 @@ Options:
       --force                   Skips the confirmation prompt
       --dry-run                 Shows what would change without writing
   -h, --help                    Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev browser - Browser bridge: drive authenticated requests through a browser tab
+
+Browser bridge: drive authenticated requests through a browser tab
+
+Usage: browser <COMMAND>
+
+Commands:
+  bridge   Runs the local bridge server (WebSocket + HTTP control planes)
+  request  Sends a request through a running bridge (thin client)
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev browser bridge - Runs the local bridge server (WebSocket + HTTP control planes)
+
+Runs the local bridge server (WebSocket + HTTP control planes)
+
+Usage: bridge [OPTIONS]
+
+Options:
+      --ws-port <WS_PORT>
+          WebSocket-plane port. `0` binds a random free port [default: 9999]
+      --control-port <CONTROL_PORT>
+          HTTP control-plane port. `0` binds a random free port [default: 9998]
+      --request-timeout <REQUEST_TIMEOUT>
+          Per-request timeout in seconds before the control plane returns `504` [default: 30]
+      --allow-origin <URL>
+          Permit this exact cross-origin for both the WebSocket upgrade and outbound request URLs (e.g. `https://grafana.internal`). Without it, only same-origin (relative) URLs are allowed
+      --max-body-bytes <MAX_BODY_BYTES>
+          Maximum browser response body size accepted, in bytes [default: 8388608]
+      --max-concurrent <MAX_CONCURRENT>
+          Maximum number of concurrent in-flight requests [default: 64]
+      --token-file <PATH>
+          Read the session token from this `0600` file instead of generating one. The token is never accepted as a command-line argument
+  -h, --help
+          Print help
+
+
+================================================================================
+
+omni-dev browser request - Sends a request through a running bridge (thin client)
+
+Sends a request through a running bridge (thin client)
+
+Usage: request [OPTIONS] --url <URL>
+
+Options:
+      --url <URL>                    Request URL, relative to the browser's page origin (e.g. `/api/foo`)
+      --method <METHOD>              HTTP method [default: GET]
+      --header <NAME: VALUE>         Request header as `Name: Value`. May be repeated
+      --body <BODY>                  Request body. Prefix with `@` to read from a file (e.g. `@payload.json`)
+      --control-port <CONTROL_PORT>  Control-plane port of the running bridge [default: 9998]
+      --token-file <PATH>            Read the session token from this `0600` file instead of the environment
+  -h, --help                         Print help
 
 
 ================================================================================

@@ -25,6 +25,11 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 
 - **[Datadog Guide](datadog.md)** - Authentication, metrics, monitors, dashboards, logs, events, SLOs, downtimes, hosts; CLI and MCP forms
 
+### Browser Bridge
+
+- **[Browser Bridge Guide](browser-bridge.md)** - Drive authenticated HTTP requests through a browser tab (Grafana/Loki, internal dashboards); the two planes, the `request` thin client, and the security model
+- **[ADR-0036](adrs/adr-0036.md)** - Confused-deputy trust boundary and dual-plane default-closed authentication
+
 ### MCP Server
 
 - **[MCP Reference](mcp.md)** - Tool catalog, resources, and setup for Claude Desktop / Claude Code / MCP Inspector
