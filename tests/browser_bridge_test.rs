@@ -20,9 +20,18 @@ use tokio_tungstenite::tungstenite::Message;
 use omni_dev::browser::{self, BridgeConfig};
 
 /// Boots a bridge on random ports and returns `(control_port, ws_port, token)`.
+/// Serialises the reserve→drop→rebind window across all tests. `tokio::test`
+/// runs test fns concurrently, so without this two tests can be handed the same
+/// just-freed ephemeral port and the second bridge fails to bind. We hold the
+/// lock until *both* of a bridge's ports are accepting, so no two bridges are
+/// ever mid-rebind on overlapping ports at once.
+static START_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn start_bridge(allow_origin: Option<String>, timeout: Duration) -> (u16, u16, String) {
-    // Reserve two random ports, then hand them to the bridge. (There is an
-    // inherent TOCTOU here, but on a test host the window is negligible.)
+    let _guard = START_LOCK.lock().await;
+
+    // Reserve two OS-assigned ports, then hand them to the bridge. The lock
+    // above closes the reserve→rebind race that this drop-then-bind creates.
     let c = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let w = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let control_port = c.local_addr().unwrap().port();
@@ -44,8 +53,9 @@ async fn start_bridge(allow_origin: Option<String>, timeout: Duration) -> (u16, 
         let _ = browser::run(config, token_clone).await;
     });
 
-    // Give the listeners a moment to bind.
+    // Wait until BOTH planes accept connections before releasing the lock.
     wait_until_listening(control_port).await;
+    wait_until_listening(ws_port).await;
     (control_port, ws_port, token)
 }
 
@@ -59,7 +69,7 @@ async fn wait_until_listening(port: u16) {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!("bridge control plane never came up on port {port}");
+    panic!("bridge plane never came up on port {port}");
 }
 
 /// A fake browser: connects, presents the token subprotocol, and (optionally)
@@ -379,4 +389,106 @@ async fn proxy_forwards_method_and_headers() {
         .unwrap();
     let text = resp.text().await.unwrap();
     assert_eq!(text, "POST accept=application/json");
+}
+
+/// Drives the real `omni-dev browser request` thin client against a running
+/// bridge. Exercises the CLI dispatch and `request::execute` end to end
+/// (token from env, header injection, `--header`, `--body @file`, and envelope
+/// printing) rather than re-implementing the HTTP call.
+#[tokio::test]
+async fn cli_request_client_round_trips() {
+    let (control_port, ws_port, token) = start_bridge(None, Duration::from_secs(5)).await;
+    let _browser = FakeBrowser::connect(ws_port, &token, true).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let bin = env!("CARGO_BIN_EXE_omni-dev");
+
+    // GET with a custom header.
+    let out = tokio::process::Command::new(bin)
+        .args([
+            "browser",
+            "request",
+            "--control-port",
+            &control_port.to_string(),
+            "--url",
+            "/api/labels",
+            "--header",
+            "Accept: application/json",
+        ])
+        .env("OMNI_BRIDGE_TOKEN", &token)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "client exited non-zero: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let env: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(env["status"], 200);
+    assert_eq!(env["body"], "echo:/api/labels");
+
+    // POST with a body read from a file (`@path`).
+    let dir = tempfile::tempdir().unwrap();
+    let payload = dir.path().join("payload.json");
+    std::fs::write(&payload, r#"{"q":"x"}"#).unwrap();
+    let out = tokio::process::Command::new(bin)
+        .args([
+            "browser",
+            "request",
+            "--control-port",
+            &control_port.to_string(),
+            "--url",
+            "/api/ds/query",
+            "--method",
+            "POST",
+            "--body",
+            &format!("@{}", payload.display()),
+        ])
+        .env("OMNI_BRIDGE_TOKEN", &token)
+        .output()
+        .await
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let env: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(env["body"], "echo:/api/ds/query");
+}
+
+/// The client exits non-zero with a helpful message when no token is available.
+#[tokio::test]
+async fn cli_request_client_without_token_errors() {
+    let bin = env!("CARGO_BIN_EXE_omni-dev");
+    let out = tokio::process::Command::new(bin)
+        .args(["browser", "request", "--url", "/x"])
+        .env_remove("OMNI_BRIDGE_TOKEN")
+        .output()
+        .await
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("OMNI_BRIDGE_TOKEN"), "stderr was: {stderr}");
+}
+
+/// The client surfaces a non-2xx bridge response as a non-zero exit.
+#[tokio::test]
+async fn cli_request_client_reports_bridge_error() {
+    // Bridge running, but no browser connected → control plane returns 503.
+    let (control_port, _ws_port, token) = start_bridge(None, Duration::from_secs(5)).await;
+    let bin = env!("CARGO_BIN_EXE_omni-dev");
+    let out = tokio::process::Command::new(bin)
+        .args([
+            "browser",
+            "request",
+            "--control-port",
+            &control_port.to_string(),
+            "--url",
+            "/x",
+        ])
+        .env("OMNI_BRIDGE_TOKEN", &token)
+        .output()
+        .await
+        .unwrap();
+    assert!(!out.status.success());
 }
