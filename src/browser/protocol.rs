@@ -42,6 +42,14 @@ pub struct ControlRequest {
     /// field. Server-side routing only — never sent to the browser.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// Request-scoped outbound-origin override. When present it takes
+    /// precedence over `serve --allow-origin` for *this request's*
+    /// [`crate::browser::auth::validate_outbound_url`] check only, letting one
+    /// request target a cross-origin URL without affecting the connection-time
+    /// `ws_origin_allowed` gate. Server-side scope check only — never sent to
+    /// the browser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_origin: Option<String>,
 }
 
 fn default_method() -> String {
@@ -354,6 +362,34 @@ mod tests {
         assert_eq!(req.method, "GET");
         assert!(req.body.is_none());
         assert!(req.headers.is_empty());
+        // The per-request outbound-origin override defaults to absent.
+        assert!(req.allow_origin.is_none());
+    }
+
+    #[test]
+    fn control_request_omits_allow_origin_when_absent() {
+        let req = ControlRequest {
+            url: "/x".to_string(),
+            method: "GET".to_string(),
+            headers: BTreeMap::new(),
+            body: None,
+            stream: false,
+            target: None,
+            allow_origin: None,
+        };
+        // Back-compat: an absent override is not serialised, so the wire body
+        // stays byte-identical to a pre-feature client's.
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("allow_origin"));
+
+        // A present override round-trips.
+        let with = ControlRequest {
+            allow_origin: Some("https://ok.test".to_string()),
+            ..req
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        let back: ControlRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.allow_origin.as_deref(), Some("https://ok.test"));
     }
 
     #[test]
