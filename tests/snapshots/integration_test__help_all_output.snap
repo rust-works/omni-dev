@@ -1876,7 +1876,23 @@ Browser bridge: drive authenticated requests through a browser tab
 Usage: browser <COMMAND>
 
 Commands:
-  bridge   Runs the local bridge server (WebSocket + HTTP control planes)
+  bridge  Bridge: run the server (`serve`) or send a request through it (`request`)
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev browser bridge - Bridge: run the server (`serve`) or send a request through it (`request`)
+
+Bridge: run the server (`serve`) or send a request through it (`request`)
+
+Usage: bridge <COMMAND>
+
+Commands:
+  serve    Runs the local bridge server (WebSocket + HTTP control planes)
   request  Sends a request through a running bridge (thin client)
   help     Print this message or the help of the given subcommand(s)
 
@@ -1886,11 +1902,31 @@ Options:
 
 ================================================================================
 
-omni-dev browser bridge - Runs the local bridge server (WebSocket + HTTP control planes)
+omni-dev browser bridge request - Sends a request through a running bridge (thin client)
+
+Sends a request through a running bridge (thin client)
+
+Usage: request [OPTIONS] --url <URL>
+
+Options:
+      --url <URL>                    Request URL, relative to the browser's page origin (e.g. `/api/foo`)
+      --method <METHOD>              HTTP method [default: GET]
+      --header <NAME: VALUE>         Request header as `Name: Value`. May be repeated
+      --body <BODY>                  Request body. Prefix with `@` to read from a file (e.g. `@payload.json`)
+      --control-port <CONTROL_PORT>  Control-plane port of the running bridge [default: 9998]
+      --token-file <PATH>            Read the session token from this `0600` file instead of the environment
+      --stream                       Stream the response: print body chunks to stdout as they arrive instead of buffering the whole response into one envelope. Use for SSE / chunked / long-lived endpoints
+      --target <ID|ORIGIN>           Route to a specific connected tab: a connection id (from `/__bridge/status`) or an `Origin` that uniquely matches one tab. Required when more than one tab is connected
+  -h, --help                         Print help
+
+
+================================================================================
+
+omni-dev browser bridge serve - Runs the local bridge server (WebSocket + HTTP control planes)
 
 Runs the local bridge server (WebSocket + HTTP control planes)
 
-Usage: bridge [OPTIONS]
+Usage: serve [OPTIONS]
 
 Options:
       --ws-port <WS_PORT>
@@ -1909,26 +1945,6 @@ Options:
           Read the session token from this `0600` file instead of generating one. The token is never accepted as a command-line argument
   -h, --help
           Print help
-
-
-================================================================================
-
-omni-dev browser request - Sends a request through a running bridge (thin client)
-
-Sends a request through a running bridge (thin client)
-
-Usage: request [OPTIONS] --url <URL>
-
-Options:
-      --url <URL>                    Request URL, relative to the browser's page origin (e.g. `/api/foo`)
-      --method <METHOD>              HTTP method [default: GET]
-      --header <NAME: VALUE>         Request header as `Name: Value`. May be repeated
-      --body <BODY>                  Request body. Prefix with `@` to read from a file (e.g. `@payload.json`)
-      --control-port <CONTROL_PORT>  Control-plane port of the running bridge [default: 9998]
-      --token-file <PATH>            Read the session token from this `0600` file instead of the environment
-      --stream                       Stream the response: print body chunks to stdout as they arrive instead of buffering the whole response into one envelope. Use for SSE / chunked / long-lived endpoints
-      --target <ID|ORIGIN>           Route to a specific connected tab: a connection id (from `/__bridge/status`) or an `Origin` that uniquely matches one tab. Required when more than one tab is connected
-  -h, --help                         Print help
 
 
 ================================================================================

@@ -856,6 +856,7 @@ async fn cli_request_client_streams() {
     let out = tokio::process::Command::new(bin)
         .args([
             "browser",
+            "bridge",
             "request",
             "--stream",
             "--control-port",
@@ -1127,6 +1128,7 @@ async fn cli_request_client_stream_reports_error() {
     let out = tokio::process::Command::new(bin)
         .args([
             "browser",
+            "bridge",
             "request",
             "--stream",
             "--control-port",
@@ -1143,7 +1145,7 @@ async fn cli_request_client_stream_reports_error() {
     assert!(stderr.contains("503"), "stderr was: {stderr}");
 }
 
-/// Drives the real `omni-dev browser request` thin client against a running
+/// Drives the real `omni-dev browser bridge request` thin client against a running
 /// bridge. Exercises the CLI dispatch and `request::execute` end to end
 /// (token from env, header injection, `--header`, `--body @file`, and envelope
 /// printing) rather than re-implementing the HTTP call.
@@ -1159,6 +1161,7 @@ async fn cli_request_client_round_trips() {
     let out = tokio::process::Command::new(bin)
         .args([
             "browser",
+            "bridge",
             "request",
             "--control-port",
             &control_port.to_string(),
@@ -1188,6 +1191,7 @@ async fn cli_request_client_round_trips() {
     let out = tokio::process::Command::new(bin)
         .args([
             "browser",
+            "bridge",
             "request",
             "--control-port",
             &control_port.to_string(),
@@ -1213,7 +1217,7 @@ async fn cli_request_client_round_trips() {
 async fn cli_request_client_without_token_errors() {
     let bin = env!("CARGO_BIN_EXE_omni-dev");
     let out = tokio::process::Command::new(bin)
-        .args(["browser", "request", "--url", "/x"])
+        .args(["browser", "bridge", "request", "--url", "/x"])
         .env_remove("OMNI_BRIDGE_TOKEN")
         .output()
         .await
@@ -1232,6 +1236,7 @@ async fn cli_request_client_reports_bridge_error() {
     let out = tokio::process::Command::new(bin)
         .args([
             "browser",
+            "bridge",
             "request",
             "--control-port",
             &control_port.to_string(),

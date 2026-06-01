@@ -1,11 +1,12 @@
-//! `omni-dev browser bridge` — runs the long-lived bridge server.
+//! `omni-dev browser bridge` — server (`serve`) and thin client (`request`).
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
+use super::request::RequestCommand;
 use crate::browser::{self, auth, BridgeConfig};
 
 /// Default WebSocket-plane port.
@@ -19,6 +20,33 @@ const DEFAULT_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// Default maximum concurrent in-flight requests.
 const DEFAULT_MAX_CONCURRENT: usize = 64;
 
+/// Bridge: run the server (`serve`) or send a request through it (`request`).
+#[derive(Parser)]
+pub struct BridgeCommand {
+    /// The bridge subcommand to execute.
+    #[command(subcommand)]
+    pub command: BridgeSubcommands,
+}
+
+/// Bridge subcommands.
+#[derive(Subcommand)]
+pub enum BridgeSubcommands {
+    /// Runs the local bridge server (WebSocket + HTTP control planes).
+    Serve(ServeCommand),
+    /// Sends a request through a running bridge (thin client).
+    Request(RequestCommand),
+}
+
+impl BridgeCommand {
+    /// Executes the bridge command.
+    pub async fn execute(self) -> Result<()> {
+        match self.command {
+            BridgeSubcommands::Serve(cmd) => cmd.execute().await,
+            BridgeSubcommands::Request(cmd) => cmd.execute().await,
+        }
+    }
+}
+
 /// Runs the local bridge server (WebSocket + HTTP control planes).
 ///
 /// Generates a session token at startup (unless `--token-file` or
@@ -27,7 +55,7 @@ const DEFAULT_MAX_CONCURRENT: usize = 64;
 /// requested port is already in use. Pass `0` for `--ws-port` / `--control-port`
 /// to bind an OS-assigned random port.
 #[derive(Parser)]
-pub struct BridgeCommand {
+pub struct ServeCommand {
     /// WebSocket-plane port. `0` binds a random free port.
     #[arg(long, default_value_t = DEFAULT_WS_PORT)]
     pub ws_port: u16,
@@ -60,8 +88,8 @@ pub struct BridgeCommand {
     pub token_file: Option<PathBuf>,
 }
 
-impl BridgeCommand {
-    /// Executes the bridge command.
+impl ServeCommand {
+    /// Executes the serve command.
     pub async fn execute(self) -> Result<()> {
         let token = auth::resolve_token(self.token_file.as_deref())?;
         let config = BridgeConfig {
@@ -81,7 +109,7 @@ impl BridgeCommand {
 mod tests {
     use super::*;
 
-    /// Mirrors the `omni-dev browser bridge` argv surface for parse tests.
+    /// Mirrors the `omni-dev browser bridge serve` argv surface for parse tests.
     #[derive(Parser)]
     struct Wrapper {
         #[command(subcommand)]
@@ -89,15 +117,13 @@ mod tests {
     }
     #[derive(clap::Subcommand)]
     enum Cmd {
-        Bridge(BridgeCommand),
+        Serve(ServeCommand),
     }
 
-    fn parse(args: &[&str]) -> BridgeCommand {
-        let mut full = vec!["omni-dev", "bridge"];
+    fn parse(args: &[&str]) -> ServeCommand {
+        let mut full = vec!["omni-dev", "serve"];
         full.extend_from_slice(args);
-        let Wrapper {
-            cmd: Cmd::Bridge(c),
-        } = Wrapper::try_parse_from(full).unwrap();
+        let Wrapper { cmd: Cmd::Serve(c) } = Wrapper::try_parse_from(full).unwrap();
         c
     }
 
@@ -139,7 +165,53 @@ mod tests {
     #[test]
     fn token_is_not_a_flag() {
         // The session token must never be settable via argv.
-        let mut full = vec!["omni-dev", "bridge", "--token", "secret"];
+        let mut full = vec!["omni-dev", "serve", "--token", "secret"];
         assert!(Wrapper::try_parse_from(std::mem::take(&mut full)).is_err());
+    }
+
+    /// Builds a `ServeCommand` whose control plane targets `control_port`.
+    fn serve_cmd(control_port: u16) -> ServeCommand {
+        ServeCommand {
+            ws_port: 0,
+            control_port,
+            request_timeout: DEFAULT_TIMEOUT_SECS,
+            allow_origin: None,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            max_concurrent: DEFAULT_MAX_CONCURRENT,
+            token_file: None,
+        }
+    }
+
+    /// The `serve` arm reaches the server, which fails closed when its control
+    /// port is already taken — exercising dispatch without a long-lived bind.
+    #[tokio::test]
+    async fn dispatch_serve_arm_surfaces_bind_failure() {
+        // Occupy a port, then ask serve to bind the same one.
+        let squatter = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let taken = squatter.local_addr().unwrap().port();
+        let cmd = BridgeCommand {
+            command: BridgeSubcommands::Serve(serve_cmd(taken)),
+        };
+        assert!(cmd.execute().await.is_err());
+    }
+
+    /// The `request` arm reaches the thin client, which errors with no bridge
+    /// listening — exercising dispatch into the request path.
+    #[tokio::test]
+    async fn dispatch_request_arm_reaches_client() {
+        let cmd = BridgeCommand {
+            command: BridgeSubcommands::Request(RequestCommand {
+                url: "/x".to_string(),
+                method: "GET".to_string(),
+                headers: Vec::new(),
+                body: None,
+                // Port 0 never has a listener, so the client fails fast.
+                control_port: 0,
+                token_file: None,
+                stream: false,
+                target: None,
+            }),
+        };
+        assert!(cmd.execute().await.is_err());
     }
 }
