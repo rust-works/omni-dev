@@ -1229,6 +1229,83 @@ mod tests {
     }
 
     #[test]
+    fn tab_list_renders_id_with_and_without_origin() {
+        let mut tabs = HashMap::new();
+        tabs.insert(1, tab(Some("https://a.test")));
+        tabs.insert(2, tab(None));
+        // Id-sorted; a tab that sent no `Origin` renders as the bare id.
+        assert_eq!(tab_list(&tabs), "id 1: https://a.test, id 2");
+    }
+
+    /// A minimal [`AppState`] for exercising `dispatch` / `start_stream` without
+    /// a real WebSocket peer.
+    fn test_state() -> AppState {
+        AppState {
+            token: Arc::new("t".to_string()),
+            config: Arc::new(BridgeConfig {
+                ws_port: 0,
+                control_port: 0,
+                request_timeout: Duration::from_secs(5),
+                allow_origin: None,
+                max_body_bytes: 1024,
+                max_concurrent: 8,
+            }),
+            correlator: Correlator::new(),
+            tabs: Arc::new(Mutex::new(HashMap::new())),
+            in_flight: Arc::new(Semaphore::new(8)),
+            conn_counter: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    /// Inserts a tab whose writer receiver is already dropped, so any send to it
+    /// fails — modelling a tab that vanished between routing and dispatch.
+    async fn insert_dead_tab(state: &AppState, id: u64) {
+        let (sender, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        state.tabs.lock().await.insert(
+            id,
+            WsConn {
+                sender,
+                origin: None,
+            },
+        );
+    }
+
+    fn plain_request() -> ControlRequest {
+        ControlRequest {
+            url: "/x".to_string(),
+            method: "GET".to_string(),
+            headers: BTreeMap::new(),
+            body: None,
+            stream: false,
+            target: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_returns_503_when_send_fails() {
+        let state = test_state();
+        insert_dead_tab(&state, 1).await;
+        let err = dispatch(&state, plain_request()).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+        // The failed dispatch leaves no dangling waiter behind.
+        assert_eq!(state.correlator.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn start_stream_returns_503_when_send_fails() {
+        let state = test_state();
+        insert_dead_tab(&state, 1).await;
+        let req = ControlRequest {
+            stream: true,
+            ..plain_request()
+        };
+        let err = start_stream(&state, req).await.err().map(|e| e.0);
+        assert_eq!(err, Some(StatusCode::SERVICE_UNAVAILABLE));
+        assert_eq!(state.correlator.pending_count(), 0);
+    }
+
+    #[test]
     fn correlator_register_resolve_round_trip() {
         let c = Correlator::new();
         let (id, rx) = c.register();

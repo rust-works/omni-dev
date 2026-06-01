@@ -1397,3 +1397,45 @@ async fn single_tab_back_compat() {
     let env: Value = resp.json().await.unwrap();
     assert_eq!(env["body"], "tab:A:/x");
 }
+
+/// A malformed JSON body to `POST /__bridge/request` is rejected with 400.
+#[tokio::test]
+async fn request_invalid_json_body_is_400() {
+    let (control_port, _ws_port, token) = start_bridge(None, Duration::from_secs(5)).await;
+    let (http, base, tok) = client(control_port, &token);
+    let resp = http
+        .post(format!("{base}/__bridge/request"))
+        .bearer_auth(&tok)
+        .header("x-omni-bridge", "1")
+        .header("content-type", "application/json")
+        .body("not valid json {")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+}
+
+/// On `POST /__bridge/request`, the `X-Omni-Bridge-Target` header selects the
+/// tab and overrides a conflicting `target` body field.
+#[tokio::test]
+async fn request_target_header_overrides_body_field() {
+    let (control_port, ws_port, token) = start_bridge(None, Duration::from_secs(5)).await;
+    let _a = FakeBrowser::connect_tagged(ws_port, &token, "https://a.test", "A").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _b = FakeBrowser::connect_tagged(ws_port, &token, "https://b.test", "B").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (http, base, tok) = client(control_port, &token);
+
+    // Body targets A, header targets B; the header wins.
+    let resp = http
+        .post(format!("{base}/__bridge/request"))
+        .bearer_auth(&tok)
+        .header("x-omni-bridge", "1")
+        .header("x-omni-bridge-target", "https://b.test")
+        .json(&serde_json::json!({"url": "/p", "method": "GET", "target": "https://a.test"}))
+        .send()
+        .await
+        .unwrap();
+    let env: Value = resp.json().await.unwrap();
+    assert_eq!(env["body"], "tab:B:/p");
+}
