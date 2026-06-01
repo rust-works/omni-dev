@@ -59,3 +59,4 @@ by Michael Nygard.
 | [ADR-0033](adr-0033.md)  | ✅ Accepted                              | 2026-05-14 | `candle` as the Production ASR Runtime                                                 |
 | [ADR-0034](adr-0034.md)  | ✅ Accepted                              | 2026-05-14 | `tract-onnx` as the Speaker-Embedding Runtime                                          |
 | [ADR-0035](adr-0035.md)  | ✅ Accepted                              | 2026-05-25 | OS-Gated ASR Backends with Auto-Upgrading Defaults                                     |
+| [ADR-0036](adr-0036.md)  | ✅ Accepted                              | 2026-05-30 | Confused-Deputy Browser Bridge with Dual-Plane Default-Closed Authentication           |

@@ -15,6 +15,10 @@ scopes:
     description: "Command-line interface and argument parsing"
     examples: ["cli: add twiddle contextual options", "cli: improve help text"]
     file_patterns: ["src/cli/**", "src/main.rs"]
+  - name: "browser"
+    description: "Browser bridge: drive authenticated requests through a browser tab"
+    examples: ["browser: add WebSocket bridge", "browser: support binary response bodies"]
+    file_patterns: ["src/browser/**", "src/cli/browser/**", "src/cli/browser.rs"]
   - name: "git"
     description: "Git operations and repository analysis"
     examples: ["git: enhance commit parsing", "git: add branch analysis"]
