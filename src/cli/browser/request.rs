@@ -2,13 +2,17 @@
 //! running bridge, injecting the required auth headers itself.
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use clap::Parser;
+use futures::StreamExt as _;
 
 use crate::browser::auth;
-use crate::browser::protocol::{ControlRequest, ResponseEnvelope};
+use crate::browser::protocol::{ControlRequest, ResponseEnvelope, StreamLine};
 
 /// Default control-plane port (matches `bridge`'s default).
 const DEFAULT_CONTROL_PORT: u16 = 9998;
@@ -43,6 +47,12 @@ pub struct RequestCommand {
     /// Read the session token from this `0600` file instead of the environment.
     #[arg(long, value_name = "PATH")]
     pub token_file: Option<PathBuf>,
+
+    /// Stream the response: print body chunks to stdout as they arrive instead
+    /// of buffering the whole response into one envelope. Use for SSE / chunked /
+    /// long-lived endpoints.
+    #[arg(long)]
+    pub stream: bool,
 }
 
 impl RequestCommand {
@@ -57,6 +67,7 @@ impl RequestCommand {
             method: self.method,
             headers,
             body,
+            stream: self.stream,
         };
 
         let endpoint = format!("http://127.0.0.1:{}/__bridge/request", self.control_port);
@@ -71,6 +82,14 @@ impl RequestCommand {
             .with_context(|| format!("Failed to reach bridge at {endpoint} (is it running?)"))?;
 
         let status = resp.status();
+        if self.stream {
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                bail!("bridge returned {status}: {text}");
+            }
+            return stream_ndjson(resp).await;
+        }
+
         let text = resp
             .text()
             .await
@@ -86,6 +105,44 @@ impl RequestCommand {
         }
         Ok(())
     }
+}
+
+/// Consumes an NDJSON streamed response: decodes each `{seq,chunk}` line's
+/// base64 to raw bytes on stdout as it arrives, reports the head status and any
+/// error on stderr, and stops on the terminating `{done}` line.
+async fn stream_ndjson(resp: reqwest::Response) -> Result<()> {
+    let mut body = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    let stdout = std::io::stdout();
+    while let Some(piece) = body.next().await {
+        let piece = piece.context("Failed to read bridge stream")?;
+        buf.extend_from_slice(&piece);
+        // Process every complete newline-terminated line in the buffer.
+        while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = buf.drain(..=nl).collect();
+            let line = &line[..line.len() - 1]; // drop the trailing newline
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_slice::<StreamLine>(line) {
+                Ok(StreamLine::Head { status, .. }) => {
+                    eprintln!("status: {status}");
+                }
+                Ok(StreamLine::Chunk { chunk, .. }) => {
+                    let bytes = BASE64
+                        .decode(chunk.as_bytes())
+                        .context("bridge sent an invalid base64 chunk")?;
+                    let mut handle = stdout.lock();
+                    handle.write_all(&bytes).context("Failed to write chunk")?;
+                    handle.flush().ok();
+                }
+                Ok(StreamLine::Done { .. }) => return Ok(()),
+                Ok(StreamLine::Error { error }) => bail!("browser stream error: {error}"),
+                Err(e) => bail!("unparseable stream line from bridge: {e}"),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Parses `Name: Value` header strings into a map.

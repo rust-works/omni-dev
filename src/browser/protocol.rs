@@ -31,10 +31,22 @@ pub struct ControlRequest {
     /// Request body, or `null` for no body.
     #[serde(default)]
     pub body: Option<String>,
+    /// When `true`, the response is streamed back as incremental chunk frames
+    /// (`response.body.getReader()`) rather than buffered into one reply.
+    #[serde(default)]
+    pub stream: bool,
 }
 
 fn default_method() -> String {
     "GET".to_string()
+}
+
+/// Serde predicate: skip a `bool` field when it is `false` (the default), so
+/// buffered command frames stay byte-identical to the pre-streaming wire format.
+// `skip_serializing_if` requires `fn(&T) -> bool`, so the `&bool` is mandatory.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Server → browser command frame.
@@ -52,6 +64,30 @@ pub struct Command {
     pub headers: BTreeMap<String, String>,
     /// Request body, or `null`.
     pub body: Option<String>,
+    /// When `true`, the browser streams the response as chunk frames. Omitted
+    /// from the wire when `false` for back-compat with buffered clients.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stream: bool,
+}
+
+/// Server → browser cancellation frame.
+///
+/// Sent to stop an in-flight streamed response (the control-plane consumer
+/// disconnected, or a limit tripped) so the browser cancels its reader.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CancelCommand {
+    /// Correlation id of the stream to cancel.
+    pub id: u64,
+    /// Always `true`; distinguishes this frame from a [`Command`] in the browser.
+    pub cancel: bool,
+}
+
+impl CancelCommand {
+    /// Builds a cancellation frame for the given stream id.
+    #[must_use]
+    pub fn new(id: u64) -> Self {
+        Self { id, cancel: true }
+    }
 }
 
 /// Browser → server reply frame.
@@ -118,6 +154,143 @@ impl BrowserReply {
     }
 }
 
+/// Browser → server frame: a superset of [`BrowserReply`] plus the streaming
+/// fields (`stream`/`chunk`/`seq`/`done`).
+///
+/// The WebSocket reader deserialises every inbound frame into this struct, then
+/// interprets it as a buffered reply or a [`StreamItem`] depending on which
+/// waiter is registered for its `id`. Modelled as a flat struct of `Option`s so
+/// one `serde` deserialise accepts every shape.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserFrame {
+    /// Correlation id echoed from the [`Command`].
+    pub id: u64,
+    /// HTTP status code (buffered success, or a stream's head frame).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub status: Option<u16>,
+    /// Response headers (buffered success, or a stream's head frame).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub headers: Option<BTreeMap<String, String>>,
+    /// Buffered response body.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub body: Option<String>,
+    /// Buffered body transfer encoding (`Some("base64")` for binary bodies).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub encoding: Option<String>,
+    /// Error message when the browser `fetch()` failed.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub error: Option<String>,
+    /// `Some(true)` on the first frame of a streamed response (head: status +
+    /// headers, no body yet).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub stream: Option<bool>,
+    /// Base64-encoded body chunk of a streamed response.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub chunk: Option<String>,
+    /// Monotonic chunk sequence number within a stream.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub seq: Option<u64>,
+    /// `Some(true)` on the terminating frame of a streamed response.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub done: Option<bool>,
+}
+
+/// One item of a streamed browser response, derived from a [`BrowserFrame`] when
+/// the registered waiter is a stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamItem {
+    /// Stream head: status and headers, before any body bytes.
+    Head {
+        /// HTTP status code.
+        status: u16,
+        /// Response headers.
+        headers: BTreeMap<String, String>,
+    },
+    /// A base64-encoded body chunk.
+    Chunk {
+        /// Monotonic chunk sequence number.
+        seq: u64,
+        /// Base64-encoded chunk bytes.
+        data: String,
+    },
+    /// The stream terminated normally.
+    End,
+    /// The browser reported an error (before or mid-stream).
+    Error(String),
+}
+
+impl BrowserFrame {
+    /// Interprets this frame as a buffered reply (the back-compat path taken
+    /// when the registered waiter is a one-shot buffered request).
+    #[must_use]
+    pub fn into_reply(self) -> BrowserReply {
+        BrowserReply {
+            id: self.id,
+            status: self.status,
+            headers: self.headers,
+            body: self.body,
+            encoding: self.encoding,
+            error: self.error,
+        }
+    }
+
+    /// Interprets this frame as a [`StreamItem`] (taken when the registered
+    /// waiter is a stream). An `error` wins; then `done`; then a `chunk`;
+    /// otherwise the frame is the stream's head.
+    #[must_use]
+    pub fn stream_item(self) -> StreamItem {
+        if let Some(error) = self.error {
+            StreamItem::Error(error)
+        } else if self.done == Some(true) {
+            StreamItem::End
+        } else if let Some(data) = self.chunk {
+            StreamItem::Chunk {
+                seq: self.seq.unwrap_or(0),
+                data,
+            }
+        } else {
+            StreamItem::Head {
+                status: self.status.unwrap_or(0),
+                headers: self.headers.unwrap_or_default(),
+            }
+        }
+    }
+}
+
+/// One NDJSON line of a streamed `POST /__bridge/request` response.
+///
+/// The server serialises these (one per line); the thin client deserialises
+/// them. Untagged so each line is the bare object the operator sees
+/// (`{status,headers}` / `{seq,chunk}` / `{done}` / `{error}`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum StreamLine {
+    /// Head line: status and headers.
+    Head {
+        /// HTTP status code.
+        status: u16,
+        /// Response headers.
+        headers: BTreeMap<String, String>,
+    },
+    /// Chunk line: a base64-encoded body chunk.
+    Chunk {
+        /// Monotonic chunk sequence number.
+        seq: u64,
+        /// Base64-encoded chunk bytes.
+        chunk: String,
+    },
+    /// Terminating line.
+    Done {
+        /// Always `true`.
+        done: bool,
+    },
+    /// Error line.
+    Error {
+        /// Error message.
+        error: String,
+    },
+}
+
 /// Control-plane response envelope returned to the caller of
 /// `POST /__bridge/request`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -170,11 +343,106 @@ mod tests {
             method: "GET".to_string(),
             headers: BTreeMap::new(),
             body: None,
+            stream: false,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(!json.contains('\n'));
+        // A buffered command omits `stream` entirely (wire back-compat).
+        assert!(!json.contains("stream"));
         let back: Command = serde_json::from_str(&json).unwrap();
         assert_eq!(cmd, back);
+    }
+
+    #[test]
+    fn streaming_command_serialises_stream_flag() {
+        let cmd = Command {
+            id: 1,
+            url: "/sse".to_string(),
+            method: "GET".to_string(),
+            headers: BTreeMap::new(),
+            body: None,
+            stream: true,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"stream\":true"));
+    }
+
+    #[test]
+    fn cancel_command_serialises_with_cancel_true() {
+        let json = serde_json::to_string(&CancelCommand::new(9)).unwrap();
+        assert_eq!(json, r#"{"id":9,"cancel":true}"#);
+    }
+
+    #[test]
+    fn frame_classifies_stream_head_chunk_and_end() {
+        let head: BrowserFrame =
+            serde_json::from_str(r#"{"id":1,"status":200,"headers":{"a":"b"},"stream":true}"#)
+                .unwrap();
+        assert!(matches!(
+            head.stream_item(),
+            StreamItem::Head { status: 200, headers } if headers.get("a").map(String::as_str) == Some("b")
+        ));
+
+        let chunk: BrowserFrame =
+            serde_json::from_str(r#"{"id":1,"seq":3,"chunk":"aGk="}"#).unwrap();
+        assert!(matches!(
+            chunk.stream_item(),
+            StreamItem::Chunk { seq: 3, data } if data == "aGk="
+        ));
+
+        let end: BrowserFrame = serde_json::from_str(r#"{"id":1,"done":true}"#).unwrap();
+        assert_eq!(end.stream_item(), StreamItem::End);
+
+        let err: BrowserFrame = serde_json::from_str(r#"{"id":1,"error":"boom"}"#).unwrap();
+        assert_eq!(err.stream_item(), StreamItem::Error("boom".into()));
+    }
+
+    #[test]
+    fn frame_into_reply_preserves_buffered_fields() {
+        let frame: BrowserFrame = serde_json::from_str(
+            r#"{"id":2,"status":200,"headers":{},"body":"hi","encoding":"base64"}"#,
+        )
+        .unwrap();
+        let reply = frame.into_reply();
+        assert_eq!(reply.id, 2);
+        assert!(matches!(
+            reply.outcome(),
+            ReplyOutcome::Success { body, encoding, .. }
+                if body == "hi" && encoding.as_deref() == Some("base64")
+        ));
+    }
+
+    #[test]
+    fn stream_lines_round_trip_untagged() {
+        for (line, json) in [
+            (
+                StreamLine::Head {
+                    status: 200,
+                    headers: BTreeMap::new(),
+                },
+                r#"{"status":200,"headers":{}}"#,
+            ),
+            (
+                StreamLine::Chunk {
+                    seq: 0,
+                    chunk: "aGk=".into(),
+                },
+                r#"{"seq":0,"chunk":"aGk="}"#,
+            ),
+            (StreamLine::Done { done: true }, r#"{"done":true}"#),
+            (
+                StreamLine::Error {
+                    error: "boom".into(),
+                },
+                r#"{"error":"boom"}"#,
+            ),
+        ] {
+            let serialised = serde_json::to_string(&line).unwrap();
+            assert_eq!(serialised, json);
+            assert!(!serialised.contains('\n'));
+            let back: StreamLine = serde_json::from_str(json).unwrap();
+            assert_eq!(back, line);
+        }
     }
 
     #[test]

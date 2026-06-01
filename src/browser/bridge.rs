@@ -28,12 +28,13 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use futures::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
+use tokio::sync::{mpsc, oneshot, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::browser::auth;
 use crate::browser::protocol::{
-    BrowserReply, Command, ControlRequest, ReplyOutcome, ResponseEnvelope, StatusResponse,
+    BrowserFrame, BrowserReply, CancelCommand, Command, ControlRequest, ReplyOutcome,
+    ResponseEnvelope, StatusResponse, StreamItem, StreamLine,
 };
 use crate::browser::snippet;
 
@@ -54,10 +55,19 @@ pub struct BridgeConfig {
     pub max_concurrent: usize,
 }
 
-/// `id → oneshot` waiter registry plus the monotonic id counter.
+/// A registered waiter for a given id: either a buffered one-shot (resolved by a
+/// single reply) or a stream (fed many [`StreamItem`]s until `End`/`Error`).
+enum Waiter {
+    /// Buffered request: one reply resolves it.
+    Buffered(oneshot::Sender<BrowserReply>),
+    /// Streamed request: head + chunk + terminator items are forwarded here.
+    Stream(mpsc::UnboundedSender<StreamItem>),
+}
+
+/// `id → waiter` registry plus the monotonic id counter.
 #[derive(Clone)]
 struct Correlator {
-    pending: Arc<StdMutex<HashMap<u64, oneshot::Sender<BrowserReply>>>>,
+    pending: Arc<StdMutex<HashMap<u64, Waiter>>>,
     next_id: Arc<AtomicU64>,
 }
 
@@ -69,11 +79,20 @@ impl Correlator {
         }
     }
 
-    /// Allocates an id and registers a waiter for its reply.
+    /// Allocates an id and registers a buffered waiter for its single reply.
     fn register(&self) -> (u64, oneshot::Receiver<BrowserReply>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.lock().insert(id, tx);
+        self.lock().insert(id, Waiter::Buffered(tx));
+        (id, rx)
+    }
+
+    /// Allocates an id and registers a stream waiter that receives every
+    /// [`StreamItem`] of the response until `End`/`Error`.
+    fn register_stream(&self) -> (u64, mpsc::UnboundedReceiver<StreamItem>) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.lock().insert(id, Waiter::Stream(tx));
         (id, rx)
     }
 
@@ -82,11 +101,35 @@ impl Correlator {
         self.lock().remove(&id);
     }
 
-    /// Resolves the waiter for `reply.id`, if one is still registered.
-    fn resolve(&self, reply: BrowserReply) {
-        let waiter = self.lock().remove(&reply.id);
-        if let Some(tx) = waiter {
-            let _ = tx.send(reply);
+    /// Routes an inbound browser frame to its waiter.
+    ///
+    /// Buffered waiters resolve and are removed; stream waiters receive one
+    /// [`StreamItem`] and are removed only on a terminal item (or when their
+    /// consumer has gone). Returns `Some(id)` when the browser should be told to
+    /// cancel that stream (its control-plane consumer disconnected).
+    fn deliver(&self, frame: BrowserFrame) -> Option<u64> {
+        let id = frame.id;
+        let mut guard = self.lock();
+        match guard.get(&id) {
+            Some(Waiter::Buffered(_)) => {
+                if let Some(Waiter::Buffered(tx)) = guard.remove(&id) {
+                    let _ = tx.send(frame.into_reply());
+                }
+                None
+            }
+            Some(Waiter::Stream(_)) => {
+                let item = frame.stream_item();
+                let terminal = matches!(item, StreamItem::End | StreamItem::Error(_));
+                let send_failed = match guard.get(&id) {
+                    Some(Waiter::Stream(tx)) => tx.send(item).is_err(),
+                    _ => false,
+                };
+                if terminal || send_failed {
+                    guard.remove(&id);
+                }
+                send_failed.then_some(id)
+            }
+            None => None,
         }
     }
 
@@ -94,7 +137,7 @@ impl Correlator {
         self.lock().len()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, oneshot::Sender<BrowserReply>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Waiter>> {
         self.pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -300,9 +343,15 @@ async fn handle_ws_conn(stream: TcpStream, state: AppState) {
 
     while let Some(Ok(msg)) = read.next().await {
         match msg {
-            Message::Text(txt) => match serde_json::from_str::<BrowserReply>(&txt) {
-                Ok(reply) => state.correlator.resolve(reply),
-                Err(e) => tracing::debug!("Unparseable browser reply: {e}"),
+            Message::Text(txt) => match serde_json::from_str::<BrowserFrame>(&txt) {
+                Ok(frame) => {
+                    // If a streamed response's control-plane consumer has gone,
+                    // tell the browser to cancel its reader so it stops fetching.
+                    if let Some(cancel_id) = state.correlator.deliver(frame) {
+                        send_cancel(&state, cancel_id).await;
+                    }
+                }
+                Err(e) => tracing::debug!("Unparseable browser frame: {e}"),
             },
             Message::Close(_) => break,
             _ => {}
@@ -393,7 +442,9 @@ async fn status_handler(State(state): State<AppState>) -> Json<StatusResponse> {
     })
 }
 
-/// `POST /__bridge/request` — full-fidelity control endpoint.
+/// `POST /__bridge/request` — full-fidelity control endpoint. A `stream: true`
+/// body returns an NDJSON stream (head line, `{seq,chunk}` lines, `{done}`);
+/// otherwise a single JSON response envelope.
 async fn request_handler(State(state): State<AppState>, body: Bytes) -> Response {
     let req: ControlRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
@@ -401,6 +452,12 @@ async fn request_handler(State(state): State<AppState>, body: Bytes) -> Response
             return (StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}")).into_response()
         }
     };
+    if req.stream {
+        return match start_stream(&state, req).await {
+            Ok((status, headers, driver)) => ndjson_stream_response(status, headers, driver),
+            Err((code, msg)) => (code, msg).into_response(),
+        };
+    }
     match dispatch(&state, req).await {
         Ok(env) => Json(env).into_response(),
         Err((code, msg)) => (code, msg).into_response(),
@@ -415,7 +472,10 @@ async fn proxy_handler(State(state): State<AppState>, request: Request) -> Respo
     if auth::normalize_request_path(path).is_none() {
         return (StatusCode::BAD_REQUEST, "unsafe request path").into_response();
     }
-    let url = match parts.uri.query() {
+    // `?__stream=1` opts the proxied request into a streamed (chunked) response;
+    // the marker is stripped so it never reaches the upstream URL.
+    let (stream, forwarded_query) = extract_stream_flag(parts.uri.query());
+    let url = match forwarded_query.as_deref() {
         Some(q) => format!("{path}?{q}"),
         None => path.to_string(),
     };
@@ -436,12 +496,49 @@ async fn proxy_handler(State(state): State<AppState>, request: Request) -> Respo
         method: parts.method.to_string(),
         headers,
         body,
+        stream,
     };
+
+    if stream {
+        return match start_stream(&state, req).await {
+            Ok((status, headers, driver)) => raw_stream_response(status, headers, driver),
+            Err((code, msg)) => (code, msg).into_response(),
+        };
+    }
 
     match dispatch(&state, req).await {
         Ok(env) => envelope_to_response(env),
         Err((code, msg)) => (code, msg).into_response(),
     }
+}
+
+/// Splits a `__stream` marker out of a query string.
+///
+/// Returns whether streaming was requested and the query with the marker
+/// removed (`None` when nothing remains). `__stream=0` / `__stream=false`
+/// explicitly disable it; any other presence enables it.
+fn extract_stream_flag(query: Option<&str>) -> (bool, Option<String>) {
+    let Some(query) = query else {
+        return (false, None);
+    };
+    let mut stream = false;
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|kv| {
+            let (key, value) = match kv.split_once('=') {
+                Some((k, v)) => (k, Some(v)),
+                None => (*kv, None),
+            };
+            if key == "__stream" {
+                stream = !matches!(value, Some("0" | "false"));
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    let rebuilt = (!kept.is_empty()).then(|| kept.join("&"));
+    (stream, rebuilt)
 }
 
 /// Copies request headers safe to forward to the browser, dropping the
@@ -509,6 +606,7 @@ async fn dispatch(
         method: req.method,
         headers: req.headers,
         body: req.body,
+        stream: false,
     };
     let frame = match serde_json::to_string(&command) {
         Ok(f) => f,
@@ -597,6 +695,280 @@ async fn dispatch(
     }
 }
 
+/// Sends a best-effort cancellation frame to the connected browser and drops the
+/// pending stream, so a stream whose consumer is gone (or which tripped a limit)
+/// stops the in-page reader rather than fetching to completion.
+async fn send_cancel(state: &AppState, id: u64) {
+    state.correlator.remove(id);
+    let Ok(frame) = serde_json::to_string(&CancelCommand::new(id)) else {
+        return;
+    };
+    if let Some(conn) = state.ws.lock().await.as_ref() {
+        let _ = conn.sender.send(Message::Text(frame));
+    }
+}
+
+/// The shared streaming request path: scope-check, register a stream waiter, send
+/// the `stream: true` command, and await the head frame (status + headers) under
+/// the inter-chunk idle timeout. Returns the head plus a [`StreamDriver`] that
+/// pulls the remaining body chunks; the concurrency permit is held by the driver
+/// for the stream's lifetime.
+async fn start_stream(
+    state: &AppState,
+    req: ControlRequest,
+) -> Result<(u16, BTreeMap<String, String>, StreamDriver), (StatusCode, String)> {
+    auth::validate_outbound_url(&req.url, state.config.allow_origin.as_deref()).map_err(|_| {
+        (
+            StatusCode::FORBIDDEN,
+            "outbound URL is cross-origin; pass --allow-origin to permit it".to_string(),
+        )
+    })?;
+
+    for (name, value) in &req.headers {
+        if !auth::header_is_safe(name, value) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "invalid header name or value".to_string(),
+            ));
+        }
+    }
+
+    let permit = state.in_flight.clone().try_acquire_owned().map_err(|_| {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many in-flight requests".to_string(),
+        )
+    })?;
+
+    let (id, mut rx) = state.correlator.register_stream();
+    let command = Command {
+        id,
+        url: req.url,
+        method: req.method,
+        headers: req.headers,
+        body: req.body,
+        stream: true,
+    };
+    let frame = match serde_json::to_string(&command) {
+        Ok(f) => f,
+        Err(e) => {
+            state.correlator.remove(id);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("serialise error: {e}"),
+            ));
+        }
+    };
+
+    {
+        let guard = state.ws.lock().await;
+        match guard.as_ref() {
+            Some(conn) if conn.sender.send(Message::Text(frame)).is_ok() => {}
+            _ => {
+                state.correlator.remove(id);
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "no browser connected".to_string(),
+                ));
+            }
+        }
+    }
+
+    let idle = state.config.request_timeout;
+    let (status, headers) = match tokio::time::timeout(idle, rx.recv()).await {
+        Ok(Some(StreamItem::Head { status, headers })) => (status, headers),
+        Ok(Some(StreamItem::Error(msg))) => {
+            state.correlator.remove(id);
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!("browser fetch failed: {msg}"),
+            ));
+        }
+        Ok(Some(_)) => {
+            state.correlator.remove(id);
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "browser streamed a body chunk before the response head".to_string(),
+            ));
+        }
+        Ok(None) => {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "browser connection closed before replying".to_string(),
+            ));
+        }
+        Err(_) => {
+            send_cancel(state, id).await;
+            return Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                "browser did not start streaming in time".to_string(),
+            ));
+        }
+    };
+
+    let driver = StreamDriver {
+        state: state.clone(),
+        id,
+        rx,
+        idle,
+        max_body: state.config.max_body_bytes,
+        sent: 0,
+        _permit: permit,
+        done: false,
+    };
+    Ok((status, headers, driver))
+}
+
+/// Drives a registered stream's body chunks: applies the inter-chunk idle
+/// timeout, decodes each base64 chunk, enforces the cumulative `--max-body-bytes`
+/// ceiling, and cancels the browser stream on early/abnormal termination. Holds
+/// the concurrency permit until dropped.
+struct StreamDriver {
+    state: AppState,
+    id: u64,
+    rx: mpsc::UnboundedReceiver<StreamItem>,
+    idle: Duration,
+    max_body: usize,
+    sent: usize,
+    _permit: OwnedSemaphorePermit,
+    done: bool,
+}
+
+/// One step of a [`StreamDriver`]: decoded chunk bytes, or end-of-stream.
+enum NextChunk {
+    /// A decoded body chunk and its sequence number.
+    Data {
+        /// Chunk sequence number reported by the browser.
+        seq: u64,
+        /// Decoded chunk bytes.
+        bytes: Vec<u8>,
+    },
+    /// The stream is finished (normal end, error, idle timeout, or cap hit).
+    End,
+}
+
+impl StreamDriver {
+    /// Pulls the next decoded chunk, ending the stream on a terminal item, an
+    /// invalid chunk, an idle timeout, or the cumulative byte cap.
+    async fn next_chunk(&mut self) -> NextChunk {
+        if self.done {
+            return NextChunk::End;
+        }
+        loop {
+            match tokio::time::timeout(self.idle, self.rx.recv()).await {
+                Ok(Some(StreamItem::Chunk { seq, data })) => {
+                    let Ok(bytes) = BASE64.decode(data.as_bytes()) else {
+                        return self.abort().await;
+                    };
+                    self.sent = self.sent.saturating_add(bytes.len());
+                    if self.sent > self.max_body {
+                        return self.abort().await;
+                    }
+                    return NextChunk::Data { seq, bytes };
+                }
+                // A stray head after the first is a protocol slip; ignore it.
+                Ok(Some(StreamItem::Head { .. })) => {}
+                Ok(Some(StreamItem::End | StreamItem::Error(_)) | None) => {
+                    return self.finish();
+                }
+                // Inter-chunk idle timeout: stop the browser and end the stream.
+                Err(_) => return self.abort().await,
+            }
+        }
+    }
+
+    /// Ends the stream and removes the pending entry (terminal item / consumer
+    /// gone — the browser is already done, so no cancel is sent).
+    fn finish(&mut self) -> NextChunk {
+        self.done = true;
+        self.state.correlator.remove(self.id);
+        NextChunk::End
+    }
+
+    /// Ends the stream early and tells the browser to cancel its reader (idle
+    /// timeout, cap exceeded, or an undecodable chunk).
+    async fn abort(&mut self) -> NextChunk {
+        self.done = true;
+        send_cancel(&self.state, self.id).await;
+        NextChunk::End
+    }
+}
+
+/// Serialises a [`StreamLine`] as one NDJSON line (trailing newline).
+fn to_ndjson_line(line: &StreamLine) -> String {
+    let mut s = serde_json::to_string(line).unwrap_or_else(|_| "{}".to_string());
+    s.push('\n');
+    s
+}
+
+/// Builds the transparent-proxy response for a streamed body: status and
+/// `content-type` from the head frame, decoded chunk bytes streamed as a chunked
+/// HTTP body.
+fn raw_stream_response(
+    status: u16,
+    headers: BTreeMap<String, String>,
+    driver: StreamDriver,
+) -> Response {
+    let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut builder = Response::builder().status(code);
+    if let Some(ct) = headers.get("content-type") {
+        builder = builder.header(header::CONTENT_TYPE, ct);
+    }
+    let stream = futures::stream::unfold(driver, |mut driver| async move {
+        match driver.next_chunk().await {
+            NextChunk::Data { bytes, .. } => Some((
+                Ok::<_, std::convert::Infallible>(Bytes::from(bytes)),
+                driver,
+            )),
+            NextChunk::End => None,
+        }
+    });
+    builder
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+/// Builds the `POST /__bridge/request` response for a streamed body: an NDJSON
+/// body of a head line, `{seq,chunk}` lines, and a terminating `{done}` line.
+fn ndjson_stream_response(
+    status: u16,
+    headers: BTreeMap<String, String>,
+    driver: StreamDriver,
+) -> Response {
+    let head_line = to_ndjson_line(&StreamLine::Head { status, headers });
+    // State: (pending head line, driver, done-line-emitted).
+    let init = (Some(head_line), driver, false);
+    let stream = futures::stream::unfold(init, |(head, mut driver, done_emitted)| async move {
+        if let Some(line) = head {
+            return Some((
+                Ok::<_, std::convert::Infallible>(Bytes::from(line)),
+                (None, driver, done_emitted),
+            ));
+        }
+        if done_emitted {
+            return None;
+        }
+        match driver.next_chunk().await {
+            NextChunk::Data { seq, bytes } => {
+                let line = to_ndjson_line(&StreamLine::Chunk {
+                    seq,
+                    chunk: BASE64.encode(&bytes),
+                });
+                Some((Ok(Bytes::from(line)), (None, driver, false)))
+            }
+            NextChunk::End => {
+                let line = to_ndjson_line(&StreamLine::Done { done: true });
+                Some((Ok(Bytes::from(line)), (None, driver, true)))
+            }
+        }
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
 /// Renders a browser response envelope as the transparent-proxy HTTP response.
 ///
 /// A base64-tagged body is decoded back to raw bytes so a `curl` client gets the
@@ -625,22 +997,79 @@ fn envelope_to_response(env: ResponseEnvelope) -> Response {
 mod tests {
     use super::*;
 
-    #[test]
-    fn correlator_register_resolve_round_trip() {
-        let c = Correlator::new();
-        let (id, rx) = c.register();
-        assert_eq!(c.pending_count(), 1);
-        c.resolve(BrowserReply {
+    fn buffered_frame(id: u64) -> BrowserFrame {
+        BrowserFrame {
             id,
             status: Some(200),
             headers: None,
             body: Some("ok".into()),
             encoding: None,
             error: None,
-        });
+            stream: None,
+            chunk: None,
+            seq: None,
+            done: None,
+        }
+    }
+
+    #[test]
+    fn correlator_register_resolve_round_trip() {
+        let c = Correlator::new();
+        let (id, rx) = c.register();
+        assert_eq!(c.pending_count(), 1);
+        assert_eq!(c.deliver(buffered_frame(id)), None);
         assert_eq!(c.pending_count(), 0);
         let reply = rx.now_or_never().unwrap().unwrap();
         assert_eq!(reply.id, id);
+    }
+
+    #[test]
+    fn correlator_stream_forwards_items_until_terminal() {
+        let c = Correlator::new();
+        let (id, mut rx) = c.register_stream();
+        assert_eq!(c.pending_count(), 1);
+
+        let mut head = buffered_frame(id);
+        head.stream = Some(true);
+        head.body = None;
+        assert_eq!(c.deliver(head), None);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(StreamItem::Head { status: 200, .. })
+        ));
+        // Head is non-terminal: the waiter stays registered.
+        assert_eq!(c.pending_count(), 1);
+
+        let mut done = BrowserFrame {
+            done: Some(true),
+            ..buffered_frame(id)
+        };
+        done.body = None;
+        assert_eq!(c.deliver(done), None);
+        assert!(matches!(rx.try_recv(), Ok(StreamItem::End)));
+        assert_eq!(c.pending_count(), 0);
+    }
+
+    #[test]
+    fn correlator_deliver_unknown_id_is_noop() {
+        let c = Correlator::new();
+        // A frame whose id was never registered (or already terminal) is dropped
+        // without panicking and never asks the caller to cancel.
+        assert_eq!(c.deliver(buffered_frame(999)), None);
+        assert_eq!(c.pending_count(), 0);
+    }
+
+    #[test]
+    fn correlator_stream_signals_cancel_when_consumer_gone() {
+        let c = Correlator::new();
+        let (id, rx) = c.register_stream();
+        drop(rx); // consumer disconnected
+        let mut chunk = buffered_frame(id);
+        chunk.chunk = Some("aGk=".into());
+        chunk.body = None;
+        // Delivery fails (receiver dropped) → caller is told to cancel `id`.
+        assert_eq!(c.deliver(chunk), Some(id));
+        assert_eq!(c.pending_count(), 0);
     }
 
     #[test]
@@ -657,6 +1086,23 @@ mod tests {
         let (id, _rx) = c.register();
         c.remove(id);
         assert_eq!(c.pending_count(), 0);
+    }
+
+    #[test]
+    fn extract_stream_flag_detects_and_strips_marker() {
+        assert_eq!(extract_stream_flag(None), (false, None));
+        assert_eq!(
+            extract_stream_flag(Some("a=1&b=2")),
+            (false, Some("a=1&b=2".to_string()))
+        );
+        assert_eq!(
+            extract_stream_flag(Some("a=1&__stream=1&b=2")),
+            (true, Some("a=1&b=2".to_string()))
+        );
+        // Bare marker, nothing else left.
+        assert_eq!(extract_stream_flag(Some("__stream")), (true, None));
+        // Explicit disable.
+        assert_eq!(extract_stream_flag(Some("__stream=0")), (false, None));
     }
 
     #[test]
