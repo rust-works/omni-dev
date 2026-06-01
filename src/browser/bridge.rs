@@ -514,6 +514,9 @@ async fn proxy_handler(State(state): State<AppState>, request: Request) -> Respo
         body,
         stream,
         target: target_header(&parts.headers),
+        // The transparent proxy has no per-request override channel; cross-origin
+        // proxying is governed solely by the `serve --allow-origin` global.
+        allow_origin: None,
     };
 
     if stream {
@@ -686,13 +689,36 @@ fn tab_list(tabs: &HashMap<u64, WsConn>) -> String {
         .join(", ")
 }
 
+/// Resolves the outbound-origin allowlist for a single request.
+///
+/// A per-request `request --allow-origin` override (`req.allow_origin`) takes
+/// precedence over the `serve --allow-origin` global; otherwise the global is
+/// used. This value reaches **only** [`auth::validate_outbound_url`] — never the
+/// connection-time `ws_origin_allowed` gate — so a request may target a
+/// cross-origin URL without the page's own tab being rejected at upgrade.
+///
+/// A WARN is logged whenever the per-request override is exercised, since it
+/// widens this request's outbound scope beyond what `serve` was started with.
+fn resolve_allow_origin<'a>(req: &'a ControlRequest, state: &'a AppState) -> Option<&'a str> {
+    match req.allow_origin.as_deref() {
+        Some(origin) => {
+            tracing::warn!(
+                "Per-request --allow-origin override in effect; outbound scope for this request \
+                 widened to {origin}"
+            );
+            Some(origin)
+        }
+        None => state.config.allow_origin.as_deref(),
+    }
+}
+
 /// The shared request path: scope-check, register a waiter, send the command,
 /// and await the browser's reply (or time out).
 async fn dispatch(
     state: &AppState,
     req: ControlRequest,
 ) -> Result<ResponseEnvelope, (StatusCode, String)> {
-    auth::validate_outbound_url(&req.url, state.config.allow_origin.as_deref()).map_err(|_| {
+    auth::validate_outbound_url(&req.url, resolve_allow_origin(&req, state)).map_err(|_| {
         (
             StatusCode::FORBIDDEN,
             "outbound URL is cross-origin; pass --allow-origin to permit it".to_string(),
@@ -844,7 +870,7 @@ async fn start_stream(
     state: &AppState,
     req: ControlRequest,
 ) -> Result<(u16, BTreeMap<String, String>, StreamDriver), (StatusCode, String)> {
-    auth::validate_outbound_url(&req.url, state.config.allow_origin.as_deref()).map_err(|_| {
+    auth::validate_outbound_url(&req.url, resolve_allow_origin(&req, state)).map_err(|_| {
         (
             StatusCode::FORBIDDEN,
             "outbound URL is cross-origin; pass --allow-origin to permit it".to_string(),
@@ -1285,7 +1311,81 @@ mod tests {
             body: None,
             stream: false,
             target: None,
+            allow_origin: None,
         }
+    }
+
+    /// Builds a state whose `serve` global allow-origin is set, to prove a
+    /// per-request override wins over (and a missing one falls back to) it.
+    fn state_with_global_origin(global: Option<&str>) -> AppState {
+        let mut state = test_state();
+        let mut config = (*state.config).clone();
+        config.allow_origin = global.map(str::to_string);
+        state.config = Arc::new(config);
+        state
+    }
+
+    #[test]
+    fn resolve_allow_origin_prefers_per_request_override() {
+        let state = state_with_global_origin(Some("https://global.test"));
+        let req = ControlRequest {
+            allow_origin: Some("https://per-request.test".to_string()),
+            ..plain_request()
+        };
+        // The per-request value wins over the serve global.
+        assert_eq!(
+            resolve_allow_origin(&req, &state),
+            Some("https://per-request.test")
+        );
+        // A request carrying the override permits its matched cross-origin
+        // target, and still rejects an unmatched one.
+        assert_eq!(
+            auth::validate_outbound_url(
+                "https://per-request.test/x",
+                resolve_allow_origin(&req, &state)
+            ),
+            Ok(())
+        );
+        assert!(auth::validate_outbound_url(
+            "https://other.test/x",
+            resolve_allow_origin(&req, &state)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn resolve_allow_origin_falls_back_to_global() {
+        let state = state_with_global_origin(Some("https://global.test"));
+        let req = plain_request();
+        assert!(req.allow_origin.is_none());
+        // With no per-request override, the serve global governs the scope.
+        assert_eq!(
+            resolve_allow_origin(&req, &state),
+            Some("https://global.test")
+        );
+    }
+
+    #[test]
+    fn per_request_override_does_not_affect_ws_origin_gate() {
+        // The per-request override feeds only the outbound-URL check. The
+        // connection-time WS gate reads the `serve` global directly, so a tab on
+        // origin A stays connectable even when a request override permits B.
+        let state = state_with_global_origin(None);
+        let req = ControlRequest {
+            allow_origin: Some("https://b.test".to_string()),
+            ..plain_request()
+        };
+        // Outbound to B is permitted by the override...
+        assert_eq!(
+            auth::validate_outbound_url("https://b.test/x", resolve_allow_origin(&req, &state)),
+            Ok(())
+        );
+        // ...while the WS upgrade gate (serve global = None) still admits any
+        // origin, unchanged by the per-request value.
+        assert!(auth::ws_origin_allowed(
+            Some("https://a.test"),
+            state.config.allow_origin.as_deref()
+        ));
     }
 
     #[tokio::test]

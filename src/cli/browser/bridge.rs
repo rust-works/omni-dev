@@ -210,6 +210,7 @@ mod tests {
                 token_file: None,
                 stream: false,
                 target: None,
+                allow_origin: None,
             }),
         };
         assert!(cmd.execute().await.is_err());

@@ -59,6 +59,14 @@ pub struct RequestCommand {
     /// Required when more than one tab is connected.
     #[arg(long, value_name = "ID|ORIGIN")]
     pub target: Option<String>,
+
+    /// Permit a cross-origin outbound URL for this request only (e.g.
+    /// `https://static.xx.fbcdn.net`). Takes precedence over the bridge's
+    /// `serve --allow-origin` for this request's outbound-URL check, and does
+    /// not affect the tab's WebSocket connection. Omit for same-origin
+    /// (relative) requests.
+    #[arg(long, value_name = "URL")]
+    pub allow_origin: Option<String>,
 }
 
 impl RequestCommand {
@@ -75,6 +83,7 @@ impl RequestCommand {
             body,
             stream: self.stream,
             target: self.target,
+            allow_origin: self.allow_origin,
         };
 
         let endpoint = format!("http://127.0.0.1:{}/__bridge/request", self.control_port);
