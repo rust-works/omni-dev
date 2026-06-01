@@ -676,5 +676,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn envelope_to_response_passes_text_body_through() {
+        let env = ResponseEnvelope {
+            id: 1,
+            status: 200,
+            headers: BTreeMap::new(),
+            body: "hello".into(),
+            encoding: None,
+        };
+        assert_eq!(envelope_to_response(env).status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn envelope_to_response_rejects_invalid_base64() {
+        // `dispatch` validates base64 before this runs, so this path is only
+        // reachable defensively — assert it still fails closed with 502.
+        let env = ResponseEnvelope {
+            id: 1,
+            status: 200,
+            headers: BTreeMap::new(),
+            body: "not valid base64 @@@".into(),
+            encoding: Some("base64".into()),
+        };
+        assert_eq!(envelope_to_response(env).status(), StatusCode::BAD_GATEWAY);
+    }
+
     use futures::FutureExt;
 }

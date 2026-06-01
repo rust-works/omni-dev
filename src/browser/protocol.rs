@@ -183,20 +183,17 @@ mod tests {
             serde_json::from_str(r#"{"id":7,"status":200,"headers":{"a":"b"},"body":"hi"}"#)
                 .unwrap();
         assert_eq!(reply.id, 7);
-        match reply.outcome() {
-            ReplyOutcome::Success {
-                status,
-                headers,
-                body,
-                encoding,
-            } => {
-                assert_eq!(status, 200);
-                assert_eq!(headers.get("a").map(String::as_str), Some("b"));
-                assert_eq!(body, "hi");
-                assert_eq!(encoding, None);
-            }
-            ReplyOutcome::Error(_) => panic!("expected success"),
-        }
+        // `matches!` keeps the assertion to one expression so there is no
+        // never-taken `panic!` arm to register as an uncovered line.
+        assert!(
+            matches!(reply.outcome(),
+                ReplyOutcome::Success { status, headers, body, encoding }
+                    if status == 200
+                        && headers.get("a").map(String::as_str) == Some("b")
+                        && body == "hi"
+                        && encoding.is_none()),
+            "success reply must classify as Success with the expected fields"
+        );
     }
 
     #[test]
@@ -205,13 +202,14 @@ mod tests {
             r#"{"id":7,"status":200,"headers":{},"body":"iVBOR=","encoding":"base64"}"#,
         )
         .unwrap();
-        match reply.outcome() {
-            ReplyOutcome::Success { body, encoding, .. } => {
-                assert_eq!(body, "iVBOR=");
-                assert_eq!(encoding.as_deref(), Some("base64"));
-            }
-            ReplyOutcome::Error(_) => panic!("expected success"),
-        }
+        // `matches!` keeps the whole assertion on one expression so there is no
+        // never-taken `panic!` arm to register as an uncovered line.
+        assert!(
+            matches!(reply.outcome(),
+                ReplyOutcome::Success { body, encoding, .. }
+                    if body == "iVBOR=" && encoding.as_deref() == Some("base64")),
+            "base64 reply must classify as Success with its encoding preserved"
+        );
     }
 
     #[test]

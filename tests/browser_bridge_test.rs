@@ -404,9 +404,14 @@ async fn proxy_forwards_method_and_headers() {
 const BINARY_BYTES: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
 const BINARY_B64: &str = "iVBORw0KGgo=";
 
-/// Connects a fake browser that replies to every command with a base64-tagged
-/// binary body (`content-type: image/png`). Returns its task handle.
-fn spawn_binary_browser(ws_port: u16, token: String) -> tokio::task::JoinHandle<()> {
+/// Connects a fake browser that replies to every command with the given body
+/// and optional `encoding` tag (`content-type: image/png`). Returns its handle.
+fn spawn_reply_browser(
+    ws_port: u16,
+    token: String,
+    body: String,
+    encoding: Option<&'static str>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let uri = format!("ws://127.0.0.1:{ws_port}/").parse().unwrap();
         let request = ClientRequestBuilder::new(uri).with_sub_protocol(&token);
@@ -414,16 +419,23 @@ fn spawn_binary_browser(ws_port: u16, token: String) -> tokio::task::JoinHandle<
         let (mut sink, mut stream) = ws.split();
         while let Some(Ok(Message::Text(txt))) = stream.next().await {
             let cmd: Value = serde_json::from_str(&txt).unwrap();
-            let resp = serde_json::json!({
+            let mut resp = serde_json::json!({
                 "id": cmd["id"].as_u64().unwrap(),
                 "status": 200,
                 "headers": {"content-type": "image/png"},
-                "body": BINARY_B64,
-                "encoding": "base64",
+                "body": body,
             });
+            if let Some(enc) = encoding {
+                resp["encoding"] = Value::String(enc.to_string());
+            }
             sink.send(Message::Text(resp.to_string())).await.unwrap();
         }
     })
+}
+
+/// Connects a fake browser that replies with a base64-tagged binary body.
+fn spawn_binary_browser(ws_port: u16, token: String) -> tokio::task::JoinHandle<()> {
+    spawn_reply_browser(ws_port, token, BINARY_B64.to_string(), Some("base64"))
 }
 
 #[tokio::test]
@@ -484,24 +496,50 @@ async fn oversized_decoded_binary_body_is_rejected() {
     // but below the decoded response: "iVBO" is the base64 of a 3-byte group, so
     // repeating it 100× decodes to 300 bytes — comfortably over the cap.
     let (control_port, ws_port, token) = start_bridge_with(None, Duration::from_secs(5), 200).await;
-    let token2 = token.clone();
-    let _browser = tokio::spawn(async move {
-        let uri = format!("ws://127.0.0.1:{ws_port}/").parse().unwrap();
-        let request = ClientRequestBuilder::new(uri).with_sub_protocol(&token2);
-        let (ws, _r) = tokio_tungstenite::connect_async(request).await.unwrap();
-        let (mut sink, mut stream) = ws.split();
-        while let Some(Ok(Message::Text(txt))) = stream.next().await {
-            let cmd: Value = serde_json::from_str(&txt).unwrap();
-            let resp = serde_json::json!({
-                "id": cmd["id"].as_u64().unwrap(),
-                "status": 200,
-                "headers": {"content-type": "image/png"},
-                "body": "iVBO".repeat(100),
-                "encoding": "base64",
-            });
-            sink.send(Message::Text(resp.to_string())).await.unwrap();
-        }
-    });
+    let _browser = spawn_reply_browser(ws_port, token.clone(), "iVBO".repeat(100), Some("base64"));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (http, base, tok) = client(control_port, &token);
+
+    let resp = http
+        .post(format!("{base}/__bridge/request"))
+        .bearer_auth(&tok)
+        .header("x-omni-bridge", "1")
+        .json(&serde_json::json!({"url": "/x.png", "method": "GET"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 502);
+}
+
+#[tokio::test]
+async fn invalid_base64_body_is_rejected() {
+    // A base64-tagged body that isn't valid base64 fails closed with 502.
+    let (control_port, ws_port, token) = start_bridge(None, Duration::from_secs(5)).await;
+    let _browser = spawn_reply_browser(
+        ws_port,
+        token.clone(),
+        "@@@ not base64 @@@".into(),
+        Some("base64"),
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (http, base, tok) = client(control_port, &token);
+
+    let resp = http
+        .post(format!("{base}/__bridge/request"))
+        .bearer_auth(&tok)
+        .header("x-omni-bridge", "1")
+        .json(&serde_json::json!({"url": "/x.png", "method": "GET"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 502);
+}
+
+#[tokio::test]
+async fn unsupported_encoding_is_rejected() {
+    // An `encoding` the server doesn't understand (e.g. `gzip`) fails closed.
+    let (control_port, ws_port, token) = start_bridge(None, Duration::from_secs(5)).await;
+    let _browser = spawn_reply_browser(ws_port, token.clone(), "anything".into(), Some("gzip"));
     tokio::time::sleep(Duration::from_millis(100)).await;
     let (http, base, tok) = client(control_port, &token);
 
