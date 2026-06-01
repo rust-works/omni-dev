@@ -561,6 +561,12 @@ async fn oversized_decoded_binary_body_is_rejected() {
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 502);
+    // The message names the limit, the observed size, and steers toward paging.
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("--max-body-bytes"));
+    assert!(body.contains("200")); // the configured limit
+    assert!(body.contains("300")); // the observed decoded size
+    assert!(body.contains("page the request"));
 }
 
 #[tokio::test]
