@@ -444,4 +444,106 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(resolve_token(Some(&path)).unwrap(), "secret-token");
     }
+
+    // ── token resolution from env / file ─────────────────────────────
+    //
+    // `OMNI_BRIDGE_TOKEN` is process-global, so these tests serialise on a
+    // shared lock and snapshot/restore the variable around each case.
+
+    static TOKEN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Holds the env lock and restores `OMNI_BRIDGE_TOKEN` on drop.
+    struct TokenEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Option<String>,
+    }
+
+    impl TokenEnvGuard {
+        fn new() -> Self {
+            let lock = TOKEN_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let saved = std::env::var(TOKEN_ENV).ok();
+            std::env::remove_var(TOKEN_ENV);
+            Self { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for TokenEnvGuard {
+        fn drop(&mut self) {
+            match &self.saved {
+                Some(v) => std::env::set_var(TOKEN_ENV, v),
+                None => std::env::remove_var(TOKEN_ENV),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_token_reads_trimmed_env_var() {
+        let _g = TokenEnvGuard::new();
+        std::env::set_var(TOKEN_ENV, "  env-token  ");
+        assert_eq!(resolve_token(None).unwrap(), "env-token");
+    }
+
+    #[test]
+    fn resolve_token_generates_when_env_empty_or_absent() {
+        let _g = TokenEnvGuard::new();
+        // Absent → freshly generated (long, URL-safe).
+        let a = resolve_token(None).unwrap();
+        assert!(a.len() >= 40);
+        // Blank/whitespace env is ignored and also generates.
+        std::env::set_var(TOKEN_ENV, "   ");
+        let b = resolve_token(None).unwrap();
+        assert!(b.len() >= 40);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn resolve_existing_token_reads_env_var() {
+        let _g = TokenEnvGuard::new();
+        std::env::set_var(TOKEN_ENV, "client-token");
+        assert_eq!(resolve_existing_token(None).unwrap(), "client-token");
+    }
+
+    #[test]
+    fn resolve_existing_token_errors_without_source() {
+        let _g = TokenEnvGuard::new();
+        let err = resolve_existing_token(None).unwrap_err();
+        assert!(err.to_string().contains(TOKEN_ENV));
+    }
+
+    #[test]
+    fn resolve_existing_token_reads_file() {
+        let _g = TokenEnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tok");
+        std::fs::write(&path, "  file-token\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(resolve_existing_token(Some(&path)).unwrap(), "file-token");
+    }
+
+    #[test]
+    fn token_file_missing_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist");
+        assert!(resolve_token(Some(&path)).is_err());
+    }
+
+    #[test]
+    fn token_file_empty_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty");
+        std::fs::write(&path, "   \n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let err = resolve_token(Some(&path)).unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
 }
