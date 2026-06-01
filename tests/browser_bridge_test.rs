@@ -135,6 +135,35 @@ impl FakeBrowser {
         });
         Self { handle }
     }
+
+    /// Connects presenting an `Origin` header and echoes `tab:<tag>:<url>` for
+    /// each command, so multi-tab routing tests can assert *which* tab replied.
+    async fn connect_tagged(ws_port: u16, token: &str, origin: &str, tag: &str) -> Self {
+        let uri = format!("ws://127.0.0.1:{ws_port}/").parse().unwrap();
+        let request = ClientRequestBuilder::new(uri)
+            .with_sub_protocol(token)
+            .with_header("Origin", origin);
+        let (ws, _resp) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let (mut sink, mut stream) = ws.split();
+        let tag = tag.to_string();
+        let handle = tokio::spawn(async move {
+            while let Some(Ok(msg)) = stream.next().await {
+                if let Message::Text(txt) = msg {
+                    let cmd: Value = serde_json::from_str(&txt).unwrap();
+                    let id = cmd["id"].as_u64().unwrap();
+                    let body = format!("tab:{tag}:{}", cmd["url"].as_str().unwrap_or(""));
+                    let resp = serde_json::json!({
+                        "id": id,
+                        "status": 200,
+                        "headers": {"content-type": "text/plain"},
+                        "body": body,
+                    });
+                    sink.send(Message::Text(resp.to_string())).await.unwrap();
+                }
+            }
+        });
+        Self { handle }
+    }
 }
 
 impl Drop for FakeBrowser {
@@ -1208,4 +1237,205 @@ async fn cli_request_client_reports_bridge_error() {
         .await
         .unwrap();
     assert!(!out.status.success());
+}
+
+// ── Multi-tab connection routing (#908) ──────────────────────────────
+
+/// Fetches `/__bridge/status` and returns the parsed JSON body.
+async fn fetch_status(http: &reqwest::Client, base: &str, tok: &str) -> Value {
+    http.get(format!("{base}/__bridge/status"))
+        .bearer_auth(tok)
+        .header("x-omni-bridge", "1")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// Two authenticated tabs connect and both appear in status; neither evicts the
+/// other (the per-connection non-eviction guarantee).
+#[tokio::test]
+async fn two_tabs_coexist_in_status() {
+    let (control_port, ws_port, token) = start_bridge(None, Duration::from_secs(5)).await;
+    let _a = FakeBrowser::connect_tagged(ws_port, &token, "https://a.test", "A").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _b = FakeBrowser::connect_tagged(ws_port, &token, "https://b.test", "B").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (http, base, tok) = client(control_port, &token);
+
+    let body = fetch_status(&http, &base, &tok).await;
+    assert_eq!(body["connected"], Value::Bool(true));
+    let tabs = body["tabs"].as_array().unwrap();
+    assert_eq!(tabs.len(), 2);
+    let origins: Vec<&str> = tabs.iter().map(|t| t["origin"].as_str().unwrap()).collect();
+    assert!(origins.contains(&"https://a.test") && origins.contains(&"https://b.test"));
+    // `browser_origin` is ambiguous with two tabs, so it is omitted.
+    assert!(body.get("browser_origin").is_none() || body["browser_origin"].is_null());
+}
+
+/// With two tabs connected and no target, the request is rejected (409) and the
+/// message lists the connected tabs.
+#[tokio::test]
+async fn two_tabs_no_target_is_409() {
+    let (control_port, ws_port, token) = start_bridge(None, Duration::from_secs(5)).await;
+    let _a = FakeBrowser::connect_tagged(ws_port, &token, "https://a.test", "A").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _b = FakeBrowser::connect_tagged(ws_port, &token, "https://b.test", "B").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (http, base, tok) = client(control_port, &token);
+
+    let resp = http
+        .post(format!("{base}/__bridge/request"))
+        .bearer_auth(&tok)
+        .header("x-omni-bridge", "1")
+        .json(&serde_json::json!({"url": "/x", "method": "GET"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 409);
+}
+
+/// A request targeted by `Origin` routes to the matching tab.
+#[tokio::test]
+async fn route_by_origin_selects_the_right_tab() {
+    let (control_port, ws_port, token) = start_bridge(None, Duration::from_secs(5)).await;
+    let _a = FakeBrowser::connect_tagged(ws_port, &token, "https://a.test", "A").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _b = FakeBrowser::connect_tagged(ws_port, &token, "https://b.test", "B").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (http, base, tok) = client(control_port, &token);
+
+    // Via the `target` body field.
+    let resp = http
+        .post(format!("{base}/__bridge/request"))
+        .bearer_auth(&tok)
+        .header("x-omni-bridge", "1")
+        .json(&serde_json::json!({"url": "/p", "method": "GET", "target": "https://b.test"}))
+        .send()
+        .await
+        .unwrap();
+    let env: Value = resp.json().await.unwrap();
+    assert_eq!(env["body"], "tab:B:/p");
+}
+
+/// A request targeted by connection id (read from status) routes to that tab,
+/// supplied via the `X-Omni-Bridge-Target` header and the transparent proxy.
+#[tokio::test]
+async fn route_by_id_header_via_proxy() {
+    let (control_port, ws_port, token) = start_bridge(None, Duration::from_secs(5)).await;
+    let _a = FakeBrowser::connect_tagged(ws_port, &token, "https://a.test", "A").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _b = FakeBrowser::connect_tagged(ws_port, &token, "https://b.test", "B").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (http, base, tok) = client(control_port, &token);
+
+    // Learn which id maps to origin a.test from status.
+    let status = fetch_status(&http, &base, &tok).await;
+    let id_a = status["tabs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["origin"] == "https://a.test")
+        .unwrap()["id"]
+        .as_u64()
+        .unwrap();
+
+    let resp = http
+        .get(format!("{base}/proxied"))
+        .bearer_auth(&tok)
+        .header("x-omni-bridge", "1")
+        .header("x-omni-bridge-target", id_a.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "tab:A:/proxied");
+}
+
+/// An unknown connection id is a 404.
+#[tokio::test]
+async fn unknown_target_id_is_404() {
+    let (control_port, ws_port, token) = start_bridge(None, Duration::from_secs(5)).await;
+    let _a = FakeBrowser::connect_tagged(ws_port, &token, "https://a.test", "A").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (http, base, tok) = client(control_port, &token);
+
+    let resp = http
+        .post(format!("{base}/__bridge/request"))
+        .bearer_auth(&tok)
+        .header("x-omni-bridge", "1")
+        .json(&serde_json::json!({"url": "/x", "method": "GET", "target": "999"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+}
+
+/// A single connected tab still routes without a target (v1 back-compat), and
+/// status reports it via the legacy `browser_origin` field.
+#[tokio::test]
+async fn single_tab_back_compat() {
+    let (control_port, ws_port, token) = start_bridge(None, Duration::from_secs(5)).await;
+    let _a = FakeBrowser::connect_tagged(ws_port, &token, "https://only.test", "A").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (http, base, tok) = client(control_port, &token);
+
+    let status = fetch_status(&http, &base, &tok).await;
+    assert_eq!(status["browser_origin"], "https://only.test");
+    assert_eq!(status["tabs"].as_array().unwrap().len(), 1);
+
+    let resp = http
+        .post(format!("{base}/__bridge/request"))
+        .bearer_auth(&tok)
+        .header("x-omni-bridge", "1")
+        .json(&serde_json::json!({"url": "/x", "method": "GET"}))
+        .send()
+        .await
+        .unwrap();
+    let env: Value = resp.json().await.unwrap();
+    assert_eq!(env["body"], "tab:A:/x");
+}
+
+/// A malformed JSON body to `POST /__bridge/request` is rejected with 400.
+#[tokio::test]
+async fn request_invalid_json_body_is_400() {
+    let (control_port, _ws_port, token) = start_bridge(None, Duration::from_secs(5)).await;
+    let (http, base, tok) = client(control_port, &token);
+    let resp = http
+        .post(format!("{base}/__bridge/request"))
+        .bearer_auth(&tok)
+        .header("x-omni-bridge", "1")
+        .header("content-type", "application/json")
+        .body("not valid json {")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+}
+
+/// On `POST /__bridge/request`, the `X-Omni-Bridge-Target` header selects the
+/// tab and overrides a conflicting `target` body field.
+#[tokio::test]
+async fn request_target_header_overrides_body_field() {
+    let (control_port, ws_port, token) = start_bridge(None, Duration::from_secs(5)).await;
+    let _a = FakeBrowser::connect_tagged(ws_port, &token, "https://a.test", "A").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _b = FakeBrowser::connect_tagged(ws_port, &token, "https://b.test", "B").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (http, base, tok) = client(control_port, &token);
+
+    // Body targets A, header targets B; the header wins.
+    let resp = http
+        .post(format!("{base}/__bridge/request"))
+        .bearer_auth(&tok)
+        .header("x-omni-bridge", "1")
+        .header("x-omni-bridge-target", "https://b.test")
+        .json(&serde_json::json!({"url": "/p", "method": "GET", "target": "https://a.test"}))
+        .send()
+        .await
+        .unwrap();
+    let env: Value = resp.json().await.unwrap();
+    assert_eq!(env["body"], "tab:B:/p");
 }

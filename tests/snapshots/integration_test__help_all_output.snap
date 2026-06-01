@@ -1927,6 +1927,7 @@ Options:
       --control-port <CONTROL_PORT>  Control-plane port of the running bridge [default: 9998]
       --token-file <PATH>            Read the session token from this `0600` file instead of the environment
       --stream                       Stream the response: print body chunks to stdout as they arrive instead of buffering the whole response into one envelope. Use for SSE / chunked / long-lived endpoints
+      --target <ID|ORIGIN>           Route to a specific connected tab: a connection id (from `/__bridge/status`) or an `Origin` that uniquely matches one tab. Required when more than one tab is connected
   -h, --help                         Print help
 
 
