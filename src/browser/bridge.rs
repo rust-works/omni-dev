@@ -34,7 +34,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::browser::auth;
 use crate::browser::protocol::{
     BrowserFrame, BrowserReply, CancelCommand, Command, ControlRequest, ReplyOutcome,
-    ResponseEnvelope, StatusResponse, StreamItem, StreamLine,
+    ResponseEnvelope, StatusResponse, StreamItem, StreamLine, TabInfo,
 };
 use crate::browser::snippet;
 
@@ -144,10 +144,8 @@ impl Correlator {
     }
 }
 
-/// The single authenticated browser connection currently held.
+/// One authenticated browser connection in the registry.
 struct WsConn {
-    /// Unique id so a stale disconnect doesn't clear a newer connection.
-    conn_id: u64,
     /// Outbound message channel to this connection's writer task.
     sender: mpsc::UnboundedSender<Message>,
     /// The connecting tab's `Origin`, if it sent one.
@@ -160,7 +158,10 @@ struct AppState {
     token: Arc<String>,
     config: Arc<BridgeConfig>,
     correlator: Correlator,
-    ws: Arc<Mutex<Option<WsConn>>>,
+    /// Connected tabs keyed by connection id (the public routing selector). A
+    /// new authenticated connection never displaces an existing one — each lives
+    /// under its own key — so the non-eviction guarantee holds per-connection.
+    tabs: Arc<Mutex<HashMap<u64, WsConn>>>,
     in_flight: Arc<Semaphore>,
     conn_counter: Arc<AtomicU64>,
 }
@@ -196,7 +197,7 @@ pub async fn run(mut config: BridgeConfig, token: String) -> Result<()> {
         token: token.clone(),
         config: Arc::new(config.clone()),
         correlator: Correlator::new(),
-        ws: Arc::new(Mutex::new(None)),
+        tabs: Arc::new(Mutex::new(HashMap::new())),
         in_flight: Arc::new(Semaphore::new(config.max_concurrent)),
         conn_counter: Arc::new(AtomicU64::new(1)),
     };
@@ -324,12 +325,8 @@ async fn handle_ws_conn(stream: TcpStream, state: AppState) {
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
     {
-        let mut guard = state.ws.lock().await;
-        *guard = Some(WsConn {
-            conn_id,
-            sender: tx,
-            origin,
-        });
+        let mut guard = state.tabs.lock().await;
+        guard.insert(conn_id, WsConn { sender: tx, origin });
     }
 
     let (mut sink, mut read) = ws_stream.split();
@@ -346,9 +343,10 @@ async fn handle_ws_conn(stream: TcpStream, state: AppState) {
             Message::Text(txt) => match serde_json::from_str::<BrowserFrame>(&txt) {
                 Ok(frame) => {
                     // If a streamed response's control-plane consumer has gone,
-                    // tell the browser to cancel its reader so it stops fetching.
+                    // tell *this* browser (the one fetching it) to cancel its
+                    // reader so it stops fetching.
                     if let Some(cancel_id) = state.correlator.deliver(frame) {
-                        send_cancel(&state, cancel_id).await;
+                        send_cancel(&state, conn_id, cancel_id).await;
                     }
                 }
                 Err(e) => tracing::debug!("Unparseable browser frame: {e}"),
@@ -359,10 +357,9 @@ async fn handle_ws_conn(stream: TcpStream, state: AppState) {
     }
 
     writer.abort();
-    // Only clear the hub if it still points at *this* connection.
-    let mut guard = state.ws.lock().await;
-    if guard.as_ref().is_some_and(|c| c.conn_id == conn_id) {
-        *guard = None;
+    // Drop only this connection's registry entry (keyed by its unique id, so a
+    // reconnect under a new id is never clobbered).
+    if state.tabs.lock().await.remove(&conn_id).is_some() {
         tracing::info!("Browser disconnected (conn {conn_id})");
     }
 }
@@ -428,16 +425,27 @@ async fn guard(State(state): State<AppState>, request: Request, next: Next) -> R
 }
 
 async fn status_handler(State(state): State<AppState>) -> Json<StatusResponse> {
-    let (connected, browser_origin) = {
-        let guard = state.ws.lock().await;
-        match guard.as_ref() {
-            Some(conn) => (true, conn.origin.clone()),
-            None => (false, None),
-        }
+    let mut tabs: Vec<TabInfo> = {
+        let guard = state.tabs.lock().await;
+        guard
+            .iter()
+            .map(|(id, conn)| TabInfo {
+                id: *id,
+                origin: conn.origin.clone(),
+            })
+            .collect()
+    };
+    tabs.sort_by_key(|t| t.id);
+    // `browser_origin` is v1 back-compat: meaningful only when exactly one tab
+    // is connected; ambiguous (so `None`) for zero or several.
+    let browser_origin = match tabs.as_slice() {
+        [only] => only.origin.clone(),
+        _ => None,
     };
     Json(StatusResponse {
-        connected,
+        connected: !tabs.is_empty(),
         browser_origin,
+        tabs,
         pending: state.correlator.pending_count(),
     })
 }
@@ -445,13 +453,21 @@ async fn status_handler(State(state): State<AppState>) -> Json<StatusResponse> {
 /// `POST /__bridge/request` — full-fidelity control endpoint. A `stream: true`
 /// body returns an NDJSON stream (head line, `{seq,chunk}` lines, `{done}`);
 /// otherwise a single JSON response envelope.
-async fn request_handler(State(state): State<AppState>, body: Bytes) -> Response {
-    let req: ControlRequest = match serde_json::from_slice(&body) {
+async fn request_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response {
+    let mut req: ControlRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
             return (StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}")).into_response()
         }
     };
+    // The header, when present, overrides a `target` body field.
+    if let Some(target) = target_header(&headers) {
+        req.target = Some(target);
+    }
     if req.stream {
         return match start_stream(&state, req).await {
             Ok((status, headers, driver)) => ndjson_stream_response(status, headers, driver),
@@ -497,6 +513,7 @@ async fn proxy_handler(State(state): State<AppState>, request: Request) -> Respo
         headers,
         body,
         stream,
+        target: target_header(&parts.headers),
     };
 
     if stream {
@@ -548,6 +565,7 @@ fn forwardable_headers(headers: &axum::http::HeaderMap) -> BTreeMap<String, Stri
         "host",
         "authorization",
         auth::BRIDGE_HEADER,
+        auth::BRIDGE_TARGET_HEADER,
         "content-length",
         "connection",
         "accept-encoding",
@@ -568,6 +586,104 @@ fn forwardable_headers(headers: &axum::http::HeaderMap) -> BTreeMap<String, Stri
                 .map(|val| (name.to_string(), val.to_string()))
         })
         .collect()
+}
+
+/// Extracts the `X-Omni-Bridge-Target` selector from request headers, if present
+/// and non-empty.
+fn target_header(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get(auth::BRIDGE_TARGET_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Resolves which connected tab a request targets, returning its connection id
+/// and a clone of its outbound sender.
+///
+/// An explicit `target` is a connection id (canonical) or an `Origin` that
+/// uniquely matches one tab. With no target, routing succeeds only when exactly
+/// one tab is connected — otherwise the request is ambiguous and rejected.
+fn resolve_target(
+    tabs: &HashMap<u64, WsConn>,
+    target: Option<&str>,
+) -> Result<(u64, mpsc::UnboundedSender<Message>), (StatusCode, String)> {
+    if tabs.is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no browser connected".to_string(),
+        ));
+    }
+    let Some(sel) = target else {
+        // No target: route only when exactly one tab is connected.
+        let mut it = tabs.iter();
+        return match (it.next(), it.next()) {
+            (Some((id, conn)), None) => Ok((*id, conn.sender.clone())),
+            _ => Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "multiple tabs connected; select one with the X-Omni-Bridge-Target \
+                     header or a `target` field ({})",
+                    tab_list(tabs)
+                ),
+            )),
+        };
+    };
+
+    // A bare integer selects by connection id (canonical, unambiguous).
+    if let Ok(id) = sel.parse::<u64>() {
+        return match tabs.get(&id) {
+            Some(conn) => Ok((id, conn.sender.clone())),
+            None => Err((
+                StatusCode::NOT_FOUND,
+                format!(
+                    "no connected tab with id {id}; connected: {}",
+                    tab_list(tabs)
+                ),
+            )),
+        };
+    }
+
+    // Otherwise match the selector against tab origins.
+    let mut hits = tabs
+        .iter()
+        .filter(|(_, c)| c.origin.as_deref() == Some(sel));
+    match (hits.next(), hits.next()) {
+        (Some((id, conn)), None) => Ok((*id, conn.sender.clone())),
+        (None, _) => Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "no connected tab with origin {sel}; connected: {}",
+                tab_list(tabs)
+            ),
+        )),
+        (Some(_), Some(_)) => Err((
+            StatusCode::CONFLICT,
+            format!(
+                "origin {sel} matches multiple tabs; target by connection id ({})",
+                tab_list(tabs)
+            ),
+        )),
+    }
+}
+
+/// Renders the connected tabs as `id N: origin, …` (id-sorted) for error
+/// messages. Carries no authenticated data beyond the origin already in status.
+fn tab_list(tabs: &HashMap<u64, WsConn>) -> String {
+    let mut items: Vec<(u64, Option<&str>)> = tabs
+        .iter()
+        .map(|(id, c)| (*id, c.origin.as_deref()))
+        .collect();
+    items.sort_by_key(|(id, _)| *id);
+    items
+        .iter()
+        .map(|(id, origin)| match origin {
+            Some(o) => format!("id {id}: {o}"),
+            None => format!("id {id}"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The shared request path: scope-check, register a waiter, send the command,
@@ -620,16 +736,20 @@ async fn dispatch(
     };
 
     {
-        let guard = state.ws.lock().await;
-        match guard.as_ref() {
-            Some(conn) if conn.sender.send(Message::Text(frame)).is_ok() => {}
-            _ => {
+        let tabs = state.tabs.lock().await;
+        let (_conn_id, sender) = match resolve_target(&tabs, req.target.as_deref()) {
+            Ok(t) => t,
+            Err(e) => {
                 state.correlator.remove(id);
-                return Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "no browser connected".to_string(),
-                ));
+                return Err(e);
             }
+        };
+        if sender.send(Message::Text(frame)).is_err() {
+            state.correlator.remove(id);
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no browser connected".to_string(),
+            ));
         }
     }
 
@@ -695,15 +815,16 @@ async fn dispatch(
     }
 }
 
-/// Sends a best-effort cancellation frame to the connected browser and drops the
-/// pending stream, so a stream whose consumer is gone (or which tripped a limit)
-/// stops the in-page reader rather than fetching to completion.
-async fn send_cancel(state: &AppState, id: u64) {
+/// Sends a best-effort cancellation frame to the tab handling stream `id` and
+/// drops the pending stream, so a stream whose consumer is gone (or which
+/// tripped a limit) stops the in-page reader rather than fetching to completion.
+/// A no-op if that tab has since disconnected.
+async fn send_cancel(state: &AppState, conn_id: u64, id: u64) {
     state.correlator.remove(id);
     let Ok(frame) = serde_json::to_string(&CancelCommand::new(id)) else {
         return;
     };
-    if let Some(conn) = state.ws.lock().await.as_ref() {
+    if let Some(conn) = state.tabs.lock().await.get(&conn_id) {
         let _ = conn.sender.send(Message::Text(frame));
     }
 }
@@ -760,19 +881,24 @@ async fn start_stream(
         }
     };
 
-    {
-        let guard = state.ws.lock().await;
-        match guard.as_ref() {
-            Some(conn) if conn.sender.send(Message::Text(frame)).is_ok() => {}
-            _ => {
+    let conn_id = {
+        let tabs = state.tabs.lock().await;
+        let (conn_id, sender) = match resolve_target(&tabs, req.target.as_deref()) {
+            Ok(t) => t,
+            Err(e) => {
                 state.correlator.remove(id);
-                return Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "no browser connected".to_string(),
-                ));
+                return Err(e);
             }
+        };
+        if sender.send(Message::Text(frame)).is_err() {
+            state.correlator.remove(id);
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no browser connected".to_string(),
+            ));
         }
-    }
+        conn_id
+    };
 
     let idle = state.config.request_timeout;
     let (status, headers) = match tokio::time::timeout(idle, rx.recv()).await {
@@ -798,7 +924,7 @@ async fn start_stream(
             ));
         }
         Err(_) => {
-            send_cancel(state, id).await;
+            send_cancel(state, conn_id, id).await;
             return Err((
                 StatusCode::GATEWAY_TIMEOUT,
                 "browser did not start streaming in time".to_string(),
@@ -809,6 +935,7 @@ async fn start_stream(
     let driver = StreamDriver {
         state: state.clone(),
         id,
+        conn_id,
         rx,
         idle,
         max_body: state.config.max_body_bytes,
@@ -826,6 +953,8 @@ async fn start_stream(
 struct StreamDriver {
     state: AppState,
     id: u64,
+    /// Connection id of the tab serving this stream; cancels route back to it.
+    conn_id: u64,
     rx: mpsc::UnboundedReceiver<StreamItem>,
     idle: Duration,
     max_body: usize,
@@ -889,7 +1018,7 @@ impl StreamDriver {
     /// timeout, cap exceeded, or an undecodable chunk).
     async fn abort(&mut self) -> NextChunk {
         self.done = true;
-        send_cancel(&self.state, self.id).await;
+        send_cancel(&self.state, self.conn_id, self.id).await;
         NextChunk::End
     }
 }
@@ -1010,6 +1139,170 @@ mod tests {
             seq: None,
             done: None,
         }
+    }
+
+    /// Builds a `tabs` map entry with a detached sender (the receiver is dropped;
+    /// routing tests only assert *which* connection is chosen, not delivery).
+    fn tab(origin: Option<&str>) -> WsConn {
+        let (sender, _rx) = mpsc::unbounded_channel();
+        WsConn {
+            sender,
+            origin: origin.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn resolve_target_no_tabs_is_503() {
+        let tabs = HashMap::new();
+        let err = resolve_target(&tabs, None).unwrap_err();
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn resolve_target_single_tab_routes_without_target() {
+        let mut tabs = HashMap::new();
+        tabs.insert(1, tab(Some("https://a.test")));
+        let (id, _s) = resolve_target(&tabs, None).unwrap();
+        assert_eq!(id, 1);
+    }
+
+    #[test]
+    fn resolve_target_multiple_tabs_no_target_is_409() {
+        let mut tabs = HashMap::new();
+        tabs.insert(1, tab(Some("https://a.test")));
+        tabs.insert(2, tab(Some("https://b.test")));
+        let err = resolve_target(&tabs, None).unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        // The message lists both connected tabs to disambiguate.
+        assert!(err.1.contains("id 1") && err.1.contains("id 2"));
+    }
+
+    #[test]
+    fn resolve_target_by_connection_id() {
+        let mut tabs = HashMap::new();
+        tabs.insert(1, tab(Some("https://a.test")));
+        tabs.insert(2, tab(Some("https://b.test")));
+        let (id, _s) = resolve_target(&tabs, Some("2")).unwrap();
+        assert_eq!(id, 2);
+        // Unknown id is a 404.
+        assert_eq!(
+            resolve_target(&tabs, Some("9")).unwrap_err().0,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn resolve_target_by_unique_origin() {
+        let mut tabs = HashMap::new();
+        tabs.insert(1, tab(Some("https://a.test")));
+        tabs.insert(2, tab(Some("https://b.test")));
+        let (id, _s) = resolve_target(&tabs, Some("https://b.test")).unwrap();
+        assert_eq!(id, 2);
+        // Unknown origin is a 404.
+        assert_eq!(
+            resolve_target(&tabs, Some("https://nope.test"))
+                .unwrap_err()
+                .0,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn resolve_target_ambiguous_origin_is_409() {
+        let mut tabs = HashMap::new();
+        tabs.insert(1, tab(Some("https://a.test")));
+        tabs.insert(2, tab(Some("https://a.test")));
+        let err = resolve_target(&tabs, Some("https://a.test")).unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        // Two tabs share the origin → caller is told to target by id.
+        assert!(err.1.contains("connection id"));
+    }
+
+    #[test]
+    fn target_header_trims_and_drops_empty() {
+        let mut h = axum::http::HeaderMap::new();
+        assert_eq!(target_header(&h), None);
+        h.insert(auth::BRIDGE_TARGET_HEADER, "  2  ".parse().unwrap());
+        assert_eq!(target_header(&h).as_deref(), Some("2"));
+        h.insert(auth::BRIDGE_TARGET_HEADER, "   ".parse().unwrap());
+        assert_eq!(target_header(&h), None);
+    }
+
+    #[test]
+    fn tab_list_renders_id_with_and_without_origin() {
+        let mut tabs = HashMap::new();
+        tabs.insert(1, tab(Some("https://a.test")));
+        tabs.insert(2, tab(None));
+        // Id-sorted; a tab that sent no `Origin` renders as the bare id.
+        assert_eq!(tab_list(&tabs), "id 1: https://a.test, id 2");
+    }
+
+    /// A minimal [`AppState`] for exercising `dispatch` / `start_stream` without
+    /// a real WebSocket peer.
+    fn test_state() -> AppState {
+        AppState {
+            token: Arc::new("t".to_string()),
+            config: Arc::new(BridgeConfig {
+                ws_port: 0,
+                control_port: 0,
+                request_timeout: Duration::from_secs(5),
+                allow_origin: None,
+                max_body_bytes: 1024,
+                max_concurrent: 8,
+            }),
+            correlator: Correlator::new(),
+            tabs: Arc::new(Mutex::new(HashMap::new())),
+            in_flight: Arc::new(Semaphore::new(8)),
+            conn_counter: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    /// Inserts a tab whose writer receiver is already dropped, so any send to it
+    /// fails — modelling a tab that vanished between routing and dispatch.
+    async fn insert_dead_tab(state: &AppState, id: u64) {
+        let (sender, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        state.tabs.lock().await.insert(
+            id,
+            WsConn {
+                sender,
+                origin: None,
+            },
+        );
+    }
+
+    fn plain_request() -> ControlRequest {
+        ControlRequest {
+            url: "/x".to_string(),
+            method: "GET".to_string(),
+            headers: BTreeMap::new(),
+            body: None,
+            stream: false,
+            target: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_returns_503_when_send_fails() {
+        let state = test_state();
+        insert_dead_tab(&state, 1).await;
+        let err = dispatch(&state, plain_request()).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+        // The failed dispatch leaves no dangling waiter behind.
+        assert_eq!(state.correlator.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn start_stream_returns_503_when_send_fails() {
+        let state = test_state();
+        insert_dead_tab(&state, 1).await;
+        let req = ControlRequest {
+            stream: true,
+            ..plain_request()
+        };
+        let err = start_stream(&state, req).await.err().map(|e| e.0);
+        assert_eq!(err, Some(StatusCode::SERVICE_UNAVAILABLE));
+        assert_eq!(state.correlator.pending_count(), 0);
     }
 
     #[test]
