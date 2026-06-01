@@ -12,6 +12,16 @@ readme = "README.md"
 keywords = ["git", "commit", "conventional-commits", "development", "cli"]
 categories = ["development-tools", "command-line-utilities"]
 rust-version = "1.80.0"
+# Keep the published crate under crates.io's 10 MiB upload limit by dropping
+# assets that consumers of the library/binary do not need: the promo website,
+# social-preview images, scratch space, and the large binary voice fixtures
+# used only by the test suite (which crates.io consumers never run).
+exclude = [
+    "website/",
+    "assets/",
+    "scratch/",
+    "tests/fixtures/voice/",
+]
 
 [dependencies]
 clap = { version = "4.6", features = ["derive", "color"] }
