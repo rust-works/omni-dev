@@ -93,7 +93,7 @@ curl -H "Authorization: Bearer $T" -H "X-Omni-Bridge: 1" \
 | Method & path            | Purpose                                                                 |
 |--------------------------|-------------------------------------------------------------------------|
 | `GET  /__bridge/status`  | `{ "connected": bool, "browser_origin": str?, "pending": int }`         |
-| `POST /__bridge/request` | Full control. Body `{url, method, headers, body}`; returns a structured response envelope. Cross-origin `url` rejected unless `--allow-origin` permits it. |
+| `POST /__bridge/request` | Full control. Body `{url, method, headers, body, stream?}`; returns a structured response envelope, or — when `"stream": true` — an NDJSON chunk stream (see [Streaming](#streaming-responses)). Cross-origin `url` rejected unless `--allow-origin` permits it. |
 
 ```bash
 curl -s -H "Authorization: Bearer $T" -H "X-Omni-Bridge: 1" \
@@ -123,6 +123,14 @@ Binary responses (images, gzipped blobs, file downloads) come back in the
 envelope as a base64 string with `"encoding": "base64"`; the caller decodes it.
 The transparent proxy (below) decodes automatically, so `curl` receives the raw
 bytes — pipe straight to a file with `--output`.
+
+Pass `--stream` to consume a streaming / chunked / long-lived endpoint (SSE,
+log-tail) instead of buffering the whole response: the decoded body bytes are
+written to stdout as they arrive, and the head status is printed to stderr.
+
+```bash
+omni-dev browser request --stream --url /events | your-consumer   # SSE / chunked
+```
 
 ## Security model
 
@@ -187,8 +195,8 @@ bridge runs.
 | `--token-file <PATH>` | — | Read the session token from this `0600` file instead of generating one. |
 
 The `request` subcommand takes `--url`, `--method` (default `GET`),
-`--header` (repeatable), `--body` (`@file` supported), `--control-port`
-(default `9998`), and `--token-file`.
+`--header` (repeatable), `--body` (`@file` supported), `--stream` (chunk the
+response to stdout), `--control-port` (default `9998`), and `--token-file`.
 
 ## Random ports
 
@@ -220,9 +228,11 @@ curl "${H[@]}" 'http://localhost:9998/api/datasources/proxy/uid/<DS_UID>/loki/ap
 ```
 
 Pagination is client-side: query `direction=backward`, take the oldest returned
-timestamp as the next `end`, repeat until empty. Keep each page modest — the
-bridge buffers full bodies under `--request-timeout`. The
-`POST /api/ds/query` form is also supported via
+timestamp as the next `end`, repeat until empty. Keep each buffered page modest —
+the bridge buffers full bodies under `--request-timeout`. For genuinely streaming
+endpoints (Grafana Live, SSE, chunked APIs), opt into streaming with `--stream` /
+`?__stream=1` (see [Streaming responses](#streaming-responses)) instead of
+paginating. The `POST /api/ds/query` form is also supported via
 `omni-dev browser request --method POST`.
 
 ## WebSocket wire protocol
@@ -254,6 +264,40 @@ tagging the frame with `"encoding": "base64"`. Text bodies omit `encoding`
 {"id": 7, "error": "Failed to fetch"}
 ```
 
+### Streaming responses
+
+When a request opts in (`stream: true` on `POST /__bridge/request`, `--stream` on
+the thin client, or `?__stream=1` on the transparent proxy), the server sends
+`{… "stream": true}` in the command and the snippet reads
+`response.body.getReader()`, emitting **a head frame, then one base64 chunk frame
+per read, then a terminator** instead of a single buffered reply:
+
+```json
+{"id": 7, "status": 200, "headers": {"content-type": "text/event-stream"}, "stream": true}
+{"id": 7, "seq": 0, "chunk": "ZGF0YTogMQ=="}
+{"id": 7, "seq": 1, "chunk": "ZGF0YTogMg=="}
+{"id": 7, "done": true}
+```
+
+The server streams the body out as it arrives:
+
+- **Transparent proxy** (`?__stream=1`) → the decoded bytes as a native chunked
+  HTTP body (curl-friendly: `curl -N … '/events?__stream=1'`).
+- **`POST /__bridge/request`** (`"stream": true`) → an NDJSON body
+  (`application/x-ndjson`): a `{status,headers}` head line, `{seq,chunk}` lines,
+  then a `{done:true}` line.
+
+For a stream, **`--request-timeout` is an inter-chunk idle timeout** (reset on
+each chunk, not a total deadline) and **`--max-body-bytes` is a cumulative
+ceiling** across all chunks; either limit ending the stream sends the browser a
+`{"id": 7, "cancel": true}` frame so it stops its reader. The browser also
+receives a cancel when the control-plane consumer disconnects mid-stream.
+
+**Server → browser (cancel):**
+```json
+{"id": 7, "cancel": true}
+```
+
 Rules:
 - `id` is assigned by the server; the browser echoes it back unchanged.
 - Multiple commands may be in flight concurrently over one socket (id-keyed).
@@ -271,6 +315,9 @@ Rules:
   URLs) is unaffected; cross-origin targets depend on their
   `Access-Control-Allow-Origin`.
 - The bridge works only while the tab is open and the snippet is running.
-- Remaining limitations: full response bodies are buffered (no
-  streaming/chunked transfer), a single browser tab, and no stdin/stdout piping.
-  Binary bodies *are* supported (base64; see the wire protocol above).
+- Streaming reads the body ahead of the consumer: memory is bounded by
+  `--max-body-bytes` (cumulative), but there is no socket-level backpressure to
+  the browser's `getReader()` — a fast producer with a slow consumer is capped,
+  not throttled.
+- Remaining limitations: a single browser tab and no stdin piping. Binary bodies
+  *and* streaming/chunked responses are supported (see the wire protocol above).
