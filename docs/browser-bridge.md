@@ -119,6 +119,11 @@ omni-dev browser request --url /api/foo --header "Accept: application/json"
 
 `--body @file` reads the body from a file; otherwise the value is sent verbatim.
 
+Binary responses (images, gzipped blobs, file downloads) come back in the
+envelope as a base64 string with `"encoding": "base64"`; the caller decodes it.
+The transparent proxy (below) decodes automatically, so `curl` receives the raw
+bytes — pipe straight to a file with `--output`.
+
 ## Security model
 
 The trust boundary, stated once: **a request is trusted only if it presents the
@@ -215,8 +220,8 @@ curl "${H[@]}" 'http://localhost:9998/api/datasources/proxy/uid/<DS_UID>/loki/ap
 ```
 
 Pagination is client-side: query `direction=backward`, take the oldest returned
-timestamp as the next `end`, repeat until empty. Keep each page modest — v1
-buffers full bodies (`resp.text()`) under `--request-timeout`. The
+timestamp as the next `end`, repeat until empty. Keep each page modest — the
+bridge buffers full bodies under `--request-timeout`. The
 `POST /api/ds/query` form is also supported via
 `omni-dev browser request --method POST`.
 
@@ -229,10 +234,20 @@ Newline-free JSON frames, correlated by a monotonic integer `id`.
 {"id": 7, "url": "/loki/api/v1/labels", "method": "GET", "headers": {}, "body": null}
 ```
 
-**Browser → server (success):**
+**Browser → server (success, text):**
 ```json
 {"id": 7, "status": 200, "headers": {"content-type": "application/json"}, "body": "..."}
 ```
+
+**Browser → server (success, binary):**
+```json
+{"id": 7, "status": 200, "headers": {"content-type": "image/png"}, "body": "iVBORw0K…", "encoding": "base64"}
+```
+
+The snippet reads non-text bodies (anything whose `Content-Type` is not
+`text/*`, JSON, XML, or JavaScript) via `arrayBuffer()` and base64-encodes them,
+tagging the frame with `"encoding": "base64"`. Text bodies omit `encoding`
+(back-compat). `--max-body-bytes` is enforced against the **decoded** size.
 
 **Browser → server (error):**
 ```json
@@ -256,5 +271,6 @@ Rules:
   URLs) is unaffected; cross-origin targets depend on their
   `Access-Control-Allow-Origin`.
 - The bridge works only while the tab is open and the snippet is running.
-- v1 limitations: full response bodies are buffered (no streaming), text bodies
-  only (no binary), a single browser tab, and no stdin/stdout piping.
+- Remaining limitations: full response bodies are buffered (no
+  streaming/chunked transfer), a single browser tab, and no stdin/stdout piping.
+  Binary bodies *are* supported (base64; see the wire protocol above).

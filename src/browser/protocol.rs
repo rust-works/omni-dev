@@ -70,9 +70,14 @@ pub struct BrowserReply {
     /// Response headers on success.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub headers: Option<BTreeMap<String, String>>,
-    /// Response body on success.
+    /// Response body on success. Plain text unless [`Self::encoding`] tags it.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub body: Option<String>,
+    /// Body transfer encoding. `Some("base64")` when the browser read a
+    /// non-text body via `arrayBuffer()` and base64-encoded it; absent (the
+    /// default) means `body` is plain text, for back-compat with v1.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub encoding: Option<String>,
     /// Error message when the browser `fetch()` failed.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub error: Option<String>,
@@ -86,8 +91,10 @@ pub enum ReplyOutcome {
         status: u16,
         /// Response headers.
         headers: BTreeMap<String, String>,
-        /// Response body.
+        /// Response body (base64-encoded when `encoding` is `Some("base64")`).
         body: String,
+        /// Body transfer encoding (`Some("base64")` for binary bodies).
+        encoding: Option<String>,
     },
     /// The browser reported a `fetch()` failure.
     Error(String),
@@ -105,6 +112,7 @@ impl BrowserReply {
                 status: self.status.unwrap_or(0),
                 headers: self.headers.unwrap_or_default(),
                 body: self.body.unwrap_or_default(),
+                encoding: self.encoding,
             },
         }
     }
@@ -120,8 +128,13 @@ pub struct ResponseEnvelope {
     pub status: u16,
     /// Response headers returned by the browser.
     pub headers: BTreeMap<String, String>,
-    /// Response body returned by the browser.
+    /// Response body returned by the browser. Base64-encoded when
+    /// [`Self::encoding`] is `Some("base64")`; the caller decodes it.
     pub body: String,
+    /// Body transfer encoding. `Some("base64")` for binary bodies; absent (the
+    /// default) means `body` is plain text.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub encoding: Option<String>,
 }
 
 /// `GET /__bridge/status` response body.
@@ -170,18 +183,60 @@ mod tests {
             serde_json::from_str(r#"{"id":7,"status":200,"headers":{"a":"b"},"body":"hi"}"#)
                 .unwrap();
         assert_eq!(reply.id, 7);
-        match reply.outcome() {
-            ReplyOutcome::Success {
-                status,
-                headers,
-                body,
-            } => {
-                assert_eq!(status, 200);
-                assert_eq!(headers.get("a").map(String::as_str), Some("b"));
-                assert_eq!(body, "hi");
-            }
-            ReplyOutcome::Error(_) => panic!("expected success"),
-        }
+        // `matches!` keeps the assertion to one expression so there is no
+        // never-taken `panic!` arm to register as an uncovered line.
+        assert!(
+            matches!(reply.outcome(),
+                ReplyOutcome::Success { status, headers, body, encoding }
+                    if status == 200
+                        && headers.get("a").map(String::as_str) == Some("b")
+                        && body == "hi"
+                        && encoding.is_none()),
+            "success reply must classify as Success with the expected fields"
+        );
+    }
+
+    #[test]
+    fn base64_reply_carries_encoding_through_outcome() {
+        let reply: BrowserReply = serde_json::from_str(
+            r#"{"id":7,"status":200,"headers":{},"body":"iVBOR=","encoding":"base64"}"#,
+        )
+        .unwrap();
+        // `matches!` keeps the whole assertion on one expression so there is no
+        // never-taken `panic!` arm to register as an uncovered line.
+        assert!(
+            matches!(reply.outcome(),
+                ReplyOutcome::Success { body, encoding, .. }
+                    if body == "iVBOR=" && encoding.as_deref() == Some("base64")),
+            "base64 reply must classify as Success with its encoding preserved"
+        );
+    }
+
+    #[test]
+    fn text_reply_omits_encoding_on_serialise() {
+        let reply = BrowserReply {
+            id: 1,
+            status: Some(200),
+            headers: None,
+            body: Some("hi".into()),
+            encoding: None,
+            error: None,
+        };
+        let json = serde_json::to_string(&reply).unwrap();
+        assert!(!json.contains("encoding"));
+    }
+
+    #[test]
+    fn envelope_omits_encoding_when_text() {
+        let env = ResponseEnvelope {
+            id: 1,
+            status: 200,
+            headers: BTreeMap::new(),
+            body: "hi".into(),
+            encoding: None,
+        };
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(!json.contains("encoding"));
     }
 
     #[test]
