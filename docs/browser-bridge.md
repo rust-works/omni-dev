@@ -94,7 +94,7 @@ curl -H "Authorization: Bearer $T" -H "X-Omni-Bridge: 1" \
 | Method & path            | Purpose                                                                 |
 |--------------------------|-------------------------------------------------------------------------|
 | `GET  /__bridge/status`  | `{ "connected": bool, "browser_origin": str?, "tabs": [{id, origin?}], "pending": int }`. `tabs` lists every connected tab; `browser_origin` is the lone tab's origin (present only when exactly one is connected, for back-compat). |
-| `POST /__bridge/request` | Full control. Body `{url, method, headers, body, stream?, target?}`; returns a structured response envelope, or — when `"stream": true` — an NDJSON chunk stream (see [Streaming](#streaming-responses)). Cross-origin `url` rejected unless `--allow-origin` permits it. See [Routing to a tab](#routing-to-a-specific-tab) for `target`. |
+| `POST /__bridge/request` | Full control. Body `{url, method, headers, body, stream?, target?, allow_origin?}`; returns a structured response envelope, or — when `"stream": true` — an NDJSON chunk stream (see [Streaming](#streaming-responses)). Cross-origin `url` rejected unless `serve --allow-origin` or the per-request `allow_origin` permits it (see [Outbound request scope](#outbound-request-scope-default-closed)). See [Routing to a tab](#routing-to-a-specific-tab) for `target`. |
 
 ```bash
 curl -s -H "Authorization: Bearer $T" -H "X-Omni-Bridge: 1" \
@@ -216,6 +216,18 @@ bridge runs.
 - **Relative URLs only by default** (resolved against the page origin).
   Absolute / cross-origin URLs are rejected unless explicitly enabled with
   `--allow-origin <url>`.
+- The `serve --allow-origin` global feeds **two** checks at different times: the
+  WebSocket **upgrade** gate (the *extension's* origin, at connection time) and
+  the per-request outbound-URL check (the *target's* origin). To widen the
+  outbound scope for a single request **without** disturbing the connected tab,
+  pass `request --allow-origin <url>` instead: it reaches only the outbound-URL
+  check, takes precedence over the global for that request, and never the WS
+  gate. A WARN is logged at dispatch whenever the per-request override is used.
+- **Security note:** a per-request override lets a session-token holder direct
+  the tab's `fetch` at an arbitrary cross-origin URL. Blast radius is bounded by
+  the browser's own CORS (the response body is readable only if the target sends
+  permissive CORS), and a token holder can already issue authenticated
+  same-origin requests. It is **per-request and explicit** — never a default.
 
 ### Resource & robustness limits
 - Per-request timeout (`--request-timeout`, default 30s → `504`), max response
@@ -248,8 +260,10 @@ bridge runs.
 The `request` subcommand takes `--url`, `--method` (default `GET`),
 `--header` (repeatable), `--body` (`@file` supported), `--stream` (chunk the
 response to stdout), `--target` (route to a connection id / origin — see
-[Routing to a specific tab](#routing-to-a-specific-tab)), `--control-port`
-(default `9998`), and `--token-file`.
+[Routing to a specific tab](#routing-to-a-specific-tab)), `--allow-origin`
+(permit a cross-origin outbound URL for this request only — see
+[Outbound request scope](#outbound-request-scope-default-closed)),
+`--control-port` (default `9998`), and `--token-file`.
 
 ## Random ports
 
