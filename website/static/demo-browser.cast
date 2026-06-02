@@ -1,0 +1,11 @@
+{"version": 2, "width": 100, "height": 32, "timestamp": 1779550900, "idle_time_limit": 1.5, "command": "bash browser/demo.sh", "env": {"SHELL": "/bin/zsh"}}
+[0.025, "o", "\u001b[1;36m$\u001b[0m omni-dev browser bridge serve &\r\n"]
+[0.55, "o", "omni-dev browser bridge  ·  control \u001b[33m127.0.0.1:9998\u001b[0m  ·  ws \u001b[33m127.0.0.1:9999\u001b[0m\r\n"]
+[0.7, "o", "   session token exported to \u001b[33mOMNI_BRIDGE_TOKEN\u001b[0m\r\n   → paste the printed snippet into the DevTools console on your authenticated tab\r\n"]
+[2.1, "o", "\u001b[32m✓\u001b[0m tab connected  (id 1, https://grafana.internal)\r\n\r\n"]
+[2.4, "o", "\u001b[1;36m$\u001b[0m omni-dev browser bridge request --url /api/datasources | jq '.status, (.body|fromjson)'\r\n"]
+[3.6, "o", "200\r\n[\r\n  {\r\n    \"type\": \"loki\",\r\n    \"uid\": \"P8E80F9AEF\"\r\n  }\r\n]\r\n\r\n"]
+[4.2, "o", "\u001b[1;36m$\u001b[0m omni-dev browser bridge request \\\r\n    --url '/api/datasources/proxy/uid/P8E80F9AEF/loki/api/v1/labels' | jq '.body|fromjson|.data'\r\n"]
+[5.6, "o", "[\r\n  \"app\",\r\n  \"level\",\r\n  \"namespace\",\r\n  \"pod\"\r\n]\r\n\r\n"]
+[6.2, "o", "\u001b[90m# same-origin, fully authenticated — the bridge never saw the session cookie\u001b[0m\r\n"]
+[8.2, "o", ""]

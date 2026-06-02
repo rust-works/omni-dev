@@ -21,6 +21,7 @@
     <li><strong>Safe amendments</strong> &mdash; improve single or batched commit messages with working-directory validation.</li>
     <li><strong>PR creation</strong> &mdash; generate complete pull request descriptions in one command.</li>
     <li><strong>Atlassian integration</strong> &mdash; read and write Jira issues and Confluence pages, with JFM &harr; ADF conversion.</li>
+    <li><strong>Browser bridge</strong> &mdash; drive authenticated HTTP requests through a logged-in browser tab without exfiltrating its cookies or tokens.</li>
     <li><strong>MCP server</strong> &mdash; drop omni-dev's capabilities into Claude Code via the bundled MCP binary.</li>
   </ul>
 </section>
@@ -40,7 +41,7 @@
 <section id="demo" class="demo-wide">
   <h2>Demo</h2>
   <p class="demo-caption">
-    Four short asciicasts &mdash; each paired with the artefact it produces.
+    Five short asciicasts &mdash; each paired with the artefact it produces.
     The source for every cast lives at
     <a href="https://github.com/rust-works/omni-dev-demo">rust-works/omni-dev-demo</a>.
   </p>
@@ -50,6 +51,7 @@
     <button class="tab"           role="tab" id="tab-confluence" aria-selected="false" aria-controls="panel-confluence" data-tab="confluence" tabindex="-1">Confluence</button>
     <button class="tab"           role="tab" id="tab-pr"         aria-selected="false" aria-controls="panel-pr"         data-tab="pr"         tabindex="-1">Create PR</button>
     <button class="tab"           role="tab" id="tab-twiddle"    aria-selected="false" aria-controls="panel-twiddle"    data-tab="twiddle"    tabindex="-1">Twiddle commits</button>
+    <button class="tab"           role="tab" id="tab-browser"    aria-selected="false" aria-controls="panel-browser"    data-tab="browser"    tabindex="-1">Browser bridge</button>
   </div>
 
   <div class="tab-panel is-active" role="tabpanel" id="panel-jira" aria-labelledby="tab-jira" data-panel="jira">
@@ -131,6 +133,42 @@
       </div>
     </div>
   </div>
+
+  <div class="tab-panel" role="tabpanel" id="panel-browser" aria-labelledby="tab-browser" data-panel="browser" hidden>
+    <p class="panel-caption">
+      <code>omni-dev browser bridge serve</code> runs a local server that drives
+      <code>fetch()</code> calls <em>inside</em> an authenticated browser tab &mdash;
+      so requests carry the tab&apos;s SSO session, but the cookies and tokens never
+      leave the browser. Here it pulls a Loki datasource and its labels straight out
+      of a logged-in Grafana, with no API keys to manage. A <em>confused deputy by
+      design</em>; the <a href="https://github.com/rust-works/omni-dev/blob/main/docs/browser-bridge.md">security model</a>
+      is the load-bearing part.
+    </p>
+    <div class="demo-grid">
+      <div class="demo-cast"><div id="cast-browser" class="asciinema-player-wrap"></div></div>
+      <div class="demo-renders">
+        <figure>
+          <div class="console-shot" aria-label="DevTools console on the authenticated Grafana tab">
+            <div class="console-bar">
+              <span class="console-dot dot-red"></span>
+              <span class="console-dot dot-amber"></span>
+              <span class="console-dot dot-green"></span>
+              <span class="console-title">grafana.internal &mdash; DevTools &rsaquo; Console</span>
+            </div>
+<pre class="console-body"><span class="c-prompt">&gt;</span> <span class="c-dim">(async () =&gt; { /* omni-dev bridge snippet */ })()</span>
+<span class="c-reply">&lt; Promise {&lt;pending&gt;}</span>
+<span class="c-ok">[omni-bridge]</span> connected to ws://127.0.0.1:9999
+<span class="c-ok">[omni-bridge]</span> authenticated &middot; origin https://grafana.internal
+<span class="c-dim">[omni-bridge]</span> GET /api/datasources &rarr; <span class="c-200">200</span> (1 datasource)
+<span class="c-dim">[omni-bridge]</span> GET &hellip;/loki/api/v1/labels &rarr; <span class="c-200">200</span> (4 labels)</pre>
+          </div>
+          <figcaption>The pasted snippet runs in-page, so every request inherits the tab&apos;s
+            <code>grafana_session</code> cookie and passes CSRF &mdash; while the bridge
+            process only ever sees the response bodies, never the credentials.</figcaption>
+        </figure>
+      </div>
+    </div>
+  </div>
 </section>
 {% endblock %}
 
@@ -141,7 +179,8 @@
       jira:       '{{ get_url(path="demo-jira.cast") }}',
       confluence: '{{ get_url(path="demo-confluence.cast") }}',
       pr:         '{{ get_url(path="demo-pr.cast") }}',
-      twiddle:    '{{ get_url(path="demo-twiddle.cast") }}'
+      twiddle:    '{{ get_url(path="demo-twiddle.cast") }}',
+      browser:    '{{ get_url(path="demo-browser.cast") }}'
     };
     const players = {};
 
