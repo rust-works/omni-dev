@@ -19,18 +19,38 @@
 //! Oculus YouTube app, and refresh `INNERTUBE_API_KEY` if the
 //! ANDROID-family key starts being rejected.
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::transcript::error::Result;
 
 /// Path appended to the `base_url` for the `/player` POST.
 pub(crate) const PLAYER_PATH: &str = "/youtubei/v1/player";
 
+/// Path appended to the `base_url` for the `/browse` POST. Used to enumerate
+/// a channel's uploads (see [`super::channel`]). Unlike `/player`, browse uses
+/// the **WEB** client (see [`web_client_context`]): only the WEB grid is
+/// paginated (continuation tokens) and carries the `richGridRenderer` /
+/// `lockupViewModel` shape the channel parser reads. The `ANDROID_VR` client
+/// returns an unpaginated `compactVideoRenderer` mobile shape instead.
+pub(crate) const BROWSE_PATH: &str = "/youtubei/v1/browse";
+
 /// Public InnerTube API key for the ANDROID-family clients (including
 /// `ANDROID_VR`). Sent as the `X-Goog-Api-Key` header — YouTube returns
 /// 400 for the legacy `?key=` query form on modern `/player` paths.
 /// Embedded in the public Oculus YouTube app binary; not a credential.
 pub(crate) const INNERTUBE_API_KEY: &str = "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w";
+
+/// Public InnerTube API key for the `WEB` client, used by the channel
+/// [`fetch_browse`] path. Like [`INNERTUBE_API_KEY`], it is embedded in the
+/// public web app and is not a credential.
+pub(crate) const WEB_INNERTUBE_API_KEY: &str = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+
+/// `client.clientName` for the WEB browse client.
+pub(crate) const WEB_CLIENT_NAME: &str = "WEB";
+
+/// `client.clientVersion` for the WEB browse client. Browse is not bot-gated
+/// the way `/player` is, so this need only be recent enough to be accepted.
+pub(crate) const WEB_CLIENT_VERSION: &str = "2.20240101.00.00";
 
 /// `client.clientName`.
 pub(crate) const CLIENT_NAME: &str = "ANDROID_VR";
@@ -58,6 +78,67 @@ pub(crate) const OS_VERSION: &str = "12L";
 /// param; modern YouTube `/player` paths reject the latter with HTTP 400.
 const API_KEY_HEADER: &str = "X-Goog-Api-Key";
 
+/// The `context.client` object pinned to the `ANDROID_VR` fingerprint and
+/// carrying the scraped `visitorData` token. Shared by every InnerTube POST
+/// ([`fetch_player_response`], [`fetch_browse`]) so the device fingerprint
+/// and bot-bypass token stay identical across endpoints.
+pub(crate) fn client_context(visitor_data: &str) -> Value {
+    json!({
+        "client": {
+            "clientName": CLIENT_NAME,
+            "clientVersion": CLIENT_VERSION,
+            "androidSdkVersion": ANDROID_SDK_VERSION,
+            "deviceMake": DEVICE_MAKE,
+            "deviceModel": DEVICE_MODEL,
+            "osName": OS_NAME,
+            "osVersion": OS_VERSION,
+            "hl": "en",
+            "gl": "US",
+            "visitorData": visitor_data,
+        },
+    })
+}
+
+/// The `context.client` object for the **WEB** client used by channel browse.
+/// Carries no device fingerprint or `visitorData` — browse is a public,
+/// non-bot-gated endpoint, unlike `/player`.
+pub(crate) fn web_client_context() -> Value {
+    json!({
+        "client": {
+            "clientName": WEB_CLIENT_NAME,
+            "clientVersion": WEB_CLIENT_VERSION,
+            "hl": "en",
+            "gl": "US",
+        },
+    })
+}
+
+/// POST `body` to the InnerTube `/browse` endpoint and return the raw body.
+///
+/// Callers build `body` with a WEB `context` (see [`web_client_context`]) plus
+/// either a `browseId` (first page) or a `continuation` token (subsequent
+/// pages); [`super::channel`] feeds the result to its `lockupViewModel` /
+/// continuation parser. Sent with the WEB API key — the ANDROID key returns
+/// the unpaginated mobile shape.
+///
+/// `base_url` is normally `https://www.youtube.com`; tests inject a
+/// `wiremock::MockServer::uri()` instead.
+pub async fn fetch_browse(http: &reqwest::Client, base_url: &str, body: &Value) -> Result<String> {
+    let url = format!(
+        "{base}{path}",
+        base = base_url.trim_end_matches('/'),
+        path = BROWSE_PATH,
+    );
+    let response = http
+        .post(&url)
+        .header(API_KEY_HEADER, WEB_INNERTUBE_API_KEY)
+        .json(body)
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(response.text().await?)
+}
+
 /// POST `videoId` to the InnerTube `/player` endpoint at `base_url` and
 /// return the raw response body. Callers feed the body to
 /// [`super::player_response::parse`].
@@ -80,20 +161,7 @@ pub async fn fetch_player_response(
         path = PLAYER_PATH,
     );
     let body = json!({
-        "context": {
-            "client": {
-                "clientName": CLIENT_NAME,
-                "clientVersion": CLIENT_VERSION,
-                "androidSdkVersion": ANDROID_SDK_VERSION,
-                "deviceMake": DEVICE_MAKE,
-                "deviceModel": DEVICE_MODEL,
-                "osName": OS_NAME,
-                "osVersion": OS_VERSION,
-                "hl": "en",
-                "gl": "US",
-                "visitorData": visitor_data,
-            },
-        },
+        "context": client_context(visitor_data),
         "videoId": video_id,
         "contentCheckOk": true,
         "racyCheckOk": true,
@@ -257,6 +325,55 @@ mod tests {
         let _ = fetch_player_response(&http(), &server.uri(), VIDEO_ID, VISITOR_DATA)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn browse_posts_to_browse_endpoint_with_web_key_and_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(BROWSE_PATH))
+            .and(header(API_KEY_HEADER, WEB_INNERTUBE_API_KEY))
+            .and(body_partial_json(json!({
+                "browseId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+                "context": { "client": { "clientName": WEB_CLIENT_NAME } },
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"ok":true}"#))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let body = json!({
+            "context": web_client_context(),
+            "browseId": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+        });
+        let out = fetch_browse(&http(), &server.uri(), &body).await.unwrap();
+        assert_eq!(out, r#"{"ok":true}"#);
+    }
+
+    #[tokio::test]
+    async fn browse_surfaces_non_2xx_as_http_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(BROWSE_PATH))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let body = json!({ "context": client_context(VISITOR_DATA), "browseId": "UCabc" });
+        let err = fetch_browse(&http(), &server.uri(), &body)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::transcript::TranscriptError::Http(_)));
+    }
+
+    #[test]
+    fn client_context_pins_full_quest_fingerprint() {
+        let ctx = client_context("vd-token");
+        let client = &ctx["client"];
+        assert_eq!(client["clientName"], CLIENT_NAME);
+        assert_eq!(client["clientVersion"], CLIENT_VERSION);
+        assert_eq!(client["osVersion"], OS_VERSION);
+        assert_eq!(client["visitorData"], "vd-token");
     }
 
     #[tokio::test]

@@ -1,0 +1,65 @@
+{
+  "contents": {
+    "twoColumnBrowseResultsRenderer": {
+      "tabs": [
+        {
+          "tabRenderer": {
+            "title": "Videos",
+            "selected": true,
+            "content": {
+              "richGridRenderer": {
+                "contents": [
+                  {
+                    "richItemRenderer": {
+                      "content": {
+                        "lockupViewModel": {
+                          "contentId": "vid00000001",
+                          "contentType": "LOCKUP_CONTENT_TYPE_VIDEO",
+                          "rendererContext": {
+                            "commandContext": {
+                              "watchEndpoint": { "videoId": "vid00000001" }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "richItemRenderer": {
+                      "content": {
+                        "lockupViewModel": {
+                          "contentId": "vid00000002",
+                          "contentType": "LOCKUP_CONTENT_TYPE_VIDEO"
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "richItemRenderer": {
+                      "content": {
+                        "lockupViewModel": {
+                          "contentId": "PLnotavideoplaylist",
+                          "contentType": "LOCKUP_CONTENT_TYPE_PLAYLIST"
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "continuationItemRenderer": {
+                      "continuationEndpoint": {
+                        "continuationCommand": {
+                          "token": "CONT_TOKEN_1",
+                          "request": "CONTINUATION_REQUEST_TYPE_BROWSE"
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
