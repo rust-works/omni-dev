@@ -250,3 +250,54 @@ p code, li code {
     }
   }
 }
+
+// Mock DevTools console used in place of a screenshot for the browser-bridge
+// demo tab (there is no static artefact to photograph for that workflow).
+.console-shot {
+  border-radius: 6px;
+  overflow: hidden;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+  border: 1px solid #e5e5e5;
+
+  .console-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.5rem 0.75rem;
+    background: #ebebeb;
+    border-bottom: 1px solid #dcdcdc;
+  }
+
+  .console-dot {
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    flex: 0 0 auto;
+
+    &.dot-red { background: #ff5f56; }
+    &.dot-amber { background: #ffbd2e; }
+    &.dot-green { background: #27c93f; }
+  }
+
+  .console-title {
+    margin-left: 0.4rem;
+    font-size: 0.78rem;
+    color: #555;
+  }
+
+  .console-body {
+    margin: 0;
+    padding: 0.9rem 1rem;
+    background: #1e1e1e;
+    color: #d4d4d4;
+    font-size: 0.82rem;
+    line-height: 1.55;
+    border-radius: 0;
+
+    .c-prompt { color: #6a9955; }
+    .c-reply  { color: #808080; }
+    .c-dim    { color: #9aa0a6; }
+    .c-ok     { color: #4ec9b0; }
+    .c-200    { color: #b5cea8; }
+  }
+}

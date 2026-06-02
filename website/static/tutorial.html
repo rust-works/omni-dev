@@ -66,7 +66,8 @@
     #tab-jira:checked       ~ .tab-bar label[for="tab-jira"],
     #tab-confluence:checked ~ .tab-bar label[for="tab-confluence"],
     #tab-pr:checked         ~ .tab-bar label[for="tab-pr"],
-    #tab-twiddle:checked    ~ .tab-bar label[for="tab-twiddle"] {
+    #tab-twiddle:checked    ~ .tab-bar label[for="tab-twiddle"],
+    #tab-browser:checked    ~ .tab-bar label[for="tab-browser"] {
       background: white;
       color: var(--accent);
       border-color: var(--border);
@@ -75,7 +76,8 @@
     #tab-jira:checked       ~ #content-jira,
     #tab-confluence:checked ~ #content-confluence,
     #tab-pr:checked         ~ #content-pr,
-    #tab-twiddle:checked    ~ #content-twiddle { display: block; }
+    #tab-twiddle:checked    ~ #content-twiddle,
+    #tab-browser:checked    ~ #content-browser { display: block; }
 
     h2 { margin-top: 32px; font-size: 20px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
     h3 { margin-top: 24px; font-size: 16px; }
@@ -270,8 +272,8 @@
 <body>
 
 <header>
-  <h1>omni-dev — Atlassian, PRs, and commits in four tabs</h1>
-  <p>A tutorial covering the four primary omni-dev workflows. Switch tabs to navigate.</p>
+  <h1>omni-dev — Atlassian, PRs, commits, and the browser bridge in five tabs</h1>
+  <p>A tutorial covering the five primary omni-dev workflows. Switch tabs to navigate.</p>
 </header>
 
 <div class="container">
@@ -280,12 +282,14 @@
     <input type="radio" name="tab" id="tab-confluence">
     <input type="radio" name="tab" id="tab-pr">
     <input type="radio" name="tab" id="tab-twiddle">
+    <input type="radio" name="tab" id="tab-browser">
 
     <div class="tab-bar">
       <label for="tab-jira">JIRA</label>
       <label for="tab-confluence">Confluence</label>
       <label for="tab-pr">Create PRs</label>
       <label for="tab-twiddle">Twiddle commit messages</label>
+      <label for="tab-browser">Browser bridge</label>
     </div>
 
     <!-- ====================== JIRA TAB ====================== -->
@@ -1209,6 +1213,245 @@ Apply rewrite? [y/N] y
 omni-dev git commit message twiddle --range HEAD~5..HEAD \
   &amp;&amp; git push --force-with-lease \
   &amp;&amp; omni-dev git branch create pr --draft</pre>
+    </section>
+
+    <!-- ====================== BROWSER BRIDGE TAB ====================== -->
+    <section class="tab-content" id="content-browser">
+      <h2>Browser bridge — drive authenticated requests through a logged-in tab</h2>
+
+      <p>
+        <code>omni-dev browser bridge serve</code> runs a long-lived local
+        process that lets you issue HTTP requests <strong>through an
+        authenticated browser tab</strong>. When you are poking at internal
+        services — Grafana/Loki, SSO-gated dashboards, admin panels — the
+        browser already holds sessions (SSO, OAuth, session cookies) that are
+        painful to replicate from a script. The bridge borrows that authority
+        <em>without exfiltrating the cookies or tokens</em>: the <code>fetch()</code>
+        runs in-page, so the credentials never leave the browser.
+      </p>
+
+      <div class="panel panel-warn">
+        <div class="panel-title">⚠️ Confused deputy by design</div>
+        The bridge lends the browser&apos;s authority to whoever can talk to it.
+        That makes the <strong>security model the load-bearing part of the
+        design</strong>, not an add-on — both planes are authenticated and
+        default-closed. The rationale lives in
+        <a href="https://github.com/rust-works/omni-dev/blob/main/docs/adrs/adr-0036.md">ADR-0036</a>;
+        the operator guide is
+        <a href="https://github.com/rust-works/omni-dev/blob/main/docs/browser-bridge.md">docs/browser-bridge.md</a>.
+      </div>
+
+      <h3>How it works</h3>
+
+      <p>
+        Two local planes joined by an <code>id</code>-keyed correlator: an HTTP
+        control plane you drive from the shell, and a WebSocket plane the browser
+        tab connects to.
+      </p>
+
+      <span class="lang-tag">request flow</span>
+<pre>   operator CLI / authorized script             browser tab (DevTools console)
+              │                                          │
+   HTTP + bearer token + X-Omni-Bridge      WebSocket + token subprotocol
+              │                                          │
+              ▼                                          ▼
+  ┌──────────────────────── omni-dev browser bridge ────────────────────────┐
+  │   HTTP control plane            id-correlator           WebSocket plane  │
+  │   127.0.0.1:9998      ──►   pending: id → oneshot   ──►   127.0.0.1:9999 │
+  │   (axum)              ◄──   resolve on WS reply     ◄──   (tungstenite)  │
+  └─────────────────────────────────────────────────────────────────────────┘</pre>
+
+      <p>
+        A request flows: <strong>control plane (authenticated) → assign
+        <code>id</code> + register a waiter → serialize a command frame →
+        WebSocket → browser <code>fetch()</code> → response frame → correlator
+        resolves the waiter by <code>id</code> → control plane returns the HTTP
+        response.</strong>
+      </p>
+
+      <h3>The basic loop</h3>
+
+      <div class="step">
+        <span class="step-num">1</span><strong>Start the bridge.</strong> It prints
+        the bound ports, a generated session token, and a ready-to-paste JS snippet.
+        <pre>omni-dev browser bridge serve</pre>
+      </div>
+
+      <div class="step">
+        <span class="step-num">2</span><strong>Paste the snippet</strong> into the
+        DevTools console on the authenticated tab (e.g.
+        <code>https://grafana.internal/…</code>). It connects over the WebSocket,
+        presenting the token via the subprotocol, and reconnects with backoff.
+      </div>
+
+      <div class="step">
+        <span class="step-num">3</span><strong>Drive requests</strong> from your
+        shell. The token is in the bridge&apos;s stdout.
+        <pre>export OMNI_BRIDGE_TOKEN=&lt;token printed by the bridge&gt;
+omni-dev browser bridge request --url /loki/api/v1/labels</pre>
+      </div>
+
+      <p class="muted">
+        The bridge works only while the tab is open and the snippet is running.
+      </p>
+
+      <h3>Two ways to issue a request</h3>
+
+      <h4>The <code>request</code> thin client</h4>
+      <p>
+        Reads the token (from <code>OMNI_BRIDGE_TOKEN</code> or
+        <code>--token-file</code>), adds the required headers, POSTs to a
+        <em>running</em> bridge, and prints the response envelope:
+      </p>
+<pre>omni-dev browser bridge request --url /loki/api/v1/labels --method GET
+omni-dev browser bridge request --url /api/foo --method POST --body @payload.json
+omni-dev browser bridge request --url /api/foo --header "Accept: application/json"
+omni-dev browser bridge request --stream --url /events | your-consumer   # SSE / chunked</pre>
+
+      <h4>The transparent proxy</h4>
+      <p>
+        Any control-plane path <em>not</em> under <code>/__bridge/</code> is
+        forwarded verbatim to the browser, resolved against the page&apos;s origin.
+        Handy with <code>curl</code> — binary bodies are decoded automatically:
+      </p>
+<pre>T="$OMNI_BRIDGE_TOKEN"
+curl -H "Authorization: Bearer $T" -H "X-Omni-Bridge: 1" \
+  http://localhost:9998/loki/api/v1/labels</pre>
+
+      <div class="panel panel-info">
+        <div class="panel-title">ℹ️ The two mandatory headers</div>
+        Every control-plane request must carry
+        <code>Authorization: Bearer &lt;token&gt;</code> <strong>and</strong>
+        <code>X-Omni-Bridge: 1</code>. The custom header forces a CORS preflight
+        that the server refuses to answer — which is exactly what blocks
+        simple-request CSRF from a random web page.
+      </div>
+
+      <h3>Routing to a specific tab</h3>
+
+      <p>
+        Paste the snippet into several authenticated tabs (e.g. a Grafana tab
+        <em>and</em> an admin tab) and each connects independently.
+        <code>GET /__bridge/status</code> lists them by connection <strong>id</strong>
+        and <code>Origin</code>; select one with <code>--target</code> (or the
+        <code>X-Omni-Bridge-Target</code> header):
+      </p>
+<pre>omni-dev browser bridge request --target 2 --url /api/foo                 # by id
+omni-dev browser bridge request --target https://admin.internal --url /x  # by origin</pre>
+
+      <table>
+        <thead><tr><th>Situation</th><th>Result</th></tr></thead>
+        <tbody>
+          <tr><td>No tab connected</td><td><code>503</code></td></tr>
+          <tr><td>Exactly one tab, no target</td><td>Routes to it (v1 back-compat)</td></tr>
+          <tr><td>Several tabs, no target</td><td><code>409</code> — specify a target (the error lists the tabs)</td></tr>
+          <tr><td>Target id / origin matches one tab</td><td>Routes to it</td></tr>
+          <tr><td>Target matches none</td><td><code>404</code></td></tr>
+          <tr><td>Target origin matches several tabs</td><td><code>409</code> — target by connection id instead</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Security model</h3>
+
+      <p>
+        The trust boundary, stated once: <strong>a request is trusted only if it
+        presents the session token AND is not a cross-origin browser request;
+        everything else is denied.</strong> A localhost bind is necessary but not
+        sufficient — it stops off-host access, not other local processes or the web
+        pages you visit while the bridge runs.
+      </p>
+
+      <div class="panel panel-success">
+        <div class="panel-title">✅ Session token — mandatory on both planes</div>
+        Generated at startup and printed with the snippet; <strong>never</strong>
+        accepted as a CLI argument (argv is world-readable via <code>ps</code>).
+        The control plane requires <code>Authorization: Bearer</code>; the WebSocket
+        upgrade is rejected without the token in its subprotocol. An
+        unauthenticated peer can never connect or evict the browser connection.
+      </div>
+
+      <div class="panel panel-info">
+        <div class="panel-title">ℹ️ Anti-CSRF / anti-DNS-rebinding (all enforced)</div>
+        <strong>Host allowlist</strong> — only <code>localhost</code>/<code>127.0.0.1</code>/<code>[::1]</code>
+        accepted (blocks DNS rebinding). <strong>Reject browser-originated
+        requests</strong> — any <code>Origin</code> header or
+        <code>Sec-Fetch-Site: cross-site</code>/<code>same-site</code> is denied.
+        <strong>Require <code>X-Omni-Bridge: 1</code></strong> on every request.
+        No CORS allow headers; <code>OPTIONS</code> is never answered.
+      </div>
+
+      <div class="panel panel-warn">
+        <div class="panel-title">⚠️ Outbound scope — default-closed</div>
+        The in-page snippet is <strong>not trusted</strong> to scope requests; the
+        server enforces scope before sending the command. <strong>Relative URLs
+        only by default</strong> (resolved against the page origin). Absolute /
+        cross-origin URLs are rejected unless explicitly enabled with
+        <code>serve --allow-origin &lt;url&gt;</code>, or per-request with
+        <code>request --allow-origin &lt;url&gt;</code> (logged with a WARN, and
+        still bounded by the browser&apos;s own CORS).
+      </div>
+
+      <h3>Worked example: draining Grafana / Loki logs</h3>
+
+      <p>
+        The bridge issues the same same-origin requests the Grafana UI makes,
+        carrying the <code>grafana_session</code> cookie; CSRF passes because the
+        <code>fetch()</code> runs in-page. Pagination is client-side — walk the
+        window backward until a page comes back empty:
+      </p>
+
+      <span class="lang-tag">bash — drain loop</span>
+<pre>DS_UID=&lt;loki-datasource-uid&gt;
+QUERY='{app="foo"}|="error"'
+END=$(date +%s)000000000   # now, in nanoseconds
+LIMIT=5000
+
+while :; do
+  page=$(omni-dev browser bridge request \
+    --url "/api/datasources/proxy/uid/${DS_UID}/loki/api/v1/query_range?query=${QUERY}&amp;end=${END}&amp;limit=${LIMIT}&amp;direction=backward")
+
+  # The upstream JSON is the envelope's `body` string; parse it once.
+  body=$(printf '%s' "$page" | jq -r '.body')
+
+  rows=$(printf '%s' "$body" | jq '[.data.result[].values[]] | length')
+  [ "$rows" -eq 0 ] &amp;&amp; break
+
+  printf '%s\n' "$body"   # collect / process this page
+
+  # Oldest timestamp on this page (ns) becomes the next `end`, minus 1ns.
+  oldest=$(printf '%s' "$body" | jq -r '[.data.result[].values[][0] | tonumber] | min')
+  END=$((oldest - 1))
+done</pre>
+
+      <p class="muted">
+        Each page must still fit under <code>--max-body-bytes</code>. For genuinely
+        streaming endpoints (Grafana Live, SSE, chunked APIs), opt into
+        <code>--stream</code> instead of paginating.
+      </p>
+
+      <h3>Flags worth knowing</h3>
+
+      <table>
+        <thead><tr><th>Flag (on <code>serve</code>)</th><th>Default</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr><td><code>--control-port &lt;PORT&gt;</code></td><td><code>9998</code></td><td>HTTP control-plane port. <code>0</code> binds a random free port.</td></tr>
+          <tr><td><code>--ws-port &lt;PORT&gt;</code></td><td><code>9999</code></td><td>WebSocket-plane port. <code>0</code> binds a random free port.</td></tr>
+          <tr><td><code>--allow-origin &lt;URL&gt;</code></td><td>—</td><td>Permit this exact cross-origin for the WS upgrade and outbound URLs.</td></tr>
+          <tr><td><code>--request-timeout &lt;SECS&gt;</code></td><td><code>30</code></td><td>Per-request timeout before the control plane returns <code>504</code>.</td></tr>
+          <tr><td><code>--max-body-bytes &lt;N&gt;</code></td><td><code>8388608</code></td><td>Maximum browser response body size accepted.</td></tr>
+          <tr><td><code>--max-concurrent &lt;N&gt;</code></td><td><code>64</code></td><td>Maximum concurrent in-flight requests.</td></tr>
+          <tr><td><code>--token-file &lt;PATH&gt;</code></td><td>—</td><td>Read the token from a <code>0600</code> file instead of generating one.</td></tr>
+        </tbody>
+      </table>
+
+      <div class="panel panel-note">
+        <div class="panel-title">📝 Caveats</div>
+        A strict CSP <code>connect-src</code> can block the WebSocket. CORS
+        constrains the in-page <code>fetch()</code>, not the bridge: same-origin
+        (relative URLs) is unaffected; cross-origin targets depend on their
+        <code>Access-Control-Allow-Origin</code>. The bridge works only while the
+        tab is open and the snippet is running.
+      </div>
     </section>
   </div>
 </div>
