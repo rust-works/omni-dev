@@ -56,6 +56,28 @@ pub struct RepositoryView<C = CommitInfo> {
 /// Enhanced repository view for AI processing with full diff content.
 pub type RepositoryViewForAI = RepositoryView<CommitInfoForAI>;
 
+/// Commit analysis stripped of all diff-related content.
+///
+/// Used by the `--from-commits` PR generation path, which drives the AI
+/// from commit messages alone. Carries only pre-computed metadata that
+/// does not require reading any diff content from disk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitAnalysisFromCommits {
+    /// Automatically detected conventional commit type (feat, fix, docs, etc.).
+    pub detected_type: String,
+    /// Automatically detected scope based on file paths (cli, git, data, etc.).
+    pub detected_scope: String,
+}
+
+/// Commit information for the commit-message-driven PR path.
+pub type CommitInfoFromCommits = CommitInfo<CommitAnalysisFromCommits>;
+
+/// Repository view used by `--from-commits`.
+///
+/// Never reads diff content from disk. Each commit carries only its
+/// metadata and the curated commit message.
+pub type RepositoryViewForAiFromCommits = RepositoryView<CommitInfoFromCommits>;
+
 /// Self-describing schema metadata embedded under [`RepositoryView::explanation`].
 ///
 /// Always present. Carries prose intro text plus a per-field list so an AI consumer can
@@ -586,6 +608,72 @@ impl RepositoryViewForAI {
     }
 }
 
+impl RepositoryViewForAiFromCommits {
+    /// Converts a `RepositoryView` into the commit-message-only view.
+    ///
+    /// No diff content is read; only pre-computed analysis metadata
+    /// (`detected_type`, `detected_scope`) is retained alongside the
+    /// commit hash, author, date, and message.
+    ///
+    /// The schema-documentation [`FieldExplanation`] is stripped here:
+    /// the default explanation lists diff-related field names (e.g.
+    /// `commits[].analysis.diff_file`) that this view never carries,
+    /// and the user prompt explicitly tells the AI what shape the
+    /// payload has — leaving the documentation in would be misleading.
+    #[must_use]
+    pub fn from_repository_view(repo_view: RepositoryView) -> Self {
+        #[allow(clippy::unwrap_used)] // Conversion is infallible.
+        let mut view: Self = repo_view
+            .map_commits(|c| {
+                Ok(CommitInfo {
+                    hash: c.hash,
+                    author: c.author,
+                    date: c.date,
+                    original_message: c.original_message,
+                    in_main_branches: c.in_main_branches,
+                    analysis: CommitAnalysisFromCommits {
+                        detected_type: c.analysis.detected_type,
+                        detected_scope: c.analysis.detected_scope,
+                    },
+                })
+            })
+            .unwrap();
+        view.explanation = FieldExplanation {
+            text: String::new(),
+            fields: Vec::new(),
+        };
+        view
+    }
+
+    /// Creates a minimal view containing a single commit for split dispatch.
+    ///
+    /// Mirrors [`RepositoryView::single_commit_view`] but for the
+    /// commit-message-only payload used by `--from-commits`.
+    #[must_use]
+    pub(crate) fn single_commit_view_from_commits(&self, commit: &CommitInfoFromCommits) -> Self {
+        Self {
+            versions: None,
+            explanation: FieldExplanation {
+                text: String::new(),
+                fields: Vec::new(),
+            },
+            working_directory: WorkingDirectoryInfo {
+                clean: true,
+                untracked_changes: Vec::new(),
+            },
+            remotes: Vec::new(),
+            ai: AiInfo {
+                scratch: String::new(),
+            },
+            branch_info: self.branch_info.clone(),
+            pr_template: None,
+            pr_template_location: None,
+            branch_prs: None,
+            commits: vec![commit.clone()],
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -893,6 +981,53 @@ mod tests {
         // branch_info IS preserved (for scope context)
         assert!(single.branch_info.is_some());
         assert_eq!(single.branch_info.unwrap().branch, "feature/test");
+    }
+
+    // ── RepositoryViewForAiFromCommits ───────────────────────────────
+
+    #[test]
+    fn from_commits_view_preserves_commit_messages() {
+        let mut view = make_repo_view(vec![make_commit_info("aaa"), make_commit_info("bbb")]);
+        view.commits[0].original_message = "feat: alpha\n\nbody line".to_string();
+        view.commits[1].original_message = "fix: beta".to_string();
+
+        let commits_view = RepositoryViewForAiFromCommits::from_repository_view(view);
+
+        assert_eq!(commits_view.commits.len(), 2);
+        assert_eq!(commits_view.commits[0].hash, "aaa");
+        assert_eq!(
+            commits_view.commits[0].original_message,
+            "feat: alpha\n\nbody line"
+        );
+        assert_eq!(commits_view.commits[1].original_message, "fix: beta");
+        assert_eq!(commits_view.commits[0].analysis.detected_type, "feat");
+        assert_eq!(commits_view.commits[1].analysis.detected_type, "feat"); // make_commit_info hard-codes feat
+    }
+
+    #[test]
+    fn from_commits_view_serialization_contains_no_diff_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let diff_path = dir.path().join("0.diff");
+        std::fs::write(&diff_path, "diff --git a/x b/x\n@@ -1 +1 @@\n-old\n+new\n").unwrap();
+
+        let mut commit = make_commit_info("aaa");
+        commit.original_message = "feat(test): unique-commit-subject-marker".to_string();
+        commit.analysis.diff_file = diff_path.to_string_lossy().to_string();
+        commit.analysis.diff_summary = "x | 1 +".to_string();
+
+        let view = make_repo_view(vec![commit]);
+        let commits_view = RepositoryViewForAiFromCommits::from_repository_view(view);
+        let yaml = yaml::to_yaml(&commits_view).unwrap();
+
+        // Commit narrative IS present
+        assert!(yaml.contains("unique-commit-subject-marker"));
+        // Diff-related fields are NOT
+        assert!(!yaml.contains("diff --git"));
+        assert!(!yaml.contains("diff_content"));
+        assert!(!yaml.contains("diff_file"));
+        assert!(!yaml.contains("diff_summary"));
+        assert!(!yaml.contains("file_changes"));
+        assert!(!yaml.contains("file_diffs"));
     }
 
     // ── FieldExplanation::default ────────────────────────────────────

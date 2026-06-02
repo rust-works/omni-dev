@@ -315,6 +315,7 @@ omni-dev git branch create pr [BASE_BRANCH] [OPTIONS]
 | `--context-dir PATH` | Custom context directory (defaults to `.omni-dev/`) | `--context-dir ./config` |
 | `--auto-apply` | Create/update PR without confirmation | `--auto-apply` |
 | `--save-only FILE` | Save PR details to YAML file instead of creating | `--save-only pr-details.yaml` |
+| `--from-commits` | Drive PR generation from commit messages instead of the diff (faster, no diff bytes are sent to the AI) | `--from-commits` |
 
 **What it does:**
 
@@ -1514,6 +1515,10 @@ omni-dev git branch create pr --auto-apply
 omni-dev git branch create pr --save-only review-pr.yaml
 # Review and edit the file...
 # Then create manually using GitHub CLI or web interface
+
+# Drive the PR description from commit messages (no diff sent to AI)
+# Useful when the branch's commits are well-crafted and convey the intent
+omni-dev git branch create pr --from-commits
 ```
 
 ### Collaborative PR Workflow

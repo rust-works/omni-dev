@@ -766,6 +766,163 @@ Start immediately with "title:" and provide only YAML content. The title should 
     prompt
 }
 
+/// System prompt for the `--from-commits` PR description generation path.
+///
+/// Tells the AI that the input is *only* commit messages (no diffs). The
+/// commit messages are the curated narrative of intent — the AI must
+/// derive the PR title and description from those messages alone.
+pub const PR_GENERATION_FROM_COMMITS_SYSTEM_PROMPT: &str = r#"You are a software engineer generating pull request descriptions. You will receive git history (commit messages only — no diffs) and a PR template.
+
+Your task:
+1. Analyze the commit messages to understand the intent and narrative of the change
+2. Fill out the PR template with specific information about what was changed
+3. Replace template placeholders with actual details derived from the commit messages
+
+Analysis steps:
+1. Read each commit message (subject and body) to understand the curated narrative the author has already established
+2. Determine if this is a new feature, bug fix, or other type of change from the commit subjects
+3. Fill in the template with accurate information drawn from the commit messages
+
+IMPORTANT: You will NOT receive any diffs or file-level content. The commit messages are the authoritative source of intent — trust them and use them verbatim where possible.
+
+RESPONSE FORMAT: Respond with YAML only. No explanations or markdown blocks.
+
+Structure:
+title: "Short descriptive title"
+description: |
+  Filled-in template content here
+
+Requirements:
+- Replace all template placeholders with real information from the commit messages
+- Check appropriate boxes based on the commit types (feat, fix, docs, etc.)
+- Remove template comments and instructions
+- Provide specific details from the commit messages, not from imagined diffs"#;
+
+/// Generates a `--from-commits` PR system prompt with provider-specific handling.
+///
+/// Counterpart to [`generate_pr_system_prompt_with_context_for_provider`]
+/// for the commit-message-driven path. Same project-guidelines and scopes
+/// treatment, but built on top of [`PR_GENERATION_FROM_COMMITS_SYSTEM_PROMPT`].
+pub fn generate_pr_system_prompt_from_commits_with_context_for_provider(
+    context: &crate::data::context::CommitContext,
+    provider: PromptStyle,
+) -> String {
+    let mut prompt = PR_GENERATION_FROM_COMMITS_SYSTEM_PROMPT.to_string();
+
+    // Add provider-specific template handling instructions
+    if provider == PromptStyle::Claude {
+        prompt.push_str("\n\n=== TEMPLATE HANDLING FOR CLAUDE ===");
+        prompt.push_str(
+            "\nThe PR template provided is a TEMPLATE TO FILL OUT, not literal text to copy.",
+        );
+        prompt.push_str(
+            "\nYou must REPLACE placeholder content with actual information derived from the commit messages.",
+        );
+    } else {
+        prompt.push_str("\n\n=== TEMPLATE FILLING INSTRUCTIONS ===");
+        prompt.push_str("\nThe provided PR template should be filled out with specific information about the changes.");
+        prompt.push_str(
+            "\nReplace placeholder content with actual details drawn from the commit messages:",
+        );
+        prompt.push_str(
+            "\n- Fill in the Description section with what this PR actually does (per the commits)",
+        );
+        prompt.push_str("\n- Mark the correct Type of Change checkboxes based on commit types");
+        prompt.push_str("\n- List the specific changes made in the Changes Made section");
+        prompt.push_str("\n- Remove placeholder text like '(issue_number)' and template comments");
+        prompt.push_str(
+            "\n- Replace empty bullet points with actual information from the commit subjects",
+        );
+    }
+
+    // Add project-specific PR guidelines if available
+    if let Some(pr_guidelines) = &context.project.pr_guidelines {
+        prompt.push_str("\n\n=== PROJECT PR GUIDELINES ===");
+        prompt.push_str("\nThis project has specific guidelines for pull request descriptions:");
+        prompt.push_str(&format!("\n\n{pr_guidelines}"));
+        prompt.push_str("\n\nIMPORTANT: Follow these project-specific guidelines when generating the PR description.");
+        prompt.push_str("\nUse these guidelines to inform the style, level of detail, and specific sections to emphasize.");
+    }
+
+    // Add scope information if available
+    if !context.project.valid_scopes.is_empty() {
+        let scope_names: Vec<&str> = context
+            .project
+            .valid_scopes
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        prompt.push_str(&format!(
+            "\n\nValid scopes for this project: {}",
+            scope_names.join(", ")
+        ));
+    }
+
+    prompt
+}
+
+/// Generates a `--from-commits` PR description user prompt with project context.
+///
+/// Counterpart to [`generate_pr_description_prompt_with_context`] for the
+/// commit-message-driven path. All references to "diffs" are removed; the
+/// AI is instructed to derive its description from the commit history alone.
+pub fn generate_pr_description_prompt_from_commits_with_context(
+    repo_yaml: &str,
+    pr_template: &str,
+    context: &crate::data::context::CommitContext,
+) -> String {
+    let mut prompt = format!(
+        r"Please analyze the following commit history and generate a comprehensive pull request description following the project's specific guidelines:
+
+Commit History (no diffs included — derive the PR description from these commit messages alone):
+{repo_yaml}
+
+PR Template:
+{pr_template}
+
+"
+    );
+
+    // Add project context information
+    if context.project.pr_guidelines.is_some() {
+        prompt
+            .push_str("IMPORTANT: This project has specific PR guidelines that must be followed. ");
+        prompt.push_str("Review the guidelines in the system prompt and apply them to create an appropriate PR description.\n\n");
+    }
+
+    // Add branch context if available
+    if context.branch.is_feature_branch {
+        prompt.push_str(&format!(
+            "BRANCH CONTEXT: This is {} work on '{}'. Use this context to better describe the purpose and scope.\n\n",
+            context.branch.work_type, context.branch.description
+        ));
+    }
+
+    prompt.push_str(r#"INSTRUCTIONS:
+1. **ANALYZE THE COMMIT HISTORY**: Read through every commit message (subject and body) to understand exactly what the author intended
+2. **UNDERSTAND THE OVERALL PURPOSE**: Determine what this branch accomplishes as a whole from the commit narrative
+3. **FOLLOW PROJECT GUIDELINES**: Apply any project-specific PR guidelines provided in the system prompt
+4. **GENERATE COMPREHENSIVE DESCRIPTION**: Create a clear, informative PR description that explains the changes based on the commits
+5. **USE APPROPRIATE DETAIL LEVEL**: Match the level of detail to the significance of the changes
+6. **BE SPECIFIC**: Provide concrete details about what was added, changed, or fixed based on the commit subjects and bodies
+7. **EXPLAIN VALUE**: Describe why these changes are beneficial or necessary
+8. **REPLACE PLACEHOLDERS**: Remove all placeholder text, comments, and generic content
+9. **INCLUDE ACTUAL CHANGES**: List specific bullet points of what was modified based on the commit messages — do NOT speculate about file-level details that the commits do not mention
+
+CRITICAL RESPONSE FORMAT: Respond with ONLY valid YAML content. Do not include explanatory text, markdown wrappers, or code blocks.
+
+Your response must follow this exact YAML structure:
+
+title: "Your concise PR title here"
+description: |
+  Your comprehensive PR description in markdown format here.
+  Follow project guidelines and replace all template placeholders with actual information from the commit messages.
+
+Start immediately with "title:" and provide only YAML content. The title should follow conventional commit format when appropriate and the description should be tailored to this project's standards."#);
+
+    prompt
+}
+
 /// System prompt for commit message check/validation.
 pub const CHECK_SYSTEM_PROMPT: &str = r#"You are a commit message reviewer. Your task is to evaluate commit messages against project guidelines and report violations.
 
@@ -1751,6 +1908,126 @@ mod tests {
         let prompt = generate_pr_description_prompt_with_context("yaml", "template", &context);
         assert!(prompt.contains("BRANCH CONTEXT"));
         assert!(prompt.contains("add feature"));
+    }
+
+    // ── from-commits prompt builders ───────────────────────────────
+
+    #[test]
+    fn from_commits_system_prompt_claude_branch_mentions_template_handling() {
+        let context = make_context();
+        let prompt = generate_pr_system_prompt_from_commits_with_context_for_provider(
+            &context,
+            PromptStyle::Claude,
+        );
+        assert!(prompt.contains("TEMPLATE HANDLING FOR CLAUDE"));
+        assert!(prompt.contains("REPLACE placeholder"));
+        assert!(!prompt.contains("TEMPLATE FILLING INSTRUCTIONS"));
+        // No diff references — flag is "commit-message-only" mode.
+        assert!(!prompt.contains("diff files"));
+    }
+
+    #[test]
+    fn from_commits_system_prompt_openai_branch_mentions_explicit_instructions() {
+        let context = make_context();
+        let prompt = generate_pr_system_prompt_from_commits_with_context_for_provider(
+            &context,
+            PromptStyle::OpenAi,
+        );
+        assert!(prompt.contains("TEMPLATE FILLING INSTRUCTIONS"));
+        assert!(prompt.contains("Fill in the Description section"));
+        assert!(prompt.contains("Mark the correct Type of Change"));
+        assert!(!prompt.contains("TEMPLATE HANDLING FOR CLAUDE"));
+    }
+
+    #[test]
+    fn from_commits_system_prompt_includes_pr_guidelines_when_present() {
+        let mut context = make_context();
+        context.project.pr_guidelines = Some("Always use conventional titles".to_string());
+        let prompt = generate_pr_system_prompt_from_commits_with_context_for_provider(
+            &context,
+            PromptStyle::Claude,
+        );
+        assert!(prompt.contains("PROJECT PR GUIDELINES"));
+        assert!(prompt.contains("Always use conventional titles"));
+    }
+
+    #[test]
+    fn from_commits_system_prompt_omits_guidelines_section_when_absent() {
+        let context = make_context();
+        let prompt = generate_pr_system_prompt_from_commits_with_context_for_provider(
+            &context,
+            PromptStyle::Claude,
+        );
+        assert!(!prompt.contains("PROJECT PR GUIDELINES"));
+    }
+
+    #[test]
+    fn from_commits_system_prompt_includes_scopes_when_present() {
+        let mut context = make_context();
+        context.project.valid_scopes = vec![
+            ScopeDefinition {
+                name: "cli".to_string(),
+                description: String::new(),
+                examples: Vec::new(),
+                file_patterns: Vec::new(),
+            },
+            ScopeDefinition {
+                name: "git".to_string(),
+                description: String::new(),
+                examples: Vec::new(),
+                file_patterns: Vec::new(),
+            },
+        ];
+        let prompt = generate_pr_system_prompt_from_commits_with_context_for_provider(
+            &context,
+            PromptStyle::Claude,
+        );
+        assert!(prompt.contains("Valid scopes for this project: cli, git"));
+    }
+
+    #[test]
+    fn from_commits_user_prompt_includes_yaml_and_template() {
+        let context = make_context();
+        let prompt = generate_pr_description_prompt_from_commits_with_context(
+            "commits:\n  - hash: abc",
+            "# Template",
+            &context,
+        );
+        assert!(prompt.contains("commits:\n  - hash: abc"));
+        assert!(prompt.contains("# Template"));
+        assert!(prompt.contains("Commit History"));
+        assert!(prompt.contains("no diffs included"));
+        // Branch context is populated by make_context()
+        assert!(prompt.contains("BRANCH CONTEXT"));
+        assert!(prompt.contains("add feature"));
+    }
+
+    #[test]
+    fn from_commits_user_prompt_includes_guidelines_reminder_when_present() {
+        let mut context = make_context();
+        context.project.pr_guidelines = Some("Use conventional titles".to_string());
+        let prompt =
+            generate_pr_description_prompt_from_commits_with_context("yaml", "tpl", &context);
+        assert!(prompt.contains("specific PR guidelines that must be followed"));
+    }
+
+    #[test]
+    fn from_commits_user_prompt_omits_branch_context_for_non_feature_branch() {
+        let mut context = make_context();
+        context.branch.is_feature_branch = false;
+        let prompt =
+            generate_pr_description_prompt_from_commits_with_context("yaml", "tpl", &context);
+        assert!(!prompt.contains("BRANCH CONTEXT"));
+    }
+
+    #[test]
+    fn from_commits_user_prompt_never_mentions_diffs() {
+        let context = make_context();
+        let prompt =
+            generate_pr_description_prompt_from_commits_with_context("yaml", "tpl", &context);
+        // The instruction wording must not push the model toward inventing diff details.
+        assert!(!prompt.contains("ANALYZE THE COMMITS AND DIFFS"));
+        assert!(!prompt.contains("their diff files"));
     }
 
     // ── coherence prompts ──────────────────────────────────────────
