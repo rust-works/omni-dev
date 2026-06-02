@@ -1,0 +1,11 @@
+{"version": 2, "width": 104, "height": 32, "timestamp": 1779550960, "idle_time_limit": 1.5, "command": "bash history/demo.sh", "env": {"SHELL": "/bin/zsh"}}
+[0.025, "o", "\u001b[1;36m$\u001b[0m omni-dev ai claude history sync --target ~/hist --output-format jsonl,markdown\r\n"]
+[0.9, "o", "\u001b[32mcreated\u001b[0m  jsonl     -Users-me-omni-dev/0f1a…2b -> ~/hist/…/0f1a…2b.jsonl (48213 bytes)\r\n"]
+[1.05, "o", "\u001b[32mcreated\u001b[0m  markdown  -Users-me-omni-dev/0f1a…2b -> ~/hist/…/0f1a…2b.md (21044 bytes)\r\n"]
+[1.2, "o", "\u001b[32mcreated\u001b[0m  jsonl     -Users-me-spike/a1b2…d4    -> ~/hist/…/a1b2…d4.jsonl (15002 bytes)\r\n"]
+[1.35, "o", "\u001b[32mcreated\u001b[0m  markdown  -Users-me-spike/a1b2…d4    -> ~/hist/…/a1b2…d4.md (8771 bytes)\r\n\r\n"]
+[3.1, "o", "\u001b[1;36m$\u001b[0m omni-dev ai claude history sync --target ~/hist --since 1d --output-format markdown --dry-run\r\n"]
+[4.0, "o", "\u001b[90m[dry-run]\u001b[0m \u001b[32mcreated\u001b[0m  markdown  -Users-me-omni-dev/7b2e…c9 -> ~/hist/…/7b2e…c9.md (9210 bytes)\r\n"]
+[4.15, "o", "\u001b[90m[dry-run]\u001b[0m \u001b[33mskipped\u001b[0m  markdown  -Users-me-spike/a1b2…d4    (filtered-by-since)\r\n\r\n"]
+[5.9, "o", "\u001b[90m# re-runs skip unchanged sessions by mtime; --prune deletes targets whose source is gone\u001b[0m\r\n"]
+[7.8, "o", ""]
