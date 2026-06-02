@@ -22,6 +22,8 @@
     <li><strong>PR creation</strong> &mdash; generate complete pull request descriptions in one command.</li>
     <li><strong>Atlassian integration</strong> &mdash; read and write Jira issues and Confluence pages, with JFM &harr; ADF conversion.</li>
     <li><strong>Browser bridge</strong> &mdash; drive authenticated HTTP requests through a logged-in browser tab without exfiltrating its cookies or tokens.</li>
+    <li><strong>Media transcripts</strong> &mdash; fetch YouTube captions as SRT, VTT, TXT, or JSON, with language fallback and optional ASR/translation.</li>
+    <li><strong>Conversation history</strong> &mdash; export your Claude Code sessions to versionable JSONL and Markdown for work-logs and review.</li>
     <li><strong>MCP server</strong> &mdash; drop omni-dev's capabilities into Claude Code via the bundled MCP binary.</li>
   </ul>
 </section>
@@ -41,7 +43,7 @@
 <section id="demo" class="demo-wide">
   <h2>Demo</h2>
   <p class="demo-caption">
-    Five short asciicasts &mdash; each paired with the artefact it produces.
+    Seven short asciicasts &mdash; each paired with the artefact it produces.
     The source for every cast lives at
     <a href="https://github.com/rust-works/omni-dev-demo">rust-works/omni-dev-demo</a>.
   </p>
@@ -52,6 +54,8 @@
     <button class="tab"           role="tab" id="tab-pr"         aria-selected="false" aria-controls="panel-pr"         data-tab="pr"         tabindex="-1">Create PR</button>
     <button class="tab"           role="tab" id="tab-twiddle"    aria-selected="false" aria-controls="panel-twiddle"    data-tab="twiddle"    tabindex="-1">Twiddle commits</button>
     <button class="tab"           role="tab" id="tab-browser"    aria-selected="false" aria-controls="panel-browser"    data-tab="browser"    tabindex="-1">Browser bridge</button>
+    <button class="tab"           role="tab" id="tab-youtube"    aria-selected="false" aria-controls="panel-youtube"    data-tab="youtube"    tabindex="-1">YouTube transcript</button>
+    <button class="tab"           role="tab" id="tab-history"    aria-selected="false" aria-controls="panel-history"    data-tab="history"    tabindex="-1">Claude history</button>
   </div>
 
   <div class="tab-panel is-active" role="tabpanel" id="panel-jira" aria-labelledby="tab-jira" data-panel="jira">
@@ -169,6 +173,90 @@
       </div>
     </div>
   </div>
+
+  <div class="tab-panel" role="tabpanel" id="panel-youtube" aria-labelledby="tab-youtube" data-panel="youtube" hidden>
+    <p class="panel-caption">
+      <code>omni-dev transcript youtube</code> pulls captions straight from a video.
+      <code>info</code> and <code>list-langs</code> inspect what is available;
+      <code>fetch</code> renders a track as <code>srt</code>, <code>vtt</code>,
+      <code>txt</code>, or <code>json</code>. Here it inspects the first video ever
+      uploaded to YouTube and prints its transcript &mdash; <code>--auto</code> falls
+      through to ASR captions, <code>--translate</code> synthesises a missing language.
+    </p>
+    <div class="demo-grid">
+      <div class="demo-cast"><div id="cast-youtube" class="asciinema-player-wrap"></div></div>
+      <div class="demo-renders">
+        <figure>
+          <div class="console-shot" aria-label="The fetched transcript written as an SRT subtitle file">
+            <div class="console-bar">
+              <span class="console-dot dot-red"></span>
+              <span class="console-dot dot-amber"></span>
+              <span class="console-dot dot-green"></span>
+              <span class="console-title">me-at-the-zoo.srt</span>
+            </div>
+<pre class="console-body"><span class="c-num">1</span>
+<span class="c-time">00:00:00,000 --&gt; 00:00:05,800</span>
+All right, so here we are in front of the elephants.
+
+<span class="c-num">2</span>
+<span class="c-time">00:00:05,800 --&gt; 00:00:11,200</span>
+The cool thing about these guys is that they have
+really, really, really long trunks.
+
+<span class="c-num">3</span>
+<span class="c-time">00:00:11,200 --&gt; 00:00:19,000</span>
+And that's cool. And that's pretty much all there is to say.</pre>
+          </div>
+          <figcaption>Same transcript, written to disk as WebVTT/SRT with
+            <code>-o me-at-the-zoo.srt</code> &mdash; ready to attach to a video or
+            feed to a search index. Drop <code>--format json</code> for cue objects
+            with millisecond timing.</figcaption>
+        </figure>
+      </div>
+    </div>
+  </div>
+
+  <div class="tab-panel" role="tabpanel" id="panel-history" aria-labelledby="tab-history" data-panel="history" hidden>
+    <p class="panel-caption">
+      <code>omni-dev ai claude history sync</code> exports your Claude Code sessions
+      &mdash; prompts, responses, thinking, and tool calls &mdash; to a target
+      directory as one <code>.jsonl</code> (and/or rendered <code>.md</code>) per chat.
+      Re-runs skip unchanged sessions by mtime, so it is safe to schedule;
+      <code>--since</code>, <code>--project</code>, and <code>--dry-run</code> scope
+      the run, and <code>--prune</code> removes exports whose source is gone.
+    </p>
+    <div class="demo-grid">
+      <div class="demo-cast"><div id="cast-history" class="asciinema-player-wrap"></div></div>
+      <div class="demo-renders">
+        <figure>
+          <div class="console-shot" aria-label="The exported history directory tree and a rendered Markdown transcript">
+            <div class="console-bar">
+              <span class="console-dot dot-red"></span>
+              <span class="console-dot dot-amber"></span>
+              <span class="console-dot dot-green"></span>
+              <span class="console-title">~/hist &mdash; after sync</span>
+            </div>
+<pre class="console-body"><span class="c-path">-Users-me-omni-dev/</span>
+  0f1a…2b.jsonl   <span class="c-dim"># append-only event log</span>
+  0f1a…2b.md      <span class="c-dim"># rendered transcript</span>
+<span class="c-path">-Users-me-spike/</span>
+  a1b2…d4.jsonl
+  a1b2…d4.md
+
+<span class="c-dim">── 0f1a…2b.md ──────────────────</span>
+<span class="c-head">## 👤 User</span>
+Refactor the transcript fetcher to support VTT.
+
+<span class="c-head">## 🤖 Assistant</span>
+Here's the plan: extract a Format enum…</pre>
+          </div>
+          <figcaption>One folder per project (the encoded cwd slug), one file per
+            session UUID. The JSONL is append-only and byte-identical across runs;
+            the Markdown is a readable transcript for work-logs and review.</figcaption>
+        </figure>
+      </div>
+    </div>
+  </div>
 </section>
 {% endblock %}
 
@@ -180,7 +268,9 @@
       confluence: '{{ get_url(path="demo-confluence.cast") }}',
       pr:         '{{ get_url(path="demo-pr.cast") }}',
       twiddle:    '{{ get_url(path="demo-twiddle.cast") }}',
-      browser:    '{{ get_url(path="demo-browser.cast") }}'
+      browser:    '{{ get_url(path="demo-browser.cast") }}',
+      youtube:    '{{ get_url(path="demo-youtube.cast") }}',
+      history:    '{{ get_url(path="demo-history.cast") }}'
     };
     const players = {};
 
