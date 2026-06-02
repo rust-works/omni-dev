@@ -22,6 +22,8 @@ conventional commit formats with project-aware suggestions.
   descriptions
 - 📦 **Automatic Batching**: Handles large commit ranges intelligently
 - 🎯 **Conventional Commits**: Automatic detection and formatting
+- 🌐 **Browser Bridge**: Drive HTTP requests through an authenticated browser
+  tab without exfiltrating cookies or tokens
 - 🛡️ **Safety First**: Working directory validation and error recovery
 - ⚡ **Fast & Reliable**: Built with Rust for memory safety and performance
 
@@ -239,6 +241,41 @@ omni-dev transcript youtube info <url> --output json
 or a bare 11-character video ID. Age-gated and login-required videos
 surface as a typed `PlayabilityRefused` error carrying YouTube's status
 code rather than a generic HTTP failure.
+
+### 🌐 Browser Bridge
+
+Drive HTTP requests **through an authenticated browser tab**. When you are
+investigating internal services (Grafana/Loki, internal dashboards, SSO-gated
+admin panels), the browser already holds sessions — SSO, OAuth, cookies — that
+are hard to replicate programmatically. The bridge issues requests inside the
+browser's authenticated context **without exfiltrating cookies or tokens** (a
+*confused deputy by design*). Both planes are authenticated and default-closed;
+see [docs/browser-bridge.md](docs/browser-bridge.md) for the full guide and
+[ADR-0036](docs/adrs/adr-0036.md) for the security rationale.
+
+```bash
+# Start the bridge; it prints the bound ports, a session token, and a JS
+# snippet to paste into the DevTools console of the authenticated tab.
+omni-dev browser bridge serve
+
+# Drive requests through the tab (token from the bridge's stdout).
+export OMNI_BRIDGE_TOKEN=<token printed by the bridge>
+omni-dev browser bridge request --url /loki/api/v1/labels
+
+# POST a JSON payload from a file, with a custom header.
+omni-dev browser bridge request --url /api/foo --method POST \
+  --body @payload.json --header "Accept: application/json"
+
+# Stream a long-lived endpoint (SSE / chunked) instead of buffering.
+omni-dev browser bridge request --url /api/events --stream
+
+# Route to a specific tab when several are connected (by id or origin).
+omni-dev browser bridge request --url /api/foo --target https://grafana.internal
+```
+
+Supports binary and streaming response bodies, multi-tab routing via
+`X-Omni-Bridge-Target`, per-request `--credentials` and `--allow-origin`
+overrides, and a transparent proxy for tools that speak plain HTTP.
 
 ### ✏️ Manual Amendment
 
