@@ -2596,6 +2596,7 @@ Options:
       --draft                      Creates PR as draft (overrides default)
       --context-dir <CONTEXT_DIR>  Path to custom context directory (defaults to .omni-dev/)
       --no-push                    Skip pushing the branch to remote before creating the PR
+      --from-commits               Use commit messages (not the diff) as the primary input for PR generation
   -h, --help                       Print help
 
 
