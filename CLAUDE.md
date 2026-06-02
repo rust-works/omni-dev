@@ -147,6 +147,17 @@ Dev-only notes:
 - `ClaudeCliAiClient::run` is the warn site for both escape hatches, the INFO-level `total_cost_usd` log, and the post-response WARN when reported cost exceeds the configured cap.
 - `--beta-header` is ignored for the `claude-cli` backend (`claude`'s `--betas` flag has different semantics).
 
+### Browser Bridge
+The `omni-dev browser bridge` command tree drives HTTP requests **through an authenticated browser tab** (Grafana/Loki, SSO-gated dashboards) without exfiltrating the browser's cookies/tokens — a *confused deputy by design*. It is a two-plane local server joined by an `id`-keyed correlator:
+
+- `src/cli/browser.rs` + `src/cli/browser/` — the CLI surface: `bridge serve` (`bridge.rs`, the long-lived server) and `bridge request` (`request.rs`, the thin client).
+- `src/browser/bridge.rs` — server core: the HTTP control plane (axum, default `127.0.0.1:9998`), the WebSocket plane the browser connects to (default `127.0.0.1:9999`), the `Correlator` (per-`id` channel), the transparent proxy, and `dispatch`/`start_stream`.
+- `src/browser/protocol.rs` — the wire types (`ControlRequest`, `Command`, `BrowserReply`/`ResponseEnvelope`, the streaming `StreamItem`/`StreamLine`/`CancelCommand`, `StatusResponse`/`TabInfo`). New optional fields use `#[serde(default, skip_serializing_if = ...)]` to keep older clients byte-identical on the wire.
+- `src/browser/auth.rs` — the **load-bearing** security primitives: token generation/resolution, `constant_time_eq`, the `X-Omni-Bridge` / `X-Omni-Bridge-Target` header constants, Host/Origin/Sec-Fetch-Site guards, and `validate_outbound_url` (server-side outbound scope; the in-page snippet is never trusted).
+- `src/templates/browser-bridge.js` — the snippet pasted into the DevTools console (rendered by `src/browser/snippet.rs`); it reads `cmd.stream` / `cmd.credentials` and base64-encodes non-text bodies.
+
+The security model is **core, not an add-on**: both planes are authenticated and default-closed. When touching the trust boundary (auth guards, outbound scope, token handling, the planes), keep [ADR-0036](docs/adrs/adr-0036.md) and the operator guide [docs/browser-bridge.md](docs/browser-bridge.md) in sync. Changes to the CLI surface require the [`update-snapshots`](.claude/skills/update-snapshots/SKILL.md) skill (see Code Changes §5).
+
 ### Skill Structure
 Claude skills are organized in `.claude/skills/`, one subdirectory per skill with a `SKILL.md` file.
 
