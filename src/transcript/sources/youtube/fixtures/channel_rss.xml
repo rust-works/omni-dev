@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns:yt="http://www.youtube.com/xml/schemas/2015"
+      xmlns:media="http://search.yahoo.com/mrss/"
+      xmlns="http://www.w3.org/2005/Atom">
+  <yt:channelId>UC_x5XG1OV2P6uZZ5FSM9Ttw</yt:channelId>
+  <title>Sample Channel</title>
+  <entry>
+    <id>yt:video:aaaaaaaaaaa</id>
+    <yt:videoId>aaaaaaaaaaa</yt:videoId>
+    <yt:channelId>UC_x5XG1OV2P6uZZ5FSM9Ttw</yt:channelId>
+    <title>Newest video</title>
+    <published>2024-11-24T18:00:00+00:00</published>
+    <updated>2024-11-24T18:30:00+00:00</updated>
+  </entry>
+  <entry>
+    <id>yt:video:bbbbbbbbbbb</id>
+    <yt:videoId>bbbbbbbbbbb</yt:videoId>
+    <yt:channelId>UC_x5XG1OV2P6uZZ5FSM9Ttw</yt:channelId>
+    <title>Middle video</title>
+    <published>2024-11-20T12:00:00+00:00</published>
+    <updated>2024-11-20T12:30:00+00:00</updated>
+  </entry>
+  <entry>
+    <id>yt:video:ccccccccccc</id>
+    <yt:videoId>ccccccccccc</yt:videoId>
+    <yt:channelId>UC_x5XG1OV2P6uZZ5FSM9Ttw</yt:channelId>
+    <title>Oldest video</title>
+    <published>2024-11-15T09:00:00+00:00</published>
+    <updated>2024-11-15T09:30:00+00:00</updated>
+  </entry>
+</feed>

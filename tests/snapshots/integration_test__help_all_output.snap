@@ -2910,6 +2910,7 @@ Commands:
   fetch       Fetches the transcript for a YouTube video
   list-langs  Lists the caption tracks available on a YouTube video
   info        Shows top-level metadata (title, channel, duration, languages) for a YouTube video
+  sync        Syncs transcripts for all videos in one or more channels to the filesystem
   help        Print this message or the help of the given subcommand(s)
 
 Options:
@@ -2966,6 +2967,29 @@ Arguments:
 Options:
       --output <OUTPUT>  Output format [default: table] [possible values: table, json]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev transcript youtube sync - Syncs transcripts for all videos in one or more channels to the filesystem
+
+Syncs transcripts for all videos in one or more channels to the filesystem
+
+Usage: sync [OPTIONS] --out <OUT> <CHANNELS>...
+
+Arguments:
+  <CHANNELS>...  One or more channel references: a `UC…` ID, a channel URL (`/channel/UC…`, `/@handle`, `/c/Name`, `/user/Name`), or a bare `@handle`
+
+Options:
+      --out <OUT>                  Output directory. Transcripts are written under `<out>/<channel-id>/<video-id>.<lang>.<format>`
+      --lang <LANG>                Preferred caption language (e.g. `en`, `en-US`). Prefix fallback is applied — `en` matches `en-US` [default: en]
+      --format <FORMAT>            Output format [default: srt] [possible values: srt, vtt, txt, json]
+      --auto                       Allow falling through to auto-generated (ASR) captions when no manual track matches. Recommended for channel syncs — many uploads only have auto captions
+      --full                       Backfill the channel's entire upload history via the InnerTube `/browse` endpoint. Without this, only the ~15 most recent uploads (the RSS feed) are considered
+      --since <DATE>               Only sync videos published on or after this date (`YYYY-MM-DD` or an RFC 3339 timestamp). Reliable for the default (RSS) path, which carries per-video publish dates; best-effort under `--full` (the browse grid has no per-item dates, so this is ignored there)
+      --concurrency <CONCURRENCY>  Maximum number of transcripts to fetch concurrently [default: 4]
+      --dry-run                    List what would be fetched without downloading or writing anything
+  -h, --help                       Print help (see more with '--help')
 
 
 ================================================================================

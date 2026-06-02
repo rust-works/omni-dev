@@ -1,0 +1,20 @@
+{
+  "onResponseReceivedActions": [
+    {
+      "appendContinuationItemsAction": {
+        "continuationItems": [
+          {
+            "richItemRenderer": {
+              "content": {
+                "lockupViewModel": {
+                  "contentId": "vid00000003",
+                  "contentType": "LOCKUP_CONTENT_TYPE_VIDEO"
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
