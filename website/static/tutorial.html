@@ -67,7 +67,9 @@
     #tab-confluence:checked ~ .tab-bar label[for="tab-confluence"],
     #tab-pr:checked         ~ .tab-bar label[for="tab-pr"],
     #tab-twiddle:checked    ~ .tab-bar label[for="tab-twiddle"],
-    #tab-browser:checked    ~ .tab-bar label[for="tab-browser"] {
+    #tab-browser:checked    ~ .tab-bar label[for="tab-browser"],
+    #tab-youtube:checked    ~ .tab-bar label[for="tab-youtube"],
+    #tab-history:checked    ~ .tab-bar label[for="tab-history"] {
       background: white;
       color: var(--accent);
       border-color: var(--border);
@@ -77,7 +79,9 @@
     #tab-confluence:checked ~ #content-confluence,
     #tab-pr:checked         ~ #content-pr,
     #tab-twiddle:checked    ~ #content-twiddle,
-    #tab-browser:checked    ~ #content-browser { display: block; }
+    #tab-browser:checked    ~ #content-browser,
+    #tab-youtube:checked    ~ #content-youtube,
+    #tab-history:checked    ~ #content-history { display: block; }
 
     h2 { margin-top: 32px; font-size: 20px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
     h3 { margin-top: 24px; font-size: 16px; }
@@ -272,8 +276,8 @@
 <body>
 
 <header>
-  <h1>omni-dev — Atlassian, PRs, commits, and the browser bridge in five tabs</h1>
-  <p>A tutorial covering the five primary omni-dev workflows. Switch tabs to navigate.</p>
+  <h1>omni-dev — Atlassian, PRs, commits, the browser bridge, and more in seven tabs</h1>
+  <p>A tutorial covering seven omni-dev workflows. Switch tabs to navigate.</p>
 </header>
 
 <div class="container">
@@ -283,6 +287,8 @@
     <input type="radio" name="tab" id="tab-pr">
     <input type="radio" name="tab" id="tab-twiddle">
     <input type="radio" name="tab" id="tab-browser">
+    <input type="radio" name="tab" id="tab-youtube">
+    <input type="radio" name="tab" id="tab-history">
 
     <div class="tab-bar">
       <label for="tab-jira">JIRA</label>
@@ -290,6 +296,8 @@
       <label for="tab-pr">Create PRs</label>
       <label for="tab-twiddle">Twiddle commit messages</label>
       <label for="tab-browser">Browser bridge</label>
+      <label for="tab-youtube">YouTube transcript</label>
+      <label for="tab-history">Claude history</label>
     </div>
 
     <!-- ====================== JIRA TAB ====================== -->
@@ -1451,6 +1459,199 @@ done</pre>
         (relative URLs) is unaffected; cross-origin targets depend on their
         <code>Access-Control-Allow-Origin</code>. The bridge works only while the
         tab is open and the snippet is running.
+      </div>
+    </section>
+
+    <!-- ====================== YOUTUBE TRANSCRIPT TAB ====================== -->
+    <section class="tab-content" id="content-youtube">
+      <h2>YouTube transcript — captions as SRT, VTT, TXT, or JSON</h2>
+
+      <p>
+        <code>omni-dev transcript youtube</code> fetches captions and transcripts
+        from YouTube. The provider is the first positional argument, so the
+        namespace stays clean as more sources (Vimeo, podcast RSS, generic
+        VTT/SRT URLs) are added later. Three subcommands: <code>info</code> and
+        <code>list-langs</code> inspect a video; <code>fetch</code> renders a track.
+      </p>
+
+      <h3>The three subcommands</h3>
+
+      <div class="step">
+        <span class="step-num">1</span><strong>Inspect</strong> the video&apos;s
+        metadata and available tracks.
+        <pre>omni-dev transcript youtube info jNQXAC9IVRw
+omni-dev transcript youtube list-langs jNQXAC9IVRw</pre>
+        <p class="muted">Both default to a human table; pass
+          <code>--output json</code> for machine-readable output.</p>
+      </div>
+
+      <div class="step">
+        <span class="step-num">2</span><strong>Fetch</strong> a track and render it.
+        Writes to stdout unless <code>-o</code> is given.
+        <pre>omni-dev transcript youtube fetch jNQXAC9IVRw --format srt -o me-at-the-zoo.srt</pre>
+      </div>
+
+      <h3>Locator forms</h3>
+      <p><code>&lt;url&gt;</code> accepts any of these — extra query params are ignored:</p>
+      <pre>https://www.youtube.com/watch?v=jNQXAC9IVRw
+https://youtu.be/jNQXAC9IVRw
+https://www.youtube.com/shorts/&lt;id&gt;
+https://www.youtube.com/embed/&lt;id&gt;
+jNQXAC9IVRw                         # bare 11-character video ID</pre>
+
+      <h3><code>fetch</code> flags</h3>
+      <table>
+        <thead><tr><th>Flag</th><th>Default</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td><code>--lang &lt;code&gt;</code></td><td><code>en</code></td><td>Preferred language. Prefix fallback applies — <code>en</code> matches <code>en-US</code>.</td></tr>
+          <tr><td><code>--format &lt;fmt&gt;</code></td><td><code>srt</code></td><td>One of <code>srt</code>, <code>vtt</code>, <code>txt</code>, <code>json</code>.</td></tr>
+          <tr><td><code>--auto</code></td><td>off</td><td>Allow falling through to auto-generated (ASR) captions when no manual track matches.</td></tr>
+          <tr><td><code>--translate &lt;lang&gt;</code></td><td>—</td><td>Synthesise a translated track in <code>&lt;lang&gt;</code> when no native track matches.</td></tr>
+          <tr><td><code>-o</code>, <code>--output</code></td><td>stdout</td><td>Write the rendered transcript to a file.</td></tr>
+        </tbody>
+      </table>
+
+      <div class="panel panel-info">
+        <div class="panel-title">ℹ️ Manual vs. auto-generated</div>
+        <code>list-langs</code> tags each track with a <code>kind</code>:
+        <code>manual</code> (human-authored), <code>auto</code> (ASR), or
+        <code>translated</code>. <code>fetch</code> only uses an <code>auto</code>
+        track when you pass <code>--auto</code> — otherwise it fails with
+        <code>AutoCaptionsRequireOptIn</code> rather than silently handing back a
+        lower-quality transcript.
+      </div>
+
+      <h3>Typed errors, not raw HTTP</h3>
+      <p>Failures surface as named variants, so a script can branch on them:</p>
+      <table>
+        <thead><tr><th>Variant</th><th>When</th></tr></thead>
+        <tbody>
+          <tr><td><code>InvalidLocator</code></td><td>URL did not parse, or bare ID failed validation.</td></tr>
+          <tr><td><code>LanguageNotFound</code></td><td>No track matched <code>--lang</code> (manual or, with <code>--auto</code>, ASR).</td></tr>
+          <tr><td><code>AutoCaptionsRequireOptIn</code></td><td>Only ASR matched, but <code>--auto</code> was not passed.</td></tr>
+          <tr><td><code>PlayabilityRefused</code></td><td>Age-gated, region-locked, removed, or login-required.</td></tr>
+          <tr><td><code>ParseError</code> / <code>Http</code></td><td>Response did not match the expected shape, or a non-2xx response.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Worked example</h3>
+      <span class="lang-tag">terminal</span>
+<pre>$ omni-dev transcript youtube info jNQXAC9IVRw
+Source:    youtube
+ID:        jNQXAC9IVRw
+Title:     Me at the zoo
+Channel:   jawed
+Duration:  00:19
+Languages:
+  - en       [manual] English
+  - en       [auto]   English (auto-generated)
+
+$ omni-dev transcript youtube fetch jNQXAC9IVRw --format txt
+All right, so here we are in front of the elephants.
+The cool thing about these guys is that they have really,
+really, really long trunks. And that's cool. And that's
+pretty much all there is to say.</pre>
+
+      <div class="panel panel-note">
+        <div class="panel-title">📝 Library-first design</div>
+        The fetching logic lives in <code>src/transcript/</code> with no
+        <code>clap</code> dependency; the CLI is a thin bridge. Format converters
+        consume <code>&amp;[Cue]</code> and never reach back into a source, so all
+        four output formats work for any future provider. See
+        <a href="https://github.com/rust-works/omni-dev/blob/main/docs/transcript.md">docs/transcript.md</a>
+        for the recipe to add one.
+      </div>
+    </section>
+
+    <!-- ====================== CLAUDE HISTORY TAB ====================== -->
+    <section class="tab-content" id="content-history">
+      <h2>Claude history — export your Claude Code sessions</h2>
+
+      <p>
+        <code>omni-dev ai claude history sync</code> exports your Claude Code
+        conversation history to a target directory as one <code>.jsonl</code>
+        (and/or rendered <code>.md</code>) per chat. The corpus is a
+        <strong>behavioural transcript</strong> — prompts, responses, thinking,
+        tool calls, and tool-result metadata — sized for analyst use cases like
+        work-log generation and behavioural review.
+      </p>
+
+      <div class="panel panel-info">
+        <div class="panel-title">ℹ️ What is and isn&apos;t exported</div>
+        <strong>Included:</strong> user prompts, assistant responses, thinking,
+        tool calls and tool-result metadata. <strong>Deliberately excluded:</strong>
+        sub-agent internals, tool-result <code>*.txt</code> sidecars, PDF rasters,
+        and auto-memory.
+      </div>
+
+      <h3>The basic command</h3>
+      <div class="step">
+        <span class="step-num">1</span><strong>Sync</strong> every session to a
+        target directory. Both file shapes side by side:
+        <pre>omni-dev ai claude history sync --target ~/claude-history \
+  --output-format jsonl,markdown</pre>
+      </div>
+
+      <h3>On-disk layout</h3>
+      <p>
+        One folder per project (the encoded working-directory slug), one file per
+        session UUID:
+      </p>
+      <pre>~/claude-history/
+  -Users-me-wrk-omni-dev/
+    0f1a…2b.jsonl       # append-only event log, byte-identical across runs
+    0f1a…2b.md          # rendered, human-readable transcript
+  -Users-me-tmp-spike/
+    a1b2…d4.jsonl
+    a1b2…d4.md</pre>
+
+      <h3>Flags</h3>
+      <table>
+        <thead><tr><th>Flag</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td><code>--target &lt;PATH&gt;</code></td><td>Target directory for the export (required). Created if absent.</td></tr>
+          <tr><td><code>--source &lt;PATH&gt;</code></td><td>Override the source root. Defaults to <code>~/.claude/projects</code>.</td></tr>
+          <tr><td><code>--project &lt;NAME&gt;</code></td><td>Restrict to one project — the encoded slug (<code>-Users-me-tmp</code>) or a decoded cwd path.</td></tr>
+          <tr><td><code>--since &lt;DUR|DATE&gt;</code></td><td>Only sessions at/after this point. Relative (<code>30s</code>, <code>2h</code>, <code>7d</code>, <code>4w</code>) or RFC 3339.</td></tr>
+          <tr><td><code>--output-format &lt;LIST&gt;</code></td><td>On-disk shapes: <code>jsonl</code> (default), <code>markdown</code>, or both comma-separated.</td></tr>
+          <tr><td><code>--exclude-system</code></td><td>Hide system-side events from Markdown (JSONL is unaffected).</td></tr>
+          <tr><td><code>--prune</code></td><td>Delete targets for sessions no longer in the source (scoped to managed extensions).</td></tr>
+          <tr><td><code>--dry-run</code></td><td>Preview changes without touching the target.</td></tr>
+          <tr><td><code>--format &lt;text|yaml&gt;</code></td><td>Shape of the run <em>report</em> printed to stdout.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Idempotent re-runs</h3>
+      <p>
+        Each run reports <code>created</code> / <code>updated</code> /
+        <code>skipped</code> / <code>pruned</code> per file. A session is skipped
+        when its source mtime is unchanged, so re-running is cheap and safe to put
+        on a schedule:
+      </p>
+      <span class="lang-tag">terminal</span>
+<pre>$ omni-dev ai claude history sync --target ~/hist --output-format jsonl,markdown
+created  jsonl     -Users-me-omni-dev/0f1a…2b -> ~/hist/…/0f1a…2b.jsonl (48213 bytes)
+created  markdown  -Users-me-omni-dev/0f1a…2b -> ~/hist/…/0f1a…2b.md (21044 bytes)
+
+$ omni-dev ai claude history sync --target ~/hist --output-format jsonl,markdown
+skipped  jsonl     -Users-me-omni-dev/0f1a…2b (unchanged) -> ~/hist/…/0f1a…2b.jsonl
+skipped  markdown  -Users-me-omni-dev/0f1a…2b (unchanged) -> ~/hist/…/0f1a…2b.md</pre>
+
+      <div class="panel panel-warn">
+        <div class="panel-title">⚠️ <code>--prune</code> is scoped, not a blunt delete</div>
+        Only files matching <code>&lt;slug&gt;/&lt;uuid&gt;.&lt;ext&gt;</code> are
+        eligible for deletion, and <code>&lt;ext&gt;</code> is restricted to the
+        formats in <code>--output-format</code> — so artefacts the run was not asked
+        to manage are preserved regardless. Pair with <code>--dry-run</code> the
+        first time to preview what would go.
+      </div>
+
+      <div class="panel panel-success">
+        <div class="panel-title">✅ Versionable by design</div>
+        The JSONL is append-only and byte-identical across runs (mtime alone
+        decides freshness), so committing <code>~/claude-history</code> to a git
+        repo produces clean, meaningful diffs — a durable, greppable record of how
+        the work actually happened.
       </div>
     </section>
   </div>
