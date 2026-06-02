@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use super::harvest::HarvestCommand;
 use super::request::RequestCommand;
 use crate::browser::{self, auth, BridgeConfig};
 
@@ -35,6 +36,8 @@ pub enum BridgeSubcommands {
     Serve(ServeCommand),
     /// Sends a request through a running bridge (thin client).
     Request(RequestCommand),
+    /// Harvests your own data from a logged-in tab (best-effort).
+    Harvest(HarvestCommand),
 }
 
 impl BridgeCommand {
@@ -43,6 +46,7 @@ impl BridgeCommand {
         match self.command {
             BridgeSubcommands::Serve(cmd) => cmd.execute().await,
             BridgeSubcommands::Request(cmd) => cmd.execute().await,
+            BridgeSubcommands::Harvest(cmd) => cmd.execute().await,
         }
     }
 }

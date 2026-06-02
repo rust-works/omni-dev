@@ -1,6 +1,7 @@
 //! Browser bridge CLI commands.
 
 pub(crate) mod bridge;
+pub(crate) mod harvest;
 pub(crate) mod request;
 
 use anyhow::Result;
