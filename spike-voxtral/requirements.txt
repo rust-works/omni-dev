@@ -1,0 +1,6 @@
+# Voxtral Realtime streaming spike (#930) — pinned to the versions probed on
+# 2026-06-03 (Apple Silicon, Python 3.12.12). mlx-audio pulls mlx/mlx-lm.
+mlx==0.31.2
+mlx-audio==0.4.3
+soundfile==0.13.1
+numpy==2.4.6

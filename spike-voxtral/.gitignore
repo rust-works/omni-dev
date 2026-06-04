@@ -1,0 +1,6 @@
+# Throwaway spike artifacts — never commit these.
+.venv/
+results/
+voxtral_c/repo/
+__pycache__/
+*.pyc
