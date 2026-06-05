@@ -146,7 +146,7 @@ impl RunningStats {
             let delta = x - self.mean[i];
             self.mean[i] += delta / n;
             let delta2 = x - self.mean[i];
-            self.m2[i] += delta * delta2;
+            self.m2[i] = delta.mul_add(delta2, self.m2[i]);
         }
     }
 
