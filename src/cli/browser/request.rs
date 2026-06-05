@@ -12,6 +12,7 @@ use clap::{Parser, ValueEnum};
 use futures::StreamExt as _;
 
 use crate::browser::auth;
+use crate::browser::client::BridgeClient;
 use crate::browser::protocol::{ControlRequest, ResponseEnvelope, StreamLine};
 
 /// Default control-plane port (matches `bridge`'s default).
@@ -122,13 +123,10 @@ impl RequestCommand {
             credentials: self.credentials.map(Credentials::to_fetch_value),
         };
 
-        let endpoint = format!("http://127.0.0.1:{}/__bridge/request", self.control_port);
-        let client = reqwest::Client::new();
+        let client = BridgeClient::new(self.control_port, token);
+        let endpoint = client.endpoint();
         let resp = client
-            .post(&endpoint)
-            .bearer_auth(&token)
-            .header(auth::BRIDGE_HEADER, auth::BRIDGE_HEADER_VALUE)
-            .json(&payload)
+            .request_builder(&payload)
             .send()
             .await
             .with_context(|| format!("Failed to reach bridge at {endpoint} (is it running?)"))?;

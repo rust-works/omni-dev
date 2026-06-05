@@ -1894,10 +1894,63 @@ Usage: bridge <COMMAND>
 Commands:
   serve    Runs the local bridge server (WebSocket + HTTP control planes)
   request  Sends a request through a running bridge (thin client)
+  harvest  Harvests your own data from a logged-in tab (best-effort)
   help     Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev browser bridge harvest - Harvests your own data from a logged-in tab (best-effort)
+
+Harvests your own data from a logged-in tab (best-effort)
+
+Usage: harvest <COMMAND>
+
+Commands:
+  facebook  Harvest your own data from Facebook
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev browser bridge harvest facebook - Harvest your own data from Facebook
+
+Harvest your own data from Facebook
+
+Usage: facebook <COMMAND>
+
+Commands:
+  posts  Download your own timeline posts
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev browser bridge harvest facebook posts - Download your own timeline posts
+
+Download your own timeline posts
+
+Usage: posts [OPTIONS]
+
+Options:
+      --control-port <CONTROL_PORT>  Control-plane port of the running bridge [default: 9998]
+      --token-file <PATH>            Read the session token from this `0600` file instead of the environment
+      --target <ID|ORIGIN>           Route to a specific connected tab: a connection id (from `/__bridge/status`) or an `Origin` that uniquely matches one tab. Required when more than one tab is connected
+      --output <PATH>                Write posts to this file instead of stdout
+      --format <FORMAT>              Output format: one post per line (`jsonl`) or a single array (`json`) [default: jsonl] [possible values: jsonl, json]
+      --since <UNIX-TS|ISO8601>      Stop paging once posts are older than this (Unix seconds or ISO-8601)
+      --limit <N>                    Stop after this many posts (smoke tests / sampling)
+      --resume <PATH>                Continue a prior interrupted run from its saved cursor (state file path)
+  -h, --help                         Print help (see more with '--help')
 
 
 ================================================================================
