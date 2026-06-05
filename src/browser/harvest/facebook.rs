@@ -1248,11 +1248,16 @@ mod tests {
         r#"__d("ProfileCometTimelineFeedRefetchQuery_facebookRelayOperation",[],(function(a){a.exports="222333"}),null);"#.to_string()
     }
 
-    /// A single-post stream/defer page that terminates pagination.
-    fn fake_graphql_page(id: &str) -> String {
+    /// A single-post stream/defer page. With `page_info`, it carries a terminal
+    /// cursor; without it (drift / a malformed defer line), the cursor never
+    /// advances.
+    fn fake_graphql_page(id: &str, with_page_info: bool) -> String {
         let edges = json!({"data": {"node": {"timeline_list_feed_units": {
             "edges": [{"node": sample_node(id, 100)}]
         }}}});
+        if !with_page_info {
+            return format!("{edges}\n");
+        }
         let page_info = json!({"data": {"node": {"timeline_list_feed_units": {
             "page_info": {"end_cursor": "C1", "has_next_page": false}
         }}}});
@@ -1269,6 +1274,8 @@ mod tests {
         me_status: u16,
         /// Whether the served bundle carries the refetch persisted-op marker.
         bundle_has_marker: bool,
+        /// Whether GraphQL pages carry a `page_info` (and thus advance the cursor).
+        page_has_info: bool,
     }
 
     impl ControlPlane {
@@ -1277,6 +1284,7 @@ mod tests {
                 post_id: post_id.to_string(),
                 me_status: 200,
                 bundle_has_marker: true,
+                page_has_info: true,
             }
         }
     }
@@ -1294,7 +1302,7 @@ mod tests {
                 };
                 (200, js)
             } else {
-                (200, fake_graphql_page(&self.post_id))
+                (200, fake_graphql_page(&self.post_id, self.page_has_info))
             };
             let env = ResponseEnvelope {
                 id: 1,
@@ -1462,5 +1470,140 @@ mod tests {
             let err = parse_session_from_me(&broken).unwrap_err().to_string();
             assert!(err.contains(expect), "removing {needle:?} → {err}");
         }
+    }
+
+    #[test]
+    fn parse_session_errors_when_variables_object_is_malformed() {
+        let tokens = r#""DTSGInitialData",[],{"token":"D"} "LSD",[],{"token":"L"} "USER_ID":"5" "#;
+        // An unbalanced `variables` object can't be sliced out.
+        let unbalanced = format!(
+            "{tokens} ProfileCometTimelineFeedQuery \"variables\":{{\"userID\":\"5\" \"queryID\":\"1\""
+        );
+        let err = parse_session_from_me(&unbalanced).unwrap_err().to_string();
+        assert!(err.contains("variables"), "got: {err}");
+
+        // A balanced but non-JSON `variables` object fails to deserialise.
+        let invalid = format!(
+            "{tokens} ProfileCometTimelineFeedQuery \"variables\":{{not valid json}} \"queryID\":\"1\""
+        );
+        let err = parse_session_from_me(&invalid).unwrap_err().to_string();
+        assert!(err.contains("variables"), "got: {err}");
+    }
+
+    #[test]
+    fn resume_state_load_surfaces_non_notfound_read_errors() {
+        // A directory path is not "not found" — read fails for another reason,
+        // exercising the contextual error arm rather than the default.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(ResumeState::load(dir.path()).is_err());
+    }
+
+    #[tokio::test]
+    async fn discover_refetch_doc_bails_when_me_references_no_bundles() {
+        let h = test_harvester(Format::Jsonl, None, None);
+        let err = h
+            .discover_refetch_doc("<html>no fbcdn script tags here</html>")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no "), "got: {err}");
+        assert!(err.to_string().contains("step 2"), "got: {err}");
+    }
+
+    /// A jsonl `HarvestConfig` with an explicit `limit` and optional resume.
+    fn run_config_limited(
+        port: u16,
+        out: PathBuf,
+        resume: Option<PathBuf>,
+        limit: usize,
+    ) -> HarvestConfig {
+        HarvestConfig {
+            limit: Some(limit),
+            ..run_config(port, out, resume)
+        }
+    }
+
+    #[tokio::test]
+    async fn run_fresh_stops_on_initial_page_when_limit_is_reached() {
+        // limit=1 with a one-post initial page trips the stop on the initial
+        // page itself, exercising the early `finish` return.
+        let server = mount_control_plane("FRESH").await;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("posts.jsonl");
+        run(run_config_limited(
+            server.address().port(),
+            out.clone(),
+            None,
+            1,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&out).unwrap().lines().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_resume_loop_stops_when_limit_is_reached() {
+        let server = mount_control_plane("RESUMED").await;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("posts.jsonl");
+        let state = dir.path().join("run.state");
+        ResumeState {
+            end_cursor: Some("C0".into()),
+            count: 0,
+            user_id: None,
+        }
+        .save(&state)
+        .unwrap();
+        run(run_config_limited(
+            server.address().port(),
+            out.clone(),
+            Some(state),
+            1,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&out).unwrap().lines().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_resume_stops_when_cursor_does_not_advance() {
+        // A page without `page_info` yields no new cursor, so the loop stops.
+        let server = mount(ControlPlane {
+            page_has_info: false,
+            ..ControlPlane::happy("STUCK")
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("posts.jsonl");
+        let state = dir.path().join("run.state");
+        ResumeState {
+            end_cursor: Some("C0".into()),
+            count: 0,
+            user_id: None,
+        }
+        .save(&state)
+        .unwrap();
+        run(run_config(
+            server.address().port(),
+            out.clone(),
+            Some(state),
+        ))
+        .await
+        .unwrap();
+        // The single page's post was still emitted before the stop.
+        assert!(std::fs::read_to_string(&out)
+            .unwrap()
+            .contains("\"id\":\"STUCK\""));
+    }
+
+    #[tokio::test]
+    async fn run_fresh_json_format_writes_array_to_stdout() {
+        // format=json + stdout output exercises the json branch of `finish`.
+        let server = mount_control_plane("JSONOUT").await;
+        let config = HarvestConfig {
+            format: Format::Json,
+            output: Output::Stdout,
+            ..run_config(server.address().port(), PathBuf::new(), None)
+        };
+        run(config).await.unwrap();
     }
 }
