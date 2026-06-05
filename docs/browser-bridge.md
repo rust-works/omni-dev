@@ -25,8 +25,9 @@ add-on — both planes are authenticated and default-closed. See
 7. [Flags](#flags)
 8. [Random ports](#random-ports)
 9. [Worked example: downloading Grafana / Loki logs](#worked-example-downloading-grafana--loki-logs)
-10. [WebSocket wire protocol](#websocket-wire-protocol)
-11. [Caveats](#caveats)
+10. [Harvesting your own data (best-effort)](#harvesting-your-own-data-best-effort)
+11. [WebSocket wire protocol](#websocket-wire-protocol)
+12. [Caveats](#caveats)
 
 ## How it works
 
@@ -346,6 +347,55 @@ Each page must still fit under `--max-body-bytes`. If a single page trips the
 over-limit error, it tells you exactly what to do: lower `--limit`/narrow the
 window so each page is smaller, or raise `--max-body-bytes` to accept a larger
 page.
+
+## Harvesting your own data (best-effort)
+
+The recipes above drive APIs you assemble by hand. For some sites the sequence
+is involved enough — harvest CSRF tokens from HTML, discover a persisted-query
+id from a lazily-loaded cross-origin bundle, then replay a paginating GraphQL
+query — that it is packaged as a built-in command tree:
+
+```
+omni-dev browser bridge harvest <platform> <object>
+```
+
+Today the only target is your **own** Facebook timeline:
+
+```bash
+# Page your whole timeline to a file, newest-first, one JSON post per line:
+omni-dev browser bridge harvest facebook posts --output my-posts.jsonl
+
+# Sample the most recent 20 posts to stdout:
+omni-dev browser bridge harvest facebook posts --limit 20
+
+# Incremental archive: stop once posts predate a cutoff (Unix seconds or ISO-8601):
+omni-dev browser bridge harvest facebook posts --since 2024-01-01T00:00:00Z
+
+# Resume a run interrupted by a 504 / token rotation from its saved cursor:
+omni-dev browser bridge harvest facebook posts --output my-posts.jsonl --resume run.state
+```
+
+Each post is `{ id, creation_time, text, url, shared_link }`. `--format jsonl`
+(default) streams one post per line and is append-friendly on `--resume`;
+`--format json` writes a single array when the run completes. `--target`,
+`--token-file`, and `--control-port` mirror `bridge request`.
+
+The command reuses the same `bridge request` dispatch path: it needs a running
+`bridge serve` with a Facebook tab connected (verify with `GET /__bridge/status`),
+and its cross-origin `doc_id`-discovery step requires the bridge to permit
+`https://static.xx.fbcdn.net` (it sends that per-request via the same machinery
+as `request --allow-origin … --credentials omit`). The full manual recipe this
+encapsulates is documented separately (issue #922).
+
+> **Best-effort contract.** This drives **reverse-engineered, undocumented**
+> Facebook internals. It re-harvests every volatile value (GraphQL `doc_id`s,
+> relay-provider flags, session tokens) on each run — nothing is hardcoded — and
+> fails with a staged, actionable error naming the step that drifted rather than
+> panicking. Even so, it **can break whenever Facebook changes** its query ids,
+> page structure, or response shape. It only ever uses the session already
+> logged into the connected tab (**your own account only**; mind Facebook's ToS).
+> For a stable archive, prefer Facebook's official **"Download Your Information"**
+> export.
 
 ## WebSocket wire protocol
 

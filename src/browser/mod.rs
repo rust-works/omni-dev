@@ -10,6 +10,8 @@
 
 pub mod auth;
 pub mod bridge;
+pub mod client;
+pub mod harvest;
 pub mod protocol;
 pub mod snippet;
 
