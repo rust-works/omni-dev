@@ -3167,7 +3167,7 @@ Arguments:
   <WAV>  Path to a 16 kHz mono 16-bit PCM WAV file. Use `voice capture` to produce one — `transcribe` does not resample
 
 Options:
-      --backend <BACKEND>              Transcriber backend (`mock`, `whisper-candle`). Defaults to `mock`; see ADR-0033 for the `whisper-candle` runtime choice
+      --backend <BACKEND>              Transcriber backend (`mock`, `whisper-candle`, `voxtral`). Defaults to `mock`; see ADR-0033 for the `whisper-candle` runtime and ADR-0037 for the platform-gated native `voxtral` backend (opt-in, macOS/Linux only)
       --model <MODEL>                  Path to a backend-specific model directory. For `whisper-candle`, this overrides `OMNI_DEV_VOICE_WHISPER_MODEL` and the default at `~/.omni-dev/voice/models/whisper-tiny.en/`. Ignored by `mock`
       --format <FORMAT>                Output format. Defaults to `md` on a tty, `jsonl` when piped [possible values: jsonl, md]
       --speaker <SPEAKER>              Enrolled speaker to filter on. Drops any `Final` event whose segment doesn't match the enrolled embedding by cosine similarity at or above `--threshold`

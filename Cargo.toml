@@ -81,6 +81,18 @@ nix = { version = "0.31", default-features = false, features = ["signal"] }
 
 [features]
 mcp = ["dep:rmcp"]
+# Off-by-default native Voxtral ASR backend (#933, ADR-0037). Platform-gated:
+# the native engine is permitted only behind a Rust FFI boundary on
+# `cfg(not(target_os = "windows"))`; on Windows and in default (feature-off)
+# builds, requesting `--backend voxtral` is a clear construction-time error,
+# never a build break. Phase 1 establishes the gating seam only. The
+# `voxtral-sys` FFI crate (vendored `antirez/voxtral.c`) is added under a
+# `[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]`
+# stanza in #933 Phase 2, at which point this becomes
+# `voxtral = ["dep:voxtral-sys"]`. As a declared Cargo feature, `voxtral` is
+# auto-known to the `unexpected_cfgs` check (unlike the custom `online_tests`
+# cfg below), so no check-cfg entry is needed for `cfg(feature = "voxtral")`.
+voxtral = []
 
 [dev-dependencies]
 tempfile = "3.27"

@@ -11,6 +11,12 @@
 //!    release cycle; pick `--backend whisper-candle` explicitly. See
 //!    [`crate::voice::backends::candle`] and ADR-0033.
 //!
+//! A fourth name, `"voxtral"`, is recognised on every host but is
+//! platform-gated (#933, ADR-0037): the native engine compiles only on
+//! `cfg(not(target_os = "windows"))` behind the off-by-default `voxtral`
+//! feature, and requesting it where it is unavailable is a clear
+//! construction-time error rather than a build break or a silent fallback.
+//!
 //! [`create_default_claude_client`]: crate::claude::client::create_default_claude_client
 
 use std::path::PathBuf;
@@ -59,9 +65,65 @@ pub fn create_default_transcriber(opts: &VoiceOpts) -> Result<Box<dyn Transcribe
             let dir = resolve_whisper_model_dir(opts)?;
             Ok(Box::new(CandleTranscriber::new(&dir)?))
         }
+        "voxtral" => create_voxtral_transcriber(opts),
         other => {
-            bail!("unknown voice backend: {other:?} (supported: \"mock\", \"whisper-candle\")")
+            bail!(
+                "unknown voice backend: {other:?} \
+                 (supported: \"mock\", \"whisper-candle\", \"voxtral\")"
+            )
         }
+    }
+}
+
+/// Constructs the native Voxtral backend (#933, [ADR-0037]).
+///
+/// The native engine (vendored `antirez/voxtral.c` behind a `voxtral-sys` FFI
+/// crate) is permitted only behind a Rust FFI boundary on
+/// `cfg(not(target_os = "windows"))`, and only when the off-by-default
+/// `voxtral` Cargo feature is enabled. This Phase-1 seam establishes the
+/// platform gating; the engine itself lands in #933 Phase 2/3.
+///
+/// The `"voxtral"` backend name is recognised on **every** host — including
+/// Windows and feature-off builds — per ADR-0035's cross-platform-descriptor
+/// contract: an unavailable backend yields a clear, actionable
+/// *construction-time* error explaining **why** it is unavailable, never an
+/// "unknown backend" error and never a build break (ADR-0037 §3). There is no
+/// silent fall-through to `whisper-candle`: an explicit `--backend voxtral`
+/// that cannot be served fails loudly rather than substituting a different
+/// backend behind the user's back.
+///
+/// [ADR-0037]: ../../../docs/adrs/adr-0037.md
+fn create_voxtral_transcriber(_opts: &VoiceOpts) -> Result<Box<dyn Transcriber>> {
+    #[cfg(all(feature = "voxtral", not(target_os = "windows")))]
+    {
+        // Feature compiled in on a supported target, but the native engine is
+        // not wired up yet — it arrives in #933 Phase 2/3.
+        bail!(
+            "voice backend \"voxtral\" is not yet implemented — the native \
+             engine lands in #933 Phase 3; use --backend whisper-candle for now"
+        )
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Native Voxtral is excluded on Windows by design (ADR-0037): the Metal
+        // fast path is Apple-only and the project takes on no Windows
+        // native-toolchain requirement. `whisper-candle` is the supported
+        // cross-platform alternative.
+        bail!(
+            "voice backend \"voxtral\" is not available on Windows by design \
+             (ADR-0037); use --backend whisper-candle"
+        )
+    }
+
+    #[cfg(all(not(feature = "voxtral"), not(target_os = "windows")))]
+    {
+        // Supported target, but built without the opt-in feature.
+        bail!(
+            "voice backend \"voxtral\" was not compiled in; rebuild with \
+             `--features voxtral` on macOS or Linux (the native engine requires \
+             a C toolchain — see ADR-0037), or use --backend whisper-candle"
+        )
     }
 }
 
@@ -141,6 +203,72 @@ mod tests {
         assert!(msg.contains("klingon"), "got: {msg}");
         assert!(msg.contains("supported"), "got: {msg}");
         assert!(msg.contains("whisper-candle"), "got: {msg}");
+        assert!(msg.contains("voxtral"), "got: {msg}");
+    }
+
+    // The "voxtral" backend name is recognised on every host (ADR-0035's
+    // cross-platform-descriptor contract), so it never surfaces as an "unknown
+    // backend". What it resolves to is platform- and feature-dependent
+    // (ADR-0037); each build configuration gets its own clear construction-time
+    // error rather than a build break or a silent fallback to whisper-candle.
+
+    /// Helper: route `--backend voxtral` through the factory and return the
+    /// error it must produce on every host where the native engine is absent.
+    #[cfg(not(all(feature = "voxtral", not(target_os = "windows"))))]
+    fn voxtral_error() -> String {
+        let _g = env_guard();
+        std::env::remove_var("OMNI_DEV_VOICE_BACKEND");
+        let opts = VoiceOpts {
+            backend: Some("voxtral".to_string()),
+            model: None,
+        };
+        // `.err().expect()` rather than `let Err(..) else { panic!() }`: the
+        // call always errors here, so the `else` arm would be a permanently
+        // uncovered branch. The test module allows `expect_used`.
+        create_default_transcriber(&opts)
+            .err()
+            .expect("expected voxtral to error where the native engine is absent")
+            .to_string()
+    }
+
+    #[cfg(all(feature = "voxtral", not(target_os = "windows")))]
+    #[test]
+    fn voxtral_feature_on_reports_not_yet_implemented() {
+        let _g = env_guard();
+        std::env::remove_var("OMNI_DEV_VOICE_BACKEND");
+        let opts = VoiceOpts {
+            backend: Some("voxtral".to_string()),
+            model: None,
+        };
+        // `.err().expect()` keeps this test's only line covered — the call
+        // always errors, so a `let Err(..) else { panic!() }` would leave the
+        // `else` arm permanently uncovered.
+        let msg = create_default_transcriber(&opts)
+            .err()
+            .expect("expected voxtral (engine not yet wired up) to error")
+            .to_string();
+        assert!(msg.contains("voxtral"), "got: {msg}");
+        assert!(msg.contains("not yet implemented"), "got: {msg}");
+        assert!(!msg.contains("unknown"), "got: {msg}");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn voxtral_on_windows_reports_unavailable_by_design() {
+        let msg = voxtral_error();
+        assert!(msg.contains("voxtral"), "got: {msg}");
+        assert!(msg.contains("Windows"), "got: {msg}");
+        assert!(msg.contains("whisper-candle"), "got: {msg}");
+        assert!(!msg.contains("unknown"), "got: {msg}");
+    }
+
+    #[cfg(all(not(feature = "voxtral"), not(target_os = "windows")))]
+    #[test]
+    fn voxtral_feature_off_reports_not_compiled_in() {
+        let msg = voxtral_error();
+        assert!(msg.contains("voxtral"), "got: {msg}");
+        assert!(msg.contains("--features voxtral"), "got: {msg}");
+        assert!(!msg.contains("unknown"), "got: {msg}");
     }
 
     #[test]

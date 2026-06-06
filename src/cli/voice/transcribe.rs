@@ -49,8 +49,9 @@ pub struct TranscribeCommand {
     /// produce one — `transcribe` does not resample.
     pub wav: PathBuf,
 
-    /// Transcriber backend (`mock`, `whisper-candle`). Defaults to `mock`;
-    /// see ADR-0033 for the `whisper-candle` runtime choice.
+    /// Transcriber backend (`mock`, `whisper-candle`, `voxtral`). Defaults to
+    /// `mock`; see ADR-0033 for the `whisper-candle` runtime and ADR-0037 for
+    /// the platform-gated native `voxtral` backend (opt-in, macOS/Linux only).
     #[arg(long)]
     pub backend: Option<String>,
 
