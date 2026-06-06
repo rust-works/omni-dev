@@ -25,4 +25,5 @@ jobs:
         with:
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
           guidelines: .omni-dev/commit-guidelines.md
+          model: claude-haiku-4-5
           verbose: true
