@@ -123,10 +123,13 @@ jobs:
         echo "voxtral-sys correctly absent from the x86_64-pc-windows-msvc graph"
 
   voxtral-build:
-    # Keep the native Voxtral path green on its supported targets: macOS
-    # (Apple-Silicon fast path) and Linux (C + OpenBLAS BLAS path). In Phase 1
-    # the `voxtral` feature is an empty placeholder; this matrix locks the
-    # supported-target build surface in before the engine lands (Phase 2).
+    # Build + test the standalone `voxtral-sys` FFI crate (#933 Phase 2) on its
+    # supported targets: macOS (Metal/MPS + Accelerate) and Linux (C + OpenBLAS).
+    # It is a workspace member, not yet an omni-dev dependency, so it is
+    # exercised directly via `-p voxtral-sys`. This compiles the vendored C
+    # (and Objective-C/Metal on macOS), runs bindgen, links, and runs the
+    # construction/error-mapping unit tests (real inference needs the staged
+    # ~8.9 GB model and is uncovered-by-design per ADR-0037).
     name: Voxtral Native Path (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -136,11 +139,13 @@ jobs:
     - uses: actions/checkout@v6
     - uses: dtolnay/rust-toolchain@stable
     - uses: Swatinem/rust-cache@v2
-    - name: Install ALSA headers for cpal
+    - name: Install Linux native build deps (OpenBLAS + libclang for bindgen)
       if: runner.os == 'Linux'
-      run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-    - name: Build with --features voxtral
-      run: cargo build --features voxtral --verbose
+      run: sudo apt-get update && sudo apt-get install -y libopenblas-dev libclang-dev
+    - name: Build voxtral-sys
+      run: cargo build -p voxtral-sys --verbose
+    - name: Test voxtral-sys
+      run: cargo test -p voxtral-sys --verbose
 
   docs:
     name: Docs
@@ -185,7 +190,10 @@ jobs:
         # shellcheck disable=SC1090
         source <(cargo llvm-cov show-env --sh)
         cargo llvm-cov clean --workspace
-        cargo test --all-features --workspace
+        # Exclude voxtral-sys: its native path needs OpenBLAS/libclang (not
+        # installed on this runner) and is uncovered-by-design (ADR-0037); it is
+        # covered separately by `cargo test -p voxtral-sys`.
+        cargo test --all-features --workspace --exclude voxtral-sys
     - name: Generate codecov.json
       # Kept ready so the disabled upload below works as soon as it is re-enabled.
       run: |

@@ -1,0 +1,27 @@
+[package]
+name = "voxtral-sys"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80.0"
+authors = ["John Ky <newhoggy@gmail.com>"]
+license = "MIT"
+description = "Low-level FFI bindings to antirez/voxtral.c, the pure-C Voxtral Realtime ASR engine (platform-gated, non-Windows)"
+repository = "https://github.com/rust-works/omni-dev"
+# Not published to crates.io yet. It becomes a published, versioned dependency
+# of omni-dev in #933 Phase 3, when the `VoxtralBackend` wires the edge and the
+# release flow grows a step to publish it. Until then it is a path-only
+# workspace member, so leaving it unpublished keeps `cargo publish` of omni-dev
+# unaffected. See ADR-0037 and the workspace comment in the root Cargo.toml.
+publish = false
+# `links` prevents two copies of the native engine from being linked into one
+# binary and lets dependents read `DEP_VOXTRAL_*` build metadata.
+links = "voxtral"
+
+[build-dependencies]
+cc = "1"
+bindgen = "0.71"
+
+[lints.rust]
+# This crate is the FFI trust boundary: all `unsafe` lives here, quarantined
+# from the root omni-dev crate (which keeps `unsafe_code = "deny"`).
+unsafe_code = "allow"

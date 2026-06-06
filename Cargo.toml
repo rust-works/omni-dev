@@ -1,3 +1,14 @@
+[workspace]
+# The root `omni-dev` package is also the workspace root. `voxtral-sys` (the
+# pure-C Voxtral FFI engine, #933 / ADR-0037) is a standalone member: it is
+# built and tested in CI via `cargo build/test -p voxtral-sys` but is NOT yet a
+# dependency of omni-dev. Wiring the omni-dev -> voxtral-sys edge (and the
+# crates.io publish-flow change it forces) lands in #933 Phase 3 with the
+# `VoxtralBackend`. Keeping it un-wired here keeps `cargo publish` of omni-dev
+# working (an optional path-dep with no registry version would break it).
+members = ["voxtral-sys"]
+resolver = "2"
+
 [package]
 name = "omni-dev"
 version = "0.28.0"
@@ -21,6 +32,9 @@ exclude = [
     "assets/",
     "scratch/",
     "tests/fixtures/voice/",
+    # `voxtral-sys` is a separate crate (its own vendored C); it must not be
+    # bundled inside the omni-dev crates.io tarball.
+    "voxtral-sys/",
 ]
 
 [dependencies]
