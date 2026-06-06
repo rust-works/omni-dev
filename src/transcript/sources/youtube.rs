@@ -14,11 +14,14 @@ use async_trait::async_trait;
 use crate::transcript::error::Result;
 use crate::transcript::source::{FetchOpts, LanguageInfo, MediaInfo, Transcript, TranscriptSource};
 
+pub mod channel;
 pub mod innertube;
 pub mod player_response;
 pub mod timedtext;
 pub mod url;
 pub mod watch_page;
+
+pub use channel::VideoEntry;
 
 pub use player_response::{
     check_playability, extract_media_info, list_languages, parse as parse_player_response,
@@ -127,6 +130,27 @@ impl Youtube {
         let response = parse_player_response(&raw)?;
         check_playability(&response)?;
         Ok(response)
+    }
+
+    /// Resolve a channel locator (`@handle`, `/c/Name`, channel URL, or a raw
+    /// `UC…` ID) to its canonical `UC…` channel ID. See
+    /// [`channel::resolve_channel_id`].
+    pub async fn resolve_channel_id(&self, input: &str) -> Result<String> {
+        channel::resolve_channel_id(&self.http, &self.base_url, input).await
+    }
+
+    /// Enumerate a channel's recent uploads via its RSS feed (newest-first,
+    /// ~15 most recent). See [`channel::fetch_recent_videos`].
+    pub async fn recent_channel_videos(&self, channel_id: &str) -> Result<Vec<VideoEntry>> {
+        channel::fetch_recent_videos(&self.http, &self.base_url, channel_id).await
+    }
+
+    /// Enumerate a channel's full upload history via the InnerTube `/browse`
+    /// endpoint (newest-first). Uses the WEB client; no `visitorData` bootstrap
+    /// is needed (browse is a public endpoint). See
+    /// [`channel::fetch_all_video_ids`].
+    pub async fn all_channel_video_ids(&self, channel_id: &str) -> Result<Vec<String>> {
+        channel::fetch_all_video_ids(&self.http, &self.base_url, channel_id).await
     }
 }
 

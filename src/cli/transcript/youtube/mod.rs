@@ -3,6 +3,7 @@
 pub mod fetch;
 pub mod info;
 pub mod list_langs;
+pub mod sync;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -24,6 +25,8 @@ pub enum YoutubeSubcommands {
     ListLangs(list_langs::ListLangsCommand),
     /// Shows top-level metadata (title, channel, duration, languages) for a YouTube video.
     Info(info::InfoCommand),
+    /// Syncs transcripts for all videos in one or more channels to the filesystem.
+    Sync(sync::SyncCommand),
 }
 
 impl YoutubeCommand {
@@ -33,6 +36,7 @@ impl YoutubeCommand {
             YoutubeSubcommands::Fetch(cmd) => cmd.execute().await,
             YoutubeSubcommands::ListLangs(cmd) => cmd.execute().await,
             YoutubeSubcommands::Info(cmd) => cmd.execute().await,
+            YoutubeSubcommands::Sync(cmd) => cmd.execute().await,
         }
     }
 }
@@ -66,6 +70,24 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, YoutubeSubcommands::ListLangs(_)));
+    }
+
+    #[test]
+    fn youtube_subcommands_sync_variant() {
+        let cmd = YoutubeCommand {
+            command: YoutubeSubcommands::Sync(sync::SyncCommand {
+                channels: vec!["@handle".to_string()],
+                out: std::path::PathBuf::from("/tmp/yt"),
+                lang: "en".to_string(),
+                format: CliFormat::Srt,
+                auto: false,
+                full: false,
+                since: None,
+                concurrency: 4,
+                dry_run: false,
+            }),
+        };
+        assert!(matches!(cmd.command, YoutubeSubcommands::Sync(_)));
     }
 
     #[test]

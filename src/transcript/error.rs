@@ -64,6 +64,17 @@ pub enum TranscriptError {
         /// The URL whose response body was scraped.
         url: String,
     },
+
+    /// A channel locator (`@handle`, `/c/Name`, `/user/Name`, …) could not be
+    /// resolved to a `UC…` channel ID. Either the input is not a recognised
+    /// channel reference or the scraped channel page did not carry the
+    /// expected `channelId` token (the page format drifts, like
+    /// [`Self::MissingVisitorData`]).
+    #[error("could not resolve a YouTube channel ID from `{input}`")]
+    ChannelNotFound {
+        /// The channel locator the caller supplied.
+        input: String,
+    },
 }
 
 #[cfg(test)]

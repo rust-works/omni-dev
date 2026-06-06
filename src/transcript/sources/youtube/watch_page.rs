@@ -36,7 +36,10 @@ const BOOTSTRAP_VIDEO_ID: &str = "dQw4w9WgXcQ";
 ///
 /// Distinct from [`super::USER_AGENT`], which the InnerTube `/player`
 /// POSTs use — that one must match `clientName: ANDROID_VR`.
-const BROWSER_USER_AGENT: &str =
+///
+/// Also reused by [`super::channel`] when scraping a channel page for its
+/// `channelId` — same browser-vs-bot reasoning applies there.
+pub(crate) const BROWSER_USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
      (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
