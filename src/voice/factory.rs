@@ -24,9 +24,9 @@ use std::path::PathBuf;
 use anyhow::{bail, Result};
 
 use crate::voice::backends::candle::CandleTranscriber;
-use crate::voice::backends::mock::MockTranscriber;
+use crate::voice::backends::mock::{MockStreamingTranscriber, MockTranscriber};
 use crate::voice::models::resolve_whisper_model_dir;
-use crate::voice::transcriber::Transcriber;
+use crate::voice::transcriber::{StreamingTranscriber, Transcriber};
 
 /// Backend-selection options carried from the CLI (or constructed
 /// programmatically for tests).
@@ -80,15 +80,52 @@ pub fn create_default_transcriber(opts: &VoiceOpts) -> Result<Box<dyn Transcribe
     }
 }
 
+/// Constructs the appropriate [`StreamingTranscriber`] given `opts` and the
+/// process environment — the streaming counterpart of
+/// [`create_default_transcriber`] (ADR-0038).
+///
+/// Backend selection follows the same priority (`--backend` → env → `mock`).
+/// Only `mock` has a streaming implementation today; `whisper-candle` and
+/// `voxtral` are batch-only until #806 / #933 Phase 6 land their streaming
+/// variants, so they return a clear construction-time error here.
+pub fn create_default_streaming_transcriber(
+    opts: &VoiceOpts,
+) -> Result<Box<dyn StreamingTranscriber>> {
+    let backend = opts
+        .backend
+        .clone()
+        .or_else(|| crate::utils::settings::get_env_var("OMNI_DEV_VOICE_BACKEND").ok())
+        .unwrap_or_else(|| "mock".to_string());
+
+    match backend.as_str() {
+        "mock" => Ok(Box::new(MockStreamingTranscriber::new(
+            MockStreamingTranscriber::default_script(),
+        ))),
+        "whisper-candle" | "voxtral" => {
+            bail!(
+                "streaming backend not yet implemented for {backend:?} \
+                 (lands in #806 / #933 Phase 6); use --backend mock for streaming, \
+                 or `voice transcribe` for batch"
+            )
+        }
+        other => {
+            bail!(
+                "unknown voice backend: {other:?} \
+                 (supported: \"mock\", \"whisper-candle\", \"voxtral\")"
+            )
+        }
+    }
+}
+
 /// Constructs the native Voxtral backend (#933, [ADR-0037]).
 ///
 /// The native engine (vendored `antirez/voxtral.c` behind a `voxtral-sys` FFI
 /// crate) is permitted only behind a Rust FFI boundary on
 /// `cfg(not(target_os = "windows"))`, and only when the off-by-default
 /// `voxtral` Cargo feature is enabled. When compiled in, this resolves the
-/// Voxtral model directory and constructs a
-/// [`crate::voice::backends::voxtral::VoxtralBackend`]; the model-bound
-/// construction errors (missing weights) carry an install hint.
+/// Voxtral model directory and constructs a `VoxtralBackend` (its module is
+/// `cfg`-gated, so this is a plain reference, not an intra-doc link); the
+/// model-bound construction errors (missing weights) carry an install hint.
 ///
 /// The `"voxtral"` backend name is recognised on **every** host — including
 /// Windows and feature-off builds — per ADR-0035's cross-platform-descriptor
@@ -310,5 +347,52 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("no Whisper model found"), "got: {msg}");
         assert!(msg.contains("voice install-model"), "got: {msg}");
+    }
+
+    // ── Streaming factory (ADR-0038) ────────────────────────────────────
+
+    #[test]
+    fn streaming_default_is_mock() {
+        let _g = env_guard();
+        std::env::remove_var("OMNI_DEV_VOICE_BACKEND");
+        assert!(create_default_streaming_transcriber(&VoiceOpts::default()).is_ok());
+    }
+
+    #[test]
+    fn streaming_real_backends_report_not_yet_implemented() {
+        let _g = env_guard();
+        std::env::remove_var("OMNI_DEV_VOICE_BACKEND");
+        for backend in ["whisper-candle", "voxtral"] {
+            let opts = VoiceOpts {
+                backend: Some(backend.to_string()),
+                model: None,
+                delay_ms: None,
+            };
+            let err = create_default_streaming_transcriber(&opts)
+                .err()
+                .expect("streaming whisper-candle/voxtral should error");
+            let msg = err.to_string();
+            assert!(msg.contains("not yet implemented"), "got: {msg}");
+            assert!(msg.contains(backend), "got: {msg}");
+            assert!(!msg.contains("unknown"), "got: {msg}");
+        }
+    }
+
+    #[test]
+    fn streaming_unknown_backend_errors() {
+        let _g = env_guard();
+        std::env::remove_var("OMNI_DEV_VOICE_BACKEND");
+        let opts = VoiceOpts {
+            backend: Some("klingon".to_string()),
+            model: None,
+            delay_ms: None,
+        };
+        let err = create_default_streaming_transcriber(&opts)
+            .err()
+            .expect("unknown streaming backend should error");
+        assert!(
+            err.to_string().contains("unknown voice backend"),
+            "got: {err}"
+        );
     }
 }
