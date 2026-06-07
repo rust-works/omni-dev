@@ -855,12 +855,13 @@ mod tests {
     // ── execute paths via env-based create_client ─────────────────
 
     /// Sets Atlassian credentials, runs a closure that may call
-    /// `create_client()`, then unsets credentials. Tests serialize on a
-    /// shared mutex because env vars are global.
+    /// `create_client()`, then unsets credentials. Tests serialize on the one
+    /// canonical env mutex (issue #950) because env vars are process-global —
+    /// an independent lock would not exclude the other Atlassian credential
+    /// tests.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::Mutex;
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock()
+        crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 

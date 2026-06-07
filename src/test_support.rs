@@ -42,14 +42,21 @@ pub(crate) mod atlassian_env {
     //! In-process Atlassian env-var guard for tests that drive
     //! `cli::atlassian::helpers::create_client()` end-to-end.
     //!
-    //! Mirrors `tests/mcp_integration_test.rs::AtlassianEnvGuard`, but
-    //! lives in the lib-test process (separate from integration tests),
-    //! so its mutex is independent. Tests that touch these env vars
-    //! must construct a guard and hold it for the duration of the test.
-    use std::sync::{Mutex, MutexGuard};
-
-    /// Process-local lock so concurrent tests don't race on the env.
-    static ATLASSIAN_ENV_LOCK: Mutex<()> = Mutex::new(());
+    //! Mirrors `tests/mcp_integration_test.rs::AtlassianEnvGuard` (which lives
+    //! in a *separate* integration-test process and so keeps its own lock).
+    //! Within the lib-test process every guard that mutates the Atlassian
+    //! credential env vars **must serialise on the one canonical mutex**
+    //! [`crate::atlassian::auth::test_util::AUTH_ENV_MUTEX`] — independent
+    //! mutexes over the same process-global vars provide no mutual exclusion
+    //! and caused the flaky env race in issue #950.
+    //!
+    //! This is transitional scaffolding: as the remaining `*Command` tests
+    //! migrate to the [`create_client_from`] dependency-injection seam (and
+    //! stop mutating env entirely), their use of this guard — and eventually
+    //! the guard itself — can be removed.
+    //!
+    //! [`create_client_from`]: crate::cli::atlassian::helpers::create_client_from
+    use std::sync::MutexGuard;
 
     pub(crate) struct AtlassianEnvGuard {
         _guard: MutexGuard<'static, ()>,
@@ -66,7 +73,7 @@ pub(crate) mod atlassian_env {
         /// vars so `create_client()` produces a client targeting the
         /// supplied URL with the supplied credentials.
         pub(crate) fn new(instance_url: &str, email: &str, token: &str) -> Self {
-            let guard = ATLASSIAN_ENV_LOCK
+            let guard = crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let tmp = tempfile::tempdir().unwrap();

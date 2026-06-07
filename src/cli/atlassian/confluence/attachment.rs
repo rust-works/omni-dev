@@ -503,8 +503,10 @@ mod tests {
         std::env::remove_var(crate::atlassian::auth::ATLASSIAN_API_TOKEN);
     }
 
-    use std::sync::Mutex;
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    // Serialise on the one canonical env mutex (issue #950) — an independent
+    // lock over the same process-global `ATLASSIAN_*` vars provides no mutual
+    // exclusion against the other Atlassian credential tests.
+    use crate::atlassian::auth::test_util::AUTH_ENV_MUTEX as ENV_MUTEX;
 
     #[tokio::test(flavor = "current_thread")]
     async fn upload_command_execute_runs_through_dispatch() {

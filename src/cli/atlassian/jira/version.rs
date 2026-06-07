@@ -32,6 +32,17 @@ impl VersionCommand {
             VersionSubcommands::Create(cmd) => cmd.execute().await,
         }
     }
+
+    /// Dispatches against an injected client result (issue #950 DI seam). Lets
+    /// tests drive the full `VersionCommand` -> subcommand dispatch path against
+    /// a mock without mutating process-global env.
+    #[cfg(test)]
+    async fn execute_with(self, client: Result<(AtlassianClient, String)>) -> Result<()> {
+        match self.command {
+            VersionSubcommands::List(cmd) => cmd.execute_with(client).await,
+            VersionSubcommands::Create(cmd) => cmd.execute_with(client).await,
+        }
+    }
 }
 
 /// Lists versions for a JIRA project.
@@ -65,7 +76,15 @@ pub struct ListCommand {
 impl ListCommand {
     /// Fetches and displays versions.
     pub async fn execute(self) -> Result<()> {
-        let (client, _instance_url) = create_client()?;
+        self.execute_with(create_client()).await
+    }
+
+    /// Runs against an injected client result (issue #950 DI seam). `execute`
+    /// supplies the env-resolved client; tests supply one built from explicit
+    /// credentials (or an `Err` to exercise the propagation path) without
+    /// touching process-global env.
+    async fn execute_with(self, client: Result<(AtlassianClient, String)>) -> Result<()> {
+        let (client, _instance_url) = client?;
         run_list_versions(
             &client,
             &self.project,
@@ -112,7 +131,13 @@ pub struct CreateCommand {
 impl CreateCommand {
     /// Creates the version.
     pub async fn execute(self) -> Result<()> {
-        let (client, _instance_url) = create_client()?;
+        self.execute_with(create_client()).await
+    }
+
+    /// Runs against an injected client result (issue #950 DI seam). See
+    /// [`ListCommand::execute_with`].
+    async fn execute_with(self, client: Result<(AtlassianClient, String)>) -> Result<()> {
+        let (client, _instance_url) = client?;
         run_create_version(
             &client,
             &self.project,
@@ -532,14 +557,34 @@ mod tests {
         assert!(err.to_string().contains("YYYY-MM-DD"));
     }
 
-    // ── execute() integration via env-injected creds ───────────────
+    // ── execute() integration via injected client (issue #950) ─────
     //
-    // These tests drive each `*Command::execute()` end-to-end against a
-    // wiremock server by setting `ATLASSIAN_*` env vars so `create_client()`
-    // builds a client pointed at the mock. They share a process-wide mutex
-    // (`AUTH_ENV_MUTEX`) with auth.rs tests to serialise env mutation.
+    // The happy-path tests drive each `*Command::execute_with()` end-to-end
+    // against a wiremock server by injecting a client built from explicit
+    // [`AtlassianCredentials`] pointed at the mock. They do NOT touch the
+    // process-global `ATLASSIAN_*` env vars and therefore need no mutex and
+    // run fully in parallel — the dependency-injection fix for the flaky
+    // env-race documented in issue #950.
+    //
+    // The error-path tests below still exercise the production `execute()` ->
+    // `create_client()` wrappers (which read the environment), so they clear
+    // credentials behind the one canonical [`EnvGuard`]/`AUTH_ENV_MUTEX`. That
+    // mutation is fully serialised and deterministic (it only ever produces
+    // `CredentialsNotFound`), so it is not subject to the original race.
 
     use crate::atlassian::auth::test_util::EnvGuard;
+    use crate::atlassian::auth::AtlassianCredentials;
+    use crate::cli::atlassian::helpers::create_client_from;
+
+    /// Credentials pointed at a mock server. Uses dummy email/token; the mock
+    /// does not authenticate, it only matches method + path.
+    fn mock_credentials(instance_url: &str) -> AtlassianCredentials {
+        AtlassianCredentials {
+            instance_url: instance_url.to_string(),
+            email: "test@example.com".to_string(),
+            api_token: "test-token".to_string(),
+        }
+    }
 
     #[tokio::test]
     async fn version_command_execute_list_dispatches_through_create_client() {
@@ -556,8 +601,29 @@ mod tests {
             .mount(&server)
             .await;
 
+        let cmd = VersionCommand {
+            command: VersionSubcommands::List(ListCommand {
+                project: "PROJ".to_string(),
+                released: false,
+                unreleased: false,
+                archived: false,
+                unarchived: false,
+                output: OutputFormat::Yaml,
+            }),
+        };
+        let client = create_client_from(mock_credentials(&server.uri()));
+        assert!(cmd.execute_with(client).await.is_ok());
+    }
+
+    /// Drives the production `VersionCommand::execute` -> `ListCommand::execute`
+    /// -> `create_client()` -> `execute_with(Err)` chain with credentials
+    /// cleared, so the `?` propagation path runs end-to-end (covers the
+    /// env-reading wrappers the injection tests bypass).
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn version_command_execute_list_propagates_create_client_error() {
         let guard = EnvGuard::take();
-        let _home = guard.set_credentials(&server.uri());
+        let _home = guard.clear_credentials();
 
         let cmd = VersionCommand {
             command: VersionSubcommands::List(ListCommand {
@@ -569,44 +635,27 @@ mod tests {
                 output: OutputFormat::Yaml,
             }),
         };
-        assert!(cmd.execute().await.is_ok());
-    }
-
-    /// Exercises the `?` Err path on `create_client()` in
-    /// `ListCommand::execute` by clearing all credential env vars before
-    /// calling.
-    #[tokio::test]
-    async fn list_command_execute_propagates_create_client_error() {
-        let guard = EnvGuard::take();
-        let _home = guard.clear_credentials();
-
-        let cmd = ListCommand {
-            project: "PROJ".to_string(),
-            released: false,
-            unreleased: false,
-            archived: false,
-            unarchived: false,
-            output: OutputFormat::Yaml,
-        };
         assert!(cmd.execute().await.is_err());
     }
 
-    /// Exercises the `?` Err path on `create_client()` in
-    /// `CreateCommand::execute` by clearing all credential env vars before
-    /// calling.
-    #[tokio::test]
-    async fn create_command_execute_propagates_create_client_error() {
+    /// Same as above for the `Create` arm: covers `VersionCommand::execute`
+    /// (Create), `CreateCommand::execute`, and `create_client()`.
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn version_command_execute_create_propagates_create_client_error() {
         let guard = EnvGuard::take();
         let _home = guard.clear_credentials();
 
-        let cmd = CreateCommand {
-            project: "PROJ".to_string(),
-            name: "1.0.0".to_string(),
-            description: None,
-            release_date: None,
-            start_date: None,
-            released: false,
-            archived: false,
+        let cmd = VersionCommand {
+            command: VersionSubcommands::Create(CreateCommand {
+                project: "PROJ".to_string(),
+                name: "1.0.0".to_string(),
+                description: None,
+                release_date: None,
+                start_date: None,
+                released: false,
+                archived: false,
+            }),
         };
         assert!(cmd.execute().await.is_err());
     }
@@ -622,9 +671,6 @@ mod tests {
             .mount(&server)
             .await;
 
-        let guard = EnvGuard::take();
-        let _home = guard.set_credentials(&server.uri());
-
         let cmd = VersionCommand {
             command: VersionSubcommands::Create(CreateCommand {
                 project: "PROJ".to_string(),
@@ -636,6 +682,7 @@ mod tests {
                 archived: false,
             }),
         };
-        assert!(cmd.execute().await.is_ok());
+        let client = create_client_from(mock_credentials(&server.uri()));
+        assert!(cmd.execute_with(client).await.is_ok());
     }
 }
