@@ -23,6 +23,7 @@ pub mod atlassian;
 pub mod browser;
 pub mod claude;
 pub mod cli;
+pub mod coverage;
 pub mod data;
 pub mod datadog;
 pub mod git;
