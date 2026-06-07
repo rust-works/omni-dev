@@ -102,6 +102,9 @@ jobs:
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write        # required to post the coverage comment
     steps:
     - uses: actions/checkout@v6
     - uses: dtolnay/rust-toolchain@stable
@@ -112,14 +115,43 @@ jobs:
       run: sudo apt-get update && sudo apt-get install -y libasound2-dev
     - name: Install cargo-llvm-cov
       uses: taiki-e/install-action@cargo-llvm-cov
-    - name: Generate coverage report
-      run: cargo llvm-cov --all-features --workspace --codecov --output-path codecov.json --fail-under-lines 30
+    - name: Run tests with coverage
+      run: cargo llvm-cov --all-features --workspace --no-report
+    - name: Generate codecov.json
+      # Reuses cached profiling data from the step above (no recompile/re-test).
+      # Kept ready so the disabled upload below works as soon as it is re-enabled.
+      run: cargo llvm-cov report --codecov --output-path codecov.json
+    - name: Build coverage summary
+      # Write the report to coverage.md (for the PR comment) and append it to the
+      # run's Summary tab so it is visible without digging through the logs.
+      run: |
+        {
+          echo '## Coverage'
+          echo '```'
+          cargo llvm-cov report --summary-only
+          echo '```'
+        } | tee coverage.md >> "$GITHUB_STEP_SUMMARY"
+    - name: Comment coverage on PR
+      if: github.event_name == 'pull_request'
+      uses: marocchino/sticky-pull-request-comment@v2
+      with:
+        header: coverage          # sticky key: updates the same comment each run
+        path: coverage.md
+    # Publishing to codecov.io is temporarily DISABLED: an upstream outage in the
+    # codecov-action GPG uploader-key import randomly fails signature verification
+    # (codecov/codecov-action#1876). The printed summary + PR comment above stand
+    # in for it. Re-enable by changing `if: false` back to a real condition once
+    # Codecov's uploader key server recovers.
     - name: Upload to codecov.io
+      if: false
       uses: codecov/codecov-action@v6
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
         files: codecov.json
         fail_ci_if_error: true
+    - name: Enforce coverage threshold
+      # Runs last so the summary and PR comment are posted even when the gate fails.
+      run: cargo llvm-cov report --summary-only --fail-under-lines 30
 
   audit:
     name: Security Audit
