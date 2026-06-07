@@ -102,6 +102,9 @@ jobs:
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write        # required to post the coverage comment
     steps:
     - uses: actions/checkout@v6
     - uses: dtolnay/rust-toolchain@stable
@@ -112,14 +115,90 @@ jobs:
       run: sudo apt-get update && sudo apt-get install -y libasound2-dev
     - name: Install cargo-llvm-cov
       uses: taiki-e/install-action@cargo-llvm-cov
-    - name: Generate coverage report
-      run: cargo llvm-cov --all-features --workspace --codecov --output-path codecov.json --fail-under-lines 30
+    - name: Run tests with coverage
+      run: cargo llvm-cov --all-features --workspace --no-report
+    - name: Generate codecov.json
+      # Reuses cached profiling data from the step above (no recompile/re-test).
+      # Kept ready so the disabled upload below works as soon as it is re-enabled.
+      run: cargo llvm-cov report --codecov --output-path codecov.json
+    - name: Generate per-file coverage JSON
+      # Normalise llvm-cov's JSON export to { total, files: { <repo path>: pct } }.
+      # This is the diff input: published as the baseline on `main`, and compared
+      # against the baseline on PRs to build the per-file change comment.
+      run: |
+        cargo llvm-cov report --json --output-path llvm-cov.json
+        jq --arg ws "$GITHUB_WORKSPACE/" '{
+          total: .data[0].totals.lines.percent,
+          files: ([ .data[0].files[]
+                    | { key: (.filename | ltrimstr($ws)), value: .summary.lines.percent } ]
+                  | from_entries)
+        }' llvm-cov.json > coverage-files.json
+    - name: Build coverage summary
+      # Full per-file summary: appended to the run's Summary tab and published as
+      # a build artifact (see "Upload coverage artifacts"). It is intentionally
+      # NOT inlined into the PR comment, which shows only changed files.
+      run: |
+        cargo llvm-cov report --summary-only | tee coverage-summary.txt
+        {
+          echo '## Coverage'
+          echo '```'
+          cat coverage-summary.txt
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+    - name: Download baseline coverage from main
+      # Best-effort: pulls the per-file coverage published by the latest successful
+      # `main` run so the comment can compute deltas. Missing baseline (first run,
+      # or no prior main artifact) is a warning, not a failure.
+      if: github.event_name == 'pull_request'
+      uses: dawidd6/action-download-artifact@v6
+      with:
+        name: coverage-baseline
+        branch: main
+        workflow: ci.yml
+        path: baseline
+        if_no_artifact_found: warn
+    - name: Build PR coverage comment
+      if: github.event_name == 'pull_request'
+      run: ./scripts/coverage-comment.sh baseline/coverage-files.json coverage-files.json > coverage.md
+    - name: Comment coverage on PR
+      if: github.event_name == 'pull_request'
+      uses: marocchino/sticky-pull-request-comment@v2
+      with:
+        header: coverage          # sticky key: updates the same comment each run
+        path: coverage.md
+    - name: Upload coverage artifacts
+      # The full summary lives here (not in the PR comment); codecov.json kept for
+      # when the upload below is re-enabled.
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-summary
+        path: |
+          coverage-summary.txt
+          codecov.json
+          coverage-files.json
+    - name: Publish coverage baseline
+      # On main only: this run's per-file coverage becomes the baseline that
+      # subsequent PRs download above to compute deltas.
+      if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-baseline
+        path: coverage-files.json
+    # Publishing to codecov.io is temporarily DISABLED: an upstream outage in the
+    # codecov-action GPG uploader-key import randomly fails signature verification
+    # (codecov/codecov-action#1876). The printed summary + PR comment above stand
+    # in for it. Re-enable by changing `if: false` back to a real condition once
+    # Codecov's uploader key server recovers.
     - name: Upload to codecov.io
+      if: false
       uses: codecov/codecov-action@v6
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
         files: codecov.json
         fail_ci_if_error: true
+    - name: Enforce coverage threshold
+      # Runs last so the summary and PR comment are posted even when the gate fails.
+      run: cargo llvm-cov report --summary-only --fail-under-lines 30
 
   audit:
     name: Security Audit
