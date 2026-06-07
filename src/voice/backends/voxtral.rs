@@ -16,16 +16,20 @@
 //! corrupt — the same correctness reason candle locks its model.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use futures::channel::mpsc;
 use ulid::Ulid;
-use voxtral_sys::VoxCtx;
+use voxtral_sys::{VoxCtx, VoxStream};
 
+use crate::voice::idle::IdleDetector;
 use crate::voice::models::ensure_voxtral_model_present;
+use crate::voice::segment::StreamSegmenter;
 use crate::voice::transcriber::{
-    AudioInput, EndpointKind, EventStream, Transcriber, TranscriptEvent,
+    AsyncAudioInput, AudioChunk, AudioInput, EndpointKind, EventStream, StreamingTranscriber,
+    Transcriber, TranscriptEvent, TranscriptEventStream,
 };
 
 /// Voxtral's fixed input sample rate (16 kHz mono), used to convert sample
@@ -44,6 +48,15 @@ const FEED_WINDOW_SAMPLES: usize = 16_000;
 /// Pointers requested per `vox_stream_get` drain call.
 const TOKENS_PER_DRAIN: usize = 256;
 
+/// Streaming: minimum wall-clock between encoder runs. Lower than the engine's
+/// 2 s default for more responsive `Partial`s; tuned against the model in #933
+/// Phase 8.
+const STREAM_PROCESSING_INTERVAL_SECS: f32 = 0.5;
+
+/// Streaming: consecutive silent 100 ms windows that commit an utterance with a
+/// `SilenceGap` endpoint (~700 ms). Tuned against the model in #933 Phase 8.
+const SILENCE_GAP_WINDOWS: u32 = 7;
+
 /// Segment confidence reported for every `Final`.
 ///
 /// Voxtral's `vox_stream_get` returns only token *strings* — the C API exposes
@@ -54,9 +67,13 @@ const TOKENS_PER_DRAIN: usize = 256;
 const VOXTRAL_CONFIDENCE: f32 = 1.0;
 
 /// Native Voxtral Realtime backend.
+///
+/// Implements both the batch [`Transcriber`] and the streaming
+/// [`StreamingTranscriber`] (ADR-0038). The context is `Arc<Mutex<_>>` so a
+/// handle can move into the blocking inference thread the streaming path spawns.
 #[derive(Debug)]
 pub struct VoxtralBackend {
-    ctx: Mutex<VoxCtx>,
+    ctx: Arc<Mutex<VoxCtx>>,
 }
 
 impl VoxtralBackend {
@@ -71,13 +88,13 @@ impl VoxtralBackend {
             .map_err(|e| anyhow!("load Voxtral model from {}: {e}", model_dir.display()))?;
         ctx.set_delay(delay_ms);
         Ok(Self {
-            ctx: Mutex::new(ctx),
+            ctx: Arc::new(Mutex::new(ctx)),
         })
     }
 }
 
 /// Drains all currently-pending token strings into `text`.
-fn drain_tokens(stream: &mut voxtral_sys::VoxStream<'_>, text: &mut String) {
+fn drain_tokens(stream: &mut VoxStream<'_>, text: &mut String) {
     loop {
         let tokens = stream.get(TOKENS_PER_DRAIN);
         if tokens.is_empty() {
@@ -87,6 +104,19 @@ fn drain_tokens(stream: &mut voxtral_sys::VoxStream<'_>, text: &mut String) {
             text.push_str(&token);
         }
     }
+}
+
+/// Drains all currently-pending token strings as a `Vec` (streaming path).
+fn drain_token_strings(stream: &mut VoxStream<'_>) -> Vec<String> {
+    let mut out = Vec::new();
+    loop {
+        let tokens = stream.get(TOKENS_PER_DRAIN);
+        if tokens.is_empty() {
+            break;
+        }
+        out.extend(tokens);
+    }
+    out
 }
 
 impl Transcriber for VoxtralBackend {
@@ -159,6 +189,120 @@ impl Transcriber for VoxtralBackend {
             kind: EndpointKind::StreamEnd,
         }));
         Ok(Box::new(events.into_iter()))
+    }
+}
+
+impl StreamingTranscriber for VoxtralBackend {
+    /// Drives the engine incrementally and returns a live event stream
+    /// (ADR-0038). Wires an async↔blocking bridge: an async **feeder** task
+    /// pulls chunks from `audio` and hands them to a `spawn_blocking`
+    /// **inference** task that drives the blocking C engine, emitting events
+    /// over a channel.
+    ///
+    /// Must be called within a tokio runtime (it uses `spawn`/`spawn_blocking`);
+    /// the streaming consumers (`voice listen`, #807) are async by design.
+    fn transcribe_stream(&self, mut audio: Box<dyn AsyncAudioInput>) -> TranscriptEventStream {
+        let (event_tx, event_rx) = mpsc::unbounded::<Result<TranscriptEvent>>();
+        let (audio_tx, audio_rx) = std::sync::mpsc::channel::<AudioChunk>();
+        let ctx = Arc::clone(&self.ctx);
+
+        // Feeder: pull async audio chunks; dropping `audio_tx` at the end
+        // signals end-of-audio to the blocking thread's `recv()`.
+        tokio::spawn(async move {
+            while let Some(chunk) = audio.next_chunk().await {
+                if audio_tx.send(chunk).is_err() {
+                    break; // inference thread gone
+                }
+            }
+        });
+
+        // Inference: drive the blocking C engine off the async runtime.
+        tokio::task::spawn_blocking(move || run_stream(&ctx, &audio_rx, &event_tx));
+
+        Box::pin(event_rx)
+    }
+}
+
+/// The streaming inference loop, run on a blocking thread. Locks the context
+/// for the stream's lifetime (the guard and `VoxStream` stay thread-local, so
+/// no lifetime escapes), then feeds audio, drains tokens into a
+/// [`StreamSegmenter`], and emits events over `event_tx`. Engine errors are
+/// forwarded as `Err` and stop the stream; a dropped receiver also stops it.
+fn run_stream(
+    ctx: &Arc<Mutex<VoxCtx>>,
+    audio_rx: &std::sync::mpsc::Receiver<AudioChunk>,
+    event_tx: &mpsc::UnboundedSender<Result<TranscriptEvent>>,
+) {
+    let guard = match ctx.lock() {
+        Ok(g) => g,
+        Err(e) => {
+            let _ = event_tx.unbounded_send(Err(anyhow!("VoxtralBackend mutex poisoned: {e}")));
+            return;
+        }
+    };
+    let mut stream = match guard.stream() {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = event_tx.unbounded_send(Err(anyhow!("open Voxtral stream: {e}")));
+            return;
+        }
+    };
+    stream.set_processing_interval(STREAM_PROCESSING_INTERVAL_SECS);
+
+    // `IdleDetector` is used only as the RMS window classifier here (we read the
+    // per-window classes from `push`); its idle-after threshold is irrelevant.
+    let mut idle = IdleDetector::new(1);
+    let mut segmenter = StreamSegmenter::new(SILENCE_GAP_WINDOWS);
+    let mut samples_fed: usize = 0;
+
+    let now = |samples: usize| -> Duration {
+        #[allow(clippy::cast_precision_loss)]
+        Duration::from_secs_f64(samples as f64 / SAMPLE_RATE)
+    };
+
+    while let Ok(chunk) = audio_rx.recv() {
+        let pcm: Vec<f32> = chunk.iter().map(|&s| f32::from(s) / 32768.0).collect();
+        let classes = idle.push(&pcm);
+
+        if let Err(e) = stream.feed(&pcm) {
+            let _ = event_tx.unbounded_send(Err(anyhow!("feed Voxtral stream: {e}")));
+            return;
+        }
+        samples_fed += chunk.len();
+        let t = now(samples_fed);
+
+        let tokens = drain_token_strings(&mut stream);
+        if let Some(partial) = segmenter.push_tokens(&tokens, t) {
+            if event_tx.unbounded_send(Ok(partial)).is_err() {
+                return;
+            }
+        }
+
+        if segmenter.observe_silence(&classes) {
+            if let Err(e) = stream.flush() {
+                let _ = event_tx.unbounded_send(Err(anyhow!("flush Voxtral stream: {e}")));
+                return;
+            }
+            let flushed = drain_token_strings(&mut stream);
+            for ev in segmenter.commit_silence_gap(&flushed, t, VOXTRAL_CONFIDENCE) {
+                if event_tx.unbounded_send(Ok(ev)).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
+    // Audio ended: finish, drain the delay window, and commit the tail.
+    if let Err(e) = stream.finish() {
+        let _ = event_tx.unbounded_send(Err(anyhow!("finish Voxtral stream: {e}")));
+        return;
+    }
+    let t = now(samples_fed);
+    let tail = drain_token_strings(&mut stream);
+    for ev in segmenter.commit_end(&tail, t, VOXTRAL_CONFIDENCE) {
+        if event_tx.unbounded_send(Ok(ev)).is_err() {
+            return;
+        }
     }
 }
 
