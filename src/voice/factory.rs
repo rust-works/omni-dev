@@ -42,6 +42,11 @@ pub struct VoiceOpts {
     pub backend: Option<String>,
     /// Path to a backend-specific model file. Ignored by the mock.
     pub model: Option<PathBuf>,
+    /// Decoder delay (lookahead) in milliseconds for the `voxtral` backend
+    /// (`--delay-ms`). `None` uses the backend default
+    /// (`DEFAULT_VOXTRAL_DELAY_MS`, 480 ms). Ignored by the `mock` and
+    /// `whisper-candle` backends.
+    pub delay_ms: Option<i32>,
 }
 
 /// Constructs the appropriate [`Transcriber`] given `opts` and the
@@ -102,10 +107,8 @@ fn create_voxtral_transcriber(opts: &VoiceOpts) -> Result<Box<dyn Transcriber>> 
         use crate::voice::models::resolve_voxtral_model_dir;
 
         let dir = resolve_voxtral_model_dir(opts)?;
-        Ok(Box::new(VoxtralBackend::new(
-            &dir,
-            DEFAULT_VOXTRAL_DELAY_MS,
-        )?))
+        let delay_ms = opts.delay_ms.unwrap_or(DEFAULT_VOXTRAL_DELAY_MS);
+        Ok(Box::new(VoxtralBackend::new(&dir, delay_ms)?))
     }
 
     #[cfg(target_os = "windows")]
@@ -180,6 +183,7 @@ mod tests {
         let opts = VoiceOpts {
             backend: Some("mock".to_string()),
             model: None,
+            delay_ms: None,
         };
         let t = create_default_transcriber(&opts).unwrap();
         let _ = collect(t.as_ref());
@@ -202,6 +206,7 @@ mod tests {
         let opts = VoiceOpts {
             backend: Some("klingon".to_string()),
             model: None,
+            delay_ms: None,
         };
         let Err(err) = create_default_transcriber(&opts) else {
             panic!("expected unknown backend to error");
@@ -228,6 +233,7 @@ mod tests {
         let opts = VoiceOpts {
             backend: Some("voxtral".to_string()),
             model: None,
+            delay_ms: None,
         };
         // `.err().expect()` rather than `let Err(..) else { panic!() }`: the
         // call always errors here, so the `else` arm would be a permanently
@@ -251,6 +257,7 @@ mod tests {
         let opts = VoiceOpts {
             backend: Some("voxtral".to_string()),
             model: Some(tmp.path().to_path_buf()),
+            delay_ms: None,
         };
         let err = create_default_transcriber(&opts)
             .err()
@@ -295,6 +302,7 @@ mod tests {
         let opts = VoiceOpts {
             backend: Some("whisper-candle".to_string()),
             model: Some(tmp.path().to_path_buf()),
+            delay_ms: None,
         };
         let Err(err) = create_default_transcriber(&opts) else {
             panic!("expected whisper-candle with empty model dir to error");

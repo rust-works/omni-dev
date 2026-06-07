@@ -3119,7 +3119,7 @@ Usage: install-model [OPTIONS]
 Options:
       --dest <DEST>        Override the install directory. Defaults to the variant's canonical location under `~/.omni-dev/voice/models/`
       --force              Re-download even if all required files are already present
-      --variant <VARIANT>  Which model variant to install. Defaults to `whisper-tiny.en` [default: whisper-tiny.en] [possible values: whisper-tiny.en, speaker-wespeaker-en]
+      --variant <VARIANT>  Which model variant to install. Defaults to `whisper-tiny.en` [default: whisper-tiny.en] [possible values: whisper-tiny.en, speaker-wespeaker-en, voxtral-mini-4b-realtime]
   -h, --help               Print help (see more with '--help')
 
 
@@ -3169,6 +3169,7 @@ Arguments:
 Options:
       --backend <BACKEND>              Transcriber backend (`mock`, `whisper-candle`, `voxtral`). Defaults to `mock`; see ADR-0033 for the `whisper-candle` runtime and ADR-0037 for the platform-gated native `voxtral` backend (opt-in, macOS/Linux only)
       --model <MODEL>                  Path to a backend-specific model directory. For `whisper-candle`, this overrides `OMNI_DEV_VOICE_WHISPER_MODEL` and the default at `~/.omni-dev/voice/models/whisper-tiny.en/`. Ignored by `mock`
+      --delay-ms <DELAY_MS>            Voxtral decoder delay (lookahead) in milliseconds; the #930 spike's sweet spot is 240–480 ms. Only used by `--backend voxtral`; ignored by `mock` and `whisper-candle`. Defaults to 480 ms
       --format <FORMAT>                Output format. Defaults to `md` on a tty, `jsonl` when piped [possible values: jsonl, md]
       --speaker <SPEAKER>              Enrolled speaker to filter on. Drops any `Final` event whose segment doesn't match the enrolled embedding by cosine similarity at or above `--threshold`
       --threshold <THRESHOLD>          Cosine-similarity threshold for `--speaker`. Defaults to 0.5; see [`DEFAULT_SPEAKER_THRESHOLD`]

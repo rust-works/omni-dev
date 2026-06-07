@@ -1,8 +1,9 @@
 //! `omni-dev voice install-model` — one-time fetch of model artefacts.
 //!
-//! Supports two variants: `whisper-tiny.en` for the `whisper-candle` ASR
-//! backend, and `speaker-wespeaker-en` for the speaker-embedding runtime
-//! added in #805 / ADR-0034. Files land in the conventional install
+//! Supports three variants: `whisper-tiny.en` for the `whisper-candle` ASR
+//! backend, `speaker-wespeaker-en` for the speaker-embedding runtime added in
+//! #805 / ADR-0034, and `voxtral-mini-4b-realtime` for the native Voxtral ASR
+//! backend (~8.9 GB; #933 / ADR-0037). Files land in the conventional install
 //! locations beneath `~/.omni-dev/voice/models/`.
 //!
 //! Bumps the model-download cost to install time rather than transcribe/
@@ -18,7 +19,9 @@ use clap::{Parser, ValueEnum};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use sha2::{Digest, Sha256};
 
-use crate::voice::models::{ModelSource, ModelSpec, SPEAKER_WESPEAKER_EN, WHISPER_TINY_EN};
+use crate::voice::models::{
+    ModelSource, ModelSpec, SPEAKER_WESPEAKER_EN, VOXTRAL_MINI_4B, WHISPER_TINY_EN,
+};
 
 /// Which model variant to install.
 ///
@@ -34,6 +37,11 @@ pub enum Variant {
     /// Wespeaker `resnet34_LM` English-only speaker embedding (ADR-0034).
     #[value(name = "speaker-wespeaker-en")]
     SpeakerWespeakerEn,
+    /// Voxtral Realtime Mini 4B — native ASR engine (ADR-0037, #933).
+    /// ~8.9 GB BF16 weights; usable only by the `voxtral` backend on
+    /// macOS/Linux, but installable on any host.
+    #[value(name = "voxtral-mini-4b-realtime")]
+    VoxtralMini4bRealtime,
 }
 
 impl Variant {
@@ -42,6 +50,7 @@ impl Variant {
         match self {
             Self::WhisperTinyEn => &WHISPER_TINY_EN,
             Self::SpeakerWespeakerEn => &SPEAKER_WESPEAKER_EN,
+            Self::VoxtralMini4bRealtime => &VOXTRAL_MINI_4B,
         }
     }
 }
@@ -530,6 +539,17 @@ mod tests {
     }
 
     #[test]
+    fn parses_voxtral_variant() {
+        #[derive(Parser)]
+        struct T {
+            #[command(flatten)]
+            c: InstallModelCommand,
+        }
+        let t = T::try_parse_from(["test", "--variant", "voxtral-mini-4b-realtime"]).unwrap();
+        assert_eq!(t.c.variant, Variant::VoxtralMini4bRealtime);
+    }
+
+    #[test]
     fn variant_spec_returns_correct_spec() {
         assert_eq!(
             Variant::WhisperTinyEn.spec().variant,
@@ -538,6 +558,10 @@ mod tests {
         assert_eq!(
             Variant::SpeakerWespeakerEn.spec().variant,
             SPEAKER_WESPEAKER_EN.variant
+        );
+        assert_eq!(
+            Variant::VoxtralMini4bRealtime.spec().variant,
+            VOXTRAL_MINI_4B.variant
         );
     }
 }

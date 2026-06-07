@@ -298,6 +298,7 @@ mod tests {
         let opts = VoiceOpts {
             backend: None,
             model: Some(PathBuf::from("/explicit/path")),
+            delay_ms: None,
         };
         let resolved = resolve_whisper_model_dir(&opts).unwrap();
         assert_eq!(resolved, PathBuf::from("/explicit/path"));
@@ -453,6 +454,7 @@ mod tests {
         let opts = VoiceOpts {
             backend: None,
             model: Some(PathBuf::from("/explicit/voxtral")),
+            delay_ms: None,
         };
         assert_eq!(
             resolve_voxtral_model_dir(&opts).unwrap(),
