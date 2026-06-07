@@ -201,6 +201,9 @@ jobs:
       env:
         COVERAGE_ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
         COVERAGE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        COVERAGE_BASE_SHA: ${{ steps.mb.outputs.sha }}
+        COVERAGE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        COVERAGE_COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit
       run: ./scripts/coverage-comment.sh baseline/coverage-files.json coverage-files.json > coverage.md
     - name: Comment coverage on PR
       if: github.event_name == 'pull_request'
