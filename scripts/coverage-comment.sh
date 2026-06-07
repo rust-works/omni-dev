@@ -40,7 +40,7 @@ if [[ -n "$BASE" && -f "$BASE" ]]; then
     ($b[0]) as $base | ($h[0]) as $head |
     def rnd(x): (x * 100 | round) / 100;
     def pct(x): if x == null then "—" else "\(rnd(x))%" end;
-    def arrow(d): if d > 0 then "🔺" elif d < 0 then "🔻" else "▪️" end;
+    def arrow(d): if d > 0 then "🟢" elif d < 0 then "🔴" else "⚪" end;
 
     # Per-file rows: new files, or files whose coverage moved by at least EPS.
     ( [ $head.files | to_entries[]
