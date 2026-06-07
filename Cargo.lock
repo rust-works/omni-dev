@@ -2817,6 +2817,7 @@ dependencies = [
  "ulid",
  "ureq",
  "url",
+ "voxtral-sys",
  "wiremock",
  "yaml-rust-davvid",
 ]

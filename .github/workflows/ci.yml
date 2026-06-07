@@ -139,13 +139,15 @@ jobs:
     - uses: actions/checkout@v6
     - uses: dtolnay/rust-toolchain@stable
     - uses: Swatinem/rust-cache@v2
-    - name: Install Linux native build deps (OpenBLAS + libclang for bindgen)
+    - name: Install Linux native build deps (ALSA for cpal; OpenBLAS + libclang for bindgen)
       if: runner.os == 'Linux'
-      run: sudo apt-get update && sudo apt-get install -y libopenblas-dev libclang-dev
+      run: sudo apt-get update && sudo apt-get install -y libasound2-dev libopenblas-dev libclang-dev
     - name: Build voxtral-sys
       run: cargo build -p voxtral-sys --verbose
     - name: Test voxtral-sys
       run: cargo test -p voxtral-sys --verbose
+    - name: Test omni-dev with --features voxtral (VoxtralBackend construction/error paths)
+      run: cargo test --features voxtral --verbose
 
   docs:
     name: Docs
@@ -173,8 +175,8 @@ jobs:
       with:
         components: llvm-tools-preview
     - uses: Swatinem/rust-cache@v2
-    - name: Install ALSA headers for cpal
-      run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+    - name: Install build deps (ALSA for cpal; OpenBLAS + libclang for the voxtral feature under --all-features)
+      run: sudo apt-get update && sudo apt-get install -y libasound2-dev libopenblas-dev libclang-dev
     - name: Install cargo-llvm-cov
       uses: taiki-e/install-action@cargo-llvm-cov
     # Every cargo step below sources cargo-llvm-cov's instrumentation env (rustc

@@ -80,8 +80,10 @@ pub fn create_default_transcriber(opts: &VoiceOpts) -> Result<Box<dyn Transcribe
 /// The native engine (vendored `antirez/voxtral.c` behind a `voxtral-sys` FFI
 /// crate) is permitted only behind a Rust FFI boundary on
 /// `cfg(not(target_os = "windows"))`, and only when the off-by-default
-/// `voxtral` Cargo feature is enabled. This Phase-1 seam establishes the
-/// platform gating; the engine itself lands in #933 Phase 2/3.
+/// `voxtral` Cargo feature is enabled. When compiled in, this resolves the
+/// Voxtral model directory and constructs a
+/// [`crate::voice::backends::voxtral::VoxtralBackend`]; the model-bound
+/// construction errors (missing weights) carry an install hint.
 ///
 /// The `"voxtral"` backend name is recognised on **every** host — including
 /// Windows and feature-off builds — per ADR-0035's cross-platform-descriptor
@@ -93,19 +95,23 @@ pub fn create_default_transcriber(opts: &VoiceOpts) -> Result<Box<dyn Transcribe
 /// backend behind the user's back.
 ///
 /// [ADR-0037]: ../../../docs/adrs/adr-0037.md
-fn create_voxtral_transcriber(_opts: &VoiceOpts) -> Result<Box<dyn Transcriber>> {
+fn create_voxtral_transcriber(opts: &VoiceOpts) -> Result<Box<dyn Transcriber>> {
     #[cfg(all(feature = "voxtral", not(target_os = "windows")))]
     {
-        // Feature compiled in on a supported target, but the native engine is
-        // not wired up yet — it arrives in #933 Phase 2/3.
-        bail!(
-            "voice backend \"voxtral\" is not yet implemented — the native \
-             engine lands in #933 Phase 3; use --backend whisper-candle for now"
-        )
+        use crate::voice::backends::voxtral::{VoxtralBackend, DEFAULT_VOXTRAL_DELAY_MS};
+        use crate::voice::models::resolve_voxtral_model_dir;
+
+        let dir = resolve_voxtral_model_dir(opts)?;
+        Ok(Box::new(VoxtralBackend::new(
+            &dir,
+            DEFAULT_VOXTRAL_DELAY_MS,
+        )?))
     }
 
     #[cfg(target_os = "windows")]
     {
+        // `opts` is unused on the error-only arms; mark it used in every config.
+        let _ = opts;
         // Native Voxtral is excluded on Windows by design (ADR-0037): the Metal
         // fast path is Apple-only and the project takes on no Windows
         // native-toolchain requirement. `whisper-candle` is the supported
@@ -118,6 +124,7 @@ fn create_voxtral_transcriber(_opts: &VoiceOpts) -> Result<Box<dyn Transcriber>>
 
     #[cfg(all(not(feature = "voxtral"), not(target_os = "windows")))]
     {
+        let _ = opts;
         // Supported target, but built without the opt-in feature.
         bail!(
             "voice backend \"voxtral\" was not compiled in; rebuild with \
@@ -233,22 +240,27 @@ mod tests {
 
     #[cfg(all(feature = "voxtral", not(target_os = "windows")))]
     #[test]
-    fn voxtral_feature_on_reports_not_yet_implemented() {
+    fn voxtral_feature_on_propagates_missing_model_error() {
+        // With the feature compiled in, the factory routes "voxtral" through
+        // VoxtralBackend::new, which calls ensure_voxtral_model_present. Point
+        // --model at an empty dir and verify the install hint reaches the
+        // caller (mirroring whisper_candle_arm_propagates_missing_model_error).
         let _g = env_guard();
         std::env::remove_var("OMNI_DEV_VOICE_BACKEND");
+        let tmp = tempfile::TempDir::new().unwrap();
         let opts = VoiceOpts {
             backend: Some("voxtral".to_string()),
-            model: None,
+            model: Some(tmp.path().to_path_buf()),
         };
-        // `.err().expect()` keeps this test's only line covered — the call
-        // always errors, so a `let Err(..) else { panic!() }` would leave the
-        // `else` arm permanently uncovered.
-        let msg = create_default_transcriber(&opts)
+        let err = create_default_transcriber(&opts)
             .err()
-            .expect("expected voxtral (engine not yet wired up) to error")
-            .to_string();
-        assert!(msg.contains("voxtral"), "got: {msg}");
-        assert!(msg.contains("not yet implemented"), "got: {msg}");
+            .expect("expected voxtral with empty model dir to error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no Voxtral model found"), "got: {msg}");
+        assert!(
+            msg.contains("--variant voxtral-mini-4b-realtime"),
+            "got: {msg}"
+        );
         assert!(!msg.contains("unknown"), "got: {msg}");
     }
 

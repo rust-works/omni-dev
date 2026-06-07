@@ -205,6 +205,44 @@ pub const SPEAKER_WESPEAKER_EN: ModelSpec = ModelSpec {
     },
 };
 
+/// Voxtral Realtime Mini 4B — native ASR engine per ADR-0037 (#933).
+///
+/// `vox_load` reads `consolidated.safetensors` (~8.9 GB BF16) and
+/// `tekken.json`; `params.json` carries the model config. File set confirmed
+/// from upstream `voxtral.c`'s `MODEL.md`. The install command itself (the
+/// `voice install-model` variant that fetches these ~8.9 GB of weights) lands
+/// in #933 Phase 4; Phase 3 uses this spec for *resolution* and the
+/// missing-model presence check only. The `HfHub` revision is left at `"main"`
+/// until Phase 4 pins a validated commit.
+pub const VOXTRAL_MINI_4B: ModelSpec = ModelSpec {
+    variant: "voxtral-mini-4b-realtime",
+    kind_label: "Voxtral",
+    default_subdir: "voxtral-mini-4b-realtime",
+    required_files: &["consolidated.safetensors", "tekken.json", "params.json"],
+    env_var: "OMNI_DEV_VOICE_VOXTRAL_MODEL",
+    install_command: "omni-dev voice install-model --variant voxtral-mini-4b-realtime",
+    model_flag: "--model",
+    source: ModelSource::HfHub {
+        repo_id: "mistralai/Voxtral-Mini-4B-Realtime-2602",
+        revision: "main",
+    },
+};
+
+/// Resolves the Voxtral model directory for the current invocation.
+///
+/// Priority: `opts.model` → `OMNI_DEV_VOICE_VOXTRAL_MODEL` → default
+/// `~/.omni-dev/voice/models/voxtral-mini-4b-realtime/`. Not validated for
+/// existence; pair with [`ensure_voxtral_model_present`] to fail fast.
+pub fn resolve_voxtral_model_dir(opts: &VoiceOpts) -> Result<PathBuf> {
+    VOXTRAL_MINI_4B.resolve_dir(opts.model.as_deref())
+}
+
+/// Verifies `dir` contains the Voxtral model files, returning the install
+/// hint shaped for the Voxtral variant on failure.
+pub fn ensure_voxtral_model_present(dir: &Path) -> Result<()> {
+    VOXTRAL_MINI_4B.ensure_present(dir)
+}
+
 // ── Backwards-compatible Whisper helpers (thin shims) ────────────────────
 
 /// Returns the absolute path of each required model file inside `dir`.
@@ -403,6 +441,58 @@ mod tests {
                 panic!("WHISPER_TINY_EN should be HfHub-sourced");
             }
         }
+    }
+
+    // ── Voxtral spec (#933 / ADR-0037) ──────────────────────────────────
+
+    #[test]
+    fn voxtral_resolve_dir_priority_override_env_default() {
+        let _g = env_guard();
+        // override wins over env
+        std::env::set_var("OMNI_DEV_VOICE_VOXTRAL_MODEL", "/should/not/be/read");
+        let opts = VoiceOpts {
+            backend: None,
+            model: Some(PathBuf::from("/explicit/voxtral")),
+        };
+        assert_eq!(
+            resolve_voxtral_model_dir(&opts).unwrap(),
+            PathBuf::from("/explicit/voxtral")
+        );
+        // env wins over default
+        std::env::set_var("OMNI_DEV_VOICE_VOXTRAL_MODEL", "/from/env");
+        assert_eq!(
+            resolve_voxtral_model_dir(&VoiceOpts::default()).unwrap(),
+            PathBuf::from("/from/env")
+        );
+        std::env::remove_var("OMNI_DEV_VOICE_VOXTRAL_MODEL");
+    }
+
+    #[test]
+    fn voxtral_default_dir_uses_voxtral_subdir() {
+        let dir = VOXTRAL_MINI_4B.default_dir().unwrap();
+        assert!(dir.ends_with(".omni-dev/voice/models/voxtral-mini-4b-realtime"));
+    }
+
+    #[test]
+    fn voxtral_ensure_present_errors_with_install_hint() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let err = ensure_voxtral_model_present(tmp.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no Voxtral model found"), "got: {msg}");
+        assert!(
+            msg.contains("--variant voxtral-mini-4b-realtime"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("consolidated.safetensors"), "got: {msg}");
+    }
+
+    #[test]
+    fn voxtral_ensure_present_succeeds_when_files_exist() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for f in VOXTRAL_MINI_4B.required_files {
+            std::fs::write(tmp.path().join(f), b"placeholder").unwrap();
+        }
+        ensure_voxtral_model_present(tmp.path()).unwrap();
     }
 
     #[test]

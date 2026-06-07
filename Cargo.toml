@@ -93,20 +93,30 @@ quick-xml = "0.40.1"
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["signal"] }
 
+# Native Voxtral ASR engine (#933 / ADR-0037), enabled by the `voxtral` feature.
+# Target-gated to non-Windows so the Windows dependency graph never references it
+# (the `voxtral-windows-gating` CI guard asserts this). It is a path dependency
+# with NO version and `voxtral-sys` stays `publish = false`: per the #933 Phase 3
+# decision we wire the edge but DEFER publishing. Consequence — and this is
+# intentional, not a bug — `cargo publish` of omni-dev is blocked while this edge
+# exists (an optional path dep must resolve to a registry version at publish
+# time). A future release resolves it by publishing voxtral-sys to crates.io and
+# adding a release.yml step; see docs/RELEASE.md.
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+voxtral-sys = { path = "voxtral-sys", optional = true }
+
 [features]
 mcp = ["dep:rmcp"]
 # Off-by-default native Voxtral ASR backend (#933, ADR-0037). Platform-gated:
 # the native engine is permitted only behind a Rust FFI boundary on
 # `cfg(not(target_os = "windows"))`; on Windows and in default (feature-off)
 # builds, requesting `--backend voxtral` is a clear construction-time error,
-# never a build break. Phase 1 establishes the gating seam only. The
-# `voxtral-sys` FFI crate (vendored `antirez/voxtral.c`) is added under a
-# `[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]`
-# stanza in #933 Phase 2, at which point this becomes
-# `voxtral = ["dep:voxtral-sys"]`. As a declared Cargo feature, `voxtral` is
+# never a build break. Enabling it pulls the `voxtral-sys` FFI crate (vendored
+# `antirez/voxtral.c`), declared under the target-gated stanza below so it is
+# never referenced on Windows. As a declared Cargo feature, `voxtral` is
 # auto-known to the `unexpected_cfgs` check (unlike the custom `online_tests`
 # cfg below), so no check-cfg entry is needed for `cfg(feature = "voxtral")`.
-voxtral = []
+voxtral = ["dep:voxtral-sys"]
 
 [dev-dependencies]
 tempfile = "3.27"
