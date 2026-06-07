@@ -107,6 +107,8 @@ jobs:
       pull-requests: write        # required to post the coverage comment
     steps:
     - uses: actions/checkout@v6
+      with:
+        fetch-depth: 0          # full history so `git merge-base` can resolve the PR's fork point
     - uses: dtolnay/rust-toolchain@stable
       with:
         components: llvm-tools-preview
@@ -145,18 +147,43 @@ jobs:
           cat coverage-summary.txt
           echo '```'
         } >> "$GITHUB_STEP_SUMMARY"
-    - name: Download baseline coverage from main
-      # Best-effort: pulls the per-file coverage published by the latest successful
-      # `main` run so the comment can compute deltas. Missing baseline (first run,
-      # or no prior main artifact) is a warning, not a failure.
+    - name: Determine merge-base
+      # The PR's fork point on main. Pinning the baseline to this immutable commit
+      # (rather than "latest main") makes per-file deltas attributable to THIS PR
+      # alone — other PRs merging into main while this one is open can't leak into
+      # the numbers, and there is no race with in-flight main runs.
+      id: mb
+      if: github.event_name == 'pull_request'
+      run: echo "sha=$(git merge-base origin/main HEAD)" >> "$GITHUB_OUTPUT"
+    - name: Download baseline coverage for merge-base
+      # Pulls the per-file coverage published by the main run for the exact
+      # merge-base commit. A miss (fork point predates the feature / artifact
+      # retention) is a warning, not a failure — the fallback below recomputes it.
+      id: baseline
       if: github.event_name == 'pull_request'
       uses: dawidd6/action-download-artifact@v6
       with:
         name: coverage-baseline
-        branch: main
+        commit: ${{ steps.mb.outputs.sha }}
         workflow: ci.yml
         path: baseline
         if_no_artifact_found: warn
+    - name: Compute baseline from merge-base (fallback)
+      # Only runs when no baseline artifact exists for the merge-base. Builds
+      # coverage at that exact commit in a worktree, so the comparison stays
+      # correct (and still PR-attributable) even on cold start or after expiry.
+      if: github.event_name == 'pull_request' && steps.baseline.outputs.found_artifact == 'false'
+      run: |
+        git worktree add ../base "${{ steps.mb.outputs.sha }}"
+        ( cd ../base && cargo llvm-cov --all-features --workspace --no-report \
+            && cargo llvm-cov report --json --output-path llvm-cov.json )
+        mkdir -p baseline
+        jq --arg ws "$(cd ../base && pwd)/" '{
+          total: .data[0].totals.lines.percent,
+          files: ([ .data[0].files[]
+                    | { key: (.filename | ltrimstr($ws)), value: .summary.lines.percent } ]
+                  | from_entries)
+        }' ../base/llvm-cov.json > baseline/coverage-files.json
     - name: Build PR coverage comment
       if: github.event_name == 'pull_request'
       run: ./scripts/coverage-comment.sh baseline/coverage-files.json coverage-files.json > coverage.md
