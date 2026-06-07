@@ -9,6 +9,30 @@ An intelligent Git commit message toolkit with AI-powered contextual
 intelligence. Transform messy commit histories into professional,
 conventional commit formats with project-aware suggestions.
 
+## 🎬 See It In Action
+
+[![asciicast](https://asciinema.org/a/eJJf5Aj8N26JoCaUsAFVH8dqz.svg)](https://asciinema.org/a/eJJf5Aj8N26JoCaUsAFVH8dqz)
+
+*Watch omni-dev transform messy commits into professional ones with AI-powered analysis*
+
+## 30-Second Demo
+
+Transform your commit messages and create professional PRs with AI intelligence:
+
+```bash
+# Analyze and improve commit messages in your current branch
+omni-dev git commit message twiddle 'origin/main..HEAD' --use-context
+
+# Before: "fix stuff", "wip", "update files"
+# After:  "feat(auth): implement OAuth2 authentication system"
+#         "docs(api): add comprehensive endpoint documentation"
+#         "fix(ui): resolve mobile responsive layout issues"
+
+# Create a professional PR with AI-generated description
+omni-dev git branch create pr
+# 🎉 Generates comprehensive PR with detailed description, testing info, and more
+```
+
 ## ✨ Key Features
 
 - 🤖 **AI-Powered Intelligence**: Claude AI analyzes your code changes to
@@ -60,30 +84,6 @@ eval "$(omni-dev completions bash)"
 
 See [docs/shell-completion.md](docs/shell-completion.md) for per-shell install
 recipes, the `$fpath`/`compinit` setup zsh requires, and troubleshooting.
-
-### 🎬 See It In Action
-
-[![asciicast](https://asciinema.org/a/eJJf5Aj8N26JoCaUsAFVH8dqz.svg)](https://asciinema.org/a/eJJf5Aj8N26JoCaUsAFVH8dqz)
-
-*Watch omni-dev transform messy commits into professional ones with AI-powered analysis*
-
-### 30-Second Demo
-
-Transform your commit messages and create professional PRs with AI intelligence:
-
-```bash
-# Analyze and improve commit messages in your current branch
-omni-dev git commit message twiddle 'origin/main..HEAD' --use-context
-
-# Before: "fix stuff", "wip", "update files"
-# After:  "feat(auth): implement OAuth2 authentication system"
-#         "docs(api): add comprehensive endpoint documentation"
-#         "fix(ui): resolve mobile responsive layout issues"
-
-# Create a professional PR with AI-generated description
-omni-dev git branch create pr
-# 🎉 Generates comprehensive PR with detailed description, testing info, and more
-```
 
 ## 📋 Core Commands
 
