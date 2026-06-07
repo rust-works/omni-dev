@@ -147,6 +147,18 @@ jobs:
           cat coverage-summary.txt
           echo '```'
         } >> "$GITHUB_STEP_SUMMARY"
+    - name: Upload coverage artifacts
+      # The full summary lives here (not in the PR comment); codecov.json kept for
+      # when the upload below is re-enabled. Runs before the comment so the comment
+      # can link to this artifact via the step's `artifact-url` output.
+      id: upload
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-summary
+        path: |
+          coverage-summary.txt
+          codecov.json
+          coverage-files.json
     - name: Determine merge-base
       # The PR's fork point on main. Pinning the baseline to this immutable commit
       # (rather than "latest main") makes per-file deltas attributable to THIS PR
@@ -186,6 +198,12 @@ jobs:
         }' ../base/llvm-cov.json > baseline/coverage-files.json
     - name: Build PR coverage comment
       if: github.event_name == 'pull_request'
+      env:
+        COVERAGE_ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        COVERAGE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        COVERAGE_BASE_SHA: ${{ steps.mb.outputs.sha }}
+        COVERAGE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        COVERAGE_COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit
       run: ./scripts/coverage-comment.sh baseline/coverage-files.json coverage-files.json > coverage.md
     - name: Comment coverage on PR
       if: github.event_name == 'pull_request'
@@ -193,16 +211,6 @@ jobs:
       with:
         header: coverage          # sticky key: updates the same comment each run
         path: coverage.md
-    - name: Upload coverage artifacts
-      # The full summary lives here (not in the PR comment); codecov.json kept for
-      # when the upload below is re-enabled.
-      uses: actions/upload-artifact@v4
-      with:
-        name: coverage-summary
-        path: |
-          coverage-summary.txt
-          codecov.json
-          coverage-files.json
     - name: Publish coverage baseline
       # On main only: this run's per-file coverage becomes the baseline that
       # subsequent PRs download above to compute deltas.
