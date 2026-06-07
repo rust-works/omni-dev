@@ -1925,6 +1925,11 @@ mod run_twiddle_tests {
             let mut cfg = repo.config().unwrap();
             cfg.set_str("user.name", "Test").unwrap();
             cfg.set_str("user.email", "test@example.com").unwrap();
+            // Disable commit signing in *local* config (overrides any ambient
+            // global `commit.gpgsign=true`) so the `git commit --amend`
+            // subprocess in the apply path is hermetic — it must not depend on
+            // the process's `HOME`, which concurrent tests mutate (issue #950).
+            cfg.set_bool("commit.gpgsign", false).unwrap();
         }
         let signature = Signature::now("Test", "test@example.com").unwrap();
         std::fs::write(temp_dir.path().join("f.txt"), "c").unwrap();
@@ -2097,6 +2102,11 @@ mod execute_tests {
             let mut cfg = repo.config().unwrap();
             cfg.set_str("user.name", "Test").unwrap();
             cfg.set_str("user.email", "test@example.com").unwrap();
+            // Disable commit signing in *local* config (overrides any ambient
+            // global `commit.gpgsign=true`) so the `git commit --amend`
+            // subprocess in the apply path is hermetic — it must not depend on
+            // the process's `HOME`, which concurrent tests mutate (issue #950).
+            cfg.set_bool("commit.gpgsign", false).unwrap();
         }
         let signature = Signature::now("Test", "test@example.com").unwrap();
 
