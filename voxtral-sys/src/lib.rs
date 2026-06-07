@@ -36,6 +36,35 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr::NonNull;
 
+// The Metal GPU backend is compiled (`voxtral_metal.m`, `USE_METAL`) only on the
+// macOS Apple-Silicon target — the same condition `build.rs` uses. `vox_metal_init`
+// is declared in `voxtral_metal.h` (not the public `voxtral.h`), so it is absent
+// from the bindgen output; declare it here. On every other target there is no
+// Metal backend and the engine uses the BLAS/CPU path, so the init is a no-op.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+extern "C" {
+    /// Initialise the Metal/MPS backend. Returns 1 on success, 0 if Metal is
+    /// unavailable (the engine then uses the CPU path). Defined in
+    /// `voxtral_metal.m`.
+    fn vox_metal_init() -> std::ffi::c_int;
+}
+
+/// Turns on the Metal/MPS GPU backend where it exists, so the engine uses the
+/// fast path instead of silently falling back to CPU. Idempotent (the C side
+/// guards on its `g_initialized` flag). No-op on non-Metal targets.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn init_metal_backend() {
+    // SAFETY: no-argument C initialiser, safe to call repeatedly. We ignore the
+    // return like upstream `main.c` does — a 0 (Metal unavailable) just leaves
+    // the engine on its CPU path.
+    unsafe {
+        vox_metal_init();
+    }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn init_metal_backend() {}
+
 /// Errors from the Voxtral engine boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VoxError {
@@ -88,6 +117,11 @@ impl VoxCtx {
     pub fn load(model_dir: &Path) -> Result<Self, VoxError> {
         let c_dir =
             CString::new(model_dir.as_os_str().as_bytes()).map_err(|_| VoxError::NulPath)?;
+        // Initialise the Metal/MPS GPU backend before loading, matching upstream
+        // `main.c`. Without this the engine silently falls back to the (much
+        // slower) CPU path — `vox_load`'s own GPU pre-warm is gated on
+        // `vox_metal_available()`, which only returns true after `vox_metal_init`.
+        init_metal_backend();
         // SAFETY: `c_dir` is a valid NUL-terminated C string that outlives the
         // call; `vox_load` either returns a heap context we now own or NULL.
         let ptr = unsafe { ffi::vox_load(c_dir.as_ptr()) };
