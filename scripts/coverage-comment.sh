@@ -22,8 +22,13 @@ HEAD="${2:?usage: coverage-comment.sh <baseline.json> <current.json>}"
 # floating-point noise from re-runs that touch nothing.
 EPS=0.05
 
+# Optional links rendered in the footer (set by CI). Empty when run locally.
+ARTIFACT_URL="${COVERAGE_ARTIFACT_URL:-}"
+RUN_URL="${COVERAGE_RUN_URL:-}"
+
 if [[ -n "$BASE" && -f "$BASE" ]]; then
-  jq -rn --slurpfile b "$BASE" --slurpfile h "$HEAD" --argjson eps "$EPS" '
+  jq -rn --slurpfile b "$BASE" --slurpfile h "$HEAD" --argjson eps "$EPS" \
+    --arg artifactUrl "$ARTIFACT_URL" --arg runUrl "$RUN_URL" '
     ($b[0]) as $base | ($h[0]) as $head |
     def rnd(x): (x * 100 | round) / 100;
     def pct(x): if x == null then "—" else "\(rnd(x))%" end;
@@ -62,10 +67,17 @@ if [[ -n "$BASE" && -f "$BASE" ]]; then
         )
       end ),
     "",
-    "<sub>Full per-file summary is attached as the **coverage-summary** build artifact.</sub>"
+    ( if $artifactUrl != "" then
+        "<sub>📦 [Full per-file coverage summary](\($artifactUrl))"
+        + (if $runUrl != "" then " · [run summary](\($runUrl))" else "" end)
+        + "</sub>"
+      else
+        "<sub>Full per-file summary is attached as the **coverage-summary** build artifact.</sub>"
+      end )
   '
 else
-  jq -rn --slurpfile h "$HEAD" '
+  jq -rn --slurpfile h "$HEAD" \
+    --arg artifactUrl "$ARTIFACT_URL" --arg runUrl "$RUN_URL" '
     ($h[0]) as $head |
     def rnd(x): (x * 100 | round) / 100;
     "## Coverage",
@@ -74,6 +86,12 @@ else
     "",
     "_No baseline available yet (first run, or the `main` baseline artifact was missing). Per-file deltas will appear on PRs once a baseline has been published from `main`._",
     "",
-    "<sub>Full per-file summary is attached as the **coverage-summary** build artifact.</sub>"
+    ( if $artifactUrl != "" then
+        "<sub>📦 [Full per-file coverage summary](\($artifactUrl))"
+        + (if $runUrl != "" then " · [run summary](\($runUrl))" else "" end)
+        + "</sub>"
+      else
+        "<sub>Full per-file summary is attached as the **coverage-summary** build artifact.</sub>"
+      end )
   '
 fi
