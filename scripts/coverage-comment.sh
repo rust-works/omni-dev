@@ -22,12 +22,25 @@ HEAD="${2:?usage: coverage-comment.sh <baseline.json> <current.json>}"
 # floating-point noise from re-runs that touch nothing.
 EPS=0.05
 
+# Optional links/identifiers rendered in the comment (set by CI). Empty locally.
+ARTIFACT_URL="${COVERAGE_ARTIFACT_URL:-}"
+RUN_URL="${COVERAGE_RUN_URL:-}"
+BASE_SHA="${COVERAGE_BASE_SHA:-}"      # merge-base commit the baseline was taken at
+HEAD_SHA="${COVERAGE_HEAD_SHA:-}"      # PR head commit the coverage was measured at
+COMMIT_URL="${COVERAGE_COMMIT_URL:-}"  # prefix for commit links, e.g. https://…/<repo>/commit
+
 if [[ -n "$BASE" && -f "$BASE" ]]; then
-  jq -rn --slurpfile b "$BASE" --slurpfile h "$HEAD" --argjson eps "$EPS" '
+  jq -rn --slurpfile b "$BASE" --slurpfile h "$HEAD" --argjson eps "$EPS" \
+    --arg artifactUrl "$ARTIFACT_URL" --arg runUrl "$RUN_URL" \
+    --arg baseSha "$BASE_SHA" --arg headSha "$HEAD_SHA" --arg commitUrl "$COMMIT_URL" '
+    # Render a commit ref as a short, optionally-linked SHA.
+    def shaRef(sha):
+      (sha[0:7]) as $short
+      | if $commitUrl != "" then "[`\($short)`](\($commitUrl)/\(sha))" else "`\($short)`" end;
     ($b[0]) as $base | ($h[0]) as $head |
     def rnd(x): (x * 100 | round) / 100;
     def pct(x): if x == null then "—" else "\(rnd(x))%" end;
-    def arrow(d): if d > 0 then "🔺" elif d < 0 then "🔻" else "▪️" end;
+    def arrow(d): if d > 0 then "🟢" elif d < 0 then "🔴" else "⚪" end;
 
     # Per-file rows: new files, or files whose coverage moved by at least EPS.
     ( [ $head.files | to_entries[]
@@ -50,6 +63,10 @@ if [[ -n "$BASE" && -f "$BASE" ]]; then
       else "Total: **\(pct($head.total))** \(arrow($totDelta)) \(rnd($totDelta)) pp vs `main`"
       end ),
     "",
+    ( if $baseSha != "" and $headSha != ""
+      then ("Comparing \(shaRef($baseSha))..\(shaRef($headSha)) _(merge-base → PR head)_", "")
+      else empty
+      end ),
     ( if ($rows | length) == 0
       then "_No per-file coverage changes vs `main`._"
       else
@@ -62,10 +79,17 @@ if [[ -n "$BASE" && -f "$BASE" ]]; then
         )
       end ),
     "",
-    "<sub>Full per-file summary is attached as the **coverage-summary** build artifact.</sub>"
+    ( if $artifactUrl != "" then
+        "<sub>📦 [Full per-file coverage summary](\($artifactUrl))"
+        + (if $runUrl != "" then " · [run summary](\($runUrl))" else "" end)
+        + "</sub>"
+      else
+        "<sub>Full per-file summary is attached as the **coverage-summary** build artifact.</sub>"
+      end )
   '
 else
-  jq -rn --slurpfile h "$HEAD" '
+  jq -rn --slurpfile h "$HEAD" \
+    --arg artifactUrl "$ARTIFACT_URL" --arg runUrl "$RUN_URL" '
     ($h[0]) as $head |
     def rnd(x): (x * 100 | round) / 100;
     "## Coverage",
@@ -74,6 +98,12 @@ else
     "",
     "_No baseline available yet (first run, or the `main` baseline artifact was missing). Per-file deltas will appear on PRs once a baseline has been published from `main`._",
     "",
-    "<sub>Full per-file summary is attached as the **coverage-summary** build artifact.</sub>"
+    ( if $artifactUrl != "" then
+        "<sub>📦 [Full per-file coverage summary](\($artifactUrl))"
+        + (if $runUrl != "" then " · [run summary](\($runUrl))" else "" end)
+        + "</sub>"
+      else
+        "<sub>Full per-file summary is attached as the **coverage-summary** build artifact.</sub>"
+      end )
   '
 fi
