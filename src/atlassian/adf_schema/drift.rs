@@ -1446,15 +1446,22 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_drift_report_from_url_errors_on_connection_refused() {
-        // Bind to find a free local port, then drop the listener so the
-        // port is no longer accepting connections. reqwest's `send().await`
-        // hits a connection-refused error, exercising the underlying error
-        // context wrapper that wiremock 200/4xx/5xx tests can't reach.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        // Hold the listener for the duration of the test so a parallel
+        // wiremock server can't reclaim the port between bind and connect
+        // (the bind-then-drop race in issue #861). The accept loop closes
+        // each connection immediately, so reqwest's `send().await` fails
+        // before any HTTP response can arrive — exercising the
+        // `fetching npm registry` context wrapper.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let accept_task = tokio::spawn(async move {
+            if let Ok((socket, _)) = listener.accept().await {
+                drop(socket);
+            }
+        });
         let url = format!("http://127.0.0.1:{port}/latest");
         let err = fetch_drift_report_from_url(&url).await.unwrap_err();
+        let _ = accept_task.await;
         assert!(
             err.to_string().contains("fetching npm registry"),
             "unexpected error: {err}"
