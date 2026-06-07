@@ -16,6 +16,7 @@ Commands:
   atlassian   Atlassian: JIRA and Confluence operations
   browser     Browser bridge: drive authenticated requests through a browser tab
   datadog     Datadog: read-only API operations
+  coverage    Coverage: diff/patch coverage analysis for PR comments
   transcript  Transcript and caption fetching from media platforms
   voice       Voice capture and processing operations
   resources   Embedded reference resources (specs, etc.)
@@ -2143,6 +2144,67 @@ Usage: show [OPTIONS]
 Options:
       --embedded-only  Show only the embedded `models.yaml` verbatim, ignoring any user/project overrides
   -h, --help           Print help
+
+
+================================================================================
+
+omni-dev coverage - Coverage: diff/patch coverage analysis for PR comments
+
+Coverage: diff/patch coverage analysis for PR comments
+
+Usage: coverage <COMMAND>
+
+Commands:
+  diff  Analyses diff/patch coverage from a per-line report and a git diff
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev coverage diff - Analyses diff/patch coverage from a per-line report and a git diff
+
+Analyses diff/patch coverage from a per-line report and a git diff
+
+Usage: diff [OPTIONS] --report <PATH>
+
+Options:
+      --report <PATH>
+          Head coverage report (lcov / llvm-cov-json / cobertura)
+      --report-format <REPORT_FORMAT>
+          Format of `--report` (auto-detected by default) [default: auto] [possible values: auto, lcov, llvm-cov-json, cobertura]
+      --base-ref <REV>
+          Base revision to diff against (default: merge-base of `origin/main` and `HEAD`)
+      --head-ref <REV>
+          Head revision the report was measured at (default: `HEAD`)
+      --baseline-report <PATH>
+          Optional baseline coverage report; enables project deltas and indirect-change detection
+      --baseline-report-format <BASELINE_REPORT_FORMAT>
+          Format of `--baseline-report` (auto-detected by default) [default: auto] [possible values: auto, lcov, llvm-cov-json, cobertura]
+      --format <FORMAT>
+          Output format [default: markdown] [possible values: markdown, yaml, json]
+      --fail-under-patch <PCT>
+          Fail (non-zero exit) when patch coverage is below this percentage
+      --repo <PATH>
+          Repository path [default: .]
+      --strip-prefix <PATH>
+          Override the path prefix stripped from report file paths to make them repo-relative (default: the repository working directory)
+      --collapse-ranges
+          Collapse consecutive uncovered new lines into ranges (e.g. `9-11`)
+      --artifact-url <URL>
+          Link to the full coverage-summary artifact (markdown footer)
+      --run-url <URL>
+          Link to the CI run (markdown footer)
+      --base-sha <SHA>
+          Base (merge-base) commit SHA shown in the markdown `Comparing` line
+      --head-sha <SHA>
+          Head commit SHA shown in the markdown `Comparing` line
+      --commit-url <URL>
+          Commit-URL prefix for linking SHAs (e.g. `https://…/<repo>/commit`)
+  -h, --help
+          Print help (see more with '--help')
 
 
 ================================================================================
