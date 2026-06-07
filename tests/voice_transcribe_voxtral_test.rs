@@ -1,6 +1,7 @@
-//! Voxtral **batch** backend end-to-end on the committed 5-minute monologue
-//! fixture — #933 Phase 7 (in-tree reproduction of the #930 spike's *offline*
-//! numbers).
+//! Voxtral backend end-to-end on the committed 5-minute monologue fixture —
+//! the in-tree reproduction of the #930 spike: **batch** offline numbers
+//! (#933 Phase 7) and **streaming** numbers (#933 Phase 8). Both share the WER
+//! helper, model resolution, and fixture loading.
 //!
 //! `#[ignore]`-by-default and `--features voxtral`-gated: it needs the ~8.9 GB
 //! Voxtral model staged on disk (so it cannot run in CI) and a native build of
@@ -18,17 +19,24 @@
 //! threshold (the spike measured ~2.84–3.15 %; the bound carries headroom for
 //! normalisation/proper-noun variance), the batch event shape (exactly one
 //! `Final { revisable: false }` + a trailing `StreamEnd`), and **RTF** < 0.6.
-//! The streaming bars (first-Partial, Partials, SilenceGap) are #933 Phase 8.
+//! The streaming test (Phase 8) drives the same fixture "as live" through
+//! `transcribe_stream` and asserts first-Partial < 1 s, ≥ N Partials, ≥ 1
+//! SilenceGap endpoint, a terminal StreamEnd, and streaming WER ≤ the same
+//! threshold. The streaming test replays at 1× wall-clock, so it takes ~5 min.
 
 #![cfg(all(feature = "voxtral", not(target_os = "windows")))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use futures::StreamExt;
 use omni_dev::voice::backends::voxtral::{VoxtralBackend, DEFAULT_VOXTRAL_DELAY_MS};
 use omni_dev::voice::models::{ensure_voxtral_model_present, VOXTRAL_MINI_4B};
-use omni_dev::voice::transcriber::{Transcriber, TranscriptEvent, VecAudioInput};
+use omni_dev::voice::transcriber::{
+    EndpointKind, StreamingTranscriber, Transcriber, TranscriptEvent, VecAudioInput,
+};
+use omni_dev::voice::{FileAsyncAudioInput, STREAM_CHUNK_SAMPLES};
 
 /// 16 kHz mono — one sample is 1/16000 s.
 const SAMPLE_RATE: f64 = 16_000.0;
@@ -46,6 +54,13 @@ const MAX_RTF: f64 = 0.6;
 /// surface (case-insensitive). Kept to robust, central vocabulary rather than
 /// rare proper nouns that the model may spell differently.
 const CONTENT_WORDS: &[&str] = &["holmes", "bohemian", "reasoning", "woman"];
+
+/// First-`Partial` latency ceiling (the spike measured 0.64–0.91 s).
+const MAX_FIRST_PARTIAL_SECS: f64 = 1.0;
+
+/// Minimum `Partial` events over a 5-minute monologue — a streaming backend
+/// must emit hypotheses continuously, not just one final per utterance.
+const MIN_PARTIALS: usize = 5;
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -189,6 +204,89 @@ fn voxtral_batch_reproduces_spike_offline_metrics_on_5min_monologue() {
         rtf < MAX_RTF,
         "RTF {rtf:.3} exceeds {MAX_RTF} (hardware-dependent)"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the ~8.9 GB Voxtral model and replays 5 min at 1x (~5 min); run `omni-dev voice install-model --variant voxtral-mini-4b-realtime` first"]
+async fn voxtral_streaming_reproduces_spike_metrics_on_5min_monologue() {
+    let Some(model_dir) = resolve_model_dir() else {
+        panic!(
+            "Voxtral model not found. Run `omni-dev voice install-model --variant \
+             voxtral-mini-4b-realtime` or set OMNI_DEV_VOICE_VOXTRAL_MODEL=<path>."
+        );
+    };
+    let reference = std::fs::read_to_string(fixture("monologue_5min.expected.txt"))
+        .expect("read reference transcript");
+
+    let backend = VoxtralBackend::new(&model_dir, DEFAULT_VOXTRAL_DELAY_MS)
+        .expect("VoxtralBackend::new should succeed with a staged model");
+    // `realtime = true`: replay the fixture on the wall clock, the way a live
+    // mic would, so first-Partial latency is meaningful.
+    let audio = FileAsyncAudioInput::from_wav_path(
+        fixture("monologue_5min.wav"),
+        STREAM_CHUNK_SAMPLES,
+        true,
+    )
+    .expect("load fixture as async audio input");
+
+    let start = Instant::now();
+    let mut stream = backend.transcribe_stream(Box::new(audio));
+
+    let mut first_partial_at: Option<Duration> = None;
+    let mut partials = 0usize;
+    let mut silence_gaps = 0usize;
+    let mut saw_stream_end = false;
+    let mut finals: Vec<String> = Vec::new();
+
+    while let Some(event) = stream.next().await {
+        match event.expect("streaming backend should not error mid-stream") {
+            TranscriptEvent::Partial { .. } => {
+                if first_partial_at.is_none() {
+                    first_partial_at = Some(start.elapsed());
+                }
+                partials += 1;
+            }
+            TranscriptEvent::Final { text, .. } => finals.push(text),
+            TranscriptEvent::Endpoint { kind, .. } => match kind {
+                EndpointKind::SilenceGap => silence_gaps += 1,
+                EndpointKind::StreamEnd => saw_stream_end = true,
+                EndpointKind::UtteranceEnd => {}
+            },
+        }
+    }
+
+    let first = first_partial_at.expect("expected at least one Partial event");
+    let transcript = finals.join(" ");
+    let wer = word_error_rate(&reference, &transcript);
+    eprintln!(
+        "voxtral streaming 5-min: first_partial={:.3}s (max {MAX_FIRST_PARTIAL_SECS}), \
+         partials={partials} (min {MIN_PARTIALS}), silence_gaps={silence_gaps}, \
+         WER={wer:.4} (max {MAX_WER})",
+        first.as_secs_f64()
+    );
+
+    assert!(
+        first.as_secs_f64() < MAX_FIRST_PARTIAL_SECS,
+        "first-Partial latency {:.3}s exceeds {MAX_FIRST_PARTIAL_SECS}s",
+        first.as_secs_f64()
+    );
+    assert!(
+        partials >= MIN_PARTIALS,
+        "only {partials} Partials (min {MIN_PARTIALS})"
+    );
+    assert!(
+        silence_gaps >= 1,
+        "expected ≥1 SilenceGap endpoint, got {silence_gaps}"
+    );
+    assert!(
+        saw_stream_end,
+        "stream must terminate with a StreamEnd endpoint"
+    );
+    assert!(
+        !transcript.trim().is_empty(),
+        "streaming transcript must be non-empty"
+    );
+    assert!(wer <= MAX_WER, "streaming WER {wer:.4} exceeds {MAX_WER}");
 }
 
 #[cfg(test)]
