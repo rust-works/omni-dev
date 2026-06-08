@@ -235,3 +235,207 @@ impl DiffCommand {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use git2::{Repository, Signature};
+    use std::fs;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    /// Creates a temp repo with a base commit (`a.rs`) and a head commit that
+    /// adds `b.rs` with three lines. Returns the dir, repo path, and base SHA.
+    fn repo_with_added_file() -> (TempDir, PathBuf, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let repo = Repository::init(&path).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Test").unwrap();
+            cfg.set_str("user.email", "test@example.com").unwrap();
+        }
+
+        let commit = |repo: &Repository, files: &[(&str, &str)], parent: Option<git2::Oid>| {
+            let mut index = repo.index().unwrap();
+            index.clear().unwrap();
+            for (name, content) in files {
+                fs::write(path.join(name), content).unwrap();
+                index.add_path(Path::new(name)).unwrap();
+            }
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let sig = Signature::now("Test", "test@example.com").unwrap();
+            let parent = parent.map(|id| repo.find_commit(id).unwrap());
+            let parents: Vec<&git2::Commit> = parent.as_ref().into_iter().collect();
+            repo.commit(Some("HEAD"), &sig, &sig, "c", &tree, &parents)
+                .unwrap()
+        };
+
+        let base = commit(&repo, &[("a.rs", "fn a() {}\n")], None);
+        commit(
+            &repo,
+            &[("a.rs", "fn a() {}\n"), ("b.rs", "one\ntwo\nthree\n")],
+            Some(base),
+        );
+        // Return git2's canonical workdir: on macOS the tempdir `/var/...` is a
+        // symlink to `/private/var/...`, and `Repository::open` resolves to the
+        // latter. Using it for both the repo path and the report's `SF:` path
+        // keeps `strip_prefix` (which defaults to the workdir) consistent.
+        let workdir = repo.workdir().unwrap().to_path_buf();
+        (dir, workdir, base.to_string())
+    }
+
+    /// Writes an lcov report for `b.rs` (line 1 & 3 covered, line 2 uncovered).
+    fn write_head_lcov(repo_path: &Path) -> PathBuf {
+        let lcov = format!(
+            "SF:{}\nDA:1,1\nDA:2,0\nDA:3,4\nend_of_record\n",
+            repo_path.join("b.rs").display()
+        );
+        let report = repo_path.join("head.lcov");
+        fs::write(&report, lcov).unwrap();
+        report
+    }
+
+    /// Builds a `DiffCommand` with defaults pointed at the temp repo and report.
+    fn command(repo: &Path, report: PathBuf, base_ref: &str) -> DiffCommand {
+        DiffCommand {
+            report,
+            report_format: ReportFormat::Auto,
+            base_ref: Some(base_ref.to_string()),
+            head_ref: None,
+            baseline_report: None,
+            baseline_report_format: ReportFormat::Auto,
+            format: OutputFormatArg::Markdown,
+            fail_under_patch: None,
+            repo: repo.to_path_buf(),
+            strip_prefix: None,
+            collapse_ranges: false,
+            artifact_url: None,
+            run_url: None,
+            base_sha: None,
+            head_sha: None,
+            commit_url: None,
+        }
+    }
+
+    #[test]
+    fn report_format_into_format() {
+        assert_eq!(ReportFormat::Auto.into_format(), None);
+        assert_eq!(ReportFormat::Lcov.into_format(), Some(Format::Lcov));
+        assert_eq!(
+            ReportFormat::LlvmCovJson.into_format(),
+            Some(Format::LlvmCovJson)
+        );
+        assert_eq!(
+            ReportFormat::Cobertura.into_format(),
+            Some(Format::Cobertura)
+        );
+    }
+
+    #[test]
+    fn output_format_arg_conversion() {
+        assert_eq!(
+            OutputFormat::from(OutputFormatArg::Markdown),
+            OutputFormat::Markdown
+        );
+        assert_eq!(
+            OutputFormat::from(OutputFormatArg::Yaml),
+            OutputFormat::Yaml
+        );
+        assert_eq!(
+            OutputFormat::from(OutputFormatArg::Json),
+            OutputFormat::Json
+        );
+    }
+
+    #[test]
+    fn run_markdown_reports_patch_coverage() {
+        let (_dir, repo, base) = repo_with_added_file();
+        let report = write_head_lcov(&repo);
+        let outcome = command(&repo, report, &base).run().unwrap();
+        // 3 added lines, 2 covered.
+        assert_eq!(outcome.patch_percent, Some(2.0 / 3.0 * 100.0));
+        assert!(!outcome.below_gate);
+        assert!(outcome.rendered.contains("### Patch coverage"));
+        assert!(outcome.rendered.contains("`b.rs:2`"));
+    }
+
+    #[test]
+    fn run_yaml_and_json_formats() {
+        let (_dir, repo, base) = repo_with_added_file();
+        for format in [OutputFormatArg::Yaml, OutputFormatArg::Json] {
+            let report = write_head_lcov(&repo);
+            let mut cmd = command(&repo, report, &base);
+            cmd.format = format;
+            let outcome = cmd.run().unwrap();
+            assert!(outcome.rendered.contains("patch_coverage"));
+        }
+    }
+
+    #[test]
+    fn run_with_baseline_enables_delta() {
+        let (_dir, repo, base) = repo_with_added_file();
+        let report = write_head_lcov(&repo);
+        // Baseline only knows a.rs at 100%.
+        let baseline = repo.join("base.lcov");
+        fs::write(
+            &baseline,
+            format!("SF:{}/a.rs\nDA:1,1\nend_of_record\n", repo.display()),
+        )
+        .unwrap();
+        let mut cmd = command(&repo, report, &base);
+        cmd.baseline_report = Some(baseline);
+        let outcome = cmd.run().unwrap();
+        assert!(outcome.rendered.contains("vs `main`"));
+    }
+
+    #[test]
+    fn fail_under_patch_gate() {
+        let (_dir, repo, base) = repo_with_added_file();
+        // Patch coverage is ~66.7%.
+        let report = write_head_lcov(&repo);
+        let mut cmd = command(&repo, report, &base);
+        cmd.fail_under_patch = Some(90.0);
+        assert!(cmd.run().unwrap().below_gate, "66.7% < 90% should fail");
+
+        let report = write_head_lcov(&repo);
+        let mut cmd = command(&repo, report, &base);
+        cmd.fail_under_patch = Some(50.0);
+        assert!(!cmd.run().unwrap().below_gate, "66.7% >= 50% should pass");
+    }
+
+    #[test]
+    fn missing_report_errors() {
+        let (_dir, repo, base) = repo_with_added_file();
+        let cmd = command(&repo, repo.join("nope.lcov"), &base);
+        assert!(cmd.run().is_err());
+    }
+
+    #[test]
+    fn render_options_use_flags() {
+        let (_dir, repo, base) = repo_with_added_file();
+        let mut cmd = command(&repo, repo.join("head.lcov"), &base);
+        cmd.artifact_url = Some("https://artifact".to_string());
+        cmd.collapse_ranges = true;
+        let opts = cmd.render_options();
+        assert_eq!(opts.artifact_url.as_deref(), Some("https://artifact"));
+        assert!(opts.collapse_ranges);
+    }
+
+    #[tokio::test]
+    async fn execute_succeeds_and_gate_bails() {
+        let (_dir, repo, base) = repo_with_added_file();
+        let report = write_head_lcov(&repo);
+        // Passing gate: execute prints and returns Ok.
+        let mut cmd = command(&repo, report.clone(), &base);
+        cmd.fail_under_patch = Some(10.0);
+        assert!(cmd.execute().await.is_ok());
+
+        // Failing gate: execute returns Err.
+        let mut cmd = command(&repo, report, &base);
+        cmd.fail_under_patch = Some(99.0);
+        assert!(cmd.execute().await.is_err());
+    }
+}

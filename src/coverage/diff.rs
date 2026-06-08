@@ -329,4 +329,62 @@ mod tests {
         // 11/12 are inside the hunk and not context ⇒ no mapping.
         assert_eq!(fd.map_base_to_head(11), None);
     }
+
+    /// Commits `files` to `repo`, returning the new commit's id.
+    fn commit(
+        repo: &Repository,
+        path: &std::path::Path,
+        files: &[(&str, &str)],
+        parent: Option<git2::Oid>,
+    ) -> git2::Oid {
+        let mut index = repo.index().unwrap();
+        index.clear().unwrap();
+        for (name, content) in files {
+            std::fs::write(path.join(name), content).unwrap();
+            index.add_path(std::path::Path::new(name)).unwrap();
+        }
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("T", "t@e.com").unwrap();
+        let parent = parent.map(|id| repo.find_commit(id).unwrap());
+        let parents: Vec<&git2::Commit> = parent.as_ref().into_iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, "c", &tree, &parents)
+            .unwrap()
+    }
+
+    #[test]
+    fn default_base_ref_is_merge_base_with_main() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let repo = Repository::init(path).unwrap();
+        let first = commit(&repo, path, &[("a.rs", "1\n")], None);
+        // Mark `main` at the first commit, then advance HEAD.
+        repo.branch("main", &repo.find_commit(first).unwrap(), false)
+            .unwrap();
+        commit(&repo, path, &[("a.rs", "1\n2\n")], Some(first));
+
+        let base = default_base_ref(&repo).unwrap();
+        assert_eq!(base, first.to_string());
+    }
+
+    #[test]
+    fn between_records_removed_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let repo = Repository::init(path).unwrap();
+        let first = commit(&repo, path, &[("a.rs", "a\nb\nc\n")], None);
+        commit(&repo, path, &[("a.rs", "a\nc\n")], Some(first)); // remove line "b"
+        let diff = DiffModel::between(&repo, &first.to_string(), Some("HEAD")).unwrap();
+        let fd = diff.files.get("a.rs").unwrap();
+        assert!(fd.removed.contains(&2), "removed old line 2 (b)");
+    }
+
+    #[test]
+    fn between_errors_on_bad_base_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let repo = Repository::init(path).unwrap();
+        commit(&repo, path, &[("a.rs", "1\n")], None);
+        assert!(DiffModel::between(&repo, "does-not-exist", Some("HEAD")).is_err());
+    }
 }

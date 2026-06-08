@@ -553,7 +553,7 @@ fn explanation() -> FieldExplanation {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::coverage::analysis::{FilePatch, IndirectChange, PatchCoverage};
+    use crate::coverage::analysis::{FileDelta, FilePatch, IndirectChange, PatchCoverage};
 
     #[test]
     fn fmt_num_trims_trailing_zeros() {
@@ -647,5 +647,150 @@ mod tests {
         let yaml = render(&diff, &RenderOptions::default(), OutputFormat::Yaml).unwrap();
         assert!(yaml.contains("patch_coverage:"));
         assert!(yaml.contains("explanation:"));
+    }
+
+    /// A baseline diff exercising the delta table (new file, decrease, increase,
+    /// below-EPS filtering, an em-dash `After`), the patch table with range
+    /// collapsing, and the artifact footer.
+    fn baseline_diff() -> CoverageDiff {
+        CoverageDiff {
+            patch: PatchCoverage {
+                covered: 2,
+                uncovered: 4,
+            },
+            file_patches: vec![FilePatch {
+                path: "src/a.rs".to_string(),
+                patch: PatchCoverage {
+                    covered: 2,
+                    uncovered: 4,
+                },
+                uncovered_lines: vec![9, 10, 11, 15],
+            }],
+            uncovered_new_lines: vec![
+                ("src/a.rs".to_string(), 9),
+                ("src/a.rs".to_string(), 10),
+                ("src/a.rs".to_string(), 11),
+                ("src/a.rs".to_string(), 15),
+            ],
+            has_baseline: true,
+            total_after: Some(80.0),
+            total_before: Some(80.0), // equal → ⚪ 0 pp
+            file_deltas: vec![
+                FileDelta {
+                    path: "src/new.rs".to_string(),
+                    before: None,
+                    after: Some(50.0),
+                },
+                FileDelta {
+                    path: "src/down.rs".to_string(),
+                    before: Some(100.0),
+                    after: Some(70.0),
+                },
+                FileDelta {
+                    path: "src/up.rs".to_string(),
+                    before: Some(70.0),
+                    after: Some(90.0),
+                },
+                FileDelta {
+                    path: "src/tiny.rs".to_string(),
+                    before: Some(90.0),
+                    after: Some(90.02), // below EPS → filtered out
+                },
+                FileDelta {
+                    path: "src/gone.rs".to_string(),
+                    before: Some(50.0),
+                    after: None, // After renders as em dash
+                },
+            ],
+            indirect: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn markdown_delta_table_and_footer() {
+        let diff = baseline_diff();
+        let opts = RenderOptions {
+            artifact_url: Some("https://artifact".to_string()),
+            run_url: Some("https://run".to_string()),
+            collapse_ranges: true,
+            ..Default::default()
+        };
+        let md = render(&diff, &opts, OutputFormat::Markdown).unwrap();
+        assert!(md.contains("⚪ 0 pp vs `main`"));
+        assert!(md.contains("| `src/new.rs` | — | 50% | 🆕 new |"));
+        assert!(md.contains("🔴 -30 pp"));
+        assert!(md.contains("🟢 20 pp"));
+        assert!(md.contains("| `src/gone.rs` | 50% | — | 🔴 -50 pp |"));
+        assert!(!md.contains("tiny.rs"), "below-EPS row must be filtered");
+        // Patch table with collapsed ranges.
+        assert!(md.contains("9-11, 15"));
+        // Artifact footer with run link.
+        assert!(md.contains("[Full per-file coverage summary](https://artifact)"));
+        assert!(md.contains("[run summary](https://run)"));
+    }
+
+    #[test]
+    fn markdown_comparing_line_and_covered_indirect() {
+        let mut diff = sample_diff();
+        diff.has_baseline = true;
+        diff.total_before = Some(80.0);
+        diff.indirect = vec![IndirectChange {
+            path: "src/b.rs".to_string(),
+            base_line: 5,
+            head_line: 5,
+            became_covered: true,
+        }];
+        let opts = RenderOptions {
+            base_sha: Some("abcdef123".to_string()),
+            head_sha: Some("fedcba321".to_string()),
+            commit_url: Some("https://x/commit".to_string()),
+            ..Default::default()
+        };
+        let md = render(&diff, &opts, OutputFormat::Markdown).unwrap();
+        assert!(md.contains("Comparing [`abcdef1`](https://x/commit/abcdef123)"));
+        assert!(md.contains("🟢 uncovered → covered"));
+    }
+
+    #[test]
+    fn markdown_no_per_file_changes() {
+        let mut diff = sample_diff();
+        diff.has_baseline = true;
+        diff.total_before = Some(80.0);
+        // No file_deltas → "no per-file coverage changes".
+        let md = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
+        assert!(md.contains("_No per-file coverage changes vs `main`._"));
+    }
+
+    #[test]
+    fn markdown_baseline_without_total_before() {
+        let mut diff = sample_diff();
+        diff.has_baseline = true;
+        diff.total_before = None;
+        let md = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
+        assert!(md.contains("Total: **80%**"));
+        assert!(!md.contains("pp vs"));
+    }
+
+    #[test]
+    fn markdown_no_added_lines() {
+        let diff = CoverageDiff {
+            total_after: Some(50.0),
+            ..Default::default()
+        };
+        let md = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
+        assert!(md.contains("_No new executable lines added by this diff._"));
+    }
+
+    #[test]
+    fn json_and_yaml_with_baseline_include_project_delta() {
+        let diff = baseline_diff();
+        let json = render(&diff, &RenderOptions::default(), OutputFormat::Json).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value.get("project_delta").is_some());
+        assert_eq!(value["project_delta"]["total_after"], 80.0);
+        assert!(value.get("indirect_changes").is_some());
+
+        let yaml = render(&diff, &RenderOptions::default(), OutputFormat::Yaml).unwrap();
+        assert!(yaml.contains("project_delta:"));
     }
 }

@@ -15,6 +15,9 @@ use super::model::{CoverageReport, FileCoverage};
 /// Parses cobertura XML text into a [`CoverageReport`].
 pub fn parse(content: &str) -> Result<CoverageReport> {
     let mut reader = Reader::from_str(content);
+    // Be lenient about unclosed/mismatched tags: we only read `class`/`line`
+    // attributes, and some coverage tools emit slightly non-well-formed XML.
+    reader.config_mut().check_end_names = false;
     let mut report = CoverageReport::new();
     let mut current: Option<FileCoverage> = None;
 
@@ -146,5 +149,36 @@ mod tests {
         let f = &report.files["src/a.rs"];
         assert_eq!(f.lines.len(), 1);
         assert_eq!(f.lines.get(&1), Some(&2));
+    }
+
+    #[test]
+    fn tolerates_unclosed_class() {
+        // No </class>: the trailing-class fallback must still record it.
+        let xml = r#"<coverage><class filename="a.rs"><lines><line number="1" hits="1"/></lines>"#;
+        let report = parse(xml).unwrap();
+        assert_eq!(report.hits("a.rs", 1), Some(1));
+    }
+
+    #[test]
+    fn new_class_closes_previous_unclosed_class() {
+        let xml = r#"<coverage>
+            <class filename="a.rs"><lines><line number="1" hits="1"/></lines>
+            <class filename="b.rs"><lines><line number="2" hits="0"/></lines></class>
+        </coverage>"#;
+        let report = parse(xml).unwrap();
+        assert_eq!(report.hits("a.rs", 1), Some(1));
+        assert_eq!(report.hits("b.rs", 2), Some(0));
+    }
+
+    #[test]
+    fn lines_outside_a_class_are_ignored() {
+        let xml = r#"<coverage><lines><line number="1" hits="1"/></lines></coverage>"#;
+        let report = parse(xml).unwrap();
+        assert!(report.files.is_empty());
+    }
+
+    #[test]
+    fn malformed_xml_errors() {
+        assert!(parse("<coverage><class").is_err());
     }
 }
