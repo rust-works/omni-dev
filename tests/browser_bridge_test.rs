@@ -128,7 +128,9 @@ impl FakeBrowser {
                             "headers": {"content-type": "text/plain"},
                             "body": body,
                         });
-                        sink.send(Message::Text(resp.to_string())).await.unwrap();
+                        sink.send(Message::Text(resp.to_string().into()))
+                            .await
+                            .unwrap();
                     }
                 }
             }
@@ -158,7 +160,9 @@ impl FakeBrowser {
                         "headers": {"content-type": "text/plain"},
                         "body": body,
                     });
-                    sink.send(Message::Text(resp.to_string())).await.unwrap();
+                    sink.send(Message::Text(resp.to_string().into()))
+                        .await
+                        .unwrap();
                 }
             }
         });
@@ -433,7 +437,9 @@ async fn proxy_forwards_method_and_headers() {
                 "body": format!("{} accept={}", cmd["method"].as_str().unwrap(),
                     headers.get("accept").cloned().unwrap_or_default()),
             });
-            sink.send(Message::Text(resp.to_string())).await.unwrap();
+            sink.send(Message::Text(resp.to_string().into()))
+                .await
+                .unwrap();
         }
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -480,7 +486,9 @@ fn spawn_reply_browser(
             if let Some(enc) = encoding {
                 resp["encoding"] = Value::String(enc.to_string());
             }
-            sink.send(Message::Text(resp.to_string())).await.unwrap();
+            sink.send(Message::Text(resp.to_string().into()))
+                .await
+                .unwrap();
         }
     })
 }
@@ -650,7 +658,7 @@ async fn spawn_stream_browser(
                 });
                 sink.lock()
                     .await
-                    .send(Message::Text(head.to_string()))
+                    .send(Message::Text(head.to_string().into()))
                     .await
                     .ok();
                 for (seq, chunk) in chunks.iter().enumerate() {
@@ -662,7 +670,7 @@ async fn spawn_stream_browser(
                     if sink
                         .lock()
                         .await
-                        .send(Message::Text(frame.to_string()))
+                        .send(Message::Text(frame.to_string().into()))
                         .await
                         .is_err()
                     {
@@ -673,7 +681,7 @@ async fn spawn_stream_browser(
                 let done = serde_json::json!({"id": id, "done": true});
                 sink.lock()
                     .await
-                    .send(Message::Text(done.to_string()))
+                    .send(Message::Text(done.to_string().into()))
                     .await
                     .ok();
             });
@@ -900,7 +908,9 @@ async fn spawn_templated_browser(
             for frame in &frames {
                 let mut frame = frame.clone();
                 frame["id"] = Value::from(id);
-                sink.send(Message::Text(frame.to_string())).await.ok();
+                sink.send(Message::Text(frame.to_string().into()))
+                    .await
+                    .ok();
             }
         }
     })
@@ -1101,7 +1111,7 @@ async fn bridge_survives_unparseable_browser_frame() {
                 "id": cmd["id"].as_u64().unwrap(), "status": 200,
                 "headers": {"content-type": "text/plain"}, "body": "ok",
             });
-            sink.send(Message::Text(resp.to_string())).await.ok();
+            sink.send(Message::Text(resp.to_string().into())).await.ok();
         }
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
