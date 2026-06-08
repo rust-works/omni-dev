@@ -1,10 +1,12 @@
 //! Rendering of a [`CoverageDiff`] to markdown, YAML, or JSON.
 //!
-//! The markdown renderer is a drop-in replacement for `scripts/coverage-comment.sh`
-//! — same `## Coverage` header, total line with 🟢/🔴 direction, merge-base→head
-//! `Comparing` line, the EPS-filtered per-file before/after/Δ table, and the
-//! artifact footer — plus a new `### Patch coverage` section (the headline metric
-//! the aggregate comment could never show) and an indirect-changes section.
+//! The markdown renderer reproduces the PR comment that the retired
+//! `scripts/coverage-comment.sh` shell renderer produced — same `## Coverage`
+//! header, total line with 🟢/🔴 direction, merge-base→head `Comparing` line, the
+//! EPS-filtered per-file before/after/Δ table, and the artifact footer — plus a
+//! `### Patch coverage` section (the headline metric the aggregate comment could
+//! never show) and an indirect-changes section. CI renders this comment via
+//! `omni-dev coverage diff --format markdown` (see `.github/workflows/ci.yml`).
 
 use anyhow::Result;
 use serde::Serialize;
@@ -13,7 +15,7 @@ use super::analysis::CoverageDiff;
 use crate::data::{FieldDocumentation, FieldExplanation};
 
 /// Minimum per-file change (percentage points) for a row to be listed, matching
-/// `scripts/coverage-comment.sh` (suppresses floating-point noise).
+/// the original coverage comment (suppresses floating-point noise).
 const EPS: f64 = 0.05;
 
 /// Output serialisation for `coverage diff`.
@@ -62,7 +64,7 @@ pub fn render(diff: &CoverageDiff, opts: &RenderOptions, format: OutputFormat) -
 }
 
 // ---------------------------------------------------------------------------
-// Number formatting (mirrors the jq `rnd`/`pct` helpers in coverage-comment.sh)
+// Number formatting (mirrors the jq `rnd`/`pct` helpers of the original comment)
 // ---------------------------------------------------------------------------
 
 /// Rounds to two decimal places, normalising negative zero to `0.0`.
@@ -190,7 +192,7 @@ fn render_markdown(diff: &CoverageDiff, opts: &RenderOptions) -> String {
 }
 
 fn render_delta_table(diff: &CoverageDiff, out: &mut String) {
-    // Build rows matching coverage-comment.sh: new files, or |delta| >= EPS.
+    // Build rows as the original comment did: new files, or |delta| >= EPS.
     struct Row {
         path: String,
         before: Option<f64>,
