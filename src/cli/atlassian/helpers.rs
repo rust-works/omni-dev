@@ -406,8 +406,24 @@ pub async fn run_edit(id: &str, api: &dyn AtlassianApi, instance_url: &str) -> R
 }
 
 /// Creates an authenticated Atlassian API client, returning the client and instance URL.
+///
+/// Resolves credentials from the process environment / `settings.json` via
+/// [`auth::load_credentials`], then delegates to [`create_client_from`]. This
+/// is the production entry point used by every command's `execute()`.
 pub fn create_client() -> Result<(AtlassianClient, String)> {
-    let credentials = auth::load_credentials()?;
+    create_client_from(auth::load_credentials()?)
+}
+
+/// Builds an Atlassian API client from explicitly-provided credentials,
+/// bypassing all environment / `settings.json` resolution.
+///
+/// This is the dependency-injection seam (issue #950): tests construct an
+/// [`auth::AtlassianCredentials`] pointed at a mock server and feed it straight
+/// in, so they never mutate the process-global `ATLASSIAN_*` env vars and can
+/// run fully in parallel.
+pub fn create_client_from(
+    credentials: auth::AtlassianCredentials,
+) -> Result<(AtlassianClient, String)> {
     let client = AtlassianClient::from_credentials(&credentials)?;
     let instance_url = client.instance_url().to_string();
     Ok((client, instance_url))
@@ -632,6 +648,11 @@ mod tests {
 
     #[test]
     fn open_editor_with_true_command() {
+        // Serialise on the one canonical env mutex (issue #950) so this
+        // `OMNI_DEV_EDITOR` mutation can't race other env-touching tests.
+        let _lock = crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::set_var("OMNI_DEV_EDITOR", "true");
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -647,6 +668,10 @@ mod tests {
 
     #[test]
     fn open_editor_with_nonexistent_command() {
+        // Serialise on the one canonical env mutex (issue #950).
+        let _lock = crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::set_var("OMNI_DEV_EDITOR", "nonexistent_editor_binary_12345");
 
         let temp_dir = tempfile::tempdir().unwrap();

@@ -231,7 +231,13 @@ mod tests {
     /// injected fake credentials so `create_client()` succeeds; the API call
     /// is allowed to fail.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn confluence_command_execute_move_dispatch() {
+        // Serialise on the one canonical env mutex (issue #950).
+        let _lock = crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         std::env::set_var("ATLASSIAN_INSTANCE_URL", "http://127.0.0.1:1");
         std::env::set_var("ATLASSIAN_EMAIL", "test@example.com");
         std::env::set_var("ATLASSIAN_API_TOKEN", "fake-token");
@@ -379,7 +385,13 @@ mod tests {
     /// downstream call is reached. The subsequent API call is allowed to
     /// fail — we only care that the dispatch line runs.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn confluence_command_execute_history_dispatch() {
+        // Serialise on the one canonical env mutex (issue #950).
+        let _lock = crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         std::env::set_var("ATLASSIAN_INSTANCE_URL", "http://127.0.0.1:1");
         std::env::set_var("ATLASSIAN_EMAIL", "test@example.com");
         std::env::set_var("ATLASSIAN_API_TOKEN", "fake-token");
@@ -434,7 +446,13 @@ mod tests {
 
     /// Exercises the `Attachment` dispatch arm in `ConfluenceCommand::execute`.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn confluence_command_execute_attachment_dispatch() {
+        // Serialise on the one canonical env mutex (issue #950).
+        let _lock = crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         std::env::set_var("ATLASSIAN_INSTANCE_URL", "http://127.0.0.1:1");
         std::env::set_var("ATLASSIAN_EMAIL", "test@example.com");
         std::env::set_var("ATLASSIAN_API_TOKEN", "fake-token");
@@ -497,7 +515,13 @@ mod tests {
     /// downstream call is reached. The subsequent API call is allowed to
     /// fail — we only care that the dispatch line runs.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn confluence_command_execute_compare_dispatch() {
+        // Serialise on the one canonical env mutex (issue #950).
+        let _lock = crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         std::env::set_var("ATLASSIAN_INSTANCE_URL", "http://127.0.0.1:1");
         std::env::set_var("ATLASSIAN_EMAIL", "test@example.com");
         std::env::set_var("ATLASSIAN_API_TOKEN", "fake-token");
