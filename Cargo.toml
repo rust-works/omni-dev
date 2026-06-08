@@ -105,6 +105,14 @@ nix = { version = "0.31", default-features = false, features = ["signal"] }
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 voxtral-sys = { path = "voxtral-sys", optional = true }
 
+# Apple MLX (`mlx-rs`) for the real-time INT4 Voxtral backend (ADR-0039), enabled
+# by the `voxtral-mlx` feature. Gated to macOS Apple Silicon only — MLX is
+# Apple-only, and `mlx-rs` builds the MLX C++ core from source via CMake. This
+# stanza keeps `mlx-rs` (and that toolchain) out of the Windows/Linux/Intel-macOS
+# and default graphs; a CI guard asserts its absence, like `voxtral-sys`.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+mlx-rs = { version = "0.21", optional = true }
+
 [features]
 mcp = ["dep:rmcp"]
 # Off-by-default native Voxtral ASR backend (#933, ADR-0037). Platform-gated:
@@ -117,6 +125,12 @@ mcp = ["dep:rmcp"]
 # auto-known to the `unexpected_cfgs` check (unlike the custom `online_tests`
 # cfg below), so no check-cfg entry is needed for `cfg(feature = "voxtral")`.
 voxtral = ["dep:voxtral-sys"]
+# Off-by-default real-time INT4 Voxtral backend via Apple MLX (`mlx-rs`), per
+# ADR-0039. Apple-Silicon-only: `mlx-rs` is declared under the macOS-aarch64
+# target stanza below, so it (and its C++/CMake MLX build) never enters any other
+# target's graph. Enabling it on macOS-arm64 pulls a CMake + C++ toolchain
+# requirement — the cost ADR-0039 narrowly permits, for this backend only.
+voxtral-mlx = ["dep:mlx-rs"]
 
 [dev-dependencies]
 tempfile = "3.27"
