@@ -143,10 +143,17 @@ jobs:
           echo '```'
         } >> "$GITHUB_STEP_SUMMARY"
     - name: Build omni-dev binary
-      # Renders the PR comment below via `omni-dev coverage diff`. Built into the
-      # normal target dir (separate from llvm-cov's instrumented one).
+      # Renders the PR comment below via `omni-dev coverage diff`. Built inside
+      # cargo-llvm-cov's environment (same rustc wrapper, flags, and target dir)
+      # so it reuses every dependency artifact already compiled by the coverage
+      # run above — only omni-dev's own crate is (re)built, not the whole tree
+      # (a plain `cargo build` differs in RUSTC_WRAPPER and recompiles ~everything).
+      # The resulting binary is coverage-instrumented; that is harmless to run.
       if: github.event_name == 'pull_request'
-      run: cargo build --bin omni-dev
+      run: |
+        # shellcheck disable=SC1090
+        source <(cargo llvm-cov show-env --sh)
+        cargo build --all-features --bin omni-dev
     - name: Upload coverage artifacts
       # The full summary lives here (not in the PR comment); codecov.json kept for
       # when the upload below is re-enabled. Runs before the comment so the comment
