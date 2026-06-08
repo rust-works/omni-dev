@@ -774,7 +774,7 @@ async fn dispatch(
                 return Err(e);
             }
         };
-        if sender.send(Message::Text(frame)).is_err() {
+        if sender.send(Message::Text(frame.into())).is_err() {
             state.correlator.remove(id);
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -861,7 +861,7 @@ async fn send_cancel(state: &AppState, conn_id: u64, id: u64) {
         return;
     };
     if let Some(conn) = state.tabs.lock().await.get(&conn_id) {
-        let _ = conn.sender.send(Message::Text(frame));
+        let _ = conn.sender.send(Message::Text(frame.into()));
     }
 }
 
@@ -927,7 +927,7 @@ async fn start_stream(
                 return Err(e);
             }
         };
-        if sender.send(Message::Text(frame)).is_err() {
+        if sender.send(Message::Text(frame.into())).is_err() {
             state.correlator.remove(id);
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
