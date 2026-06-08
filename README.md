@@ -85,6 +85,63 @@ eval "$(omni-dev completions bash)"
 See [docs/shell-completion.md](docs/shell-completion.md) for per-shell install
 recipes, the `$fpath`/`compinit` setup zsh requires, and troubleshooting.
 
+## 🆚 How omni-dev Compares
+
+omni-dev sits in two adjacent spaces — AI commit-message tooling and
+Atlassian/dev-workflow MCP servers. The tables below contrast the
+incumbents on the dimensions a first-time reader is most likely to weigh.
+In every cell, `✅` means full / native support, `⚠` means partial or
+available only with caveats, and `❌` means not supported — and omni-dev's
+own limitations are flagged just as honestly (the `⚠` marks in its own
+columns).
+
+Beyond these two niches, omni-dev also ships a supervised **daemon** that
+hosts a **browser bridge** (an authenticated proxy that runs requests
+through a logged-in browser tab for SSO-gated dashboards such as Grafana
+and Loki) and a **Snowflake** SQL service (one external-browser SSO session
+reused for concurrent queries), plus a local append-only **request log**
+(`omni-dev log`). These have no direct incumbent in either table below, so
+they are called out here rather than scored against tools that don't aim
+for them.
+
+### vs AI commit tools
+
+|                                                       | omni-dev                            | [opencommit](https://github.com/di-sukharev/opencommit) | [aicommits](https://github.com/Nutlope/aicommits) |
+|-------------------------------------------------------|-------------------------------------|---------------------------------------------------------|---------------------------------------------------|
+| Rewrite existing commits in a range                   | ✅ `twiddle`                         | ❌ pre-commit only                                       | ❌ pre-commit only                                 |
+| Parallel batched processing (long ranges)             | ✅ `--concurrency N`                 | ❌                                                       | ❌                                                 |
+| AI-written PR descriptions                            | ✅ `git branch create pr`            | ⚠ GitHub Action only                                    | ❌                                                 |
+| Project-context awareness                             | ✅ `--use-context`                   | ❌                                                       | ❌                                                 |
+| Sandboxed `claude-cli` backend                        | ✅ [ADR-0028](docs/adrs/adr-0028.md) | ❌                                                       | ❌                                                 |
+| Multi-backend (Anthropic / Bedrock / OpenAI / Ollama) | ✅                                   | ✅                                                       | ✅                                                 |
+| Conventional Commits                                  | ✅                                   | ✅                                                       | ⚠ config                                          |
+| Language / runtime                                    | Rust (static binary)                | Node.js                                                 | Node.js                                           |
+
+### vs Atlassian-workflow MCP servers
+
+omni-dev's MCP server also exposes Git tools (commit analysis, twiddling,
+PR creation), Datadog tools, and an `ai_chat` proxy — surfaces the
+Atlassian-focused servers don't aim for. The table below compares only
+Atlassian capability depth.
+
+|                                         | omni-dev MCP                                                                          | [sooperset/mcp-atlassian](https://github.com/sooperset/mcp-atlassian)             | [Atlassian official (Rovo)](https://github.com/atlassian/atlassian-mcp-server)                              |
+|-----------------------------------------|---------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------|
+| Jira REST surface                       | ✅ 36 tools (agile, fields, dev panel, links, watchers, worklogs, versions, changelog) | ✅ 49 tools (above + JSM, proforma forms, SLA, batch ops)                          | ⚠ 14 tools (basic CRUD, search, transitions, worklogs only)                                                 |
+| Confluence REST surface                 | ✅ 25 tools (history, diff, attachments, labels, spaces, inline + footer comments)     | ✅ 24 tools (history, diff, attachments, labels; **no inline comments / spaces**)  | ⚠ 12 tools (inline + footer comments, spaces; **no delete / move / history / diff / attachments / labels**) |
+| Lossless JFM ↔ ADF round-trip           | ✅ full ADF node set (schema v54.0.4) + unsupported-node escape                        | ❌                                                                                 | ❌ raw ADF only                                                                                              |
+| Anchored review-comment preservation    | ✅ annotation marks survive round-trip                                                 | ❌ anchor stripped, comments orphaned                                              | ❌ raw ADF, no managed preservation                                                                          |
+| Pre-flight ADF schema validation        | ✅ nesting + arity, before write                                                       | ❌                                                                                 | ❌                                                                                                           |
+| Offline JFM ↔ ADF conversion (no creds) | ✅ `atlassian_convert`                                                                 | ❌                                                                                 | ❌                                                                                                           |
+| Cloud + Server + Data Center            | ⚠ Cloud verified                                                                      | ✅ Cloud + Server (v6+) + DC (Jira v8.14+)                                         | ❌ Cloud only                                                                                                |
+| Auth                                    | ⚠ API token only                                                                      | ✅ API token / PAT / OAuth 2.0                                                     | ✅ OAuth 2.1 / API token                                                                                     |
+
+_Last verified: 2026-06-22. omni-dev and sooperset counts come from live
+`tools/list` enumeration (omni-dev branch build vs
+`ghcr.io/sooperset/mcp-atlassian:latest`); Atlassian Rovo is from its
+[Supported tools](https://support.atlassian.com/atlassian-rovo-mcp-server/docs/supported-tools/)
+docs (OAuth-gated, not live-enumerated). Refresh quarterly or whenever a
+release-note search for the comparators flags a relevant change._
+
 ## 📋 Core Commands
 
 ### 🤖 AI-Powered Commit Improvement (`twiddle`)
