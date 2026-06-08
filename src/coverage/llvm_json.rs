@@ -244,4 +244,36 @@ mod tests {
         let report = parse(&json).unwrap();
         assert!(report.files.is_empty());
     }
+
+    #[test]
+    fn skips_files_without_filename_and_malformed_segments() {
+        let json = export(serde_json::json!([
+            { "segments": [[1, 1, 5, true, true, false]] }, // no filename → skipped
+            {
+                "filename": "src/a.rs",
+                "segments": [
+                    [],                               // malformed → skipped
+                    [1, 1, 5, true, true, false],
+                    [2, 1, "x", true, true, false],   // non-numeric count → treated as 0
+                    [3, 1, 0, false, false, false]
+                ]
+            }
+        ]));
+        let report = parse(&json).unwrap();
+        assert_eq!(report.files.len(), 1);
+        assert_eq!(report.hits("src/a.rs", 1), Some(5));
+        // Line 2's region entry has a non-numeric count (→ 0), but it is still
+        // wrapped by line 1's count-5 region, so the line's count is max(5, 0).
+        assert_eq!(report.hits("src/a.rs", 2), Some(5));
+    }
+
+    #[test]
+    fn invalid_json_errors() {
+        assert!(parse("{ not json").is_err());
+    }
+
+    #[test]
+    fn missing_data_array_errors() {
+        assert!(parse(r#"{"version":"2"}"#).is_err());
+    }
 }

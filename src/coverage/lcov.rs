@@ -145,4 +145,17 @@ end_of_record
         let lcov = "DA:1,1\n";
         assert!(parse(lcov).is_err());
     }
+
+    #[test]
+    fn skips_blank_lines() {
+        let lcov = "\nSF:a.rs\n\nDA:1,1\n\nend_of_record\n\n";
+        let report = parse(lcov).unwrap();
+        assert_eq!(report.hits("a.rs", 1), Some(1));
+    }
+
+    #[test]
+    fn negative_hit_count_saturates_to_zero() {
+        let report = parse("SF:a.rs\nDA:1,-5\nend_of_record\n").unwrap();
+        assert_eq!(report.hits("a.rs", 1), Some(0));
+    }
 }

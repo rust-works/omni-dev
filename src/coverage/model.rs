@@ -246,6 +246,23 @@ mod tests {
     }
 
     #[test]
+    fn strip_prefix_merges_colliding_paths() {
+        // Two distinct source paths that normalise to the same repo path.
+        let mut report = CoverageReport::new();
+        let mut a = FileCoverage::new("/root/src/a.rs");
+        a.record(1, 0);
+        let mut b = FileCoverage::new("/root/./src/a.rs");
+        b.record(2, 1);
+        report.insert(a);
+        report.insert(b);
+        assert_eq!(report.files.len(), 2);
+        report.strip_prefix(Path::new("/root"));
+        assert_eq!(report.files.len(), 1);
+        assert_eq!(report.hits("src/a.rs", 1), Some(0));
+        assert_eq!(report.hits("src/a.rs", 2), Some(1));
+    }
+
+    #[test]
     fn strip_prefix_leaves_relative_paths() {
         let mut report = CoverageReport::new();
         let mut f = FileCoverage::new("./src/a.rs");

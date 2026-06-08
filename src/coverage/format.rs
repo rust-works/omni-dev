@@ -118,4 +118,37 @@ mod tests {
         let report = parse("SF:src/a.rs\nDA:1,2\nend_of_record\n", None).unwrap();
         assert_eq!(report.hits("src/a.rs", 1), Some(2));
     }
+
+    #[test]
+    fn display_names() {
+        assert_eq!(Format::Lcov.to_string(), "lcov");
+        assert_eq!(Format::LlvmCovJson.to_string(), "llvm-cov-json");
+        assert_eq!(Format::Cobertura.to_string(), "cobertura");
+    }
+
+    #[test]
+    fn parse_with_explicit_format_dispatches_each_parser() {
+        let lcov = parse("SF:a.rs\nDA:1,1\nend_of_record\n", Some(Format::Lcov)).unwrap();
+        assert_eq!(lcov.hits("a.rs", 1), Some(1));
+
+        let json = parse(
+            r#"{"data":[{"files":[{"filename":"a.rs","segments":[[1,1,3,true,true,false],[2,1,0,false,false,false]]}]}]}"#,
+            Some(Format::LlvmCovJson),
+        )
+        .unwrap();
+        assert_eq!(json.hits("a.rs", 1), Some(3));
+
+        let xml = parse(
+            r#"<coverage><packages><package><classes><class filename="a.rs"><lines><line number="1" hits="2"/></lines></class></classes></package></packages></coverage>"#,
+            Some(Format::Cobertura),
+        )
+        .unwrap();
+        assert_eq!(xml.hits("a.rs", 1), Some(2));
+    }
+
+    #[test]
+    fn parse_propagates_parser_errors() {
+        // Detected as JSON but invalid → parse error with context.
+        assert!(parse("{ not json", None).is_err());
+    }
 }

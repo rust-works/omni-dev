@@ -379,6 +379,34 @@ mod tests {
     }
 
     #[test]
+    fn patch_percent_none_when_empty() {
+        assert_eq!(PatchCoverage::default().percent(), None);
+        assert_eq!(PatchCoverage::default().total(), 0);
+    }
+
+    #[test]
+    fn file_delta_handles_all_combinations() {
+        let d = |before, after| FileDelta {
+            path: "x".to_string(),
+            before,
+            after,
+        };
+        assert_eq!(d(Some(80.0), Some(90.0)).delta(), Some(10.0));
+        assert_eq!(d(Some(50.0), None).delta(), Some(-50.0));
+        assert_eq!(d(None, Some(50.0)).delta(), None);
+    }
+
+    #[test]
+    fn indirect_change_newly_covered() {
+        let baseline = report(&[("src/b.rs", &[(5, 0)])]);
+        let head = report(&[("src/b.rs", &[(5, 3)])]);
+        let diff = diff_added("src/a.rs", true, &[1]);
+        let out = analyze(&head, &diff, Some(&baseline));
+        assert_eq!(out.indirect_newly_covered(), 1);
+        assert!(out.indirect[0].became_covered);
+    }
+
+    #[test]
     fn added_lines_are_not_counted_as_indirect() {
         // The added line 1 is direct (patch), not indirect, even with a baseline.
         let baseline = report(&[("src/a.rs", &[(1, 1)])]);
