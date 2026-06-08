@@ -62,3 +62,4 @@ by Michael Nygard.
 | [ADR-0036](adr-0036.md)  | ✅ Accepted                              | 2026-05-30 | Confused-Deputy Browser Bridge with Dual-Plane Default-Closed Authentication           |
 | [ADR-0037](adr-0037.md)  | ✅ Accepted                              | 2026-06-06 | Pure-C Native ASR Backends Behind a Rust FFI Boundary on Non-Windows Targets           |
 | [ADR-0038](adr-0038.md)  | ✅ Accepted                              | 2026-06-07 | Streaming `Transcriber` Seam (async `Stream` + `AsyncAudioInput`)                      |
+| [ADR-0039](adr-0039.md)  | ✅ Accepted                              | 2026-06-08 | Permit C++/CMake for `mlx-rs` on Apple Silicon — Real-Time INT4 Voxtral via MLX        |
