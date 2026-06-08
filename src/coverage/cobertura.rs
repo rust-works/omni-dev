@@ -24,11 +24,9 @@ pub fn parse(content: &str) -> Result<CoverageReport> {
             Event::Start(e) | Event::Empty(e) => {
                 handle_start(&e, &mut current, &mut report)?;
             }
-            Event::End(e) => {
-                if e.name().as_ref() == b"class" {
-                    if let Some(file) = current.take() {
-                        report.insert(file);
-                    }
+            Event::End(e) if e.name().as_ref() == b"class" => {
+                if let Some(file) = current.take() {
+                    report.insert(file);
                 }
             }
             _ => {}
