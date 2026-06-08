@@ -194,8 +194,14 @@ mod tests {
     /// Drives `MoveCommand::execute` past `create_client()` with injected
     /// fake credentials so the dispatch line runs. The downstream API call
     /// fails (no mock server) and we only care that the entrypoint executes.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
     async fn move_command_execute_dispatch() {
+        // Serialise on the one canonical env mutex (issue #950); this mutation
+        // was previously unguarded and could clobber concurrent credential tests.
+        let _lock = crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::set_var("ATLASSIAN_INSTANCE_URL", "http://127.0.0.1:1");
         std::env::set_var("ATLASSIAN_EMAIL", "test@example.com");
         std::env::set_var("ATLASSIAN_API_TOKEN", "fake-token");
