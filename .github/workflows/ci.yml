@@ -181,11 +181,17 @@ jobs:
         path: baseline
         if_no_artifact_found: warn
     - name: Compute baseline from merge-base (fallback)
-      # Only runs when no baseline artifact exists for the merge-base. Builds
-      # coverage at that exact commit in a worktree, so the comparison stays
-      # correct (and still PR-attributable) even on cold start or after expiry.
-      if: github.event_name == 'pull_request' && steps.baseline.outputs.found_artifact == 'false'
+      # Runs whenever the merge-base has no usable lcov baseline: a cold start,
+      # an expired artifact, or a pre-migration aggregate-only artifact (which
+      # the download above fetches but which lacks the lcov). Builds coverage at
+      # that exact commit in a worktree, so the comparison stays correct (and
+      # still PR-attributable). A no-op when the lcov baseline was downloaded.
+      if: github.event_name == 'pull_request'
       run: |
+        if [ -f baseline/coverage-head.lcov ]; then
+          echo "lcov baseline already present for the merge-base; skipping recompute"
+          exit 0
+        fi
         git worktree add ../base "${{ steps.mb.outputs.sha }}"
         ( cd ../base && cargo llvm-cov --all-features --workspace --no-report \
             && cargo llvm-cov report --lcov --output-path coverage-head.lcov )
