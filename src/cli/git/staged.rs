@@ -92,7 +92,7 @@ pub async fn run_staged(
         anyhow::bail!("no staged changes — stage files with `git add` before running this command");
     }
 
-    crate::utils::check_ai_command_prerequisites(model.as_deref())?;
+    crate::utils::check_ai_command_prerequisites(model.as_deref(), repo_root)?;
     let claude_client = crate::claude::create_default_claude_client(model, beta_header).await?;
 
     let resolved_context_dir =

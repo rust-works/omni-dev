@@ -112,7 +112,8 @@ impl TwiddleCommand {
         }
 
         // Preflight check: validate AI credentials before any processing
-        let ai_info = crate::utils::check_ai_command_prerequisites(self.model.as_deref())?;
+        let ai_info =
+            crate::utils::check_ai_command_prerequisites(self.model.as_deref(), repo_root)?;
         println!(
             "✓ {} credentials verified (model: {})",
             ai_info.provider, ai_info.model
@@ -1795,7 +1796,7 @@ pub async fn run_twiddle(
 ) -> Result<TwiddleOutcome> {
     let repo_root = repo_path.unwrap_or_else(|| std::path::Path::new("."));
 
-    crate::utils::check_ai_command_prerequisites(model.as_deref())?;
+    crate::utils::check_ai_command_prerequisites(model.as_deref(), repo_root)?;
 
     if !dry_run {
         crate::utils::check_working_directory_clean_at(repo_root)?;

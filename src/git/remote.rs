@@ -21,10 +21,16 @@ impl RemoteInfo {
         let mut remotes = Vec::new();
         let remote_names = repo.remotes().context("Failed to get remote names")?;
 
+        // Anchor the `gh` subprocess fallback to the repository's working
+        // directory (RULE-1: git2 ops keep `&Repository`; the subprocess takes
+        // `repo_root`). Derived from the git2 repo itself, so no external caller
+        // signature changes.
+        let repo_root = repo.workdir().unwrap_or_else(|| repo.path());
+
         for name in remote_names.iter().flatten().flatten() {
             if let Ok(remote) = repo.find_remote(name) {
                 let uri = remote.url().unwrap_or("").to_string();
-                let main_branch = Self::detect_main_branch(repo, name)?;
+                let main_branch = Self::detect_main_branch(repo, name, repo_root)?;
 
                 remotes.push(Self {
                     name: name.to_string(),
@@ -38,7 +44,14 @@ impl RemoteInfo {
     }
 
     /// Detects the main branch for a remote.
-    fn detect_main_branch(repo: &Repository, remote_name: &str) -> Result<String> {
+    ///
+    /// `repo_root` anchors the `gh` subprocess fallback to the repository's
+    /// working directory rather than the process current working directory.
+    fn detect_main_branch(
+        repo: &Repository,
+        remote_name: &str,
+        repo_root: &std::path::Path,
+    ) -> Result<String> {
         // First try to get the remote HEAD reference
         let head_ref_name = format!("refs/remotes/{remote_name}/HEAD");
         if let Ok(head_ref) = repo.find_reference(&head_ref_name) {
@@ -56,7 +69,7 @@ impl RemoteInfo {
         if let Ok(remote) = repo.find_remote(remote_name) {
             if let Ok(uri) = remote.url() {
                 if uri.contains("github.com") {
-                    if let Ok(main_branch) = Self::get_github_default_branch(uri) {
+                    if let Ok(main_branch) = Self::get_github_default_branch(uri, repo_root) {
                         return Ok(main_branch);
                     }
                 }
@@ -111,7 +124,12 @@ impl RemoteInfo {
     }
 
     /// Returns the default branch from GitHub using gh CLI.
-    fn get_github_default_branch(uri: &str) -> Result<String> {
+    ///
+    /// `repo_root` anchors the `gh` subprocess to the repository's working
+    /// directory. The `gh repo view <repo_name>` invocation already passes an
+    /// explicit repo argument (so it is CWD-inert), but the directory is pinned
+    /// for uniformity with the rest of the repo-anchored subprocess seams.
+    fn get_github_default_branch(uri: &str, repo_root: &std::path::Path) -> Result<String> {
         use std::process::Command;
 
         // Extract repository name from URI
@@ -128,6 +146,7 @@ impl RemoteInfo {
                 "--jq",
                 ".defaultBranchRef.name",
             ])
+            .current_dir(repo_root)
             .output();
 
         match output {

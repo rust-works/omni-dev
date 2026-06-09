@@ -103,7 +103,8 @@ impl CreatePrCommand {
 
         // Preflight check: validate all prerequisites before any processing
         // This catches missing credentials/tools early before wasting time
-        let ai_info = crate::utils::check_pr_command_prerequisites(self.model.as_deref())?;
+        let ai_info =
+            crate::utils::check_pr_command_prerequisites(self.model.as_deref(), repo_root)?;
         println!(
             "✓ {} credentials verified (model: {})",
             ai_info.provider, ai_info.model
@@ -1414,7 +1415,7 @@ pub async fn run_create_pr(
         None => std::env::current_dir().context("Failed to determine current directory")?,
     };
 
-    crate::utils::check_pr_command_prerequisites(model.as_deref())?;
+    crate::utils::check_pr_command_prerequisites(model.as_deref(), &repo_root)?;
 
     let cmd = CreatePrCommand {
         base: base_branch.map(str::to_string),
