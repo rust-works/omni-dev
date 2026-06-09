@@ -1552,8 +1552,14 @@ async fn git_view_commits_default_range_is_head() -> Result<()> {
 
 // ─── Resources ──────────────────────────────────────────────────────
 
-/// Serialises CWD mutations across the resource tests in this file so they
-/// don't race with each other or with CWD-swapping unit tests elsewhere.
+/// Serialises the CWD swap in `read_resource_git_commits_head_returns_yaml`.
+///
+/// This is the one intentional CWD-mutating test left after #967: the
+/// path-less `git://repo/commits/HEAD` wire URI carries no per-call repo path,
+/// so the in-process MCP server resolves the repository from its own current
+/// working directory at the boundary (`server.rs`). Pointing it at a temp repo
+/// therefore requires swapping the process CWD. Retiring this would need a
+/// configurable server workdir — a separate feature, out of scope for #967.
 static CWD_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[tokio::test]

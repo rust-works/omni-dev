@@ -34,6 +34,8 @@ Options:
           Per-invocation spending cap in USD for the `claude-cli` backend
       --models-yaml <PATH>
           Path to a single user-side `models.yaml` that short-circuits the standard `./.omni-dev/models.yaml` and `~/.omni-dev/models.yaml` lookup. The file is still merged over the embedded catalog. Equivalent to setting `OMNI_DEV_MODELS_YAML`
+  -C, --repo <PATH>
+          Run as if omni-dev was started in `<PATH>` instead of the current working directory
   -h, --help
           Print help (see more with '--help')
   -V, --version
@@ -2187,8 +2189,6 @@ Options:
           Output format [default: markdown] [possible values: markdown, yaml, json]
       --fail-under-patch <PCT>
           Fail (non-zero exit) when patch coverage is below this percentage
-      --repo <PATH>
-          Repository path [default: .]
       --strip-prefix <PATH>
           Override the path prefix stripped from report file paths to make them repo-relative (default: the repository working directory)
       --collapse-ranges

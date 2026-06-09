@@ -30,13 +30,6 @@ pub struct FileStatus {
 }
 
 impl GitRepository {
-    /// Opens a repository at the current directory.
-    pub fn open() -> Result<Self> {
-        let repo = Repository::open(".").context("Not in a git repository")?;
-
-        Ok(Self { repo })
-    }
-
     /// Opens a repository at the specified path.
     pub fn open_at<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
         let repo = Repository::open(path).context("Failed to open git repository")?;

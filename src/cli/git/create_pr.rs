@@ -91,10 +91,20 @@ impl CreatePrCommand {
     }
 
     /// Executes the create PR command.
-    pub async fn execute(self) -> Result<()> {
+    pub async fn execute(self, repo: Option<&std::path::Path>) -> Result<()> {
+        // Resolve the repo root once; every git, config, scratch, PR-template,
+        // and `gh` read below anchors to it (the CWD is the default when no
+        // path is injected).
+        let repo_root = match repo {
+            Some(p) => p.to_path_buf(),
+            None => std::env::current_dir().context("Failed to determine current directory")?,
+        };
+        let repo_root = repo_root.as_path();
+
         // Preflight check: validate all prerequisites before any processing
         // This catches missing credentials/tools early before wasting time
-        let ai_info = crate::utils::check_pr_command_prerequisites(self.model.as_deref())?;
+        let ai_info =
+            crate::utils::check_pr_command_prerequisites(self.model.as_deref(), repo_root)?;
         println!(
             "✓ {} credentials verified (model: {})",
             ai_info.provider, ai_info.model
@@ -104,18 +114,18 @@ impl CreatePrCommand {
         println!("🔄 Starting pull request creation process...");
 
         // 1. Generate repository view (reuse InfoCommand logic)
-        let repo_view = self.generate_repository_view()?;
+        let repo_view = self.generate_repository_view(repo_root)?;
 
         // 2. Validate branch state (always needed)
         self.validate_branch_state(&repo_view)?;
 
         // 3. Show guidance files status early (before AI processing)
         use crate::claude::context::ProjectDiscovery;
-        let repo_root = std::path::PathBuf::from(".");
-        let context_dir = crate::claude::context::resolve_context_dir(self.context_dir.as_deref());
-        let discovery = ProjectDiscovery::new(repo_root, context_dir);
+        let context_dir =
+            crate::claude::context::resolve_context_dir_at(self.context_dir.as_deref(), repo_root);
+        let discovery = ProjectDiscovery::new(repo_root.to_path_buf(), context_dir);
         let project_context = discovery.discover().unwrap_or_default();
-        self.show_guidance_files_status(&project_context)?;
+        self.show_guidance_files_status(repo_root, &project_context)?;
 
         // 4. Show AI model configuration before generation
         let claude_client =
@@ -148,7 +158,7 @@ impl CreatePrCommand {
         // 7. Generate AI-powered PR content (title + description)
         debug!("About to generate PR content from AI");
         let (pr_content, _claude_client) = self
-            .generate_pr_content_with_client_internal(&repo_view, claude_client)
+            .generate_pr_content_with_client_internal(repo_root, &repo_view, claude_client)
             .await?;
 
         // 8. Show detailed context information (like twiddle command)
@@ -242,6 +252,7 @@ impl CreatePrCommand {
         match pr_action {
             PrAction::CreateNew => {
                 self.create_github_pr(
+                    repo_root,
                     &repo_view,
                     &final_pr_content.title,
                     &final_pr_content.description,
@@ -252,6 +263,7 @@ impl CreatePrCommand {
             }
             PrAction::UpdateExisting => {
                 self.update_github_pr(
+                    repo_root,
                     &repo_view,
                     &final_pr_content.title,
                     &final_pr_content.description,
@@ -266,7 +278,10 @@ impl CreatePrCommand {
     }
 
     /// Generates the repository view (reuses InfoCommand logic).
-    fn generate_repository_view(&self) -> Result<crate::data::RepositoryView> {
+    fn generate_repository_view(
+        &self,
+        repo_root: &std::path::Path,
+    ) -> Result<crate::data::RepositoryView> {
         use crate::data::{
             AiInfo, BranchInfo, FieldExplanation, FileStatusInfo, RepositoryView, VersionInfo,
             WorkingDirectoryInfo,
@@ -274,9 +289,9 @@ impl CreatePrCommand {
         use crate::git::{GitRepository, RemoteInfo};
         use crate::utils::ai_scratch;
 
-        // Open git repository
-        let repo = GitRepository::open()
-            .context("Failed to open git repository. Make sure you're in a git repository.")?;
+        // Open git repository at the injected root
+        let repo = GitRepository::open_at(repo_root)
+            .context("Failed to open git repository at the given path")?;
 
         // Get current branch name
         let current_branch = repo.get_current_branch().context(
@@ -357,14 +372,14 @@ impl CreatePrCommand {
         let commits = repo.get_commits_in_range(&commit_range)?;
 
         // Check for PR template
-        let pr_template_result = InfoCommand::read_pr_template().ok();
+        let pr_template_result = InfoCommand::read_pr_template(repo_root).ok();
         let (pr_template, pr_template_location) = match pr_template_result {
             Some((content, location)) => (Some(content), Some(location)),
             None => (None, None),
         };
 
         // Get PRs for current branch
-        let branch_prs = InfoCommand::get_branch_prs(&current_branch)
+        let branch_prs = InfoCommand::get_branch_prs(&current_branch, repo_root)
             .ok()
             .filter(|prs| !prs.is_empty());
 
@@ -374,8 +389,8 @@ impl CreatePrCommand {
         });
 
         // Get AI scratch directory
-        let ai_scratch_path =
-            ai_scratch::get_ai_scratch_dir().context("Failed to determine AI scratch directory")?;
+        let ai_scratch_path = ai_scratch::get_ai_scratch_dir_at(repo_root)
+            .context("Failed to determine AI scratch directory")?;
         let ai_info = AiInfo {
             scratch: ai_scratch_path.to_string_lossy().to_string(),
         };
@@ -516,6 +531,7 @@ impl CreatePrCommand {
     /// Collects contextual information for enhanced PR generation (adapted from twiddle).
     async fn collect_context(
         &self,
+        repo_root: &std::path::Path,
         repo_view: &crate::data::RepositoryView,
     ) -> Result<crate::data::context::CommitContext> {
         use crate::claude::context::{
@@ -527,11 +543,11 @@ impl CreatePrCommand {
         let mut context = CommitContext::new();
 
         // 1. Discover project context
-        let context_dir = crate::claude::context::resolve_context_dir(self.context_dir.as_deref());
+        let context_dir =
+            crate::claude::context::resolve_context_dir_at(self.context_dir.as_deref(), repo_root);
 
         // ProjectDiscovery takes repo root and context directory
-        let repo_root = std::path::PathBuf::from(".");
-        let discovery = ProjectDiscovery::new(repo_root, context_dir);
+        let discovery = ProjectDiscovery::new(repo_root.to_path_buf(), context_dir);
         match discovery.discover() {
             Ok(project_context) => {
                 context.project = project_context;
@@ -542,7 +558,7 @@ impl CreatePrCommand {
         }
 
         // 2. Analyze current branch
-        let repo = GitRepository::open()?;
+        let repo = GitRepository::open_at(repo_root)?;
         let current_branch = repo
             .get_current_branch()
             .unwrap_or_else(|_| "HEAD".to_string());
@@ -564,14 +580,15 @@ impl CreatePrCommand {
     /// Shows guidance files status (adapted from twiddle).
     fn show_guidance_files_status(
         &self,
+        repo_root: &std::path::Path,
         project_context: &crate::data::context::ProjectContext,
     ) -> Result<()> {
         use crate::claude::context::{
-            config_source_label, resolve_context_dir_with_source, ConfigSourceLabel,
+            config_source_label, resolve_context_dir_with_source_at, ConfigSourceLabel,
         };
 
         let (context_dir, dir_source) =
-            resolve_context_dir_with_source(self.context_dir.as_deref());
+            resolve_context_dir_with_source_at(self.context_dir.as_deref(), repo_root);
 
         println!("📋 Project guidance files status:");
         println!("   📂 Config dir: {} ({dir_source})", context_dir.display());
@@ -602,7 +619,7 @@ impl CreatePrCommand {
         println!("   🎯 Valid scopes: {scopes_source}");
 
         // Check PR template
-        let pr_template_path = std::path::Path::new(".github/pull_request_template.md");
+        let pr_template_path = repo_root.join(".github/pull_request_template.md");
         let pr_template_status = if pr_template_path.exists() {
             format!("✅ Project: {}", pr_template_path.display())
         } else {
@@ -673,6 +690,7 @@ impl CreatePrCommand {
     /// Generates PR content with a pre-created client (internal method that does not show model info).
     async fn generate_pr_content_with_client_internal(
         &self,
+        repo_root: &std::path::Path,
         repo_view: &crate::data::RepositoryView,
         claude_client: crate::claude::client::ClaudeClient,
     ) -> Result<(PrContent, crate::claude::client::ClaudeClient)> {
@@ -694,7 +712,7 @@ impl CreatePrCommand {
 
         // Collect project context for PR guidelines
         debug!("Collecting context for PR generation");
-        let context = self.collect_context(repo_view).await?;
+        let context = self.collect_context(repo_root, repo_view).await?;
         debug!("Context collection completed");
 
         // Generate AI-powered PR content with context
@@ -1016,6 +1034,7 @@ impl CreatePrCommand {
     /// Creates a new GitHub PR using gh CLI.
     fn create_github_pr(
         &self,
+        repo_root: &std::path::Path,
         repo_view: &crate::data::RepositoryView,
         title: &str,
         description: &str,
@@ -1048,8 +1067,8 @@ impl CreatePrCommand {
             determine_push_action(true, false)
         } else {
             debug!("Opening git repository to check branch status");
-            let git_repo =
-                crate::git::GitRepository::open().context("Failed to open git repository")?;
+            let git_repo = crate::git::GitRepository::open_at(repo_root)
+                .context("Failed to open git repository at the given path")?;
 
             debug!(
                 "Checking if branch '{}' exists on remote 'origin'",
@@ -1100,6 +1119,7 @@ impl CreatePrCommand {
         }
 
         let pr_result = Command::new("gh")
+            .current_dir(repo_root)
             .args(&args)
             .output()
             .context("Failed to create pull request")?;
@@ -1121,6 +1141,7 @@ impl CreatePrCommand {
     /// Updates an existing GitHub PR using gh CLI.
     fn update_github_pr(
         &self,
+        repo_root: &std::path::Path,
         repo_view: &crate::data::RepositoryView,
         title: &str,
         description: &str,
@@ -1193,6 +1214,7 @@ impl CreatePrCommand {
         );
 
         let pr_result = Command::new("gh")
+            .current_dir(repo_root)
             .args(&gh_args)
             .output()
             .context("Failed to update pull request")?;
@@ -1224,6 +1246,11 @@ impl CreatePrCommand {
 
         // Get actual metadata from the client
         let metadata = client.get_ai_client_metadata();
+        // NOTE (#967): this diagnostic banner reads the process-wide model
+        // catalog (`get_model_registry` → CWD-relative project models.yaml),
+        // not a `--repo`-scoped catalog. It is informational only and does not
+        // affect the generated PR content, so it is left CWD-scoped until the
+        // repo-aware `ModelRegistry::load_at` foundation lands.
         let registry = get_model_registry();
 
         if let Some(spec) = registry.get_model_spec(&metadata.model) {
@@ -1380,12 +1407,15 @@ pub async fn run_create_pr(
     base_branch: Option<&str>,
     repo_path: Option<&std::path::Path>,
 ) -> Result<CreatePrOutcome> {
-    let _cwd_guard = match repo_path {
-        Some(p) => Some(super::CwdGuard::enter(p).await?),
-        None => None,
+    // Resolve the repo root once; the repository view and context discovery
+    // anchor to it (the CWD is the default when no path is injected), so no
+    // read resolves against the process working directory.
+    let repo_root = match repo_path {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_dir().context("Failed to determine current directory")?,
     };
 
-    crate::utils::check_pr_command_prerequisites(model.as_deref())?;
+    crate::utils::check_pr_command_prerequisites(model.as_deref(), &repo_root)?;
 
     let cmd = CreatePrCommand {
         base: base_branch.map(str::to_string),
@@ -1399,8 +1429,8 @@ pub async fn run_create_pr(
         from_commits: false,
     };
 
-    let repo_view = cmd.generate_repository_view()?;
-    let context = cmd.collect_context(&repo_view).await?;
+    let repo_view = cmd.generate_repository_view(&repo_root)?;
+    let context = cmd.collect_context(&repo_root, &repo_view).await?;
     let claude_client = crate::claude::create_default_claude_client(model, None).await?;
     run_create_pr_with_client(&cmd, &repo_view, &context, &claude_client).await
 }
@@ -1473,12 +1503,18 @@ mod run_create_pr_tests {
         )
         .await
         .unwrap_err();
-        let msg = format!("{err:#}");
+        let msg = format!("{err:#}").to_lowercase();
+        // Preflight may surface a credentials error first, or (with creds
+        // present) `generate_repository_view` opens the injected path via
+        // `open_at` and fails with a git/repository error. Either proves the
+        // injected path is honored without mutating the process CWD.
         assert!(
-            msg.to_lowercase().contains("set_current_dir")
-                || msg.to_lowercase().contains("no such")
-                || msg.to_lowercase().contains("directory"),
-            "expected cwd-related error, got: {msg}"
+            msg.contains("git")
+                || msg.contains("repository")
+                || msg.contains("credential")
+                || msg.contains("api")
+                || msg.contains("directory"),
+            "expected git/repository or preflight error, got: {msg}"
         );
     }
 
@@ -1682,6 +1718,119 @@ mod run_create_pr_tests {
         };
         let cloned = outcome.clone();
         assert_eq!(format!("{outcome:?}"), format!("{cloned:?}"));
+    }
+
+    /// Builds a temp repo with `origin/main`, a feature branch one commit
+    /// ahead, and a distinctive `.github/pull_request_template.md`. Returns the
+    /// temp dir so callers can drive `generate_repository_view` against it.
+    fn init_repo_with_remote_and_template(template_marker: &str) -> tempfile::TempDir {
+        use git2::{Repository, Signature};
+        let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
+        std::fs::create_dir_all(&tmp_root).unwrap();
+        let temp_dir = tempfile::tempdir_in(&tmp_root).unwrap();
+        let repo_path = temp_dir.path();
+        let repo = Repository::init(repo_path).unwrap();
+        {
+            let mut config = repo.config().unwrap();
+            config.set_str("user.name", "Test").unwrap();
+            config.set_str("user.email", "test@example.com").unwrap();
+            config.set_str("init.defaultBranch", "main").unwrap();
+        }
+        repo.set_head("refs/heads/main").unwrap();
+
+        let signature = Signature::now("Test", "test@example.com").unwrap();
+
+        // Base commit on main.
+        std::fs::write(repo_path.join("f.txt"), "base").unwrap();
+        let mut idx = repo.index().unwrap();
+        idx.add_path(std::path::Path::new("f.txt")).unwrap();
+        idx.write().unwrap();
+        let tree_id = idx.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let base_oid = repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "base: init",
+                &tree,
+                &[],
+            )
+            .unwrap();
+
+        // A non-github remote so detection never shells out to gh.
+        repo.remote("origin", "https://example.com/test/repo.git")
+            .unwrap();
+        // origin/main tracking ref at the base commit.
+        repo.reference(
+            "refs/remotes/origin/main",
+            base_oid,
+            true,
+            "set origin/main",
+        )
+        .unwrap();
+
+        // Feature branch one commit ahead of origin/main.
+        let base_commit = repo.find_commit(base_oid).unwrap();
+        repo.branch("feature/test", &base_commit, true).unwrap();
+        repo.set_head("refs/heads/feature/test").unwrap();
+        std::fs::write(repo_path.join("f.txt"), "feature").unwrap();
+        let mut idx = repo.index().unwrap();
+        idx.add_path(std::path::Path::new("f.txt")).unwrap();
+        idx.write().unwrap();
+        let tree_id = idx.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "feat: feature work",
+            &tree,
+            &[&base_commit],
+        )
+        .unwrap();
+
+        // Distinctive PR template inside the injected repo's .github/.
+        let github_dir = repo_path.join(".github");
+        std::fs::create_dir_all(&github_dir).unwrap();
+        std::fs::write(github_dir.join("pull_request_template.md"), template_marker).unwrap();
+
+        temp_dir
+    }
+
+    /// "No silent mix" anchoring guard: `generate_repository_view` resolves the
+    /// PR template, branch, and commits from the INJECTED repo root, not the
+    /// process CWD (the omni-dev checkout, which ships its own
+    /// `.github/pull_request_template.md`). We leave the process CWD untouched
+    /// and assert the returned view reflects the injected repo's distinctive
+    /// template and feature branch.
+    #[test]
+    fn generate_repository_view_anchors_to_injected_repo() {
+        let marker = "## INJECTED_PR_TEMPLATE_MARKER_42";
+        let temp_dir = init_repo_with_remote_and_template(marker);
+        let cmd = fresh_cmd();
+
+        let repo_view = cmd.generate_repository_view(temp_dir.path()).unwrap();
+
+        // PR template came from the injected repo, not the ambient CWD.
+        assert_eq!(
+            repo_view.pr_template.as_deref(),
+            Some(marker),
+            "PR template must be read from the injected repo root"
+        );
+        // Branch + commits reflect the injected repo's feature branch.
+        assert_eq!(
+            repo_view.branch_info.as_ref().map(|b| b.branch.as_str()),
+            Some("feature/test")
+        );
+        assert_eq!(
+            repo_view.commits.len(),
+            1,
+            "exactly the one commit ahead of origin/main"
+        );
+        assert!(repo_view.commits[0]
+            .original_message
+            .contains("feature work"));
     }
 }
 
