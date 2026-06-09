@@ -265,6 +265,15 @@ pub fn check_git_repository() -> Result<()> {
     Ok(())
 }
 
+/// Like [`check_git_repository`], but validates the repository at an explicit
+/// `repo_root` instead of the process current working directory.
+pub fn check_git_repository_at(repo_root: &std::path::Path) -> Result<()> {
+    crate::git::GitRepository::open_at(repo_root).context(
+        "Not in a git repository. Please run this command from within a git repository.",
+    )?;
+    Ok(())
+}
+
 /// Validates that the working directory is clean (no uncommitted changes).
 ///
 /// This checks for:
@@ -276,7 +285,19 @@ pub fn check_git_repository() -> Result<()> {
 /// like amending commits.
 pub fn check_working_directory_clean() -> Result<()> {
     let repo = crate::git::GitRepository::open().context("Failed to open git repository")?;
+    check_working_directory_clean_for(&repo)
+}
 
+/// Like [`check_working_directory_clean`], but checks the repository at an
+/// explicit `repo_root` instead of the process current working directory.
+pub fn check_working_directory_clean_at(repo_root: &std::path::Path) -> Result<()> {
+    let repo =
+        crate::git::GitRepository::open_at(repo_root).context("Failed to open git repository")?;
+    check_working_directory_clean_for(&repo)
+}
+
+/// Shared clean-worktree check over an already-opened repository.
+fn check_working_directory_clean_for(repo: &crate::git::GitRepository) -> Result<()> {
     let status = repo
         .get_working_directory_status()
         .context("Failed to get working directory status")?;
