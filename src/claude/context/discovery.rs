@@ -1134,6 +1134,49 @@ scopes:
         );
     }
 
+    // ── repo-anchored `_at` variants (#967) ──────────────────────────────
+
+    #[test]
+    fn with_source_at_cli_flag() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let custom = PathBuf::from("custom-config");
+        let (path, source) =
+            resolve_context_dir_with_source_at(Some(&custom), std::path::Path::new("/unused"));
+        assert_eq!(path, custom);
+        assert_eq!(source, ConfigDirSource::CliFlag);
+    }
+
+    #[test]
+    fn with_source_at_env_var() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("OMNI_DEV_CONFIG_DIR", "/tmp/env-config");
+        let (path, source) =
+            resolve_context_dir_with_source_at(None, std::path::Path::new("/unused"));
+        std::env::remove_var("OMNI_DEV_CONFIG_DIR");
+        assert_eq!(path, PathBuf::from("/tmp/env-config"));
+        assert_eq!(source, ConfigDirSource::EnvVar);
+    }
+
+    #[test]
+    fn with_source_at_default_anchors_to_repo_root() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        std::env::remove_var("OMNI_DEV_CONFIG_DIR");
+        // A repo root with a `.git` boundary but no `.omni-dev`: walk-up stops at
+        // the boundary without escaping, so the default anchors to
+        // `repo_root/.omni-dev` (NOT the CWD-relative `.omni-dev`). This is the
+        // distinguishing behavior of the `_at` variant vs. its CWD sibling.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        let (path, source) = resolve_context_dir_with_source_at(None, tmp.path());
+        assert_eq!(path, tmp.path().join(".omni-dev"));
+        assert_eq!(source, ConfigDirSource::Default);
+        // The thin wrapper returns the same path, discarding the source.
+        assert_eq!(
+            resolve_context_dir_at(None, tmp.path()),
+            tmp.path().join(".omni-dev")
+        );
+    }
+
     // ── ConfigDirSource Display ──────────────────────────────────────────
 
     #[test]

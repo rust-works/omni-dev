@@ -70,8 +70,9 @@ impl StagedCommand {
 /// Public entry point for the staged-commit command.
 ///
 /// Mirrors [`crate::cli::git::run_twiddle`]'s shape so the MCP server can wrap
-/// it the same way: pin the CWD, run AI preflight, build the client, delegate
-/// to the test-injectable inner [`run_staged_with_client`].
+/// it the same way: resolve the repo root (the injected path, or the CWD as the
+/// default), run AI preflight, build the client, and delegate to the
+/// test-injectable inner [`run_staged_with_client`].
 pub async fn run_staged(
     print_only: bool,
     model: Option<String>,
