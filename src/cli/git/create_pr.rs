@@ -91,7 +91,10 @@ impl CreatePrCommand {
     }
 
     /// Executes the create PR command.
-    pub async fn execute(self) -> Result<()> {
+    pub async fn execute(self, repo: Option<&std::path::Path>) -> Result<()> {
+        if repo.is_some() {
+            anyhow::bail!("--repo is not yet supported for `git branch create pr`");
+        }
         // Preflight check: validate all prerequisites before any processing
         // This catches missing credentials/tools early before wasting time
         let ai_info = crate::utils::check_pr_command_prerequisites(self.model.as_deref())?;
@@ -278,6 +281,14 @@ impl CreatePrCommand {
         let repo = GitRepository::open()
             .context("Failed to open git repository. Make sure you're in a git repository.")?;
 
+        // create-pr is still CWD-pinned (converted in a later slice), so the
+        // opened repo's workdir is the process CWD; deriving `repo_root` here
+        // keeps the PR-template/`gh` reads using the shared path-taking helpers
+        // without changing behavior yet.
+        let repo_root = repo
+            .workdir()
+            .context("repository has no working directory (bare repositories are not supported)")?;
+
         // Get current branch name
         let current_branch = repo.get_current_branch().context(
             "Failed to get current branch. Make sure you're not in detached HEAD state.",
@@ -357,14 +368,14 @@ impl CreatePrCommand {
         let commits = repo.get_commits_in_range(&commit_range)?;
 
         // Check for PR template
-        let pr_template_result = InfoCommand::read_pr_template().ok();
+        let pr_template_result = InfoCommand::read_pr_template(repo_root).ok();
         let (pr_template, pr_template_location) = match pr_template_result {
             Some((content, location)) => (Some(content), Some(location)),
             None => (None, None),
         };
 
         // Get PRs for current branch
-        let branch_prs = InfoCommand::get_branch_prs(&current_branch)
+        let branch_prs = InfoCommand::get_branch_prs(&current_branch, repo_root)
             .ok()
             .filter(|prs| !prs.is_empty());
 

@@ -17,6 +17,8 @@ pub use staged::{run_staged, StagedCommand, StagedOutcome};
 pub use twiddle::{run_twiddle, TwiddleCommand, TwiddleOutcome};
 pub use view::{run_view, ViewCommand};
 
+use std::path::Path;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -185,51 +187,55 @@ pub enum CreateSubcommands {
 
 impl GitCommand {
     /// Executes the git command.
-    pub async fn execute(self) -> Result<()> {
+    ///
+    /// `repo` is the repository location resolved once at the CLI boundary
+    /// (`None` = current working directory); it is threaded explicitly down to
+    /// each leaf command rather than read from the ambient CWD.
+    pub async fn execute(self, repo: Option<&Path>) -> Result<()> {
         match self.command {
-            GitSubcommands::Commit(commit_cmd) => commit_cmd.execute().await,
-            GitSubcommands::Branch(branch_cmd) => branch_cmd.execute().await,
+            GitSubcommands::Commit(commit_cmd) => commit_cmd.execute(repo).await,
+            GitSubcommands::Branch(branch_cmd) => branch_cmd.execute(repo).await,
         }
     }
 }
 
 impl CommitCommand {
     /// Executes the commit command.
-    pub async fn execute(self) -> Result<()> {
+    pub async fn execute(self, repo: Option<&Path>) -> Result<()> {
         match self.command {
-            CommitSubcommands::Message(message_cmd) => message_cmd.execute().await,
+            CommitSubcommands::Message(message_cmd) => message_cmd.execute(repo).await,
         }
     }
 }
 
 impl MessageCommand {
     /// Executes the message command.
-    pub async fn execute(self) -> Result<()> {
+    pub async fn execute(self, repo: Option<&Path>) -> Result<()> {
         match self.command {
-            MessageSubcommands::View(view_cmd) => view_cmd.execute(),
-            MessageSubcommands::Amend(amend_cmd) => amend_cmd.execute(),
-            MessageSubcommands::Twiddle(twiddle_cmd) => twiddle_cmd.execute().await,
-            MessageSubcommands::Check(check_cmd) => check_cmd.execute().await,
-            MessageSubcommands::Staged(staged_cmd) => staged_cmd.execute().await,
+            MessageSubcommands::View(view_cmd) => view_cmd.execute(repo),
+            MessageSubcommands::Amend(amend_cmd) => amend_cmd.execute(repo),
+            MessageSubcommands::Twiddle(twiddle_cmd) => twiddle_cmd.execute(repo).await,
+            MessageSubcommands::Check(check_cmd) => check_cmd.execute(repo).await,
+            MessageSubcommands::Staged(staged_cmd) => staged_cmd.execute(repo).await,
         }
     }
 }
 
 impl BranchCommand {
     /// Executes the branch command.
-    pub async fn execute(self) -> Result<()> {
+    pub async fn execute(self, repo: Option<&Path>) -> Result<()> {
         match self.command {
-            BranchSubcommands::Info(info_cmd) => info_cmd.execute(),
-            BranchSubcommands::Create(create_cmd) => create_cmd.execute().await,
+            BranchSubcommands::Info(info_cmd) => info_cmd.execute(repo),
+            BranchSubcommands::Create(create_cmd) => create_cmd.execute(repo).await,
         }
     }
 }
 
 impl CreateCommand {
     /// Executes the create command.
-    pub async fn execute(self) -> Result<()> {
+    pub async fn execute(self, repo: Option<&Path>) -> Result<()> {
         match self.command {
-            CreateSubcommands::Pr(pr_cmd) => pr_cmd.execute().await,
+            CreateSubcommands::Pr(pr_cmd) => pr_cmd.execute(repo).await,
         }
     }
 }
@@ -448,5 +454,42 @@ mod tests {
         // that exercise `CwdGuard::enter(valid_path)` followed by restoration.
         let result = CwdGuard::enter("/no/such/path/exists").await;
         assert!(result.is_err(), "expected error for nonexistent path");
+    }
+
+    /// Every git command that has not yet been converted to honor `--repo`
+    /// must reject an injected path with a clear error rather than silently
+    /// ignoring it (RULE 6). Exercises each reject-guard branch through the
+    /// real parse + dispatch path. `git branch info` is converted, so it is
+    /// absent here.
+    #[tokio::test]
+    async fn repo_flag_rejected_for_unconverted_commands() {
+        let unconverted: [&[&str]; 6] = [
+            &["omni-dev", "-C", "/tmp", "git", "commit", "message", "view"],
+            &[
+                "omni-dev", "-C", "/tmp", "git", "commit", "message", "amend", "x.yaml",
+            ],
+            &[
+                "omni-dev", "-C", "/tmp", "git", "commit", "message", "twiddle",
+            ],
+            &[
+                "omni-dev", "-C", "/tmp", "git", "commit", "message", "check",
+            ],
+            &[
+                "omni-dev", "-C", "/tmp", "git", "commit", "message", "staged",
+            ],
+            &["omni-dev", "-C", "/tmp", "git", "branch", "create", "pr"],
+        ];
+        for args in unconverted {
+            let cli = Cli::try_parse_from(args.iter().copied()).unwrap();
+            let err = cli
+                .execute()
+                .await
+                .expect_err("unconverted command must reject --repo");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("not yet supported"),
+                "args {args:?} -> unexpected error: {msg}"
+            );
+        }
     }
 }

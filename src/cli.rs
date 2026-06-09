@@ -97,6 +97,16 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub models_yaml: Option<std::path::PathBuf>,
 
+    /// Run as if omni-dev was started in `<PATH>` instead of the current
+    /// working directory.
+    ///
+    /// Resolved exactly once here and threaded explicitly to each command as a
+    /// parameter; deliberately **not** propagated to an environment variable
+    /// (unlike the flags above) so the repo location never becomes an ambient
+    /// global. Mirrors `git -C`.
+    #[arg(long = "repo", short = 'C', global = true, value_name = "PATH")]
+    pub repo: Option<std::path::PathBuf>,
+
     /// The main command to execute.
     #[command(subcommand)]
     pub command: Commands,
@@ -173,14 +183,19 @@ impl Cli {
     pub async fn execute(self) -> Result<()> {
         self.propagate_global_flags();
 
-        match self.command {
+        // Resolve the repo location exactly once at this boundary, then thread
+        // it explicitly into each command. Nothing deeper reads the ambient CWD.
+        let Self { repo, command, .. } = self;
+        let repo = repo.as_deref();
+
+        match command {
             Commands::Ai(ai_cmd) => ai_cmd.execute().await,
-            Commands::Git(git_cmd) => git_cmd.execute().await,
+            Commands::Git(git_cmd) => git_cmd.execute(repo).await,
             Commands::Commands(commands_cmd) => commands_cmd.execute(),
             Commands::Atlassian(cmd) => cmd.execute().await,
             Commands::Browser(cmd) => cmd.execute().await,
             Commands::Datadog(cmd) => cmd.execute().await,
-            Commands::Coverage(cmd) => cmd.execute().await,
+            Commands::Coverage(cmd) => cmd.execute(repo).await,
             Commands::Transcript(cmd) => cmd.execute().await,
             Commands::Voice(cmd) => cmd.execute().await,
             Commands::Config(config_cmd) => config_cmd.execute(),
@@ -428,6 +443,38 @@ mod tests {
         assert_eq!(
             cli.models_yaml.as_deref(),
             Some(std::path::Path::new("/tmp/custom-models.yaml"))
+        );
+    }
+
+    #[test]
+    fn parses_repo_flag_long_and_short() {
+        let long = Cli::try_parse_from(["omni-dev", "--repo", "/tmp/r", "help-all"]).unwrap();
+        assert_eq!(
+            long.repo.as_deref(),
+            Some(std::path::Path::new("/tmp/r")),
+            "--repo should populate cli.repo"
+        );
+        let short = Cli::try_parse_from(["omni-dev", "-C", "/tmp/r", "help-all"]).unwrap();
+        assert_eq!(
+            short.repo.as_deref(),
+            Some(std::path::Path::new("/tmp/r")),
+            "-C should populate cli.repo"
+        );
+        let absent = Cli::try_parse_from(["omni-dev", "help-all"]).unwrap();
+        assert!(absent.repo.is_none());
+    }
+
+    /// RULE 3: the repo location is a parameter, never a relocated global.
+    /// `propagate_global_flags` must not export it to any environment variable.
+    #[test]
+    fn repo_flag_is_not_propagated_to_env() {
+        let _g = GlobalFlagsEnvGuard::new();
+        let mut cli = cli_with_defaults();
+        cli.repo = Some(std::path::PathBuf::from("/tmp/some-repo"));
+        cli.propagate_global_flags();
+        assert!(
+            std::env::var("OMNI_DEV_REPO").is_err(),
+            "repo must not be exported to an env var"
         );
     }
 

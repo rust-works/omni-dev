@@ -1,6 +1,6 @@
 //! `omni-dev coverage diff` — diff/patch coverage analysis.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
@@ -93,10 +93,6 @@ pub struct DiffCommand {
     #[arg(long, value_name = "PCT")]
     pub fail_under_patch: Option<f64>,
 
-    /// Repository path.
-    #[arg(long, value_name = "PATH", default_value = ".")]
-    pub repo: PathBuf,
-
     /// Override the path prefix stripped from report file paths to make them
     /// repo-relative (default: the repository working directory).
     #[arg(long, value_name = "PATH")]
@@ -140,8 +136,11 @@ pub struct DiffOutcome {
 
 impl DiffCommand {
     /// Executes the command: prints the report and applies the patch gate.
-    pub async fn execute(self) -> Result<()> {
-        let outcome = self.run()?;
+    ///
+    /// `repo` is the repository location resolved at the CLI boundary
+    /// (`None` = current working directory).
+    pub async fn execute(self, repo: Option<&Path>) -> Result<()> {
+        let outcome = self.run(repo)?;
         println!("{}", outcome.rendered);
         if outcome.below_gate {
             let pct = outcome.patch_percent.unwrap_or(0.0);
@@ -154,9 +153,15 @@ impl DiffCommand {
     }
 
     /// Runs the analysis and renders the output without printing.
-    pub fn run(&self) -> Result<DiffOutcome> {
-        let repo = Repository::open(&self.repo)
-            .with_context(|| format!("could not open git repository at {}", self.repo.display()))?;
+    ///
+    /// `repo_root` is the repository to analyze (`None` defaults to `.`, which
+    /// preserves the CI invocation that runs from the repo root). Relative
+    /// `--report`/`--baseline-report` paths are anchored to it so the git repo
+    /// and the coverage reports always resolve against the same root.
+    pub fn run(&self, repo_root: Option<&Path>) -> Result<DiffOutcome> {
+        let repo_path = repo_root.map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        let repo = Repository::open(&repo_path)
+            .with_context(|| format!("could not open git repository at {}", repo_path.display()))?;
 
         // Resolve the base ref (default: merge-base of origin/main and HEAD).
         let base_ref = match &self.base_ref {
@@ -170,12 +175,18 @@ impl DiffCommand {
             .clone()
             .or_else(|| repo.workdir().map(std::path::Path::to_path_buf));
 
-        let head = self.load_report(&self.report, self.report_format, strip_prefix.as_deref())?;
+        let head = self.load_report(
+            &self.report,
+            self.report_format,
+            strip_prefix.as_deref(),
+            &repo_path,
+        )?;
         let baseline = match &self.baseline_report {
             Some(path) => Some(self.load_report(
                 path,
                 self.baseline_report_format,
                 strip_prefix.as_deref(),
+                &repo_path,
             )?),
             None => None,
         };
@@ -201,13 +212,23 @@ impl DiffCommand {
     }
 
     /// Reads and parses a coverage report, normalising paths to be repo-relative.
+    ///
+    /// A relative `path` is resolved against `repo_root` so the report and the
+    /// git repository always anchor to the same root; an absolute `path` is
+    /// used as-is.
     fn load_report(
         &self,
         path: &std::path::Path,
         format: ReportFormat,
         strip_prefix: Option<&std::path::Path>,
+        repo_root: &Path,
     ) -> Result<crate::coverage::CoverageReport> {
-        let content = std::fs::read_to_string(path)
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            repo_root.join(path)
+        };
+        let content = std::fs::read_to_string(&path)
             .with_context(|| format!("could not read coverage report {}", path.display()))?;
         let mut report = parse(&content, format.into_format())
             .with_context(|| format!("could not parse coverage report {}", path.display()))?;
@@ -298,8 +319,9 @@ mod tests {
         report
     }
 
-    /// Builds a `DiffCommand` with defaults pointed at the temp repo and report.
-    fn command(repo: &Path, report: PathBuf, base_ref: &str) -> DiffCommand {
+    /// Builds a `DiffCommand` with defaults pointed at the given report. The
+    /// repository root is supplied separately to `run`/`execute`.
+    fn command(report: PathBuf, base_ref: &str) -> DiffCommand {
         DiffCommand {
             report,
             report_format: ReportFormat::Auto,
@@ -309,7 +331,6 @@ mod tests {
             baseline_report_format: ReportFormat::Auto,
             format: OutputFormatArg::Markdown,
             fail_under_patch: None,
-            repo: repo.to_path_buf(),
             strip_prefix: None,
             collapse_ranges: false,
             artifact_url: None,
@@ -354,7 +375,7 @@ mod tests {
     fn run_markdown_reports_patch_coverage() {
         let (_dir, repo, base) = repo_with_added_file();
         let report = write_head_lcov(&repo);
-        let outcome = command(&repo, report, &base).run().unwrap();
+        let outcome = command(report, &base).run(Some(&repo)).unwrap();
         // 3 added lines, 2 covered.
         assert_eq!(outcome.patch_percent, Some(2.0 / 3.0 * 100.0));
         assert!(!outcome.below_gate);
@@ -367,9 +388,9 @@ mod tests {
         let (_dir, repo, base) = repo_with_added_file();
         for format in [OutputFormatArg::Yaml, OutputFormatArg::Json] {
             let report = write_head_lcov(&repo);
-            let mut cmd = command(&repo, report, &base);
+            let mut cmd = command(report, &base);
             cmd.format = format;
-            let outcome = cmd.run().unwrap();
+            let outcome = cmd.run(Some(&repo)).unwrap();
             assert!(outcome.rendered.contains("patch_coverage"));
         }
     }
@@ -385,9 +406,9 @@ mod tests {
             format!("SF:{}/a.rs\nDA:1,1\nend_of_record\n", repo.display()),
         )
         .unwrap();
-        let mut cmd = command(&repo, report, &base);
+        let mut cmd = command(report, &base);
         cmd.baseline_report = Some(baseline);
-        let outcome = cmd.run().unwrap();
+        let outcome = cmd.run(Some(&repo)).unwrap();
         assert!(outcome.rendered.contains("vs `main`"));
     }
 
@@ -396,27 +417,33 @@ mod tests {
         let (_dir, repo, base) = repo_with_added_file();
         // Patch coverage is ~66.7%.
         let report = write_head_lcov(&repo);
-        let mut cmd = command(&repo, report, &base);
+        let mut cmd = command(report, &base);
         cmd.fail_under_patch = Some(90.0);
-        assert!(cmd.run().unwrap().below_gate, "66.7% < 90% should fail");
+        assert!(
+            cmd.run(Some(&repo)).unwrap().below_gate,
+            "66.7% < 90% should fail"
+        );
 
         let report = write_head_lcov(&repo);
-        let mut cmd = command(&repo, report, &base);
+        let mut cmd = command(report, &base);
         cmd.fail_under_patch = Some(50.0);
-        assert!(!cmd.run().unwrap().below_gate, "66.7% >= 50% should pass");
+        assert!(
+            !cmd.run(Some(&repo)).unwrap().below_gate,
+            "66.7% >= 50% should pass"
+        );
     }
 
     #[test]
     fn missing_report_errors() {
         let (_dir, repo, base) = repo_with_added_file();
-        let cmd = command(&repo, repo.join("nope.lcov"), &base);
-        assert!(cmd.run().is_err());
+        let cmd = command(repo.join("nope.lcov"), &base);
+        assert!(cmd.run(Some(&repo)).is_err());
     }
 
     #[test]
     fn render_options_use_flags() {
         let (_dir, repo, base) = repo_with_added_file();
-        let mut cmd = command(&repo, repo.join("head.lcov"), &base);
+        let mut cmd = command(repo.join("head.lcov"), &base);
         cmd.artifact_url = Some("https://artifact".to_string());
         cmd.collapse_ranges = true;
         let opts = cmd.render_options();
@@ -429,13 +456,29 @@ mod tests {
         let (_dir, repo, base) = repo_with_added_file();
         let report = write_head_lcov(&repo);
         // Passing gate: execute prints and returns Ok.
-        let mut cmd = command(&repo, report.clone(), &base);
+        let mut cmd = command(report.clone(), &base);
         cmd.fail_under_patch = Some(10.0);
-        assert!(cmd.execute().await.is_ok());
+        assert!(cmd.execute(Some(&repo)).await.is_ok());
 
         // Failing gate: execute returns Err.
-        let mut cmd = command(&repo, report, &base);
+        let mut cmd = command(report, &base);
         cmd.fail_under_patch = Some(99.0);
-        assert!(cmd.execute().await.is_err());
+        assert!(cmd.execute(Some(&repo)).await.is_err());
+    }
+
+    /// The injected repo root drives BOTH the git repository and relative
+    /// report-path resolution. With a RELATIVE `--report` and the injected repo
+    /// at `repo` (never the process CWD), the report must be read from
+    /// `repo/head.lcov` — proving `-C` is honored consistently and not split
+    /// between the injected repo and the ambient CWD.
+    #[test]
+    fn run_anchors_repo_and_relative_report_to_injected_root() {
+        let (_dir, repo, base) = repo_with_added_file();
+        write_head_lcov(&repo); // writes <repo>/head.lcov
+        let outcome = command(PathBuf::from("head.lcov"), &base)
+            .run(Some(&repo))
+            .unwrap();
+        assert_eq!(outcome.patch_percent, Some(2.0 / 3.0 * 100.0));
+        assert!(outcome.rendered.contains("`b.rs:2`"));
     }
 }

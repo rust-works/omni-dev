@@ -95,7 +95,10 @@ impl TwiddleCommand {
     }
 
     /// Executes the twiddle command with contextual intelligence.
-    pub async fn execute(mut self) -> Result<()> {
+    pub async fn execute(mut self, repo: Option<&std::path::Path>) -> Result<()> {
+        if repo.is_some() {
+            anyhow::bail!("--repo is not yet supported for `git commit message twiddle`");
+        }
         // Resolve deprecated --batch-size into --concurrency
         if let Some(bs) = self.batch_size {
             eprintln!("warning: --batch-size is deprecated; use --concurrency instead");
@@ -2338,7 +2341,7 @@ mod execute_tests {
             quiet: true,
         };
 
-        cmd.execute().await.unwrap();
+        cmd.execute(None).await.unwrap();
 
         let saved = AmendmentFile::load_from_file(&save_path).unwrap();
         assert_eq!(saved.amendments.len(), 1);

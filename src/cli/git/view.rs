@@ -15,7 +15,10 @@ pub struct ViewCommand {
 
 impl ViewCommand {
     /// Executes the view command.
-    pub fn execute(self) -> Result<()> {
+    pub fn execute(self, repo: Option<&Path>) -> Result<()> {
+        if repo.is_some() {
+            anyhow::bail!("--repo is not yet supported for `git commit message view`");
+        }
         let commit_range = self.commit_range.as_deref().unwrap_or("HEAD");
         let yaml_output = run_view(commit_range, None::<&str>)?;
         println!("{yaml_output}");
@@ -171,7 +174,7 @@ mod tests {
         let result = ViewCommand {
             commit_range: Some("HEAD".to_string()),
         }
-        .execute();
+        .execute(None);
 
         std::env::set_current_dir(original_cwd).unwrap();
         result.expect("execute should succeed in a valid repo");
@@ -184,7 +187,7 @@ mod tests {
         let original_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(temp_dir.path()).unwrap();
 
-        let result = ViewCommand { commit_range: None }.execute();
+        let result = ViewCommand { commit_range: None }.execute(None);
 
         std::env::set_current_dir(original_cwd).unwrap();
         result.expect("execute with default range should succeed");
