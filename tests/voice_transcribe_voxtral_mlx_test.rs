@@ -156,3 +156,97 @@ async fn voxtral_mlx_streaming_emits_partials_and_correct_transcript() {
     );
     assert_has_expected_words(&transcript);
 }
+
+/// Lowercases + reduces to alphanumeric word tokens for WER.
+fn normalize(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Word-level edit distance ÷ reference length.
+fn word_error_rate(reference: &str, hypothesis: &str) -> f64 {
+    let r = normalize(reference);
+    let h = normalize(hypothesis);
+    let (n, m) = (r.len(), h.len());
+    let mut prev: Vec<usize> = (0..=m).collect();
+    let mut cur = vec![0usize; m + 1];
+    for i in 1..=n {
+        cur[0] = i;
+        for j in 1..=m {
+            let cost = usize::from(r[i - 1] != h[j - 1]);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[m] as f64 / n.max(1) as f64
+}
+
+/// Full 5-minute streaming validation replayed at 1× ("as live"): the direct
+/// counterpart to the offline 5-min run and the `voxtral.c` streaming check.
+/// Reports first-Partial latency, Partial count, ≥1 SilenceGap, and streaming
+/// WER against the reference. (#933 M3b)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the INT4 model and replays 5 min at 1x (~5 min wall); run with --test-threads=1"]
+async fn voxtral_mlx_streaming_5min_metrics() {
+    let Some(model_dir) = resolve_model_dir() else {
+        eprintln!("skipping: no voxtral-mlx-int4 model installed");
+        return;
+    };
+    let backend = VoxtralMlxBackend::new(&model_dir, DEFAULT_VOXTRAL_MLX_DELAY_MS)
+        .expect("construct backend");
+    let audio = FileAsyncAudioInput::from_wav_path(
+        fixture("monologue_5min.wav"),
+        STREAM_CHUNK_SAMPLES,
+        true,
+    )
+    .expect("load monologue");
+
+    let start = std::time::Instant::now();
+    let mut stream = backend.transcribe_stream(Box::new(audio));
+
+    let mut partials = 0usize;
+    let mut silence_gaps = 0usize;
+    let mut first_partial_at: Option<Duration> = None;
+    let mut finals: Vec<String> = Vec::new();
+    let mut saw_stream_end = false;
+
+    while let Some(ev) = stream.next().await {
+        match ev.expect("stream event") {
+            TranscriptEvent::Partial { .. } => {
+                partials += 1;
+                first_partial_at.get_or_insert_with(|| start.elapsed());
+            }
+            TranscriptEvent::Final { text, .. } => finals.push(text),
+            TranscriptEvent::Endpoint { kind, .. } => match kind {
+                EndpointKind::SilenceGap => silence_gaps += 1,
+                EndpointKind::StreamEnd => saw_stream_end = true,
+                EndpointKind::UtteranceEnd => {}
+            },
+        }
+    }
+
+    let transcript = finals.join(" ");
+    let reference =
+        std::fs::read_to_string(fixture("monologue_5min.expected.txt")).expect("read expected");
+    let wer = word_error_rate(&reference, &transcript);
+    let first = first_partial_at.expect("first Partial").as_secs_f64();
+    eprintln!(
+        "voxtral-mlx streaming 5-min: first_partial={first:.2}s, partials={partials}, \
+         silence_gaps={silence_gaps}, WER={:.1}%",
+        wer * 100.0
+    );
+
+    assert!(saw_stream_end, "expected StreamEnd");
+    assert!(partials >= 50, "expected many Partials, got {partials}");
+    assert!(silence_gaps >= 1, "expected at least one SilenceGap");
+    assert!(
+        first < MAX_FIRST_PARTIAL_SECS,
+        "first Partial {first:.2}s too slow"
+    );
+    assert!(wer < 0.10, "streaming WER {:.1}% too high", wer * 100.0);
+}
