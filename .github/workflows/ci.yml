@@ -117,24 +117,43 @@ jobs:
       run: sudo apt-get update && sudo apt-get install -y libasound2-dev
     - name: Install cargo-llvm-cov
       uses: taiki-e/install-action@cargo-llvm-cov
+    # Every cargo step below sources cargo-llvm-cov's instrumentation env (rustc
+    # wrapper, flags, profile path) so they all share ONE set of dependency
+    # artifacts: the tests build them, and the omni-dev binary build reuses them
+    # (a plain `cargo build` differs in RUSTC_WRAPPER and would recompile the
+    # whole tree). `show-env` is deterministic, so sourcing it per step
+    # re-establishes the same env without leaking it into the worktree fallback
+    # below (which must run its own, separate coverage at the merge-base).
+    # This is the documented manual equivalent of the all-in-one `cargo llvm-cov`.
     - name: Run tests with coverage
-      run: cargo llvm-cov --all-features --workspace --no-report
+      run: |
+        # shellcheck disable=SC1090
+        source <(cargo llvm-cov show-env --sh)
+        cargo llvm-cov clean --workspace
+        cargo test --all-features --workspace
     - name: Generate codecov.json
-      # Reuses cached profiling data from the step above (no recompile/re-test).
       # Kept ready so the disabled upload below works as soon as it is re-enabled.
-      run: cargo llvm-cov report --codecov --output-path codecov.json
+      run: |
+        # shellcheck disable=SC1090
+        source <(cargo llvm-cov show-env --sh)
+        cargo llvm-cov report --codecov --output-path codecov.json
     - name: Generate head coverage report (lcov)
       # Per-line lcov for the head commit. This is the input to
       # `omni-dev coverage diff`: it drives patch coverage (of the lines this PR
       # added, how many are covered — needs only the head report + diff) and,
       # paired with the merge-base baseline below, the per-file deltas and
       # indirect-change detection. Published as the baseline on `main` for PRs.
-      run: cargo llvm-cov report --lcov --output-path coverage-head.lcov
+      run: |
+        # shellcheck disable=SC1090
+        source <(cargo llvm-cov show-env --sh)
+        cargo llvm-cov report --lcov --output-path coverage-head.lcov
     - name: Build coverage summary
       # Full per-file summary: appended to the run's Summary tab and published as
       # a build artifact (see "Upload coverage artifacts"). It is intentionally
       # NOT inlined into the PR comment, which shows changed files and patch lines.
       run: |
+        # shellcheck disable=SC1090
+        source <(cargo llvm-cov show-env --sh)
         cargo llvm-cov report --summary-only | tee coverage-summary.txt
         {
           echo '## Coverage'
@@ -143,12 +162,10 @@ jobs:
           echo '```'
         } >> "$GITHUB_STEP_SUMMARY"
     - name: Build omni-dev binary
-      # Renders the PR comment below via `omni-dev coverage diff`. Built inside
-      # cargo-llvm-cov's environment (same rustc wrapper, flags, and target dir)
-      # so it reuses every dependency artifact already compiled by the coverage
-      # run above — only omni-dev's own crate is (re)built, not the whole tree
-      # (a plain `cargo build` differs in RUSTC_WRAPPER and recompiles ~everything).
-      # The resulting binary is coverage-instrumented; that is harmless to run.
+      # Renders the PR comment below via `omni-dev coverage diff`. Under the same
+      # coverage env, this reuses the dependency artifacts already compiled for
+      # the tests — only omni-dev's own crate is rebuilt, not the whole tree. The
+      # resulting binary is coverage-instrumented, which is harmless to run.
       if: github.event_name == 'pull_request'
       run: |
         # shellcheck disable=SC1090
@@ -265,7 +282,10 @@ jobs:
         fail_ci_if_error: true
     - name: Enforce coverage threshold
       # Runs last so the summary and PR comment are posted even when the gate fails.
-      run: cargo llvm-cov report --summary-only --fail-under-lines 30
+      run: |
+        # shellcheck disable=SC1090
+        source <(cargo llvm-cov show-env --sh)
+        cargo llvm-cov report --summary-only --fail-under-lines 30
 
   audit:
     name: Security Audit
