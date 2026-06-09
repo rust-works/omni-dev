@@ -24,9 +24,8 @@ use crate::resources;
 
 /// Format suffix for a resource URI.
 ///
-/// `git://` URIs do not carry a format suffix (always YAML). Atlassian URIs
-/// accept an optional `.adf` suffix: absent means JFM markdown, present means
-/// raw ADF JSON.
+/// Atlassian URIs accept an optional `.adf` suffix: absent means JFM markdown,
+/// present means raw ADF JSON.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceFormat {
     /// JFM markdown (the default for Atlassian resources).
@@ -38,11 +37,6 @@ pub enum ResourceFormat {
 /// A parsed omni-dev resource URI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceUri {
-    /// `git://repo/commits/{range}` — YAML commit analysis.
-    GitCommits {
-        /// A git revision range or single ref (e.g. `HEAD`, `HEAD~3..HEAD`).
-        range: String,
-    },
     /// `jira://issue/{key}` / `jira://issue/{key}.adf` — JIRA issue body.
     JiraIssue {
         /// JIRA issue key (e.g. `PROJ-123`).
@@ -68,9 +62,7 @@ pub enum ResourceUri {
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum UriParseError {
     /// The URI scheme is not one omni-dev knows about.
-    #[error(
-        "unknown URI scheme in `{0}`; expected git://, jira://, confluence://, or omni-dev://"
-    )]
+    #[error("unknown URI scheme in `{0}`; expected jira://, confluence://, or omni-dev://")]
     UnknownScheme(String),
     /// The URI authority/path shape does not match any known template.
     #[error("malformed URI `{0}`: {1}")]
@@ -85,15 +77,6 @@ impl ResourceUri {
     ///
     /// Rejects URIs that do not match one of the known templates.
     pub fn parse(uri: &str) -> Result<Self, UriParseError> {
-        if let Some(rest) = uri.strip_prefix("git://repo/commits/") {
-            if rest.is_empty() {
-                return Err(UriParseError::EmptyIdentifier(uri.to_string()));
-            }
-            return Ok(Self::GitCommits {
-                range: rest.to_string(),
-            });
-        }
-
         if let Some(rest) = uri.strip_prefix("jira://issue/") {
             let (key, format) = split_suffix(rest);
             if key.is_empty() {
@@ -128,12 +111,6 @@ impl ResourceUri {
         // Reject `<scheme>://` URIs with a different path shape explicitly
         // rather than falling through to UnknownScheme, so the client sees
         // what's actually wrong. Placeholders are escaped for the lint.
-        if uri.starts_with("git://") {
-            return Err(UriParseError::Malformed(
-                uri.to_string(),
-                "expected `git://repo/commits/<range>`",
-            ));
-        }
         if uri.starts_with("jira://") {
             return Err(UriParseError::Malformed(
                 uri.to_string(),
@@ -183,13 +160,6 @@ fn specs_only_csv() -> String {
 /// Returned by `list_resource_templates`. URIs are RFC 6570 templates; the
 /// placeholders match the identifiers [`ResourceUri::parse`] understands.
 pub fn resource_templates() -> Vec<ResourceTemplate> {
-    let git_commits = RawResourceTemplate::new("git://repo/commits/{range}", "git_commits")
-        .with_description(
-            "YAML commit analysis for a git range (e.g. `HEAD`, `HEAD~3..HEAD`). \
-             Backed by the same core as `omni-dev git commit message view`.",
-        )
-        .with_mime_type("application/yaml");
-
     let jira_issue_jfm = RawResourceTemplate::new("jira://issue/{key}", "jira_issue_jfm")
         .with_description("JIRA issue rendered as JFM (JIRA-flavoured markdown).")
         .with_mime_type("text/markdown");
@@ -217,7 +187,6 @@ pub fn resource_templates() -> Vec<ResourceTemplate> {
         .with_mime_type("text/markdown");
 
     vec![
-        annotate_template(git_commits),
         annotate_template(jira_issue_jfm),
         annotate_template(jira_issue_adf),
         annotate_template(confluence_page_jfm),
@@ -269,29 +238,8 @@ pub fn resource_listing() -> Vec<Resource> {
 }
 
 /// Resolves a parsed URI into [`ReadResourceResult`] contents.
-///
-/// `repo_root` is the repository location resolved once at the MCP boundary;
-/// the `git://` arm opens the repository there instead of reading the ambient
-/// process CWD. Non-git arms ignore it.
-pub async fn read_resource(
-    uri: &ResourceUri,
-    raw_uri: &str,
-    repo_root: &std::path::Path,
-) -> Result<ReadResourceResult> {
+pub async fn read_resource(uri: &ResourceUri, raw_uri: &str) -> Result<ReadResourceResult> {
     match uri {
-        ResourceUri::GitCommits { range } => {
-            let range = range.clone();
-            let repo_root = repo_root.to_path_buf();
-            let yaml = tokio::task::spawn_blocking(move || {
-                crate::cli::git::run_view(&range, Some(&repo_root))
-            })
-            .await
-            .context("git run_view task panicked")??;
-            Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                yaml, raw_uri,
-            )
-            .with_mime_type("application/yaml")]))
-        }
         ResourceUri::JiraIssue { key, format } => {
             let (client, instance_url) =
                 create_client().context("Failed to load Atlassian credentials")?;
@@ -398,39 +346,6 @@ mod tests {
     // ── Parser ─────────────────────────────────────────────────────
 
     #[test]
-    fn parse_git_commits_head() {
-        let uri = ResourceUri::parse("git://repo/commits/HEAD").unwrap();
-        assert_eq!(
-            uri,
-            ResourceUri::GitCommits {
-                range: "HEAD".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn parse_git_commits_range() {
-        let uri = ResourceUri::parse("git://repo/commits/HEAD~3..HEAD").unwrap();
-        assert_eq!(
-            uri,
-            ResourceUri::GitCommits {
-                range: "HEAD~3..HEAD".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn parse_git_commits_triple_dot_range() {
-        let uri = ResourceUri::parse("git://repo/commits/main...feature").unwrap();
-        assert_eq!(
-            uri,
-            ResourceUri::GitCommits {
-                range: "main...feature".to_string(),
-            }
-        );
-    }
-
-    #[test]
     fn parse_jira_issue_jfm() {
         let uri = ResourceUri::parse("jira://issue/PROJ-123").unwrap();
         assert_eq!(
@@ -514,19 +429,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_git_wrong_path_is_malformed() {
-        let err = ResourceUri::parse("git://repo/bogus").unwrap_err();
-        match err {
-            UriParseError::Malformed(ref uri, reason) => {
-                assert_eq!(uri, "git://repo/bogus");
-                assert!(reason.contains("git://repo/commits/"));
-                assert!(err.to_string().contains("git://repo/bogus"));
-            }
-            other => panic!("expected Malformed, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn parse_jira_wrong_path_is_malformed() {
         let err = ResourceUri::parse("jira://board/123").unwrap_err();
         assert!(matches!(err, UriParseError::Malformed(_, _)));
@@ -536,12 +438,6 @@ mod tests {
     fn parse_confluence_wrong_path_is_malformed() {
         let err = ResourceUri::parse("confluence://space/ENG").unwrap_err();
         assert!(matches!(err, UriParseError::Malformed(_, _)));
-    }
-
-    #[test]
-    fn parse_empty_git_range_is_empty_identifier() {
-        let err = ResourceUri::parse("git://repo/commits/").unwrap_err();
-        assert!(matches!(err, UriParseError::EmptyIdentifier(_)));
     }
 
     #[test]
@@ -578,7 +474,6 @@ mod tests {
             .iter()
             .map(|t| t.raw.uri_template.as_str())
             .collect();
-        assert!(template_uris.contains(&"git://repo/commits/{range}"));
         assert!(template_uris.contains(&"jira://issue/{key}"));
         assert!(template_uris.contains(&"jira://issue/{key}.adf"));
         assert!(template_uris.contains(&"confluence://page/{id}"));
@@ -617,14 +512,14 @@ mod tests {
     fn list_resources_result_has_no_pagination() {
         let result = list_resources_result();
         assert!(result.next_cursor.is_none());
-        assert_eq!(result.resources.len(), 6);
+        assert_eq!(result.resources.len(), 5);
     }
 
     #[test]
     fn list_resource_templates_result_has_no_pagination() {
         let result = list_resource_templates_result();
         assert!(result.next_cursor.is_none());
-        assert_eq!(result.resource_templates.len(), 6);
+        assert_eq!(result.resource_templates.len(), 5);
     }
 
     // ── not_found ──────────────────────────────────────────────────
@@ -694,69 +589,6 @@ mod tests {
         let (text, _) =
             render_content_item(&item, "https://org.atlassian.net", ResourceFormat::Adf).unwrap();
         assert_eq!(text.trim(), "null");
-    }
-
-    // ── read_resource (git path only; Atlassian paths need creds) ──
-
-    use git2::{Repository, Signature};
-
-    fn init_tmp_repo() -> tempfile::TempDir {
-        let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
-        std::fs::create_dir_all(&tmp_root).unwrap();
-        let temp_dir = tempfile::tempdir_in(&tmp_root).unwrap();
-        let repo = Repository::init(temp_dir.path()).unwrap();
-        {
-            let mut config = repo.config().unwrap();
-            config.set_str("user.name", "Test").unwrap();
-            config.set_str("user.email", "test@example.com").unwrap();
-        }
-        let signature = Signature::now("Test", "test@example.com").unwrap();
-        std::fs::write(temp_dir.path().join("f.txt"), "x").unwrap();
-        let mut idx = repo.index().unwrap();
-        idx.add_path(std::path::Path::new("f.txt")).unwrap();
-        idx.write().unwrap();
-        let tree_id = idx.write_tree().unwrap();
-        let tree = repo.find_tree(tree_id).unwrap();
-        repo.commit(
-            Some("HEAD"),
-            &signature,
-            &signature,
-            "feat: seed",
-            &tree,
-            &[],
-        )
-        .unwrap();
-        temp_dir
-    }
-
-    // `read_resource` resolves the `git://` repo from the injected `repo_root`,
-    // so the test passes the temp repo path directly — no CWD manipulation.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn read_resource_git_commits_returns_yaml() {
-        let temp_dir = init_tmp_repo();
-
-        let uri = ResourceUri::parse("git://repo/commits/HEAD").unwrap();
-        let result = read_resource(&uri, "git://repo/commits/HEAD", temp_dir.path()).await;
-
-        let result = result.unwrap();
-        let contents = result.contents;
-        assert_eq!(contents.len(), 1);
-        match &contents[0] {
-            ResourceContents::TextResourceContents {
-                text,
-                mime_type,
-                uri: reply_uri,
-                ..
-            } => {
-                assert!(text.contains("commits:"), "yaml missing commits: {text}");
-                assert!(text.contains("feat: seed"), "yaml missing subject: {text}");
-                assert_eq!(mime_type.as_deref(), Some("application/yaml"));
-                assert_eq!(reply_uri, "git://repo/commits/HEAD");
-            }
-            other @ ResourceContents::BlobResourceContents { .. } => {
-                panic!("expected text resource contents, got {other:?}")
-            }
-        }
     }
 
     // ── Atlassian branches of read_resource ────────────────────────
@@ -829,9 +661,7 @@ mod tests {
         ]);
 
         let uri = ResourceUri::parse("jira://issue/PROJ-7").unwrap();
-        let result = read_resource(&uri, "jira://issue/PROJ-7", std::path::Path::new("."))
-            .await
-            .unwrap();
+        let result = read_resource(&uri, "jira://issue/PROJ-7").await.unwrap();
         assert_eq!(result.contents.len(), 1);
         match &result.contents[0] {
             ResourceContents::TextResourceContents {
@@ -886,7 +716,7 @@ mod tests {
         ]);
 
         let uri = ResourceUri::parse("jira://issue/PROJ-8.adf").unwrap();
-        let result = read_resource(&uri, "jira://issue/PROJ-8.adf", std::path::Path::new("."))
+        let result = read_resource(&uri, "jira://issue/PROJ-8.adf")
             .await
             .unwrap();
         match &result.contents[0] {
@@ -921,7 +751,7 @@ mod tests {
         ]);
 
         let uri = ResourceUri::parse("jira://issue/NOPE-1").unwrap();
-        let err = read_resource(&uri, "jira://issue/NOPE-1", std::path::Path::new("."))
+        let err = read_resource(&uri, "jira://issue/NOPE-1")
             .await
             .expect_err("404 should surface as error");
         let chain = format!("{err:#}");
@@ -982,8 +812,7 @@ mod tests {
         ]);
 
         let uri = ResourceUri::parse("confluence://page/99999").unwrap();
-        let result =
-            read_resource(&uri, "confluence://page/99999", std::path::Path::new(".")).await;
+        let result = read_resource(&uri, "confluence://page/99999").await;
         // We don't pin the exact rendered output (depends on internal ADF
         // rendering details), only that the branch ran and produced
         // TextResourceContents with the markdown MIME type.
@@ -1028,7 +857,7 @@ mod tests {
         ]);
 
         let uri = ResourceUri::parse("confluence://page/404404").unwrap();
-        let err = read_resource(&uri, "confluence://page/404404", std::path::Path::new("."))
+        let err = read_resource(&uri, "confluence://page/404404")
             .await
             .expect_err("404 should surface as error");
         let chain = format!("{err:#}");
@@ -1059,7 +888,7 @@ mod tests {
         std::env::set_var("HOME", std::env::temp_dir());
 
         let uri = ResourceUri::parse("jira://issue/ZZZ-1").unwrap();
-        let err = read_resource(&uri, "jira://issue/ZZZ-1", std::path::Path::new("."))
+        let err = read_resource(&uri, "jira://issue/ZZZ-1")
             .await
             .expect_err("missing credentials must error");
         let chain = format!("{err:#}");
@@ -1085,7 +914,7 @@ mod tests {
         std::env::set_var("HOME", std::env::temp_dir());
 
         let uri = ResourceUri::parse("confluence://page/0").unwrap();
-        let err = read_resource(&uri, "confluence://page/0", std::path::Path::new("."))
+        let err = read_resource(&uri, "confluence://page/0")
             .await
             .expect_err("missing credentials must error");
         let chain = format!("{err:#}");
@@ -1122,7 +951,7 @@ mod tests {
 
     #[test]
     fn uri_parse_error_variants_display_expected_messages() {
-        let malformed = UriParseError::Malformed("git://x".to_string(), "oops");
+        let malformed = UriParseError::Malformed("jira://x".to_string(), "oops");
         assert!(malformed.to_string().contains("oops"));
         let empty = UriParseError::EmptyIdentifier("jira://issue/".to_string());
         assert!(empty.to_string().contains("empty identifier"));
@@ -1154,9 +983,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn read_resource_specs_jfm_returns_markdown() {
         let uri = ResourceUri::parse("omni-dev://specs/jfm").unwrap();
-        let result = read_resource(&uri, "omni-dev://specs/jfm", std::path::Path::new("."))
-            .await
-            .unwrap();
+        let result = read_resource(&uri, "omni-dev://specs/jfm").await.unwrap();
         assert_eq!(result.contents.len(), 1);
         match &result.contents[0] {
             ResourceContents::TextResourceContents {
@@ -1181,7 +1008,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn read_resource_specs_unknown_name_errors() {
         let uri = ResourceUri::parse("omni-dev://specs/nope").unwrap();
-        let err = read_resource(&uri, "omni-dev://specs/nope", std::path::Path::new("."))
+        let err = read_resource(&uri, "omni-dev://specs/nope")
             .await
             .expect_err("unknown spec must error");
         let chain = format!("{err:#}");
