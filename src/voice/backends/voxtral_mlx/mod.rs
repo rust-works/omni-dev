@@ -7,8 +7,10 @@
 //! is the lever — #933 validation).
 //!
 //! **Under construction (#933 M1).** This currently provides the config and the
-//! weights loader (M1.1); the encoder/decoder/adapter/tokenizer ports and the
-//! `Transcriber`/`StreamingTranscriber` impls land in M1.2–M1.5.
+//! weights loader (M1.1) and the causal audio encoder + adapter (M1.2, batch
+//! `encode_full` path — verified running on the real INT4 weights on Metal); the
+//! decoder/tokenizer/mel ports and the `Transcriber`/`StreamingTranscriber` impls
+//! land in M1.3–M1.5.
 //!
 //! [ADR-0039]: ../../../../docs/adrs/adr-0039.md
 // Port in progress (#933 M1): layers consume the config/weights incrementally,
@@ -17,7 +19,11 @@
 #![allow(dead_code, missing_docs)]
 
 mod config;
+mod encoder;
+mod nn;
 mod weights;
 
 pub use config::VoxtralMlxConfig;
+pub use encoder::AudioEncoder;
+pub use nn::Weights;
 pub use weights::{get_tensor, load_safetensors};
