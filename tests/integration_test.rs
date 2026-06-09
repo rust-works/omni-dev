@@ -102,8 +102,16 @@ impl TestRepo {
                 .collect(),
         };
 
-        // Create the amendments file outside the repository to avoid it showing up as untracked
-        let yaml_path = self.repo_path.parent().unwrap().join("amendments.yaml");
+        // Create the amendments file outside the repository (so it doesn't show
+        // up as untracked) under a name unique to this repo's tempdir, so tests
+        // that share the parent `tmp/` directory can't overwrite each other's
+        // file and race.
+        let unique = self.repo_path.file_name().unwrap().to_string_lossy();
+        let yaml_path = self
+            .repo_path
+            .parent()
+            .unwrap()
+            .join(format!("{unique}-amendments.yaml"));
         amendment_file.save_to_file(&yaml_path)?;
         Ok(yaml_path)
     }
@@ -175,9 +183,12 @@ fn amend_preflight_checks_injected_repo_worktree() -> Result<()> {
     .execute(Some(repo_a.repo_path.as_path()))
     .expect_err("amend must bail on the injected repo's dirty worktree");
     let msg = format!("{err:#}").to_lowercase();
+    // Assert on the injected repo's specific untracked file: a regressed
+    // CWD-anchored check would report a different (or no) file, so this can't
+    // pass for the wrong reason.
     assert!(
-        msg.contains("uncommitted") || msg.contains("clean"),
-        "expected dirty-worktree error from the injected repo, got: {msg}"
+        msg.contains("dirty.txt"),
+        "expected dirty-worktree error naming the injected repo's file, got: {msg}"
     );
 
     Ok(())

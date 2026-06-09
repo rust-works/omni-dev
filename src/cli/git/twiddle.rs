@@ -103,8 +103,15 @@ impl TwiddleCommand {
         }
 
         // Resolve the repo root once; every git, config, and scratch read below
-        // anchors to it (the CWD is the default when no path is injected).
-        let repo_root = repo.unwrap_or_else(|| std::path::Path::new("."));
+        // anchors to it (the CWD is the default when no path is injected). Resolve
+        // the default to an absolute path via `current_dir` — matching the sibling
+        // commands — so walk-ups from a subdirectory work and echoed paths are
+        // absolute.
+        let repo_root = match repo {
+            Some(p) => p.to_path_buf(),
+            None => std::env::current_dir().context("Failed to determine current directory")?,
+        };
+        let repo_root = repo_root.as_path();
 
         // If --no-ai flag is set, skip AI processing and output YAML directly
         if self.no_ai {
@@ -1794,7 +1801,11 @@ pub async fn run_twiddle(
     dry_run: bool,
     repo_path: Option<&std::path::Path>,
 ) -> Result<TwiddleOutcome> {
-    let repo_root = repo_path.unwrap_or_else(|| std::path::Path::new("."));
+    let repo_root = match repo_path {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_dir().context("Failed to determine current directory")?,
+    };
+    let repo_root = repo_root.as_path();
 
     crate::utils::check_ai_command_prerequisites(model.as_deref(), repo_root)?;
 
