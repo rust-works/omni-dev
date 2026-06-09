@@ -13,8 +13,12 @@ pub struct AmendCommand {
 
 impl AmendCommand {
     /// Executes the amend command.
-    pub fn execute(self) -> Result<()> {
+    pub fn execute(self, repo: Option<&std::path::Path>) -> Result<()> {
         use crate::git::AmendmentHandler;
+
+        if repo.is_some() {
+            anyhow::bail!("--repo is not yet supported for `git commit message amend`");
+        }
 
         // Preflight checks: validate prerequisites before any processing
         crate::utils::check_git_repository()?;

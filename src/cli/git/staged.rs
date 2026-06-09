@@ -46,7 +46,10 @@ pub struct StagedOutcome {
 
 impl StagedCommand {
     /// Executes the staged command.
-    pub async fn execute(self) -> Result<()> {
+    pub async fn execute(self, repo: Option<&std::path::Path>) -> Result<()> {
+        if repo.is_some() {
+            anyhow::bail!("--repo is not yet supported for `git commit message staged`");
+        }
         let beta = self
             .beta_header
             .as_deref()
@@ -484,7 +487,7 @@ mod tests {
             beta_header: None,
             context_dir: None,
         };
-        let err = cmd.execute().await.unwrap_err();
+        let err = cmd.execute(None).await.unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.to_lowercase().contains("no staged changes"),
@@ -506,7 +509,7 @@ mod tests {
             beta_header: Some("no-colon-here".to_string()),
             context_dir: None,
         };
-        let err = cmd.execute().await.unwrap_err();
+        let err = cmd.execute(None).await.unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("Invalid --beta-header"),

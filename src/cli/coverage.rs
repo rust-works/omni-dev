@@ -22,9 +22,12 @@ pub enum CoverageSubcommands {
 
 impl CoverageCommand {
     /// Executes the coverage command.
-    pub async fn execute(self) -> Result<()> {
+    ///
+    /// `repo` is the repository location resolved at the CLI boundary
+    /// (`None` = current working directory).
+    pub async fn execute(self, repo: Option<&std::path::Path>) -> Result<()> {
         match self.command {
-            CoverageSubcommands::Diff(cmd) => cmd.execute().await,
+            CoverageSubcommands::Diff(cmd) => cmd.execute(repo).await,
         }
     }
 }
@@ -48,7 +51,6 @@ mod tests {
                 baseline_report_format: diff::ReportFormat::Auto,
                 format: diff::OutputFormatArg::Markdown,
                 fail_under_patch: None,
-                repo: std::path::PathBuf::from("."),
                 strip_prefix: None,
                 collapse_ranges: false,
                 artifact_url: None,
@@ -59,6 +61,6 @@ mod tests {
             }),
         };
         // Reaches the leaf command and fails on the missing report file.
-        assert!(cmd.execute().await.is_err());
+        assert!(cmd.execute(None).await.is_err());
     }
 }

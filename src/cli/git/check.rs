@@ -73,7 +73,10 @@ pub struct CheckCommand {
 
 impl CheckCommand {
     /// Executes the check command, validating commit messages against guidelines.
-    pub async fn execute(mut self) -> Result<()> {
+    pub async fn execute(mut self, repo: Option<&std::path::Path>) -> Result<()> {
+        if repo.is_some() {
+            anyhow::bail!("--repo is not yet supported for `git commit message check`");
+        }
         // Resolve deprecated --batch-size into --concurrency
         if let Some(bs) = self.batch_size {
             eprintln!("warning: --batch-size is deprecated; use --concurrency instead");
