@@ -251,7 +251,7 @@ jobs:
         ./target/debug/omni-dev "${args[@]}" > coverage.md
     - name: Comment coverage on PR
       if: github.event_name == 'pull_request'
-      uses: marocchino/sticky-pull-request-comment@v2
+      uses: marocchino/sticky-pull-request-comment@v3
       with:
         header: coverage          # sticky key: updates the same comment each run
         path: coverage.md
