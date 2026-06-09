@@ -21,7 +21,7 @@ use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
 
 use super::config::EncoderConfig;
-use super::nn::{causal_mask, Weights, COMPUTE_DTYPE};
+use super::nn::{sliding_window_mask, Weights, COMPUTE_DTYPE};
 
 /// The audio encoder, borrowing the loaded weights for the duration of a forward
 /// pass. Construct per-encode; holds no mutable state on the batch path.
@@ -63,8 +63,9 @@ impl<'a> AudioEncoder<'a> {
     }
 
     /// Conv stem: `[128, frames]` mel → `[seq, 1280]`, truncated to a multiple of
-    /// the downsample factor (mirrors `conv_stem`).
-    fn conv_stem(&self, mel: &Array) -> Result<Array> {
+    /// the downsample factor (mirrors `conv_stem`). The conv output frame count
+    /// is `4 ×` the audio-token count consumed by the decoder.
+    pub fn conv_stem(&self, mel: &Array) -> Result<Array> {
         // mel.T[None] : [128, frames] -> [1, frames, 128]
         let x = mel
             .transpose(&[1, 0])?
@@ -170,21 +171,30 @@ impl<'a> AudioEncoder<'a> {
             .linear(&x, "encoder.audio_language_projection_2", false)
     }
 
-    /// Non-chunked encode: conv stem + 32 layers (one shared causal mask) + RMS
-    /// norm + downsample + project. Valid when the conv output fits within the
-    /// sliding window; errors otherwise (long-audio chunking is M3).
-    pub fn encode(&self, mel: &Array) -> Result<Array> {
-        let conv_out = self.conv_stem(mel)?;
+    /// Largest conv-output length [`encode_full`] will run in a single SDPA. The
+    /// `[seq, seq]` attention scores grow quadratically (≈ `seq² · n_heads · 2 B`
+    /// in F16), so a cap keeps offline clips on the memory-safe single-pass path;
+    /// longer audio needs the chunked rotating-cache encoder (#933 M3). At 2048
+    /// (≈ 41 s of audio) the scores are ≈ 256 MB — comfortable on unified memory.
+    pub const MAX_FULL_FRAMES: usize = 2048;
+
+    /// Encodes a full conv output `[seq, 1280]` into the adapter output
+    /// `[seq/4, 3072]` in a single pass: 32 transformer layers under one shared
+    /// sliding-window causal mask, then RMS norm, downsample, and the adapter
+    /// projection. Equivalent to the reference's chunked rotating-cache encoding
+    /// over the whole sequence, capped at [`Self::MAX_FULL_FRAMES`] (longer audio
+    /// uses the M3 chunked path).
+    pub fn encode_full(&self, conv_out: &Array) -> Result<Array> {
         let seq = conv_out.shape()[0] as usize;
-        if seq > self.cfg.sliding_window {
+        if seq > Self::MAX_FULL_FRAMES {
             bail!(
-                "encoder.encode: conv output {seq} frames exceeds sliding window {} — \
+                "encoder.encode_full: {seq} conv frames exceeds the single-pass cap {} — \
                  long-audio chunked encoding lands with streaming (#933 M3)",
-                self.cfg.sliding_window
+                Self::MAX_FULL_FRAMES
             );
         }
-        let mask = causal_mask(seq)?;
-        let mut x = conv_out;
+        let mask = sliding_window_mask(seq, self.cfg.sliding_window)?;
+        let mut x = conv_out.clone();
         for layer in 0..self.cfg.n_layers {
             x = self.layer(&x, layer, &mask)?;
         }
@@ -192,6 +202,12 @@ impl<'a> AudioEncoder<'a> {
             .w
             .rms_norm(&x, "encoder.transformer_norm", self.cfg.norm_eps)?;
         self.downsample_and_project(&x)
+    }
+
+    /// Convenience: conv stem + [`Self::encode_full`] from a `[128, frames]` mel.
+    pub fn encode(&self, mel: &Array) -> Result<Array> {
+        let conv_out = self.conv_stem(mel)?;
+        self.encode_full(&conv_out)
     }
 }
 

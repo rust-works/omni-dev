@@ -112,3 +112,22 @@ pub fn causal_mask(seq: usize) -> Result<Array> {
     }
     Ok(Array::from_slice(&data, &[seq as i32, seq as i32]).as_dtype(COMPUTE_DTYPE)?)
 }
+
+/// Builds an additive **sliding-window** causal mask `[seq, seq]`: `0` where
+/// `j <= i` and `i - j < window`, `-inf` otherwise. A single SDPA over this mask
+/// is mathematically identical to the reference's chunked rotating-KV-cache
+/// encoding for the whole sequence (both realise sliding-window causal
+/// attention); it trades the streaming memory bound for simplicity, so it is used
+/// for offline clips that fit in memory (the rotating cache returns for long
+/// audio / streaming, M3).
+pub fn sliding_window_mask(seq: usize, window: usize) -> Result<Array> {
+    let mut data = vec![0.0_f32; seq * seq];
+    for (i, row) in data.chunks_mut(seq).enumerate() {
+        for (j, cell) in row.iter_mut().enumerate() {
+            if j > i || i - j >= window {
+                *cell = f32::NEG_INFINITY;
+            }
+        }
+    }
+    Ok(Array::from_slice(&data, &[seq as i32, seq as i32]).as_dtype(COMPUTE_DTYPE)?)
+}
