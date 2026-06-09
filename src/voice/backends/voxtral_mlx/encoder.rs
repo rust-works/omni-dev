@@ -248,7 +248,7 @@ mod tests {
         let (bins, frames) = (128usize, 300usize);
         let mut data = vec![0.0_f32; bins * frames];
         for (i, v) in data.iter_mut().enumerate() {
-            *v = ((i % 17) as f32 / 17.0) * 3.0 - 1.5;
+            *v = ((i % 17) as f32 / 17.0).mul_add(3.0, -1.5);
         }
         let mel = Array::from_slice(&data, &[bins as i32, frames as i32]);
 

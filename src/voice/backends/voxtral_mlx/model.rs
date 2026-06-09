@@ -215,6 +215,88 @@ mod tests {
             .map(std::path::PathBuf::from)
     }
 
+    /// Normalises text for WER: lowercase, keep alphanumerics + spaces, split.
+    fn norm_words(s: &str) -> Vec<String> {
+        s.to_lowercase()
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+            .collect::<String>()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Word-level edit distance ÷ reference length.
+    fn wer(reference: &[String], hypothesis: &[String]) -> f64 {
+        let (n, m) = (reference.len(), hypothesis.len());
+        let mut prev: Vec<usize> = (0..=m).collect();
+        let mut cur = vec![0usize; m + 1];
+        for i in 1..=n {
+            cur[0] = i;
+            for j in 1..=m {
+                let cost = usize::from(reference[i - 1] != hypothesis[j - 1]);
+                cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+            }
+            std::mem::swap(&mut prev, &mut cur);
+        }
+        prev[m] as f64 / n.max(1) as f64
+    }
+
+    /// WER of `hyp` against the best-length prefix of `reference` (the audio slice
+    /// is a prefix of the full recording, so the transcript should match a prefix
+    /// of the reference text; search a window around `len(hyp)` to fairly handle
+    /// the cut boundary).
+    fn best_prefix_wer(reference: &[String], hyp: &[String]) -> f64 {
+        let h = hyp.len();
+        let lo = h.saturating_sub(12).max(1);
+        let hi = (h + 12).min(reference.len());
+        (lo..=hi)
+            .map(|k| wer(&reference[..k], hyp))
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// Batch accuracy + real-time-factor on a cap-sized (~32 s) prefix of the
+    /// 5-min fixture (the full clip needs M3 chunking). Reports WER vs the
+    /// best-aligned reference prefix and RTF (transcribe wall-clock ÷ audio
+    /// duration). Run with `--release` for a meaningful RTF.
+    #[test]
+    #[ignore = "requires the INT4 Voxtral model; set OMNI_DEV_VOICE_VOXTRAL_MLX_MODEL=<dir> (#933 M1.5)"]
+    fn batch_wer_and_rtf_on_monologue_prefix() {
+        let Some(dir) = model_dir() else {
+            panic!("set OMNI_DEV_VOICE_VOXTRAL_MLX_MODEL=<dir>");
+        };
+        let model = VoxtralMlxModel::from_model_dir(&dir).expect("load model");
+        let wav = std::path::Path::new("tests/fixtures/voice/monologue_5min.wav");
+        let all = load_wav_16k_mono(wav).expect("load monologue");
+
+        // First ~32 s keeps the conv output under AudioEncoder::MAX_FULL_FRAMES.
+        let slice_secs = 32.0_f64;
+        let n = (slice_secs * 16_000.0) as usize;
+        let samples = &all[..n.min(all.len())];
+        let dur = samples.len() as f64 / 16_000.0;
+
+        let start = std::time::Instant::now();
+        let text = model.transcribe(samples).expect("transcribe");
+        let elapsed = start.elapsed().as_secs_f64();
+        let rtf = elapsed / dur;
+
+        let reference = std::fs::read_to_string("tests/fixtures/voice/monologue_5min.expected.txt")
+            .expect("read expected");
+        let ref_words = norm_words(&reference);
+        let hyp_words = norm_words(&text);
+        let wer = best_prefix_wer(&ref_words, &hyp_words);
+
+        println!("\n=== monologue {dur:.1}s prefix ===");
+        println!("transcript: {text}");
+        println!(
+            "WER (best prefix): {:.1}%  |  RTF: {rtf:.3}  ({elapsed:.2}s / {dur:.1}s)",
+            wer * 100.0
+        );
+        println!("=================================");
+        assert!(wer < 0.15, "WER {:.1}% too high", wer * 100.0);
+        assert!(!hyp_words.is_empty(), "empty transcript");
+    }
+
     /// End-to-end offline transcription on the short English fixture. Prints the
     /// transcript (inspect with `--nocapture`) and asserts it is non-empty and
     /// looks like real text — the M1.4/M1.5 deliverable (a correct offline
@@ -233,7 +315,7 @@ mod tests {
         let text = model.transcribe(&samples).expect("transcribe");
         println!("\n=== short_en.wav transcript ===\n{text}\n===============================");
         assert!(!text.is_empty(), "transcript should not be empty");
-        let letters = text.chars().filter(|c| c.is_ascii_alphabetic()).count();
+        let letters = text.chars().filter(char::is_ascii_alphabetic).count();
         assert!(
             letters > 10,
             "transcript should contain real words: {text:?}"
