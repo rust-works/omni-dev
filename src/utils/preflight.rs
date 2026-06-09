@@ -259,19 +259,9 @@ pub fn check_github_cli(repo_root: &std::path::Path) -> Result<()> {
     }
 }
 
-/// Validates that the current directory is in a valid git repository.
+/// Validates that `repo_root` is a valid git repository.
 ///
-/// This is a lightweight check that opens the repository without
-/// loading any commit data.
-pub fn check_git_repository() -> Result<()> {
-    crate::git::GitRepository::open().context(
-        "Not in a git repository. Please run this command from within a git repository.",
-    )?;
-    Ok(())
-}
-
-/// Like [`check_git_repository`], but validates the repository at an explicit
-/// `repo_root` instead of the process current working directory.
+/// A lightweight check that opens the repository without loading commit data.
 pub fn check_git_repository_at(repo_root: &std::path::Path) -> Result<()> {
     crate::git::GitRepository::open_at(repo_root).context(
         "Not in a git repository. Please run this command from within a git repository.",
@@ -279,22 +269,11 @@ pub fn check_git_repository_at(repo_root: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Validates that the working directory is clean (no uncommitted changes).
+/// Validates that the working directory at `repo_root` is clean — no
+/// uncommitted changes (staged, unstaged, or untracked non-ignored files).
 ///
-/// This checks for:
-/// - Staged changes
-/// - Unstaged modifications
-/// - Untracked files (excluding ignored files)
-///
-/// Use this before operations that require a clean working directory,
-/// like amending commits.
-pub fn check_working_directory_clean() -> Result<()> {
-    let repo = crate::git::GitRepository::open().context("Failed to open git repository")?;
-    check_working_directory_clean_for(&repo)
-}
-
-/// Like [`check_working_directory_clean`], but checks the repository at an
-/// explicit `repo_root` instead of the process current working directory.
+/// Use this before operations that require a clean working directory, like
+/// amending commits.
 pub fn check_working_directory_clean_at(repo_root: &std::path::Path) -> Result<()> {
     let repo =
         crate::git::GitRepository::open_at(repo_root).context("Failed to open git repository")?;

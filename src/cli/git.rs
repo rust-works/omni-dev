@@ -22,57 +22,6 @@ use std::path::Path;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-/// Global async mutex serialising every caller that mutates the process-wide
-/// current working directory via `std::env::set_current_dir`.
-///
-/// Now that every `git` command threads an explicit `--repo` root through its
-/// reads, no production code path changes the CWD. This mutex and the
-/// [`CwdGuard`] it backs survive only to serialise the remaining
-/// CWD-mutating *unit test* (`cwd_guard_invalid_path_returns_error`) against
-/// any other test that touches the shared CWD, so it is gated behind
-/// `#[cfg(test)]`.
-///
-/// We use `tokio::sync::Mutex` rather than `std::sync::Mutex` so the guard is
-/// `Send` and can be held across `.await` points.
-#[cfg(test)]
-pub(crate) static CWD_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// RAII guard that temporarily changes the process current working directory
-/// and restores it on drop.
-///
-/// Test-only (`#[cfg(test)]`): production commands no longer mutate the CWD —
-/// they thread an explicit `--repo` root instead. The guard is retained so the
-/// `cwd_guard_invalid_path_returns_error` regression test can keep exercising
-/// the error path without racing on the shared CWD.
-#[cfg(test)]
-pub(crate) struct CwdGuard {
-    original: std::path::PathBuf,
-    _lock: tokio::sync::MutexGuard<'static, ()>,
-}
-
-#[cfg(test)]
-impl CwdGuard {
-    /// Enters `path`, holding the CWD mutex for the lifetime of the guard.
-    pub(crate) async fn enter<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
-        let lock = CWD_MUTEX.lock().await;
-        let original =
-            std::env::current_dir().map_err(|e| anyhow::anyhow!("current_dir failed: {e}"))?;
-        std::env::set_current_dir(path.as_ref())
-            .map_err(|e| anyhow::anyhow!("set_current_dir failed: {e}"))?;
-        Ok(Self {
-            original,
-            _lock: lock,
-        })
-    }
-}
-
-#[cfg(test)]
-impl Drop for CwdGuard {
-    fn drop(&mut self) {
-        let _ = std::env::set_current_dir(&self.original);
-    }
-}
-
 /// Reads one line of interactive input from `reader`.
 ///
 /// Returns `Some(line)` on success, or `None` when the reader reaches EOF
@@ -444,17 +393,6 @@ mod tests {
         let mut reader = std::io::Cursor::new(b"\n" as &[u8]);
         let result = read_interactive_line(&mut reader).unwrap();
         assert_eq!(result, Some("\n".to_string()));
-    }
-
-    #[tokio::test]
-    async fn cwd_guard_invalid_path_returns_error() {
-        // Error path doesn't mutate the shared CWD, so it is safe to run in
-        // parallel with the rest of the test suite. No production code calls
-        // `CwdGuard::enter` anymore — every git command threads `--repo`
-        // instead — so this test is the guard's sole remaining caller and
-        // covers only the error path. The guard is retired in the final slice.
-        let result = CwdGuard::enter("/no/such/path/exists").await;
-        assert!(result.is_err(), "expected error for nonexistent path");
     }
 
     /// All `git` message and branch commands now honor `--repo` by threading

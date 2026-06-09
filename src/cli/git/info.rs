@@ -124,11 +124,14 @@ pub fn run_info<P: AsRef<Path>>(base_branch: Option<&str>, repo_path: Option<P>)
     use crate::git::{GitRepository, RemoteInfo};
     use crate::utils::ai_scratch;
 
+    // Resolve the repo location: the injected path, or the current working
+    // directory as the default (resolved here at the entry point). Both branches
+    // open via `open_at`, so nothing falls back to a no-arg CWD open.
     let repo = if let Some(path) = repo_path {
         GitRepository::open_at(path).context("Failed to open git repository at the given path")?
     } else {
-        crate::utils::check_git_repository()?;
-        GitRepository::open()
+        let cwd = std::env::current_dir().context("Failed to determine current directory")?;
+        GitRepository::open_at(cwd)
             .context("Failed to open git repository. Make sure you're in a git repository.")?
     };
 
