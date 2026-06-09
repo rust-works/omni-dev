@@ -30,14 +30,16 @@ const L2_EPSILON: f32 = 1e-12;
 pub const MIN_EMBED_SAMPLES: usize = SAMPLE_RATE as usize / 2; // 0.5 s
 
 /// Type alias for the runnable tract-onnx plan shape that
-/// [`WespeakerEmbedder`] owns. Spelled out once here so the struct field
-/// stays readable.
-type OnnxPlan = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
+/// [`WespeakerEmbedder`] owns. `tract-onnx` 0.23 returns an `Arc`-wrapped
+/// plan from `into_runnable()` and [`TypedSimplePlan`]'s `run` takes
+/// `&Arc<Self>`, so the owned field is the `Arc`. Spelled out once here so
+/// the struct field stays readable.
+type OnnxPlan = Arc<TypedSimplePlan>;
 
 /// In-memory `tract-onnx` model + precomputed mel filterbank + FFT plan.
 ///
-/// `Send + Sync` because [`SimplePlan::run`] takes `&self` and the
-/// `Arc<dyn Fft<f32>>` from `rustfft` is also thread-safe.
+/// `Send + Sync` because [`TypedSimplePlan`]'s `run` takes `&Arc<Self>` and
+/// the `Arc<dyn Fft<f32>>` from `rustfft` is also thread-safe.
 pub struct WespeakerEmbedder {
     plan: OnnxPlan,
     mel_filters: Vec<Vec<f32>>,
@@ -103,7 +105,7 @@ impl WespeakerEmbedder {
             .run(tvec!(tensor.into()))
             .context("run wespeaker inference")?;
         let emb: Vec<f32> = outputs[0]
-            .to_array_view::<f32>()
+            .to_plain_array_view::<f32>()
             .context("wespeaker output to f32 view")?
             .iter()
             .copied()
