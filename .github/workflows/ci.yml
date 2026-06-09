@@ -197,7 +197,7 @@ jobs:
       # warning, not a failure — the fallback below recomputes it.
       id: baseline
       if: github.event_name == 'pull_request'
-      uses: dawidd6/action-download-artifact@v6
+      uses: dawidd6/action-download-artifact@v21
       with:
         name: coverage-baseline
         commit: ${{ steps.mb.outputs.sha }}
