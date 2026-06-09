@@ -20,7 +20,7 @@
 //! path); on the full 5-min fixture it measured **WER 4.0%** and **RTF 0.263**,
 //! matching `voxtral.c`'s 4.12% at ≈ 5× its speed (M3a). The
 //! [`StreamingTranscriber`](crate::voice::transcriber::StreamingTranscriber) impl
-//! drives the [`stream::StreamSession`] incrementally — proven to reproduce the
+//! drives the streaming session (`stream::StreamSession`) incrementally — proven to reproduce the
 //! batch transcript byte-for-byte — emitting `Partial`/`Final`/`SilenceGap`
 //! events via `StreamSegmenter` (M3b). Remaining: CI graph-gating and
 //! docs/security/`voxtral.c` fate (M4).

@@ -213,7 +213,7 @@ impl<'a> AudioEncoder<'a> {
             .linear(&x, "encoder.audio_language_projection_2", false)
     }
 
-    /// Largest conv-output length [`encode_full`] will run in a single SDPA. The
+    /// Largest conv-output length [`Self::encode_full`] will run in a single SDPA. The
     /// `[seq, seq]` attention scores grow quadratically (≈ `seq² · n_heads · 2 B`
     /// in F16), so a cap keeps short clips on the memory-safe single-pass path;
     /// longer audio routes to [`Self::encode_chunked`] (via [`Self::encode_conv`]).
