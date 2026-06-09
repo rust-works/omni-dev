@@ -46,10 +46,10 @@ pub struct StagedOutcome {
 
 impl StagedCommand {
     /// Executes the staged command.
+    ///
+    /// `repo` is the repository location resolved at the CLI boundary
+    /// (`None` = current working directory).
     pub async fn execute(self, repo: Option<&std::path::Path>) -> Result<()> {
-        if repo.is_some() {
-            anyhow::bail!("--repo is not yet supported for `git commit message staged`");
-        }
         let beta = self
             .beta_header
             .as_deref()
@@ -60,7 +60,7 @@ impl StagedCommand {
             self.model,
             beta,
             self.context_dir.as_deref(),
-            None,
+            repo,
         )
         .await?;
         Ok(())
@@ -79,25 +79,28 @@ pub async fn run_staged(
     context_dir: Option<&std::path::Path>,
     repo_path: Option<&std::path::Path>,
 ) -> Result<StagedOutcome> {
-    let _cwd_guard = match repo_path {
-        Some(p) => Some(super::CwdGuard::enter(p).await?),
-        None => None,
+    // Resolve the repo root once (the CWD is the default when no path is
+    // injected); every git subprocess and config/scopes read below anchors to
+    // it, so nothing deeper reads the ambient CWD.
+    let repo_root = match repo_path {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_dir().context("Failed to determine current directory")?,
     };
+    let repo_root = repo_root.as_path();
 
-    if !has_staged_changes()? {
+    if !has_staged_changes(repo_root)? {
         anyhow::bail!("no staged changes — stage files with `git add` before running this command");
     }
 
     crate::utils::check_ai_command_prerequisites(model.as_deref())?;
     let claude_client = crate::claude::create_default_claude_client(model, beta_header).await?;
 
-    let resolved_context_dir = crate::claude::context::resolve_context_dir(context_dir);
-    let valid_scopes = crate::claude::context::load_project_scopes(
-        &resolved_context_dir,
-        &std::path::PathBuf::from("."),
-    );
+    let resolved_context_dir =
+        crate::claude::context::resolve_context_dir_at(context_dir, repo_root);
+    let valid_scopes =
+        crate::claude::context::load_project_scopes(&resolved_context_dir, repo_root);
 
-    run_staged_with_client(print_only, &valid_scopes, &claude_client).await
+    run_staged_with_client(print_only, &valid_scopes, &claude_client, repo_root).await
 }
 
 /// Test-injectable core of [`run_staged`].
@@ -111,8 +114,9 @@ pub(crate) async fn run_staged_with_client(
     print_only: bool,
     valid_scopes: &[ScopeDefinition],
     claude_client: &crate::claude::client::ClaudeClient,
+    repo_root: &std::path::Path,
 ) -> Result<StagedOutcome> {
-    let diff = read_staged_diff()?;
+    let diff = read_staged_diff(repo_root)?;
     let system = crate::claude::prompts::generate_staged_commit_system_prompt(valid_scopes);
     let user = crate::claude::prompts::generate_staged_commit_user_prompt(&diff);
 
@@ -131,7 +135,7 @@ pub(crate) async fn run_staged_with_client(
         });
     }
 
-    commit_with_message(&message)?;
+    commit_with_message(&message, repo_root)?;
     Ok(StagedOutcome {
         message,
         applied: true,
@@ -144,8 +148,9 @@ pub(crate) async fn run_staged_with_client(
 /// - `0` ⇒ no diff (nothing staged)
 /// - `1` ⇒ diff present (staged changes exist)
 /// - other ⇒ a real error (not in a repo, permission denied, etc.)
-fn has_staged_changes() -> Result<bool> {
+fn has_staged_changes(repo_root: &std::path::Path) -> Result<bool> {
     let output = Command::new("git")
+        .current_dir(repo_root)
         .args(["diff", "--cached", "--quiet"])
         .stdin(Stdio::null())
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -163,8 +168,9 @@ fn has_staged_changes() -> Result<bool> {
 }
 
 /// Reads the staged diff via `git diff --cached`.
-fn read_staged_diff() -> Result<String> {
+fn read_staged_diff(repo_root: &std::path::Path) -> Result<String> {
     let output = Command::new("git")
+        .current_dir(repo_root)
         .args(["diff", "--cached"])
         .stdin(Stdio::null())
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -188,8 +194,9 @@ fn read_staged_diff() -> Result<String> {
 /// can block reading from an inherited stdin fd. On CI runners (Linux), an
 /// inherited stdin from `cargo test` can produce indefinite waits that don't
 /// reproduce on developer terminals.
-fn commit_with_message(message: &str) -> Result<()> {
+fn commit_with_message(message: &str, repo_root: &std::path::Path) -> Result<()> {
     let status = Command::new("git")
+        .current_dir(repo_root)
         .args(["commit", "-m", message])
         .stdin(Stdio::null())
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -280,8 +287,9 @@ mod tests {
     #[tokio::test]
     async fn run_staged_errors_when_nothing_staged() {
         let temp_dir = init_empty_repo();
-        // run_staged() acquires CwdGuard internally — do NOT acquire it
-        // here as well or we deadlock on the shared CWD mutex.
+        // `has_staged_changes` is anchored to the injected repo (`.current_dir`),
+        // so this empty repo bails regardless of whether the process CWD has
+        // staged changes.
         let err = run_staged(true, None, None, None, Some(temp_dir.path()))
             .await
             .unwrap_err();
@@ -295,15 +303,14 @@ mod tests {
     #[tokio::test]
     async fn run_staged_with_client_print_only_does_not_commit() {
         let temp_dir = init_repo_with_staged_change();
-        let _guard = super::super::CwdGuard::enter(temp_dir.path())
-            .await
-            .unwrap();
         let head_before = head_oid(temp_dir.path());
 
         let mock = ConfigurableMockAiClient::new(vec![Ok("feat(foo): add bar".to_string())]);
         let client = ClaudeClient::new(Box::new(mock));
 
-        let outcome = run_staged_with_client(true, &[], &client).await.unwrap();
+        let outcome = run_staged_with_client(true, &[], &client, temp_dir.path())
+            .await
+            .unwrap();
         assert!(!outcome.applied, "print_only must not apply");
         assert_eq!(outcome.message, "feat(foo): add bar");
 
@@ -314,15 +321,14 @@ mod tests {
     #[tokio::test]
     async fn run_staged_with_client_commits_on_default() {
         let temp_dir = init_repo_with_staged_change();
-        let _guard = super::super::CwdGuard::enter(temp_dir.path())
-            .await
-            .unwrap();
         let head_before = head_oid(temp_dir.path());
 
         let mock = ConfigurableMockAiClient::new(vec![Ok("feat(foo): add marker".to_string())]);
         let client = ClaudeClient::new(Box::new(mock));
 
-        let outcome = run_staged_with_client(false, &[], &client).await.unwrap();
+        let outcome = run_staged_with_client(false, &[], &client, temp_dir.path())
+            .await
+            .unwrap();
         assert!(outcome.applied, "default mode must commit");
 
         let head_after = head_oid(temp_dir.path());
@@ -338,16 +344,13 @@ mod tests {
     #[tokio::test]
     async fn run_staged_propagates_ai_failure() {
         let temp_dir = init_repo_with_staged_change();
-        let _guard = super::super::CwdGuard::enter(temp_dir.path())
-            .await
-            .unwrap();
         let head_before = head_oid(temp_dir.path());
 
         // Empty response queue → mock returns Err on first call.
         let mock = ConfigurableMockAiClient::new(vec![]);
         let client = ClaudeClient::new(Box::new(mock));
 
-        let err = run_staged_with_client(false, &[], &client)
+        let err = run_staged_with_client(false, &[], &client, temp_dir.path())
             .await
             .unwrap_err();
         let _ = err;
@@ -359,28 +362,24 @@ mod tests {
     #[tokio::test]
     async fn run_staged_with_client_trims_ai_response_whitespace() {
         let temp_dir = init_repo_with_staged_change();
-        let _guard = super::super::CwdGuard::enter(temp_dir.path())
-            .await
-            .unwrap();
 
         let mock = ConfigurableMockAiClient::new(vec![Ok("  feat(x): y  \n\n".to_string())]);
         let client = ClaudeClient::new(Box::new(mock));
 
-        let outcome = run_staged_with_client(true, &[], &client).await.unwrap();
+        let outcome = run_staged_with_client(true, &[], &client, temp_dir.path())
+            .await
+            .unwrap();
         assert_eq!(outcome.message, "feat(x): y");
     }
 
     #[tokio::test]
     async fn run_staged_with_client_empty_ai_response_errors() {
         let temp_dir = init_repo_with_staged_change();
-        let _guard = super::super::CwdGuard::enter(temp_dir.path())
-            .await
-            .unwrap();
 
         let mock = ConfigurableMockAiClient::new(vec![Ok("   \n\n".to_string())]);
         let client = ClaudeClient::new(Box::new(mock));
 
-        let err = run_staged_with_client(false, &[], &client)
+        let err = run_staged_with_client(false, &[], &client, temp_dir.path())
             .await
             .unwrap_err();
         let msg = format!("{err:#}");
@@ -393,9 +392,6 @@ mod tests {
     #[tokio::test]
     async fn run_staged_invokes_git_commit_subprocess_so_hooks_fire() {
         let temp_dir = init_repo_with_staged_change();
-        let _guard = super::super::CwdGuard::enter(temp_dir.path())
-            .await
-            .unwrap();
         let head_before = head_oid(temp_dir.path());
 
         // Install a commit-msg hook that always fails. If we go through real
@@ -414,7 +410,7 @@ mod tests {
         let mock = ConfigurableMockAiClient::new(vec![Ok("feat(x): y".to_string())]);
         let client = ClaudeClient::new(Box::new(mock));
 
-        let err = run_staged_with_client(false, &[], &client)
+        let err = run_staged_with_client(false, &[], &client, temp_dir.path())
             .await
             .unwrap_err();
         let msg = format!("{err:#}");
@@ -433,9 +429,6 @@ mod tests {
     #[tokio::test]
     async fn run_staged_passes_valid_scopes_into_prompt() {
         let temp_dir = init_repo_with_staged_change();
-        let _guard = super::super::CwdGuard::enter(temp_dir.path())
-            .await
-            .unwrap();
 
         let mock = ConfigurableMockAiClient::new(vec![Ok("feat(cli): add".to_string())]);
         let prompts = mock.prompt_handle();
@@ -448,7 +441,7 @@ mod tests {
             file_patterns: Vec::new(),
         }];
 
-        let _ = run_staged_with_client(true, &scopes, &client)
+        let _ = run_staged_with_client(true, &scopes, &client, temp_dir.path())
             .await
             .unwrap();
         let recorded = prompts.prompts();
@@ -478,16 +471,13 @@ mod tests {
     #[tokio::test]
     async fn staged_command_execute_bails_when_nothing_staged() {
         let temp_dir = init_empty_repo();
-        let _guard = super::super::CwdGuard::enter(temp_dir.path())
-            .await
-            .unwrap();
         let cmd = StagedCommand {
             print_only: true,
             model: None,
             beta_header: None,
             context_dir: None,
         };
-        let err = cmd.execute(None).await.unwrap_err();
+        let err = cmd.execute(Some(temp_dir.path())).await.unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.to_lowercase().contains("no staged changes"),
@@ -500,20 +490,42 @@ mod tests {
     #[tokio::test]
     async fn staged_command_execute_rejects_malformed_beta_header() {
         let temp_dir = init_empty_repo();
-        let _guard = super::super::CwdGuard::enter(temp_dir.path())
-            .await
-            .unwrap();
         let cmd = StagedCommand {
             print_only: true,
             model: None,
             beta_header: Some("no-colon-here".to_string()),
             context_dir: None,
         };
-        let err = cmd.execute(None).await.unwrap_err();
+        let err = cmd.execute(Some(temp_dir.path())).await.unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("Invalid --beta-header"),
             "expected beta-header parse error, got: {msg}"
+        );
+    }
+
+    /// "No silent mix" guard: `read_staged_diff` reads the staged diff from the
+    /// INJECTED repo, not the process CWD. We stage a uniquely-marked file in
+    /// the temp repo, run with that repo injected (the process CWD is the
+    /// omni-dev checkout), and assert the marker reached the AI prompt.
+    #[tokio::test]
+    async fn run_staged_with_client_reads_diff_from_injected_repo() {
+        let temp_dir = init_repo_with_staged_change();
+
+        let mock = ConfigurableMockAiClient::new(vec![Ok("feat: x".to_string())]);
+        let prompts = mock.prompt_handle();
+        let client = ClaudeClient::new(Box::new(mock));
+
+        let _ = run_staged_with_client(true, &[], &client, temp_dir.path())
+            .await
+            .unwrap();
+
+        let recorded = prompts.prompts();
+        assert_eq!(recorded.len(), 1, "exactly one AI call");
+        let (_system, user) = &recorded[0];
+        assert!(
+            user.contains("marker_xyz"),
+            "staged diff from the injected repo must reach the prompt: {user}"
         );
     }
 }
