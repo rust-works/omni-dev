@@ -161,16 +161,11 @@ jobs:
           cat coverage-summary.txt
           echo '```'
         } >> "$GITHUB_STEP_SUMMARY"
-    - name: Build omni-dev binary
-      # Renders the PR comment below via `omni-dev coverage diff`. Under the same
-      # coverage env, this reuses the dependency artifacts already compiled for
-      # the tests — only omni-dev's own crate is rebuilt, not the whole tree. The
-      # resulting binary is coverage-instrumented, which is harmless to run.
-      if: github.event_name == 'pull_request'
-      run: |
-        # shellcheck disable=SC1090
-        source <(cargo llvm-cov show-env --sh)
-        cargo build --all-features --bin omni-dev
+    # No separate binary build: `cargo test` above already compiled the
+    # `omni-dev` executable (target/debug/omni-dev, part of the test build graph)
+    # with the same instrumentation env. The PR-comment step below runs it
+    # directly. Building it separately with `cargo build --bin` would recompile a
+    # dozen crates whose features differ once dev-dependencies drop out.
     - name: Upload coverage artifacts
       # The full summary lives here (not in the PR comment); codecov.json kept for
       # when the upload below is re-enabled. Runs before the comment so the comment
