@@ -21,7 +21,7 @@ use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
 
 use super::config::EncoderConfig;
-use super::nn::{sliding_window_mask, Weights, COMPUTE_DTYPE};
+use super::nn::{chunk_window_mask, sliding_window_mask, Weights, COMPUTE_DTYPE};
 
 /// The audio encoder, borrowing the loaded weights for the duration of a forward
 /// pass. Construct per-encode; holds no mutable state on the batch path.
@@ -86,9 +86,23 @@ impl<'a> AudioEncoder<'a> {
         }
     }
 
-    /// One encoder layer's attention with interleaved RoPE and an explicit mask.
-    /// `x` is `[seq, dim]`; biases are selective (wq/wv/wo yes, wk no).
-    fn attention(&self, x: &Array, layer: usize, mask: &Array) -> Result<Array> {
+    /// One encoder layer's attention with interleaved RoPE and an explicit mask,
+    /// threading an optional left-context KV block for chunked encoding.
+    ///
+    /// `x` is the current chunk `[seq, dim]`; q/k/v are RoPE'd at absolute
+    /// positions starting at `rope_offset`. When `prev_kv` is `Some`, those
+    /// (already-RoPE'd) keys/values are prepended before SDPA so a query attends
+    /// across the chunk boundary. Returns the attention output **and the current
+    /// chunk's RoPE'd `(k, v)`** for the next chunk to use as left context.
+    /// Biases are selective (wq/wv/wo yes, wk no).
+    fn attention_kv(
+        &self,
+        x: &Array,
+        layer: usize,
+        rope_offset: i32,
+        prev_kv: Option<&(Array, Array)>,
+        mask: &Array,
+    ) -> Result<(Array, (Array, Array))> {
         let prefix = format!("encoder.transformer_layers.{layer}.attention");
         let seq = x.shape()[0];
         let nh = self.cfg.n_heads as i32;
@@ -106,32 +120,36 @@ impl<'a> AudioEncoder<'a> {
         let k = to_heads(&k)?;
         let v = to_heads(&v)?;
 
-        // Fused interleaved RoPE (traditional=true), offset 0 on the batch path.
+        // Fused interleaved RoPE (traditional=true) at absolute positions.
         let theta = self.cfg.rope_theta;
-        let q = mlx_rs::fast::rope(&q, hd, true, theta, 1.0, 0, None)?;
-        let k = mlx_rs::fast::rope(&k, hd, true, theta, 1.0, 0, None)?;
+        let q = mlx_rs::fast::rope(&q, hd, true, theta, 1.0, rope_offset, None)?;
+        let k = mlx_rs::fast::rope(&k, hd, true, theta, 1.0, rope_offset, None)?;
+
+        // Prepend the previous chunk's KV (already RoPE'd at its own offsets).
+        let (ck, cv) = match prev_kv {
+            None => (k.clone(), v.clone()),
+            Some((pk, pv)) => (
+                concatenate(&[pk, &k], 2).map_err(|e| anyhow!("kv k concat layer {layer}: {e}"))?,
+                concatenate(&[pv, &v], 2).map_err(|e| anyhow!("kv v concat layer {layer}: {e}"))?,
+            ),
+        };
 
         let scale = 1.0 / (self.cfg.head_dim as f32).sqrt();
-        let out = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, scale, mask, None)
+        let out = mlx_rs::fast::scaled_dot_product_attention(&q, &ck, &cv, scale, mask, None)
             .map_err(|e| anyhow!("sdpa layer {layer}: {e}"))?;
 
         // [1, nh, seq, hd] -> [seq, nh*hd]
         let out = out.transpose(&[0, 2, 1, 3])?.reshape(&[seq, nh * hd])?;
-        self.w.qlinear(&out, &format!("{prefix}.wo"), true)
+        let out = self.w.qlinear(&out, &format!("{prefix}.wo"), true)?;
+        Ok((out, (k, v)))
     }
 
-    /// One full encoder transformer layer (pre-norm attention + SwiGLU FFN).
-    fn layer(&self, x: &Array, layer: usize, mask: &Array) -> Result<Array> {
+    /// The SwiGLU FFN sub-block (pre-norm + gated MLP + residual).
+    fn ffn_block(&self, x: &Array, layer: usize) -> Result<Array> {
         let lp = format!("encoder.transformer_layers.{layer}");
         let h = self
             .w
-            .rms_norm(x, &format!("{lp}.attention_norm"), self.cfg.norm_eps)?;
-        let h = self.attention(&h, layer, mask)?;
-        let x = x.add(&h)?;
-
-        let h = self
-            .w
-            .rms_norm(&x, &format!("{lp}.ffn_norm"), self.cfg.norm_eps)?;
+            .rms_norm(x, &format!("{lp}.ffn_norm"), self.cfg.norm_eps)?;
         let gate = mlx_rs::nn::silu(self.w.qlinear(
             &h,
             &format!("{lp}.feed_forward_w1"),
@@ -145,6 +163,30 @@ impl<'a> AudioEncoder<'a> {
             .qlinear(&gate.multiply(&up)?, &format!("{lp}.feed_forward_w2"), true)?;
         x.add(&ff)
             .map_err(|e| anyhow!("ffn residual layer {layer}: {e}"))
+    }
+
+    /// One full encoder transformer layer (pre-norm attention + SwiGLU FFN),
+    /// threading the chunk KV cache. Returns `(output, current-chunk (k, v))`.
+    fn layer_kv(
+        &self,
+        x: &Array,
+        layer: usize,
+        rope_offset: i32,
+        prev_kv: Option<&(Array, Array)>,
+        mask: &Array,
+    ) -> Result<(Array, (Array, Array))> {
+        let lp = format!("encoder.transformer_layers.{layer}");
+        let h = self
+            .w
+            .rms_norm(x, &format!("{lp}.attention_norm"), self.cfg.norm_eps)?;
+        let (h, kv) = self.attention_kv(&h, layer, rope_offset, prev_kv, mask)?;
+        let x = x.add(&h)?;
+        Ok((self.ffn_block(&x, layer)?, kv))
+    }
+
+    /// One full encoder transformer layer for the single-pass path (no cache).
+    fn layer(&self, x: &Array, layer: usize, mask: &Array) -> Result<Array> {
+        Ok(self.layer_kv(x, layer, 0, None, mask)?.0)
     }
 
     /// 4× downsample the encoder output and project to decoder dim via the
@@ -173,23 +215,23 @@ impl<'a> AudioEncoder<'a> {
 
     /// Largest conv-output length [`encode_full`] will run in a single SDPA. The
     /// `[seq, seq]` attention scores grow quadratically (≈ `seq² · n_heads · 2 B`
-    /// in F16), so a cap keeps offline clips on the memory-safe single-pass path;
-    /// longer audio needs the chunked rotating-cache encoder (#933 M3). At 2048
-    /// (≈ 41 s of audio) the scores are ≈ 256 MB — comfortable on unified memory.
+    /// in F16), so a cap keeps short clips on the memory-safe single-pass path;
+    /// longer audio routes to [`Self::encode_chunked`] (via [`Self::encode_conv`]).
+    /// At 2048 (≈ 41 s) the scores are ≈ 256 MB — comfortable on unified memory.
     pub const MAX_FULL_FRAMES: usize = 2048;
 
     /// Encodes a full conv output `[seq, 1280]` into the adapter output
     /// `[seq/4, 3072]` in a single pass: 32 transformer layers under one shared
     /// sliding-window causal mask, then RMS norm, downsample, and the adapter
-    /// projection. Equivalent to the reference's chunked rotating-cache encoding
-    /// over the whole sequence, capped at [`Self::MAX_FULL_FRAMES`] (longer audio
-    /// uses the M3 chunked path).
+    /// projection. Equivalent to [`Self::encode_chunked`] over the whole sequence,
+    /// capped at [`Self::MAX_FULL_FRAMES`] (callers should use
+    /// [`Self::encode_conv`], which dispatches to the chunked path above the cap).
     pub fn encode_full(&self, conv_out: &Array) -> Result<Array> {
         let seq = conv_out.shape()[0] as usize;
         if seq > Self::MAX_FULL_FRAMES {
             bail!(
                 "encoder.encode_full: {seq} conv frames exceeds the single-pass cap {} — \
-                 long-audio chunked encoding lands with streaming (#933 M3)",
+                 use encode_conv/encode_chunked for long audio",
                 Self::MAX_FULL_FRAMES
             );
         }
@@ -204,10 +246,61 @@ impl<'a> AudioEncoder<'a> {
         self.downsample_and_project(&x)
     }
 
-    /// Convenience: conv stem + [`Self::encode_full`] from a `[128, frames]` mel.
+    /// Encodes a conv output of **any length** by processing it in
+    /// sliding-window-sized chunks, each carrying the previous chunk's KV as
+    /// left context. Memory is bounded by one chunk's attention scores
+    /// regardless of total length; the result is numerically identical to
+    /// [`Self::encode_full`] (each query attends the same key window at the same
+    /// absolute RoPE positions). Used for audio beyond [`Self::MAX_FULL_FRAMES`].
+    pub fn encode_chunked(&self, conv_out: &Array) -> Result<Array> {
+        let sw = self.cfg.sliding_window;
+        let n = conv_out.shape()[0] as usize;
+        let n_layers = self.cfg.n_layers;
+
+        let mut prev_kv: Vec<Option<(Array, Array)>> = (0..n_layers).map(|_| None).collect();
+        let mut prev_len = 0usize;
+        let mut chunk_outputs: Vec<Array> = Vec::new();
+
+        let mut start = 0usize;
+        while start < n {
+            let end = (start + sw).min(n);
+            let chunk_len = end - start;
+            let mask = chunk_window_mask(chunk_len, prev_len, sw)?;
+            let mut x = conv_out.index((start as i32)..(end as i32));
+            for (layer, kv_slot) in prev_kv.iter_mut().enumerate() {
+                let (out, kv) = self.layer_kv(&x, layer, start as i32, kv_slot.as_ref(), &mask)?;
+                x = out;
+                *kv_slot = Some(kv);
+            }
+            chunk_outputs.push(self.w.rms_norm(
+                &x,
+                "encoder.transformer_norm",
+                self.cfg.norm_eps,
+            )?);
+            prev_len = chunk_len;
+            start = end;
+        }
+
+        let refs: Vec<&Array> = chunk_outputs.iter().collect();
+        let encoded = concatenate(&refs, 0).map_err(|e| anyhow!("concat chunk outputs: {e}"))?;
+        self.downsample_and_project(&encoded)
+    }
+
+    /// Encodes a conv output of any length, dispatching to the single-pass
+    /// [`Self::encode_full`] when it fits the memory cap, else the memory-bounded
+    /// [`Self::encode_chunked`]. Both yield the same adapter output.
+    pub fn encode_conv(&self, conv_out: &Array) -> Result<Array> {
+        if conv_out.shape()[0] as usize <= Self::MAX_FULL_FRAMES {
+            self.encode_full(conv_out)
+        } else {
+            self.encode_chunked(conv_out)
+        }
+    }
+
+    /// Convenience: conv stem + [`Self::encode_conv`] from a `[128, frames]` mel.
     pub fn encode(&self, mel: &Array) -> Result<Array> {
         let conv_out = self.conv_stem(mel)?;
-        self.encode_full(&conv_out)
+        self.encode_conv(&conv_out)
     }
 }
 
@@ -260,6 +353,56 @@ mod tests {
         assert!(
             out.as_slice::<f32>().iter().all(|x| x.is_finite()),
             "encoder output must be finite (no NaN/Inf)"
+        );
+    }
+
+    /// Chunked encoding must be numerically equivalent to the single-pass path
+    /// (same key window + absolute RoPE per query). Builds a multi-chunk conv
+    /// output (> sliding_window) and asserts the two adapter outputs match to
+    /// F16 tolerance — the M3 long-audio correctness guarantee.
+    #[test]
+    #[ignore = "requires the INT4 Voxtral model; set OMNI_DEV_VOICE_VOXTRAL_MLX_MODEL=<dir> (#933 M3)"]
+    fn chunked_encoding_matches_single_pass() {
+        let Some(dir) = model_dir() else {
+            panic!("set OMNI_DEV_VOICE_VOXTRAL_MLX_MODEL=<dir>");
+        };
+        let map = load_safetensors(&dir.join("model.safetensors")).expect("load weights");
+        let cfg = VoxtralMlxConfig::voxtral_realtime_mini_4b();
+        let enc = AudioEncoder::new(
+            Weights::new(&map, cfg.quant.group_size, cfg.quant.bits),
+            cfg.encoder,
+        );
+
+        // 1600 mel frames → conv ≈ 800 frames > 750 window → 2 chunks chunked,
+        // still ≤ 2048 so single-pass runs too. Compare the two.
+        let (bins, frames) = (128usize, 1600usize);
+        let mut data = vec![0.0_f32; bins * frames];
+        for (i, v) in data.iter_mut().enumerate() {
+            *v = ((i % 23) as f32 / 23.0).mul_add(3.0, -1.5);
+        }
+        let mel = Array::from_slice(&data, &[bins as i32, frames as i32]);
+        let conv_out = enc.conv_stem(&mel).expect("conv stem");
+        assert!(
+            conv_out.shape()[0] > cfg.encoder.sliding_window as i32,
+            "test needs a multi-chunk conv output"
+        );
+
+        let full = enc.encode_full(&conv_out).expect("encode_full");
+        let chunked = enc.encode_chunked(&conv_out).expect("encode_chunked");
+        assert_eq!(full.shape(), chunked.shape());
+
+        let diff = full
+            .subtract(&chunked)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None, None)
+            .unwrap();
+        diff.eval().unwrap();
+        let max_abs = diff.item::<f32>();
+        assert!(
+            max_abs < 0.05,
+            "chunked vs single-pass max abs diff {max_abs}"
         );
     }
 }

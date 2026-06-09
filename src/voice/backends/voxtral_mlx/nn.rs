@@ -131,3 +131,74 @@ pub fn sliding_window_mask(seq: usize, window: usize) -> Result<Array> {
     }
     Ok(Array::from_slice(&data, &[seq as i32, seq as i32]).as_dtype(COMPUTE_DTYPE)?)
 }
+
+/// Builds the additive sliding-window mask for chunked encoding:
+/// `[chunk_len, prev_len + chunk_len]`, where the keys are a `prev_len`-frame
+/// left-context block (the previous chunk) followed by the `chunk_len`-frame
+/// current chunk. With local query index `i` (absolute `chunk_start + i`) and
+/// combined key index `j` (absolute `chunk_start - prev_len + j`), a query
+/// attends iff `chunk_start - prev_len + j` lies in the window
+/// `(absolute_q - window, absolute_q]` — i.e. `i + prev_len - window < j ≤ i +
+/// prev_len`. With `prev_len = 0` this reduces to a plain causal mask, so a
+/// single chunk equals the [`sliding_window_mask`] single-pass path exactly.
+pub fn chunk_window_mask(chunk_len: usize, prev_len: usize, window: usize) -> Result<Array> {
+    let cols = prev_len + chunk_len;
+    let mut data = vec![0.0_f32; chunk_len * cols];
+    for (i, row) in data.chunks_mut(cols).enumerate() {
+        let hi = i + prev_len; // inclusive upper bound on j
+        let lo = (i + prev_len).saturating_sub(window); // exclusive lower bound
+        for (j, cell) in row.iter_mut().enumerate() {
+            if j > hi || j <= lo && (i + prev_len) >= window {
+                *cell = f32::NEG_INFINITY;
+            }
+        }
+    }
+    Ok(Array::from_slice(&data, &[chunk_len as i32, cols as i32]).as_dtype(COMPUTE_DTYPE)?)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// Reads an `[r, c]` F16 additive mask back as a boolean "attends" grid
+    /// (`true` where the entry is finite, i.e. allowed).
+    fn attends(mask: &Array, r: usize, c: usize) -> Vec<Vec<bool>> {
+        let m = mask.as_dtype(Dtype::Float32).unwrap();
+        m.eval().unwrap();
+        let flat = m.as_slice::<f32>();
+        (0..r)
+            .map(|i| (0..c).map(|j| flat[i * c + j].is_finite()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn chunk_mask_first_chunk_is_plain_causal() {
+        // prev_len = 0 → query i attends keys j ≤ i (chunk_len ≤ window).
+        let g = attends(&chunk_window_mask(4, 0, 750).unwrap(), 4, 4);
+        for (i, row) in g.iter().enumerate() {
+            for (j, &ok) in row.iter().enumerate() {
+                assert_eq!(ok, j <= i, "({i},{j})");
+            }
+        }
+    }
+
+    #[test]
+    fn chunk_mask_windows_across_the_boundary() {
+        // window = 3, prev_len = 3 (combined cols = 3 + chunk_len). Query i
+        // (abs i) attends combined key j (abs j-3) iff i-3 < j-3 ≤ i, i.e.
+        // i < j ≤ i+3.
+        let (chunk_len, prev_len, window) = (3usize, 3usize, 3usize);
+        let g = attends(
+            &chunk_window_mask(chunk_len, prev_len, window).unwrap(),
+            chunk_len,
+            prev_len + chunk_len,
+        );
+        for (i, row) in g.iter().enumerate() {
+            for (j, &ok) in row.iter().enumerate() {
+                let want = j > i && j <= i + window;
+                assert_eq!(ok, want, "({i},{j})");
+            }
+        }
+    }
+}

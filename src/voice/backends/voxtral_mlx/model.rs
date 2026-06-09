@@ -122,7 +122,7 @@ impl VoxtralMlxModel {
         );
         let conv_out = enc.conv_stem(&mel_array)?;
         let n_audio = (conv_out.shape()[0] / self.cfg.encoder.downsample_factor as i32) as usize;
-        let adapter_out = enc.encode_full(&conv_out)?; // [n_audio, dim]
+        let adapter_out = enc.encode_conv(&conv_out)?; // [n_audio, dim]
         let adapter_len = adapter_out.shape()[0] as usize;
 
         if prompt_len > adapter_len {
@@ -301,6 +301,42 @@ mod tests {
         println!("=================================");
         assert!(wer < 0.15, "WER {:.1}% too high", wer * 100.0);
         assert!(!hyp_words.is_empty(), "empty transcript");
+    }
+
+    /// Full 5-minute fixture transcription + WER/RTF — exercises the chunked
+    /// long-audio encoder (M3) and closes the M1.5 batch validation directly
+    /// comparable to the `voxtral.c` BF16 numbers (WER 4.12%, RTF 1.25). Run with
+    /// `--release` for a meaningful RTF.
+    #[test]
+    #[ignore = "requires the INT4 Voxtral model; set OMNI_DEV_VOICE_VOXTRAL_MLX_MODEL=<dir> (#933 M3)"]
+    fn full_monologue_wer_and_rtf() {
+        let Some(dir) = model_dir() else {
+            panic!("set OMNI_DEV_VOICE_VOXTRAL_MLX_MODEL=<dir>");
+        };
+        let model = VoxtralMlxModel::from_model_dir(&dir).expect("load model");
+        let wav = std::path::Path::new("tests/fixtures/voice/monologue_5min.wav");
+        let samples = load_wav_16k_mono(wav).expect("load monologue");
+        let dur = samples.len() as f64 / 16_000.0;
+
+        let start = std::time::Instant::now();
+        let text = model.transcribe(&samples).expect("transcribe");
+        let elapsed = start.elapsed().as_secs_f64();
+        let rtf = elapsed / dur;
+
+        let reference = std::fs::read_to_string("tests/fixtures/voice/monologue_5min.expected.txt")
+            .expect("read expected");
+        let ref_words = norm_words(&reference);
+        let hyp_words = norm_words(&text);
+        let wer = wer(&ref_words, &hyp_words);
+
+        println!("\n=== monologue {dur:.1}s (full) ===");
+        println!("transcript ({} words): {text}", hyp_words.len());
+        println!(
+            "WER: {:.1}%  |  RTF: {rtf:.3}  ({elapsed:.1}s / {dur:.1}s)",
+            wer * 100.0
+        );
+        println!("==================================");
+        assert!(wer < 0.10, "WER {:.1}% too high", wer * 100.0);
     }
 
     /// End-to-end offline transcription on the short English fixture. Prints the

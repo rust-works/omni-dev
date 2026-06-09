@@ -15,8 +15,12 @@
 //! `voxtral.c` BF16 path's RTF 1.25, confirming ADR-0039's INT4 real-time thesis
 //! (M1.5). The batch backend [`VoxtralMlxBackend`] implements [`Transcriber`] and
 //! is wired to `--backend voxtral-mlx` with a `voxtral-mlx-int4` install variant
-//! (M2). Remaining: long-audio chunking + the `StreamingTranscriber` (M3), CI
-//! graph-gating, and docs/security/`voxtral.c` fate (M4).
+//! (M2). Long audio of any length is handled by the chunked encoder
+//! ([`AudioEncoder::encode_chunked`], proven numerically equal to the single-pass
+//! path); on the full 5-min fixture it measured **WER 4.0%** and **RTF 0.263**,
+//! matching `voxtral.c`'s 4.12% at ≈ 5× its speed (M3a). Remaining: the
+//! `StreamingTranscriber` impl (M3b), CI graph-gating, and
+//! docs/security/`voxtral.c` fate (M4).
 //!
 //! [`Transcriber`]: crate::voice::Transcriber
 //!
