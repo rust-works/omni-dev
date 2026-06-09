@@ -20,7 +20,8 @@ use hf_hub::{api::sync::Api, Repo, RepoType};
 use sha2::{Digest, Sha256};
 
 use crate::voice::models::{
-    ModelSource, ModelSpec, SPEAKER_WESPEAKER_EN, VOXTRAL_MINI_4B, WHISPER_TINY_EN,
+    ModelSource, ModelSpec, SPEAKER_WESPEAKER_EN, VOXTRAL_MINI_4B, VOXTRAL_MLX_INT4,
+    WHISPER_TINY_EN,
 };
 
 /// Which model variant to install.
@@ -42,6 +43,11 @@ pub enum Variant {
     /// macOS/Linux, but installable on any host.
     #[value(name = "voxtral-mini-4b-realtime")]
     VoxtralMini4bRealtime,
+    /// Voxtral Realtime Mini 4B, INT4-quantized — real-time MLX backend
+    /// (ADR-0039, #933). ~2.6 GB; usable only by the `voxtral-mlx` backend on
+    /// macOS Apple Silicon, but installable on any host.
+    #[value(name = "voxtral-mlx-int4")]
+    VoxtralMlxInt4,
 }
 
 impl Variant {
@@ -51,6 +57,7 @@ impl Variant {
             Self::WhisperTinyEn => &WHISPER_TINY_EN,
             Self::SpeakerWespeakerEn => &SPEAKER_WESPEAKER_EN,
             Self::VoxtralMini4bRealtime => &VOXTRAL_MINI_4B,
+            Self::VoxtralMlxInt4 => &VOXTRAL_MLX_INT4,
         }
     }
 }

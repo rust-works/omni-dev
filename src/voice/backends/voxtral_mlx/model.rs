@@ -83,6 +83,12 @@ impl VoxtralMlxModel {
         })
     }
 
+    /// Overrides the decoder delay (lookahead) in milliseconds; the next
+    /// transcription recomputes the ada-norm gains for it.
+    pub fn set_delay_ms(&mut self, delay_ms: u32) {
+        self.delay_ms = delay_ms;
+    }
+
     /// Greedy `argmax` over a `[1, vocab]` logits row → token id.
     fn argmax(logits: &Array) -> Result<i64> {
         let axis = (logits.ndim() - 1) as i32;

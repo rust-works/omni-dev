@@ -71,10 +71,11 @@ pub fn create_default_transcriber(opts: &VoiceOpts) -> Result<Box<dyn Transcribe
             Ok(Box::new(CandleTranscriber::new(&dir)?))
         }
         "voxtral" => create_voxtral_transcriber(opts),
+        "voxtral-mlx" => create_voxtral_mlx_transcriber(opts),
         other => {
             bail!(
                 "unknown voice backend: {other:?} \
-                 (supported: \"mock\", \"whisper-candle\", \"voxtral\")"
+                 (supported: \"mock\", \"whisper-candle\", \"voxtral\", \"voxtral-mlx\")"
             )
         }
     }
@@ -109,10 +110,17 @@ pub fn create_default_streaming_transcriber(
                  or `voice transcribe` for batch"
             )
         }
+        "voxtral-mlx" => {
+            bail!(
+                "streaming backend not yet implemented for \"voxtral-mlx\" \
+                 (lands in #933 M3); use --backend voxtral or mock for streaming, \
+                 or `voice transcribe --backend voxtral-mlx` for batch"
+            )
+        }
         other => {
             bail!(
                 "unknown voice backend: {other:?} \
-                 (supported: \"mock\", \"whisper-candle\", \"voxtral\")"
+                 (supported: \"mock\", \"whisper-candle\", \"voxtral\", \"voxtral-mlx\")"
             )
         }
     }
@@ -211,6 +219,55 @@ fn create_voxtral_transcriber(opts: &VoiceOpts) -> Result<Box<dyn Transcriber>> 
     }
 }
 
+/// Constructs the real-time INT4 Voxtral MLX backend (#933, [ADR-0039]).
+///
+/// MLX is Apple-only, so this backend is available only on macOS Apple Silicon
+/// with the off-by-default `voxtral-mlx` feature (which builds the MLX C++ core
+/// via CMake — the cost ADR-0039 narrowly permits). As with `voxtral`, the name
+/// is recognised on **every** host per ADR-0035: an unavailable configuration
+/// yields a clear construction-time error explaining **why**, never a build break
+/// and never a silent fall-through to another backend.
+///
+/// [ADR-0039]: ../../../docs/adrs/adr-0039.md
+fn create_voxtral_mlx_transcriber(opts: &VoiceOpts) -> Result<Box<dyn Transcriber>> {
+    #[cfg(all(feature = "voxtral-mlx", target_os = "macos", target_arch = "aarch64"))]
+    {
+        use crate::voice::backends::voxtral_mlx::{
+            VoxtralMlxBackend, DEFAULT_VOXTRAL_MLX_DELAY_MS,
+        };
+        use crate::voice::models::resolve_voxtral_mlx_model_dir;
+
+        let dir = resolve_voxtral_mlx_model_dir(opts)?;
+        let delay_ms = opts
+            .delay_ms
+            .map_or(DEFAULT_VOXTRAL_MLX_DELAY_MS, |ms| ms.max(0) as u32);
+        Ok(Box::new(VoxtralMlxBackend::new(&dir, delay_ms)?))
+    }
+
+    #[cfg(not(all(feature = "voxtral-mlx", target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = opts;
+        // MLX is Apple-Silicon-only. Distinguish "wrong platform" from "feature
+        // off" so the message points at the right fix.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            bail!(
+                "voice backend \"voxtral-mlx\" was not compiled in; rebuild with \
+                 `--features voxtral-mlx` (it builds the MLX C++ core via CMake — \
+                 see ADR-0039), or use --backend voxtral or whisper-candle"
+            )
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            bail!(
+                "voice backend \"voxtral-mlx\" is only available on macOS Apple \
+                 Silicon by design (MLX is Apple-only — ADR-0039); use \
+                 --backend whisper-candle, or --backend voxtral on macOS/Linux"
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -290,6 +347,7 @@ mod tests {
         assert!(msg.contains("supported"), "got: {msg}");
         assert!(msg.contains("whisper-candle"), "got: {msg}");
         assert!(msg.contains("voxtral"), "got: {msg}");
+        assert!(msg.contains("voxtral-mlx"), "got: {msg}");
     }
 
     // The "voxtral" backend name is recognised on every host (ADR-0035's
@@ -361,6 +419,76 @@ mod tests {
         let msg = voxtral_error();
         assert!(msg.contains("voxtral"), "got: {msg}");
         assert!(msg.contains("--features voxtral"), "got: {msg}");
+        assert!(!msg.contains("unknown"), "got: {msg}");
+    }
+
+    // The "voxtral-mlx" backend (ADR-0039) follows the same cross-platform
+    // descriptor contract: recognised everywhere, with a clear construction-time
+    // error wherever the Apple-Silicon MLX backend is unavailable.
+
+    /// Helper: route `--backend voxtral-mlx` through the factory and return the
+    /// error it must produce wherever the MLX backend is unavailable.
+    #[cfg(not(all(feature = "voxtral-mlx", target_os = "macos", target_arch = "aarch64")))]
+    fn voxtral_mlx_error() -> String {
+        let _g = env_guard();
+        std::env::remove_var("OMNI_DEV_VOICE_BACKEND");
+        let opts = VoiceOpts {
+            backend: Some("voxtral-mlx".to_string()),
+            model: None,
+            delay_ms: None,
+        };
+        create_default_transcriber(&opts)
+            .err()
+            .expect("expected voxtral-mlx to error where the MLX backend is absent")
+            .to_string()
+    }
+
+    #[cfg(all(feature = "voxtral-mlx", target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn voxtral_mlx_feature_on_propagates_missing_model_error() {
+        // Feature compiled in on Apple Silicon: the factory routes "voxtral-mlx"
+        // through VoxtralMlxBackend::new → ensure_voxtral_mlx_model_present.
+        // Point --model at an empty dir and verify the install hint reaches the
+        // caller (mirroring the voxtral arm).
+        let _g = env_guard();
+        std::env::remove_var("OMNI_DEV_VOICE_BACKEND");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let opts = VoiceOpts {
+            backend: Some("voxtral-mlx".to_string()),
+            model: Some(tmp.path().to_path_buf()),
+            delay_ms: None,
+        };
+        let err = create_default_transcriber(&opts)
+            .err()
+            .expect("expected voxtral-mlx with empty model dir to error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no Voxtral MLX INT4 model found"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("--variant voxtral-mlx-int4"), "got: {msg}");
+        assert!(!msg.contains("unknown"), "got: {msg}");
+    }
+
+    #[cfg(all(
+        target_os = "macos",
+        target_arch = "aarch64",
+        not(feature = "voxtral-mlx")
+    ))]
+    #[test]
+    fn voxtral_mlx_feature_off_reports_not_compiled_in() {
+        let msg = voxtral_mlx_error();
+        assert!(msg.contains("voxtral-mlx"), "got: {msg}");
+        assert!(msg.contains("--features voxtral-mlx"), "got: {msg}");
+        assert!(!msg.contains("unknown"), "got: {msg}");
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    #[test]
+    fn voxtral_mlx_on_non_apple_silicon_reports_unavailable_by_design() {
+        let msg = voxtral_mlx_error();
+        assert!(msg.contains("voxtral-mlx"), "got: {msg}");
+        assert!(msg.contains("Apple"), "got: {msg}");
         assert!(!msg.contains("unknown"), "got: {msg}");
     }
 

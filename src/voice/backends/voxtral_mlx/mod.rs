@@ -13,9 +13,12 @@
 //! produces correct transcripts; on a 32 s prefix of the 5-min fixture (release)
 //! it measured **WER 1.5%** and **RTF 0.193** (≈ 5× real-time) — versus the
 //! `voxtral.c` BF16 path's RTF 1.25, confirming ADR-0039's INT4 real-time thesis
-//! (M1.5). Remaining: the `Transcriber` impl + model management (M2), long-audio
-//! chunking + the `StreamingTranscriber` (M3), and docs/security/`voxtral.c` fate
-//! (M4).
+//! (M1.5). The batch backend [`VoxtralMlxBackend`] implements [`Transcriber`] and
+//! is wired to `--backend voxtral-mlx` with a `voxtral-mlx-int4` install variant
+//! (M2). Remaining: long-audio chunking + the `StreamingTranscriber` (M3), CI
+//! graph-gating, and docs/security/`voxtral.c` fate (M4).
+//!
+//! [`Transcriber`]: crate::voice::Transcriber
 //!
 //! [ADR-0039]: ../../../../docs/adrs/adr-0039.md
 // Port in progress (#933 M1): layers consume the config/weights incrementally,
@@ -23,6 +26,7 @@
 // are removed when the backend is complete (M1.5).
 #![allow(dead_code, missing_docs)]
 
+mod backend;
 mod config;
 mod decoder;
 mod encoder;
@@ -32,6 +36,7 @@ mod nn;
 mod tokenizer;
 mod weights;
 
+pub use backend::{VoxtralMlxBackend, DEFAULT_VOXTRAL_MLX_DELAY_MS};
 pub use config::VoxtralMlxConfig;
 pub use decoder::{Decoder, KvCache};
 pub use encoder::AudioEncoder;

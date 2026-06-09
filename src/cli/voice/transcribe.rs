@@ -49,9 +49,11 @@ pub struct TranscribeCommand {
     /// produce one — `transcribe` does not resample.
     pub wav: PathBuf,
 
-    /// Transcriber backend (`mock`, `whisper-candle`, `voxtral`). Defaults to
-    /// `mock`; see ADR-0033 for the `whisper-candle` runtime and ADR-0037 for
-    /// the platform-gated native `voxtral` backend (opt-in, macOS/Linux only).
+    /// Transcriber backend (`mock`, `whisper-candle`, `voxtral`, `voxtral-mlx`).
+    /// Defaults to `mock`; see ADR-0033 for the `whisper-candle` runtime,
+    /// ADR-0037 for the platform-gated native `voxtral` backend (opt-in,
+    /// macOS/Linux), and ADR-0039 for the real-time INT4 `voxtral-mlx` backend
+    /// (opt-in, macOS Apple Silicon only).
     #[arg(long)]
     pub backend: Option<String>,
 
@@ -62,8 +64,8 @@ pub struct TranscribeCommand {
     pub model: Option<PathBuf>,
 
     /// Voxtral decoder delay (lookahead) in milliseconds; the #930 spike's
-    /// sweet spot is 240–480 ms. Only used by `--backend voxtral`; ignored by
-    /// `mock` and `whisper-candle`. Defaults to 480 ms.
+    /// sweet spot is 240–480 ms. Used by `--backend voxtral` and `voxtral-mlx`;
+    /// ignored by `mock` and `whisper-candle`. Defaults to 480 ms.
     #[arg(long)]
     pub delay_ms: Option<i32>,
 

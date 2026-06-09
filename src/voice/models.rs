@@ -243,6 +243,43 @@ pub fn ensure_voxtral_model_present(dir: &Path) -> Result<()> {
     VOXTRAL_MINI_4B.ensure_present(dir)
 }
 
+/// Voxtral Realtime Mini 4B, **INT4-quantized** — the real-time MLX backend
+/// (ADR-0039, #933 M2).
+///
+/// The `voxtral-mlx` backend loads `model.safetensors` (~2.6 GB MLX
+/// group-quantized 4-bit, far smaller than the BF16 `consolidated.safetensors`)
+/// and the `tekken.json` tokenizer. The revision is pinned to the commit
+/// validated in M1.5 (WER 1.5%, RTF 0.193). Apache-2.0, ungated — installable on
+/// any host, but consumable only by the Apple-Silicon `voxtral-mlx` backend.
+pub const VOXTRAL_MLX_INT4: ModelSpec = ModelSpec {
+    variant: "voxtral-mlx-int4",
+    kind_label: "Voxtral MLX INT4",
+    default_subdir: "voxtral-mlx-int4",
+    required_files: &["model.safetensors", "tekken.json"],
+    env_var: "OMNI_DEV_VOICE_VOXTRAL_MLX_MODEL",
+    install_command: "omni-dev voice install-model --variant voxtral-mlx-int4",
+    model_flag: "--model",
+    source: ModelSource::HfHub {
+        repo_id: "mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit",
+        revision: "fdebf7b2af834a1db4b8a3c99ab7480b333adf9e",
+    },
+};
+
+/// Resolves the INT4 Voxtral MLX model directory for the current invocation.
+///
+/// Priority: `opts.model` → `OMNI_DEV_VOICE_VOXTRAL_MLX_MODEL` → default
+/// `~/.omni-dev/voice/models/voxtral-mlx-int4/`. Not validated for existence;
+/// pair with [`ensure_voxtral_mlx_model_present`] to fail fast.
+pub fn resolve_voxtral_mlx_model_dir(opts: &VoiceOpts) -> Result<PathBuf> {
+    VOXTRAL_MLX_INT4.resolve_dir(opts.model.as_deref())
+}
+
+/// Verifies `dir` contains the INT4 Voxtral MLX model files, returning the
+/// install hint shaped for the `voxtral-mlx-int4` variant on failure.
+pub fn ensure_voxtral_mlx_model_present(dir: &Path) -> Result<()> {
+    VOXTRAL_MLX_INT4.ensure_present(dir)
+}
+
 // ── Backwards-compatible Whisper helpers (thin shims) ────────────────────
 
 /// Returns the absolute path of each required model file inside `dir`.
