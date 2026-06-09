@@ -96,18 +96,19 @@ impl TwiddleCommand {
 
     /// Executes the twiddle command with contextual intelligence.
     pub async fn execute(mut self, repo: Option<&std::path::Path>) -> Result<()> {
-        if repo.is_some() {
-            anyhow::bail!("--repo is not yet supported for `git commit message twiddle`");
-        }
         // Resolve deprecated --batch-size into --concurrency
         if let Some(bs) = self.batch_size {
             eprintln!("warning: --batch-size is deprecated; use --concurrency instead");
             self.concurrency = bs;
         }
 
+        // Resolve the repo root once; every git, config, and scratch read below
+        // anchors to it (the CWD is the default when no path is injected).
+        let repo_root = repo.unwrap_or_else(|| std::path::Path::new("."));
+
         // If --no-ai flag is set, skip AI processing and output YAML directly
         if self.no_ai {
-            return self.execute_no_ai().await;
+            return self.execute_no_ai(repo_root).await;
         }
 
         // Preflight check: validate AI credentials before any processing
@@ -118,7 +119,7 @@ impl TwiddleCommand {
         );
 
         // Preflight check: ensure working directory is clean before expensive operations
-        crate::utils::preflight::check_working_directory_clean()?;
+        crate::utils::check_working_directory_clean_at(repo_root)?;
         println!("✓ Working directory is clean");
 
         // Initialize Claude client
@@ -130,7 +131,7 @@ impl TwiddleCommand {
         let claude_client =
             crate::claude::create_default_claude_client(self.model.clone(), beta).await?;
 
-        self.execute_with_client(claude_client).await
+        self.execute_with_client(repo_root, claude_client).await
     }
 
     /// Test-injectable inner core of [`Self::execute`].
@@ -141,6 +142,7 @@ impl TwiddleCommand {
     /// outer [`Self::execute`] before this is reached.
     pub(crate) async fn execute_with_client(
         self,
+        repo_root: &std::path::Path,
         claude_client: crate::claude::client::ClaudeClient,
     ) -> Result<()> {
         // Determine if contextual analysis should be used
@@ -155,18 +157,18 @@ impl TwiddleCommand {
         }
 
         // 1. Generate repository view to get all commits
-        let mut full_repo_view = self.generate_repository_view().await?;
+        let mut full_repo_view = self.generate_repository_view(repo_root).await?;
 
         // 2. Use parallel map-reduce for multiple commits
         if full_repo_view.commits.len() > 1 {
             return self
-                .execute_with_map_reduce(use_contextual, full_repo_view, claude_client)
+                .execute_with_map_reduce(repo_root, use_contextual, full_repo_view, claude_client)
                 .await;
         }
 
         // 3. Collect contextual information (Phase 3)
         let context = if use_contextual {
-            Some(self.collect_context(&full_repo_view).await?)
+            Some(self.collect_context(repo_root, &full_repo_view).await?)
         } else {
             None
         };
@@ -174,7 +176,7 @@ impl TwiddleCommand {
         // Refine detected scopes using file_patterns from scope definitions
         let scope_defs = match &context {
             Some(ctx) => ctx.project.valid_scopes.clone(),
-            None => self.load_check_scopes(),
+            None => self.load_check_scopes(repo_root),
         };
         for commit in &mut full_repo_view.commits {
             commit.analysis.refine_scope(&scope_defs);
@@ -250,12 +252,13 @@ impl TwiddleCommand {
             }
 
             // 8. Apply amendments (re-read from file to capture any user edits)
-            self.apply_amendments_from_file(&amendments_file).await?;
+            self.apply_amendments_from_file(repo_root, &amendments_file)
+                .await?;
             println!("✅ Commit messages improved successfully!");
 
             // 9. Run post-twiddle check if --check flag is set
             if self.check {
-                self.run_post_twiddle_check().await?;
+                self.run_post_twiddle_check(repo_root).await?;
             }
         } else {
             println!("✨ No commits found to process!");
@@ -272,6 +275,7 @@ impl TwiddleCommand {
     /// single batch since the AI already saw them together.
     async fn execute_with_map_reduce(
         &self,
+        repo_root: &std::path::Path,
         use_contextual: bool,
         mut full_repo_view: crate::data::RepositoryView,
         claude_client: crate::claude::client::ClaudeClient,
@@ -298,7 +302,7 @@ impl TwiddleCommand {
 
         // Collect context once (shared across all commits)
         let context = if use_contextual {
-            Some(self.collect_context(&full_repo_view).await?)
+            Some(self.collect_context(repo_root, &full_repo_view).await?)
         } else {
             None
         };
@@ -310,7 +314,7 @@ impl TwiddleCommand {
         // Refine scopes on all commits upfront
         let scope_defs = match &context {
             Some(ctx) => ctx.project.valid_scopes.clone(),
-            None => self.load_check_scopes(),
+            None => self.load_check_scopes(repo_root),
         };
         for commit in &mut full_repo_view.commits {
             commit.analysis.refine_scope(&scope_defs);
@@ -580,11 +584,12 @@ impl TwiddleCommand {
                 }
             }
 
-            self.apply_amendments_from_file(&amendments_file).await?;
+            self.apply_amendments_from_file(repo_root, &amendments_file)
+                .await?;
             println!("✅ Commit messages improved successfully!");
 
             if self.check {
-                self.run_post_twiddle_check().await?;
+                self.run_post_twiddle_check(repo_root).await?;
             }
         } else {
             println!("✨ No commits found to process!");
@@ -594,7 +599,10 @@ impl TwiddleCommand {
     }
 
     /// Generates the repository view (reuses ViewCommand logic).
-    async fn generate_repository_view(&self) -> Result<crate::data::RepositoryView> {
+    async fn generate_repository_view(
+        &self,
+        repo_root: &std::path::Path,
+    ) -> Result<crate::data::RepositoryView> {
         use crate::data::{
             AiInfo, BranchInfo, FieldExplanation, FileStatusInfo, RepositoryView, VersionInfo,
             WorkingDirectoryInfo,
@@ -605,8 +613,8 @@ impl TwiddleCommand {
         let commit_range = self.commit_range.as_deref().unwrap_or("HEAD~5..HEAD");
 
         // Open git repository
-        let repo = GitRepository::open()
-            .context("Failed to open git repository. Make sure you're in a git repository.")?;
+        let repo = GitRepository::open_at(repo_root)
+            .context("Failed to open git repository at the given path")?;
 
         // Get current branch name
         let current_branch = repo
@@ -639,8 +647,8 @@ impl TwiddleCommand {
         });
 
         // Get AI scratch directory
-        let ai_scratch_path =
-            ai_scratch::get_ai_scratch_dir().context("Failed to determine AI scratch directory")?;
+        let ai_scratch_path = ai_scratch::get_ai_scratch_dir_at(repo_root)
+            .context("Failed to determine AI scratch directory")?;
         let ai_info = AiInfo {
             scratch: ai_scratch_path.to_string_lossy().to_string(),
         };
@@ -793,14 +801,17 @@ impl TwiddleCommand {
     }
 
     /// Applies amendments from a file path (re-reads from disk to capture user edits).
-    async fn apply_amendments_from_file(&self, amendments_file: &std::path::Path) -> Result<()> {
+    async fn apply_amendments_from_file(
+        &self,
+        repo_root: &std::path::Path,
+        amendments_file: &std::path::Path,
+    ) -> Result<()> {
         use crate::git::AmendmentHandler;
 
-        // Use AmendmentHandler to apply amendments directly from file.
-        // `twiddle` is still CWD-pinned (converted in a later slice), so the
-        // injected root is `.` — byte-identical to the pre-injection behavior.
-        let handler = AmendmentHandler::new(std::path::Path::new("."))
-            .context("Failed to initialize amendment handler")?;
+        // Use AmendmentHandler to apply amendments directly from file, anchored
+        // to the injected repo root.
+        let handler =
+            AmendmentHandler::new(repo_root).context("Failed to initialize amendment handler")?;
         handler
             .apply_amendments(&amendments_file.to_string_lossy())
             .context("Failed to apply amendments")?;
@@ -811,6 +822,7 @@ impl TwiddleCommand {
     /// Collects contextual information for enhanced commit message generation.
     async fn collect_context(
         &self,
+        repo_root: &std::path::Path,
         repo_view: &crate::data::RepositoryView,
     ) -> Result<crate::data::context::CommitContext> {
         use crate::claude::context::{
@@ -821,12 +833,13 @@ impl TwiddleCommand {
         let mut context = CommitContext::new();
 
         // 1. Discover project context
-        let (context_dir, dir_source) =
-            crate::claude::context::resolve_context_dir_with_source(self.context_dir.as_deref());
+        let (context_dir, dir_source) = crate::claude::context::resolve_context_dir_with_source_at(
+            self.context_dir.as_deref(),
+            repo_root,
+        );
 
         // ProjectDiscovery takes repo root and context directory
-        let repo_root = std::path::PathBuf::from(".");
-        let discovery = ProjectDiscovery::new(repo_root, context_dir.clone());
+        let discovery = ProjectDiscovery::new(repo_root.to_path_buf(), context_dir.clone());
         debug!(context_dir = ?context_dir, "Using context directory");
         match discovery.discover() {
             Ok(project_context) => {
@@ -849,7 +862,7 @@ impl TwiddleCommand {
         } else {
             // Fallback to getting current branch directly if not in repo view
             use crate::git::GitRepository;
-            let repo = GitRepository::open()?;
+            let repo = GitRepository::open_at(repo_root)?;
             let current_branch = repo
                 .get_current_branch()
                 .unwrap_or_else(|_| "HEAD".to_string());
@@ -937,6 +950,12 @@ impl TwiddleCommand {
 
         // Get actual metadata from the client
         let metadata = client.get_ai_client_metadata();
+        // NOTE (#967): this `--verbose` diagnostic banner reads the process-wide
+        // model catalog (`get_model_registry` → CWD-relative project models.yaml),
+        // not a `--repo`-scoped catalog. It is informational only and does not
+        // affect the twiddle output, so it is left CWD-scoped until the
+        // repo-aware `ModelRegistry::load_at` foundation lands (first used by
+        // `create pr`).
         let registry = get_model_registry();
 
         if let Some(spec) = registry.get_model_spec(&metadata.model) {
@@ -1024,13 +1043,13 @@ impl TwiddleCommand {
     }
 
     /// Executes the twiddle command without AI, creating amendments with original messages.
-    async fn execute_no_ai(&self) -> Result<()> {
+    async fn execute_no_ai(&self, repo_root: &std::path::Path) -> Result<()> {
         use crate::data::amendments::{Amendment, AmendmentFile};
 
         println!("📋 Generating amendments YAML without AI processing...");
 
         // Generate repository view to get all commits
-        let repo_view = self.generate_repository_view().await?;
+        let repo_view = self.generate_repository_view(repo_root).await?;
 
         // Create amendments with original commit messages (no AI improvements)
         let amendments: Vec<Amendment> = repo_view
@@ -1076,12 +1095,13 @@ impl TwiddleCommand {
             }
 
             // Apply amendments (re-read from file to capture any user edits)
-            self.apply_amendments_from_file(&amendments_file).await?;
+            self.apply_amendments_from_file(repo_root, &amendments_file)
+                .await?;
             println!("✅ Commit messages applied successfully!");
 
             // Run post-twiddle check if --check flag is set
             if self.check {
-                self.run_post_twiddle_check().await?;
+                self.run_post_twiddle_check(repo_root).await?;
             }
         } else {
             println!("✨ No commits found to process!");
@@ -1093,12 +1113,12 @@ impl TwiddleCommand {
     /// Runs commit message validation after twiddle amendments are applied.
     /// If the check finds errors with suggestions, automatically applies the
     /// suggestions and re-checks, up to 3 retries.
-    async fn run_post_twiddle_check(&self) -> Result<()> {
+    async fn run_post_twiddle_check(&self, repo_root: &std::path::Path) -> Result<()> {
         const MAX_CHECK_RETRIES: u32 = 3;
 
         // Load guidelines, scopes, and Claude client once (they don't change between retries)
-        let guidelines = self.load_check_guidelines()?;
-        let valid_scopes = self.load_check_scopes();
+        let guidelines = self.load_check_guidelines(repo_root)?;
+        let valid_scopes = self.load_check_scopes(repo_root);
         let beta = self
             .beta_header
             .as_deref()
@@ -1116,7 +1136,7 @@ impl TwiddleCommand {
             }
 
             // Generate fresh repository view to get updated commit messages
-            let mut repo_view = self.generate_repository_view().await?;
+            let mut repo_view = self.generate_repository_view(repo_root).await?;
 
             if repo_view.commits.is_empty() {
                 println!("⚠️  No commits to check");
@@ -1131,7 +1151,7 @@ impl TwiddleCommand {
             }
 
             if attempt == 0 {
-                self.show_check_guidance_files_status(&guidelines, &valid_scopes);
+                self.show_check_guidance_files_status(repo_root, &guidelines, &valid_scopes);
             }
 
             // Run check
@@ -1201,7 +1221,8 @@ impl TwiddleCommand {
             amendment_file
                 .save_to_file(temp_file.path())
                 .context("Failed to save retry amendments")?;
-            self.apply_amendments_from_file(temp_file.path()).await?;
+            self.apply_amendments_from_file(repo_root, temp_file.path())
+                .await?;
         }
 
         Ok(())
@@ -1236,29 +1257,35 @@ impl TwiddleCommand {
     }
 
     /// Loads commit guidelines for check via the standard resolution chain.
-    fn load_check_guidelines(&self) -> Result<Option<String>> {
-        let context_dir = crate::claude::context::resolve_context_dir(self.context_dir.as_deref());
+    fn load_check_guidelines(&self, repo_root: &std::path::Path) -> Result<Option<String>> {
+        let context_dir =
+            crate::claude::context::resolve_context_dir_at(self.context_dir.as_deref(), repo_root);
         crate::claude::context::load_config_content(&context_dir, "commit-guidelines.md")
     }
 
     /// Loads valid scopes for check with ecosystem defaults.
-    fn load_check_scopes(&self) -> Vec<crate::data::context::ScopeDefinition> {
-        let context_dir = crate::claude::context::resolve_context_dir(self.context_dir.as_deref());
-        crate::claude::context::load_project_scopes(&context_dir, &std::path::PathBuf::from("."))
+    fn load_check_scopes(
+        &self,
+        repo_root: &std::path::Path,
+    ) -> Vec<crate::data::context::ScopeDefinition> {
+        let context_dir =
+            crate::claude::context::resolve_context_dir_at(self.context_dir.as_deref(), repo_root);
+        crate::claude::context::load_project_scopes(&context_dir, repo_root)
     }
 
     /// Shows guidance files status for check.
     fn show_check_guidance_files_status(
         &self,
+        repo_root: &std::path::Path,
         guidelines: &Option<String>,
         valid_scopes: &[crate::data::context::ScopeDefinition],
     ) {
         use crate::claude::context::{
-            config_source_label, resolve_context_dir_with_source, ConfigSourceLabel,
+            config_source_label, resolve_context_dir_with_source_at, ConfigSourceLabel,
         };
 
         let (context_dir, dir_source) =
-            resolve_context_dir_with_source(self.context_dir.as_deref());
+            resolve_context_dir_with_source_at(self.context_dir.as_deref(), repo_root);
 
         println!("📋 Project guidance files status:");
         println!("   📂 Config dir: {} ({dir_source})", context_dir.display());
@@ -1755,38 +1782,39 @@ pub struct TwiddleOutcome {
 /// `dry_run` is false and never opens an editor. When `dry_run` is true,
 /// proposed amendments are returned as YAML without being applied.
 ///
-/// Like [`super::run_check`], a `Some` `repo_path` pins the process CWD for
-/// the duration of the call.
+/// `repo_path` selects the repository to twiddle (`None` defaults to the
+/// current working directory). It is resolved once here and threaded explicitly
+/// into [`run_twiddle_with_client`], so git, context-discovery, AI-scratch, and
+/// amendment-apply paths anchor to the target repo without changing the process
+/// working directory.
 pub async fn run_twiddle(
     range: Option<&str>,
     model: Option<String>,
     dry_run: bool,
     repo_path: Option<&std::path::Path>,
 ) -> Result<TwiddleOutcome> {
-    let _cwd_guard = match repo_path {
-        Some(p) => Some(super::CwdGuard::enter(p).await?),
-        None => None,
-    };
+    let repo_root = repo_path.unwrap_or_else(|| std::path::Path::new("."));
 
     crate::utils::check_ai_command_prerequisites(model.as_deref())?;
 
     if !dry_run {
-        crate::utils::preflight::check_working_directory_clean()?;
+        crate::utils::check_working_directory_clean_at(repo_root)?;
     }
 
     let claude_client = crate::claude::create_default_claude_client(model, None).await?;
-    run_twiddle_with_client(range, dry_run, &claude_client).await
+    run_twiddle_with_client(range, dry_run, repo_root, &claude_client).await
 }
 
 /// Non-credential-gated inner core of [`run_twiddle`] for unit tests.
 ///
 /// Extracted so tests can inject a [`crate::claude::client::ClaudeClient`]
 /// backed by the in-crate mock AI client and exercise the full flow without
-/// real credentials. Callers are responsible for holding any
-/// [`super::CwdGuard`] they need and for running preflight themselves.
+/// real credentials. `repo_root` selects the repository; callers run preflight
+/// themselves.
 pub(crate) async fn run_twiddle_with_client(
     range: Option<&str>,
     dry_run: bool,
+    repo_root: &std::path::Path,
     claude_client: &crate::claude::client::ClaudeClient,
 ) -> Result<TwiddleOutcome> {
     use crate::data::{
@@ -1798,8 +1826,8 @@ pub(crate) async fn run_twiddle_with_client(
 
     let resolved_range = range.unwrap_or("HEAD~5..HEAD");
 
-    let repo = GitRepository::open()
-        .context("Failed to open git repository. Make sure you're in a git repository.")?;
+    let repo = GitRepository::open_at(repo_root)
+        .context("Failed to open git repository at the given path")?;
 
     let current_branch = repo
         .get_current_branch()
@@ -1832,8 +1860,8 @@ pub(crate) async fn run_twiddle_with_client(
         });
     }
 
-    let ai_scratch_path =
-        ai_scratch::get_ai_scratch_dir().context("Failed to determine AI scratch directory")?;
+    let ai_scratch_path = ai_scratch::get_ai_scratch_dir_at(repo_root)
+        .context("Failed to determine AI scratch directory")?;
     let ai_info = AiInfo {
         scratch: ai_scratch_path.to_string_lossy().to_string(),
     };
@@ -1860,9 +1888,8 @@ pub(crate) async fn run_twiddle_with_client(
         .generate_amendments_with_options(&repo_view, true)
         .await?;
 
-    let context_dir = crate::claude::context::resolve_context_dir(None);
-    let scope_defs =
-        crate::claude::context::load_project_scopes(&context_dir, &std::path::PathBuf::from("."));
+    let context_dir = crate::claude::context::resolve_context_dir_at(None, repo_root);
+    let scope_defs = crate::claude::context::load_project_scopes(&context_dir, repo_root);
     refine_amendment_scopes(&mut amendments, &repo_view, &scope_defs);
 
     let amendments_yaml =
@@ -1882,9 +1909,7 @@ pub(crate) async fn run_twiddle_with_client(
     amendments
         .save_to_file(&amendments_file)
         .context("Failed to save amendments")?;
-    // `twiddle` is still CWD-pinned (converted in a later slice), so the
-    // injected root is `.` — byte-identical to the pre-injection behavior.
-    let handler = crate::git::AmendmentHandler::new(std::path::Path::new("."))
+    let handler = crate::git::AmendmentHandler::new(repo_root)
         .context("Failed to initialise amendment handler")?;
     handler
         .apply_amendments(&amendments_file.to_string_lossy())
@@ -1905,6 +1930,9 @@ mod run_twiddle_tests {
     use crate::claude::test_utils::ConfigurableMockAiClient;
     use git2::{Repository, Signature};
 
+    /// With the `CwdGuard` retired, `run_twiddle` opens the injected repo via
+    /// `open_at`, so an invalid path errors with a git/repository error (the
+    /// `GitRepository::open_at` context) before any AI call.
     #[tokio::test]
     async fn run_twiddle_invalid_repo_path_errors_before_ai() {
         let err = run_twiddle(
@@ -1917,10 +1945,8 @@ mod run_twiddle_tests {
         .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.to_lowercase().contains("set_current_dir")
-                || msg.to_lowercase().contains("no such")
-                || msg.to_lowercase().contains("directory"),
-            "expected cwd-related error, got: {msg}"
+            msg.to_lowercase().contains("git") || msg.to_lowercase().contains("repository"),
+            "expected git/repository error, got: {msg}"
         );
     }
 
@@ -1966,9 +1992,6 @@ mod run_twiddle_tests {
     #[tokio::test]
     async fn run_twiddle_with_client_dry_run_returns_amendments() {
         let (temp_dir, hash) = init_test_repo_with_commit();
-        let _guard = super::super::CwdGuard::enter(temp_dir.path())
-            .await
-            .unwrap();
 
         let mock = ConfigurableMockAiClient::new(vec![Ok(amendment_yaml(
             &hash,
@@ -1976,7 +1999,7 @@ mod run_twiddle_tests {
         ))]);
         let client = ClaudeClient::new(Box::new(mock));
 
-        let outcome = run_twiddle_with_client(Some("HEAD"), true, &client)
+        let outcome = run_twiddle_with_client(Some("HEAD"), true, temp_dir.path(), &client)
             .await
             .unwrap();
         assert!(!outcome.applied, "dry_run must not apply");
@@ -1987,14 +2010,11 @@ mod run_twiddle_tests {
     #[tokio::test]
     async fn run_twiddle_with_client_empty_range_returns_empty() {
         let (temp_dir, _hash) = init_test_repo_with_commit();
-        let _guard = super::super::CwdGuard::enter(temp_dir.path())
-            .await
-            .unwrap();
 
         let mock = ConfigurableMockAiClient::new(vec![]);
         let client = ClaudeClient::new(Box::new(mock));
 
-        let outcome = run_twiddle_with_client(Some("HEAD..HEAD"), true, &client)
+        let outcome = run_twiddle_with_client(Some("HEAD..HEAD"), true, temp_dir.path(), &client)
             .await
             .unwrap();
         assert_eq!(outcome.amendment_count, 0);
@@ -2004,13 +2024,10 @@ mod run_twiddle_tests {
     #[tokio::test]
     async fn run_twiddle_with_client_ai_failure_errors() {
         let (temp_dir, _hash) = init_test_repo_with_commit();
-        let _guard = super::super::CwdGuard::enter(temp_dir.path())
-            .await
-            .unwrap();
 
         let mock = ConfigurableMockAiClient::new(vec![]);
         let client = ClaudeClient::new(Box::new(mock));
-        let err = run_twiddle_with_client(Some("HEAD"), true, &client)
+        let err = run_twiddle_with_client(Some("HEAD"), true, temp_dir.path(), &client)
             .await
             .unwrap_err();
         let _ = err;
@@ -2019,9 +2036,6 @@ mod run_twiddle_tests {
     #[tokio::test]
     async fn run_twiddle_with_client_default_range_errors_on_sparse_repo() {
         let (temp_dir, _hash) = init_test_repo_with_commit();
-        let _guard = super::super::CwdGuard::enter(temp_dir.path())
-            .await
-            .unwrap();
 
         // Default range HEAD~5..HEAD cannot resolve HEAD~5 in a repo with
         // only one commit — get_commits_in_range returns an error, which
@@ -2029,7 +2043,7 @@ mod run_twiddle_tests {
         let mock = ConfigurableMockAiClient::new(vec![]);
         let client = ClaudeClient::new(Box::new(mock));
 
-        let err = run_twiddle_with_client(None, true, &client)
+        let err = run_twiddle_with_client(None, true, temp_dir.path(), &client)
             .await
             .unwrap_err();
         assert!(
@@ -2056,9 +2070,6 @@ mod run_twiddle_tests {
     #[tokio::test]
     async fn run_twiddle_with_client_applies_head_amendment() {
         let (temp_dir, hash) = init_test_repo_with_commit();
-        let _guard = super::super::CwdGuard::enter(temp_dir.path())
-            .await
-            .unwrap();
 
         let mock = ConfigurableMockAiClient::new(vec![Ok(amendment_yaml(
             &hash,
@@ -2066,7 +2077,7 @@ mod run_twiddle_tests {
         ))]);
         let client = ClaudeClient::new(Box::new(mock));
 
-        let outcome = run_twiddle_with_client(Some("HEAD"), false, &client)
+        let outcome = run_twiddle_with_client(Some("HEAD"), false, temp_dir.path(), &client)
             .await
             .unwrap();
         assert!(outcome.applied, "dry_run=false must apply amendments");
@@ -2085,6 +2096,52 @@ mod run_twiddle_tests {
         assert!(
             head_msg.contains("much better subject"),
             "HEAD message should be rewritten: {head_msg}"
+        );
+    }
+
+    /// "No silent mix" guard: `run_twiddle_with_client` must amend the INJECTED
+    /// repo, not the process CWD (the omni-dev checkout). We build a temp repo
+    /// with a rewritable HEAD, leave the process CWD pointed at the omni-dev
+    /// checkout, and assert the temp repo's HEAD was rewritten — proving the
+    /// amendment anchored to the injected path rather than ambient CWD.
+    #[tokio::test]
+    async fn run_twiddle_with_client_targets_injected_repo_not_cwd() {
+        let (temp_dir, hash) = init_test_repo_with_commit();
+
+        // Sanity-check: the process CWD is NOT the temp repo, so an amendment
+        // that leaked to the ambient CWD would target the omni-dev checkout.
+        let cwd = std::env::current_dir().unwrap();
+        assert_ne!(
+            cwd.canonicalize().unwrap(),
+            temp_dir.path().canonicalize().unwrap(),
+            "test precondition: process CWD must differ from the injected repo"
+        );
+
+        let mock = ConfigurableMockAiClient::new(vec![Ok(amendment_yaml(
+            &hash,
+            "feat(cli): injected-repo subject",
+        ))]);
+        let client = ClaudeClient::new(Box::new(mock));
+
+        let outcome = run_twiddle_with_client(Some("HEAD"), false, temp_dir.path(), &client)
+            .await
+            .unwrap();
+        assert!(outcome.applied, "dry_run=false must apply amendments");
+        assert_eq!(outcome.amendment_count, 1);
+
+        // The injected repo's HEAD must carry the rewritten message.
+        let repo = git2::Repository::open(temp_dir.path()).unwrap();
+        let head_msg = repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .message()
+            .unwrap()
+            .to_string();
+        assert!(
+            head_msg.contains("injected-repo subject"),
+            "injected repo HEAD must be rewritten: {head_msg}"
         );
     }
 }
@@ -2205,9 +2262,6 @@ mod execute_tests {
     #[tokio::test]
     async fn execute_with_client_multi_commit_batch_success_covers_line_392() {
         let (temp_dir, hashes) = init_test_repo_with_n_commits(3);
-        let _guard = super::super::CwdGuard::enter(temp_dir.path())
-            .await
-            .unwrap();
 
         // Range yields the 2 most recent commits (oldest excluded).
         let h_mid = &hashes[1];
@@ -2225,7 +2279,9 @@ mod execute_tests {
         let save_path = temp_dir.path().join("amendments.yaml");
         let cmd = make_cmd("HEAD~2..HEAD", save_path.clone());
 
-        cmd.execute_with_client(client).await.unwrap();
+        cmd.execute_with_client(temp_dir.path(), client)
+            .await
+            .unwrap();
 
         // Single batch dispatch, single AI request.
         assert_eq!(response_handle.remaining(), 0);
@@ -2258,9 +2314,6 @@ mod execute_tests {
     #[tokio::test]
     async fn execute_with_client_multi_commit_split_retry_covers_line_424() {
         let (temp_dir, hashes) = init_test_repo_with_n_commits(3);
-        let _guard = super::super::CwdGuard::enter(temp_dir.path())
-            .await
-            .unwrap();
 
         let h_mid = &hashes[1];
         let h_new = &hashes[2];
@@ -2290,7 +2343,9 @@ mod execute_tests {
         let save_path = temp_dir.path().join("amendments.yaml");
         let cmd = make_cmd("HEAD~2..HEAD", save_path.clone());
 
-        cmd.execute_with_client(client).await.unwrap();
+        cmd.execute_with_client(temp_dir.path(), client)
+            .await
+            .unwrap();
 
         // 3 batch attempts + 2 individual retries = 5 AI requests.
         assert_eq!(response_handle.remaining(), 0);
@@ -2320,9 +2375,6 @@ mod execute_tests {
     #[tokio::test]
     async fn execute_no_ai_save_only_covers_line_1031() {
         let (temp_dir, hash) = init_test_repo_with_commit();
-        let _guard = super::super::CwdGuard::enter(temp_dir.path())
-            .await
-            .unwrap();
 
         let save_path = temp_dir.path().join("amendments.yaml");
         let cmd = TwiddleCommand {
@@ -2346,7 +2398,7 @@ mod execute_tests {
             quiet: true,
         };
 
-        cmd.execute(None).await.unwrap();
+        cmd.execute(Some(temp_dir.path())).await.unwrap();
 
         let saved = AmendmentFile::load_from_file(&save_path).unwrap();
         assert_eq!(saved.amendments.len(), 1);

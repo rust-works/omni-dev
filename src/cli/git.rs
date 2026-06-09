@@ -460,16 +460,13 @@ mod tests {
     /// must reject an injected path with a clear error rather than silently
     /// ignoring it (RULE 6). Exercises each reject-guard branch through the
     /// real parse + dispatch path. `git branch info`, `git commit message
-    /// view`, `git commit message staged`, `git commit message check`, and
-    /// `git commit message amend` are converted, so they are absent here.
+    /// view`, `git commit message staged`, `git commit message check`, `git
+    /// commit message amend`, and `git commit message twiddle` are converted,
+    /// so they are absent here.
     #[tokio::test]
     async fn repo_flag_rejected_for_unconverted_commands() {
-        let unconverted: [&[&str]; 2] = [
-            &[
-                "omni-dev", "-C", "/tmp", "git", "commit", "message", "twiddle",
-            ],
-            &["omni-dev", "-C", "/tmp", "git", "branch", "create", "pr"],
-        ];
+        let unconverted: [&[&str]; 1] =
+            [&["omni-dev", "-C", "/tmp", "git", "branch", "create", "pr"]];
         for args in unconverted {
             let cli = Cli::try_parse_from(args.iter().copied()).unwrap();
             let err = cli
