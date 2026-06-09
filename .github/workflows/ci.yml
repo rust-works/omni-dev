@@ -275,7 +275,7 @@ jobs:
     # Codecov's uploader key server recovers.
     - name: Upload to codecov.io
       if: false
-      uses: codecov/codecov-action@v6
+      uses: codecov/codecov-action@v7
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
         files: codecov.json
