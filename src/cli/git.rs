@@ -25,33 +25,32 @@ use clap::{Parser, Subcommand};
 /// Global async mutex serialising every caller that mutates the process-wide
 /// current working directory via `std::env::set_current_dir`.
 ///
-/// Used by:
-/// - The production [`CwdGuard`] wrapper that MCP tool handlers acquire via
-///   `.lock().await`.
-/// - Async unit tests that call `CwdGuard::enter` directly (e.g., `check`,
-///   `twiddle`, `create_pr`).
-/// - Sync unit tests that change CWD directly; they acquire the same mutex
-///   via [`tokio::sync::Mutex::blocking_lock`] so both styles of test
-///   serialise through one instance and cannot race on the shared CWD.
+/// Now that every `git` command threads an explicit `--repo` root through its
+/// reads, no production code path changes the CWD. This mutex and the
+/// [`CwdGuard`] it backs survive only to serialise the remaining
+/// CWD-mutating *unit test* (`cwd_guard_invalid_path_returns_error`) against
+/// any other test that touches the shared CWD, so it is gated behind
+/// `#[cfg(test)]`.
 ///
 /// We use `tokio::sync::Mutex` rather than `std::sync::Mutex` so the guard is
-/// `Send` and can be held across `.await` points (required by the MCP
-/// async tool handlers).
+/// `Send` and can be held across `.await` points.
+#[cfg(test)]
 pub(crate) static CWD_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// RAII guard that temporarily changes the process current working directory
 /// and restores it on drop.
 ///
-/// Shared by MCP tool handlers that accept a `repo_path` parameter: many
-/// commands (check/twiddle/create_pr) read configuration and invoke external
-/// tools relative to the current working directory, so the simplest way to
-/// "run this command at a different path" is to pin the CWD for the duration
-/// of the call. A global async mutex serialises concurrent callers.
+/// Test-only (`#[cfg(test)]`): production commands no longer mutate the CWD —
+/// they thread an explicit `--repo` root instead. The guard is retained so the
+/// `cwd_guard_invalid_path_returns_error` regression test can keep exercising
+/// the error path without racing on the shared CWD.
+#[cfg(test)]
 pub(crate) struct CwdGuard {
     original: std::path::PathBuf,
     _lock: tokio::sync::MutexGuard<'static, ()>,
 }
 
+#[cfg(test)]
 impl CwdGuard {
     /// Enters `path`, holding the CWD mutex for the lifetime of the guard.
     pub(crate) async fn enter<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
@@ -67,6 +66,7 @@ impl CwdGuard {
     }
 }
 
+#[cfg(test)]
 impl Drop for CwdGuard {
     fn drop(&mut self) {
         let _ = std::env::set_current_dir(&self.original);
@@ -449,24 +449,25 @@ mod tests {
     #[tokio::test]
     async fn cwd_guard_invalid_path_returns_error() {
         // Error path doesn't mutate the shared CWD, so it is safe to run in
-        // parallel with the rest of the test suite. The happy path is covered
-        // indirectly by `run_{check,twiddle,create_pr}` error-path tests
-        // that exercise `CwdGuard::enter(valid_path)` followed by restoration.
+        // parallel with the rest of the test suite. No production code calls
+        // `CwdGuard::enter` anymore — every git command threads `--repo`
+        // instead — so this test is the guard's sole remaining caller and
+        // covers only the error path. The guard is retired in the final slice.
         let result = CwdGuard::enter("/no/such/path/exists").await;
         assert!(result.is_err(), "expected error for nonexistent path");
     }
 
-    /// Every git command that has not yet been converted to honor `--repo`
-    /// must reject an injected path with a clear error rather than silently
-    /// ignoring it (RULE 6). Exercises each reject-guard branch through the
-    /// real parse + dispatch path. `git branch info`, `git commit message
-    /// view`, `git commit message staged`, `git commit message check`, `git
-    /// commit message amend`, and `git commit message twiddle` are converted,
-    /// so they are absent here.
+    /// All `git` message and branch commands now honor `--repo` by threading
+    /// an explicit repo root through their reads (RULE 6 fully satisfied):
+    /// `git branch info`, `git branch create pr`, `git commit message view`,
+    /// `git commit message staged`, `git commit message check`, `git commit
+    /// message amend`, and `git commit message twiddle` are all converted, so
+    /// there are no remaining reject-guards. The empty array keeps this guard
+    /// in place: should a future unconverted command be added, list it here so
+    /// it is asserted to reject `--repo` rather than silently ignoring it.
     #[tokio::test]
     async fn repo_flag_rejected_for_unconverted_commands() {
-        let unconverted: [&[&str]; 1] =
-            [&["omni-dev", "-C", "/tmp", "git", "branch", "create", "pr"]];
+        let unconverted: [&[&str]; 0] = [];
         for args in unconverted {
             let cli = Cli::try_parse_from(args.iter().copied()).unwrap();
             let err = cli
