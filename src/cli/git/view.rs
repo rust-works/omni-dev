@@ -15,12 +15,12 @@ pub struct ViewCommand {
 
 impl ViewCommand {
     /// Executes the view command.
+    ///
+    /// `repo` is the repository location resolved at the CLI boundary
+    /// (`None` = current working directory).
     pub fn execute(self, repo: Option<&Path>) -> Result<()> {
-        if repo.is_some() {
-            anyhow::bail!("--repo is not yet supported for `git commit message view`");
-        }
         let commit_range = self.commit_range.as_deref().unwrap_or("HEAD");
-        let yaml_output = run_view(commit_range, None::<&str>)?;
+        let yaml_output = run_view(commit_range, repo)?;
         println!("{yaml_output}");
         Ok(())
     }
@@ -47,6 +47,13 @@ pub fn run_view<P: AsRef<Path>>(commit_range: &str, repo_path: Option<P>) -> Res
             .context("Failed to open git repository. Make sure you're in a git repository.")?
     };
 
+    // Anchor the AI-scratch read to the opened repo's workdir (covers both the
+    // injected-path and CWD-default branches) so it never resolves against an
+    // unrelated ambient CWD.
+    let repo_root = repo
+        .workdir()
+        .context("repository has no working directory (bare repositories are not supported)")?;
+
     let wd_status = repo.get_working_directory_status()?;
     let working_directory = WorkingDirectoryInfo {
         clean: wd_status.clean,
@@ -67,8 +74,8 @@ pub fn run_view<P: AsRef<Path>>(commit_range: &str, repo_path: Option<P>) -> Res
         omni_dev: env!("CARGO_PKG_VERSION").to_string(),
     });
 
-    let ai_scratch_path =
-        ai_scratch::get_ai_scratch_dir().context("Failed to determine AI scratch directory")?;
+    let ai_scratch_path = ai_scratch::get_ai_scratch_dir_at(repo_root)
+        .context("Failed to determine AI scratch directory")?;
     let ai_info = AiInfo {
         scratch: ai_scratch_path.to_string_lossy().to_string(),
     };
@@ -162,34 +169,20 @@ mod tests {
         );
     }
 
-    use crate::cli::git::CWD_MUTEX;
-
     #[test]
-    fn execute_uses_cwd_repo_and_succeeds() {
-        let _guard = CWD_MUTEX.blocking_lock();
+    fn execute_with_explicit_repo_path_succeeds() {
         let (temp_dir, _commits) = init_repo_with_commits();
-        let original_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(temp_dir.path()).unwrap();
-
         let result = ViewCommand {
             commit_range: Some("HEAD".to_string()),
         }
-        .execute(None);
-
-        std::env::set_current_dir(original_cwd).unwrap();
-        result.expect("execute should succeed in a valid repo");
+        .execute(Some(temp_dir.path()));
+        result.expect("execute should succeed against the injected repo");
     }
 
     #[test]
     fn execute_default_range_uses_head() {
-        let _guard = CWD_MUTEX.blocking_lock();
         let (temp_dir, _commits) = init_repo_with_commits();
-        let original_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(temp_dir.path()).unwrap();
-
-        let result = ViewCommand { commit_range: None }.execute(None);
-
-        std::env::set_current_dir(original_cwd).unwrap();
+        let result = ViewCommand { commit_range: None }.execute(Some(temp_dir.path()));
         result.expect("execute with default range should succeed");
     }
 

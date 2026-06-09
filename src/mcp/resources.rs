@@ -269,12 +269,21 @@ pub fn resource_listing() -> Vec<Resource> {
 }
 
 /// Resolves a parsed URI into [`ReadResourceResult`] contents.
-pub async fn read_resource(uri: &ResourceUri, raw_uri: &str) -> Result<ReadResourceResult> {
+///
+/// `repo_root` is the repository location resolved once at the MCP boundary;
+/// the `git://` arm opens the repository there instead of reading the ambient
+/// process CWD. Non-git arms ignore it.
+pub async fn read_resource(
+    uri: &ResourceUri,
+    raw_uri: &str,
+    repo_root: &std::path::Path,
+) -> Result<ReadResourceResult> {
     match uri {
         ResourceUri::GitCommits { range } => {
             let range = range.clone();
+            let repo_root = repo_root.to_path_buf();
             let yaml = tokio::task::spawn_blocking(move || {
-                crate::cli::git::run_view(&range, None::<&str>)
+                crate::cli::git::run_view(&range, Some(&repo_root))
             })
             .await
             .context("git run_view task panicked")??;
@@ -720,24 +729,15 @@ mod tests {
         temp_dir
     }
 
-    use crate::cli::git::CWD_MUTEX;
-
-    // `read_resource` is async and must run with the CWD held fixed, so we
-    // hold the guard across `.await` points. The shared
-    // `tokio::sync::Mutex` is designed for this; no clippy suppression is
-    // needed. The critical section is CPU-bound `run_view` work behind
-    // `spawn_blocking`, so no cross-task yield contends for the lock.
+    // `read_resource` resolves the `git://` repo from the injected `repo_root`,
+    // so the test passes the temp repo path directly — no CWD manipulation.
     #[tokio::test(flavor = "multi_thread")]
     async fn read_resource_git_commits_returns_yaml() {
-        let _guard = CWD_MUTEX.lock().await;
         let temp_dir = init_tmp_repo();
-        let original_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(temp_dir.path()).unwrap();
 
         let uri = ResourceUri::parse("git://repo/commits/HEAD").unwrap();
-        let result = read_resource(&uri, "git://repo/commits/HEAD").await;
+        let result = read_resource(&uri, "git://repo/commits/HEAD", temp_dir.path()).await;
 
-        std::env::set_current_dir(original_cwd).unwrap();
         let result = result.unwrap();
         let contents = result.contents;
         assert_eq!(contents.len(), 1);
@@ -829,7 +829,9 @@ mod tests {
         ]);
 
         let uri = ResourceUri::parse("jira://issue/PROJ-7").unwrap();
-        let result = read_resource(&uri, "jira://issue/PROJ-7").await.unwrap();
+        let result = read_resource(&uri, "jira://issue/PROJ-7", std::path::Path::new("."))
+            .await
+            .unwrap();
         assert_eq!(result.contents.len(), 1);
         match &result.contents[0] {
             ResourceContents::TextResourceContents {
@@ -884,7 +886,7 @@ mod tests {
         ]);
 
         let uri = ResourceUri::parse("jira://issue/PROJ-8.adf").unwrap();
-        let result = read_resource(&uri, "jira://issue/PROJ-8.adf")
+        let result = read_resource(&uri, "jira://issue/PROJ-8.adf", std::path::Path::new("."))
             .await
             .unwrap();
         match &result.contents[0] {
@@ -919,7 +921,7 @@ mod tests {
         ]);
 
         let uri = ResourceUri::parse("jira://issue/NOPE-1").unwrap();
-        let err = read_resource(&uri, "jira://issue/NOPE-1")
+        let err = read_resource(&uri, "jira://issue/NOPE-1", std::path::Path::new("."))
             .await
             .expect_err("404 should surface as error");
         let chain = format!("{err:#}");
@@ -980,7 +982,8 @@ mod tests {
         ]);
 
         let uri = ResourceUri::parse("confluence://page/99999").unwrap();
-        let result = read_resource(&uri, "confluence://page/99999").await;
+        let result =
+            read_resource(&uri, "confluence://page/99999", std::path::Path::new(".")).await;
         // We don't pin the exact rendered output (depends on internal ADF
         // rendering details), only that the branch ran and produced
         // TextResourceContents with the markdown MIME type.
@@ -1025,7 +1028,7 @@ mod tests {
         ]);
 
         let uri = ResourceUri::parse("confluence://page/404404").unwrap();
-        let err = read_resource(&uri, "confluence://page/404404")
+        let err = read_resource(&uri, "confluence://page/404404", std::path::Path::new("."))
             .await
             .expect_err("404 should surface as error");
         let chain = format!("{err:#}");
@@ -1056,7 +1059,7 @@ mod tests {
         std::env::set_var("HOME", std::env::temp_dir());
 
         let uri = ResourceUri::parse("jira://issue/ZZZ-1").unwrap();
-        let err = read_resource(&uri, "jira://issue/ZZZ-1")
+        let err = read_resource(&uri, "jira://issue/ZZZ-1", std::path::Path::new("."))
             .await
             .expect_err("missing credentials must error");
         let chain = format!("{err:#}");
@@ -1082,7 +1085,7 @@ mod tests {
         std::env::set_var("HOME", std::env::temp_dir());
 
         let uri = ResourceUri::parse("confluence://page/0").unwrap();
-        let err = read_resource(&uri, "confluence://page/0")
+        let err = read_resource(&uri, "confluence://page/0", std::path::Path::new("."))
             .await
             .expect_err("missing credentials must error");
         let chain = format!("{err:#}");
@@ -1151,7 +1154,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn read_resource_specs_jfm_returns_markdown() {
         let uri = ResourceUri::parse("omni-dev://specs/jfm").unwrap();
-        let result = read_resource(&uri, "omni-dev://specs/jfm").await.unwrap();
+        let result = read_resource(&uri, "omni-dev://specs/jfm", std::path::Path::new("."))
+            .await
+            .unwrap();
         assert_eq!(result.contents.len(), 1);
         match &result.contents[0] {
             ResourceContents::TextResourceContents {
@@ -1176,7 +1181,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn read_resource_specs_unknown_name_errors() {
         let uri = ResourceUri::parse("omni-dev://specs/nope").unwrap();
-        let err = read_resource(&uri, "omni-dev://specs/nope")
+        let err = read_resource(&uri, "omni-dev://specs/nope", std::path::Path::new("."))
             .await
             .expect_err("unknown spec must error");
         let chain = format!("{err:#}");
