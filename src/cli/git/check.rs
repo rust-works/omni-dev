@@ -73,7 +73,15 @@ pub struct CheckCommand {
 
 impl CheckCommand {
     /// Executes the check command, validating commit messages against guidelines.
-    pub async fn execute(mut self) -> Result<()> {
+    pub async fn execute(mut self, repo: Option<&std::path::Path>) -> Result<()> {
+        // Resolve the repo root once; every git, config, and scratch read below
+        // anchors to it (the CWD is the default when no path is injected).
+        let repo_root = match repo {
+            Some(p) => p.to_path_buf(),
+            None => std::env::current_dir().context("Failed to determine current directory")?,
+        };
+        let repo_root = repo_root.as_path();
+
         // Resolve deprecated --batch-size into --concurrency
         if let Some(bs) = self.batch_size {
             eprintln!("warning: --batch-size is deprecated; use --concurrency instead");
@@ -85,7 +93,8 @@ impl CheckCommand {
         let output_format: OutputFormat = self.format.parse().unwrap_or(OutputFormat::Text);
 
         // Preflight check: validate AI credentials before any processing
-        let ai_info = crate::utils::check_ai_command_prerequisites(self.model.as_deref())?;
+        let ai_info =
+            crate::utils::check_ai_command_prerequisites(self.model.as_deref(), repo_root)?;
         if !self.quiet && output_format == OutputFormat::Text {
             println!(
                 "✓ {} credentials verified (model: {})",
@@ -98,7 +107,7 @@ impl CheckCommand {
         }
 
         // 1. Generate repository view to get all commits
-        let mut repo_view = self.generate_repository_view().await?;
+        let mut repo_view = self.generate_repository_view(repo_root).await?;
 
         // 2. Check for empty commit range (exit code 3)
         if repo_view.commits.is_empty() {
@@ -111,8 +120,8 @@ impl CheckCommand {
         }
 
         // 3. Load commit guidelines and scopes
-        let guidelines = self.load_guidelines().await?;
-        let valid_scopes = self.load_scopes();
+        let guidelines = self.load_guidelines(repo_root).await?;
+        let valid_scopes = self.load_scopes(repo_root);
 
         // Refine detected scopes using file_patterns from scope definitions
         for commit in &mut repo_view.commits {
@@ -120,7 +129,7 @@ impl CheckCommand {
         }
 
         if !self.quiet && output_format == OutputFormat::Text {
-            self.show_guidance_files_status(&guidelines, &valid_scopes);
+            self.show_guidance_files_status(repo_root, &guidelines, &valid_scopes);
         }
 
         // 4. Initialize Claude client
@@ -177,6 +186,7 @@ impl CheckCommand {
             if !amendments.is_empty()
                 && self
                     .prompt_and_apply_suggestions(
+                        repo_root,
                         amendments,
                         std::io::stdin().is_terminal(),
                         &mut std::io::BufReader::new(std::io::stdin()),
@@ -198,7 +208,10 @@ impl CheckCommand {
     }
 
     /// Generates the repository view (reuses logic from TwiddleCommand).
-    async fn generate_repository_view(&self) -> Result<crate::data::RepositoryView> {
+    async fn generate_repository_view(
+        &self,
+        repo_root: &std::path::Path,
+    ) -> Result<crate::data::RepositoryView> {
         use crate::data::{
             AiInfo, BranchInfo, FieldExplanation, FileStatusInfo, RepositoryView, VersionInfo,
             WorkingDirectoryInfo,
@@ -207,8 +220,8 @@ impl CheckCommand {
         use crate::utils::ai_scratch;
 
         // Open git repository
-        let repo = GitRepository::open()
-            .context("Failed to open git repository. Make sure you're in a git repository.")?;
+        let repo = GitRepository::open_at(repo_root)
+            .context("Failed to open git repository at the given path")?;
 
         // Get current branch name
         let current_branch = repo
@@ -256,8 +269,8 @@ impl CheckCommand {
         });
 
         // Get AI scratch directory
-        let ai_scratch_path =
-            ai_scratch::get_ai_scratch_dir().context("Failed to determine AI scratch directory")?;
+        let ai_scratch_path = ai_scratch::get_ai_scratch_dir_at(repo_root)
+            .context("Failed to determine AI scratch directory")?;
         let ai_info = AiInfo {
             scratch: ai_scratch_path.to_string_lossy().to_string(),
         };
@@ -285,7 +298,7 @@ impl CheckCommand {
     }
 
     /// Loads commit guidelines from file or context directory.
-    async fn load_guidelines(&self) -> Result<Option<String>> {
+    async fn load_guidelines(&self, repo_root: &std::path::Path) -> Result<Option<String>> {
         // If explicit guidelines path is provided, use it
         if let Some(guidelines_path) = &self.guidelines {
             let content = std::fs::read_to_string(guidelines_path).with_context(|| {
@@ -298,28 +311,34 @@ impl CheckCommand {
         }
 
         // Otherwise, use standard resolution chain
-        let context_dir = crate::claude::context::resolve_context_dir(self.context_dir.as_deref());
+        let context_dir =
+            crate::claude::context::resolve_context_dir_at(self.context_dir.as_deref(), repo_root);
         crate::claude::context::load_config_content(&context_dir, "commit-guidelines.md")
     }
 
     /// Loads valid scopes from context directory with ecosystem defaults.
-    fn load_scopes(&self) -> Vec<crate::data::context::ScopeDefinition> {
-        let context_dir = crate::claude::context::resolve_context_dir(self.context_dir.as_deref());
-        crate::claude::context::load_project_scopes(&context_dir, &std::path::PathBuf::from("."))
+    fn load_scopes(
+        &self,
+        repo_root: &std::path::Path,
+    ) -> Vec<crate::data::context::ScopeDefinition> {
+        let context_dir =
+            crate::claude::context::resolve_context_dir_at(self.context_dir.as_deref(), repo_root);
+        crate::claude::context::load_project_scopes(&context_dir, repo_root)
     }
 
     /// Shows diagnostic information about loaded guidance files.
     fn show_guidance_files_status(
         &self,
+        repo_root: &std::path::Path,
         guidelines: &Option<String>,
         valid_scopes: &[crate::data::context::ScopeDefinition],
     ) {
         use crate::claude::context::{
-            config_source_label, resolve_context_dir_with_source, ConfigSourceLabel,
+            config_source_label, resolve_context_dir_with_source_at, ConfigSourceLabel,
         };
 
         let (context_dir, dir_source) =
-            resolve_context_dir_with_source(self.context_dir.as_deref());
+            resolve_context_dir_with_source_at(self.context_dir.as_deref(), repo_root);
 
         println!("📋 Project guidance files status:");
         println!("   📂 Config dir: {} ({dir_source})", context_dir.display());
@@ -671,6 +690,11 @@ impl CheckCommand {
         println!("🤖 AI Model Configuration:");
 
         let metadata = client.get_ai_client_metadata();
+        // NOTE (#967): this `--verbose` diagnostic banner reads the process-wide
+        // model catalog (`get_model_registry` → CWD-relative project models.yaml),
+        // not a `--repo`-scoped catalog. It is informational only and does not
+        // affect the check verdict, so it is left CWD-scoped until the repo-aware
+        // `ModelRegistry::load_at` foundation lands (first used by `create pr`).
         let registry = get_model_registry();
 
         if let Some(spec) = registry.get_model_spec(&metadata.model) {
@@ -725,6 +749,7 @@ impl CheckCommand {
     /// without blocking on real stdin.
     async fn prompt_and_apply_suggestions(
         &self,
+        repo_root: &std::path::Path,
         amendments: Vec<crate::data::amendments::Amendment>,
         is_terminal: bool,
         reader: &mut (dyn std::io::BufRead + Send),
@@ -762,7 +787,7 @@ impl CheckCommand {
                         .save_to_file(temp_file.path())
                         .context("Failed to save amendments")?;
 
-                    let handler = AmendmentHandler::new()
+                    let handler = AmendmentHandler::new(repo_root)
                         .context("Failed to initialize amendment handler")?;
                     handler
                         .apply_amendments(&temp_file.path().to_string_lossy())
@@ -893,9 +918,10 @@ pub struct CheckOutcome {
 /// runs a single direct AI call — the MCP tool boundary never needs the
 /// map-reduce/interactive-retry flow from [`CheckCommand::execute`].
 ///
-/// When `repo_path` is provided the current working directory is changed for
-/// the duration of the call (serialised by a global mutex) so CWD-dependent
-/// context-discovery and AI-scratch paths resolve relative to the target repo.
+/// `repo_path` selects the repository to check (`None` defaults to the current
+/// working directory). It is resolved once here and threaded explicitly into
+/// [`run_check_with_client`], so context-discovery and AI-scratch paths anchor
+/// to the target repo without changing the process working directory.
 pub async fn run_check(
     range: &str,
     guidelines_path: Option<&std::path::Path>,
@@ -903,29 +929,30 @@ pub async fn run_check(
     strict: bool,
     model: Option<String>,
 ) -> Result<CheckOutcome> {
-    let _cwd_guard = match repo_path {
-        Some(p) => Some(super::CwdGuard::enter(p).await?),
-        None => None,
+    let repo_root = match repo_path {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_dir().context("Failed to determine current directory")?,
     };
 
     // Preflight: validate AI credentials.
-    crate::utils::check_ai_command_prerequisites(model.as_deref())?;
+    crate::utils::check_ai_command_prerequisites(model.as_deref(), &repo_root)?;
 
     let claude_client = crate::claude::create_default_claude_client(model, None).await?;
-    run_check_with_client(range, guidelines_path, strict, &claude_client).await
+    run_check_with_client(range, guidelines_path, strict, &claude_client, &repo_root).await
 }
 
 /// Non-credential-gated inner core of [`run_check`] for unit tests.
 ///
 /// Extracted so tests can inject a [`crate::claude::client::ClaudeClient`]
 /// backed by the in-crate mock AI client and exercise the full happy path
-/// without real credentials. Callers are responsible for holding any
-/// [`super::CwdGuard`] they need and for running preflight themselves.
+/// without real credentials. `repo_root` selects the repository; callers run
+/// preflight themselves.
 pub(crate) async fn run_check_with_client(
     range: &str,
     guidelines_path: Option<&std::path::Path>,
     strict: bool,
     claude_client: &crate::claude::client::ClaudeClient,
+    repo_root: &std::path::Path,
 ) -> Result<CheckOutcome> {
     use crate::data::{
         AiInfo, BranchInfo, FieldExplanation, FileStatusInfo, RepositoryView, VersionInfo,
@@ -934,8 +961,8 @@ pub(crate) async fn run_check_with_client(
     use crate::git::{GitRepository, RemoteInfo};
     use crate::utils::ai_scratch;
 
-    let repo = GitRepository::open()
-        .context("Failed to open git repository. Make sure you're in a git repository.")?;
+    let repo = GitRepository::open_at(repo_root)
+        .context("Failed to open git repository at the given path")?;
 
     let current_branch = repo
         .get_current_branch()
@@ -961,8 +988,8 @@ pub(crate) async fn run_check_with_client(
         anyhow::bail!("no commits found in range: {range}");
     }
 
-    let ai_scratch_path =
-        ai_scratch::get_ai_scratch_dir().context("Failed to determine AI scratch directory")?;
+    let ai_scratch_path = ai_scratch::get_ai_scratch_dir_at(repo_root)
+        .context("Failed to determine AI scratch directory")?;
     let ai_info = AiInfo {
         scratch: ai_scratch_path.to_string_lossy().to_string(),
     };
@@ -991,13 +1018,12 @@ pub(crate) async fn run_check_with_client(
                 .with_context(|| format!("Failed to read guidelines file: {}", path.display()))?,
         )
     } else {
-        let context_dir = crate::claude::context::resolve_context_dir(None);
+        let context_dir = crate::claude::context::resolve_context_dir_at(None, repo_root);
         crate::claude::context::load_config_content(&context_dir, "commit-guidelines.md")?
     };
 
-    let context_dir = crate::claude::context::resolve_context_dir(None);
-    let valid_scopes =
-        crate::claude::context::load_project_scopes(&context_dir, &std::path::PathBuf::from("."));
+    let context_dir = crate::claude::context::resolve_context_dir_at(None, repo_root);
+    let valid_scopes = crate::claude::context::load_project_scopes(&context_dir, repo_root);
     for commit in &mut repo_view.commits {
         commit.analysis.refine_scope(&valid_scopes);
     }
@@ -1030,25 +1056,26 @@ mod run_check_tests {
     use crate::claude::test_utils::ConfigurableMockAiClient;
     use git2::{Repository, Signature};
 
-    /// With `/no/such/path` as repo_path, `CwdGuard::enter` fails before any AI
-    /// call is attempted — no credentials needed.
+    /// `run_check_with_client` opens the injected repo via `open_at` before any
+    /// AI call, so an invalid path errors with a git/repository error and needs
+    /// no credentials.
     #[tokio::test]
-    async fn run_check_invalid_repo_path_errors_before_ai() {
-        let err = run_check(
+    async fn run_check_with_client_invalid_repo_path_errors() {
+        let mock = ConfigurableMockAiClient::new(vec![]);
+        let client = ClaudeClient::new(Box::new(mock));
+        let err = run_check_with_client(
             "HEAD",
             None,
-            Some(std::path::Path::new("/no/such/path/exists")),
             false,
-            None,
+            &client,
+            std::path::Path::new("/no/such/path/exists"),
         )
         .await
         .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.to_lowercase().contains("set_current_dir")
-                || msg.to_lowercase().contains("no such")
-                || msg.to_lowercase().contains("directory"),
-            "expected cwd-related error, got: {msg}"
+            msg.to_lowercase().contains("git") || msg.to_lowercase().contains("repository"),
+            "expected git/repository error, got: {msg}"
         );
     }
 
@@ -1094,15 +1121,12 @@ mod run_check_tests {
     #[tokio::test]
     async fn run_check_with_client_happy_path_passing() {
         let temp_dir = init_test_repo();
-        let _guard = super::super::CwdGuard::enter(temp_dir.path())
-            .await
-            .unwrap();
 
         // Use a short hash prefix that resolves in the mini repo.
         let mock = ConfigurableMockAiClient::new(vec![Ok(passing_check_yaml("00000000"))]);
         let client = ClaudeClient::new(Box::new(mock));
 
-        let outcome = run_check_with_client("HEAD", None, false, &client)
+        let outcome = run_check_with_client("HEAD", None, false, &client, temp_dir.path())
             .await
             .unwrap();
         assert!(!outcome.has_errors);
@@ -1116,14 +1140,11 @@ mod run_check_tests {
     #[tokio::test]
     async fn run_check_with_client_failing_commit_sets_error_exit_code() {
         let temp_dir = init_test_repo();
-        let _guard = super::super::CwdGuard::enter(temp_dir.path())
-            .await
-            .unwrap();
 
         let mock = ConfigurableMockAiClient::new(vec![Ok(failing_check_yaml("00000000"))]);
         let client = ClaudeClient::new(Box::new(mock));
 
-        let outcome = run_check_with_client("HEAD", None, false, &client)
+        let outcome = run_check_with_client("HEAD", None, false, &client, temp_dir.path())
             .await
             .unwrap();
         assert!(outcome.has_errors);
@@ -1133,14 +1154,11 @@ mod run_check_tests {
     #[tokio::test]
     async fn run_check_with_client_strict_does_not_affect_no_issues() {
         let temp_dir = init_test_repo();
-        let _guard = super::super::CwdGuard::enter(temp_dir.path())
-            .await
-            .unwrap();
 
         let mock = ConfigurableMockAiClient::new(vec![Ok(passing_check_yaml("00000000"))]);
         let client = ClaudeClient::new(Box::new(mock));
 
-        let outcome = run_check_with_client("HEAD", None, true, &client)
+        let outcome = run_check_with_client("HEAD", None, true, &client, temp_dir.path())
             .await
             .unwrap();
         assert_eq!(outcome.exit_code, 0);
@@ -1152,16 +1170,19 @@ mod run_check_tests {
         let temp_dir = init_test_repo();
         let guidelines_path = temp_dir.path().join("guidelines.md");
         std::fs::write(&guidelines_path, "guideline body").unwrap();
-        let _guard = super::super::CwdGuard::enter(temp_dir.path())
-            .await
-            .unwrap();
 
         let mock = ConfigurableMockAiClient::new(vec![Ok(passing_check_yaml("00000000"))]);
         let client = ClaudeClient::new(Box::new(mock));
 
-        let outcome = run_check_with_client("HEAD", Some(&guidelines_path), false, &client)
-            .await
-            .unwrap();
+        let outcome = run_check_with_client(
+            "HEAD",
+            Some(&guidelines_path),
+            false,
+            &client,
+            temp_dir.path(),
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome.exit_code, 0);
     }
 
@@ -1169,13 +1190,10 @@ mod run_check_tests {
     async fn run_check_with_client_guidelines_path_missing_errors() {
         let temp_dir = init_test_repo();
         let missing = temp_dir.path().join("no-such.md");
-        let _guard = super::super::CwdGuard::enter(temp_dir.path())
-            .await
-            .unwrap();
 
         let mock = ConfigurableMockAiClient::new(vec![Ok(passing_check_yaml("00000000"))]);
         let client = ClaudeClient::new(Box::new(mock));
-        let err = run_check_with_client("HEAD", Some(&missing), false, &client)
+        let err = run_check_with_client("HEAD", Some(&missing), false, &client, temp_dir.path())
             .await
             .unwrap_err();
         assert!(
@@ -1187,14 +1205,11 @@ mod run_check_tests {
     #[tokio::test]
     async fn run_check_with_client_empty_range_bails() {
         let temp_dir = init_test_repo();
-        let _guard = super::super::CwdGuard::enter(temp_dir.path())
-            .await
-            .unwrap();
 
         let mock = ConfigurableMockAiClient::new(vec![]);
         let client = ClaudeClient::new(Box::new(mock));
         // A range with no commits reachable → get_commits_in_range returns empty.
-        let err = run_check_with_client("HEAD..HEAD", None, false, &client)
+        let err = run_check_with_client("HEAD..HEAD", None, false, &client, temp_dir.path())
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("no commits"));
@@ -1203,15 +1218,12 @@ mod run_check_tests {
     #[tokio::test]
     async fn run_check_with_client_ai_failure_propagates() {
         let temp_dir = init_test_repo();
-        let _guard = super::super::CwdGuard::enter(temp_dir.path())
-            .await
-            .unwrap();
 
         // No responses → mock returns "no more mock responses" error; this
         // propagates after check_commits_with_scopes exhausts its retries.
         let mock = ConfigurableMockAiClient::new(vec![]);
         let client = ClaudeClient::new(Box::new(mock));
-        let err = run_check_with_client("HEAD", None, false, &client)
+        let err = run_check_with_client("HEAD", None, false, &client, temp_dir.path())
             .await
             .unwrap_err();
         let _ = err; // any error is acceptable — the point is we didn't panic
@@ -1230,6 +1242,40 @@ mod run_check_tests {
         };
         let cloned = outcome.clone();
         assert_eq!(format!("{outcome:?}"), format!("{cloned:?}"));
+    }
+
+    /// "No silent mix" guard: default commit guidelines are loaded from the
+    /// INJECTED repo's `.omni-dev/commit-guidelines.md`, not the process CWD.
+    /// We write a distinctive marker into the temp repo's guidelines and assert
+    /// it reaches the AI prompt.
+    #[tokio::test]
+    async fn run_check_with_client_loads_guidelines_from_injected_repo() {
+        let temp_dir = init_test_repo();
+        let omni_dir = temp_dir.path().join(".omni-dev");
+        std::fs::create_dir_all(&omni_dir).unwrap();
+        std::fs::write(
+            omni_dir.join("commit-guidelines.md"),
+            "# Project rules\n\nDISTINCTIVE_GUIDELINE_MARKER: always do the thing.\n",
+        )
+        .unwrap();
+
+        let mock = ConfigurableMockAiClient::new(vec![Ok(passing_check_yaml("00000000"))]);
+        let prompts = mock.prompt_handle();
+        let client = ClaudeClient::new(Box::new(mock));
+
+        let _ = run_check_with_client("HEAD", None, false, &client, temp_dir.path())
+            .await
+            .unwrap();
+
+        let recorded = prompts.prompts();
+        assert!(!recorded.is_empty(), "expected at least one AI call");
+        assert!(
+            recorded.iter().any(|(s, u)| {
+                s.contains("DISTINCTIVE_GUIDELINE_MARKER")
+                    || u.contains("DISTINCTIVE_GUIDELINE_MARKER")
+            }),
+            "guidelines from the injected repo must reach the prompt: {recorded:?}"
+        );
     }
 }
 
@@ -1817,7 +1863,12 @@ mod tests {
         let cmd = make_check_cmd(false);
         let mut reader = std::io::Cursor::new(b"" as &[u8]);
         let result = cmd
-            .prompt_and_apply_suggestions(vec![make_amendment()], false, &mut reader)
+            .prompt_and_apply_suggestions(
+                std::path::Path::new("."),
+                vec![make_amendment()],
+                false,
+                &mut reader,
+            )
             .await
             .unwrap();
         assert!(!result, "non-terminal should return false");
@@ -1829,7 +1880,12 @@ mod tests {
         let cmd = make_check_cmd(false);
         let mut reader = std::io::Cursor::new(b"" as &[u8]);
         let result = cmd
-            .prompt_and_apply_suggestions(vec![make_amendment()], true, &mut reader)
+            .prompt_and_apply_suggestions(
+                std::path::Path::new("."),
+                vec![make_amendment()],
+                true,
+                &mut reader,
+            )
             .await
             .unwrap();
         assert!(!result, "EOF should return false");
@@ -1841,7 +1897,12 @@ mod tests {
         let cmd = make_check_cmd(false);
         let mut reader = std::io::Cursor::new(b"q\n" as &[u8]);
         let result = cmd
-            .prompt_and_apply_suggestions(vec![make_amendment()], true, &mut reader)
+            .prompt_and_apply_suggestions(
+                std::path::Path::new("."),
+                vec![make_amendment()],
+                true,
+                &mut reader,
+            )
             .await
             .unwrap();
         assert!(!result, "quit should return false");
@@ -1853,7 +1914,12 @@ mod tests {
         let cmd = make_check_cmd(false);
         let mut reader = std::io::Cursor::new(b"x\nq\n" as &[u8]);
         let result = cmd
-            .prompt_and_apply_suggestions(vec![make_amendment()], true, &mut reader)
+            .prompt_and_apply_suggestions(
+                std::path::Path::new("."),
+                vec![make_amendment()],
+                true,
+                &mut reader,
+            )
             .await
             .unwrap();
         assert!(!result, "invalid then quit should return false");

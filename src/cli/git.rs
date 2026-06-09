@@ -17,59 +17,10 @@ pub use staged::{run_staged, StagedCommand, StagedOutcome};
 pub use twiddle::{run_twiddle, TwiddleCommand, TwiddleOutcome};
 pub use view::{run_view, ViewCommand};
 
+use std::path::Path;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-
-/// Global async mutex serialising every caller that mutates the process-wide
-/// current working directory via `std::env::set_current_dir`.
-///
-/// Used by:
-/// - The production [`CwdGuard`] wrapper that MCP tool handlers acquire via
-///   `.lock().await`.
-/// - Async unit tests that call `CwdGuard::enter` directly (e.g., `check`,
-///   `twiddle`, `create_pr`).
-/// - Sync unit tests that change CWD directly; they acquire the same mutex
-///   via [`tokio::sync::Mutex::blocking_lock`] so both styles of test
-///   serialise through one instance and cannot race on the shared CWD.
-///
-/// We use `tokio::sync::Mutex` rather than `std::sync::Mutex` so the guard is
-/// `Send` and can be held across `.await` points (required by the MCP
-/// async tool handlers).
-pub(crate) static CWD_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// RAII guard that temporarily changes the process current working directory
-/// and restores it on drop.
-///
-/// Shared by MCP tool handlers that accept a `repo_path` parameter: many
-/// commands (check/twiddle/create_pr) read configuration and invoke external
-/// tools relative to the current working directory, so the simplest way to
-/// "run this command at a different path" is to pin the CWD for the duration
-/// of the call. A global async mutex serialises concurrent callers.
-pub(crate) struct CwdGuard {
-    original: std::path::PathBuf,
-    _lock: tokio::sync::MutexGuard<'static, ()>,
-}
-
-impl CwdGuard {
-    /// Enters `path`, holding the CWD mutex for the lifetime of the guard.
-    pub(crate) async fn enter<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
-        let lock = CWD_MUTEX.lock().await;
-        let original =
-            std::env::current_dir().map_err(|e| anyhow::anyhow!("current_dir failed: {e}"))?;
-        std::env::set_current_dir(path.as_ref())
-            .map_err(|e| anyhow::anyhow!("set_current_dir failed: {e}"))?;
-        Ok(Self {
-            original,
-            _lock: lock,
-        })
-    }
-}
-
-impl Drop for CwdGuard {
-    fn drop(&mut self) {
-        let _ = std::env::set_current_dir(&self.original);
-    }
-}
 
 /// Reads one line of interactive input from `reader`.
 ///
@@ -185,51 +136,55 @@ pub enum CreateSubcommands {
 
 impl GitCommand {
     /// Executes the git command.
-    pub async fn execute(self) -> Result<()> {
+    ///
+    /// `repo` is the repository location resolved once at the CLI boundary
+    /// (`None` = current working directory); it is threaded explicitly down to
+    /// each leaf command rather than read from the ambient CWD.
+    pub async fn execute(self, repo: Option<&Path>) -> Result<()> {
         match self.command {
-            GitSubcommands::Commit(commit_cmd) => commit_cmd.execute().await,
-            GitSubcommands::Branch(branch_cmd) => branch_cmd.execute().await,
+            GitSubcommands::Commit(commit_cmd) => commit_cmd.execute(repo).await,
+            GitSubcommands::Branch(branch_cmd) => branch_cmd.execute(repo).await,
         }
     }
 }
 
 impl CommitCommand {
     /// Executes the commit command.
-    pub async fn execute(self) -> Result<()> {
+    pub async fn execute(self, repo: Option<&Path>) -> Result<()> {
         match self.command {
-            CommitSubcommands::Message(message_cmd) => message_cmd.execute().await,
+            CommitSubcommands::Message(message_cmd) => message_cmd.execute(repo).await,
         }
     }
 }
 
 impl MessageCommand {
     /// Executes the message command.
-    pub async fn execute(self) -> Result<()> {
+    pub async fn execute(self, repo: Option<&Path>) -> Result<()> {
         match self.command {
-            MessageSubcommands::View(view_cmd) => view_cmd.execute(),
-            MessageSubcommands::Amend(amend_cmd) => amend_cmd.execute(),
-            MessageSubcommands::Twiddle(twiddle_cmd) => twiddle_cmd.execute().await,
-            MessageSubcommands::Check(check_cmd) => check_cmd.execute().await,
-            MessageSubcommands::Staged(staged_cmd) => staged_cmd.execute().await,
+            MessageSubcommands::View(view_cmd) => view_cmd.execute(repo),
+            MessageSubcommands::Amend(amend_cmd) => amend_cmd.execute(repo),
+            MessageSubcommands::Twiddle(twiddle_cmd) => twiddle_cmd.execute(repo).await,
+            MessageSubcommands::Check(check_cmd) => check_cmd.execute(repo).await,
+            MessageSubcommands::Staged(staged_cmd) => staged_cmd.execute(repo).await,
         }
     }
 }
 
 impl BranchCommand {
     /// Executes the branch command.
-    pub async fn execute(self) -> Result<()> {
+    pub async fn execute(self, repo: Option<&Path>) -> Result<()> {
         match self.command {
-            BranchSubcommands::Info(info_cmd) => info_cmd.execute(),
-            BranchSubcommands::Create(create_cmd) => create_cmd.execute().await,
+            BranchSubcommands::Info(info_cmd) => info_cmd.execute(repo),
+            BranchSubcommands::Create(create_cmd) => create_cmd.execute(repo).await,
         }
     }
 }
 
 impl CreateCommand {
     /// Executes the create command.
-    pub async fn execute(self) -> Result<()> {
+    pub async fn execute(self, repo: Option<&Path>) -> Result<()> {
         match self.command {
-            CreateSubcommands::Pr(pr_cmd) => pr_cmd.execute().await,
+            CreateSubcommands::Pr(pr_cmd) => pr_cmd.execute(repo).await,
         }
     }
 }
@@ -440,13 +395,28 @@ mod tests {
         assert_eq!(result, Some("\n".to_string()));
     }
 
+    /// All `git` message and branch commands now honor `--repo` by threading
+    /// an explicit repo root through their reads (RULE 6 fully satisfied):
+    /// `git branch info`, `git branch create pr`, `git commit message view`,
+    /// `git commit message staged`, `git commit message check`, `git commit
+    /// message amend`, and `git commit message twiddle` are all converted, so
+    /// there are no remaining reject-guards. The empty array keeps this guard
+    /// in place: should a future unconverted command be added, list it here so
+    /// it is asserted to reject `--repo` rather than silently ignoring it.
     #[tokio::test]
-    async fn cwd_guard_invalid_path_returns_error() {
-        // Error path doesn't mutate the shared CWD, so it is safe to run in
-        // parallel with the rest of the test suite. The happy path is covered
-        // indirectly by `run_{check,twiddle,create_pr}` error-path tests
-        // that exercise `CwdGuard::enter(valid_path)` followed by restoration.
-        let result = CwdGuard::enter("/no/such/path/exists").await;
-        assert!(result.is_err(), "expected error for nonexistent path");
+    async fn repo_flag_rejected_for_unconverted_commands() {
+        let unconverted: [&[&str]; 0] = [];
+        for args in unconverted {
+            let cli = Cli::try_parse_from(args.iter().copied()).unwrap();
+            let err = cli
+                .execute()
+                .await
+                .expect_err("unconverted command must reject --repo");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("not yet supported"),
+                "args {args:?} -> unexpected error: {msg}"
+            );
+        }
     }
 }

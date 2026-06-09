@@ -1,15 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::env;
 use std::fs;
 use std::path::PathBuf;
-
-// Serialises the window where amend_command_with_temporary_repo mutates the
-// process-wide CWD via env::set_current_dir.  That mutation is visible to all
-// threads; without serialisation any concurrently-running test that creates a
-// git2 Repository via a relative path (including TestRepo::new) races against
-// it.  See <https://github.com/rust-works/omni-dev/issues/230>.
-static CWD_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 use anyhow::Result;
 use git2::{Repository, Signature};
@@ -110,8 +102,16 @@ impl TestRepo {
                 .collect(),
         };
 
-        // Create the amendments file outside the repository to avoid it showing up as untracked
-        let yaml_path = self.repo_path.parent().unwrap().join("amendments.yaml");
+        // Create the amendments file outside the repository (so it doesn't show
+        // up as untracked) under a name unique to this repo's tempdir, so tests
+        // that share the parent `tmp/` directory can't overwrite each other's
+        // file and race.
+        let unique = self.repo_path.file_name().unwrap().to_string_lossy();
+        let yaml_path = self
+            .repo_path
+            .parent()
+            .unwrap()
+            .join(format!("{unique}-amendments.yaml"));
         amendment_file.save_to_file(&yaml_path)?;
         Ok(yaml_path)
     }
@@ -140,63 +140,56 @@ fn amend_command_with_temporary_repo() -> Result<()> {
     let amendment_file_path = test_repo.create_amendment_file(amendments)?;
     println!("Created amendment file at: {amendment_file_path:?}");
 
-    // AmendCommand::execute → AmendmentHandler::new → Repository::open(".")
-    // requires the process CWD to equal the repository root.  env::set_current_dir
-    // is process-wide, so we hold CWD_MUTEX for the entire mutation window to
-    // prevent concurrent tests from observing an unexpected CWD.
-    let original_dir = env::current_dir()?;
-    let result = {
-        let _cwd_guard = CWD_MUTEX.lock().unwrap();
-        env::set_current_dir(&test_repo.repo_path)?;
-
-        let outcome = std::panic::catch_unwind(|| {
-            let amend_cmd = AmendCommand {
-                yaml_file: amendment_file_path.to_string_lossy().to_string(),
-            };
-
-            println!("Testing amend command...");
-            let result = amend_cmd.execute();
-            println!("Amend command result: {result:?}");
-            result
-        });
-
-        // Restore CWD before releasing the mutex.
-        env::set_current_dir(&original_dir)?;
-        outcome
-        // _cwd_guard dropped here — other threads may now change or read CWD.
+    // The repository is injected explicitly via `--repo`, so the amend command
+    // runs entirely against `test_repo.repo_path` — no process-CWD manipulation
+    // and no shared mutex are needed.
+    let amend_cmd = AmendCommand {
+        yaml_file: amendment_file_path.to_string_lossy().to_string(),
     };
+    amend_cmd
+        .execute(Some(test_repo.repo_path.as_path()))
+        .expect("Amend command should succeed");
 
-    match result {
-        Ok(cmd_result) => {
-            println!("Amend command completed: {cmd_result:?}");
+    // Verify that amendments were actually made.  Use the absolute repo_path
+    // directly so this does not depend on process CWD.
+    let repo = Repository::open(&test_repo.repo_path)?;
+    let head = repo.head()?.target().unwrap();
+    let commit = repo.find_commit(head)?;
+    let head_message = commit.message().unwrap_or("").trim();
+    assert_eq!(
+        head_message, "Fix critical bug in the new feature",
+        "HEAD commit should have been amended with new message"
+    );
 
-            // The implementation should now actually work
-            assert!(cmd_result.is_ok(), "Amend command should succeed");
+    Ok(())
+}
 
-            // Verify that amendments were actually made.  Use the absolute
-            // repo_path directly so this does not depend on process CWD.
-            let repo = Repository::open(&test_repo.repo_path)?;
-            let head = repo.head()?.target().unwrap();
-            let commit = repo.find_commit(head)?;
-            println!(
-                "Current HEAD commit message after amendment: {}",
-                commit.message().unwrap_or("")
-            );
+/// "No silent mix" guard: the clean-worktree preflight checks the INJECTED
+/// repository, not the process CWD. Repo A has a dirty worktree, so amend must
+/// bail citing A's uncommitted changes even though the process CWD (the
+/// omni-dev checkout) is a different repository.
+#[test]
+fn amend_preflight_checks_injected_repo_worktree() -> Result<()> {
+    let mut repo_a = TestRepo::new()?;
+    repo_a.add_commit("a: initial", "content")?;
+    let amendment_file = repo_a.create_amendment_file(vec![(0, "a: amended")])?;
 
-            // The HEAD commit message should have been amended
-            let head_message = commit.message().unwrap_or("").trim();
-            assert_eq!(
-                head_message, "Fix critical bug in the new feature",
-                "HEAD commit should have been amended with new message"
-            );
+    // Dirty the injected repo's worktree with an untracked file.
+    fs::write(repo_a.repo_path.join("dirty.txt"), "uncommitted")?;
 
-            println!("✅ Test passed: Amend command successfully amended the commit message");
-        }
-        Err(e) => {
-            println!("❌ Amend command panicked: {e:?}");
-            panic!("Amend command should not panic");
-        }
+    let err = AmendCommand {
+        yaml_file: amendment_file.to_string_lossy().to_string(),
     }
+    .execute(Some(repo_a.repo_path.as_path()))
+    .expect_err("amend must bail on the injected repo's dirty worktree");
+    let msg = format!("{err:#}").to_lowercase();
+    // Assert on the injected repo's specific untracked file: a regressed
+    // CWD-anchored check would report a different (or no) file, so this can't
+    // pass for the wrong reason.
+    assert!(
+        msg.contains("dirty.txt"),
+        "expected dirty-worktree error naming the injected repo's file, got: {msg}"
+    );
 
     Ok(())
 }
@@ -564,6 +557,7 @@ async fn cli_execute_dispatches_git_commit_message_view() {
         claude_cli_allow_mcp: false,
         claude_cli_max_budget_usd: None,
         models_yaml: None,
+        repo: None,
         command: Commands::Git(GitCommand {
             command: GitSubcommands::Commit(CommitCommand {
                 command: CommitSubcommands::Message(MessageCommand {
@@ -590,6 +584,7 @@ async fn cli_execute_dispatches_git_branch_info() {
         claude_cli_allow_mcp: false,
         claude_cli_max_budget_usd: None,
         models_yaml: None,
+        repo: None,
         command: Commands::Git(GitCommand {
             command: GitSubcommands::Branch(BranchCommand {
                 command: BranchSubcommands::Info(InfoCommand { base_branch: None }),
@@ -610,6 +605,7 @@ async fn cli_execute_dispatches_ai_chat() {
         claude_cli_allow_mcp: false,
         claude_cli_max_budget_usd: None,
         models_yaml: None,
+        repo: None,
         command: Commands::Ai(AiCommand {
             command: AiSubcommands::Chat(ChatCommand { model: None }),
         }),

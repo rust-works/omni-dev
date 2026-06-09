@@ -215,17 +215,22 @@ pub fn check_ai_credentials(model_override: Option<&str>) -> Result<AiCredential
 /// 2. User is authenticated (can access the current repo)
 ///
 /// Use this at the start of commands that require GitHub API access.
-pub fn check_github_cli() -> Result<()> {
-    // Check if gh CLI is available
+///
+/// `repo_root` anchors the repository-access probe to the injected repository
+/// rather than the process current working directory.
+pub fn check_github_cli(repo_root: &std::path::Path) -> Result<()> {
+    // Check if gh CLI is available. This probe is a PATH availability check
+    // (CWD-independent), so it is not anchored to `repo_root`.
     let gh_check = std::process::Command::new("gh")
         .args(["--version"])
         .output();
 
     match gh_check {
         Ok(output) if output.status.success() => {
-            // Test if gh can access the current repo
+            // Test if gh can access the injected repo
             let repo_check = std::process::Command::new("gh")
                 .args(["repo", "view", "--json", "name"])
+                .current_dir(repo_root)
                 .output();
 
             match repo_check {
@@ -254,29 +259,29 @@ pub fn check_github_cli() -> Result<()> {
     }
 }
 
-/// Validates that the current directory is in a valid git repository.
+/// Validates that `repo_root` is a valid git repository.
 ///
-/// This is a lightweight check that opens the repository without
-/// loading any commit data.
-pub fn check_git_repository() -> Result<()> {
-    crate::git::GitRepository::open().context(
+/// A lightweight check that opens the repository without loading commit data.
+pub fn check_git_repository_at(repo_root: &std::path::Path) -> Result<()> {
+    crate::git::GitRepository::open_at(repo_root).context(
         "Not in a git repository. Please run this command from within a git repository.",
     )?;
     Ok(())
 }
 
-/// Validates that the working directory is clean (no uncommitted changes).
+/// Validates that the working directory at `repo_root` is clean — no
+/// uncommitted changes (staged, unstaged, or untracked non-ignored files).
 ///
-/// This checks for:
-/// - Staged changes
-/// - Unstaged modifications
-/// - Untracked files (excluding ignored files)
-///
-/// Use this before operations that require a clean working directory,
-/// like amending commits.
-pub fn check_working_directory_clean() -> Result<()> {
-    let repo = crate::git::GitRepository::open().context("Failed to open git repository")?;
+/// Use this before operations that require a clean working directory, like
+/// amending commits.
+pub fn check_working_directory_clean_at(repo_root: &std::path::Path) -> Result<()> {
+    let repo =
+        crate::git::GitRepository::open_at(repo_root).context("Failed to open git repository")?;
+    check_working_directory_clean_for(&repo)
+}
 
+/// Shared clean-worktree check over an already-opened repository.
+fn check_working_directory_clean_for(repo: &crate::git::GitRepository) -> Result<()> {
     let status = repo
         .get_working_directory_status()
         .context("Failed to get working directory status")?;
@@ -300,8 +305,14 @@ pub fn check_working_directory_clean() -> Result<()> {
 /// - AI credentials
 ///
 /// Returns information about the AI provider that will be used.
-pub fn check_ai_command_prerequisites(model_override: Option<&str>) -> Result<AiCredentialInfo> {
-    check_git_repository()?;
+///
+/// `repo_root` anchors the git-repository check to the injected repository
+/// rather than the process current working directory.
+pub fn check_ai_command_prerequisites(
+    model_override: Option<&str>,
+    repo_root: &std::path::Path,
+) -> Result<AiCredentialInfo> {
+    check_git_repository_at(repo_root)?;
     check_ai_credentials(model_override)
 }
 
@@ -313,10 +324,16 @@ pub fn check_ai_command_prerequisites(model_override: Option<&str>) -> Result<Ai
 /// - GitHub CLI availability and authentication
 ///
 /// Returns information about the AI provider that will be used.
-pub fn check_pr_command_prerequisites(model_override: Option<&str>) -> Result<AiCredentialInfo> {
-    check_git_repository()?;
+///
+/// `repo_root` anchors the git-repository and GitHub CLI checks to the injected
+/// repository rather than the process current working directory.
+pub fn check_pr_command_prerequisites(
+    model_override: Option<&str>,
+    repo_root: &std::path::Path,
+) -> Result<AiCredentialInfo> {
+    check_git_repository_at(repo_root)?;
     let ai_info = check_ai_credentials(model_override)?;
-    check_github_cli()?;
+    check_github_cli(repo_root)?;
     Ok(ai_info)
 }
 

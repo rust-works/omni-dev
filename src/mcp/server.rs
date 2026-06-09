@@ -101,7 +101,20 @@ impl ServerHandler for OmniDevServer {
         let uri = request.uri;
         let parsed =
             resources::ResourceUri::parse(&uri).map_err(|err| resources::not_found(&uri, err))?;
-        resources::read_resource(&parsed, &uri)
+        // Only the `git://` arm consults a repo; the server carries no per-call
+        // path and no configured workdir, so the process CWD is the canonical
+        // root. Resolve it once here for that arm (RULE 2) rather than letting
+        // `run_view` read the ambient CWD deeper in the call tree. Non-git arms
+        // ignore the value, so they get a placeholder and never touch the CWD.
+        let repo_root = match &parsed {
+            resources::ResourceUri::GitCommits { .. } => {
+                std::env::current_dir().map_err(|err| {
+                    resources::not_found(&uri, format!("failed to resolve repo root: {err}"))
+                })?
+            }
+            _ => std::path::PathBuf::from("."),
+        };
+        resources::read_resource(&parsed, &uri, &repo_root)
             .await
             .map_err(|err| resources::not_found(&uri, err))
     }

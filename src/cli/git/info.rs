@@ -15,20 +15,25 @@ pub struct InfoCommand {
 
 impl InfoCommand {
     /// Executes the info command.
-    pub fn execute(self) -> Result<()> {
-        let yaml_output = run_info(self.base_branch.as_deref(), None::<&str>)?;
+    ///
+    /// `repo` is the repository location resolved at the CLI boundary
+    /// (`None` = current working directory).
+    pub fn execute(self, repo: Option<&Path>) -> Result<()> {
+        let yaml_output = run_info(self.base_branch.as_deref(), repo)?;
         println!("{yaml_output}");
         Ok(())
     }
 
     /// Reads the PR template file if it exists, returning both content and location.
-    pub(crate) fn read_pr_template() -> Result<(String, String)> {
+    ///
+    /// Resolves `.github/pull_request_template.md` against `repo_root` rather
+    /// than the process current working directory.
+    pub(crate) fn read_pr_template(repo_root: &Path) -> Result<(String, String)> {
         use std::fs;
-        use std::path::Path;
 
-        let template_path = Path::new(".github/pull_request_template.md");
+        let template_path = repo_root.join(".github/pull_request_template.md");
         if template_path.exists() {
-            let content = fs::read_to_string(template_path)
+            let content = fs::read_to_string(&template_path)
                 .context("Failed to read .github/pull_request_template.md")?;
             Ok((content, template_path.to_string_lossy().to_string()))
         } else {
@@ -37,12 +42,19 @@ impl InfoCommand {
     }
 
     /// Returns pull requests for the current branch using gh CLI.
-    pub(crate) fn get_branch_prs(branch_name: &str) -> Result<Vec<crate::data::PullRequest>> {
+    ///
+    /// Runs `gh` pinned to `repo_root` (via `.current_dir`) so it resolves the
+    /// repository from the injected path rather than the process CWD.
+    pub(crate) fn get_branch_prs(
+        branch_name: &str,
+        repo_root: &Path,
+    ) -> Result<Vec<crate::data::PullRequest>> {
         use serde_json::Value;
         use std::process::Command;
 
         // Use gh CLI to get PRs for the branch
         let output = Command::new("gh")
+            .current_dir(repo_root)
             .args([
                 "pr",
                 "list",
@@ -112,13 +124,23 @@ pub fn run_info<P: AsRef<Path>>(base_branch: Option<&str>, repo_path: Option<P>)
     use crate::git::{GitRepository, RemoteInfo};
     use crate::utils::ai_scratch;
 
+    // Resolve the repo location: the injected path, or the current working
+    // directory as the default (resolved here at the entry point). Both branches
+    // open via `open_at`, so nothing falls back to a no-arg CWD open.
     let repo = if let Some(path) = repo_path {
         GitRepository::open_at(path).context("Failed to open git repository at the given path")?
     } else {
-        crate::utils::check_git_repository()?;
-        GitRepository::open()
+        let cwd = std::env::current_dir().context("Failed to determine current directory")?;
+        GitRepository::open_at(cwd)
             .context("Failed to open git repository. Make sure you're in a git repository.")?
     };
+
+    // Resolve the workdir of the opened repo once; all sibling reads (PR
+    // template, branch PRs via `gh`, AI scratch dir) anchor to it so they can
+    // never silently mix data from the ambient CWD with the injected repo.
+    let repo_root = repo
+        .workdir()
+        .context("repository has no working directory (bare repositories are not supported)")?;
 
     let current_branch = repo
         .get_current_branch()
@@ -160,12 +182,12 @@ pub fn run_info<P: AsRef<Path>>(base_branch: Option<&str>, repo_path: Option<P>)
     let remotes = RemoteInfo::get_all_remotes(repo.repository())?;
     let commits = repo.get_commits_in_range(&commit_range)?;
 
-    let (pr_template, pr_template_location) = match InfoCommand::read_pr_template().ok() {
+    let (pr_template, pr_template_location) = match InfoCommand::read_pr_template(repo_root).ok() {
         Some((content, location)) => (Some(content), Some(location)),
         None => (None, None),
     };
 
-    let branch_prs = InfoCommand::get_branch_prs(&current_branch)
+    let branch_prs = InfoCommand::get_branch_prs(&current_branch, repo_root)
         .ok()
         .filter(|prs| !prs.is_empty());
 
@@ -173,8 +195,8 @@ pub fn run_info<P: AsRef<Path>>(base_branch: Option<&str>, repo_path: Option<P>)
         omni_dev: env!("CARGO_PKG_VERSION").to_string(),
     });
 
-    let ai_scratch_path =
-        ai_scratch::get_ai_scratch_dir().context("Failed to determine AI scratch directory")?;
+    let ai_scratch_path = ai_scratch::get_ai_scratch_dir_at(repo_root)
+        .context("Failed to determine AI scratch directory")?;
     let ai_info = AiInfo {
         scratch: ai_scratch_path.to_string_lossy().to_string(),
     };
@@ -311,16 +333,13 @@ mod tests {
         );
     }
 
-    /// Exercises the `None` branch of `repo_path` (the CLI default), which
-    /// goes through `crate::utils::check_git_repository` and `GitRepository::open`.
-    /// We enter a fresh repo via `CwdGuard` so the test is hermetic.
-    #[tokio::test]
-    async fn run_info_opens_cwd_repo_when_no_path_given() {
+    /// The injected `repo_path` fully determines the repository with no
+    /// dependence on the process current working directory (previously this
+    /// entered the temp repo via a `CwdGuard`; now the path is passed directly).
+    #[test]
+    fn run_info_uses_injected_repo_without_cwd() {
         let (temp_dir, _commits) = init_repo_with_commits();
-        let _guard = super::super::CwdGuard::enter(temp_dir.path())
-            .await
-            .unwrap();
-        let yaml = run_info(None, None::<&str>).unwrap();
+        let yaml = run_info(None, Some(temp_dir.path())).unwrap();
         assert!(yaml.contains("branch:"));
     }
 
@@ -360,10 +379,11 @@ mod tests {
         assert!(yaml.contains("branch:"));
     }
 
-    /// Exercises the `read_pr_template()` Some arm by placing a PR template
-    /// in the expected location.
-    #[tokio::test]
-    async fn run_info_picks_up_pr_template_from_cwd() {
+    /// Exercises the `read_pr_template` Some arm by placing a PR template in
+    /// the injected repo root's `.github/` — proving the template is read from
+    /// the repo root, not the process current working directory.
+    #[test]
+    fn run_info_picks_up_pr_template_from_repo_root() {
         let (temp_dir, _commits) = init_repo_with_commits();
         let github_dir = temp_dir.path().join(".github");
         std::fs::create_dir_all(&github_dir).unwrap();
@@ -373,13 +393,39 @@ mod tests {
         )
         .unwrap();
 
-        let _guard = super::super::CwdGuard::enter(temp_dir.path())
-            .await
-            .unwrap();
-        let yaml = run_info(None, None::<&str>).unwrap();
+        let yaml = run_info(None, Some(temp_dir.path())).unwrap();
         assert!(
             yaml.contains("pr_template:") || yaml.contains("Sample Template"),
             "expected PR template info in yaml: {yaml}"
+        );
+    }
+
+    /// "No silent mix" guard: `read_pr_template` resolves only against its
+    /// `repo_root` argument and has **no** fallback to the ambient CWD. A repo
+    /// root with a template returns it; a different root without one errors —
+    /// even though the process CWD (the omni-dev checkout) *does* ship a
+    /// `.github/pull_request_template.md`. This is the regression guard for the
+    /// silent-mix bug the injection closes.
+    #[test]
+    fn read_pr_template_anchors_to_repo_root() {
+        let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
+        std::fs::create_dir_all(&tmp_root).unwrap();
+
+        let with = tempfile::tempdir_in(&tmp_root).unwrap();
+        std::fs::create_dir_all(with.path().join(".github")).unwrap();
+        std::fs::write(
+            with.path().join(".github/pull_request_template.md"),
+            "## Marker ABC",
+        )
+        .unwrap();
+        let (content, location) = InfoCommand::read_pr_template(with.path()).unwrap();
+        assert!(content.contains("Marker ABC"));
+        assert!(location.contains("pull_request_template.md"));
+
+        let without = tempfile::tempdir_in(&tmp_root).unwrap();
+        assert!(
+            InfoCommand::read_pr_template(without.path()).is_err(),
+            "read_pr_template must not fall back to the ambient CWD template"
         );
     }
 }

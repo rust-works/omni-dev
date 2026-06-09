@@ -24,6 +24,26 @@ pub fn get_ai_scratch_dir() -> Result<PathBuf> {
     }
 }
 
+/// Returns the AI scratch directory, resolving the `git-root:` form against
+/// `repo_root` instead of the process current working directory.
+///
+/// Behaves identically to [`get_ai_scratch_dir`] for the direct-path and
+/// `TMPDIR` fallback cases; only the `git-root:` walk-up is anchored to the
+/// injected `repo_root`.
+pub fn get_ai_scratch_dir_at(repo_root: &Path) -> Result<PathBuf> {
+    if let Ok(ai_scratch) = env::var("AI_SCRATCH") {
+        if let Some(git_root_path) = ai_scratch.strip_prefix("git-root:") {
+            let git_root = find_git_root_from_path(repo_root)?;
+            Ok(git_root.join(git_root_path))
+        } else {
+            Ok(PathBuf::from(ai_scratch))
+        }
+    } else {
+        let tmpdir = env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
+        Ok(PathBuf::from(tmpdir))
+    }
+}
+
 /// Finds the closest ancestor directory containing a .git directory.
 fn find_git_root() -> Result<PathBuf> {
     let current_dir = env::current_dir().context("Failed to get current directory")?;
@@ -121,6 +141,22 @@ mod tests {
 
         let result = get_ai_scratch_dir().unwrap();
         assert_eq!(result, PathBuf::from("/custom/tmp"));
+    }
+
+    #[test]
+    fn get_ai_scratch_dir_at_resolves_git_root_from_injected_path() {
+        let mut guard = EnvGuard::new();
+        let temp_dir = {
+            std::fs::create_dir_all("tmp").ok();
+            TempDir::new_in("tmp").unwrap()
+        };
+        std::fs::create_dir(temp_dir.path().join(".git")).unwrap();
+        guard.set("AI_SCRATCH", "git-root:scratch");
+
+        // Resolves the `git-root:` form against the injected path, not the
+        // process current working directory.
+        let result = get_ai_scratch_dir_at(temp_dir.path()).unwrap();
+        assert_eq!(result, temp_dir.path().join("scratch"));
     }
 
     #[test]

@@ -498,8 +498,12 @@ impl CommitAnalysis {
         repo: &Repository,
         commit: &Commit,
     ) -> Result<(String, Vec<FileDiffRef>)> {
-        // Get AI scratch directory
-        let ai_scratch_path = crate::utils::ai_scratch::get_ai_scratch_dir()
+        // Get AI scratch directory, anchored to the opened repository's workdir
+        // (#967) so the per-commit diff files land under the same repo the rest
+        // of the view reports, rather than the ambient process CWD. `repo` is
+        // the already-opened (possibly `--repo`-injected) git2 handle.
+        let repo_root = repo.workdir().unwrap_or_else(|| repo.path());
+        let ai_scratch_path = crate::utils::ai_scratch::get_ai_scratch_dir_at(repo_root)
             .context("Failed to determine AI scratch directory")?;
 
         // Create diffs subdirectory
