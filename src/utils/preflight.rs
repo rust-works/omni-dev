@@ -215,17 +215,22 @@ pub fn check_ai_credentials(model_override: Option<&str>) -> Result<AiCredential
 /// 2. User is authenticated (can access the current repo)
 ///
 /// Use this at the start of commands that require GitHub API access.
-pub fn check_github_cli() -> Result<()> {
-    // Check if gh CLI is available
+///
+/// `repo_root` anchors the repository-access probe to the injected repository
+/// rather than the process current working directory.
+pub fn check_github_cli(repo_root: &std::path::Path) -> Result<()> {
+    // Check if gh CLI is available. This probe is a PATH availability check
+    // (CWD-independent), so it is not anchored to `repo_root`.
     let gh_check = std::process::Command::new("gh")
         .args(["--version"])
         .output();
 
     match gh_check {
         Ok(output) if output.status.success() => {
-            // Test if gh can access the current repo
+            // Test if gh can access the injected repo
             let repo_check = std::process::Command::new("gh")
                 .args(["repo", "view", "--json", "name"])
+                .current_dir(repo_root)
                 .output();
 
             match repo_check {
@@ -321,8 +326,14 @@ fn check_working_directory_clean_for(repo: &crate::git::GitRepository) -> Result
 /// - AI credentials
 ///
 /// Returns information about the AI provider that will be used.
-pub fn check_ai_command_prerequisites(model_override: Option<&str>) -> Result<AiCredentialInfo> {
-    check_git_repository()?;
+///
+/// `repo_root` anchors the git-repository check to the injected repository
+/// rather than the process current working directory.
+pub fn check_ai_command_prerequisites(
+    model_override: Option<&str>,
+    repo_root: &std::path::Path,
+) -> Result<AiCredentialInfo> {
+    check_git_repository_at(repo_root)?;
     check_ai_credentials(model_override)
 }
 
@@ -334,10 +345,16 @@ pub fn check_ai_command_prerequisites(model_override: Option<&str>) -> Result<Ai
 /// - GitHub CLI availability and authentication
 ///
 /// Returns information about the AI provider that will be used.
-pub fn check_pr_command_prerequisites(model_override: Option<&str>) -> Result<AiCredentialInfo> {
-    check_git_repository()?;
+///
+/// `repo_root` anchors the git-repository and GitHub CLI checks to the injected
+/// repository rather than the process current working directory.
+pub fn check_pr_command_prerequisites(
+    model_override: Option<&str>,
+    repo_root: &std::path::Path,
+) -> Result<AiCredentialInfo> {
+    check_git_repository_at(repo_root)?;
     let ai_info = check_ai_credentials(model_override)?;
-    check_github_cli()?;
+    check_github_cli(repo_root)?;
     Ok(ai_info)
 }
 

@@ -93,7 +93,8 @@ impl CheckCommand {
         let output_format: OutputFormat = self.format.parse().unwrap_or(OutputFormat::Text);
 
         // Preflight check: validate AI credentials before any processing
-        let ai_info = crate::utils::check_ai_command_prerequisites(self.model.as_deref())?;
+        let ai_info =
+            crate::utils::check_ai_command_prerequisites(self.model.as_deref(), repo_root)?;
         if !self.quiet && output_format == OutputFormat::Text {
             println!(
                 "✓ {} credentials verified (model: {})",
@@ -934,7 +935,7 @@ pub async fn run_check(
     };
 
     // Preflight: validate AI credentials.
-    crate::utils::check_ai_command_prerequisites(model.as_deref())?;
+    crate::utils::check_ai_command_prerequisites(model.as_deref(), &repo_root)?;
 
     let claude_client = crate::claude::create_default_claude_client(model, None).await?;
     run_check_with_client(range, guidelines_path, strict, &claude_client, &repo_root).await
