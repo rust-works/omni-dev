@@ -1,6 +1,7 @@
 //! Git commit amendment operations.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
@@ -13,13 +14,28 @@ use crate::git::SHORT_HASH_LEN;
 /// Amendment operation handler.
 pub struct AmendmentHandler {
     repo: Repository,
+    /// Workdir the `git` subprocesses are pinned to, so amendments target the
+    /// injected repository rather than the process current working directory.
+    repo_root: PathBuf,
 }
 
 impl AmendmentHandler {
-    /// Creates a new amendment handler.
-    pub fn new() -> Result<Self> {
-        let repo = Repository::open(".").context("Failed to open git repository")?;
-        Ok(Self { repo })
+    /// Creates a new amendment handler for the repository at `repo_root`.
+    pub fn new(repo_root: &Path) -> Result<Self> {
+        let repo = Repository::open(repo_root).context("Failed to open git repository")?;
+        Ok(Self {
+            repo,
+            repo_root: repo_root.to_path_buf(),
+        })
+    }
+
+    /// Builds a `git` subprocess pinned to the handler's repo workdir, so every
+    /// rebase/commit/read operation targets the injected repository rather than
+    /// the process current working directory.
+    fn git_command(&self) -> Command {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(&self.repo_root);
+        cmd
     }
 
     /// Applies amendments from a YAML file.
@@ -60,7 +76,7 @@ impl AmendmentHandler {
     /// Performs safety checks before amendment.
     fn perform_safety_checks(&self, amendment_file: &AmendmentFile) -> Result<()> {
         // Check if working directory is clean
-        crate::utils::preflight::check_working_directory_clean()
+        crate::utils::preflight::check_working_directory_clean_at(&self.repo_root)
             .context("Cannot amend commits with uncommitted changes")?;
 
         // Check if commits exist and are not in remote main branches
@@ -144,7 +160,8 @@ impl AmendmentHandler {
         let head_commit = self.repo.head()?.peel_to_commit()?;
 
         // Use the simpler approach: git commit --amend
-        let output = Command::new("git")
+        let output = self
+            .git_command()
             .args(["commit", "--amend", "--message", new_message])
             .output()
             .context("Failed to execute git commit --amend")?;
@@ -212,7 +229,8 @@ impl AmendmentHandler {
 
         // Generate rebase sequence: edit the target commit, pick the rest
         let mut sequence_content = String::new();
-        let commit_list_output = Command::new("git")
+        let commit_list_output = self
+            .git_command()
             .args(["rev-list", "--reverse", &format!("{base_commit}..HEAD")])
             .output()
             .context("Failed to get commit list for rebase")?;
@@ -229,7 +247,8 @@ impl AmendmentHandler {
             }
 
             // Get short commit message for the sequence file
-            let subject_output = Command::new("git")
+            let subject_output = self
+                .git_command()
                 .args(["log", "--format=%s", "-n", "1", commit])
                 .output()
                 .context("Failed to get commit subject")?;
@@ -256,7 +275,7 @@ impl AmendmentHandler {
         );
 
         // Execute rebase with custom sequence editor
-        let rebase_result = Command::new("git")
+        let rebase_result = self.git_command()
             .args(["rebase", "-i", &base_commit])
             .env(
                 "GIT_SEQUENCE_EDITOR",
@@ -270,7 +289,7 @@ impl AmendmentHandler {
             let error_msg = String::from_utf8_lossy(&rebase_result.stderr);
 
             // Best-effort cleanup; the rebase may not have started.
-            if let Err(e) = Command::new("git").args(["rebase", "--abort"]).output() {
+            if let Err(e) = self.git_command().args(["rebase", "--abort"]).output() {
                 debug!("Rebase abort during cleanup failed: {e}");
             }
 
@@ -281,7 +300,8 @@ impl AmendmentHandler {
         let repo_state = self.repo.state();
         if repo_state == git2::RepositoryState::RebaseInteractive {
             // We should be stopped at the target commit - amend it
-            let current_commit_output = Command::new("git")
+            let current_commit_output = self
+                .git_command()
                 .args(["rev-parse", "HEAD"])
                 .output()
                 .context("Failed to get current commit during rebase")?;
@@ -294,7 +314,8 @@ impl AmendmentHandler {
                 .starts_with(&commit_hash[..current_commit.len().min(commit_hash.len())])
             {
                 // Amend with new message
-                let amend_result = Command::new("git")
+                let amend_result = self
+                    .git_command()
                     .args(["commit", "--amend", "-m", new_message])
                     .output()
                     .context("Failed to amend commit during rebase")?;
@@ -302,7 +323,7 @@ impl AmendmentHandler {
                 if !amend_result.status.success() {
                     let error_msg = String::from_utf8_lossy(&amend_result.stderr);
                     // Best-effort cleanup; abort so the repo isn't left mid-rebase.
-                    if let Err(e) = Command::new("git").args(["rebase", "--abort"]).output() {
+                    if let Err(e) = self.git_command().args(["rebase", "--abort"]).output() {
                         debug!("Rebase abort during cleanup failed: {e}");
                     }
                     anyhow::bail!("Failed to amend commit: {error_msg}");
@@ -311,7 +332,8 @@ impl AmendmentHandler {
                 println!("✅ Amended commit: {}", &commit_hash[..SHORT_HASH_LEN]);
 
                 // Continue the rebase
-                let continue_result = Command::new("git")
+                let continue_result = self
+                    .git_command()
                     .args(["rebase", "--continue"])
                     .output()
                     .context("Failed to continue rebase")?;
@@ -319,7 +341,7 @@ impl AmendmentHandler {
                 if !continue_result.status.success() {
                     let error_msg = String::from_utf8_lossy(&continue_result.stderr);
                     // Best-effort cleanup; abort so the repo isn't left mid-rebase.
-                    if let Err(e) = Command::new("git").args(["rebase", "--abort"]).output() {
+                    if let Err(e) = self.git_command().args(["rebase", "--abort"]).output() {
                         debug!("Rebase abort during cleanup failed: {e}");
                     }
                     anyhow::bail!("Failed to continue rebase: {error_msg}");
@@ -328,7 +350,7 @@ impl AmendmentHandler {
                 println!("✅ Rebase completed successfully");
             } else {
                 // Best-effort cleanup; abort so the repo isn't left mid-rebase.
-                if let Err(e) = Command::new("git").args(["rebase", "--abort"]).output() {
+                if let Err(e) = self.git_command().args(["rebase", "--abort"]).output() {
                     debug!("Rebase abort during cleanup failed: {e}");
                 }
                 anyhow::bail!(

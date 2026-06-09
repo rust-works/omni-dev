@@ -796,8 +796,11 @@ impl TwiddleCommand {
     async fn apply_amendments_from_file(&self, amendments_file: &std::path::Path) -> Result<()> {
         use crate::git::AmendmentHandler;
 
-        // Use AmendmentHandler to apply amendments directly from file
-        let handler = AmendmentHandler::new().context("Failed to initialize amendment handler")?;
+        // Use AmendmentHandler to apply amendments directly from file.
+        // `twiddle` is still CWD-pinned (converted in a later slice), so the
+        // injected root is `.` — byte-identical to the pre-injection behavior.
+        let handler = AmendmentHandler::new(std::path::Path::new("."))
+            .context("Failed to initialize amendment handler")?;
         handler
             .apply_amendments(&amendments_file.to_string_lossy())
             .context("Failed to apply amendments")?;
@@ -1879,8 +1882,10 @@ pub(crate) async fn run_twiddle_with_client(
     amendments
         .save_to_file(&amendments_file)
         .context("Failed to save amendments")?;
-    let handler =
-        crate::git::AmendmentHandler::new().context("Failed to initialise amendment handler")?;
+    // `twiddle` is still CWD-pinned (converted in a later slice), so the
+    // injected root is `.` — byte-identical to the pre-injection behavior.
+    let handler = crate::git::AmendmentHandler::new(std::path::Path::new("."))
+        .context("Failed to initialise amendment handler")?;
     handler
         .apply_amendments(&amendments_file.to_string_lossy())
         .context("Failed to apply amendments")?;

@@ -185,6 +185,7 @@ impl CheckCommand {
             if !amendments.is_empty()
                 && self
                     .prompt_and_apply_suggestions(
+                        repo_root,
                         amendments,
                         std::io::stdin().is_terminal(),
                         &mut std::io::BufReader::new(std::io::stdin()),
@@ -747,6 +748,7 @@ impl CheckCommand {
     /// without blocking on real stdin.
     async fn prompt_and_apply_suggestions(
         &self,
+        repo_root: &std::path::Path,
         amendments: Vec<crate::data::amendments::Amendment>,
         is_terminal: bool,
         reader: &mut (dyn std::io::BufRead + Send),
@@ -784,7 +786,7 @@ impl CheckCommand {
                         .save_to_file(temp_file.path())
                         .context("Failed to save amendments")?;
 
-                    let handler = AmendmentHandler::new()
+                    let handler = AmendmentHandler::new(repo_root)
                         .context("Failed to initialize amendment handler")?;
                     handler
                         .apply_amendments(&temp_file.path().to_string_lossy())
@@ -1860,7 +1862,12 @@ mod tests {
         let cmd = make_check_cmd(false);
         let mut reader = std::io::Cursor::new(b"" as &[u8]);
         let result = cmd
-            .prompt_and_apply_suggestions(vec![make_amendment()], false, &mut reader)
+            .prompt_and_apply_suggestions(
+                std::path::Path::new("."),
+                vec![make_amendment()],
+                false,
+                &mut reader,
+            )
             .await
             .unwrap();
         assert!(!result, "non-terminal should return false");
@@ -1872,7 +1879,12 @@ mod tests {
         let cmd = make_check_cmd(false);
         let mut reader = std::io::Cursor::new(b"" as &[u8]);
         let result = cmd
-            .prompt_and_apply_suggestions(vec![make_amendment()], true, &mut reader)
+            .prompt_and_apply_suggestions(
+                std::path::Path::new("."),
+                vec![make_amendment()],
+                true,
+                &mut reader,
+            )
             .await
             .unwrap();
         assert!(!result, "EOF should return false");
@@ -1884,7 +1896,12 @@ mod tests {
         let cmd = make_check_cmd(false);
         let mut reader = std::io::Cursor::new(b"q\n" as &[u8]);
         let result = cmd
-            .prompt_and_apply_suggestions(vec![make_amendment()], true, &mut reader)
+            .prompt_and_apply_suggestions(
+                std::path::Path::new("."),
+                vec![make_amendment()],
+                true,
+                &mut reader,
+            )
             .await
             .unwrap();
         assert!(!result, "quit should return false");
@@ -1896,7 +1913,12 @@ mod tests {
         let cmd = make_check_cmd(false);
         let mut reader = std::io::Cursor::new(b"x\nq\n" as &[u8]);
         let result = cmd
-            .prompt_and_apply_suggestions(vec![make_amendment()], true, &mut reader)
+            .prompt_and_apply_suggestions(
+                std::path::Path::new("."),
+                vec![make_amendment()],
+                true,
+                &mut reader,
+            )
             .await
             .unwrap();
         assert!(!result, "invalid then quit should return false");

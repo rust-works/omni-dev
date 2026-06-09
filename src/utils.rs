@@ -5,7 +5,8 @@ pub mod preflight;
 pub mod settings;
 
 pub use preflight::{
-    check_ai_command_prerequisites, check_ai_credentials, check_git_repository, check_github_cli,
-    check_pr_command_prerequisites, check_working_directory_clean, AiCredentialInfo, AiProvider,
+    check_ai_command_prerequisites, check_ai_credentials, check_git_repository,
+    check_git_repository_at, check_github_cli, check_pr_command_prerequisites,
+    check_working_directory_clean, check_working_directory_clean_at, AiCredentialInfo, AiProvider,
 };
 pub use settings::{get_env_var, get_env_vars, Settings};
