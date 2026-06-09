@@ -459,11 +459,12 @@ mod tests {
     /// Every git command that has not yet been converted to honor `--repo`
     /// must reject an injected path with a clear error rather than silently
     /// ignoring it (RULE 6). Exercises each reject-guard branch through the
-    /// real parse + dispatch path. `git branch info` and `git commit message
-    /// view` are converted, so they are absent here.
+    /// real parse + dispatch path. `git branch info`, `git commit message
+    /// view`, and `git commit message staged` are converted, so they are
+    /// absent here.
     #[tokio::test]
     async fn repo_flag_rejected_for_unconverted_commands() {
-        let unconverted: [&[&str]; 5] = [
+        let unconverted: [&[&str]; 4] = [
             &[
                 "omni-dev", "-C", "/tmp", "git", "commit", "message", "amend", "x.yaml",
             ],
@@ -472,9 +473,6 @@ mod tests {
             ],
             &[
                 "omni-dev", "-C", "/tmp", "git", "commit", "message", "check",
-            ],
-            &[
-                "omni-dev", "-C", "/tmp", "git", "commit", "message", "staged",
             ],
             &["omni-dev", "-C", "/tmp", "git", "branch", "create", "pr"],
         ];

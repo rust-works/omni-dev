@@ -154,6 +154,39 @@ pub fn resolve_context_dir(override_dir: Option<&Path>) -> PathBuf {
     resolve_context_dir_with_source(override_dir).0
 }
 
+/// Like [`resolve_context_dir_with_source`], but anchored to an explicit
+/// `repo_root` instead of the process current working directory.
+///
+/// The override and `OMNI_DEV_CONFIG_DIR` tiers behave identically; only the
+/// walk-up start and the default fall back to `repo_root` rather than the CWD,
+/// so a command run with an injected `--repo` discovers config under that repo.
+pub fn resolve_context_dir_with_source_at(
+    override_dir: Option<&Path>,
+    repo_root: &Path,
+) -> (PathBuf, ConfigDirSource) {
+    if let Some(dir) = override_dir {
+        return (dir.to_path_buf(), ConfigDirSource::CliFlag);
+    }
+
+    if let Ok(env_dir) = std::env::var("OMNI_DEV_CONFIG_DIR") {
+        if !env_dir.is_empty() {
+            return (PathBuf::from(env_dir), ConfigDirSource::EnvVar);
+        }
+    }
+
+    // Walk-up discovery: search from the injected repo root upward.
+    if let Some(config_dir) = walk_up_find_config_dir(repo_root) {
+        return (config_dir, ConfigDirSource::WalkUp);
+    }
+
+    (repo_root.join(".omni-dev"), ConfigDirSource::Default)
+}
+
+/// Like [`resolve_context_dir`], but anchored to an explicit `repo_root`.
+pub fn resolve_context_dir_at(override_dir: Option<&Path>, repo_root: &Path) -> PathBuf {
+    resolve_context_dir_with_source_at(override_dir, repo_root).0
+}
+
 /// Loads a config file's content via the standard resolution chain.
 ///
 /// Uses [`resolve_config_file`] to find the file, then reads its content.
