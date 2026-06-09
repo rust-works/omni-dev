@@ -89,7 +89,8 @@ impl TekkenTokenizer {
     }
 
     /// The raw bytes a single id contributes (empty for special / out-of-range).
-    fn token_bytes(&self, token_id: i64) -> &[u8] {
+    /// Exposed for incremental streaming decode.
+    pub fn token_bytes(&self, token_id: i64) -> &[u8] {
         if token_id < 0
             || (token_id as usize) < self.n_special
             || self.special_ids.contains(&(token_id as usize))

@@ -118,10 +118,7 @@ fn reflect_pad(x: &[f32], pad: usize) -> Vec<f32> {
 #[allow(clippy::suboptimal_flops)]
 fn log_mel(samples: &[f32], global_log_mel_max: f32) -> (Vec<f32>, usize) {
     const N_FREQ: usize = N_FFT / 2 + 1;
-    // Periodic Hann window (divide by N, not N-1).
-    let window: Vec<f32> = (0..N_FFT)
-        .map(|n| 0.5 * (1.0 - (2.0 * PI * n as f32 / N_FFT as f32).cos()))
-        .collect();
+    let window = hann_window();
 
     let padded = reflect_pad(samples, N_FFT / 2);
     let n_frames = 1 + (padded.len() - N_FFT) / HOP;
@@ -156,6 +153,68 @@ fn log_mel(samples: &[f32], global_log_mel_max: f32) -> (Vec<f32>, usize) {
         }
     }
     (mel, out_frames)
+}
+
+/// Periodic Hann window of length [`N_FFT`].
+fn hann_window() -> Vec<f32> {
+    (0..N_FFT)
+        .map(|n| 0.5 * (1.0 - (2.0 * PI * n as f32 / N_FFT as f32).cos()))
+        .collect()
+}
+
+/// Number of samples the left edge of the audio buffer must hold before mel
+/// frame 0 is centered correctly: the streaming caller prepends `N_FFT/2`
+/// (reflect-pad equivalent on leading silence) so frame `t` reads
+/// `audio[t*HOP .. t*HOP + N_FFT]`, matching the offline center-padded indexing.
+pub const MEL_FRONT_PAD: usize = N_FFT / 2;
+
+/// Number of complete mel frames available from an `audio` buffer of `len`
+/// samples (`frame t` needs `audio[t*HOP .. t*HOP + N_FFT]`).
+pub fn mel_frames_available(len: usize) -> usize {
+    if len < N_FFT {
+        0
+    } else {
+        1 + (len - N_FFT) / HOP
+    }
+}
+
+/// Computes log-mel frames `[t0, t1)` **frame-major** (`out[i*128 ..]` is frame
+/// `t0 + i`) from already-padded `audio`. The incremental counterpart of
+/// [`log_mel`]: same window/FFT/Slaney-bank/log recipe, but per-frame so a
+/// streaming session computes only newly-available frames. Caller guarantees
+/// `audio.len() >= t1 * HOP + N_FFT`.
+#[allow(clippy::suboptimal_flops)]
+pub fn mel_frames(audio: &[f32], t0: usize, t1: usize, global_log_mel_max: f32) -> Vec<f32> {
+    const N_FREQ: usize = N_FFT / 2 + 1;
+    let window = hann_window();
+    let bank = mel_filter_bank();
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(N_FFT);
+    let min_val = global_log_mel_max - 8.0;
+
+    let mut out = vec![0.0_f32; (t1 - t0) * N_MELS];
+    let mut buf = vec![Complex::new(0.0_f32, 0.0); N_FFT];
+    for t in t0..t1 {
+        let start = t * HOP;
+        for (n, b) in buf.iter_mut().enumerate() {
+            *b = Complex::new(audio[start + n] * window[n], 0.0);
+        }
+        fft.process(&mut buf);
+        let mut power = [0.0_f32; N_FREQ];
+        for (k, p) in power.iter_mut().enumerate() {
+            *p = buf[k].re * buf[k].re + buf[k].im * buf[k].im;
+        }
+        let frame = (t - t0) * N_MELS;
+        for (m, filt) in bank.iter().enumerate() {
+            let mut acc = 0.0_f32;
+            for k in 0..N_FREQ {
+                acc += filt[k] * power[k];
+            }
+            let log = acc.max(1e-10).log10().max(min_val);
+            out[frame + m] = (log + 4.0) / 4.0;
+        }
+    }
+    out
 }
 
 /// The mel front-end output: the `[128, frames]` log-mel buffer (row-major) and

@@ -110,13 +110,7 @@ pub fn create_default_streaming_transcriber(
                  or `voice transcribe` for batch"
             )
         }
-        "voxtral-mlx" => {
-            bail!(
-                "streaming backend not yet implemented for \"voxtral-mlx\" \
-                 (lands in #933 M3); use --backend voxtral or mock for streaming, \
-                 or `voice transcribe --backend voxtral-mlx` for batch"
-            )
-        }
+        "voxtral-mlx" => create_voxtral_mlx_streaming_transcriber(opts),
         other => {
             bail!(
                 "unknown voice backend: {other:?} \
@@ -263,6 +257,48 @@ fn create_voxtral_mlx_transcriber(opts: &VoiceOpts) -> Result<Box<dyn Transcribe
                 "voice backend \"voxtral-mlx\" is only available on macOS Apple \
                  Silicon by design (MLX is Apple-only — ADR-0039); use \
                  --backend whisper-candle, or --backend voxtral on macOS/Linux"
+            )
+        }
+    }
+}
+
+/// Constructs the INT4 Voxtral MLX backend as a [`StreamingTranscriber`] (#933
+/// M3b, ADR-0039). Same Apple-Silicon + `voxtral-mlx`-feature gating and
+/// construction-time error contract as [`create_voxtral_mlx_transcriber`].
+fn create_voxtral_mlx_streaming_transcriber(
+    opts: &VoiceOpts,
+) -> Result<Box<dyn StreamingTranscriber>> {
+    #[cfg(all(feature = "voxtral-mlx", target_os = "macos", target_arch = "aarch64"))]
+    {
+        use crate::voice::backends::voxtral_mlx::{
+            VoxtralMlxBackend, DEFAULT_VOXTRAL_MLX_DELAY_MS,
+        };
+        use crate::voice::models::resolve_voxtral_mlx_model_dir;
+
+        let dir = resolve_voxtral_mlx_model_dir(opts)?;
+        let delay_ms = opts
+            .delay_ms
+            .map_or(DEFAULT_VOXTRAL_MLX_DELAY_MS, |ms| ms.max(0) as u32);
+        Ok(Box::new(VoxtralMlxBackend::new(&dir, delay_ms)?))
+    }
+
+    #[cfg(not(all(feature = "voxtral-mlx", target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = opts;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            bail!(
+                "voice backend \"voxtral-mlx\" was not compiled in; rebuild with \
+                 `--features voxtral-mlx` (see ADR-0039), or use --backend mock \
+                 for streaming"
+            )
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            bail!(
+                "voice backend \"voxtral-mlx\" is only available on macOS Apple \
+                 Silicon by design (MLX is Apple-only — ADR-0039); use \
+                 --backend mock for streaming"
             )
         }
     }

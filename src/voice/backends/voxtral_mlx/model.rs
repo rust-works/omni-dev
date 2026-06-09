@@ -13,9 +13,9 @@
 //!    is `adapter_out[pos] + embed(prev_token)`. Stop at EOS or when the audio
 //!    runs out. Decode the collected ids to text.
 //!
-//! Scope (M1.4/M1.5): the single-pass encoder path ([`AudioEncoder::encode_full`],
-//! capped at [`AudioEncoder::MAX_FULL_FRAMES`]); long-audio chunking + streaming
-//! are M3.
+//! This is the offline driver; long audio is handled by
+//! [`AudioEncoder::encode_conv`]'s chunked path (M3a), and the incremental
+//! streaming counterpart lives in [`super::stream`] (M3b).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -33,10 +33,10 @@ use super::tokenizer::TekkenTokenizer;
 use super::weights::load_safetensors;
 
 // Stable special-token ids + streaming constants (config.py `AudioEncodingConfig`).
-const BOS_TOKEN_ID: i64 = 1;
-const EOS_TOKEN_ID: i64 = 2;
-const STREAMING_PAD_TOKEN_ID: i32 = 32;
-const N_LEFT_PAD_TOKENS: usize = 32;
+pub(crate) const BOS_TOKEN_ID: i64 = 1;
+pub(crate) const EOS_TOKEN_ID: i64 = 2;
+pub(crate) const STREAMING_PAD_TOKEN_ID: i32 = 32;
+pub(crate) const N_LEFT_PAD_TOKENS: usize = 32;
 const HOP_LENGTH: usize = 160;
 const AUDIO_LENGTH_PER_TOK: usize = 8; // RAW_AUDIO_PER_TOK / HOP_LENGTH
 const MAX_TOKENS: usize = 4096;
@@ -53,7 +53,7 @@ fn num_audio_tokens(audio_len: usize) -> usize {
 }
 
 /// `_num_delay_tokens`: decoder lag for a given delay in ms (480 ms → 6 tokens).
-fn num_delay_tokens(delay_ms: u32) -> usize {
+pub(crate) fn num_delay_tokens(delay_ms: u32) -> usize {
     let delay_len = (f64::from(delay_ms) / 1000.0 * 16_000.0) as usize;
     num_audio_tokens(delay_len)
 }
@@ -89,12 +89,10 @@ impl VoxtralMlxModel {
         self.delay_ms = delay_ms;
     }
 
-    /// Greedy `argmax` over a `[1, vocab]` logits row → token id.
-    fn argmax(logits: &Array) -> Result<i64> {
-        let axis = (logits.ndim() - 1) as i32;
-        let idx = mlx_rs::ops::indexing::argmax(logits, axis, false)?;
-        idx.eval()?;
-        Ok(i64::from(idx.item::<u32>()))
+    /// Builds a streaming session borrowing this model's weights, config, and
+    /// tokenizer for the lifetime of the stream (M3b).
+    pub fn stream_session(&self) -> super::stream::StreamSession<'_> {
+        super::stream::StreamSession::new(&self.weights, self.cfg, &self.tokenizer, self.delay_ms)
     }
 
     /// Transcribes 16 kHz mono `samples` to text (offline, greedy).
@@ -152,7 +150,8 @@ impl VoxtralMlxModel {
         let prefix = adapter_out.index(0..prompt_len as i32).add(&text_embeds)?;
         let h = dec.forward(&prefix, 0, &ada, &mut caches)?;
         let last = h.index((prompt_len as i32 - 1)..prompt_len as i32); // [1, dim]
-        let mut token = Self::argmax(&dec.logits(&last)?)?;
+        let mut token =
+            crate::voice::backends::voxtral_mlx::stream::argmax_token(&dec.logits(&last)?)?;
 
         // Greedy decode: one token per audio position in [prompt_len, n_audio).
         let mut generated: Vec<i64> = Vec::new();
@@ -167,7 +166,7 @@ impl VoxtralMlxModel {
             let tok_embed = dec.embed_tokens(&[token as i32])?; // [1, dim]
             let embed = audio.add(&tok_embed)?;
             let h = dec.forward(&embed, pos as i32, &ada, &mut caches)?;
-            token = Self::argmax(&dec.logits(&h)?)?;
+            token = crate::voice::backends::voxtral_mlx::stream::argmax_token(&dec.logits(&h)?)?;
         }
         if completed {
             // Loop ran to the end of the audio without an early stop: the last

@@ -302,6 +302,186 @@ impl<'a> AudioEncoder<'a> {
         let conv_out = self.conv_stem(mel)?;
         self.encode_conv(&conv_out)
     }
+
+    /// Downsamples + projects complete `downsample_factor`-frame groups of
+    /// `encoded`, exposed for the streaming session (which carries the `<4`-frame
+    /// remainder across steps). See [`Self::downsample_and_project`].
+    pub(crate) fn project_downsampled(&self, encoded: &Array) -> Result<Array> {
+        self.downsample_and_project(encoded)
+    }
+
+    // ── Streaming primitives (M3b) ───────────────────────────────────────────
+
+    /// One streaming causal Conv1d step (port of `StreamingCausalConv1d.step`):
+    /// feeds `x_new` `[n_new, C_in]`, returns `[n_out, C_out]`, carrying the
+    /// `kernel - stride` left-context frames in `st` so concatenated step outputs
+    /// equal the batch [`Self::causal_conv1d`] over the concatenated input.
+    fn stream_conv1d(
+        &self,
+        st: &mut StreamConvState,
+        x_new: &Array,
+        prefix: &str,
+        kernel: i32,
+        stride: i32,
+    ) -> Result<Array> {
+        let weight = self
+            .w
+            .get(&format!("{prefix}.weight"))?
+            .as_dtype(COMPUTE_DTYPE)?;
+        let c_out = weight.shape()[0];
+        if x_new.shape()[0] == 0 {
+            return Ok(mlx_rs::ops::zeros::<f32>(&[0, c_out])?.as_dtype(COMPUTE_DTYPE)?);
+        }
+        let keep = kernel - stride;
+        let context = if !st.initialized {
+            st.initialized = true;
+            if keep > 0 {
+                let pad = mlx_rs::ops::zeros::<f32>(&[keep, x_new.shape()[1]])?
+                    .as_dtype(COMPUTE_DTYPE)?;
+                concatenate(&[&pad, x_new], 0).map_err(|e| anyhow!("conv pad {prefix}: {e}"))?
+            } else {
+                x_new.clone()
+            }
+        } else {
+            match &st.state {
+                Some(s) => concatenate(&[s, x_new], 0)
+                    .map_err(|e| anyhow!("conv state concat {prefix}: {e}"))?,
+                None => x_new.clone(),
+            }
+        };
+
+        let len = context.shape()[0];
+        if len < kernel {
+            st.state = Some(context);
+            return Ok(mlx_rs::ops::zeros::<f32>(&[0, c_out])?.as_dtype(COMPUTE_DTYPE)?);
+        }
+
+        let out = mlx_rs::ops::conv1d(&context.expand_dims(&[0])?, &weight, stride, 0, 1, 1)
+            .map_err(|e| anyhow!("stream conv1d {prefix}: {e}"))?;
+        let bias = self
+            .w
+            .get(&format!("{prefix}.bias"))?
+            .as_dtype(COMPUTE_DTYPE)?;
+        let out = out.add(&bias)?.squeeze(&[0i32][..])?; // [n_out, C_out]
+        let n_out = out.shape()[0];
+
+        if keep > 0 {
+            let leftover = len - n_out * stride;
+            st.state = if leftover <= 0 {
+                None
+            } else {
+                let take = keep.min(leftover);
+                Some(context.index((len - take)..len))
+            };
+        } else {
+            st.state = None;
+        }
+        Ok(out)
+    }
+
+    /// One streaming conv-stem step: mel frames `[n, 128]` (frame-major) →
+    /// conv output `[m, dim]` (port of `StreamingConvStem.step`; no front-trunc —
+    /// the standard padding keeps the running total ÷ `downsample_factor`).
+    pub(crate) fn stream_conv_stem(
+        &self,
+        st: &mut ConvStemState,
+        mel_frames: &Array,
+    ) -> Result<Array> {
+        let x = mel_frames.as_dtype(COMPUTE_DTYPE)?;
+        let x = mlx_rs::nn::gelu(self.stream_conv1d(
+            &mut st.c0,
+            &x,
+            "encoder.conv_layers_0_conv.conv",
+            3,
+            1,
+        )?)?;
+        let x = mlx_rs::nn::gelu(self.stream_conv1d(
+            &mut st.c1,
+            &x,
+            "encoder.conv_layers_1_conv.conv",
+            3,
+            2,
+        )?)?;
+        Ok(x)
+    }
+
+    /// One streaming encoder step over a conv chunk `[n, dim]` → post-norm output
+    /// `[n, dim]` (port of `StreamingEncoder.step`): runs all 32 layers with a
+    /// per-layer rotating KV cache (≤ sliding_window frames) at the running RoPE
+    /// position. Equivalent to [`Self::encode_chunked`] for any chunking.
+    pub(crate) fn stream_encode(
+        &self,
+        st: &mut StreamEncState,
+        conv_chunk: &Array,
+    ) -> Result<Array> {
+        let chunk_len = conv_chunk.shape()[0] as usize;
+        if chunk_len == 0 {
+            return Ok(conv_chunk.clone());
+        }
+        let sw = self.cfg.sliding_window;
+        let prev_len = st.prev_kv[0]
+            .as_ref()
+            .map_or(0, |(k, _)| k.shape()[2] as usize);
+        let mask = chunk_window_mask(chunk_len, prev_len, sw)?;
+
+        let mut x = conv_chunk.clone();
+        for (layer, slot) in st.prev_kv.iter_mut().enumerate() {
+            let (out, (k, v)) = self.layer_kv(&x, layer, st.pos, slot.as_ref(), &mask)?;
+            x = out;
+            // Append the new chunk's KV and keep only the last `sw` frames.
+            let (mut nk, mut nv) = match slot.take() {
+                None => (k, v),
+                Some((pk, pv)) => (
+                    concatenate(&[&pk, &k], 2).map_err(|e| anyhow!("enc kv k: {e}"))?,
+                    concatenate(&[&pv, &v], 2).map_err(|e| anyhow!("enc kv v: {e}"))?,
+                ),
+            };
+            let t = nk.shape()[2];
+            if t as usize > sw {
+                let idx: Vec<i32> = ((t - sw as i32)..t).collect();
+                let idx = Array::from_slice(&idx, &[sw as i32]);
+                nk = nk.take(&idx, 2)?;
+                nv = nv.take(&idx, 2)?;
+            }
+            *slot = Some((nk, nv));
+        }
+        let normed = self
+            .w
+            .rms_norm(&x, "encoder.transformer_norm", self.cfg.norm_eps)?;
+        st.pos += chunk_len as i32;
+        Ok(normed)
+    }
+}
+
+/// Per-conv carried left-context state for [`AudioEncoder::stream_conv1d`].
+#[derive(Default)]
+pub(crate) struct StreamConvState {
+    state: Option<Array>,
+    initialized: bool,
+}
+
+/// The two streaming conv states of the conv stem.
+#[derive(Default)]
+pub(crate) struct ConvStemState {
+    c0: StreamConvState,
+    c1: StreamConvState,
+}
+
+/// Streaming encoder state: a per-layer rotating KV cache and the running RoPE
+/// position.
+pub(crate) struct StreamEncState {
+    prev_kv: Vec<Option<(Array, Array)>>,
+    pos: i32,
+}
+
+impl StreamEncState {
+    /// A fresh state for an `n_layers`-deep encoder.
+    pub(crate) fn new(n_layers: usize) -> Self {
+        Self {
+            prev_kv: (0..n_layers).map(|_| None).collect(),
+            pos: 0,
+        }
+    }
 }
 
 #[cfg(test)]

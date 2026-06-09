@@ -18,8 +18,11 @@
 //! (M2). Long audio of any length is handled by the chunked encoder
 //! ([`AudioEncoder::encode_chunked`], proven numerically equal to the single-pass
 //! path); on the full 5-min fixture it measured **WER 4.0%** and **RTF 0.263**,
-//! matching `voxtral.c`'s 4.12% at ≈ 5× its speed (M3a). Remaining: the
-//! `StreamingTranscriber` impl (M3b), CI graph-gating, and
+//! matching `voxtral.c`'s 4.12% at ≈ 5× its speed (M3a). The
+//! [`StreamingTranscriber`](crate::voice::transcriber::StreamingTranscriber) impl
+//! drives the [`stream::StreamSession`] incrementally — proven to reproduce the
+//! batch transcript byte-for-byte — emitting `Partial`/`Final`/`SilenceGap`
+//! events via `StreamSegmenter` (M3b). Remaining: CI graph-gating and
 //! docs/security/`voxtral.c` fate (M4).
 //!
 //! [`Transcriber`]: crate::voice::Transcriber
@@ -37,6 +40,7 @@ mod encoder;
 mod mel;
 mod model;
 mod nn;
+mod stream;
 mod tokenizer;
 mod weights;
 
