@@ -74,6 +74,7 @@ byteorder = "1"
 tract-onnx = "0.22"
 rustfft = "6"
 ureq = "3"
+quick-xml = "0.40.1"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["signal"] }

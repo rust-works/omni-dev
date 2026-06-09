@@ -9,6 +9,7 @@ pub mod browser;
 pub mod commands;
 pub mod completions;
 pub mod config;
+pub mod coverage;
 pub mod datadog;
 pub mod git;
 pub mod help;
@@ -122,6 +123,8 @@ pub enum Commands {
     Browser(browser::BrowserCommand),
     /// Datadog: read-only API operations.
     Datadog(datadog::DatadogCommand),
+    /// Coverage: diff/patch coverage analysis for PR comments.
+    Coverage(coverage::CoverageCommand),
     /// Transcript and caption fetching from media platforms.
     Transcript(transcript::TranscriptCommand),
     /// Voice capture and processing operations.
@@ -177,6 +180,7 @@ impl Cli {
             Commands::Atlassian(cmd) => cmd.execute().await,
             Commands::Browser(cmd) => cmd.execute().await,
             Commands::Datadog(cmd) => cmd.execute().await,
+            Commands::Coverage(cmd) => cmd.execute().await,
             Commands::Transcript(cmd) => cmd.execute().await,
             Commands::Voice(cmd) => cmd.execute().await,
             Commands::Config(config_cmd) => config_cmd.execute(),
