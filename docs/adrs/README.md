@@ -61,3 +61,4 @@ by Michael Nygard.
 | [ADR-0035](adr-0035.md)  | ✅ Accepted                              | 2026-05-25 | OS-Gated ASR Backends with Auto-Upgrading Defaults                                     |
 | [ADR-0036](adr-0036.md)  | ✅ Accepted                              | 2026-05-30 | Confused-Deputy Browser Bridge with Dual-Plane Default-Closed Authentication           |
 | [ADR-0037](adr-0037.md)  | ✅ Accepted                              | 2026-06-06 | Pure-C Native ASR Backends Behind a Rust FFI Boundary on Non-Windows Targets           |
+| [ADR-0040](adr-0040.md)  | ✅ Accepted                              | 2026-06-10 | candle + earshot VAD + LocalAgreement-2 as the Latency-Tolerant Streaming ASR Floor    |
