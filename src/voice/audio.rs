@@ -212,7 +212,7 @@ impl CpalAudioSource {
         let (mut producer, consumer) = rb.split();
         let stream_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let error_clone = stream_error.clone();
-        let err_fn = move |err: cpal::StreamError| {
+        let err_fn = move |err: cpal::Error| {
             if let Ok(mut slot) = error_clone.lock() {
                 *slot = Some(err.to_string());
             }
@@ -221,7 +221,7 @@ impl CpalAudioSource {
         let stream = match sample_format {
             SampleFormat::F32 => device
                 .build_input_stream(
-                    &config,
+                    config,
                     move |data: &[f32], _| {
                         producer.push_slice(data);
                     },
@@ -231,7 +231,7 @@ impl CpalAudioSource {
                 .with_context(|| format!("Failed to build f32 input stream on {resolved_name}"))?,
             SampleFormat::I16 => device
                 .build_input_stream(
-                    &config,
+                    config,
                     move |data: &[i16], _| {
                         for sample in data {
                             let _ = producer.try_push(sample.to_float_sample());
@@ -243,7 +243,7 @@ impl CpalAudioSource {
                 .with_context(|| format!("Failed to build i16 input stream on {resolved_name}"))?,
             SampleFormat::U16 => device
                 .build_input_stream(
-                    &config,
+                    config,
                     move |data: &[u16], _| {
                         for sample in data {
                             let _ = producer.try_push(sample.to_float_sample());
