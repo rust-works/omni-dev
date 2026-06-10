@@ -284,6 +284,18 @@ mod tests {
     }
 
     #[test]
+    fn execute_against_injected_repo_succeeds() {
+        // Drives `execute()` (not just `run_info`) so its run_info+println body
+        // is covered deterministically via the injected repo path. Those lines
+        // were previously only hit by the live-repo dispatch test and flickered
+        // covered<->uncovered depending on the checkout state.
+        let (temp_dir, _commits) = init_repo_with_commits();
+        InfoCommand { base_branch: None }
+            .execute(Some(temp_dir.path()))
+            .unwrap();
+    }
+
+    #[test]
     fn run_info_with_explicit_missing_base_errors() {
         let (temp_dir, _commits) = init_repo_with_commits();
         let err = run_info(Some("no-such-branch"), Some(temp_dir.path())).unwrap_err();
@@ -334,8 +346,8 @@ mod tests {
     }
 
     /// The injected `repo_path` fully determines the repository with no
-    /// dependence on the process current working directory (previously this
-    /// entered the temp repo via a `CwdGuard`; now the path is passed directly).
+    /// dependence on the process current working directory — the path is passed
+    /// directly rather than via any process-CWD mutation.
     #[test]
     fn run_info_uses_injected_repo_without_cwd() {
         let (temp_dir, _commits) = init_repo_with_commits();
