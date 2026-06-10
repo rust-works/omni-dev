@@ -537,6 +537,32 @@ mod tests {
         }
     }
 
+    /// [`WindowDecoder`] returning the same response for every call —
+    /// for end-to-end paths where the number of inferences depends on
+    /// earshot's scoring of real audio.
+    struct ConstDecoder {
+        text: String,
+        confidence: f32,
+        calls: AtomicUsize,
+    }
+
+    impl ConstDecoder {
+        fn new(text: &str, confidence: f32) -> Arc<Self> {
+            Arc::new(Self {
+                text: text.to_string(),
+                confidence,
+                calls: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl WindowDecoder for ConstDecoder {
+        fn decode(&self, _pcm: &[f32]) -> Result<(String, f32)> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok((self.text.clone(), self.confidence))
+        }
+    }
+
     /// Config where every VAD window counts as voiced (threshold 0 ⇒
     /// `score >= 0` always) and auto-endpointing is off — isolates the
     /// cadence/LA-2/cap logic from earshot's GMM scoring.
@@ -828,6 +854,114 @@ mod tests {
             assert!(config.validate().is_err(), "should reject: {config:?}");
         }
         assert!(StreamingConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn vad_silence_endpoint_emits_silence_gap_through_the_stream() {
+        // Real speech primes the VAD, then a second of zeros trips the
+        // idle edge: the stream must finalize and emit a mid-stream
+        // Endpoint(SilenceGap) — the production silence-endpoint path
+        // through `step`, not a hand-built `finalize` call.
+        let wav = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/voice/short_en.wav");
+        let mut speech = VecAudioInput::from_wav_path(wav, 1600).unwrap();
+        let mut samples: Vec<i16> = Vec::new();
+        while let Some(chunk) = speech.next_chunk() {
+            samples.extend_from_slice(&chunk);
+            if samples.len() >= 32_000 {
+                break; // 2 s of real speech
+            }
+        }
+        samples.extend(std::iter::repeat(0i16).take(16_000)); // 1 s silence
+
+        let config = StreamingConfig {
+            // Default 0.5 threshold: zeros are silent at 0.5 (VadGate unit
+            // tests) and real speech is voiced at 0.5 (the #969 envelope
+            // was measured at this cut).
+            min_window_secs: 0.5,
+            cadence_secs: 0.5,
+            ..StreamingConfig::default()
+        };
+        let decoder = ConstDecoder::new("hello world", 0.9);
+        let t = CandleStreamingTranscriber::from_decoder(
+            Arc::clone(&decoder) as Arc<dyn WindowDecoder>,
+            config,
+            Box::new(CountingUlidRng::new()),
+        )
+        .unwrap();
+        let input = VecAudioInput::from_samples(samples, 1600);
+        let events: Vec<Result<TranscriptEvent>> = t.transcribe(Box::new(input)).unwrap().collect();
+
+        let rendered = texts(&events);
+        assert!(
+            rendered.contains(&"E:SilenceGap".to_string()),
+            "speech followed by silence must emit a SilenceGap endpoint, got: {rendered:?}"
+        );
+        assert_eq!(rendered.last().unwrap(), "E:StreamEnd", "got: {rendered:?}");
+        assert!(
+            decoder.calls.load(Ordering::SeqCst) >= 1,
+            "real speech must reach the decoder"
+        );
+    }
+
+    #[test]
+    fn finalize_with_no_new_words_emits_endpoint_only() {
+        // The window grew, finalize re-decodes — but the hypothesis has
+        // no words beyond the commit point. Nothing to flush: just the
+        // Endpoint.
+        let decoder = ScriptedDecoder::ok(&[("hello", 0.5)]);
+        let mut stream = bare_stream(&decoder, StreamingConfig::default());
+        stream.window = std::iter::repeat(0.1f32).take(32_000).collect();
+        stream.last_inference_window_len = 16_000;
+        stream.hyp_prev_words = vec!["hello".into()];
+        stream.committed = 1;
+        stream.samples_pushed = 48_000;
+
+        stream.finalize(EndpointKind::SilenceGap).unwrap();
+        assert_eq!(decoder.calls(), 1);
+        let events: Vec<TranscriptEvent> = stream.pending.drain(..).collect();
+        assert_eq!(events.len(), 1, "got: {events:?}");
+        assert!(matches!(
+            &events[0],
+            TranscriptEvent::Endpoint {
+                kind: EndpointKind::SilenceGap,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn queue_final_skips_empty_text() {
+        let decoder = ScriptedDecoder::ok(&[]);
+        let mut stream = bare_stream(&decoder, StreamingConfig::default());
+        stream.queue_final(String::new(), 0.9).unwrap();
+        assert!(
+            stream.pending.is_empty(),
+            "empty text must not produce a Final"
+        );
+    }
+
+    #[test]
+    fn end_of_stream_decode_error_is_yielded_then_stream_fuses() {
+        // No cadence inference ever fires (min-window far above the input
+        // length), so the only decode is the end-of-stream flush — and the
+        // scripted decoder errors there.
+        let config = StreamingConfig {
+            min_window_secs: 50.0,
+            ..all_voiced_config()
+        };
+        let decoder = ScriptedDecoder::new(vec![]);
+        let t = CandleStreamingTranscriber::from_decoder(
+            Arc::clone(&decoder) as Arc<dyn WindowDecoder>,
+            config,
+            Box::new(CountingUlidRng::new()),
+        )
+        .unwrap();
+        let input = VecAudioInput::from_samples(vec![1000i16; 16_000], 1600);
+        let mut stream = t.transcribe(Box::new(input)).unwrap();
+        let first = stream.next().expect("expected an item");
+        assert!(first.is_err(), "got: {first:?}");
+        assert!(stream.next().is_none(), "stream must fuse after the error");
     }
 
     #[test]
