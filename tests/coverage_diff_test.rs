@@ -15,7 +15,7 @@ use anyhow::Result;
 use git2::{Repository, Signature};
 use tempfile::TempDir;
 
-use omni_dev::coverage::{analyze, CoverageReport, DiffModel, FileCoverage};
+use omni_dev::coverage::{analyze, CoverageReport, DiffModel, DiffScope, FileCoverage};
 
 /// A temporary git repo whose commits each define the full file set (files
 /// omitted from a commit are removed), so renames and deletions work.
@@ -121,7 +121,7 @@ fn new_file_patch_coverage() -> Result<()> {
 
     // Head report: line 1 & 3 covered, line 2 uncovered.
     let head = cov(&[("b.rs", &[(1, 1), (2, 0), (3, 4)])]);
-    let result = analyze(&head, &diff, None);
+    let result = analyze(&head, &diff, None, DiffScope::DiffOnly);
     assert_eq!(result.patch.covered, 2);
     assert_eq!(result.patch.uncovered, 1);
     assert_eq!(result.uncovered_new_lines, vec![("b.rs".to_string(), 2)]);
@@ -142,7 +142,7 @@ fn modified_file_mixed_coverage() -> Result<()> {
 
     // New line 3 covered, new line 4 uncovered.
     let head = cov(&[("m.rs", &[(1, 1), (2, 1), (3, 1), (4, 0), (5, 1)])]);
-    let result = analyze(&head, &diff, None);
+    let result = analyze(&head, &diff, None, DiffScope::DiffOnly);
     assert_eq!(result.patch.covered, 1);
     assert_eq!(result.patch.uncovered, 1);
     assert_eq!(result.uncovered_new_lines, vec![("m.rs".to_string(), 4)]);
@@ -166,7 +166,7 @@ fn line_shift_detects_indirect_change() -> Result<()> {
     // Baseline: l3 covered. Head: same line (now line 5) uncovered.
     let baseline = cov(&[("s.rs", &[(3, 2)])]);
     let head = cov(&[("s.rs", &[(2, 1), (3, 1), (5, 0)])]);
-    let result = analyze(&head, &diff, Some(&baseline));
+    let result = analyze(&head, &diff, Some(&baseline), DiffScope::DiffOnly);
 
     assert_eq!(result.indirect.len(), 1, "expected one indirect flip");
     let change = &result.indirect[0];
@@ -194,7 +194,7 @@ fn rename_does_not_show_false_lost_coverage() -> Result<()> {
     // Same coverage before (old path) and after (new path) ⇒ no flips.
     let baseline = cov(&[("old.rs", &[(2, 1), (3, 1), (4, 1)])]);
     let head = cov(&[("new.rs", &[(2, 1), (3, 1), (4, 1)])]);
-    let result = analyze(&head, &diff, Some(&baseline));
+    let result = analyze(&head, &diff, Some(&baseline), DiffScope::DiffOnly);
     assert_eq!(result.patch.total(), 0, "a pure rename adds no lines");
     assert!(
         result.indirect.is_empty(),

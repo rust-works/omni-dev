@@ -22,7 +22,7 @@ pub mod llvm_json;
 pub mod model;
 pub mod render;
 
-pub use analysis::{analyze, CoverageDiff};
+pub use analysis::{analyze, CoverageDiff, DiffScope};
 pub use diff::{default_base_ref, DiffModel};
 pub use format::{parse, Format};
 pub use model::{CoverageReport, FileCoverage};
