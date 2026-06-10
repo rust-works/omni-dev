@@ -111,8 +111,8 @@ mod tests {
     fn normalize_id_does_not_strip_other_schemes() {
         assert_eq!(normalize_id("jira://issue/X-1"), "jira://issue/X-1");
         assert_eq!(
-            normalize_id("git://repo/commits/HEAD"),
-            "git://repo/commits/HEAD"
+            normalize_id("confluence://page/12345"),
+            "confluence://page/12345"
         );
     }
 

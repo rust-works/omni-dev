@@ -346,8 +346,8 @@ mod tests {
     }
 
     /// The injected `repo_path` fully determines the repository with no
-    /// dependence on the process current working directory (previously this
-    /// entered the temp repo via a `CwdGuard`; now the path is passed directly).
+    /// dependence on the process current working directory — the path is passed
+    /// directly rather than via any process-CWD mutation.
     #[test]
     fn run_info_uses_injected_repo_without_cwd() {
         let (temp_dir, _commits) = init_repo_with_commits();
