@@ -179,7 +179,6 @@ The server exposes URI-addressable content alongside tools.
 
 | URI template | Returns |
 |--------------|---------|
-| `git://repo/commits/{range}` | YAML commit analysis (mirrors `git_view_commits`) |
 | `jira://issue/{key}` | JIRA issue body as JFM markdown |
 | `jira://issue/{key}.adf` | JIRA issue body as ADF JSON |
 | `confluence://page/{id}` | Confluence page as JFM markdown |
@@ -236,9 +235,8 @@ restarting the MCP server.
   `RUST_LOG=omni_dev::mcp=trace`.
 - **"Failed to open git repository":** the assistant runs `omni-dev-mcp` with
   its own working directory. Tools that open a git repository use that
-  directory unless an explicit `repo_path` parameter (or a resource URI
-  placing you elsewhere) overrides it. Confirm the assistant launched the
-  server from inside the repo you expected.
+  directory unless an explicit `repo_path` parameter overrides it. Confirm the
+  assistant launched the server from inside the repo you expected.
 - **Tool not found:** confirm the binary was built with `--features mcp`.
   `omni-dev-mcp --help` should print without error if the build succeeded.
 - **Atlassian / Datadog tools return auth errors:** run the matching
