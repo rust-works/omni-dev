@@ -18,6 +18,33 @@ use super::model::{CoverageReport, FileCoverage};
 /// A base-side → head-side line mapper used during indirect-change detection.
 type BaseToHead<'a> = Box<dyn Fn(u32) -> Option<u32> + 'a>;
 
+/// Minimum net covered-line change for an *unchanged* file (one the diff never
+/// touched) to be surfaced under [`DiffScope::DiffOnly`]. Small run-to-run flips
+/// (the usual cross-run measurement noise) stay below this; a real cross-file
+/// effect — e.g. a PR that removes a test, dropping a whole module's coverage —
+/// exceeds it and is reported in `notable_unchanged`.
+const NOTABLE_UNCHANGED_LINES: u64 = 10;
+
+/// Which files the project-delta and indirect-change sections report on.
+///
+/// Coverage is measured by running the test suite twice (baseline vs head), and
+/// that measurement is not perfectly reproducible — lines in code with any
+/// run-to-run variance flip even when the source is identical. Only changes in
+/// files the diff *touches* are causally attributable to the PR; everything else
+/// is measurement noise. `DiffOnly` (the default) reports only touched files,
+/// with a magnitude-gated note for substantially-moved unchanged files so real
+/// cross-file effects still surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiffScope {
+    /// Report deltas/indirect only for files the diff touches (plus the
+    /// `notable_unchanged` magnitude-gated note). The default.
+    #[default]
+    DiffOnly,
+    /// Report deltas/indirect for *all* files (legacy; includes the cross-run
+    /// measurement noise on files the PR never modified).
+    All,
+}
+
 /// Covered / uncovered tally over a set of lines.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PatchCoverage {
@@ -105,9 +132,17 @@ pub struct CoverageDiff {
     pub total_after: Option<f64>,
     /// Baseline project coverage percentage (requires a baseline).
     pub total_before: Option<f64>,
-    /// Per-file project deltas (requires a baseline).
+    /// Per-file project deltas (requires a baseline). Under [`DiffScope::DiffOnly`]
+    /// this lists only files the diff touched.
     pub file_deltas: Vec<FileDelta>,
-    /// Indirect coverage flips on unchanged lines (requires a baseline).
+    /// Files the diff did *not* touch whose coverage nonetheless moved by at
+    /// least [`NOTABLE_UNCHANGED_LINES`] covered lines (requires a baseline; only
+    /// populated under [`DiffScope::DiffOnly`]). These are flagged separately as
+    /// not attributable to the PR, so a real cross-file regression still shows
+    /// while small measurement-noise flips stay hidden.
+    pub notable_unchanged: Vec<FileDelta>,
+    /// Indirect coverage flips on unchanged lines (requires a baseline). Under
+    /// [`DiffScope::DiffOnly`] this lists only flips within files the diff touched.
     pub indirect: Vec<IndirectChange>,
 }
 
@@ -123,11 +158,12 @@ impl CoverageDiff {
     }
 }
 
-/// Runs the full attribution.
+/// Runs the full attribution at the given [`DiffScope`].
 pub fn analyze(
     head: &CoverageReport,
     diff: &DiffModel,
     baseline: Option<&CoverageReport>,
+    scope: DiffScope,
 ) -> CoverageDiff {
     let mut result = CoverageDiff {
         total_after: head.percent(),
@@ -139,8 +175,8 @@ pub fn analyze(
 
     if let Some(baseline) = baseline {
         result.total_before = baseline.percent();
-        project_delta(head, baseline, &mut result);
-        indirect_changes(head, baseline, diff, &mut result);
+        project_delta(head, baseline, diff, scope, &mut result);
+        indirect_changes(head, baseline, diff, scope, &mut result);
     }
 
     result
@@ -185,27 +221,59 @@ fn patch_coverage(head: &CoverageReport, diff: &DiffModel, result: &mut Coverage
         .sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 }
 
-/// Computes per-file and total project deltas against the baseline.
-fn project_delta(head: &CoverageReport, baseline: &CoverageReport, result: &mut CoverageDiff) {
+/// Computes per-file project deltas against the baseline.
+///
+/// Under [`DiffScope::DiffOnly`], a file the diff did not touch goes to
+/// `file_deltas` only if its coverage moved by at least
+/// [`NOTABLE_UNCHANGED_LINES`] covered lines (→ `notable_unchanged`); smaller
+/// moves are dropped as measurement noise.
+fn project_delta(
+    head: &CoverageReport,
+    baseline: &CoverageReport,
+    diff: &DiffModel,
+    scope: DiffScope,
+    result: &mut CoverageDiff,
+) {
     for (path, file) in &head.files {
-        result.file_deltas.push(FileDelta {
+        let delta = FileDelta {
             path: path.clone(),
             before: baseline.files.get(path).and_then(FileCoverage::percent),
             after: file.percent(),
-        });
+        };
+
+        if scope == DiffScope::All || diff.files.contains_key(path) {
+            result.file_deltas.push(delta);
+            continue;
+        }
+
+        // Untouched file under DiffOnly: surface only a substantial net move.
+        let covered_after = file.covered_lines();
+        let covered_before = baseline
+            .files
+            .get(path)
+            .map_or(0, FileCoverage::covered_lines);
+        let net = covered_after.abs_diff(covered_before);
+        if net >= NOTABLE_UNCHANGED_LINES {
+            result.notable_unchanged.push(delta);
+        }
     }
     result.file_deltas.sort_by(|a, b| a.path.cmp(&b.path));
+    result.notable_unchanged.sort_by(|a, b| a.path.cmp(&b.path));
 }
 
 /// Detects coverage flips on lines whose content did not change.
 ///
-/// Covers both changed files (aligned through their [`FileDiff`]) and entirely
-/// unchanged files (identity alignment), since coverage can shift on a file the
-/// diff never touched (e.g. a callee changed).
+/// Changed files are aligned through their [`FileDiff`]. Under [`DiffScope::All`],
+/// entirely-unchanged files are also compared by identity alignment; under
+/// [`DiffScope::DiffOnly`] (the default) they are skipped, because a per-line
+/// flip in a file the PR never touched is cross-run measurement noise, not a
+/// real change (its file-level move, if substantial, is reported via
+/// `notable_unchanged` instead).
 fn indirect_changes(
     head: &CoverageReport,
     baseline: &CoverageReport,
     diff: &DiffModel,
+    scope: DiffScope,
     result: &mut CoverageDiff,
 ) {
     // Index changed files by their base-side path.
@@ -224,9 +292,13 @@ fn indirect_changes(
                     fd.new_path.as_str(),
                     Box::new(move |l| fd.map_base_to_head(l)),
                 )
-            } else if head.files.contains_key(base_path) && !diff.files.contains_key(base_path) {
+            } else if scope == DiffScope::All
+                && head.files.contains_key(base_path)
+                && !diff.files.contains_key(base_path)
+            {
                 // File untouched by the diff: identity alignment. (A file added by
                 // the diff is excluded — its lines are direct, not indirect.)
+                // Only under `All` scope — otherwise these per-line flips are noise.
                 (base_path.as_str(), Box::new(Some))
             } else {
                 // Deleted in head — nothing to compare.
@@ -298,7 +370,7 @@ mod tests {
         // File has lines 1..4; the diff added lines 2 and 3.
         let head = report(&[("src/a.rs", &[(1, 1), (2, 1), (3, 0), (4, 1)])]);
         let diff = diff_added("src/a.rs", false, &[2, 3]);
-        let out = analyze(&head, &diff, None);
+        let out = analyze(&head, &diff, None, DiffScope::All);
         assert_eq!(
             out.patch,
             PatchCoverage {
@@ -315,7 +387,7 @@ mod tests {
         // Added lines 2 (uncovered), 5 (not instrumented — absent from report).
         let head = report(&[("src/a.rs", &[(1, 1), (2, 0)])]);
         let diff = diff_added("src/a.rs", false, &[2, 5]);
-        let out = analyze(&head, &diff, None);
+        let out = analyze(&head, &diff, None, DiffScope::All);
         assert_eq!(
             out.patch,
             PatchCoverage {
@@ -329,7 +401,7 @@ mod tests {
     fn new_file_patch_coverage() {
         let head = report(&[("src/new.rs", &[(1, 1), (2, 0), (3, 1)])]);
         let diff = diff_added("src/new.rs", true, &[1, 2, 3]);
-        let out = analyze(&head, &diff, None);
+        let out = analyze(&head, &diff, None, DiffScope::All);
         assert_eq!(
             out.patch,
             PatchCoverage {
@@ -346,7 +418,7 @@ mod tests {
         let baseline = report(&[("src/a.rs", &[(1, 1), (2, 0)])]); // 50%
         let head = report(&[("src/a.rs", &[(1, 1), (2, 1)])]); // 100%
         let diff = diff_added("src/a.rs", false, &[2]);
-        let out = analyze(&head, &diff, Some(&baseline));
+        let out = analyze(&head, &diff, Some(&baseline), DiffScope::All);
         assert!(out.has_baseline);
         assert_eq!(out.total_before, Some(50.0));
         assert_eq!(out.total_after, Some(100.0));
@@ -359,7 +431,7 @@ mod tests {
         let baseline = report(&[]);
         let head = report(&[("src/new.rs", &[(1, 1)])]);
         let diff = diff_added("src/new.rs", true, &[1]);
-        let out = analyze(&head, &diff, Some(&baseline));
+        let out = analyze(&head, &diff, Some(&baseline), DiffScope::All);
         assert_eq!(out.file_deltas[0].before, None);
         assert_eq!(out.file_deltas[0].after, Some(100.0));
     }
@@ -370,7 +442,7 @@ mod tests {
         let baseline = report(&[("src/b.rs", &[(5, 3)])]);
         let head = report(&[("src/b.rs", &[(5, 0)])]);
         let diff = diff_added("src/a.rs", true, &[1]); // unrelated change
-        let out = analyze(&head, &diff, Some(&baseline));
+        let out = analyze(&head, &diff, Some(&baseline), DiffScope::All);
         assert_eq!(out.indirect.len(), 1);
         assert_eq!(out.indirect[0].path, "src/b.rs");
         assert_eq!(out.indirect[0].base_line, 5);
@@ -401,7 +473,7 @@ mod tests {
         let baseline = report(&[("src/b.rs", &[(5, 0)])]);
         let head = report(&[("src/b.rs", &[(5, 3)])]);
         let diff = diff_added("src/a.rs", true, &[1]);
-        let out = analyze(&head, &diff, Some(&baseline));
+        let out = analyze(&head, &diff, Some(&baseline), DiffScope::All);
         assert_eq!(out.indirect_newly_covered(), 1);
         assert!(out.indirect[0].became_covered);
     }
@@ -412,8 +484,64 @@ mod tests {
         let baseline = report(&[("src/a.rs", &[(1, 1)])]);
         let head = report(&[("src/a.rs", &[(1, 0)])]);
         let diff = diff_added("src/a.rs", true, &[1]); // new file → no old_path
-        let out = analyze(&head, &diff, Some(&baseline));
+        let out = analyze(&head, &diff, Some(&baseline), DiffScope::All);
         // New file has no base mapping, so no indirect entries from it.
         assert!(out.indirect.is_empty());
+    }
+
+    // ── DiffScope::DiffOnly (noise filter) ──
+
+    #[test]
+    fn diff_only_suppresses_untouched_file_indirect() {
+        // Same as indirect_change_on_unchanged_file, but DiffOnly drops the flip.
+        let baseline = report(&[("src/b.rs", &[(5, 3)])]);
+        let head = report(&[("src/b.rs", &[(5, 0)])]);
+        let diff = diff_added("src/a.rs", true, &[1]); // unrelated change
+        let out = analyze(&head, &diff, Some(&baseline), DiffScope::DiffOnly);
+        assert!(
+            out.indirect.is_empty(),
+            "an untouched-file flip is cross-run noise under DiffOnly"
+        );
+        // A one-line move is below the notable threshold → not surfaced.
+        assert!(out.notable_unchanged.is_empty());
+    }
+
+    #[test]
+    fn diff_only_delta_table_scoped_to_changed_files() {
+        let baseline = report(&[
+            ("src/a.rs", &[(1, 1), (2, 0)]),
+            ("src/b.rs", &[(1, 1), (2, 1)]),
+        ]);
+        let head = report(&[
+            ("src/a.rs", &[(1, 1), (2, 1)]),
+            ("src/b.rs", &[(1, 1), (2, 0)]),
+        ]);
+        let diff = diff_added("src/a.rs", false, &[2]); // only a.rs is touched
+        let out = analyze(&head, &diff, Some(&baseline), DiffScope::DiffOnly);
+        let paths: Vec<&str> = out.file_deltas.iter().map(|d| d.path.as_str()).collect();
+        assert_eq!(paths, vec!["src/a.rs"], "only the changed file appears");
+        assert!(out.notable_unchanged.is_empty(), "b.rs moved < threshold");
+    }
+
+    #[test]
+    fn diff_only_surfaces_substantial_unchanged_move() {
+        // An untouched file loses 12 covered lines (e.g. its only test was removed).
+        let before: Vec<(u32, u64)> = (1..=12).map(|n| (n, 1)).collect();
+        let after: Vec<(u32, u64)> = (1..=12).map(|n| (n, 0)).collect();
+        let baseline = report(&[("src/c.rs", &before)]);
+        let head = report(&[("src/c.rs", &after)]);
+        let diff = diff_added("src/a.rs", true, &[1]); // unrelated
+        let out = analyze(&head, &diff, Some(&baseline), DiffScope::DiffOnly);
+        assert!(out.file_deltas.is_empty(), "c.rs is not in the diff");
+        assert_eq!(
+            out.notable_unchanged.len(),
+            1,
+            "12-line drop exceeds threshold"
+        );
+        assert_eq!(out.notable_unchanged[0].path, "src/c.rs");
+        assert!(
+            out.indirect.is_empty(),
+            "per-line indirect still suppressed"
+        );
     }
 }

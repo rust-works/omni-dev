@@ -173,6 +173,7 @@ fn render_markdown(diff: &CoverageDiff, opts: &RenderOptions) -> String {
 
     if diff.has_baseline {
         render_delta_table(diff, &mut out);
+        render_notable_unchanged(diff, &mut out);
     } else {
         out.push_str(
             "_No baseline available yet (first run, or the `main` baseline artifact was \
@@ -242,6 +243,40 @@ fn render_delta_table(diff: &CoverageDiff, out: &mut String) {
         ));
     }
     out.push('\n');
+}
+
+/// Renders the magnitude-gated note for unchanged files whose coverage moved
+/// substantially — flagged as *not* attributable to the PR (measurement variance
+/// or a cross-file effect like a removed test), kept collapsed so it does not
+/// crowd out the actionable sections.
+fn render_notable_unchanged(diff: &CoverageDiff, out: &mut String) {
+    if diff.notable_unchanged.is_empty() {
+        return;
+    }
+    out.push_str(&format!(
+        "<details><summary>ℹ️ {} unchanged file(s) also moved (not attributed to this PR)</summary>\n\n",
+        diff.notable_unchanged.len()
+    ));
+    out.push_str(
+        "These files were not modified by this diff; the shift is either measurement variance \
+         between the two runs or a cross-file effect (e.g. a removed test).\n\n",
+    );
+    out.push_str("| File | Before | After | Δ |\n");
+    out.push_str("|------|-------:|------:|---|\n");
+    for fd in &diff.notable_unchanged {
+        let change = match fd.delta() {
+            None => "🆕 new".to_string(),
+            Some(d) => format!("{} {} pp", arrow(d), fmt_num(d)),
+        };
+        out.push_str(&format!(
+            "| `{}` | {} | {} | {} |\n",
+            fd.path,
+            pct(fd.before),
+            pct(fd.after),
+            change
+        ));
+    }
+    out.push_str("\n</details>\n\n");
 }
 
 fn render_patch_section(diff: &CoverageDiff, opts: &RenderOptions, out: &mut String) {
@@ -381,6 +416,10 @@ struct ProjectDeltaView {
     total_before: Option<f64>,
     total_after: Option<f64>,
     files: Vec<FileDeltaView>,
+    /// Unchanged files (not touched by the diff) that nonetheless moved
+    /// substantially — flagged as not attributable to the PR.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    notable_unchanged: Vec<FileDeltaView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -432,19 +471,17 @@ impl CoverageDiffView {
             .collect();
 
         let (project_delta, indirect_changes) = if diff.has_baseline {
+            let file_delta_view = |fd: &crate::coverage::analysis::FileDelta| FileDeltaView {
+                path: fd.path.clone(),
+                before: fd.before.map(round2),
+                after: fd.after.map(round2),
+                delta: fd.delta().map(round2),
+            };
             let project_delta = ProjectDeltaView {
                 total_before: diff.total_before.map(round2),
                 total_after: diff.total_after.map(round2),
-                files: diff
-                    .file_deltas
-                    .iter()
-                    .map(|fd| FileDeltaView {
-                        path: fd.path.clone(),
-                        before: fd.before.map(round2),
-                        after: fd.after.map(round2),
-                        delta: fd.delta().map(round2),
-                    })
-                    .collect(),
+                files: diff.file_deltas.iter().map(file_delta_view).collect(),
+                notable_unchanged: diff.notable_unchanged.iter().map(file_delta_view).collect(),
             };
             let indirect_changes = IndirectView {
                 newly_covered: diff.indirect_newly_covered(),
@@ -704,6 +741,7 @@ mod tests {
                     after: None, // After renders as em dash
                 },
             ],
+            notable_unchanged: Vec::new(),
             indirect: Vec::new(),
         }
     }
@@ -794,5 +832,44 @@ mod tests {
 
         let yaml = render(&diff, &RenderOptions::default(), OutputFormat::Yaml).unwrap();
         assert!(yaml.contains("project_delta:"));
+    }
+
+    #[test]
+    fn markdown_renders_notable_unchanged_note() {
+        let mut diff = baseline_diff();
+        diff.notable_unchanged = vec![
+            FileDelta {
+                path: "src/other.rs".to_string(),
+                before: Some(80.0),
+                after: Some(60.0),
+            },
+            // Absent from the baseline → delta() is None → renders as "🆕 new".
+            FileDelta {
+                path: "src/fresh.rs".to_string(),
+                before: None,
+                after: Some(55.0),
+            },
+        ];
+        let md = render(&diff, &RenderOptions::default(), OutputFormat::Markdown).unwrap();
+        assert!(md.contains("unchanged file(s) also moved (not attributed to this PR)"));
+        assert!(md.contains("`src/other.rs`"));
+        assert!(md.contains("🔴 -20 pp"));
+        assert!(md.contains("| `src/fresh.rs` | — | 55% | 🆕 new |"));
+    }
+
+    #[test]
+    fn json_includes_notable_unchanged() {
+        let mut diff = baseline_diff();
+        diff.notable_unchanged = vec![FileDelta {
+            path: "src/other.rs".to_string(),
+            before: Some(80.0),
+            after: Some(60.0),
+        }];
+        let json = render(&diff, &RenderOptions::default(), OutputFormat::Json).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["project_delta"]["notable_unchanged"][0]["path"],
+            "src/other.rs"
+        );
     }
 }
