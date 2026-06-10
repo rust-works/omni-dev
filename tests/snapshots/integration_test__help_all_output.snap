@@ -2193,6 +2193,8 @@ Options:
           Override the path prefix stripped from report file paths to make them repo-relative (default: the repository working directory)
       --collapse-ranges
           Collapse consecutive uncovered new lines into ranges (e.g. `9-11`)
+      --all-files
+          Report per-file deltas and indirect changes for ALL files, not just the ones this diff touches
       --artifact-url <URL>
           Link to the full coverage-summary artifact (markdown footer)
       --run-url <URL>
