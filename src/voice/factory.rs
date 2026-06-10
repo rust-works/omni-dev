@@ -8,8 +8,11 @@
 //! 2. `OMNI_DEV_VOICE_BACKEND` (env var, with project settings.json
 //!    fallback via [`crate::utils::settings::get_env_var`]),
 //! 3. Default — `"mock"` until the real ASR backend has been through a
-//!    release cycle; pick `--backend whisper-candle` explicitly. See
-//!    [`crate::voice::backends::candle`] and ADR-0033.
+//!    release cycle; pick `--backend whisper-candle` (batch) or
+//!    `--backend whisper-candle-streaming` (latency-tolerant streaming)
+//!    explicitly. See [`crate::voice::backends::candle`],
+//!    [`crate::voice::backends::candle_streaming`], ADR-0033, and
+//!    ADR-0040.
 //!
 //! [`create_default_claude_client`]: crate::claude::client::create_default_claude_client
 
@@ -18,6 +21,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Result};
 
 use crate::voice::backends::candle::CandleTranscriber;
+use crate::voice::backends::candle_streaming::CandleStreamingTranscriber;
 use crate::voice::backends::mock::MockTranscriber;
 use crate::voice::models::resolve_whisper_model_dir;
 use crate::voice::transcriber::Transcriber;
@@ -59,8 +63,14 @@ pub fn create_default_transcriber(opts: &VoiceOpts) -> Result<Box<dyn Transcribe
             let dir = resolve_whisper_model_dir(opts)?;
             Ok(Box::new(CandleTranscriber::new(&dir)?))
         }
+        "whisper-candle-streaming" => {
+            let dir = resolve_whisper_model_dir(opts)?;
+            Ok(Box::new(CandleStreamingTranscriber::new(&dir)?))
+        }
         other => {
-            bail!("unknown voice backend: {other:?} (supported: \"mock\", \"whisper-candle\")")
+            bail!(
+                "unknown voice backend: {other:?} (supported: \"mock\", \"whisper-candle\", \"whisper-candle-streaming\")"
+            )
         }
     }
 }
@@ -141,6 +151,7 @@ mod tests {
         assert!(msg.contains("klingon"), "got: {msg}");
         assert!(msg.contains("supported"), "got: {msg}");
         assert!(msg.contains("whisper-candle"), "got: {msg}");
+        assert!(msg.contains("whisper-candle-streaming"), "got: {msg}");
     }
 
     #[test]
@@ -158,6 +169,25 @@ mod tests {
         };
         let Err(err) = create_default_transcriber(&opts) else {
             panic!("expected whisper-candle with empty model dir to error");
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no Whisper model found"), "got: {msg}");
+        assert!(msg.contains("voice install-model"), "got: {msg}");
+    }
+
+    #[test]
+    fn whisper_candle_streaming_arm_propagates_missing_model_error() {
+        // Same install-hint contract as the batch arm: the streaming
+        // backend loads the same model files via WhisperEngine::load.
+        let _g = env_guard();
+        std::env::remove_var("OMNI_DEV_VOICE_BACKEND");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let opts = VoiceOpts {
+            backend: Some("whisper-candle-streaming".to_string()),
+            model: Some(tmp.path().to_path_buf()),
+        };
+        let Err(err) = create_default_transcriber(&opts) else {
+            panic!("expected whisper-candle-streaming with empty model dir to error");
         };
         let msg = format!("{err:#}");
         assert!(msg.contains("no Whisper model found"), "got: {msg}");
