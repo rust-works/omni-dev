@@ -7,7 +7,8 @@ use clap::{Parser, ValueEnum};
 use git2::Repository;
 
 use crate::coverage::{
-    analyze, default_base_ref, parse, render, DiffModel, Format, OutputFormat, RenderOptions,
+    analyze, default_base_ref, parse, render, DiffModel, DiffScope, Format, OutputFormat,
+    RenderOptions,
 };
 
 /// Coverage report format selector (CLI mirror of [`Format`] plus auto-detect).
@@ -102,6 +103,16 @@ pub struct DiffCommand {
     #[arg(long)]
     pub collapse_ranges: bool,
 
+    /// Report per-file deltas and indirect changes for ALL files, not just the
+    /// ones this diff touches.
+    ///
+    /// By default the project-delta and indirect-change sections are scoped to
+    /// files the diff modifies, because coverage is measured by two independent
+    /// test runs and lines in untouched files flip purely from run-to-run
+    /// variance. This flag restores the unscoped (noisier) report.
+    #[arg(long)]
+    pub all_files: bool,
+
     /// Link to the full coverage-summary artifact (markdown footer).
     #[arg(long, value_name = "URL")]
     pub artifact_url: Option<String>,
@@ -192,7 +203,12 @@ impl DiffCommand {
         };
 
         let diff = DiffModel::between(&repo, &base_ref, self.head_ref.as_deref())?;
-        let result = analyze(&head, &diff, baseline.as_ref());
+        let scope = if self.all_files {
+            DiffScope::All
+        } else {
+            DiffScope::DiffOnly
+        };
+        let result = analyze(&head, &diff, baseline.as_ref(), scope);
 
         let opts = self.render_options();
         let rendered = render(&result, &opts, self.format.into())?;
@@ -333,6 +349,7 @@ mod tests {
             fail_under_patch: None,
             strip_prefix: None,
             collapse_ranges: false,
+            all_files: false,
             artifact_url: None,
             run_url: None,
             base_sha: None,
@@ -430,6 +447,51 @@ mod tests {
         assert!(
             !cmd.run(Some(&repo)).unwrap().below_gate,
             "66.7% >= 50% should pass"
+        );
+    }
+
+    #[test]
+    fn all_files_scope_surfaces_untouched_file() {
+        // `a.rs` is unchanged between base and head, so the diff never touches
+        // it. Its coverage moves by a single line (2/4 → 3/4): a small enough
+        // net move that DiffOnly drops it as noise, but a 25 pp shift that the
+        // delta table renders once `--all-files` widens the scope to `All`.
+        let (_dir, repo, base) = repo_with_added_file();
+        let head = format!(
+            "SF:{a}\nDA:1,1\nDA:2,1\nDA:3,1\nDA:4,0\nend_of_record\n\
+             SF:{b}\nDA:1,1\nDA:2,0\nDA:3,4\nend_of_record\n",
+            a = repo.join("a.rs").display(),
+            b = repo.join("b.rs").display(),
+        );
+        let report = repo.join("head.lcov");
+        fs::write(&report, head).unwrap();
+        let baseline = repo.join("base.lcov");
+        fs::write(
+            &baseline,
+            format!(
+                "SF:{}\nDA:1,1\nDA:2,1\nDA:3,0\nDA:4,0\nend_of_record\n",
+                repo.join("a.rs").display()
+            ),
+        )
+        .unwrap();
+
+        // Default (DiffOnly): the untouched `a.rs` row is filtered out as noise.
+        let mut scoped = command(report.clone(), &base);
+        scoped.baseline_report = Some(baseline.clone());
+        let scoped_md = scoped.run(Some(&repo)).unwrap().rendered;
+        assert!(
+            !scoped_md.contains("`a.rs`"),
+            "DiffOnly must hide untouched a.rs"
+        );
+
+        // --all-files (All): the untouched `a.rs` row is now surfaced.
+        let mut all = command(report, &base);
+        all.baseline_report = Some(baseline);
+        all.all_files = true;
+        let all_md = all.run(Some(&repo)).unwrap().rendered;
+        assert!(
+            all_md.contains("`a.rs`"),
+            "All scope must surface untouched a.rs"
         );
     }
 
