@@ -171,7 +171,7 @@ jobs:
       # when the upload below is re-enabled. Runs before the comment so the comment
       # can link to this artifact via the step's `artifact-url` output.
       id: upload
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: coverage-summary
         path: |
@@ -259,7 +259,7 @@ jobs:
       # On main only: this run's per-line lcov becomes the baseline that
       # subsequent PRs download above to compute deltas and indirect changes.
       if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: coverage-baseline
         path: coverage-head.lcov
