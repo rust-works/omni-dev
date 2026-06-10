@@ -118,7 +118,7 @@ the combined router automatically.
 
 Tools take parameters and return content; **resources** are URI-addressable
 content an MCP client fetches without a tool call (e.g.
-`omni-dev://specs/jfm`, `git://repo/commits/HEAD`). If your extension is
+`omni-dev://specs/jfm`, `jira://issue/PROJ-1`). If your extension is
 better modelled as a resource than a tool:
 
 1. Add a variant to `ResourceUri` and a parse arm in `ResourceUri::parse()`
