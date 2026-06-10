@@ -449,6 +449,39 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn current_branch_on_a_branch() -> Result<()> {
+        let temp_dir = init_tmp_repo();
+        let p = temp_dir.path();
+        std::fs::write(p.join("f.txt"), "x")?;
+        git_in(p, &["add", "."]);
+        git_in(p, &["commit", "-m", "init"]);
+        let repo = GitRepository::open_at(p)?;
+        // The branch name is whichever the local git default is (main/master);
+        // either way it must resolve to a non-"HEAD" shorthand.
+        assert_ne!(repo.get_current_branch()?, "HEAD");
+        Ok(())
+    }
+
+    #[test]
+    fn current_branch_errors_in_detached_head() -> Result<()> {
+        // CI checks PRs out as a detached HEAD, which is what makes the bail at
+        // the end of `get_current_branch` flicker run-to-run; pin it here.
+        let temp_dir = init_tmp_repo();
+        let p = temp_dir.path();
+        std::fs::write(p.join("f.txt"), "x")?;
+        git_in(p, &["add", "."]);
+        git_in(p, &["commit", "-m", "init"]);
+        git_in(p, &["checkout", "--detach", "HEAD"]);
+        let repo = GitRepository::open_at(p)?;
+        let result = repo.get_current_branch();
+        assert!(
+            matches!(&result, Err(e) if e.to_string().contains("detached HEAD")),
+            "expected detached-HEAD error, got: {result:?}"
+        );
+        Ok(())
+    }
+
     // ── remote operations via the git CLI (issue #903) ─────────────
 
     /// Runs `git` in `dir` with a deterministic identity, asserting success.
