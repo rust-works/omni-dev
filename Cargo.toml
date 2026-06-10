@@ -39,7 +39,7 @@ reqwest = { version = "0.13", features = ["json", "multipart", "stream"] }
 tokio = { version = "1.52", features = ["full"] }
 axum = "0.8"
 tokio-tungstenite = "0.24"
-rand = "0.8"
+rand = "0.9"
 thiserror = "2.0"
 async-trait = "0.1"
 regex = "1.12.3"
@@ -59,7 +59,7 @@ mime_guess = "2"
 flate2 = "1"
 tar = "0.4"
 sha2 = "0.11"
-cpal = "0.17"
+cpal = "0.18"
 rubato = "3.0"
 hound = "3.5"
 signal-hook = "0.4"
@@ -71,7 +71,7 @@ candle-transformers = { version = "0.10", default-features = false }
 hf-hub = { version = "0.5", default-features = false, features = ["ureq", "rustls-tls"] }
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 byteorder = "1"
-tract-onnx = "0.22"
+tract-onnx = "0.23"
 rustfft = "6"
 ureq = "3"
 quick-xml = "0.40.1"

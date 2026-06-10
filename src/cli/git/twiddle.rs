@@ -1942,9 +1942,10 @@ mod run_twiddle_tests {
     use crate::claude::test_utils::ConfigurableMockAiClient;
     use git2::{Repository, Signature};
 
-    /// With the `CwdGuard` retired, `run_twiddle` opens the injected repo via
-    /// `open_at`, so an invalid path errors with a git/repository error (the
-    /// `GitRepository::open_at` context) before any AI call.
+    /// `run_twiddle` opens the injected repo via `open_at` with no dependence
+    /// on the process working directory, so an invalid path errors with a
+    /// git/repository error (the `GitRepository::open_at` context) before any
+    /// AI call.
     #[tokio::test]
     async fn run_twiddle_invalid_repo_path_errors_before_ai() {
         let err = run_twiddle(
