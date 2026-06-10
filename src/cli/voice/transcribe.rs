@@ -49,8 +49,11 @@ pub struct TranscribeCommand {
     /// produce one — `transcribe` does not resample.
     pub wav: PathBuf,
 
-    /// Transcriber backend (`mock`, `whisper-candle`). Defaults to `mock`;
-    /// see ADR-0033 for the `whisper-candle` runtime choice.
+    /// Transcriber backend (`mock`, `whisper-candle`, `voxtral`, `voxtral-mlx`).
+    /// Defaults to `mock`; see ADR-0033 for the `whisper-candle` runtime,
+    /// ADR-0037 for the platform-gated native `voxtral` backend (opt-in,
+    /// macOS/Linux), and ADR-0039 for the real-time INT4 `voxtral-mlx` backend
+    /// (opt-in, macOS Apple Silicon only).
     #[arg(long)]
     pub backend: Option<String>,
 
@@ -59,6 +62,12 @@ pub struct TranscribeCommand {
     /// `~/.omni-dev/voice/models/whisper-tiny.en/`. Ignored by `mock`.
     #[arg(long)]
     pub model: Option<PathBuf>,
+
+    /// Voxtral decoder delay (lookahead) in milliseconds; the #930 spike's
+    /// sweet spot is 240–480 ms. Used by `--backend voxtral` and `voxtral-mlx`;
+    /// ignored by `mock` and `whisper-candle`. Defaults to 480 ms.
+    #[arg(long)]
+    pub delay_ms: Option<i32>,
 
     /// Output format. Defaults to `md` on a tty, `jsonl` when piped.
     #[arg(long, value_enum)]
@@ -139,6 +148,7 @@ impl TranscribeCommand {
         let opts = VoiceOpts {
             backend: self.backend,
             model: self.model,
+            delay_ms: self.delay_ms,
         };
         let transcriber = create_default_transcriber(&opts)?;
         let input = VecAudioInput::from_wav_path(&self.wav, DEFAULT_CHUNK_SAMPLES)?;
@@ -311,6 +321,15 @@ mod tests {
     }
 
     #[test]
+    fn parses_delay_ms_flag() {
+        let cli = TestCli::try_parse_from(["test", "/tmp/x.wav", "--delay-ms", "300"]).unwrap();
+        assert_eq!(cli.transcribe.delay_ms, Some(300));
+        // Absent by default.
+        let bare = TestCli::try_parse_from(["test", "/tmp/x.wav"]).unwrap();
+        assert!(bare.transcribe.delay_ms.is_none());
+    }
+
+    #[test]
     fn parses_all_flags() {
         let cli = TestCli::try_parse_from([
             "test",
@@ -440,6 +459,7 @@ mod tests {
             wav,
             backend: backend.map(str::to_string),
             model: None,
+            delay_ms: None,
             format: None,
             speaker: None,
             threshold: None,

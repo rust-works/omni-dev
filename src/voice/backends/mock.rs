@@ -22,10 +22,12 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Result;
+use futures::stream;
 
 pub use crate::voice::det::{CountingUlidRng, SystemUlidRng, UlidRng};
 use crate::voice::transcriber::{
-    AudioInput, EndpointKind, EventId, EventStream, Transcriber, TranscriptEvent,
+    AsyncAudioInput, AudioInput, EndpointKind, EventId, EventStream, StreamingTranscriber,
+    Transcriber, TranscriptEvent, TranscriptEventStream,
 };
 
 /// One Final event the mock will emit. Built before `transcribe` runs;
@@ -126,6 +128,125 @@ impl Transcriber for MockTranscriber {
             kind: EndpointKind::StreamEnd,
         }));
         Ok(Box::new(events.into_iter()))
+    }
+}
+
+/// One streaming utterance the [`MockStreamingTranscriber`] emits: a sequence
+/// of progressively-refined `Partial` hypotheses, then a revisable `Final`.
+#[derive(Debug, Clone)]
+pub struct MockStreamSegment {
+    /// Progressive partial hypotheses, emitted in order before the `Final`.
+    pub partials: Vec<String>,
+    /// Committed text for the segment's `Final`.
+    pub final_text: String,
+    /// Stream-relative start of the utterance.
+    pub start: Duration,
+    /// Stream-relative end of the utterance.
+    pub end: Duration,
+    /// Confidence in `[0.0, 1.0]` attached to the `Final`.
+    pub confidence: f32,
+}
+
+/// A canned-script [`StreamingTranscriber`] placeholder until real streaming
+/// backends land (#806 / #933 Phase 6).
+///
+/// Emits, per script segment: each `Partial` in order, then a
+/// `Final { revisable: true }`, then a `SilenceGap` `Endpoint` — and a trailing
+/// `StreamEnd` `Endpoint`. The audio is ignored (scripted timestamps); the
+/// `event_id` source is pluggable via [`UlidRng`] for deterministic tests. This
+/// is what `voice listen` (#807) orchestrates against and what Phase 8's
+/// streaming-shape assertions target.
+pub struct MockStreamingTranscriber {
+    script: Vec<MockStreamSegment>,
+    rng: Mutex<Box<dyn UlidRng>>,
+}
+
+impl MockStreamingTranscriber {
+    /// Builds a streaming mock with a real-entropy ULID source.
+    pub fn new(script: Vec<MockStreamSegment>) -> Self {
+        Self {
+            script,
+            rng: Mutex::new(Box::new(SystemUlidRng)),
+        }
+    }
+
+    /// Test-friendly constructor: caller supplies the RNG (use
+    /// [`CountingUlidRng`] for determinism).
+    pub fn with_rng(script: Vec<MockStreamSegment>, rng: Box<dyn UlidRng>) -> Self {
+        Self {
+            script,
+            rng: Mutex::new(rng),
+        }
+    }
+
+    /// The script the factory uses for `OMNI_DEV_VOICE_BACKEND=mock` streaming:
+    /// two utterances, each with two partials + a final, separated by a
+    /// `SilenceGap` — bland placeholder text so it's never mistaken for real
+    /// transcription.
+    pub fn default_script() -> Vec<MockStreamSegment> {
+        vec![
+            MockStreamSegment {
+                partials: vec!["[mock]".to_string(), "[mock] streaming".to_string()],
+                final_text: "[mock] streaming segment 1".to_string(),
+                start: Duration::from_millis(0),
+                end: Duration::from_secs(2),
+                confidence: 1.0,
+            },
+            MockStreamSegment {
+                partials: vec!["[mock]".to_string(), "[mock] streaming".to_string()],
+                final_text: "[mock] streaming segment 2".to_string(),
+                start: Duration::from_secs(3),
+                end: Duration::from_secs(5),
+                confidence: 1.0,
+            },
+        ]
+    }
+}
+
+impl StreamingTranscriber for MockStreamingTranscriber {
+    fn transcribe_stream(&self, _audio: Box<dyn AsyncAudioInput>) -> TranscriptEventStream {
+        // Build the scripted event sequence up front (the mock ignores the
+        // audio). ULIDs are minted synchronously here so the returned stream is
+        // a trivial `iter` with no shared state.
+        let mut events: Vec<Result<TranscriptEvent>> = Vec::new();
+        for seg in &self.script {
+            for partial in &seg.partials {
+                events.push(Ok(TranscriptEvent::Partial {
+                    text: partial.clone(),
+                    start: seg.start,
+                    end: seg.end,
+                    words: None,
+                    speaker: None,
+                }));
+            }
+            let event_id: Result<EventId> =
+                self.rng.lock().map(|mut rng| rng.next_ulid()).map_err(|e| {
+                    anyhow::anyhow!("MockStreamingTranscriber RNG mutex poisoned: {e}")
+                });
+            match event_id {
+                Ok(event_id) => events.push(Ok(TranscriptEvent::Final {
+                    event_id,
+                    text: seg.final_text.clone(),
+                    start: seg.start,
+                    end: seg.end,
+                    confidence: seg.confidence,
+                    words: None,
+                    speaker: None,
+                    revisable: true,
+                })),
+                Err(e) => events.push(Err(e)),
+            }
+            events.push(Ok(TranscriptEvent::Endpoint {
+                at: seg.end,
+                kind: EndpointKind::SilenceGap,
+            }));
+        }
+        let stream_end = self.script.last().map_or(Duration::ZERO, |s| s.end);
+        events.push(Ok(TranscriptEvent::Endpoint {
+            at: stream_end,
+            kind: EndpointKind::StreamEnd,
+        }));
+        Box::pin(stream::iter(events))
     }
 }
 
@@ -304,6 +425,65 @@ mod tests {
         assert!(
             err.to_string().contains("poisoned"),
             "expected poisoned mutex error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_mock_emits_partials_revisable_finals_and_endpoints() {
+        use crate::voice::stream_input::FileAsyncAudioInput;
+        use futures::StreamExt;
+
+        let t = MockStreamingTranscriber::with_rng(
+            MockStreamingTranscriber::default_script(),
+            Box::new(CountingUlidRng::new()),
+        );
+        let audio = Box::new(FileAsyncAudioInput::from_samples(vec![], 1600, false));
+        let events: Vec<TranscriptEvent> = t
+            .transcribe_stream(audio)
+            .map(Result::unwrap)
+            .collect::<Vec<_>>()
+            .await;
+
+        let partials = events
+            .iter()
+            .filter(|e| matches!(e, TranscriptEvent::Partial { .. }))
+            .count();
+        let finals: Vec<bool> = events
+            .iter()
+            .filter_map(|e| match e {
+                TranscriptEvent::Final { revisable, .. } => Some(*revisable),
+                _ => None,
+            })
+            .collect();
+        let silence_gaps = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    TranscriptEvent::Endpoint {
+                        kind: EndpointKind::SilenceGap,
+                        ..
+                    }
+                )
+            })
+            .count();
+
+        assert!(partials >= 2, "expected >=2 partials, got {partials}");
+        assert_eq!(finals.len(), 2, "two scripted utterances → two finals");
+        assert!(
+            finals.iter().all(|&r| r),
+            "streaming finals must be revisable"
+        );
+        assert!(silence_gaps >= 1, "expected >=1 SilenceGap endpoint");
+        assert!(
+            matches!(
+                events.last(),
+                Some(TranscriptEvent::Endpoint {
+                    kind: EndpointKind::StreamEnd,
+                    ..
+                })
+            ),
+            "stream must terminate with a StreamEnd endpoint"
         );
     }
 }

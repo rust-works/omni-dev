@@ -147,6 +147,10 @@ Dev-only notes:
 - `ClaudeCliAiClient::run` is the warn site for both escape hatches, the INFO-level `total_cost_usd` log, and the post-response WARN when reported cost exceeds the configured cap.
 - `--beta-header` is ignored for the `claude-cli` backend (`claude`'s `--betas` flag has different semantics).
 
+### ASR (Speech-to-Text) Backends
+
+Distinct from the AI/LLM backends above: `voice transcribe` dispatches to an ASR backend via `src/voice/factory.rs::create_default_transcriber` (`--backend` → `OMNI_DEV_VOICE_BACKEND` → default `mock`). Backends live in `src/voice/backends/` (`mock.rs`, `candle.rs` per ADR-0033, and the platform-gated `voxtral.rs` per ADR-0037 — compiled only with the off-by-default `voxtral` feature on `cfg(not(target_os = "windows"))`, with all FFI `unsafe` quarantined in the `voxtral-sys/` crate). Model fetch/resolution is in `src/voice/models.rs` + `src/cli/voice/install_model.rs`. The platform matrix, build requirements, model footprints (~8.9 GB Voxtral BF16 vs ~75 MB Whisper), and the `--delay-ms` knob live in [docs/asr-backends.md](docs/asr-backends.md). Keep it in sync when changing the backend surface. CLI changes here require the [`update-snapshots`](.claude/skills/update-snapshots/SKILL.md) skill (see Code Changes §5).
+
 ### Browser Bridge
 The `omni-dev browser bridge` command tree drives HTTP requests **through an authenticated browser tab** (Grafana/Loki, SSO-gated dashboards) without exfiltrating the browser's cookies/tokens — a *confused deputy by design*. It is a two-plane local server joined by an `id`-keyed correlator:
 

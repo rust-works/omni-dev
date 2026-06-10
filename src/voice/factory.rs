@@ -11,6 +11,12 @@
 //!    release cycle; pick `--backend whisper-candle` explicitly. See
 //!    [`crate::voice::backends::candle`] and ADR-0033.
 //!
+//! A fourth name, `"voxtral"`, is recognised on every host but is
+//! platform-gated (#933, ADR-0037): the native engine compiles only on
+//! `cfg(not(target_os = "windows"))` behind the off-by-default `voxtral`
+//! feature, and requesting it where it is unavailable is a clear
+//! construction-time error rather than a build break or a silent fallback.
+//!
 //! [`create_default_claude_client`]: crate::claude::client::create_default_claude_client
 
 use std::path::PathBuf;
@@ -18,9 +24,9 @@ use std::path::PathBuf;
 use anyhow::{bail, Result};
 
 use crate::voice::backends::candle::CandleTranscriber;
-use crate::voice::backends::mock::MockTranscriber;
+use crate::voice::backends::mock::{MockStreamingTranscriber, MockTranscriber};
 use crate::voice::models::resolve_whisper_model_dir;
-use crate::voice::transcriber::Transcriber;
+use crate::voice::transcriber::{StreamingTranscriber, Transcriber};
 
 /// Backend-selection options carried from the CLI (or constructed
 /// programmatically for tests).
@@ -36,6 +42,11 @@ pub struct VoiceOpts {
     pub backend: Option<String>,
     /// Path to a backend-specific model file. Ignored by the mock.
     pub model: Option<PathBuf>,
+    /// Decoder delay (lookahead) in milliseconds for the `voxtral` backend
+    /// (`--delay-ms`). `None` uses the backend default
+    /// (`DEFAULT_VOXTRAL_DELAY_MS`, 480 ms). Ignored by the `mock` and
+    /// `whisper-candle` backends.
+    pub delay_ms: Option<i32>,
 }
 
 /// Constructs the appropriate [`Transcriber`] given `opts` and the
@@ -59,8 +70,236 @@ pub fn create_default_transcriber(opts: &VoiceOpts) -> Result<Box<dyn Transcribe
             let dir = resolve_whisper_model_dir(opts)?;
             Ok(Box::new(CandleTranscriber::new(&dir)?))
         }
+        "voxtral" => create_voxtral_transcriber(opts),
+        "voxtral-mlx" => create_voxtral_mlx_transcriber(opts),
         other => {
-            bail!("unknown voice backend: {other:?} (supported: \"mock\", \"whisper-candle\")")
+            bail!(
+                "unknown voice backend: {other:?} \
+                 (supported: \"mock\", \"whisper-candle\", \"voxtral\", \"voxtral-mlx\")"
+            )
+        }
+    }
+}
+
+/// Constructs the appropriate [`StreamingTranscriber`] given `opts` and the
+/// process environment — the streaming counterpart of
+/// [`create_default_transcriber`] (ADR-0038).
+///
+/// Backend selection follows the same priority (`--backend` → env → `mock`).
+/// Only `mock` has a streaming implementation today; `whisper-candle` and
+/// `voxtral` are batch-only until #806 / #933 Phase 6 land their streaming
+/// variants, so they return a clear construction-time error here.
+pub fn create_default_streaming_transcriber(
+    opts: &VoiceOpts,
+) -> Result<Box<dyn StreamingTranscriber>> {
+    let backend = opts
+        .backend
+        .clone()
+        .or_else(|| crate::utils::settings::get_env_var("OMNI_DEV_VOICE_BACKEND").ok())
+        .unwrap_or_else(|| "mock".to_string());
+
+    match backend.as_str() {
+        "mock" => Ok(Box::new(MockStreamingTranscriber::new(
+            MockStreamingTranscriber::default_script(),
+        ))),
+        "voxtral" => create_voxtral_streaming_transcriber(opts),
+        "whisper-candle" => {
+            bail!(
+                "streaming backend not yet implemented for \"whisper-candle\" \
+                 (lands in #806); use --backend voxtral or mock for streaming, \
+                 or `voice transcribe` for batch"
+            )
+        }
+        "voxtral-mlx" => create_voxtral_mlx_streaming_transcriber(opts),
+        other => {
+            bail!(
+                "unknown voice backend: {other:?} \
+                 (supported: \"mock\", \"whisper-candle\", \"voxtral\", \"voxtral-mlx\")"
+            )
+        }
+    }
+}
+
+/// Constructs the native Voxtral backend as a [`StreamingTranscriber`] (#933
+/// Phase 6, ADR-0037/0038). Same platform gating as
+/// [`create_voxtral_transcriber`]: real construction only on
+/// `cfg(all(feature = "voxtral", not(target_os = "windows")))`, a clear
+/// construction-time error otherwise.
+fn create_voxtral_streaming_transcriber(opts: &VoiceOpts) -> Result<Box<dyn StreamingTranscriber>> {
+    #[cfg(all(feature = "voxtral", not(target_os = "windows")))]
+    {
+        use crate::voice::backends::voxtral::{VoxtralBackend, DEFAULT_VOXTRAL_DELAY_MS};
+        use crate::voice::models::resolve_voxtral_model_dir;
+
+        let dir = resolve_voxtral_model_dir(opts)?;
+        let delay_ms = opts.delay_ms.unwrap_or(DEFAULT_VOXTRAL_DELAY_MS);
+        Ok(Box::new(VoxtralBackend::new(&dir, delay_ms)?))
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = opts;
+        bail!(
+            "voice backend \"voxtral\" is not available on Windows by design \
+             (ADR-0037); use --backend mock for streaming"
+        )
+    }
+
+    #[cfg(all(not(feature = "voxtral"), not(target_os = "windows")))]
+    {
+        let _ = opts;
+        bail!(
+            "voice backend \"voxtral\" was not compiled in; rebuild with \
+             `--features voxtral` on macOS or Linux (the native engine requires \
+             a C toolchain — see ADR-0037), or use --backend mock for streaming"
+        )
+    }
+}
+
+/// Constructs the native Voxtral backend (#933, [ADR-0037]).
+///
+/// The native engine (vendored `antirez/voxtral.c` behind a `voxtral-sys` FFI
+/// crate) is permitted only behind a Rust FFI boundary on
+/// `cfg(not(target_os = "windows"))`, and only when the off-by-default
+/// `voxtral` Cargo feature is enabled. When compiled in, this resolves the
+/// Voxtral model directory and constructs a `VoxtralBackend` (its module is
+/// `cfg`-gated, so this is a plain reference, not an intra-doc link); the
+/// model-bound construction errors (missing weights) carry an install hint.
+///
+/// The `"voxtral"` backend name is recognised on **every** host — including
+/// Windows and feature-off builds — per ADR-0035's cross-platform-descriptor
+/// contract: an unavailable backend yields a clear, actionable
+/// *construction-time* error explaining **why** it is unavailable, never an
+/// "unknown backend" error and never a build break (ADR-0037 §3). There is no
+/// silent fall-through to `whisper-candle`: an explicit `--backend voxtral`
+/// that cannot be served fails loudly rather than substituting a different
+/// backend behind the user's back.
+///
+/// [ADR-0037]: ../../../docs/adrs/adr-0037.md
+fn create_voxtral_transcriber(opts: &VoiceOpts) -> Result<Box<dyn Transcriber>> {
+    #[cfg(all(feature = "voxtral", not(target_os = "windows")))]
+    {
+        use crate::voice::backends::voxtral::{VoxtralBackend, DEFAULT_VOXTRAL_DELAY_MS};
+        use crate::voice::models::resolve_voxtral_model_dir;
+
+        let dir = resolve_voxtral_model_dir(opts)?;
+        let delay_ms = opts.delay_ms.unwrap_or(DEFAULT_VOXTRAL_DELAY_MS);
+        Ok(Box::new(VoxtralBackend::new(&dir, delay_ms)?))
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // `opts` is unused on the error-only arms; mark it used in every config.
+        let _ = opts;
+        // Native Voxtral is excluded on Windows by design (ADR-0037): the Metal
+        // fast path is Apple-only and the project takes on no Windows
+        // native-toolchain requirement. `whisper-candle` is the supported
+        // cross-platform alternative.
+        bail!(
+            "voice backend \"voxtral\" is not available on Windows by design \
+             (ADR-0037); use --backend whisper-candle"
+        )
+    }
+
+    #[cfg(all(not(feature = "voxtral"), not(target_os = "windows")))]
+    {
+        let _ = opts;
+        // Supported target, but built without the opt-in feature.
+        bail!(
+            "voice backend \"voxtral\" was not compiled in; rebuild with \
+             `--features voxtral` on macOS or Linux (the native engine requires \
+             a C toolchain — see ADR-0037), or use --backend whisper-candle"
+        )
+    }
+}
+
+/// Constructs the real-time INT4 Voxtral MLX backend (#933, [ADR-0039]).
+///
+/// MLX is Apple-only, so this backend is available only on macOS Apple Silicon
+/// with the off-by-default `voxtral-mlx` feature (which builds the MLX C++ core
+/// via CMake — the cost ADR-0039 narrowly permits). As with `voxtral`, the name
+/// is recognised on **every** host per ADR-0035: an unavailable configuration
+/// yields a clear construction-time error explaining **why**, never a build break
+/// and never a silent fall-through to another backend.
+///
+/// [ADR-0039]: ../../../docs/adrs/adr-0039.md
+fn create_voxtral_mlx_transcriber(opts: &VoiceOpts) -> Result<Box<dyn Transcriber>> {
+    #[cfg(all(feature = "voxtral-mlx", target_os = "macos", target_arch = "aarch64"))]
+    {
+        use crate::voice::backends::voxtral_mlx::{
+            VoxtralMlxBackend, DEFAULT_VOXTRAL_MLX_DELAY_MS,
+        };
+        use crate::voice::models::resolve_voxtral_mlx_model_dir;
+
+        let dir = resolve_voxtral_mlx_model_dir(opts)?;
+        let delay_ms = opts
+            .delay_ms
+            .map_or(DEFAULT_VOXTRAL_MLX_DELAY_MS, |ms| ms.max(0) as u32);
+        Ok(Box::new(VoxtralMlxBackend::new(&dir, delay_ms)?))
+    }
+
+    #[cfg(not(all(feature = "voxtral-mlx", target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = opts;
+        // MLX is Apple-Silicon-only. Distinguish "wrong platform" from "feature
+        // off" so the message points at the right fix.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            bail!(
+                "voice backend \"voxtral-mlx\" was not compiled in; rebuild with \
+                 `--features voxtral-mlx` (it builds the MLX C++ core via CMake — \
+                 see ADR-0039), or use --backend voxtral or whisper-candle"
+            )
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            bail!(
+                "voice backend \"voxtral-mlx\" is only available on macOS Apple \
+                 Silicon by design (MLX is Apple-only — ADR-0039); use \
+                 --backend whisper-candle, or --backend voxtral on macOS/Linux"
+            )
+        }
+    }
+}
+
+/// Constructs the INT4 Voxtral MLX backend as a [`StreamingTranscriber`] (#933
+/// M3b, ADR-0039). Same Apple-Silicon + `voxtral-mlx`-feature gating and
+/// construction-time error contract as [`create_voxtral_mlx_transcriber`].
+fn create_voxtral_mlx_streaming_transcriber(
+    opts: &VoiceOpts,
+) -> Result<Box<dyn StreamingTranscriber>> {
+    #[cfg(all(feature = "voxtral-mlx", target_os = "macos", target_arch = "aarch64"))]
+    {
+        use crate::voice::backends::voxtral_mlx::{
+            VoxtralMlxBackend, DEFAULT_VOXTRAL_MLX_DELAY_MS,
+        };
+        use crate::voice::models::resolve_voxtral_mlx_model_dir;
+
+        let dir = resolve_voxtral_mlx_model_dir(opts)?;
+        let delay_ms = opts
+            .delay_ms
+            .map_or(DEFAULT_VOXTRAL_MLX_DELAY_MS, |ms| ms.max(0) as u32);
+        Ok(Box::new(VoxtralMlxBackend::new(&dir, delay_ms)?))
+    }
+
+    #[cfg(not(all(feature = "voxtral-mlx", target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = opts;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            bail!(
+                "voice backend \"voxtral-mlx\" was not compiled in; rebuild with \
+                 `--features voxtral-mlx` (see ADR-0039), or use --backend mock \
+                 for streaming"
+            )
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            bail!(
+                "voice backend \"voxtral-mlx\" is only available on macOS Apple \
+                 Silicon by design (MLX is Apple-only — ADR-0039); use \
+                 --backend mock for streaming"
+            )
         }
     }
 }
@@ -111,6 +350,7 @@ mod tests {
         let opts = VoiceOpts {
             backend: Some("mock".to_string()),
             model: None,
+            delay_ms: None,
         };
         let t = create_default_transcriber(&opts).unwrap();
         let _ = collect(t.as_ref());
@@ -133,6 +373,7 @@ mod tests {
         let opts = VoiceOpts {
             backend: Some("klingon".to_string()),
             model: None,
+            delay_ms: None,
         };
         let Err(err) = create_default_transcriber(&opts) else {
             panic!("expected unknown backend to error");
@@ -141,6 +382,150 @@ mod tests {
         assert!(msg.contains("klingon"), "got: {msg}");
         assert!(msg.contains("supported"), "got: {msg}");
         assert!(msg.contains("whisper-candle"), "got: {msg}");
+        assert!(msg.contains("voxtral"), "got: {msg}");
+        assert!(msg.contains("voxtral-mlx"), "got: {msg}");
+    }
+
+    // The "voxtral" backend name is recognised on every host (ADR-0035's
+    // cross-platform-descriptor contract), so it never surfaces as an "unknown
+    // backend". What it resolves to is platform- and feature-dependent
+    // (ADR-0037); each build configuration gets its own clear construction-time
+    // error rather than a build break or a silent fallback to whisper-candle.
+
+    /// Helper: route `--backend voxtral` through the factory and return the
+    /// error it must produce on every host where the native engine is absent.
+    #[cfg(not(all(feature = "voxtral", not(target_os = "windows"))))]
+    fn voxtral_error() -> String {
+        let _g = env_guard();
+        std::env::remove_var("OMNI_DEV_VOICE_BACKEND");
+        let opts = VoiceOpts {
+            backend: Some("voxtral".to_string()),
+            model: None,
+            delay_ms: None,
+        };
+        // `.err().expect()` rather than `let Err(..) else { panic!() }`: the
+        // call always errors here, so the `else` arm would be a permanently
+        // uncovered branch. The test module allows `expect_used`.
+        create_default_transcriber(&opts)
+            .err()
+            .expect("expected voxtral to error where the native engine is absent")
+            .to_string()
+    }
+
+    #[cfg(all(feature = "voxtral", not(target_os = "windows")))]
+    #[test]
+    fn voxtral_feature_on_propagates_missing_model_error() {
+        // With the feature compiled in, the factory routes "voxtral" through
+        // VoxtralBackend::new, which calls ensure_voxtral_model_present. Point
+        // --model at an empty dir and verify the install hint reaches the
+        // caller (mirroring whisper_candle_arm_propagates_missing_model_error).
+        let _g = env_guard();
+        std::env::remove_var("OMNI_DEV_VOICE_BACKEND");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let opts = VoiceOpts {
+            backend: Some("voxtral".to_string()),
+            model: Some(tmp.path().to_path_buf()),
+            delay_ms: None,
+        };
+        let err = create_default_transcriber(&opts)
+            .err()
+            .expect("expected voxtral with empty model dir to error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no Voxtral model found"), "got: {msg}");
+        assert!(
+            msg.contains("--variant voxtral-mini-4b-realtime"),
+            "got: {msg}"
+        );
+        assert!(!msg.contains("unknown"), "got: {msg}");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn voxtral_on_windows_reports_unavailable_by_design() {
+        let msg = voxtral_error();
+        assert!(msg.contains("voxtral"), "got: {msg}");
+        assert!(msg.contains("Windows"), "got: {msg}");
+        assert!(msg.contains("whisper-candle"), "got: {msg}");
+        assert!(!msg.contains("unknown"), "got: {msg}");
+    }
+
+    #[cfg(all(not(feature = "voxtral"), not(target_os = "windows")))]
+    #[test]
+    fn voxtral_feature_off_reports_not_compiled_in() {
+        let msg = voxtral_error();
+        assert!(msg.contains("voxtral"), "got: {msg}");
+        assert!(msg.contains("--features voxtral"), "got: {msg}");
+        assert!(!msg.contains("unknown"), "got: {msg}");
+    }
+
+    // The "voxtral-mlx" backend (ADR-0039) follows the same cross-platform
+    // descriptor contract: recognised everywhere, with a clear construction-time
+    // error wherever the Apple-Silicon MLX backend is unavailable.
+
+    /// Helper: route `--backend voxtral-mlx` through the factory and return the
+    /// error it must produce wherever the MLX backend is unavailable.
+    #[cfg(not(all(feature = "voxtral-mlx", target_os = "macos", target_arch = "aarch64")))]
+    fn voxtral_mlx_error() -> String {
+        let _g = env_guard();
+        std::env::remove_var("OMNI_DEV_VOICE_BACKEND");
+        let opts = VoiceOpts {
+            backend: Some("voxtral-mlx".to_string()),
+            model: None,
+            delay_ms: None,
+        };
+        create_default_transcriber(&opts)
+            .err()
+            .expect("expected voxtral-mlx to error where the MLX backend is absent")
+            .to_string()
+    }
+
+    #[cfg(all(feature = "voxtral-mlx", target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn voxtral_mlx_feature_on_propagates_missing_model_error() {
+        // Feature compiled in on Apple Silicon: the factory routes "voxtral-mlx"
+        // through VoxtralMlxBackend::new → ensure_voxtral_mlx_model_present.
+        // Point --model at an empty dir and verify the install hint reaches the
+        // caller (mirroring the voxtral arm).
+        let _g = env_guard();
+        std::env::remove_var("OMNI_DEV_VOICE_BACKEND");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let opts = VoiceOpts {
+            backend: Some("voxtral-mlx".to_string()),
+            model: Some(tmp.path().to_path_buf()),
+            delay_ms: None,
+        };
+        let err = create_default_transcriber(&opts)
+            .err()
+            .expect("expected voxtral-mlx with empty model dir to error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no Voxtral MLX INT4 model found"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("--variant voxtral-mlx-int4"), "got: {msg}");
+        assert!(!msg.contains("unknown"), "got: {msg}");
+    }
+
+    #[cfg(all(
+        target_os = "macos",
+        target_arch = "aarch64",
+        not(feature = "voxtral-mlx")
+    ))]
+    #[test]
+    fn voxtral_mlx_feature_off_reports_not_compiled_in() {
+        let msg = voxtral_mlx_error();
+        assert!(msg.contains("voxtral-mlx"), "got: {msg}");
+        assert!(msg.contains("--features voxtral-mlx"), "got: {msg}");
+        assert!(!msg.contains("unknown"), "got: {msg}");
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    #[test]
+    fn voxtral_mlx_on_non_apple_silicon_reports_unavailable_by_design() {
+        let msg = voxtral_mlx_error();
+        assert!(msg.contains("voxtral-mlx"), "got: {msg}");
+        assert!(msg.contains("Apple"), "got: {msg}");
+        assert!(!msg.contains("unknown"), "got: {msg}");
     }
 
     #[test]
@@ -155,6 +540,7 @@ mod tests {
         let opts = VoiceOpts {
             backend: Some("whisper-candle".to_string()),
             model: Some(tmp.path().to_path_buf()),
+            delay_ms: None,
         };
         let Err(err) = create_default_transcriber(&opts) else {
             panic!("expected whisper-candle with empty model dir to error");
@@ -162,5 +548,92 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("no Whisper model found"), "got: {msg}");
         assert!(msg.contains("voice install-model"), "got: {msg}");
+    }
+
+    // ── Streaming factory (ADR-0038) ────────────────────────────────────
+
+    #[test]
+    fn streaming_default_is_mock() {
+        let _g = env_guard();
+        std::env::remove_var("OMNI_DEV_VOICE_BACKEND");
+        assert!(create_default_streaming_transcriber(&VoiceOpts::default()).is_ok());
+    }
+
+    #[test]
+    fn streaming_candle_reports_not_yet_implemented() {
+        // candle has no streaming backend (that's #806).
+        let _g = env_guard();
+        std::env::remove_var("OMNI_DEV_VOICE_BACKEND");
+        let opts = VoiceOpts {
+            backend: Some("whisper-candle".to_string()),
+            model: None,
+            delay_ms: None,
+        };
+        let err = create_default_streaming_transcriber(&opts)
+            .err()
+            .expect("streaming whisper-candle should error");
+        let msg = err.to_string();
+        assert!(msg.contains("not yet implemented"), "got: {msg}");
+        assert!(msg.contains("whisper-candle"), "got: {msg}");
+        assert!(!msg.contains("unknown"), "got: {msg}");
+    }
+
+    /// `--backend voxtral` streaming where the native engine is absent (Windows
+    /// or feature-off) returns a clear construction-time error, not "unknown".
+    #[cfg(not(all(feature = "voxtral", not(target_os = "windows"))))]
+    #[test]
+    fn streaming_voxtral_reports_unavailable_when_engine_absent() {
+        let _g = env_guard();
+        std::env::remove_var("OMNI_DEV_VOICE_BACKEND");
+        let opts = VoiceOpts {
+            backend: Some("voxtral".to_string()),
+            model: None,
+            delay_ms: None,
+        };
+        let msg = create_default_streaming_transcriber(&opts)
+            .err()
+            .expect("streaming voxtral should error where the engine is absent")
+            .to_string();
+        assert!(msg.contains("voxtral"), "got: {msg}");
+        assert!(!msg.contains("unknown"), "got: {msg}");
+        assert!(!msg.contains("not yet implemented"), "got: {msg}");
+    }
+
+    /// With the engine compiled in, streaming voxtral routes through
+    /// `VoxtralBackend::new` and surfaces the missing-model install hint.
+    #[cfg(all(feature = "voxtral", not(target_os = "windows")))]
+    #[test]
+    fn streaming_voxtral_propagates_missing_model_error() {
+        let _g = env_guard();
+        std::env::remove_var("OMNI_DEV_VOICE_BACKEND");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let opts = VoiceOpts {
+            backend: Some("voxtral".to_string()),
+            model: Some(tmp.path().to_path_buf()),
+            delay_ms: None,
+        };
+        let err = create_default_streaming_transcriber(&opts)
+            .err()
+            .expect("streaming voxtral with empty model dir should error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no Voxtral model found"), "got: {msg}");
+    }
+
+    #[test]
+    fn streaming_unknown_backend_errors() {
+        let _g = env_guard();
+        std::env::remove_var("OMNI_DEV_VOICE_BACKEND");
+        let opts = VoiceOpts {
+            backend: Some("klingon".to_string()),
+            model: None,
+            delay_ms: None,
+        };
+        let err = create_default_streaming_transcriber(&opts)
+            .err()
+            .expect("unknown streaming backend should error");
+        assert!(
+            err.to_string().contains("unknown voice backend"),
+            "got: {err}"
+        );
     }
 }

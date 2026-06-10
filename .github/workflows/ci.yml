@@ -87,6 +87,127 @@ jobs:
           cargo clippy --all-targets --features "${{ matrix.features }}" -- -D warnings
         fi
 
+  windows-build:
+    # First-class Windows build guard for #933 / ADR-0037: the cross-platform
+    # default surface (candle + mock, no native Voxtral) must build on Windows.
+    # Native Voxtral is excluded on Windows by design; this proves the default
+    # build never depends on it.
+    name: Windows Default Build
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v6
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+    - name: Build (default features)
+      run: cargo build --verbose
+
+  voxtral-windows-gating:
+    # The enforcer ADR-0037 / #933 Phase 1 calls for: cargo-deny cannot ban a
+    # dependency per-target, so assert directly that the native `voxtral-sys`
+    # engine never enters the Windows dependency graph — even with the
+    # `voxtral` feature enabled (the `[target.'cfg(...)']` stanza excludes it on
+    # Windows). Runs on Linux; `cargo tree --target` needs no Windows toolchain.
+    name: Voxtral Windows Gating
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+    - name: Assert voxtral-sys absent from the Windows dependency graph
+      run: |
+        if cargo tree --target x86_64-pc-windows-msvc -e normal --features voxtral 2>/dev/null \
+            | grep -q 'voxtral-sys'; then
+          echo "::error::voxtral-sys must never enter the Windows dependency graph (ADR-0037 / #933)"
+          exit 1
+        fi
+        echo "voxtral-sys correctly absent from the x86_64-pc-windows-msvc graph"
+
+  voxtral-build:
+    # Build + test the standalone `voxtral-sys` FFI crate (#933 Phase 2) on its
+    # supported targets: macOS (Metal/MPS + Accelerate) and Linux (C + OpenBLAS).
+    # It is a workspace member, not yet an omni-dev dependency, so it is
+    # exercised directly via `-p voxtral-sys`. This compiles the vendored C
+    # (and Objective-C/Metal on macOS), runs bindgen, links, and runs the
+    # construction/error-mapping unit tests (real inference needs the staged
+    # ~8.9 GB model and is uncovered-by-design per ADR-0037).
+    name: Voxtral Native Path (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+    - uses: actions/checkout@v6
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+    - name: Install Linux native build deps (ALSA for cpal; OpenBLAS + libclang for bindgen)
+      if: runner.os == 'Linux'
+      run: sudo apt-get update && sudo apt-get install -y libasound2-dev libopenblas-dev libclang-dev
+    - name: Build voxtral-sys
+      run: cargo build -p voxtral-sys --verbose
+    - name: Test voxtral-sys
+      run: cargo test -p voxtral-sys --verbose
+    - name: Test omni-dev with --features voxtral (VoxtralBackend construction/error paths)
+      run: cargo test --features voxtral --verbose
+
+  voxtral-mlx-gating:
+    # ADR-0039 / #933 M4: `mlx-rs` (and its C++/CMake MLX build) is permitted
+    # ONLY on macOS Apple Silicon. Assert directly — `cargo tree --target` needs
+    # no cross toolchain — that it never enters the Windows / Linux / Intel-macOS
+    # / default dependency graphs even with the `voxtral-mlx` feature enabled
+    # (the `[target.'cfg(all(target_os="macos", target_arch="aarch64"))']` stanza
+    # excludes it), and conversely that it IS present on aarch64-apple-darwin.
+    name: Voxtral MLX Gating
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+    - name: Assert mlx-rs absent from non-Apple-Silicon and default graphs
+      run: |
+        for target in x86_64-pc-windows-msvc x86_64-unknown-linux-gnu x86_64-apple-darwin; do
+          if cargo tree --target "$target" -e normal --features voxtral-mlx 2>/dev/null \
+              | grep -q 'mlx-rs'; then
+            echo "::error::mlx-rs must never enter the $target dependency graph (ADR-0039 / #933)"
+            exit 1
+          fi
+          echo "mlx-rs correctly absent from $target (--features voxtral-mlx)"
+        done
+        if cargo tree -e normal 2>/dev/null | grep -q 'mlx-rs'; then
+          echo "::error::mlx-rs must not be in the default (feature-off) graph"
+          exit 1
+        fi
+        echo "mlx-rs correctly absent from the default graph"
+    - name: Assert mlx-rs IS present on aarch64-apple-darwin with the feature
+      run: |
+        if ! cargo tree --target aarch64-apple-darwin -e normal --features voxtral-mlx 2>/dev/null \
+            | grep -q 'mlx-rs'; then
+          echo "::error::mlx-rs must be in the aarch64-apple-darwin graph with --features voxtral-mlx"
+          exit 1
+        fi
+        echo "mlx-rs correctly present on aarch64-apple-darwin (--features voxtral-mlx)"
+
+  voxtral-mlx-build:
+    # ADR-0039 / #933 M4: compile the INT4 Voxtral MLX backend on Apple Silicon.
+    # `mlx-rs` builds the MLX C++ core from source (CMake + C++) and compiles
+    # Metal shaders AOT (the Metal Toolchain component). Runs the non-ignored
+    # tests — the pure unit tests (mel/tokenizer/mask) and the
+    # construction/error-path tests; real inference is model-gated `#[ignore]`
+    # (the ~2.6 GB INT4 weights are not staged in CI).
+    name: Voxtral MLX Backend (Apple Silicon)
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v6
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+    - name: Install CMake
+      run: brew install cmake
+    - name: Download the Metal Toolchain (AOT shader compilation)
+      run: xcodebuild -downloadComponent MetalToolchain
+    - name: Build --features voxtral-mlx
+      run: cargo build --features voxtral-mlx --verbose
+    - name: Test --features voxtral-mlx (non-ignored)
+      run: cargo test --features voxtral-mlx --verbose
+
   docs:
     name: Docs
     runs-on: ubuntu-latest
@@ -113,8 +234,8 @@ jobs:
       with:
         components: llvm-tools-preview
     - uses: Swatinem/rust-cache@v2
-    - name: Install ALSA headers for cpal
-      run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+    - name: Install build deps (ALSA for cpal; OpenBLAS + libclang for the voxtral feature under --all-features)
+      run: sudo apt-get update && sudo apt-get install -y libasound2-dev libopenblas-dev libclang-dev
     - name: Install cargo-llvm-cov
       uses: taiki-e/install-action@cargo-llvm-cov
     # Every cargo step below sources cargo-llvm-cov's instrumentation env (rustc
@@ -130,7 +251,10 @@ jobs:
         # shellcheck disable=SC1090
         source <(cargo llvm-cov show-env --sh)
         cargo llvm-cov clean --workspace
-        cargo test --all-features --workspace
+        # Exclude voxtral-sys: its native path needs OpenBLAS/libclang (not
+        # installed on this runner) and is uncovered-by-design (ADR-0037); it is
+        # covered separately by `cargo test -p voxtral-sys`.
+        cargo test --all-features --workspace --exclude voxtral-sys
     - name: Generate codecov.json
       # Kept ready so the disabled upload below works as soon as it is re-enabled.
       run: |

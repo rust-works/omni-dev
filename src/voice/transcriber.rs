@@ -12,9 +12,12 @@
 //! `Send`) that ASR engines consume natively. See ADR-0032 for the rationale.
 
 use std::path::Path;
+use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
+use futures::Stream;
 use serde::{Deserialize, Serialize};
 
 /// Monotonically-unique identifier for a `Final` event, used by downstream
@@ -157,6 +160,41 @@ pub enum TranscriptEvent {
 pub trait Transcriber: Send + Sync {
     /// Consumes an audio input and returns the resulting event stream.
     fn transcribe(&self, audio: Box<dyn AudioInput>) -> Result<Box<dyn EventStream>>;
+}
+
+/// Async stream of transcription events produced by a [`StreamingTranscriber`].
+///
+/// The streaming analogue of [`EventStream`]: a `Send` `futures::Stream` the
+/// caller pulls at its own pace as live audio is consumed. See
+/// [ADR-0038](../../docs/adrs/adr-0038.md).
+pub type TranscriptEventStream = Pin<Box<dyn Stream<Item = Result<TranscriptEvent>> + Send>>;
+
+/// Async source of 16 kHz mono signed-PCM audio for *streaming* transcription.
+///
+/// The async analogue of [`AudioInput`] (same `AudioChunk` payload). A live
+/// source (`voice listen`, #807) `await`s the next captured chunk; a
+/// [`crate::voice::stream_input::FileAsyncAudioInput`] replays a fixture, optionally
+/// on a simulated-realtime clock. `None` signals end-of-stream.
+#[async_trait]
+pub trait AsyncAudioInput: Send {
+    /// Returns the next chunk of samples, or `None` when the input is
+    /// exhausted. Chunk size is up to the implementation (the streaming
+    /// convention is 100 ms / 1600 samples at 16 kHz).
+    async fn next_chunk(&mut self) -> Option<AudioChunk>;
+}
+
+/// Streaming speech-to-text backend.
+///
+/// The streaming counterpart of [`Transcriber`]: it consumes an
+/// [`AsyncAudioInput`] incrementally and returns a [`TranscriptEventStream`]
+/// that emits `Partial` hypotheses, revisable `Final`s, and `Endpoint`s as the
+/// audio arrives — rather than draining the whole input first. A backend may
+/// implement [`Transcriber`] (batch), `StreamingTranscriber` (streaming), or
+/// both. See [ADR-0038](../../docs/adrs/adr-0038.md); real streaming backends
+/// land in #806 / #933 Phase 6.
+pub trait StreamingTranscriber: Send + Sync {
+    /// Consumes an async audio input and returns the resulting event stream.
+    fn transcribe_stream(&self, audio: Box<dyn AsyncAudioInput>) -> TranscriptEventStream;
 }
 
 /// In-memory [`AudioInput`] adapter — reads a 16 kHz mono 16-bit PCM WAV

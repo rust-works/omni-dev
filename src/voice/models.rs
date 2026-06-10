@@ -205,6 +205,81 @@ pub const SPEAKER_WESPEAKER_EN: ModelSpec = ModelSpec {
     },
 };
 
+/// Voxtral Realtime Mini 4B — native ASR engine per ADR-0037 (#933).
+///
+/// `vox_load` reads `consolidated.safetensors` (~8.9 GB BF16) and
+/// `tekken.json`; `params.json` carries the model config. File set confirmed
+/// from upstream `voxtral.c`'s `MODEL.md`. The install command itself (the
+/// `voice install-model` variant that fetches these ~8.9 GB of weights) lands
+/// in #933 Phase 4; Phase 3 uses this spec for *resolution* and the
+/// missing-model presence check only. The `HfHub` revision is left at `"main"`
+/// until Phase 4 pins a validated commit.
+pub const VOXTRAL_MINI_4B: ModelSpec = ModelSpec {
+    variant: "voxtral-mini-4b-realtime",
+    kind_label: "Voxtral",
+    default_subdir: "voxtral-mini-4b-realtime",
+    required_files: &["consolidated.safetensors", "tekken.json", "params.json"],
+    env_var: "OMNI_DEV_VOICE_VOXTRAL_MODEL",
+    install_command: "omni-dev voice install-model --variant voxtral-mini-4b-realtime",
+    model_flag: "--model",
+    source: ModelSource::HfHub {
+        repo_id: "mistralai/Voxtral-Mini-4B-Realtime-2602",
+        revision: "main",
+    },
+};
+
+/// Resolves the Voxtral model directory for the current invocation.
+///
+/// Priority: `opts.model` → `OMNI_DEV_VOICE_VOXTRAL_MODEL` → default
+/// `~/.omni-dev/voice/models/voxtral-mini-4b-realtime/`. Not validated for
+/// existence; pair with [`ensure_voxtral_model_present`] to fail fast.
+pub fn resolve_voxtral_model_dir(opts: &VoiceOpts) -> Result<PathBuf> {
+    VOXTRAL_MINI_4B.resolve_dir(opts.model.as_deref())
+}
+
+/// Verifies `dir` contains the Voxtral model files, returning the install
+/// hint shaped for the Voxtral variant on failure.
+pub fn ensure_voxtral_model_present(dir: &Path) -> Result<()> {
+    VOXTRAL_MINI_4B.ensure_present(dir)
+}
+
+/// Voxtral Realtime Mini 4B, **INT4-quantized** — the real-time MLX backend
+/// (ADR-0039, #933 M2).
+///
+/// The `voxtral-mlx` backend loads `model.safetensors` (~2.6 GB MLX
+/// group-quantized 4-bit, far smaller than the BF16 `consolidated.safetensors`)
+/// and the `tekken.json` tokenizer. The revision is pinned to the commit
+/// validated in M1.5 (WER 1.5%, RTF 0.193). Apache-2.0, ungated — installable on
+/// any host, but consumable only by the Apple-Silicon `voxtral-mlx` backend.
+pub const VOXTRAL_MLX_INT4: ModelSpec = ModelSpec {
+    variant: "voxtral-mlx-int4",
+    kind_label: "Voxtral MLX INT4",
+    default_subdir: "voxtral-mlx-int4",
+    required_files: &["model.safetensors", "tekken.json"],
+    env_var: "OMNI_DEV_VOICE_VOXTRAL_MLX_MODEL",
+    install_command: "omni-dev voice install-model --variant voxtral-mlx-int4",
+    model_flag: "--model",
+    source: ModelSource::HfHub {
+        repo_id: "mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit",
+        revision: "fdebf7b2af834a1db4b8a3c99ab7480b333adf9e",
+    },
+};
+
+/// Resolves the INT4 Voxtral MLX model directory for the current invocation.
+///
+/// Priority: `opts.model` → `OMNI_DEV_VOICE_VOXTRAL_MLX_MODEL` → default
+/// `~/.omni-dev/voice/models/voxtral-mlx-int4/`. Not validated for existence;
+/// pair with [`ensure_voxtral_mlx_model_present`] to fail fast.
+pub fn resolve_voxtral_mlx_model_dir(opts: &VoiceOpts) -> Result<PathBuf> {
+    VOXTRAL_MLX_INT4.resolve_dir(opts.model.as_deref())
+}
+
+/// Verifies `dir` contains the INT4 Voxtral MLX model files, returning the
+/// install hint shaped for the `voxtral-mlx-int4` variant on failure.
+pub fn ensure_voxtral_mlx_model_present(dir: &Path) -> Result<()> {
+    VOXTRAL_MLX_INT4.ensure_present(dir)
+}
+
 // ── Backwards-compatible Whisper helpers (thin shims) ────────────────────
 
 /// Returns the absolute path of each required model file inside `dir`.
@@ -260,6 +335,7 @@ mod tests {
         let opts = VoiceOpts {
             backend: None,
             model: Some(PathBuf::from("/explicit/path")),
+            delay_ms: None,
         };
         let resolved = resolve_whisper_model_dir(&opts).unwrap();
         assert_eq!(resolved, PathBuf::from("/explicit/path"));
@@ -403,6 +479,59 @@ mod tests {
                 panic!("WHISPER_TINY_EN should be HfHub-sourced");
             }
         }
+    }
+
+    // ── Voxtral spec (#933 / ADR-0037) ──────────────────────────────────
+
+    #[test]
+    fn voxtral_resolve_dir_priority_override_env_default() {
+        let _g = env_guard();
+        // override wins over env
+        std::env::set_var("OMNI_DEV_VOICE_VOXTRAL_MODEL", "/should/not/be/read");
+        let opts = VoiceOpts {
+            backend: None,
+            model: Some(PathBuf::from("/explicit/voxtral")),
+            delay_ms: None,
+        };
+        assert_eq!(
+            resolve_voxtral_model_dir(&opts).unwrap(),
+            PathBuf::from("/explicit/voxtral")
+        );
+        // env wins over default
+        std::env::set_var("OMNI_DEV_VOICE_VOXTRAL_MODEL", "/from/env");
+        assert_eq!(
+            resolve_voxtral_model_dir(&VoiceOpts::default()).unwrap(),
+            PathBuf::from("/from/env")
+        );
+        std::env::remove_var("OMNI_DEV_VOICE_VOXTRAL_MODEL");
+    }
+
+    #[test]
+    fn voxtral_default_dir_uses_voxtral_subdir() {
+        let dir = VOXTRAL_MINI_4B.default_dir().unwrap();
+        assert!(dir.ends_with(".omni-dev/voice/models/voxtral-mini-4b-realtime"));
+    }
+
+    #[test]
+    fn voxtral_ensure_present_errors_with_install_hint() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let err = ensure_voxtral_model_present(tmp.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no Voxtral model found"), "got: {msg}");
+        assert!(
+            msg.contains("--variant voxtral-mini-4b-realtime"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("consolidated.safetensors"), "got: {msg}");
+    }
+
+    #[test]
+    fn voxtral_ensure_present_succeeds_when_files_exist() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for f in VOXTRAL_MINI_4B.required_files {
+            std::fs::write(tmp.path().join(f), b"placeholder").unwrap();
+        }
+        ensure_voxtral_model_present(tmp.path()).unwrap();
     }
 
     #[test]

@@ -86,6 +86,7 @@ mod tests {
                 wav: PathBuf::from("/tmp/x.wav"),
                 backend: None,
                 model: None,
+                delay_ms: None,
                 format: None,
                 speaker: None,
                 threshold: None,

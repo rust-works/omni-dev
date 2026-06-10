@@ -154,6 +154,19 @@ Pushing a `v*` tag triggers the following automated workflows:
 - **Uploads Release Assets**: Attaches compiled binaries to the GitHub release
 - **Publishes to crates.io**: Automatically using `CARGO_REGISTRY_TOKEN` secret
 
+> **⚠️ Known limitation — the native `voxtral` ASR backend blocks `cargo publish`.**
+> Per the [#933](https://github.com/rust-works/omni-dev/issues/933) Phase 3
+> decision, omni-dev depends on the in-repo `voxtral-sys` crate as an optional,
+> target-gated **path dependency with no version**, and `voxtral-sys` is
+> `publish = false`. Cargo requires every dependency (including optional/
+> target-specific ones) to resolve to a registry version at publish time, so
+> `cargo publish` of omni-dev will **fail** until this is resolved. Before the
+> next crates.io release, either (a) publish `voxtral-sys` to crates.io (give it
+> a version, flip `publish = true`, add a `cargo publish -p voxtral-sys` step to
+> `release.yml` ahead of omni-dev, and add a `version` to the path dep), or
+> (b) temporarily drop the `voxtral` feature/dependency for the release. Local
+> builds, CI, and `cargo install --git` are unaffected.
+
 ### 7. Monitor and Verify
 
 After pushing the tag, monitor the automated release:
