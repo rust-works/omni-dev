@@ -265,8 +265,16 @@ impl CommitAnalysis {
 
     /// Detects conventional commit type based on files and existing message.
     fn detect_commit_type(commit: &Commit, file_changes: &FileChanges) -> String {
-        let message = commit.message().unwrap_or("");
+        Self::detect_commit_type_from_message(commit.message().unwrap_or(""), file_changes)
+    }
 
+    /// Pure type inference from a commit `message` and its `file_changes`.
+    ///
+    /// Separated from [`Self::detect_commit_type`] so the branch logic can be exercised
+    /// deterministically by unit tests; the `&Commit`-taking wrapper requires a
+    /// live repository whose state varies run-to-run (which makes coverage of
+    /// these branches flicker — see the conventional-type tests below).
+    fn detect_commit_type_from_message(message: &str, file_changes: &FileChanges) -> String {
         // Check if message already has conventional commit format
         if let Some(existing_type) = Self::extract_conventional_type(message) {
             return existing_type;
@@ -404,7 +412,20 @@ impl CommitAnalysis {
         file_changes: &FileChanges,
     ) -> String {
         let current_message = commit.message().unwrap_or("").lines().next().unwrap_or("");
+        Self::generate_proposed_message_from(current_message, commit_type, scope, file_changes)
+    }
 
+    /// Pure message generation from the commit's first line and its analysis.
+    ///
+    /// Separated from [`Self::generate_proposed_message`] so the scope/format branches
+    /// can be unit-tested deterministically (the `&Commit` wrapper needs a live
+    /// repository).
+    fn generate_proposed_message_from(
+        current_message: &str,
+        commit_type: &str,
+        scope: &str,
+        file_changes: &FileChanges,
+    ) -> String {
         // If already properly formatted, return as-is
         if Self::extract_conventional_type(current_message).is_some() {
             return current_message.to_string();
@@ -1768,6 +1789,137 @@ diff_file: "/tmp/test.diff"
         assert_eq!(partial.base.original_message, original_message);
         assert!(partial.pre_validated_checks.is_empty());
 
+        Ok(())
+    }
+
+    // ── detect_commit_type_from_message (deterministic type inference) ──
+    //
+    // These pin every branch of the type-inference chain so its coverage no
+    // longer depends on whatever commit the live-repo dispatch tests analyze.
+
+    fn infer_type(message: &str, files: &[(&str, &str)]) -> String {
+        CommitAnalysis::detect_commit_type_from_message(message, &make_file_changes(files))
+    }
+
+    #[test]
+    fn commit_type_existing_conventional_wins() {
+        assert_eq!(infer_type("feat(cli): add", &[("A", "src/x.rs")]), "feat");
+    }
+
+    #[test]
+    fn commit_type_test_files() {
+        assert_eq!(infer_type("update", &[("A", "tests/foo_test.rs")]), "test");
+    }
+
+    #[test]
+    fn commit_type_docs_files() {
+        assert_eq!(infer_type("update", &[("M", "README.md")]), "docs");
+    }
+
+    #[test]
+    fn commit_type_config_added_is_feat() {
+        assert_eq!(infer_type("update", &[("A", "Cargo.toml")]), "feat");
+    }
+
+    #[test]
+    fn commit_type_config_modified_is_chore() {
+        assert_eq!(infer_type("update", &[("M", "Cargo.toml")]), "chore");
+    }
+
+    #[test]
+    fn commit_type_added_source_is_feat() {
+        assert_eq!(infer_type("add module", &[("A", "src/lib.rs")]), "feat");
+    }
+
+    #[test]
+    fn commit_type_fix_from_message() {
+        // Modified (not added) .rs file ⇒ falls through to the message check.
+        assert_eq!(infer_type("fix the bug", &[("M", "src/lib.rs")]), "fix");
+    }
+
+    #[test]
+    fn commit_type_refactor_when_more_deletions() {
+        assert_eq!(
+            infer_type("cleanup", &[("D", "src/a.rs"), ("D", "src/b.rs")]),
+            "refactor"
+        );
+    }
+
+    #[test]
+    fn commit_type_default_chore() {
+        assert_eq!(infer_type("update stuff", &[("M", "src/c.rs")]), "chore");
+    }
+
+    // ── generate_proposed_message_from (scope/format branches) ──
+
+    #[test]
+    fn proposed_message_with_scope() {
+        let fc = make_file_changes(&[("A", "src/x.rs")]);
+        let msg = CommitAnalysis::generate_proposed_message_from("do thing", "feat", "cli", &fc);
+        assert_eq!(msg, "feat(cli): do thing");
+    }
+
+    #[test]
+    fn proposed_message_without_scope() {
+        let fc = make_file_changes(&[("A", "src/x.rs")]);
+        let msg = CommitAnalysis::generate_proposed_message_from("do thing", "feat", "", &fc);
+        assert_eq!(msg, "feat: do thing");
+    }
+
+    #[test]
+    fn proposed_message_keeps_already_conventional() {
+        let fc = make_file_changes(&[("A", "src/x.rs")]);
+        let msg = CommitAnalysis::generate_proposed_message_from("fix(x): y", "feat", "cli", &fc);
+        assert_eq!(msg, "fix(x): y");
+    }
+
+    #[test]
+    fn proposed_message_generates_description_when_empty() {
+        let fc = make_file_changes(&[("A", "src/x.rs")]);
+        let msg = CommitAnalysis::generate_proposed_message_from("", "chore", "", &fc);
+        assert!(msg.starts_with("chore: "), "got: {msg}");
+    }
+
+    // ── analyze_file_changes (Delta arms) ──
+    //
+    // Exercises the Added/Deleted/Modified arms against a constructed repo, so
+    // their coverage is deterministic rather than dependent on the live HEAD
+    // commit (which is what made `Delta::Deleted` flicker run-to-run).
+
+    #[test]
+    fn analyze_file_changes_covers_delta_arms() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let repo = git2::Repository::init(dir.path())?;
+        let sig = git2::Signature::now("T", "t@e.com")?;
+
+        // Commit 1: add a.txt and b.txt.
+        for (name, content) in [("a.txt", "a"), ("b.txt", "b")] {
+            std::fs::write(dir.path().join(name), content)?;
+        }
+        let mut index = repo.index()?;
+        index.add_path(std::path::Path::new("a.txt"))?;
+        index.add_path(std::path::Path::new("b.txt"))?;
+        index.write()?;
+        let tree1 = repo.find_tree(index.write_tree()?)?;
+        let c1 = repo.commit(Some("HEAD"), &sig, &sig, "init", &tree1, &[])?;
+
+        // Commit 2: delete a.txt (Deleted), modify b.txt (Modified), add c.txt (Added).
+        std::fs::remove_file(dir.path().join("a.txt"))?;
+        std::fs::write(dir.path().join("b.txt"), "b2")?;
+        std::fs::write(dir.path().join("c.txt"), "c")?;
+        let mut index = repo.index()?;
+        index.remove_path(std::path::Path::new("a.txt"))?;
+        index.add_path(std::path::Path::new("b.txt"))?;
+        index.add_path(std::path::Path::new("c.txt"))?;
+        index.write()?;
+        let tree2 = repo.find_tree(index.write_tree()?)?;
+        let parent = repo.find_commit(c1)?;
+        let c2 = repo.commit(Some("HEAD"), &sig, &sig, "change", &tree2, &[&parent])?;
+
+        let commit2 = repo.find_commit(c2)?;
+        let changes = CommitAnalysis::analyze_file_changes(&repo, &commit2)?;
+        assert_eq!(changes.files_added, 1, "c.txt added");
+        assert_eq!(changes.files_deleted, 1, "a.txt deleted");
         Ok(())
     }
 }
