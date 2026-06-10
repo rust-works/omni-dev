@@ -53,6 +53,7 @@ mod tests {
                 fail_under_patch: None,
                 strip_prefix: None,
                 collapse_ranges: false,
+                all_files: false,
                 artifact_url: None,
                 run_url: None,
                 base_sha: None,
