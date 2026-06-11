@@ -125,12 +125,40 @@ jobs:
     # re-establishes the same env without leaking it into the worktree fallback
     # below (which must run its own, separate coverage at the merge-base).
     # This is the documented manual equivalent of the all-in-one `cargo llvm-cov`.
+    - name: Cache Whisper tiny.en model
+      # The model-gated voice tests below need whisper-tiny.en on disk.
+      # The model is pinned (HF Hub openai/whisper-tiny.en@refs/pr/15), so a
+      # constant cache key is correct; bump the key if the pin ever changes.
+      id: whisper-cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.omni-dev/voice/models/whisper-tiny.en
+        key: whisper-tiny-en-refs-pr-15
     - name: Run tests with coverage
       run: |
         # shellcheck disable=SC1090
         source <(cargo llvm-cov show-env --sh)
         cargo llvm-cov clean --workspace
         cargo test --all-features --workspace
+    - name: Install Whisper tiny.en model
+      if: steps.whisper-cache.outputs.cache-hit != 'true'
+      run: |
+        # shellcheck disable=SC1090
+        source <(cargo llvm-cov show-env --sh)
+        cargo run --all-features --bin omni-dev -- voice install-model
+    - name: Run model-gated voice tests with coverage
+      # Covers the candle Whisper inference path (WhisperEngine and the
+      # streaming backend's real-decode seam), which the default suite
+      # cannot reach without a model on disk. Only the fast gated tests run
+      # here — the 5-minute streaming envelope tests stay on the manual
+      # voice-streaming-keepup workflow. Dependencies are compiled at
+      # opt-level 2 even in dev (see Cargo.toml [profile.dev.package."*"]),
+      # which keeps these inference-heavy tests to seconds, not minutes.
+      run: |
+        # shellcheck disable=SC1090
+        source <(cargo llvm-cov show-env --sh)
+        cargo test --all-features --test voice_transcribe_candle_test -- --ignored
+        cargo test --all-features --test voice_streaming_candle_test streaming_smoke -- --ignored
     - name: Generate codecov.json
       # Kept ready so the disabled upload below works as soon as it is re-enabled.
       run: |

@@ -178,6 +178,75 @@ fn peak_rss_bytes() -> Option<u64> {
     Some(kib * 1024)
 }
 
+/// Fast smoke test over the real backend on the 11.7 s `short_en.wav`
+/// fixture — this is the gated test the **coverage CI job** runs (the
+/// 5-minute envelope tests stay manual / keep-up CI): it executes the
+/// production path end-to-end (`CandleStreamingTranscriber::new` →
+/// `WhisperEngine::decode_pcm`) so the inference code is covered.
+/// Config trades cadence for speed (~3 decodes total).
+#[test]
+#[ignore = "requires Whisper tiny.en model on disk; run `omni-dev voice install-model` first"]
+fn streaming_smoke_short_en_transcribes_with_real_backend() {
+    const CONTENT_WORDS: &[&str] = &[
+        "wizards",
+        "tempers",
+        "universal",
+        "flaw",
+        "species",
+        "fighting",
+        "rely",
+    ];
+    let model_dir = require_model_dir();
+    let transcriber = CandleStreamingTranscriber::with_config_and_rng(
+        &model_dir,
+        StreamingConfig {
+            cadence_secs: 2.0,
+            ..StreamingConfig::default()
+        },
+        Box::new(CountingUlidRng::new()),
+    )
+    .expect("CandleStreamingTranscriber should build");
+    let wav = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/voice/short_en.wav");
+    let input = VecAudioInput::from_wav_path(wav, CHUNK_SAMPLES).expect("fixture should load");
+
+    let events: Vec<TranscriptEvent> = transcriber
+        .transcribe(Box::new(input))
+        .expect("transcribe should succeed")
+        .collect::<anyhow::Result<Vec<_>>>()
+        .expect("backend should not error mid-stream");
+
+    assert!(
+        matches!(
+            events.last(),
+            Some(TranscriptEvent::Endpoint {
+                kind: EndpointKind::StreamEnd,
+                ..
+            })
+        ),
+        "last event must be Endpoint(StreamEnd), got: {:?}",
+        events.last()
+    );
+    let transcript = committed_transcript(&events).to_lowercase();
+    assert!(!transcript.is_empty(), "expected committed text");
+    let hits = CONTENT_WORDS
+        .iter()
+        .filter(|w| transcript.contains(**w))
+        .count();
+    assert!(
+        hits >= 4,
+        "expected most content words to survive streaming commit, got {hits}/7 in: {transcript:?}"
+    );
+    // Real confidence (not the spike's hard-coded 1.0) on every Final.
+    for event in &events {
+        if let TranscriptEvent::Final { confidence, .. } = event {
+            assert!(
+                *confidence > 0.0 && *confidence <= 1.0,
+                "confidence must be in (0, 1], got {confidence}"
+            );
+        }
+    }
+}
+
 /// LCD-envelope gates that don't need pacing: WER ≤ 15 %, total-pipeline
 /// RTF ≤ 0.5 (an upper bound on inference RTF — chunk pulls are instant
 /// when unpaced), and event-stream shape.
