@@ -151,9 +151,10 @@ jobs:
       # streaming backend's real-decode seam), which the default suite
       # cannot reach without a model on disk. Only the fast gated tests run
       # here — the 5-minute streaming envelope tests stay on the manual
-      # voice-streaming-keepup workflow. Dependencies are compiled at
-      # opt-level 2 even in dev (see Cargo.toml [profile.dev.package."*"]),
-      # which keeps these inference-heavy tests to seconds, not minutes.
+      # voice-streaming-keepup workflow. The candle inference crates are
+      # compiled at opt-level 2 even in dev (see the scoped
+      # [profile.dev.package.*] overrides in Cargo.toml), which keeps
+      # these inference-heavy tests to seconds, not minutes.
       run: |
         # shellcheck disable=SC1090
         source <(cargo llvm-cov show-env --sh)
