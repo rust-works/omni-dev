@@ -15,6 +15,11 @@ name: Voice streaming keep-up
 
 on:
   workflow_dispatch:
+  # TEMPORARY: workflow_dispatch can't target a workflow that isn't on the
+  # default branch yet, so trigger on pushes to the PR branch to get the
+  # one-time Linux/Windows keep-up numbers. Remove before merge.
+  push:
+    branches: [issue-974-candle-streaming-transcriber]
 
 env:
   CARGO_TERM_COLOR: always
