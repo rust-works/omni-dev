@@ -170,6 +170,19 @@ fn normalise_words(text: &str) -> Vec<String> {
     wer::tokenize(text)
 }
 
+/// Reads a numeric gate override from the environment, falling back to
+/// the strict envelope default. The keep-up CI lane relaxes the RTF and
+/// time-to-final gates to the true keep-up criterion (during-speech
+/// RTF < 1, lag bounded) because the strict numbers are calibrated to the
+/// Apple-Silicon baseline and hosted runners are slower than target
+/// hardware.
+fn env_gate(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 /// Peak RSS in bytes from `/proc/self/status` (`VmHWM`), Linux only.
 fn peak_rss_bytes() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
@@ -297,8 +310,12 @@ fn streaming_unpaced_meets_wer_and_rtf_envelope() {
         "frontier should be ~300 s, got {audio_secs}"
     );
     let rtf = wall_secs / audio_secs;
+    let rtf_gate = env_gate("OMNI_DEV_STREAMING_RTF_GATE", 0.5);
     eprintln!("unpaced: wall={wall_secs:.1}s audio={audio_secs:.1}s rtf={rtf:.3}");
-    assert!(rtf <= 0.5, "RTF gate: {rtf:.3} > 0.5 (baseline 0.34)");
+    assert!(
+        rtf <= rtf_gate,
+        "RTF gate: {rtf:.3} > {rtf_gate} (baseline 0.34)"
+    );
 
     // WER against the hand-corrected reference transcript.
     let reference =
@@ -420,13 +437,14 @@ fn streaming_paced_time_to_final_and_lag_bounded() {
         "paced: time-to-final mean={ttf_mean:.2}s max={ttf_max:.2}s over {} endpoints",
         ttf.len()
     );
+    let ttf_gate = env_gate("OMNI_DEV_STREAMING_TTF_GATE", 2.5);
     assert!(
-        ttf_mean <= 2.5,
-        "time-to-final mean gate: {ttf_mean:.2} > 2.5 (baseline 0.73)"
+        ttf_mean <= ttf_gate,
+        "time-to-final mean gate: {ttf_mean:.2} > {ttf_gate} (baseline 0.73)"
     );
     assert!(
-        ttf_max <= 2.5,
-        "time-to-final max gate: {ttf_max:.2} > 2.5 (baseline 1.42)"
+        ttf_max <= ttf_gate,
+        "time-to-final max gate: {ttf_max:.2} > {ttf_gate} (baseline 1.42)"
     );
 
     // ── Display lag: wall − audio frontier at emission, per Partial/Final.

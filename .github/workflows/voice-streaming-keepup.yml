@@ -52,6 +52,14 @@ jobs:
           # binary), so the process RSS high-water mark belongs to one
           # pipeline — safe to gate (Linux-only metric; no-op on Windows).
           OMNI_DEV_STREAMING_RSS_GATE: "1"
+          # This lane checks the true KEEP-UP criterion, not the strict
+          # Apple-Silicon envelope (RTF 0.5 / ttf 2.5 s): during-speech
+          # RTF < 1 with bounded lag. Measured on hosted runners:
+          # ubuntu RTF 0.70 (keeps up), windows RTF 1.20 (does not —
+          # hosted Windows runners are below the deployment floor; see
+          # docs/asr-backends.md).
+          OMNI_DEV_STREAMING_RTF_GATE: "1.0"
+          OMNI_DEV_STREAMING_TTF_GATE: "5.0"
         run: >-
           cargo test --release --test voice_streaming_candle_test --
           --ignored --nocapture --test-threads=1

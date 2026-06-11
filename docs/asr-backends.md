@@ -128,3 +128,13 @@ lag bounded and non-drifting. Partial latency is reported, not gated (the LCD
 tier explicitly does not meet the interactive ≤ 1 s bar). Peak RSS is
 reported on Linux and gated at ≤ 500 MB when `OMNI_DEV_STREAMING_RSS_GATE=1`
 (set by the CI keep-up workflow, which runs the test in isolation).
+
+The RTF and time-to-final gates accept env overrides
+(`OMNI_DEV_STREAMING_RTF_GATE`, `OMNI_DEV_STREAMING_TTF_GATE`): the
+`voice-streaming-keepup` CI lane sets them to `1.0` / `5.0` because it
+checks the *keep-up* criterion (during-speech RTF < 1, bounded lag) on
+hosted runners slower than target hardware, not the Apple-Silicon-calibrated
+envelope. Measured: ubuntu-latest RTF 0.70 with bounded non-drifting lag
+(keeps up); windows-latest RTF 1.20 (hosted Windows runners are below the
+deployment floor — Windows keep-up needs validation on representative
+hardware).
