@@ -135,6 +135,9 @@ The RTF and time-to-final gates accept env overrides
 checks the *keep-up* criterion (during-speech RTF < 1, bounded lag) on
 hosted runners slower than target hardware, not the Apple-Silicon-calibrated
 envelope. Measured: ubuntu-latest RTF 0.70 with bounded non-drifting lag
-(keeps up); windows-latest RTF 1.20 (hosted Windows runners are below the
-deployment floor — Windows keep-up needs validation on representative
-hardware).
+(keeps up consistently); windows-latest straddles the boundary across
+runner hardware — RTF 0.84 with bounded lag (kept up) and RTF 1.20 with
+unbounded lag (did not) on consecutive runs. Hosted Windows VMs are
+slower than representative end-user hardware, so real Windows desktops
+should sit comfortably under RTF 1, but per-deployment validation of the
+during-speech RTF < 1 floor remains advised.

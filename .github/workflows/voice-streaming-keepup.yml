@@ -15,11 +15,6 @@ name: Voice streaming keep-up
 
 on:
   workflow_dispatch:
-  # TEMPORARY: workflow_dispatch can't target a workflow that isn't on the
-  # default branch yet, so trigger on pushes to the PR branch to get the
-  # one-time Linux/Windows keep-up numbers. Remove before merge.
-  push:
-    branches: [issue-974-candle-streaming-transcriber]
 
 env:
   CARGO_TERM_COLOR: always
@@ -55,9 +50,10 @@ jobs:
           # This lane checks the true KEEP-UP criterion, not the strict
           # Apple-Silicon envelope (RTF 0.5 / ttf 2.5 s): during-speech
           # RTF < 1 with bounded lag. Measured on hosted runners:
-          # ubuntu RTF 0.70 (keeps up), windows RTF 1.20 (does not —
-          # hosted Windows runners are below the deployment floor; see
-          # docs/asr-backends.md).
+          # ubuntu RTF ~0.70 (keeps up consistently); windows varies by
+          # runner hardware — RTF 0.84 (kept up, bounded lag) and 1.20
+          # (did not) across consecutive runs, i.e. hosted Windows sits
+          # near the boundary. See docs/asr-backends.md.
           OMNI_DEV_STREAMING_RTF_GATE: "1.0"
           OMNI_DEV_STREAMING_TTF_GATE: "5.0"
         run: >-
