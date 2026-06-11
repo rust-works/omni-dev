@@ -424,6 +424,59 @@ mod tests {
         assert!(msg.contains("voice install-model"), "got: {msg}");
     }
 
+    fn resolve_model_dir() -> Option<std::path::PathBuf> {
+        if let Ok(env) = std::env::var("OMNI_DEV_VOICE_WHISPER_MODEL") {
+            if !env.is_empty() {
+                return Some(std::path::PathBuf::from(env));
+            }
+        }
+        crate::voice::models::default_whisper_model_dir()
+            .filter(|d| ensure_model_present(d).is_ok())
+    }
+
+    fn load_engine() -> WhisperEngine {
+        let dir = resolve_model_dir().expect(
+            "Whisper model not found. Run `omni-dev voice install-model` or set \
+             OMNI_DEV_VOICE_WHISPER_MODEL=<path>.",
+        );
+        WhisperEngine::load(&dir).expect("WhisperEngine::load should succeed")
+    }
+
+    #[test]
+    #[ignore = "requires Whisper tiny.en model on disk; run `omni-dev voice install-model` first"]
+    fn decode_pcm_empty_input_returns_empty_text() {
+        let engine = load_engine();
+        let (text, confidence) = engine.decode_pcm(&[]).unwrap();
+        assert!(text.is_empty());
+        assert!(confidence.abs() < f32::EPSILON);
+    }
+
+    #[test]
+    #[ignore = "requires Whisper tiny.en model on disk; run `omni-dev voice install-model` first"]
+    fn decode_pcm_joins_multi_segment_windows() {
+        // A >30 s window spans two N_FRAMES segments, exercising the
+        // segment loop and the space-join between segment texts (the
+        // streaming backend's ≤5 s windows never reach this path).
+        let engine = load_engine();
+        let wav = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/voice/monologue_5min.wav");
+        let mut input = crate::voice::transcriber::VecAudioInput::from_wav_path(wav, 16_000)
+            .expect("fixture should load");
+        let mut pcm: Vec<f32> = Vec::new();
+        while let Some(chunk) = input.next_chunk() {
+            pcm.extend(chunk.iter().map(|&s| f32::from(s) / 32768.0));
+            if pcm.len() >= 35 * 16_000 {
+                break;
+            }
+        }
+        let (text, confidence) = engine.decode_pcm(&pcm).unwrap();
+        assert!(
+            text.len() > 200,
+            "35 s of speech should decode to substantial text, got: {text:?}"
+        );
+        assert!(confidence > 0.0 && confidence <= 1.0, "got: {confidence}");
+    }
+
     #[test]
     fn confidence_from_zero_decoded_is_zero() {
         assert!(confidence_from(0.0, 0).abs() < f32::EPSILON);

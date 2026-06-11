@@ -159,6 +159,7 @@ jobs:
         source <(cargo llvm-cov show-env --sh)
         cargo test --all-features --test voice_transcribe_candle_test -- --ignored
         cargo test --all-features --test voice_streaming_candle_test streaming_smoke -- --ignored
+        cargo test --all-features --lib voice::backends::candle:: -- --ignored
     - name: Generate codecov.json
       # Kept ready so the disabled upload below works as soon as it is re-enabled.
       run: |
