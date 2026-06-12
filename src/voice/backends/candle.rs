@@ -424,14 +424,36 @@ mod tests {
         assert!(msg.contains("voice install-model"), "got: {msg}");
     }
 
+    /// Pure half of `resolve_model_dir`: an env override counts only when
+    /// non-empty. Split out so it is unit-testable without mutating the
+    /// process environment (models.rs tests guard that env var with their
+    /// own module-local mutex).
+    fn model_dir_from_env(value: Option<&str>) -> Option<std::path::PathBuf> {
+        value
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+    }
+
     fn resolve_model_dir() -> Option<std::path::PathBuf> {
-        if let Ok(env) = std::env::var("OMNI_DEV_VOICE_WHISPER_MODEL") {
-            if !env.is_empty() {
-                return Some(std::path::PathBuf::from(env));
-            }
-        }
-        crate::voice::models::default_whisper_model_dir()
-            .filter(|d| ensure_model_present(d).is_ok())
+        model_dir_from_env(
+            std::env::var("OMNI_DEV_VOICE_WHISPER_MODEL")
+                .ok()
+                .as_deref(),
+        )
+        .or_else(|| {
+            crate::voice::models::default_whisper_model_dir()
+                .filter(|d| ensure_model_present(d).is_ok())
+        })
+    }
+
+    #[test]
+    fn model_dir_from_env_requires_non_empty_value() {
+        assert_eq!(model_dir_from_env(None), None);
+        assert_eq!(model_dir_from_env(Some("")), None);
+        assert_eq!(
+            model_dir_from_env(Some("/custom/model")),
+            Some(std::path::PathBuf::from("/custom/model"))
+        );
     }
 
     fn load_engine() -> WhisperEngine {
