@@ -110,12 +110,18 @@ impl ModelSpec {
     /// `None` when the user's home directory cannot be located — same
     /// failure mode as `dirs::home_dir()`.
     pub fn default_dir(&self) -> Option<PathBuf> {
-        dirs::home_dir().map(|home| {
-            home.join(".omni-dev")
-                .join("voice")
-                .join("models")
-                .join(self.default_subdir)
-        })
+        dirs::home_dir().map(|home| self.default_dir_from(&home))
+    }
+
+    /// Builds the default install directory beneath an explicit `home`,
+    /// without consulting `dirs::home_dir()`/`HOME`. Lets callers (and
+    /// tests) resolve the default-dir layout against an injected base
+    /// rather than the process-global home, sidestepping env mutation.
+    pub fn default_dir_from(&self, home: &Path) -> PathBuf {
+        home.join(".omni-dev")
+            .join("voice")
+            .join("models")
+            .join(self.default_subdir)
     }
 
     /// Resolves the install directory for this spec.
