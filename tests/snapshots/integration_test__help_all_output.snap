@@ -3169,8 +3169,8 @@ Arguments:
   <WAV>  Path to a 16 kHz mono 16-bit PCM WAV file. Use `voice capture` to produce one — `transcribe` does not resample
 
 Options:
-      --backend <BACKEND>              Transcriber backend (`mock`, `whisper-candle`). Defaults to `mock`; see ADR-0033 for the `whisper-candle` runtime choice
-      --model <MODEL>                  Path to a backend-specific model directory. For `whisper-candle`, this overrides `OMNI_DEV_VOICE_WHISPER_MODEL` and the default at `~/.omni-dev/voice/models/whisper-tiny.en/`. Ignored by `mock`
+      --backend <BACKEND>              Transcriber backend (`mock`, `whisper-candle`, `whisper-candle-streaming`). Defaults to `mock`; see ADR-0033 for the `whisper-candle` runtime choice and ADR-0040 for the latency-tolerant streaming variant
+      --model <MODEL>                  Path to a backend-specific model directory. For `whisper-candle` and `whisper-candle-streaming`, this overrides `OMNI_DEV_VOICE_WHISPER_MODEL` and the default at `~/.omni-dev/voice/models/whisper-tiny.en/`. Ignored by `mock`
       --format <FORMAT>                Output format. Defaults to `md` on a tty, `jsonl` when piped [possible values: jsonl, md]
       --speaker <SPEAKER>              Enrolled speaker to filter on. Drops any `Final` event whose segment doesn't match the enrolled embedding by cosine similarity at or above `--threshold`
       --threshold <THRESHOLD>          Cosine-similarity threshold for `--speaker`. Defaults to 0.5; see [`DEFAULT_SPEAKER_THRESHOLD`]

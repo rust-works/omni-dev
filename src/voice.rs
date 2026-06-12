@@ -27,6 +27,7 @@ pub mod review;
 pub mod session;
 pub mod speaker;
 pub mod transcriber;
+pub mod vad;
 pub mod wav;
 
 pub use audio::{AudioSource, CpalAudioSource, FileAudioSource};

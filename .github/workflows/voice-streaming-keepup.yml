@@ -1,0 +1,61 @@
+# Cross-platform keep-up check for the whisper-candle-streaming backend
+# (#974 / ADR-0040): the bounded-lag property holds only while during-speech
+# RTF < 1 on the host, so the LCD envelope must be confirmed on Linux and
+# Windows, not just the Apple-Silicon machine the #969 spike measured.
+#
+# Manual-dispatch only: it downloads the ~150 MB whisper-tiny.en model from
+# the HuggingFace Hub and burns ~15 min of runner CPU per OS. Run it once per
+# meaningful change to the streaming path and paste the numbers into the PR.
+#
+# Caveat: hosted runners are not perf-stable. A pass here (RTF ≤ 0.5 on a
+# runner slower than target hardware) is strong keep-up evidence; a marginal
+# failure needs a controlled host before reading it as NO-GO.
+
+name: Voice streaming keep-up
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  keepup:
+    name: Keep-up (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ALSA headers for cpal
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Build (release)
+        run: cargo build --release
+      - name: Install whisper-tiny.en model
+        # --bin is required: the workspace has two binaries (omni-dev and
+        # omni-dev-mcp), so a bare `cargo run` is ambiguous.
+        run: cargo run --release --bin omni-dev -- voice install-model
+      - name: Run streaming envelope tests
+        env:
+          # The paced test runs in isolation (--test-threads=1, single test
+          # binary), so the process RSS high-water mark belongs to one
+          # pipeline — safe to gate (Linux-only metric; no-op on Windows).
+          OMNI_DEV_STREAMING_RSS_GATE: "1"
+          # This lane checks the true KEEP-UP criterion, not the strict
+          # Apple-Silicon envelope (RTF 0.5 / ttf 2.5 s): during-speech
+          # RTF < 1 with bounded lag. Measured on hosted runners:
+          # ubuntu RTF ~0.70 (keeps up consistently); windows varies by
+          # runner hardware — RTF 0.84 (kept up, bounded lag) and 1.20
+          # (did not) across consecutive runs, i.e. hosted Windows sits
+          # near the boundary. See docs/asr-backends.md.
+          OMNI_DEV_STREAMING_RTF_GATE: "1.0"
+          OMNI_DEV_STREAMING_TTF_GATE: "5.0"
+        run: >-
+          cargo test --release --test voice_streaming_candle_test --
+          --ignored --nocapture --test-threads=1

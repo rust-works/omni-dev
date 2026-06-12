@@ -49,13 +49,16 @@ pub struct TranscribeCommand {
     /// produce one — `transcribe` does not resample.
     pub wav: PathBuf,
 
-    /// Transcriber backend (`mock`, `whisper-candle`). Defaults to `mock`;
-    /// see ADR-0033 for the `whisper-candle` runtime choice.
+    /// Transcriber backend (`mock`, `whisper-candle`,
+    /// `whisper-candle-streaming`). Defaults to `mock`; see ADR-0033 for
+    /// the `whisper-candle` runtime choice and ADR-0040 for the
+    /// latency-tolerant streaming variant.
     #[arg(long)]
     pub backend: Option<String>,
 
-    /// Path to a backend-specific model directory. For `whisper-candle`,
-    /// this overrides `OMNI_DEV_VOICE_WHISPER_MODEL` and the default at
+    /// Path to a backend-specific model directory. For `whisper-candle`
+    /// and `whisper-candle-streaming`, this overrides
+    /// `OMNI_DEV_VOICE_WHISPER_MODEL` and the default at
     /// `~/.omni-dev/voice/models/whisper-tiny.en/`. Ignored by `mock`.
     #[arg(long)]
     pub model: Option<PathBuf>,
