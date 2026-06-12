@@ -81,12 +81,23 @@ impl InstallModelCommand {
     /// Writer-generic core, parameterised over stderr so tests can drive
     /// the success/idempotency paths without touching the global stream.
     fn run<W: Write>(self, w: &mut W) -> Result<()> {
+        let home = dirs::home_dir();
+        self.run_in(w, home.as_deref())
+    }
+
+    /// `run` with the home directory injected rather than read from
+    /// `dirs::home_dir()`/`HOME`. The `dest: None` default-dir branch
+    /// resolves against `home`, so tests can exercise it against a
+    /// tempdir base without mutating the process-global `HOME` (the race
+    /// behind #978).
+    fn run_in<W: Write>(self, w: &mut W, home: Option<&Path>) -> Result<()> {
         let spec = self.variant.spec();
-        let dest = match self.dest {
-            Some(p) => p,
-            None => spec
-                .default_dir()
-                .ok_or_else(|| anyhow!("could not determine home directory; pass --dest <path>"))?,
+        let dest = if let Some(p) = self.dest {
+            p
+        } else {
+            let home = home
+                .ok_or_else(|| anyhow!("could not determine home directory; pass --dest <path>"))?;
+            spec.default_dir_from(home)
         };
 
         if !self.force && all_present(spec, &dest) {
@@ -300,18 +311,6 @@ fn part_sibling(to: &Path) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use crate::voice::models::REQUIRED_FILES;
-    use std::sync::{Mutex, MutexGuard};
-
-    // HOME-mutating tests share this guard so they don't race the
-    // env-mutating tests in `voice::models`.
-    static ENV_GUARD: Mutex<()> = Mutex::new(());
-
-    fn env_guard() -> MutexGuard<'static, ()> {
-        match ENV_GUARD.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        }
-    }
 
     fn stage_complete_whisper_model(dir: &Path) {
         std::fs::create_dir_all(dir).unwrap();
@@ -462,17 +461,13 @@ mod tests {
 
     #[test]
     fn run_with_dest_none_resolves_default_install_dir_from_home() {
-        // Covers the `match self.dest { None => spec.default_dir()… }`
+        // Covers the `match self.dest { None => spec.default_dir_from()… }`
         // arm — the priority-3 path that the explicit-dest tests skip.
-        // We stage the model files at the default location *under a
-        // tempdir HOME* so the idempotent branch returns Ok and we
-        // never touch the network or the real user's home.
-        let _g = env_guard();
+        // The home base is injected via `run_in`, so we stage the model
+        // files at the default location beneath a tempdir without
+        // mutating the process-global `HOME` (the #978 race).
         let tmp = tempfile::TempDir::new().unwrap();
-        let prev_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
-
-        let default_dir = WHISPER_TINY_EN.default_dir().unwrap();
+        let default_dir = WHISPER_TINY_EN.default_dir_from(tmp.path());
         stage_complete_whisper_model(&default_dir);
 
         let cmd = InstallModelCommand {
@@ -481,14 +476,8 @@ mod tests {
             variant: Variant::WhisperTinyEn,
         };
         let mut out: Vec<u8> = Vec::new();
-        let result = cmd.run(&mut out);
+        cmd.run_in(&mut out, Some(tmp.path())).unwrap();
 
-        match prev_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-
-        result.unwrap();
         let msg = String::from_utf8(out).unwrap();
         assert!(msg.contains("already installed"), "got: {msg}");
         assert!(
@@ -499,12 +488,8 @@ mod tests {
 
     #[test]
     fn run_speaker_variant_with_dest_none_resolves_default() {
-        let _g = env_guard();
         let tmp = tempfile::TempDir::new().unwrap();
-        let prev_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
-
-        let default_dir = SPEAKER_WESPEAKER_EN.default_dir().unwrap();
+        let default_dir = SPEAKER_WESPEAKER_EN.default_dir_from(tmp.path());
         stage_complete_speaker_model(&default_dir);
 
         let cmd = InstallModelCommand {
@@ -513,19 +498,30 @@ mod tests {
             variant: Variant::SpeakerWespeakerEn,
         };
         let mut out: Vec<u8> = Vec::new();
-        let result = cmd.run(&mut out);
+        cmd.run_in(&mut out, Some(tmp.path())).unwrap();
 
-        match prev_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-
-        result.unwrap();
         let msg = String::from_utf8(out).unwrap();
         assert!(msg.contains("already installed"), "got: {msg}");
         assert!(
             msg.contains("wespeaker-en-voxceleb-resnet34-LM"),
             "expected resolved default dir in message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_in_errors_when_home_unavailable_and_dest_none() {
+        // The `home: None` arm of the default-dir branch — deterministically
+        // reachable via `run_in` without simulating a missing `HOME`.
+        let cmd = InstallModelCommand {
+            dest: None,
+            force: false,
+            variant: Variant::WhisperTinyEn,
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let err = cmd.run_in(&mut out, None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("could not determine home directory"),
+            "got: {err:#}"
         );
     }
 
