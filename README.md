@@ -85,6 +85,41 @@ eval "$(omni-dev completions bash)"
 See [docs/shell-completion.md](docs/shell-completion.md) for per-shell install
 recipes, the `$fpath`/`compinit` setup zsh requires, and troubleshooting.
 
+## 🆚 How omni-dev Compares
+
+omni-dev sits in two adjacent spaces — AI commit-message tooling and
+Atlassian/dev-workflow MCP servers. The tables below contrast the
+incumbents on the dimensions a first-time reader is most likely to weigh.
+Gaps on the omni-dev side are marked honestly with `⚠`.
+
+### vs AI commit tools
+
+|                                                       | omni-dev                            | [opencommit](https://github.com/di-sukharev/opencommit) | [aicommits](https://github.com/Nutlope/aicommits) |
+|-------------------------------------------------------|-------------------------------------|---------------------------------------------------------|---------------------------------------------------|
+| Rewrite existing commits in a range                   | ✅ `twiddle`                         | ❌ pre-commit only                                       | ❌ pre-commit only                                 |
+| Parallel batched processing (long ranges)             | ✅ `--concurrency N`                 | ❌                                                       | ❌                                                 |
+| AI-written PR descriptions                            | ✅ `git branch create pr`            | ⚠ GitHub Action only                                    | ❌                                                 |
+| Project-context awareness                             | ✅ `--use-context`                   | ❌                                                       | ❌                                                 |
+| Sandboxed `claude-cli` backend                        | ✅ [ADR-0028](docs/adrs/adr-0028.md) | ❌                                                       | ❌                                                 |
+| Multi-backend (Anthropic / Bedrock / OpenAI / Ollama) | ✅                                   | ✅                                                       | ✅                                                 |
+| Conventional Commits                                  | ✅                                   | ✅                                                       | ⚠ config                                          |
+| Language / runtime                                    | Rust (static binary)                | Node.js                                                 | Node.js                                           |
+
+### vs Atlassian-workflow MCP servers
+
+|                                                     | omni-dev MCP     | [sooperset/mcp-atlassian](https://github.com/sooperset/mcp-atlassian) | Atlassian official |
+|-----------------------------------------------------|------------------|-----------------------------------------------------------------------|--------------------|
+| Jira tools                                          | ✅                | ✅                                                                     | ✅                  |
+| Confluence tools                                    | ✅                | ✅                                                                     | ✅                  |
+| Datadog tools                                       | ✅                | ❌                                                                     | ❌                  |
+| Git tools (analysis, commit twiddling, PR creation) | ✅                | ❌                                                                     | ❌                  |
+| `ai_chat` proxy for tool-driven workflows           | ✅                | ❌                                                                     | ❌                  |
+| Cloud + Server + Data Center                        | ⚠ Cloud verified | ✅                                                                     | Cloud only         |
+| OAuth 2.0                                           | ⚠                | ✅                                                                     | ✅                  |
+
+_Last verified: 2026-06-08. Refresh quarterly or whenever a release-note
+search for the comparators flags a relevant change._
+
 ## 📋 Core Commands
 
 ### 🤖 AI-Powered Commit Improvement (`twiddle`)
