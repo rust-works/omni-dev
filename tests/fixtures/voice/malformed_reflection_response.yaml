@@ -1,4 +1,0 @@
-events:
-  - event_type: item.update
-    payload:
-      text: "deliberately missing item_id — should produce a single reflection.error event"
