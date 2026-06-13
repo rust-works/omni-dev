@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`jira dev --summary` provider output** ([#924](https://github.com/rust-works/omni-dev/issues/924)): each entry in a category's `providers` list now carries both the `instance_type` identifier (the `applicationType` round-trip key, e.g. `stash`) and the display `name` (e.g. `Bitbucket Server`). The human table shows `Bitbucket Server (stash)` when the two differ and a plain `GitHub` when they match. **Output shape change**: under `--output json`/`yaml`, `providers` is now a list of `{instance_type, name}` objects instead of a list of strings.
+
+### Fixed
+- **`jira dev` auto-discovery for Bitbucket Server** ([#924](https://github.com/rust-works/omni-dev/issues/924)): provider auto-discovery now queries the DevStatus detail endpoint with the instance-type identifier (e.g. `applicationType=stash`) reported by the summary's `byInstanceType` map, rather than the human-readable display name (`Bitbucket Server`). Previously, any provider whose display name differed from its identifier — Bitbucket Server being the canonical case — was missed, returning empty results.
+
 ## [0.29.0] - 2026-06-12
 
 ### Added

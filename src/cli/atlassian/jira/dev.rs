@@ -129,7 +129,21 @@ fn print_summary(key: &str, summary: &JiraDevStatusSummary) {
         let providers = if count.providers.is_empty() {
             "-".to_string()
         } else {
-            count.providers.join(", ")
+            // Show the display name, appending the instance-type identifier
+            // only when it differs (e.g. "Bitbucket Server (stash)"), so a
+            // provider whose name matches its key reads as plain "GitHub".
+            count
+                .providers
+                .iter()
+                .map(|p| {
+                    if p.name == p.instance_type {
+                        p.name.clone()
+                    } else {
+                        format!("{} ({})", p.name, p.instance_type)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
         };
         println!("  {:<type_w$}  {:>5}  {}", name, count.count, providers);
     }
@@ -308,7 +322,14 @@ fn print_commits(commits: &[JiraDevCommit]) {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::atlassian::client::JiraDevStatusCount;
+    use crate::atlassian::client::{JiraDevProvider, JiraDevStatusCount};
+
+    fn github_provider() -> JiraDevProvider {
+        JiraDevProvider {
+            instance_type: "GitHub".to_string(),
+            name: "GitHub".to_string(),
+        }
+    }
 
     fn sample_pr() -> JiraDevPullRequest {
         JiraDevPullRequest {
@@ -442,15 +463,21 @@ mod tests {
         let summary = JiraDevStatusSummary {
             pullrequest: JiraDevStatusCount {
                 count: 2,
-                providers: vec!["GitHub".to_string()],
+                providers: vec![github_provider()],
             },
             branch: JiraDevStatusCount {
                 count: 1,
-                providers: vec!["GitHub".to_string()],
+                providers: vec![github_provider()],
             },
             repository: JiraDevStatusCount {
                 count: 1,
-                providers: vec!["GitHub".to_string(), "bitbucket".to_string()],
+                providers: vec![
+                    github_provider(),
+                    JiraDevProvider {
+                        instance_type: "stash".to_string(),
+                        name: "Bitbucket Server".to_string(),
+                    },
+                ],
             },
         };
         print_summary("PROJ-1", &summary);
