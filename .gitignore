@@ -53,3 +53,8 @@ cinema/
 
 # Git worktrees
 /.work/
+
+# Issue #813 spike: model weights and prototype build artifacts
+/models/
+/spike-*/target/
+/spike-*/Cargo.lock
