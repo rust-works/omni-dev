@@ -832,8 +832,20 @@ pub struct JiraDevStatus {
 pub struct JiraDevStatusCount {
     /// Number of items.
     pub count: u32,
-    /// Application type names that have data (e.g., "GitHub", "bitbucket").
-    pub providers: Vec<String>,
+    /// Providers that have data for this category.
+    pub providers: Vec<JiraDevProvider>,
+}
+
+/// A development-info provider that has data for a JIRA issue, as reported by
+/// the DevStatus summary endpoint's `byInstanceType` map.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct JiraDevProvider {
+    /// Instance-type identifier — the value the detail endpoint expects as
+    /// `applicationType` (e.g. "stash", "bitbucket", "GitHub"). This is the
+    /// round-trip key; do not substitute the display name here.
+    pub instance_type: String,
+    /// Human-readable display name (e.g. "Bitbucket Server", "GitHub").
+    pub name: String,
 }
 
 /// High-level dev-status summary from
@@ -1600,20 +1612,16 @@ struct DevStatusSummaryData {
 #[derive(Deserialize)]
 struct DevStatusSummaryCategory {
     overall: Option<DevStatusSummaryOverall>,
+    // Keyed by instance-type identifier (e.g. "github", "stash"); only the
+    // keys are needed for provider discovery, so the values are ignored.
     #[serde(rename = "byInstanceType", default)]
-    by_instance_type: HashMap<String, DevStatusSummaryInstance>,
+    by_instance_type: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Deserialize)]
 struct DevStatusSummaryOverall {
     #[serde(default)]
     count: u32,
-}
-
-#[derive(Deserialize)]
-struct DevStatusSummaryInstance {
-    #[serde(default)]
-    name: String,
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -5946,7 +5954,13 @@ mod tests {
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
         let summary = client.get_dev_status_summary("PROJ-1").await.unwrap();
         assert_eq!(summary.pullrequest.count, 2);
-        assert_eq!(summary.pullrequest.providers, vec!["GitHub"]);
+        assert_eq!(
+            summary.pullrequest.providers,
+            vec![JiraDevProvider {
+                instance_type: "GitHub".to_string(),
+                name: "GitHub".to_string(),
+            }]
+        );
         assert_eq!(summary.branch.count, 1);
         assert_eq!(summary.repository.count, 1);
         assert!(summary.repository.providers.is_empty());
@@ -6195,6 +6209,102 @@ mod tests {
 
         assert_eq!(status.pull_requests.len(), 1);
         assert_eq!(status.pull_requests[0].name, "Fix login bug");
+    }
+
+    /// Regression test for #924: a Bitbucket Server PR is keyed under `stash`
+    /// in the summary's `byInstanceType` map (with the display name "Bitbucket
+    /// Server"). Auto-discovery must query the detail endpoint with the *key*
+    /// (`applicationType=stash`), not the display name, or the PR is missed and
+    /// the result is empty.
+    #[tokio::test]
+    async fn get_dev_status_auto_discovers_bitbucket_server() {
+        let server = wiremock::MockServer::start().await;
+        mount_issue_id_mock(&server).await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/dev-status/1.0/issue/summary",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "summary": {
+                        "pullrequest": {
+                            "overall": {"count": 1},
+                            "byInstanceType": {"stash": {"count": 1, "name": "Bitbucket Server"}}
+                        },
+                        "branch": {"overall": {"count": 0}, "byInstanceType": {}},
+                        "repository": {
+                            "overall": {"count": 1},
+                            "byInstanceType": {"stash": {"count": 1, "name": "Bitbucket Server"}}
+                        }
+                    }
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        // Only respond when the detail query carries `applicationType=stash`.
+        // The buggy code queried `applicationType=Bitbucket Server`, which would
+        // not match this mock and surface as an API error.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/dev-status/1.0/issue/detail",
+            ))
+            .and(wiremock::matchers::query_param("applicationType", "stash"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(dev_status_detail_response()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let status = client
+            .get_dev_status("PROJ-1", Some("pullrequest"), None)
+            .await
+            .unwrap();
+
+        assert_eq!(status.pull_requests.len(), 1);
+        assert_eq!(status.pull_requests[0].name, "Fix login bug");
+    }
+
+    /// The summary must keep *both* halves of a `byInstanceType` entry: the key
+    /// (`stash`) as `instance_type` for the detail round-trip, and the value's
+    /// `name` ("Bitbucket Server") for display. Earlier behaviour collapsed them
+    /// onto one or the other.
+    #[tokio::test]
+    async fn get_dev_status_summary_keeps_key_and_name() {
+        let server = wiremock::MockServer::start().await;
+        mount_issue_id_mock(&server).await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/dev-status/1.0/issue/summary",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "summary": {
+                        "pullrequest": {
+                            "overall": {"count": 1},
+                            "byInstanceType": {"stash": {"count": 1, "name": "Bitbucket Server"}}
+                        },
+                        "branch": {"overall": {"count": 0}, "byInstanceType": {}},
+                        "repository": {"overall": {"count": 0}, "byInstanceType": {}}
+                    }
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let summary = client.get_dev_status_summary("PROJ-1").await.unwrap();
+
+        assert_eq!(
+            summary.pullrequest.providers,
+            vec![JiraDevProvider {
+                instance_type: "stash".to_string(),
+                name: "Bitbucket Server".to_string(),
+            }]
+        );
     }
 
     #[tokio::test]
@@ -8457,8 +8567,9 @@ impl AtlassianClient {
 
     /// Fetches a development status summary (counts per category) for a JIRA issue.
     ///
-    /// Uses the DevStatus summary endpoint. Returns counts and provider names
-    /// for each category (pull requests, branches, repositories).
+    /// Uses the DevStatus summary endpoint. Returns counts and providers (each
+    /// carrying both the `applicationType` instance-type key and its display
+    /// name) for each category (pull requests, branches, repositories).
     pub async fn get_dev_status_summary(&self, key: &str) -> Result<JiraDevStatusSummary> {
         let issue_id = self.get_issue_id(key).await?;
         let url = format!(
@@ -8480,11 +8591,26 @@ impl AtlassianClient {
             match cat {
                 Some(c) => JiraDevStatusCount {
                     count: c.overall.map_or(0, |o| o.count),
+                    // The `byInstanceType` map is keyed by the instance-type
+                    // identifier (e.g. "github", "stash", "bitbucket") — this
+                    // key, not the human-readable `name` ("Bitbucket Server"),
+                    // is what the detail endpoint expects as `applicationType`.
+                    // Keep the key as `instance_type` for provider auto-discovery
+                    // in `get_dev_status`, and the value's `name` for display,
+                    // falling back to the key when the API omits a name.
                     providers: c
                         .by_instance_type
-                        .into_values()
-                        .map(|i| i.name)
-                        .filter(|n| !n.is_empty())
+                        .into_iter()
+                        .filter(|(k, _)| !k.is_empty())
+                        .map(|(k, v)| JiraDevProvider {
+                            name: v
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or(&k)
+                                .to_string(),
+                            instance_type: k,
+                        })
                         .collect(),
                 },
                 None => JiraDevStatusCount {
@@ -8520,7 +8646,9 @@ impl AtlassianClient {
         let app_types: Vec<String> = if let Some(app) = application_type {
             vec![app.to_string()]
         } else {
-            // Discover available providers via the summary endpoint.
+            // Discover available providers via the summary endpoint. The
+            // `instance_type` key — not the display name — is what the detail
+            // endpoint expects as `applicationType`.
             let summary = self.get_dev_status_summary(key).await?;
             let mut providers: Vec<String> = Vec::new();
             for p in summary
@@ -8530,8 +8658,8 @@ impl AtlassianClient {
                 .chain(summary.branch.providers)
                 .chain(summary.repository.providers)
             {
-                if !providers.contains(&p) {
-                    providers.push(p);
+                if !providers.contains(&p.instance_type) {
+                    providers.push(p.instance_type);
                 }
             }
             if providers.is_empty() {
