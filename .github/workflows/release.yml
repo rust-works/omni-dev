@@ -70,10 +70,6 @@ jobs:
         toolchain: ${{ matrix.rust }}
         target: ${{ matrix.target }}
 
-    - name: Install ALSA headers for cpal (linux)
-      if: matrix.build == 'linux'
-      run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-
     - name: Build release binaries
       run: cargo build --verbose --release --target ${{ matrix.target }} --features mcp --bin omni-dev --bin omni-dev-mcp
 
@@ -117,7 +113,5 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - uses: dtolnay/rust-toolchain@stable
-    - name: Install ALSA headers for cpal
-      run: sudo apt-get update && sudo apt-get install -y libasound2-dev
     - name: Publish
       run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}

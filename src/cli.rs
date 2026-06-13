@@ -15,7 +15,6 @@ pub mod git;
 pub mod help;
 pub mod resources;
 pub mod transcript;
-pub mod voice;
 
 /// CLI-side selector for the AI backend dispatched by
 /// [`create_default_claude_client`][crate::claude::client::create_default_claude_client].
@@ -137,8 +136,6 @@ pub enum Commands {
     Coverage(coverage::CoverageCommand),
     /// Transcript and caption fetching from media platforms.
     Transcript(transcript::TranscriptCommand),
-    /// Voice capture and processing operations.
-    Voice(voice::VoiceCommand),
     /// Embedded reference resources (specs, etc.).
     Resources(resources::ResourcesCommand),
     /// Generates shell completion scripts.
@@ -197,7 +194,6 @@ impl Cli {
             Commands::Datadog(cmd) => cmd.execute().await,
             Commands::Coverage(cmd) => cmd.execute(repo).await,
             Commands::Transcript(cmd) => cmd.execute().await,
-            Commands::Voice(cmd) => cmd.execute().await,
             Commands::Config(config_cmd) => config_cmd.execute(),
             Commands::Resources(resources_cmd) => resources_cmd.execute(),
             Commands::Completions(completions_cmd) => completions_cmd.execute(),

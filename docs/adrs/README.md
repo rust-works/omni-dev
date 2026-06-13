@@ -54,10 +54,11 @@ by Michael Nygard.
 | [ADR-0028](adr-0028.md)  | ✅ Accepted                              | 2026-05-12 | Sandboxed `claude-cli` Subprocess AI Backend                                           |
 | [ADR-0029](adr-0029.md)  | ✅ Accepted                              | 2026-05-12 | JFM ↔ ADF Converter Strategy                                                           |
 | [ADR-0030](adr-0030.md)  | ✅ Accepted                              | 2026-05-12 | CLI Snapshot Golden Testing for the Help Surface                                       |
-| [ADR-0031](adr-0031.md)  | ✅ Accepted                              | 2026-05-13 | AudioSource Trait Boundary for Real-Time Audio Capture Testability                     |
-| [ADR-0032](adr-0032.md)  | ✅ Accepted                              | 2026-05-13 | Separate AudioInput Trait at the Transcriber Boundary                                  |
-| [ADR-0033](adr-0033.md)  | ✅ Accepted                              | 2026-05-14 | `candle` as the Production ASR Runtime                                                 |
-| [ADR-0034](adr-0034.md)  | ✅ Accepted                              | 2026-05-14 | `tract-onnx` as the Speaker-Embedding Runtime                                          |
-| [ADR-0035](adr-0035.md)  | ✅ Accepted                              | 2026-05-25 | OS-Gated ASR Backends with Auto-Upgrading Defaults                                     |
+| [ADR-0031](adr-0031.md)  | 🔄 Superseded by [ADR-0038](adr-0038.md) | 2026-05-13 | AudioSource Trait Boundary for Real-Time Audio Capture Testability                     |
+| [ADR-0032](adr-0032.md)  | 🔄 Superseded by [ADR-0038](adr-0038.md) | 2026-05-13 | Separate AudioInput Trait at the Transcriber Boundary                                  |
+| [ADR-0033](adr-0033.md)  | 🔄 Superseded by [ADR-0038](adr-0038.md) | 2026-05-14 | `candle` as the Production ASR Runtime                                                 |
+| [ADR-0034](adr-0034.md)  | 🔄 Superseded by [ADR-0038](adr-0038.md) | 2026-05-14 | `tract-onnx` as the Speaker-Embedding Runtime                                          |
+| [ADR-0035](adr-0035.md)  | 🔄 Superseded by [ADR-0038](adr-0038.md) | 2026-05-25 | OS-Gated ASR Backends with Auto-Upgrading Defaults                                     |
 | [ADR-0036](adr-0036.md)  | ✅ Accepted                              | 2026-05-30 | Confused-Deputy Browser Bridge with Dual-Plane Default-Closed Authentication           |
-| [ADR-0037](adr-0037.md)  | ✅ Accepted                              | 2026-06-06 | Pure-C Native ASR Backends Behind a Rust FFI Boundary on Non-Windows Targets           |
+| [ADR-0037](adr-0037.md)  | 🔄 Superseded by [ADR-0038](adr-0038.md) | 2026-06-06 | Pure-C Native ASR Backends Behind a Rust FFI Boundary on Non-Windows Targets           |
+| [ADR-0038](adr-0038.md)  | ✅ Accepted                              | 2026-06-13 | Voice Functionality Extracted to the omni-voice Repository                             |

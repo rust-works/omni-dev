@@ -1,8 +1,0 @@
----
-source: tests/voice_transcribe_test.rs
-expression: transcribe_to_jsonl()
----
-{"type":"final","event_id":"00000000000000000000000001","text":"hello world","start":0.0,"end":2.0,"confidence":0.95,"revisable":false}
-{"type":"final","event_id":"00000000000000000000000002","text":"this is the mock transcriber","start":2.0,"end":5.5,"confidence":0.92,"revisable":false}
-{"type":"final","event_id":"00000000000000000000000003","text":"emitting a deterministic event sequence","start":5.5,"end":10.0,"confidence":0.97,"revisable":false}
-{"type":"endpoint","at":11.6879375,"kind":"stream_end"}

@@ -63,7 +63,6 @@ Required. Use scopes defined in `.omni-dev/scopes.yaml`:
 - `release` - Release process, versioning, and publishing
 - `resources` - Embedded reference content registry shared by CLI and MCP
 - `scopes` - Commit scope definitions and configuration
-- `voice` - Voice capture, transcription, and ASR backends
 - `workflows` - GitHub Actions workflow files
 
 For multi-scope commits, the scopes are correct when each listed scope
