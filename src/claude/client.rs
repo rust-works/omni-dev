@@ -49,8 +49,8 @@ impl ClaudeClient {
     ///
     /// `ClaudeClient` is the commit-message-improvement entry point —
     /// callers that want to drive the AI directly for unrelated workflows
-    /// (e.g. `voice reflect`) extract the underlying client via this
-    /// method rather than reimplementing the backend-dispatch ladder in
+    /// extract the underlying client via this method rather than
+    /// reimplementing the backend-dispatch ladder in
     /// [`create_default_claude_client`].
     #[must_use]
     pub fn into_ai_client(self) -> Box<dyn AiClient> {

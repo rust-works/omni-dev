@@ -1,5 +1,0 @@
----
-source: tests/voice_transcribe_cli_test.rs
-expression: out
----
-[00:00:00] [mock transcriber] segment 1 [mock transcriber] segment 2
