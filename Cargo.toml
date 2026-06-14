@@ -14,13 +14,11 @@ categories = ["development-tools", "command-line-utilities"]
 rust-version = "1.80.0"
 # Keep the published crate under crates.io's 10 MiB upload limit by dropping
 # assets that consumers of the library/binary do not need: the promo website,
-# social-preview images, scratch space, and the large binary voice fixtures
-# used only by the test suite (which crates.io consumers never run).
+# social-preview images, and scratch space.
 exclude = [
     "website/",
     "assets/",
     "scratch/",
-    "tests/fixtures/voice/",
 ]
 
 [dependencies]
@@ -59,20 +57,6 @@ mime_guess = "2"
 flate2 = "1"
 tar = "0.4"
 sha2 = "0.11"
-cpal = "0.18"
-rubato = "3.0"
-hound = "3.5"
-signal-hook = "0.4"
-ringbuf = "0.5"
-ulid = { version = "1", features = ["serde"] }
-candle-core = { version = "0.10", default-features = false }
-candle-nn = { version = "0.10", default-features = false }
-candle-transformers = { version = "0.10", default-features = false }
-hf-hub = { version = "0.5", default-features = false, features = ["ureq", "rustls-tls"] }
-tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
-byteorder = "1"
-tract-onnx = "0.23"
-rustfft = "6"
 ureq = "3"
 quick-xml = "0.40.1"
 
