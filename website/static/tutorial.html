@@ -359,35 +359,35 @@ omni-dev atlassian auth status</pre>
 type: jira
 instance: https://myorg.atlassian.net
 key: PROJ-1234
-summary: "Migrate ingestion pipeline to streaming-Zipformer ASR"
+summary: "Add diff/patch coverage analysis for PR comments"
 status: In Progress
 issue_type: Story
 assignee: Alice Smith
 priority: High
 labels:
-  - voice
-  - asr
-  - streaming
+  - coverage
+  - ci
+  - tooling
 ---
 
 # Overview
 
-The ingestion service currently buffers audio for &gt;=&nbsp;30&nbsp;s before
-calling Whisper in batch mode. This issue tracks the migration to a
-streaming model — see :mention[Alice]{id=712020:abc} for the design.
+The PR coverage comment reports whole-project coverage on every PR,
+which hides whether the *changed* lines are tested. This issue tracks
+adding patch-coverage attribution — see :mention[Alice]{id=712020:abc} for the design.
 
 Status today: :status[Implementation]{color=blue}, target ship
 :date[2026-06-30]{timestamp=1782777600000}.
 
 :::panel{type=info}
-**Context.** This is the third attempt at streaming. Read the
+**Context.** This is the third attempt at patch attribution. Read the
 :card[https://myorg.atlassian.net/browse/PROJ-1100]{localId=card-1} retrospective before
 proposing new architecture changes.
 :::
 
 :::panel{type=warning}
-**Heads up.** The 5&nbsp;min monologue fixture under
-`tests/fixtures/voice/monologue_5min.wav` is licensed CC0 but is
+**Heads up.** The 12k-line lcov fixture under
+`tests/fixtures/coverage/big_project.lcov` is licensed CC0 but is
 2&nbsp;MB — do **not** add more like it without a justification.
 :::
 
@@ -397,56 +397,56 @@ proposing new architecture changes.
 :::column{width=66.66}
 ### Requirements
 
-- First :status[Partial]{color=yellow} event within
-  :span[300&nbsp;ms]{color=#cf222e} of audio start.
-- Final transcript Word Error Rate &le; 7&nbsp;% on
-  CHiME-6&nbsp;eval set.
+- First :status[Partial]{color=yellow} patch-coverage number within
+  :span[300&nbsp;ms]{color=#cf222e} of report parse.
+- Uncovered-new-line list exact against the diff, to within
+  &le;&nbsp;1&nbsp;line on the reference report set.
 - Memory ceiling: 512&nbsp;MB resident on the i7-1185G7&nbsp;reference
   laptop.
 :::
 :::column{width=33.33}
 ### Non-goals
 
-- Diarization (deferred to PROJ-1500).
-- On-device fine-tuning.
-- Languages other than en-US&nbsp;/&nbsp;zh-CN at v1.
+- Branch coverage (line coverage only; deferred to PROJ-1500).
+- Mutation testing.
+- Report formats other than lcov&nbsp;/&nbsp;llvm-cov&nbsp;JSON&nbsp;/&nbsp;Cobertura at v1.
 :::
 ::::
 
 ## Decisions
 
 :::decisions
-- &lt;&gt; Use `candle` as the production runtime (ADR-0033).
-- &lt;&gt; Defer streaming-native Zipformer until measured latency on
-  candle&nbsp;+ LocalAgreement-2 is demonstrated insufficient.
-- &lt;&gt; Keep RMS-based endpoint detection for the candle path.
+- &lt;&gt; Use line coverage only; ignore branch data (PR&nbsp;#952).
+- &lt;&gt; Default `DiffScope` to `DiffOnly` so run-to-run variance on
+  untouched files does not surface as phantom deltas (PR&nbsp;#973).
+- &lt;&gt; Auto-detect the report format from file contents.
 :::
 
 ## Open tasks
 
-- [x] Pin the candle revision to a tagged release.
-- [x] Verify the trait shape against :card[https://github.com/rust-works/omni-dev/issues/807]{localId=task-card}.
-- [ ] Land the `FileAsyncAudioInput` harness — see expander below.
-- [ ] Snapshot the boundary-artifact test.
+- [x] Pin the lcov grammar to the documented subset.
+- [x] Verify the metric shape against :card[https://github.com/rust-works/omni-dev/issues/949]{localId=task-card}.
+- [ ] Land the `CoberturaReport` parser — see expander below.
+- [ ] Snapshot the markdown-renderer output.
 
 ## Implementation detail (collapsed)
 
-:::expand{title="LocalAgreement-2 pseudocode (click to expand)" localId=exp-pseudo}
-The merger keeps two recent hypotheses and emits the longest common
-prefix as a `Final { revisable: true }` event.
+:::expand{title="Patch-attribution pseudocode (click to expand)" localId=exp-pseudo}
+The analyzer intersects the diff&apos;s added lines with the report&apos;s
+covered lines and emits a `PatchCoverage { covered, total }` summary.
 
 ```rust
 state:
-  window:        VecDeque&lt;i16&gt;     // sliding audio, max 30 s
-  hyp_prev:      Vec&lt;Word&gt;
-  hyp_cur:       Vec&lt;Word&gt;
-  committed_end: Duration
+  added:      BTreeSet&lt;(PathBuf, u32)&gt;   // new lines from the diff
+  covered:    BTreeSet&lt;(PathBuf, u32)&gt;   // hit lines from the report
+  uncovered:  Vec&lt;(PathBuf, u32)&gt;        // added ∧ ¬covered
+  patch_pct:  f64
 ```
 
-:::nested-expand{title="Why revisable: true?"}
-A later merger step may **extend** the committed text — the next two
-hypotheses can agree on more words. Downstream consumers see the
-prefix grow, never contract.
+:::nested-expand{title="Why a BTreeSet?"}
+Deterministic ordering so the uncovered-line list and the rendered
+snapshots stay stable across runs — set iteration order can otherwise
+churn the comment on every CI run.
 :::
 :::
 
@@ -466,35 +466,36 @@ Mitigation
 :::
 :::tr
 :::td{border-color=#091e42 border-size=2}
-**Hallucinated tail** past the 30&nbsp;s window — Whisper drifts on
-long-form audio.
+**Phantom per-file deltas** from run-to-run coverage variance on files
+the PR never touched.
 :::
 :::td
 :status[High]{color=red}
 :::
 :::td
-:::nested-expand{title="Endpoint forcing strategy"}
-On 1.5&nbsp;s of consecutive RMS&nbsp;&lt;&nbsp;&minus;40&nbsp;dBFS,
-flush the tail as `Final { revisable: true }` and emit `Endpoint
-{ kind: SilenceGap }`. Reset the window&nbsp;+&nbsp;hypotheses.
+:::nested-expand{title="DiffScope=DiffOnly strategy"}
+Default the project-delta and indirect-change sections to files the
+diff touches. Surface real cross-file effects only via a
+magnitude-gated note (&ge;&nbsp;10 net covered lines). `--all-files`
+restores the noisier report.
 :::
 :::
 :::
 :::tr
 :::td
-Word-timestamp drift between merger steps.
+Baseline lcov missing at the merge-base (cold start / expired artifact).
 :::
 :::td
 :status[Medium]{color=yellow}
 :::
 :::td
-Anchor `committed_end_ts` to the **last** word end of the prior
-common-prefix, never the current step.
+Recompute coverage at the merge-base in a worktree, rewriting absolute
+`SF` paths to the workspace prefix so both reports strip one prefix.
 :::
 :::
 :::tr
 :::td{colspan=3}
-**Cross-cutting:** memory growth from un-trimmed window — see
+**Cross-cutting:** huge reports blow the parse budget — see
 [the design](https://example.com/design){annotation-id=anno-7 annotation-type=inlineComment}.
 :::
 :::
@@ -503,11 +504,11 @@ common-prefix, never the current step.
 ## Inline rich content
 
 H<sub>2</sub>O is water; E&nbsp;=&nbsp;mc<sup>2</sup>. The candidate
-:span[merger algorithm]{bg=#fff8c5} is named after :emoji{shortName=:dolphin: text="🐬"} —
+:span[attribution algorithm]{bg=#fff8c5} is named after :emoji{shortName=:dolphin: text="🐬"} —
 no idea why.
 
-This paragraph contains :placeholder[fill in latency number once
-measured] and a :card[https://github.com/rust-works/omni-dev/issues/806]{localId=card-806}.
+This paragraph contains :placeholder[fill in parse time once
+measured] and a :card[https://github.com/rust-works/omni-dev/issues/952]{localId=card-952}.
 
 [This sentence carries an inline comment thread.]{annotation-id=anno-3 annotation-type=inlineComment}
 
@@ -526,18 +527,18 @@ omni-dev preserves these byte-for-byte across read/write.
 
       <div class="preview">
         <div class="preview-label">PROJ-1234 — preview</div>
-        <h3 style="margin-top:0">Migrate ingestion pipeline to streaming-Zipformer ASR</h3>
+        <h3 style="margin-top:0">Add diff/patch coverage analysis for PR comments</h3>
         <p><span class="status-badge status-blue">Implementation</span> &nbsp; target ship <span class="date-pill">2026-06-30</span></p>
 
         <div class="panel panel-info">
           <div class="panel-title">ℹ️ Context</div>
-          This is the third attempt at streaming. Read the
+          This is the third attempt at patch attribution. Read the
           <span class="inline-card">PROJ-1100</span> retrospective before proposing new architecture changes.
         </div>
 
         <div class="panel panel-warn">
           <div class="panel-title">⚠️ Heads up</div>
-          The 5&nbsp;min monologue fixture under <code>tests/fixtures/voice/monologue_5min.wav</code>
+          The 12k-line lcov fixture under <code>tests/fixtures/coverage/big_project.lcov</code>
           is licensed CC0 but is 2&nbsp;MB — do <strong>not</strong> add more like it without a justification.
         </div>
 
@@ -545,48 +546,48 @@ omni-dev preserves these byte-for-byte across read/write.
           <div class="column">
             <strong>Requirements</strong>
             <ul>
-              <li>First <span class="status-badge status-yellow">Partial</span> event within
-                <span style="color:#cf222e">300&nbsp;ms</span> of audio start.</li>
-              <li>Final transcript WER ≤ 7% on CHiME-6 eval.</li>
+              <li>First <span class="status-badge status-yellow">Partial</span> patch-coverage number within
+                <span style="color:#cf222e">300&nbsp;ms</span> of report parse.</li>
+              <li>Uncovered-new-line list exact against the diff (≤ 1 line).</li>
               <li>Memory ceiling: 512&nbsp;MB resident.</li>
             </ul>
           </div>
           <div class="column">
             <strong>Non-goals</strong>
             <ul>
-              <li>Diarization (deferred to PROJ-1500).</li>
-              <li>On-device fine-tuning.</li>
-              <li>Languages other than en-US / zh-CN at v1.</li>
+              <li>Branch coverage (deferred to PROJ-1500).</li>
+              <li>Mutation testing.</li>
+              <li>Formats beyond lcov / llvm-cov / Cobertura at v1.</li>
             </ul>
           </div>
         </div>
 
         <strong>Decisions</strong>
         <ul class="decisions">
-          <li>Use <code>candle</code> as the production runtime (ADR-0033).</li>
-          <li>Defer streaming-native Zipformer until measured latency on candle + LocalAgreement-2 is demonstrated insufficient.</li>
-          <li>Keep RMS-based endpoint detection for the candle path.</li>
+          <li>Use line coverage only; ignore branch data (PR #952).</li>
+          <li>Default <code>DiffScope</code> to <code>DiffOnly</code> so variance on untouched files isn't a phantom delta (PR #973).</li>
+          <li>Auto-detect the report format from file contents.</li>
         </ul>
 
         <strong>Open tasks</strong>
         <ul class="tasks">
-          <li><input type="checkbox" checked disabled> Pin the candle revision to a tagged release.</li>
-          <li><input type="checkbox" checked disabled> Verify the trait shape against <span class="inline-card">#807</span>.</li>
-          <li><input type="checkbox" disabled> Land the <code>FileAsyncAudioInput</code> harness.</li>
-          <li><input type="checkbox" disabled> Snapshot the boundary-artifact test.</li>
+          <li><input type="checkbox" checked disabled> Pin the lcov grammar to the documented subset.</li>
+          <li><input type="checkbox" checked disabled> Verify the metric shape against <span class="inline-card">#949</span>.</li>
+          <li><input type="checkbox" disabled> Land the <code>CoberturaReport</code> parser.</li>
+          <li><input type="checkbox" disabled> Snapshot the markdown-renderer output.</li>
         </ul>
 
         <details class="expand">
-          <summary>LocalAgreement-2 pseudocode (click to expand)</summary>
-          <p>The merger keeps two recent hypotheses and emits the longest common prefix as a <code>Final { revisable: true }</code> event.</p>
+          <summary>Patch-attribution pseudocode (click to expand)</summary>
+          <p>The analyzer intersects the diff's added lines with the report's covered lines and emits a <code>PatchCoverage { covered, total }</code> summary.</p>
           <pre>state:
-  window:        VecDeque&lt;i16&gt;
-  hyp_prev:      Vec&lt;Word&gt;
-  hyp_cur:       Vec&lt;Word&gt;
-  committed_end: Duration</pre>
+  added:      BTreeSet&lt;(PathBuf, u32)&gt;
+  covered:    BTreeSet&lt;(PathBuf, u32)&gt;
+  uncovered:  Vec&lt;(PathBuf, u32)&gt;
+  patch_pct:  f64</pre>
           <details class="expand nested-expand">
-            <summary>Why revisable: true?</summary>
-            A later merger step may <strong>extend</strong> the committed text — the next two hypotheses can agree on more words. Downstream consumers see the prefix grow, never contract.
+            <summary>Why a BTreeSet?</summary>
+            Deterministic ordering so the uncovered-line list and the rendered snapshots stay stable across runs — set iteration order would otherwise churn the comment on every CI run.
           </details>
         </details>
 
@@ -596,29 +597,29 @@ omni-dev preserves these byte-for-byte across read/write.
           </thead>
           <tbody>
             <tr>
-              <td class="cell-bordered"><strong>Hallucinated tail</strong> past the 30&nbsp;s window — Whisper drifts on long-form audio.</td>
+              <td class="cell-bordered"><strong>Phantom per-file deltas</strong> from run-to-run coverage variance on untouched files.</td>
               <td><span class="status-badge status-red">High</span></td>
               <td>
                 <details class="expand nested-expand">
-                  <summary>Endpoint forcing strategy</summary>
-                  On 1.5&nbsp;s of consecutive RMS &lt; &minus;40&nbsp;dBFS, flush the tail as <code>Final { revisable: true }</code> and emit <code>Endpoint { kind: SilenceGap }</code>. Reset the window + hypotheses.
+                  <summary>DiffScope=DiffOnly strategy</summary>
+                  Default the project-delta and indirect-change sections to files the diff touches. Surface real cross-file effects only via a magnitude-gated note (≥ 10 net covered lines). <code>--all-files</code> restores the noisier report.
                 </details>
               </td>
             </tr>
             <tr>
-              <td>Word-timestamp drift between merger steps.</td>
+              <td>Baseline lcov missing at the merge-base (cold start / expired artifact).</td>
               <td><span class="status-badge status-yellow">Medium</span></td>
-              <td>Anchor <code>committed_end_ts</code> to the <strong>last</strong> word end of the prior common-prefix, never the current step.</td>
+              <td>Recompute coverage at the merge-base in a worktree, rewriting absolute <code>SF</code> paths to the workspace prefix.</td>
             </tr>
             <tr>
-              <td colspan="3"><strong>Cross-cutting:</strong> memory growth from un-trimmed window — see <span class="annotation" title="Inline comment thread">the design</span>.</td>
+              <td colspan="3"><strong>Cross-cutting:</strong> huge reports blow the parse budget — see <span class="annotation" title="Inline comment thread">the design</span>.</td>
             </tr>
           </tbody>
         </table>
 
-        <p>H<sub>2</sub>O is water; E&nbsp;=&nbsp;mc<sup>2</sup>. The candidate <span style="background:#fff8c5">merger algorithm</span> is named after 🐬 — no idea why.</p>
+        <p>H<sub>2</sub>O is water; E&nbsp;=&nbsp;mc<sup>2</sup>. The candidate <span style="background:#fff8c5">attribution algorithm</span> is named after 🐬 — no idea why.</p>
 
-        <p>This paragraph contains <em style="color:#57606a">[fill in latency number once measured]</em> and a <span class="inline-card">#806</span>.</p>
+        <p>This paragraph contains <em style="color:#57606a">[fill in parse time once measured]</em> and a <span class="inline-card">#952</span>.</p>
 
         <p><span class="annotation" title="Inline comment thread anno-3">This sentence carries an inline comment thread.</span></p>
       </div>
@@ -691,17 +692,17 @@ omni-dev atlassian confluence write page.md              # push</pre>
 type: confluence
 instance: https://myorg.atlassian.net
 page_id: "98765432"
-title: "Voice Capture — Architecture Brief"
+title: "Coverage Diff — Architecture Brief"
 space_key: ENG
 status: current
 version: 14
 parent_id: "12345"
 ---
 
-# Voice Capture — Architecture Brief
+# Coverage Diff — Architecture Brief
 {align=center}
 
-::card[https://github.com/rust-works/omni-dev/issues/799]
+::card[https://github.com/rust-works/omni-dev/issues/949]
 ::embed[https://www.youtube.com/watch?v=dQw4w9WgXcQ]{width=480}
 
 :::panel{type=info}
@@ -713,37 +714,38 @@ parent_id: "12345"
 ## Executive summary
 {indent=1}
 
-We propose a three-stage voice-capture pipeline: capture &rarr;
-endpointing &rarr; ASR. Stage 1 is shipped; stage 2 lands in
+We propose a three-stage coverage-diff pipeline: parse &rarr;
+diff &rarr; attribute. Stage 1 is shipped; stage 2 lands in
 :status[Q2]{color=purple}; stage 3 begins :status[Q3]{color=neutral}.
 
-[The latency budget is the load-bearing constraint.]{annotation-id=ann-budget annotation-type=inlineComment}
+[The patch-coverage figure is the load-bearing number.]{annotation-id=ann-budget annotation-type=inlineComment}
 
 ## Three-column layout: stages of the pipeline
 
 ::::layout
 :::column{width=33.33}
-### 1. Capture
-:emoji{shortName=:microphone: text="🎙️"}
+### 1. Parse
+:emoji{shortName=:inbox_tray: text="📥"}
 
-- 16&nbsp;kHz mono i16
-- 100&nbsp;ms chunks
-- `cpal` backend (see #807)
+- lcov / llvm-cov JSON / Cobertura
+- line hits per file
+- format auto-detect (see #949)
 :::
 :::column{width=33.33}
-### 2. Endpoint
-:emoji{shortName=:zzz: text="💤"}
+### 2. Diff
+:emoji{shortName=:twisted_rightwards_arrows: text="🔀"}
 
-- 1.5&nbsp;s RMS&nbsp;&lt;&nbsp;&minus;40&nbsp;dBFS &rarr; `SilenceGap`
-- VAD-based path deferred
+- `git diff` base&nbsp;&rarr;&nbsp;head
+- added / changed lines only
+- rename-aware path mapping
 :::
 :::column{width=33.34}
-### 3. ASR
-:emoji{shortName=:brain: text="🧠"}
+### 3. Attribute
+:emoji{shortName=:bar_chart: text="📊"}
 
-- `candle` (default)
-- `tract-onnx` (streaming spike)
-- LocalAgreement-2 merger
+- patch coverage %
+- per-file project deltas
+- indirect coverage flips
 :::
 ::::
 
@@ -751,8 +753,8 @@ endpointing &rarr; ASR. Stage 1 is shipped; stage 2 lands in
 
 ![Pipeline overview](){type=file id=acab1234-5678-90ab-cdef-1122334455 collection=contentId-98765432 width=720 height=320}
 :::caption{localId=cap-diagram-1}
-Stage boundaries map 1:1 to crates in `src/voice/`. The dashed arrows
-show the streaming path; solid arrows show the batch fallback.
+Stage boundaries map 1:1 to the parse / diff / attribute modules. The
+dashed arrows show the baseline path; solid arrows show the head path.
 :::
 
 The inline-media variant
@@ -762,20 +764,20 @@ appears mid-sentence — handy for screenshots referenced inline.
 ## Decision log
 
 :::decisions
-- &lt;&gt; **Runtime = candle** (ADR-0033, 2026-05-14). Drives all downstream
-  decisions on this page.
-- &lt;&gt; **Endpoint heuristic = silence-gap RMS.** Re-evaluate when
-  Silero VAD on `tract-onnx` is benchmarked.
-- &lt;&gt; **No diarization in v1.** Deferred to PROJ-1500.
+- &lt;&gt; **Line coverage only; branch data ignored** (PR&nbsp;#952). Drives all
+  downstream decisions on this page.
+- &lt;&gt; **DiffScope = DiffOnly by default.** Re-evaluate when cross-file
+  effects need surfacing past the magnitude gate.
+- &lt;&gt; **No mutation testing in v1.** Deferred to PROJ-1500.
 :::
 
 ## Open work
 
-- [x] Land batch whisper-rs backend (#801).
-- [x] Land sherpa-onnx batch wrapper (#805).
-- [ ] Land streaming ASR (this issue, #806).
-- [ ] Wire `cpal` realtime input (#807).
-- [ ] Reflection-trigger heuristic.
+- [x] Land the lcov parser (#949).
+- [x] Land the llvm-cov JSON parser (#952).
+- [ ] Land the Cobertura parser (this page, #964).
+- [ ] Wire the markdown renderer into the PR comment (#948).
+- [ ] Make the coverage tests deterministic (#966).
 
 ## Two-column: configuration knobs vs. defaults
 
@@ -784,25 +786,25 @@ appears mid-sentence — handy for screenshots referenced inline.
 ### Knobs
 | Knob | Type |
 | --- | --- |
-| `chunk_ms` | u32 |
-| `window_max_s` | u32 |
-| `rms_threshold_dbfs` | f32 |
-| `silence_gap_ms` | u32 |
-| `backend` | enum |
+| `base_ref` | String |
+| `head_ref` | String |
+| `diff_scope` | enum |
+| `format` | enum |
+| `gate_pct` | f64 |
 :::
 :::column{width=50}
 ### Defaults
 | Knob | Default |
 | --- | --- |
-| `chunk_ms` | 100 |
-| `window_max_s` | 30 |
-| `rms_threshold_dbfs` | -40.0 |
-| `silence_gap_ms` | 1500 |
-| `backend` | `candle` |
+| `base_ref` | merge-base |
+| `head_ref` | HEAD |
+| `diff_scope` | `DiffOnly` |
+| `format` | `markdown` |
+| `gate_pct` | (none) |
 :::
 ::::
 
-## Latency table (directive table — captures hard breaks, colspan, nested-expand)
+## Runtime budget table (directive table — captures hard breaks, colspan, nested-expand)
 
 ::::table{layout=wide isNumberColumnEnabled=true}
 :::tr
@@ -816,27 +818,27 @@ Target p50
 Target p95
 :::
 :::th
-Measured (CHiME-6)
+Measured (this repo)
 :::
 :::
 :::tr
 :::td
-Capture &rarr; first sample on bus
+Parse report (12k&nbsp;lines)
 :::
 :::td
-&lt;&nbsp;5&nbsp;ms
+&lt;&nbsp;50&nbsp;ms
 :::
 :::td
-&lt;&nbsp;15&nbsp;ms
+&lt;&nbsp;120&nbsp;ms
 :::
 :::td
-:status[3.1&nbsp;ms]{color=green}\
-:status[9.8&nbsp;ms]{color=green}
+:status[31&nbsp;ms]{color=green}\
+:status[98&nbsp;ms]{color=green}
 :::
 :::
 :::tr
 :::td
-Endpoint detection
+Compute diff
 :::
 :::td
 &lt;&nbsp;20&nbsp;ms
@@ -851,7 +853,7 @@ Endpoint detection
 :::
 :::tr
 :::td{border-color=#cf222e border-size=2}
-**First Partial transcript** :emoji{shortName=:warning: text="⚠️"}
+**Full PR comment** :emoji{shortName=:warning: text="⚠️"}
 :::
 :::td
 &lt;&nbsp;300&nbsp;ms
@@ -866,12 +868,13 @@ Endpoint detection
 :::
 :::tr
 :::td{colspan=4}
-:::nested-expand{title="Why is first-Partial latency over budget?"}
-The 2&nbsp;s warm-up window dominates. Options:
+:::nested-expand{title="Why is the full comment over budget?"}
+The merge-base baseline recompute dominates when the artifact is
+missing. Options:
 
-1. Lower the warm-up to 1&nbsp;s and accept a higher revision rate.
-2. Switch to streaming-native Zipformer (`tract-onnx` spike).
-3. Pipeline parallelism: kick off the first inference after 500&nbsp;ms.
+1. Cache the baseline lcov as a CI artifact keyed on the merge-base.
+2. Skip indirect-change detection when no baseline is available.
+3. Run parse and diff concurrently.
 
 Owner: :mention[Alice Smith]{id=712020:abc}. Due
 :date[2026-06-01]{timestamp=1780617600000}.
@@ -883,22 +886,23 @@ Owner: :mention[Alice Smith]{id=712020:abc}. Due
 ## Expander with nested expander
 
 :::expand{title="API surface (click to expand)" localId=exp-api}
-The streaming trait is the only thing downstream consumers need to
+The report trait is the only thing downstream consumers need to
 import.
 
 ```rust
-pub trait StreamingTranscriber: Send + Sync {
-    fn transcribe_stream(
+pub trait CoverageReport {
+    fn line_hits(
         &amp;self,
-        audio: Box&lt;dyn AsyncAudioInput&gt;,
-    ) -&gt; Pin&lt;Box&lt;dyn Stream&lt;Item = Result&lt;TranscriptEvent&gt;&gt; + Send&gt;&gt;;
+        file: &Path,
+    ) -&gt; Option&lt;&LineHits&gt;;
+    fn files(&self) -&gt; Box&lt;dyn Iterator&lt;Item = &Path&gt; + '_&gt;;
 }
 ```
 
-:::nested-expand{title="TranscriptEvent variants"}
-- `Partial { text, ts }` — emitted continuously, may change.
-- `Final { text, start, end, revisable }` — committed prefix.
-- `Endpoint { kind: SilenceGap | UserStop | ModelHint }` — segment boundary.
+:::nested-expand{title="CoverageReport variants"}
+- `Lcov` — parsed from `.lcov` / `.info` (`SF`/`DA` records).
+- `LlvmCovJson` — llvm-cov `export` JSON.
+- `Cobertura` — Cobertura XML (line coverage; branch data ignored).
 :::
 :::
 
@@ -933,9 +937,9 @@ line three.
 
       <div class="preview">
         <div class="preview-label">page 98765432 — preview</div>
-        <h3 style="text-align:center; margin-top:0">Voice Capture — Architecture Brief</h3>
+        <h3 style="text-align:center; margin-top:0">Coverage Diff — Architecture Brief</h3>
         <p>
-          <span class="inline-card">#799 — Voice umbrella issue</span>
+          <span class="inline-card">#949 — Coverage-diff issue</span>
           &nbsp;<span class="inline-card">YouTube embed</span>
         </p>
         <div class="panel panel-info">
@@ -944,45 +948,45 @@ line three.
           <span class="date-pill">2026-05-20</span>
         </div>
         <p style="margin-left: 16px">
-          We propose a three-stage voice-capture pipeline: capture → endpointing → ASR.
+          We propose a three-stage coverage-diff pipeline: parse → diff → attribute.
           Stage 1 is shipped; stage 2 lands in <span class="status-badge" style="background:#fbefff;color:#8250df">Q2</span>;
           stage 3 begins <span class="status-badge status-grey">Q3</span>.
         </p>
-        <p style="margin-left: 16px"><span class="annotation" title="Inline comment thread ann-budget">The latency budget is the load-bearing constraint.</span></p>
+        <p style="margin-left: 16px"><span class="annotation" title="Inline comment thread ann-budget">The patch-coverage figure is the load-bearing number.</span></p>
 
         <div class="layout layout-3col">
-          <div class="column"><strong>1. Capture 🎙️</strong><ul><li>16 kHz mono i16</li><li>100 ms chunks</li><li><code>cpal</code> backend (#807)</li></ul></div>
-          <div class="column"><strong>2. Endpoint 💤</strong><ul><li>1.5 s RMS &lt; −40 dBFS → <code>SilenceGap</code></li><li>VAD path deferred</li></ul></div>
-          <div class="column"><strong>3. ASR 🧠</strong><ul><li><code>candle</code> (default)</li><li><code>tract-onnx</code> (spike)</li><li>LocalAgreement-2</li></ul></div>
+          <div class="column"><strong>1. Parse 📥</strong><ul><li>lcov / llvm-cov / Cobertura</li><li>line hits per file</li><li>format auto-detect (#949)</li></ul></div>
+          <div class="column"><strong>2. Diff 🔀</strong><ul><li><code>git diff</code> base → head</li><li>added / changed lines</li><li>rename-aware</li></ul></div>
+          <div class="column"><strong>3. Attribute 📊</strong><ul><li>patch coverage %</li><li>per-file deltas</li><li>indirect flips</li></ul></div>
         </div>
 
         <figure style="margin:16px 0; border:1px dashed var(--border); padding:24px; text-align:center; background:#fcfcfc">
           <span class="muted">[ pipeline-overview.png ]</span>
-          <figcaption class="muted" style="margin-top:8px; font-size: 13px">Stage boundaries map 1:1 to crates in <code>src/voice/</code>. Dashed = streaming, solid = batch.</figcaption>
+          <figcaption class="muted" style="margin-top:8px; font-size: 13px">Stage boundaries map 1:1 to the parse / diff / attribute modules. Dashed = baseline, solid = head.</figcaption>
         </figure>
 
         <strong>Decision log</strong>
         <ul class="decisions">
-          <li><strong>Runtime = candle</strong> (ADR-0033, 2026-05-14).</li>
-          <li><strong>Endpoint heuristic = silence-gap RMS.</strong></li>
-          <li><strong>No diarization in v1.</strong></li>
+          <li><strong>Line coverage only; branch data ignored</strong> (PR #952).</li>
+          <li><strong>DiffScope = DiffOnly by default.</strong></li>
+          <li><strong>No mutation testing in v1.</strong></li>
         </ul>
 
-        <strong>Latency table</strong>
+        <strong>Runtime budget table</strong>
         <table>
-          <thead><tr><th>#</th><th>Stage</th><th>Target p50</th><th>Target p95</th><th>Measured (CHiME-6)</th></tr></thead>
+          <thead><tr><th>#</th><th>Stage</th><th>Target p50</th><th>Target p95</th><th>Measured (this repo)</th></tr></thead>
           <tbody>
-            <tr><td>1</td><td>Capture → first sample on bus</td><td>&lt; 5 ms</td><td>&lt; 15 ms</td><td><span class="status-badge status-green">3.1 ms</span><br><span class="status-badge status-green">9.8 ms</span></td></tr>
-            <tr><td>2</td><td>Endpoint detection</td><td>&lt; 20 ms</td><td>&lt; 80 ms</td><td><span class="status-badge status-green">12 ms</span><br><span class="status-badge status-green">54 ms</span></td></tr>
-            <tr><td>3</td><td class="cell-bordered"><strong>First Partial transcript</strong> ⚠️</td><td>&lt; 300 ms</td><td>&lt; 600 ms</td><td><span class="status-badge status-red">412 ms</span><br><span class="status-badge status-red">890 ms</span></td></tr>
+            <tr><td>1</td><td>Parse report (12k lines)</td><td>&lt; 50 ms</td><td>&lt; 120 ms</td><td><span class="status-badge status-green">31 ms</span><br><span class="status-badge status-green">98 ms</span></td></tr>
+            <tr><td>2</td><td>Compute diff</td><td>&lt; 20 ms</td><td>&lt; 80 ms</td><td><span class="status-badge status-green">12 ms</span><br><span class="status-badge status-green">54 ms</span></td></tr>
+            <tr><td>3</td><td class="cell-bordered"><strong>Full PR comment</strong> ⚠️</td><td>&lt; 300 ms</td><td>&lt; 600 ms</td><td><span class="status-badge status-red">412 ms</span><br><span class="status-badge status-red">890 ms</span></td></tr>
             <tr><td colspan="5">
               <details class="expand nested-expand">
-                <summary>Why is first-Partial latency over budget?</summary>
-                <p>The 2 s warm-up window dominates. Options:</p>
+                <summary>Why is the full comment over budget?</summary>
+                <p>The merge-base baseline recompute dominates when the artifact is missing. Options:</p>
                 <ol>
-                  <li>Lower the warm-up to 1 s and accept higher revision rate.</li>
-                  <li>Switch to streaming-native Zipformer (<code>tract-onnx</code> spike).</li>
-                  <li>Pipeline parallelism: kick off the first inference after 500 ms.</li>
+                  <li>Cache the baseline lcov as a CI artifact keyed on the merge-base.</li>
+                  <li>Skip indirect-change detection when no baseline is available.</li>
+                  <li>Run parse and diff concurrently.</li>
                 </ol>
                 <p>Owner: <span class="mention">@Alice Smith</span>. Due <span class="date-pill">2026-06-01</span>.</p>
               </details>
@@ -1035,9 +1039,9 @@ line three.
 
       <div class="step">
         <span class="step-num">1</span><strong>Land your commits</strong> on a feature branch.
-        <pre>git checkout -b feature/streaming-asr
+        <pre>git checkout -b feature/coverage-diff
 # ... commits ...
-git push -u origin feature/streaming-asr</pre>
+git push -u origin feature/coverage-diff</pre>
       </div>
 
       <div class="step">
@@ -1080,9 +1084,9 @@ git push -u origin feature/streaming-asr</pre>
       <h3>End-to-end example</h3>
 
       <pre>$ git log --oneline main..HEAD
-c5449c9 feat(voice): land streaming-ASR trait surface
-841187f feat(voice): LocalAgreement-2 merger
-728ce74 test(voice): 5-min monologue fixture
+c5449c9 feat(coverage): land patch-coverage attribution
+841187f feat(coverage): lcov + llvm-cov JSON parsers
+728ce74 test(coverage): Cobertura fixture
 
 $ omni-dev git branch create pr --draft
 
@@ -1091,17 +1095,17 @@ $ omni-dev git branch create pr --draft
   → calling claude (≈ $0.02)…
 
 PROPOSED TITLE
-  feat(voice): streaming ASR — trait + LocalAgreement-2 merger
+  feat(coverage): diff/patch coverage analysis — parsers + attribution
 
 PROPOSED BODY (excerpt)
   ## Summary
-  - Add StreamingTranscriber trait and AsyncAudioInput boundary
-  - Implement LocalAgreement-2 sliding-window merger for whisper backend
-  - Land 5-min monologue fixture for boundary-artifact snapshot tests
+  - Add CoverageReport trait with lcov and llvm-cov JSON parsers
+  - Compute patch coverage and the uncovered-new-line list from the diff
+  - Render the PR coverage comment via the markdown renderer
   ## Test plan
   - [ ] cargo test --all
   - [ ] cargo insta review
-  - [ ] manual smoke against monologue_5min.wav
+  - [ ] manual smoke against big_project.lcov
 
 Open the PR? [y/N] y
 
@@ -1174,7 +1178,7 @@ Open the PR? [y/N] y
 c5449c9 wip
 841187f more fixes
 728ce74 fix tests
-4d1290d streaming stuff
+4d1290d coverage stuff
 52ba037 initial</pre>
 
       <pre>$ omni-dev git commit message twiddle --range HEAD~5..HEAD
@@ -1184,15 +1188,15 @@ c5449c9 wip
   → calling claude…
 
 PROPOSED REWRITES
-  c5449c9 wip              →  feat(voice): wire StreamingTranscriber into create_default_transcriber
-  841187f more fixes       →  fix(voice): trim sliding window to committed_end_ts to bound memory
-  728ce74 fix tests        →  test(voice): unblock LocalAgreement-2 snapshot on the 5-min fixture
-  4d1290d streaming stuff  →  feat(voice): add LocalAgreement-2 merger skeleton + types
-  52ba037 initial          →  feat(voice): add StreamingTranscriber + AsyncAudioInput traits
+  c5449c9 wip              →  feat(coverage): wire CoverageReport into the diff analyzer
+  841187f more fixes       →  fix(coverage): ignore branch records when computing line hits
+  728ce74 fix tests        →  test(coverage): unblock the markdown-renderer snapshot
+  4d1290d coverage stuff   →  feat(coverage): add patch-attribution skeleton + types
+  52ba037 initial          →  feat(coverage): add CoverageReport trait + lcov parser
 
 Apply rewrite? [y/N] y
 ✓ rewrote 5 commits. Force-push with care:
-  git push --force-with-lease origin issue-806-streaming-asr</pre>
+  git push --force-with-lease origin issue-949-diff-patch-coverage-analysis</pre>
 
       <div class="panel panel-warn">
         <div class="panel-title">⚠️ Rewrites public history</div>
