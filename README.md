@@ -4,6 +4,7 @@
 [![Documentation](https://docs.rs/omni-dev/badge.svg)](https://docs.rs/omni-dev)
 [![Build Status](https://github.com/rust-works/omni-dev/workflows/CI/badge.svg)](https://github.com/rust-works/omni-dev/actions)
 [![License: BSD-3-Clause](https://img.shields.io/badge/License-BSD%203--Clause-blue.svg)](LICENSE)
+[![SafeSkill 30/100](https://img.shields.io/badge/SafeSkill-30%2F100_Blocked-red)](https://safeskill.dev/scan/rust-works-omni-dev)
 
 An intelligent Git commit message toolkit with AI-powered contextual
 intelligence. Transform messy commit histories into professional,
