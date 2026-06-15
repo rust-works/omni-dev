@@ -4,12 +4,12 @@ version = "0.29.0"
 edition = "2021"
 authors = ["John Ky <newhoggy@gmail.com>"]
 license = "BSD-3-Clause"
-description = "A powerful Git commit message analysis and amendment toolkit"
+description = "AI-powered git commit rewriter, PR generator, and MCP server for Jira, Confluence, and Datadog."
 repository = "https://github.com/rust-works/omni-dev"
 homepage = "https://github.com/rust-works/omni-dev"
 documentation = "https://docs.rs/omni-dev"
 readme = "README.md"
-keywords = ["git", "commit", "conventional-commits", "development", "cli"]
+keywords = ["git", "ai", "claude", "mcp", "conventional-commits"]
 categories = ["development-tools", "command-line-utilities"]
 rust-version = "1.80.0"
 # Keep the published crate under crates.io's 10 MiB upload limit by dropping

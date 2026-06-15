@@ -1,19 +1,38 @@
 //! # omni-dev
 //!
-//! A comprehensive development toolkit written in Rust.
+//! AI-powered git commit rewriter, PR generator, and MCP server for Jira,
+//! Confluence, and Datadog.
 //!
-//! ## Features
+//! omni-dev is primarily a command-line tool; this crate also exposes the
+//! library types that power it for programmatic use. See the [`cli`] module
+//! for the command-line surface, and [`mcp`] (feature-gated) for the MCP
+//! server implementation.
 //!
-//! - Fast and efficient development tools
-//! - Extensible architecture
-//! - Memory safe and reliable
+//! ## Highlights
 //!
-//! ## Quick Start
+//! - Analyse and rewrite git commit messages with a configurable AI backend
+//!   (Anthropic API, AWS Bedrock, OpenAI, Ollama, or a local `claude` CLI
+//!   subprocess) — see [`claude`].
+//! - Generate pull-request titles and descriptions from branch history.
+//! - Read, edit, and create Jira issues and Confluence pages via JFM
+//!   (JIRA-Flavoured Markdown) — see [`atlassian`].
+//! - Query Datadog metrics, logs, monitors, and dashboards — see [`datadog`].
+//! - Expose every CLI capability as an MCP server for AI assistants by
+//!   enabling the `mcp` feature.
+//!
+//! ## Installation
+//!
+//! ```text
+//! cargo install omni-dev
+//! omni-dev --help
+//! ```
+//!
+//! ## Library example
 //!
 //! ```rust
-//! use omni_dev::*;
+//! use omni_dev::VERSION;
 //!
-//! println!("Hello from omni-dev!");
+//! println!("omni-dev v{VERSION}");
 //! ```
 
 #![warn(missing_docs)]

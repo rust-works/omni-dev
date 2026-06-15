@@ -42,7 +42,10 @@ pub enum AiBackend {
 /// before dispatching to a [`Commands`] variant.
 #[derive(Parser)]
 #[command(name = "omni-dev")]
-#[command(about = "A comprehensive development toolkit", long_about = None)]
+#[command(
+    about = "AI-powered git commit rewriter, PR generator, and MCP server for Jira, Confluence, and Datadog.",
+    long_about = None
+)]
 #[command(version)]
 pub struct Cli {
     /// Selects the AI backend used by commands that invoke an AI model.
