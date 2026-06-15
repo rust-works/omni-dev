@@ -14,7 +14,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
-use rand::RngCore;
+use rand::Rng;
 
 /// Environment variable an operator may use to pin the session token instead of
 /// letting the bridge generate one. Never read from argv (`ps`/`/proc` expose
