@@ -182,7 +182,7 @@ mod tests {
         let gen = HelpGenerator::new();
         let help = gen.render_command_help(&gen.app, "");
         // The main app help should include the about text
-        assert!(help.contains("comprehensive development toolkit"));
+        assert!(help.contains("AI-powered git commit rewriter"));
     }
 
     #[test]
