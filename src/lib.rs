@@ -5,8 +5,8 @@
 //!
 //! omni-dev is primarily a command-line tool; this crate also exposes the
 //! library types that power it for programmatic use. See the [`cli`] module
-//! for the command-line surface, and [`mcp`] (feature-gated) for the MCP
-//! server implementation.
+//! for the command-line surface, and the `mcp` module (gated on the `mcp`
+//! feature) for the MCP server implementation.
 //!
 //! ## Highlights
 //!
