@@ -2,9 +2,9 @@
 source: tests/integration_test.rs
 expression: help_output
 ---
-omni-dev - A comprehensive development toolkit
+omni-dev - AI-powered git commit rewriter, PR generator, and MCP server for Jira, Confluence, and Datadog.
 
-A comprehensive development toolkit
+AI-powered git commit rewriter, PR generator, and MCP server for Jira, Confluence, and Datadog.
 
 Usage: omni-dev [OPTIONS] <COMMAND>
 

@@ -275,7 +275,7 @@ fn binary_help_flag_succeeds() {
         .expect("failed to run binary");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("comprehensive development toolkit"));
+    assert!(stdout.contains("AI-powered git commit rewriter"));
 }
 
 #[test]
