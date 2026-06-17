@@ -1226,9 +1226,16 @@ async fn cli_request_client_round_trips() {
 #[tokio::test]
 async fn cli_request_client_without_token_errors() {
     let bin = env!("CARGO_BIN_EXE_omni-dev");
+    // Isolate from any real per-user daemon token file (the `request` client
+    // falls back to `<data dir>/omni-dev/bridge.token`). Point HOME/XDG at an
+    // empty temp dir so that fallback finds nothing and we exercise the true
+    // "no token anywhere" path rather than a stray daemon token on the dev box.
+    let home = tempfile::tempdir().unwrap();
     let out = tokio::process::Command::new(bin)
         .args(["browser", "bridge", "request", "--url", "/x"])
         .env_remove("OMNI_BRIDGE_TOKEN")
+        .env("HOME", home.path())
+        .env_remove("XDG_DATA_HOME")
         .output()
         .await
         .unwrap();

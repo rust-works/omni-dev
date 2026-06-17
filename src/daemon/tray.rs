@@ -210,16 +210,22 @@ fn handle_action(
         return;
     };
 
-    if action == "copy-snippet" {
-        match handle.block_on(registry.dispatch(service, "snippet", Value::Null)) {
+    // Clipboard actions: fetch a string field from a service op and copy it.
+    let copy = match action {
+        "copy-key" => Some(("token", "token")),
+        "copy-snippet" => Some(("snippet", "snippet")),
+        _ => None,
+    };
+    if let Some((op, field)) = copy {
+        match handle.block_on(registry.dispatch(service, op, Value::Null)) {
             Ok(value) => {
-                if let Some(text) = value.get("snippet").and_then(Value::as_str) {
+                if let Some(text) = value.get(field).and_then(Value::as_str) {
                     copy_to_clipboard(clipboard, text);
                 } else {
-                    tracing::warn!("snippet op returned no snippet");
+                    tracing::warn!("`{op}` op returned no `{field}`");
                 }
             }
-            Err(e) => tracing::warn!("copy snippet failed: {e}"),
+            Err(e) => tracing::warn!("copy from `{op}` op failed: {e}"),
         }
         return;
     }
