@@ -214,6 +214,7 @@ fn handle_action(
     let copy = match action {
         "copy-key" => Some(("token", "token")),
         "copy-snippet" => Some(("snippet", "snippet")),
+        "copy-request" => Some(("request-command", "command")),
         _ => None,
     };
     if let Some((op, field)) = copy {
