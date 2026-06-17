@@ -45,7 +45,9 @@ use services::bridge::BridgeService;
 /// Everything `daemon run` needs to start the daemon, resolved from the CLI.
 ///
 /// Shared by the headless path ([`run_headless`]) and the macOS menu-bar path
-/// ([`tray::run`]) so both start an identical daemon.
+/// (`tray::run`) so both start an identical daemon. The latter is a plain code
+/// span, not an intra-doc link, because the `tray` module is feature- and
+/// target-gated and absent from the docs build.
 #[derive(Debug, Clone)]
 pub struct DaemonRunConfig {
     /// Control-socket path (also the single-instance lock).
