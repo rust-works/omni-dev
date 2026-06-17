@@ -61,7 +61,7 @@ ureq = "3"
 quick-xml = "0.40.1"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", default-features = false, features = ["signal"] }
+nix = { version = "0.31", default-features = false, features = ["signal", "user"] }
 
 [features]
 mcp = ["dep:rmcp"]

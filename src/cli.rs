@@ -10,6 +10,7 @@ pub mod commands;
 pub mod completions;
 pub mod config;
 pub mod coverage;
+pub mod daemon;
 pub mod datadog;
 pub mod git;
 pub mod help;
@@ -133,6 +134,8 @@ pub enum Commands {
     Atlassian(atlassian::AtlassianCommand),
     /// Browser bridge: drive authenticated requests through a browser tab.
     Browser(browser::BrowserCommand),
+    /// Daemon: host long-lived services (e.g. the browser bridge).
+    Daemon(daemon::DaemonCommand),
     /// Datadog: read-only API operations.
     Datadog(datadog::DatadogCommand),
     /// Coverage: diff/patch coverage analysis for PR comments.
@@ -194,6 +197,7 @@ impl Cli {
             Commands::Commands(commands_cmd) => commands_cmd.execute(),
             Commands::Atlassian(cmd) => cmd.execute().await,
             Commands::Browser(cmd) => cmd.execute().await,
+            Commands::Daemon(cmd) => cmd.execute().await,
             Commands::Datadog(cmd) => cmd.execute().await,
             Commands::Coverage(cmd) => cmd.execute(repo).await,
             Commands::Transcript(cmd) => cmd.execute().await,
