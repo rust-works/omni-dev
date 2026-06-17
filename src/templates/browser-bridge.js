@@ -1,5 +1,11 @@
 (() => {
   const PORT = __OMNI_BRIDGE_PORT__, TOKEN = '__OMNI_BRIDGE_TOKEN__';
+  // Use the `localhost` hostname, not a loopback IP: page CSPs commonly allow
+  // `ws://localhost:*` in connect-src but not `ws://127.0.0.1`. The bridge binds
+  // both 127.0.0.1 and ::1, so this connects whichever way localhost resolves.
+  const ENDPOINT = 'ws://localhost:' + PORT;
+  const log = (...a) => console.log('%c[omni-dev]%c', 'color:#3ddc84;font-weight:bold', '', ...a);
+  const warn = (...a) => console.warn('[omni-dev]', ...a);
   let ws, backoff = 500;
   // Readers of in-flight streamed responses, keyed by command id, so a `cancel`
   // frame from the server can stop one mid-flight.
@@ -22,10 +28,19 @@
     return btoa(bin);
   };
   const connect = () => {
-    ws = new WebSocket('ws://localhost:' + PORT, [TOKEN]);
-    ws.onopen = () => { backoff = 500; console.log('✅ omni-dev bridge connected on ' + PORT); };
-    ws.onclose = () => { setTimeout(connect, backoff = Math.min(backoff * 2, 10000)); };
-    ws.onerror = () => ws.close();
+    log('connecting to ' + ENDPOINT + ' …');
+    ws = new WebSocket(ENDPOINT, [TOKEN]);
+    ws.onopen = () => { backoff = 500; log('connected ✅ — ready for requests'); };
+    ws.onerror = () => {
+      warn('WebSocket error connecting to ' + ENDPOINT + '. Check: the daemon is running'
+        + ' (`omni-dev daemon status`); this page’s Content-Security-Policy `connect-src`'
+        + ' allows it; and (on an https page) mixed-content is not blocking ws://.');
+      ws.close();
+    };
+    ws.onclose = (e) => {
+      warn('disconnected (code ' + e.code + '); retrying in ' + backoff + 'ms');
+      setTimeout(connect, backoff = Math.min(backoff * 2, 10000));
+    };
     ws.onmessage = async (event) => {
       const cmd = JSON.parse(event.data);
       // A cancel frame stops an in-flight streamed response by cancelling its reader.

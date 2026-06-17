@@ -9,7 +9,7 @@
 //! → control plane returns the HTTP response.
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -28,8 +28,10 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use futures::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_util::sync::CancellationToken;
 
 use crate::browser::auth;
 use crate::browser::protocol::{
@@ -37,6 +39,17 @@ use crate::browser::protocol::{
     ResponseEnvelope, StatusResponse, StreamItem, StreamLine, TabInfo,
 };
 use crate::browser::snippet;
+
+/// Default WebSocket-plane port.
+pub const DEFAULT_WS_PORT: u16 = 9999;
+/// Default HTTP control-plane port.
+pub const DEFAULT_CONTROL_PORT: u16 = 9998;
+/// Default per-request timeout, in seconds.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
+/// Default maximum browser response body size (8 MiB).
+pub const DEFAULT_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+/// Default maximum concurrent in-flight requests.
+pub const DEFAULT_MAX_CONCURRENT: usize = 64;
 
 /// Resolved runtime configuration for a bridge instance.
 #[derive(Debug, Clone)]
@@ -53,6 +66,21 @@ pub struct BridgeConfig {
     pub max_body_bytes: usize,
     /// Maximum number of concurrent in-flight requests.
     pub max_concurrent: usize,
+}
+
+impl Default for BridgeConfig {
+    /// The documented default ports and limits, shared by the `serve` CLI and
+    /// the daemon-hosted bridge so the two never drift.
+    fn default() -> Self {
+        Self {
+            ws_port: DEFAULT_WS_PORT,
+            control_port: DEFAULT_CONTROL_PORT,
+            request_timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            allow_origin: None,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            max_concurrent: DEFAULT_MAX_CONCURRENT,
+        }
+    }
 }
 
 /// A registered waiter for a given id: either a buffered one-shot (resolved by a
@@ -161,66 +189,217 @@ struct AppState {
     /// Connected tabs keyed by connection id (the public routing selector). A
     /// new authenticated connection never displaces an existing one — each lives
     /// under its own key — so the non-eviction guarantee holds per-connection.
-    tabs: Arc<Mutex<HashMap<u64, WsConn>>>,
+    ///
+    /// A `std::sync::Mutex` (not tokio's): the guard is never held across an
+    /// `.await`, so a synchronous lock keeps [`AppState::status_snapshot`] and
+    /// [`BridgeServer::disconnect_tab`] non-async — matching [`Correlator`].
+    tabs: Arc<StdMutex<HashMap<u64, WsConn>>>,
     in_flight: Arc<Semaphore>,
     conn_counter: Arc<AtomicU64>,
 }
 
+impl AppState {
+    /// Locks the tab registry, recovering from a poisoned mutex (mirrors
+    /// [`Correlator::lock`]).
+    fn lock_tabs(&self) -> std::sync::MutexGuard<'_, HashMap<u64, WsConn>> {
+        self.tabs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Builds a [`StatusResponse`] snapshot of the connected tabs and pending
+    /// request count. Shared by the `GET /__bridge/status` handler and
+    /// [`BridgeServer::status`] so neither makes an internal HTTP self-call.
+    fn status_snapshot(&self) -> StatusResponse {
+        let mut tabs: Vec<TabInfo> = {
+            let guard = self.lock_tabs();
+            guard
+                .iter()
+                .map(|(id, conn)| TabInfo {
+                    id: *id,
+                    origin: conn.origin.clone(),
+                })
+                .collect()
+        };
+        tabs.sort_by_key(|t| t.id);
+        // `browser_origin` is v1 back-compat: meaningful only when exactly one
+        // tab is connected; ambiguous (so `None`) for zero or several.
+        let browser_origin = match tabs.as_slice() {
+            [only] => only.origin.clone(),
+            _ => None,
+        };
+        StatusResponse {
+            connected: !tabs.is_empty(),
+            browser_origin,
+            tabs,
+            pending: self.correlator.pending_count(),
+        }
+    }
+}
+
+/// A running bridge instance: both loopback-TCP planes bound and serving, with
+/// a [`CancellationToken`] for graceful shutdown.
+///
+/// Created by [`BridgeServer::start`], which returns once the planes are bound
+/// (fail-closed) and the accept loops are spawned. A standalone `serve` calls
+/// [`wait`](Self::wait) (run until Ctrl-C); a supervisor (the daemon) instead
+/// drives [`status`](Self::status) / [`disconnect_tab`](Self::disconnect_tab) /
+/// [`shutdown`](Self::shutdown) directly.
+pub struct BridgeServer {
+    state: AppState,
+    control_port: u16,
+    ws_port: u16,
+    shutdown: CancellationToken,
+    tasks: JoinSet<()>,
+}
+
+impl BridgeServer {
+    /// Binds both planes (fail-closed), spawns the accept loops, and returns
+    /// immediately. `token` is the already-resolved session token (never
+    /// sourced from argv).
+    pub async fn start(mut config: BridgeConfig, token: String) -> Result<Self> {
+        let control_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.control_port))
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to bind control plane to 127.0.0.1:{} (already in use?)",
+                    config.control_port
+                )
+            })?;
+        let ws_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.ws_port))
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to bind WebSocket plane to 127.0.0.1:{} (already in use?)",
+                    config.ws_port
+                )
+            })?;
+
+        // Read back the OS-assigned ports so port-0 (random) is reflected
+        // everywhere: the snippet, the printed instructions, and the Host check.
+        config.control_port = control_listener.local_addr()?.port();
+        config.ws_port = ws_listener.local_addr()?.port();
+        let control_port = config.control_port;
+        let ws_port = config.ws_port;
+        let max_body_bytes = config.max_body_bytes;
+        let max_concurrent = config.max_concurrent;
+
+        // Also accept the WebSocket plane on IPv6 loopback (`::1`) at the same
+        // port, best-effort. A browser connecting to `ws://localhost` may resolve
+        // it to `::1` rather than `127.0.0.1`; binding both means the pasted
+        // snippet connects either way. Still loopback-only — ADR-0036 unchanged.
+        let ws_listener_v6 = TcpListener::bind((Ipv6Addr::LOCALHOST, ws_port)).await.ok();
+
+        let state = AppState {
+            token: Arc::new(token),
+            config: Arc::new(config),
+            correlator: Correlator::new(),
+            tabs: Arc::new(StdMutex::new(HashMap::new())),
+            in_flight: Arc::new(Semaphore::new(max_concurrent)),
+            conn_counter: Arc::new(AtomicU64::new(1)),
+        };
+
+        let shutdown = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+
+        // WebSocket accept loops (cancellable), one per bound loopback address.
+        spawn_ws_accept(&mut tasks, ws_listener, state.clone(), shutdown.clone());
+        if let Some(listener) = ws_listener_v6 {
+            spawn_ws_accept(&mut tasks, listener, state.clone(), shutdown.clone());
+        } else {
+            tracing::debug!("IPv6 loopback (::1) WebSocket bind unavailable; IPv4 only");
+        }
+
+        // Control plane (axum) with graceful shutdown: drains in-flight requests
+        // before the serve future resolves.
+        let control_state = state.clone();
+        let control_shutdown = shutdown.clone();
+        tasks.spawn(async move {
+            let app = control_router(control_state, max_body_bytes);
+            if let Err(e) = axum::serve(control_listener, app)
+                .with_graceful_shutdown(control_shutdown.cancelled_owned())
+                .await
+            {
+                tracing::warn!("Control-plane server error: {e}");
+            }
+        });
+
+        Ok(Self {
+            state,
+            control_port,
+            ws_port,
+            shutdown,
+            tasks,
+        })
+    }
+
+    /// The bound control-plane port (resolved if `0` was requested).
+    pub fn control_port(&self) -> u16 {
+        self.control_port
+    }
+
+    /// The bound WebSocket-plane port (resolved if `0` was requested).
+    pub fn ws_port(&self) -> u16 {
+        self.ws_port
+    }
+
+    /// A synchronous snapshot of connection status (the same payload the
+    /// `GET /__bridge/status` endpoint returns).
+    pub fn status(&self) -> StatusResponse {
+        self.state.status_snapshot()
+    }
+
+    /// Disconnects the tab with the given connection id: sends a WebSocket
+    /// Close and drops it from the registry. Errors if no such tab is connected.
+    pub fn disconnect_tab(&self, id: u64) -> Result<()> {
+        let mut tabs = self.state.lock_tabs();
+        match tabs.remove(&id) {
+            Some(conn) => {
+                let _ = conn.sender.send(Message::Close(None));
+                Ok(())
+            }
+            None => anyhow::bail!("no connected tab with id {id}"),
+        }
+    }
+
+    /// Runs until Ctrl-C, then shuts down gracefully. Used by standalone
+    /// `serve` (a supervisor calls [`shutdown`](Self::shutdown) directly).
+    pub async fn wait(self) -> Result<()> {
+        let _ = tokio::signal::ctrl_c().await;
+        self.shutdown().await;
+        Ok(())
+    }
+
+    /// Cancels the planes and drains spawned tasks (bounded by a timeout, after
+    /// which any stragglers are aborted when the [`JoinSet`] drops).
+    pub async fn shutdown(self) {
+        let Self {
+            mut tasks,
+            shutdown,
+            ..
+        } = self;
+        shutdown.cancel();
+        let drain = async { while tasks.join_next().await.is_some() {} };
+        if tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .is_err()
+        {
+            tracing::warn!("bridge shutdown timed out; remaining tasks will be aborted");
+        }
+    }
+}
+
 /// Binds both planes (fail-closed) and serves until the process is stopped.
 ///
+/// Thin wrapper over [`BridgeServer::start`] + [`BridgeServer::wait`] that also
+/// prints the startup banner — preserved so `omni-dev browser bridge serve` is
+/// behaviourally unchanged.
+///
 /// `token` is the already-resolved session token (never sourced from argv).
-pub async fn run(mut config: BridgeConfig, token: String) -> Result<()> {
-    let control_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.control_port))
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to bind control plane to 127.0.0.1:{} (already in use?)",
-                config.control_port
-            )
-        })?;
-    let ws_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.ws_port))
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to bind WebSocket plane to 127.0.0.1:{} (already in use?)",
-                config.ws_port
-            )
-        })?;
-
-    // Read back the OS-assigned ports so port-0 (random) is reflected
-    // everywhere: the snippet, the printed instructions, and the Host check.
-    config.control_port = control_listener.local_addr()?.port();
-    config.ws_port = ws_listener.local_addr()?.port();
-
-    let token = Arc::new(token);
-    let state = AppState {
-        token: token.clone(),
-        config: Arc::new(config.clone()),
-        correlator: Correlator::new(),
-        tabs: Arc::new(Mutex::new(HashMap::new())),
-        in_flight: Arc::new(Semaphore::new(config.max_concurrent)),
-        conn_counter: Arc::new(AtomicU64::new(1)),
-    };
-
-    print_startup(&config, &token);
-
-    // WebSocket accept loop.
-    let ws_state = state.clone();
-    tokio::spawn(async move {
-        loop {
-            match ws_listener.accept().await {
-                Ok((stream, _peer)) => {
-                    tokio::spawn(handle_ws_conn(stream, ws_state.clone()));
-                }
-                Err(e) => tracing::warn!("WebSocket accept error: {e}"),
-            }
-        }
-    });
-
-    let app = control_router(state, config.max_body_bytes);
-    axum::serve(control_listener, app)
-        .await
-        .context("Control-plane server error")
+pub async fn run(config: BridgeConfig, token: String) -> Result<()> {
+    let server = BridgeServer::start(config, token).await?;
+    print_startup(server.state.config.as_ref(), &server.state.token);
+    server.wait().await
 }
 
 /// Prints the bound ports, session token, and paste-ready snippet to stdout.
@@ -246,6 +425,30 @@ fn print_startup(config: &BridgeConfig, token: &str) {
 }
 
 // ── WebSocket plane ──────────────────────────────────────────────────
+
+/// Spawns a cancellable accept loop for one WebSocket-plane listener; each
+/// accepted connection is handled on its own task. Used once per bound loopback
+/// address (IPv4 and, when available, IPv6) feeding the shared [`AppState`].
+fn spawn_ws_accept(
+    tasks: &mut JoinSet<()>,
+    listener: TcpListener,
+    state: AppState,
+    shutdown: CancellationToken,
+) {
+    tasks.spawn(async move {
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                accepted = listener.accept() => match accepted {
+                    Ok((stream, _peer)) => {
+                        tokio::spawn(handle_ws_conn(stream, state.clone()));
+                    }
+                    Err(e) => tracing::warn!("WebSocket accept error: {e}"),
+                },
+            }
+        }
+    });
+}
 
 /// Handles one inbound TCP connection on the WebSocket plane: authenticates the
 /// upgrade, registers the connection, and pumps replies into the correlator.
@@ -324,10 +527,9 @@ async fn handle_ws_conn(stream: TcpStream, state: AppState) {
     );
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-    {
-        let mut guard = state.tabs.lock().await;
-        guard.insert(conn_id, WsConn { sender: tx, origin });
-    }
+    state
+        .lock_tabs()
+        .insert(conn_id, WsConn { sender: tx, origin });
 
     let (mut sink, mut read) = ws_stream.split();
     let writer = tokio::spawn(async move {
@@ -359,7 +561,7 @@ async fn handle_ws_conn(stream: TcpStream, state: AppState) {
     writer.abort();
     // Drop only this connection's registry entry (keyed by its unique id, so a
     // reconnect under a new id is never clobbered).
-    if state.tabs.lock().await.remove(&conn_id).is_some() {
+    if state.lock_tabs().remove(&conn_id).is_some() {
         tracing::info!("Browser disconnected (conn {conn_id})");
     }
 }
@@ -425,29 +627,7 @@ async fn guard(State(state): State<AppState>, request: Request, next: Next) -> R
 }
 
 async fn status_handler(State(state): State<AppState>) -> Json<StatusResponse> {
-    let mut tabs: Vec<TabInfo> = {
-        let guard = state.tabs.lock().await;
-        guard
-            .iter()
-            .map(|(id, conn)| TabInfo {
-                id: *id,
-                origin: conn.origin.clone(),
-            })
-            .collect()
-    };
-    tabs.sort_by_key(|t| t.id);
-    // `browser_origin` is v1 back-compat: meaningful only when exactly one tab
-    // is connected; ambiguous (so `None`) for zero or several.
-    let browser_origin = match tabs.as_slice() {
-        [only] => only.origin.clone(),
-        _ => None,
-    };
-    Json(StatusResponse {
-        connected: !tabs.is_empty(),
-        browser_origin,
-        tabs,
-        pending: state.correlator.pending_count(),
-    })
+    Json(state.status_snapshot())
 }
 
 /// `POST /__bridge/request` — full-fidelity control endpoint. A `stream: true`
@@ -766,7 +946,7 @@ async fn dispatch(
     };
 
     {
-        let tabs = state.tabs.lock().await;
+        let tabs = state.lock_tabs();
         let (_conn_id, sender) = match resolve_target(&tabs, req.target.as_deref()) {
             Ok(t) => t,
             Err(e) => {
@@ -860,7 +1040,8 @@ async fn send_cancel(state: &AppState, conn_id: u64, id: u64) {
     let Ok(frame) = serde_json::to_string(&CancelCommand::new(id)) else {
         return;
     };
-    if let Some(conn) = state.tabs.lock().await.get(&conn_id) {
+    let tabs = state.lock_tabs();
+    if let Some(conn) = tabs.get(&conn_id) {
         let _ = conn.sender.send(Message::Text(frame.into()));
     }
 }
@@ -919,7 +1100,7 @@ async fn start_stream(
     };
 
     let conn_id = {
-        let tabs = state.tabs.lock().await;
+        let tabs = state.lock_tabs();
         let (conn_id, sender) = match resolve_target(&tabs, req.target.as_deref()) {
             Ok(t) => t,
             Err(e) => {
@@ -1288,7 +1469,7 @@ mod tests {
                 max_concurrent: 8,
             }),
             correlator: Correlator::new(),
-            tabs: Arc::new(Mutex::new(HashMap::new())),
+            tabs: Arc::new(StdMutex::new(HashMap::new())),
             in_flight: Arc::new(Semaphore::new(8)),
             conn_counter: Arc::new(AtomicU64::new(1)),
         }
@@ -1299,7 +1480,7 @@ mod tests {
     async fn insert_dead_tab(state: &AppState, id: u64) {
         let (sender, rx) = mpsc::unbounded_channel();
         drop(rx);
-        state.tabs.lock().await.insert(
+        state.lock_tabs().insert(
             id,
             WsConn {
                 sender,
@@ -1554,4 +1735,57 @@ mod tests {
     }
 
     use futures::FutureExt;
+
+    /// A `BridgeConfig` bound to random free ports, for lifecycle tests.
+    fn ephemeral_config() -> BridgeConfig {
+        BridgeConfig {
+            ws_port: 0,
+            control_port: 0,
+            request_timeout: Duration::from_secs(5),
+            allow_origin: None,
+            max_body_bytes: 1024,
+            max_concurrent: 8,
+        }
+    }
+
+    #[tokio::test]
+    async fn bridge_server_start_status_shutdown() {
+        let server = BridgeServer::start(ephemeral_config(), "tok".to_string())
+            .await
+            .unwrap();
+        // Ports were resolved from the OS (port 0 → a real bound port).
+        assert_ne!(server.control_port(), 0);
+        assert_ne!(server.ws_port(), 0);
+        // No browser is connected yet.
+        let status = server.status();
+        assert!(!status.connected);
+        assert!(status.tabs.is_empty());
+        assert_eq!(status.pending, 0);
+        // Graceful shutdown drains and returns.
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn disconnect_unknown_tab_is_error() {
+        let server = BridgeServer::start(ephemeral_config(), "tok".to_string())
+            .await
+            .unwrap();
+        let err = server.disconnect_tab(999).unwrap_err();
+        assert!(err.to_string().contains("no connected tab"));
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn start_fails_closed_on_taken_control_port() {
+        // Occupy a port, then ask the bridge to bind the same one.
+        let squatter = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let taken = squatter.local_addr().unwrap().port();
+        let config = BridgeConfig {
+            control_port: taken,
+            ..ephemeral_config()
+        };
+        assert!(BridgeServer::start(config, "tok".to_string())
+            .await
+            .is_err());
+    }
 }

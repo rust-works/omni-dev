@@ -8,18 +8,11 @@ use clap::{Parser, Subcommand};
 
 use super::harvest::HarvestCommand;
 use super::request::RequestCommand;
+use crate::browser::bridge::{
+    DEFAULT_CONTROL_PORT, DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_CONCURRENT, DEFAULT_TIMEOUT_SECS,
+    DEFAULT_WS_PORT,
+};
 use crate::browser::{self, auth, BridgeConfig};
-
-/// Default WebSocket-plane port.
-const DEFAULT_WS_PORT: u16 = 9999;
-/// Default HTTP control-plane port.
-const DEFAULT_CONTROL_PORT: u16 = 9998;
-/// Default per-request timeout, in seconds.
-const DEFAULT_TIMEOUT_SECS: u64 = 30;
-/// Default maximum browser response body size (8 MiB).
-const DEFAULT_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
-/// Default maximum concurrent in-flight requests.
-const DEFAULT_MAX_CONCURRENT: usize = 64;
 
 /// Bridge: run the server (`serve`) or send a request through it (`request`).
 #[derive(Parser)]
