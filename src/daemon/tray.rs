@@ -160,7 +160,7 @@ fn event_loop(
     let mut last_sig = signature(&initial);
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(build_menu(&initial)))
-        .with_title("omni-dev")
+        .with_title("od")
         .with_tooltip("omni-dev daemon")
         .build()
         .context("failed to create the menu-bar tray icon")?;
