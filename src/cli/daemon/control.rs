@@ -60,3 +60,19 @@ pub(super) async fn wait_until_down(socket: &Path) -> Result<()> {
         socket.display()
     )
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn wait_until_down_returns_when_no_daemon() {
+        // Nothing is listening on this socket, so `ping` fails on the first try
+        // and the helper returns quickly. (No daemon is launched.)
+        let dir = tempfile::tempdir().unwrap();
+        wait_until_down(&dir.path().join("absent.sock"))
+            .await
+            .unwrap();
+    }
+}

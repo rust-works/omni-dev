@@ -47,3 +47,29 @@ impl DaemonService for EchoService {
 
     async fn shutdown(&self) {}
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn echo_service_round_trips_and_reports() {
+        let svc = EchoService;
+        assert_eq!(svc.name(), "echo");
+        // `echo` returns its payload verbatim; any other op errors.
+        assert_eq!(
+            svc.handle("echo", json!({ "a": 1 })).await.unwrap(),
+            json!({ "a": 1 })
+        );
+        assert!(svc.handle("nope", Value::Null).await.is_err());
+        // Menu / status / actions are inert but must not panic.
+        assert_eq!(svc.menu().title, "Echo");
+        svc.menu_action("anything").await.unwrap();
+        let status = svc.status().await;
+        assert_eq!(status.name, "echo");
+        assert!(status.healthy);
+        svc.shutdown().await;
+    }
+}

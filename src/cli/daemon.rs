@@ -99,4 +99,21 @@ mod tests {
         assert!(cmd.socket.is_none());
         assert!(!cmd.json);
     }
+
+    /// `daemon status` against a socket with no daemon dispatches through to the
+    /// "not running" path (table and `--json`) without erroring or side effects.
+    #[tokio::test]
+    async fn status_dispatch_reports_not_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("absent.sock");
+        for json in [false, true] {
+            let cmd = DaemonCommand {
+                command: DaemonSubcommands::Status(status::StatusCommand {
+                    socket: Some(socket.clone()),
+                    json,
+                }),
+            };
+            cmd.execute().await.unwrap();
+        }
+    }
 }
