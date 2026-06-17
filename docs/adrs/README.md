@@ -62,3 +62,4 @@ by Michael Nygard.
 | [ADR-0036](adr-0036.md)  | ✅ Accepted                              | 2026-05-30 | Confused-Deputy Browser Bridge with Dual-Plane Default-Closed Authentication           |
 | [ADR-0037](adr-0037.md)  | 🔄 Superseded by [ADR-0038](adr-0038.md) | 2026-06-06 | Pure-C Native ASR Backends Behind a Rust FFI Boundary on Non-Windows Targets           |
 | [ADR-0038](adr-0038.md)  | ✅ Accepted                              | 2026-06-13 | Voice Functionality Extracted to the omni-voice Repository                             |
+| [ADR-0039](adr-0039.md)  | ✅ Accepted                              | 2026-06-18 | Extensible omni-dev Daemon Hosting Pluggable Services over a Unix Control Socket       |
