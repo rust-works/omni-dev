@@ -30,11 +30,20 @@ async fn daemon_run_status_stop_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("d.sock");
 
+    // Bind the bridge's TCP planes to random free ports so the test never
+    // collides with a real daemon (or another test) on the default 9998/9999.
     let mut child = Command::new(env!("CARGO_BIN_EXE_omni-dev"))
         .arg("daemon")
         .arg("run")
         .arg("--socket")
         .arg(&socket)
+        .arg("--bridge-control-port")
+        .arg("0")
+        .arg("--bridge-ws-port")
+        .arg("0")
+        // Stay headless even when the binary is built with `--features menu-bar`,
+        // so this test never tries to open a macOS tray in a headless run.
+        .arg("--no-menu")
         .spawn()
         .expect("failed to spawn `omni-dev daemon run`");
 
@@ -51,14 +60,14 @@ async fn daemon_run_status_stop_roundtrip() {
     }
     assert!(ready, "daemon did not become ready");
 
-    // Status reports the registered echo service.
+    // Status reports the registered browser-bridge service.
     let report = client.status().await.expect("status request failed");
     assert!(
         report
             .services
             .iter()
-            .any(|s| s.name == "echo" && s.healthy),
-        "expected a healthy echo service, got {report:?}"
+            .any(|s| s.name == "browser-bridge" && s.healthy),
+        "expected a healthy browser-bridge service, got {report:?}"
     );
 
     // Graceful shutdown over the socket.

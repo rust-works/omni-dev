@@ -63,8 +63,22 @@ quick-xml = "0.40.1"
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["signal", "user"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Menu-bar tray deps (enabled by the `menu-bar` feature). `muda` (the menu
+# library) is used via tray-icon's `tray_icon::menu` re-export, so it is not a
+# direct dependency. `tao` provides the main-thread macOS event loop the tray
+# requires; `arboard` backs the "Copy console snippet" clipboard action.
+arboard = { version = "3.6.1", optional = true }
+tao = { version = "0.35.3", optional = true }
+tray-icon = { version = "0.24.1", optional = true }
+
 [features]
 mcp = ["dep:rmcp"]
+# macOS menu-bar tray for the daemon. Off by default; the tray deps are
+# macOS-only (see the `[target.'cfg(target_os = "macos")']` table) and the tray
+# code is additionally gated on `cfg(target_os = "macos")`, so enabling this on
+# another platform is a no-op.
+menu-bar = ["dep:tray-icon", "dep:tao", "dep:arboard"]
 
 [dev-dependencies]
 tempfile = "3.27"

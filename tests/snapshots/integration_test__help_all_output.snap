@@ -2251,8 +2251,20 @@ Runs the daemon in the foreground (the process launchd execs)
 Usage: run [OPTIONS]
 
 Options:
-      --socket <PATH>  Control-socket path. Defaults to the per-user runtime location
-  -h, --help           Print help
+      --socket <PATH>
+          Control-socket path. Defaults to the per-user runtime location
+      --bridge-ws-port <BRIDGE_WS_PORT>
+          Browser-bridge WebSocket-plane port (`0` binds a random free port) [default: 9999]
+      --bridge-control-port <BRIDGE_CONTROL_PORT>
+          Browser-bridge HTTP control-plane port (`0` binds a random free port) [default: 9998]
+      --bridge-allow-origin <URL>
+          Permit this cross-origin for the bridge's WebSocket upgrade and outbound URLs (the bridge's `--allow-origin`)
+      --bridge-token-file <PATH>
+          Read the bridge session token from this `0600` file instead of generating one
+      --no-menu
+          Run headless: never show the macOS menu-bar tray (no effect on non-macOS or non-`menu-bar` builds, which are always headless)
+  -h, --help
+          Print help
 
 
 ================================================================================
