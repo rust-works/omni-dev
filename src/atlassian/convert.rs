@@ -1568,7 +1568,7 @@ fn url_safe_in_bracket_content(s: &str) -> bool {
 ///
 /// The character class for the name segment must match `try_parse_emoji_shortcode`
 /// exactly (Unicode `is_alphanumeric` plus `_`, `+`, `-`).  An ASCII-only escape
-/// would leave Unicode patterns like `:Café:` or `:ZBC::Zendesk::配置:` un-escaped
+/// would leave Unicode patterns like `:Café:` or `:ZBC::Acme::配置:` un-escaped
 /// while still being detected as emoji on re-parse, splitting the text node
 /// (issue #552).
 fn escape_emoji_shortcodes(text: &str) -> String {
@@ -8372,11 +8372,11 @@ mod tests {
     }
 
     #[test]
-    fn code_block_with_exact_zendesk_shortcode_pattern_round_trips() {
-        // Issue #552: Use the exact pattern from the bug report.
+    fn code_block_with_exact_namespaced_shortcode_pattern_round_trips() {
+        // Issue #552: Use a namespaced pattern modeled on the bug report.
         let adf_json = r#"{"version":1,"type":"doc","content":[
           {"type":"codeBlock","attrs":{"language":"ruby"},"content":[
-            {"type":"text","text":"class ZBC::Zendesk::PlanType::Professional < Base"}
+            {"type":"text","text":"class ZBC::Acme::PlanType::Professional < Base"}
           ]}
         ]}"#;
         let doc: AdfDocument = serde_json::from_str(adf_json).unwrap();
@@ -8390,7 +8390,7 @@ mod tests {
         assert_eq!(content.len(), 1, "should be a single text node");
         assert_eq!(
             content[0].text.as_deref().unwrap(),
-            "class ZBC::Zendesk::PlanType::Professional < Base"
+            "class ZBC::Acme::PlanType::Professional < Base"
         );
     }
 
