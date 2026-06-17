@@ -8372,8 +8372,8 @@ mod tests {
     }
 
     #[test]
-    fn code_block_with_exact_acme_shortcode_pattern_round_trips() {
-        // Issue #552: Use the exact pattern from the bug report.
+    fn code_block_with_exact_namespaced_shortcode_pattern_round_trips() {
+        // Issue #552: Use a namespaced pattern modeled on the bug report.
         let adf_json = r#"{"version":1,"type":"doc","content":[
           {"type":"codeBlock","attrs":{"language":"ruby"},"content":[
             {"type":"text","text":"class ZBC::Acme::PlanType::Professional < Base"}
