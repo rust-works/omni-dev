@@ -137,6 +137,12 @@ impl DaemonService for BridgeService {
                     None => bail!("bridge is not running"),
                 }
             }
+            "token" => {
+                // The raw session token (the "bridge key"). Exposed for the
+                // tray's "Copy bridge key" action; the control socket is
+                // owner-only (`0600`), same trust as the token file.
+                Ok(json!({ "token": self.token.as_str() }))
+            }
             other => bail!("unknown browser-bridge op: {other}"),
         }
     }
@@ -170,7 +176,16 @@ impl DaemonService for BridgeService {
                 } else {
                     "No tab connected".to_string()
                 };
-                let mut items = vec![MenuItem::Label(line), MenuItem::Separator];
+                let mut items = vec![
+                    MenuItem::Label(line),
+                    MenuItem::Label(format!("Key: {}", self.token)),
+                    MenuItem::Separator,
+                ];
+                items.push(MenuItem::Action(MenuAction {
+                    id: "copy-key".to_string(),
+                    label: "Copy bridge key".to_string(),
+                    enabled: true,
+                }));
                 items.push(MenuItem::Action(MenuAction {
                     id: "copy-snippet".to_string(),
                     label: "Copy console snippet".to_string(),
@@ -293,6 +308,18 @@ mod tests {
         let payload = svc.handle("status", Value::Null).await.unwrap();
         assert_eq!(payload.get("connected"), Some(&json!(false)));
 
+        // `token` op returns the raw session key, matching the persisted file.
+        let token = svc
+            .handle("token", Value::Null)
+            .await
+            .unwrap()
+            .get("token")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        assert!(!token.is_empty());
+        assert_eq!(std::fs::read_to_string(&token_path).unwrap().trim(), token);
+
         // Unknown op is an error, not a panic.
         assert!(svc.handle("frobnicate", Value::Null).await.is_err());
 
@@ -308,6 +335,15 @@ mod tests {
         let menu = svc.menu();
         assert_eq!(menu.title, "Browser Bridge");
         assert!(matches!(menu.items.first(), Some(MenuItem::Label(_))));
+        // The key is shown as a label and is copyable.
+        assert!(menu.items.iter().any(|i| matches!(
+            i,
+            MenuItem::Label(text) if text.starts_with("Key: ")
+        )));
+        assert!(menu.items.iter().any(|i| matches!(
+            i,
+            MenuItem::Action(a) if a.id == "copy-key"
+        )));
         assert!(menu.items.iter().any(|i| matches!(
             i,
             MenuItem::Action(a) if a.id == "restart-bridge"
