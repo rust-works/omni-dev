@@ -143,6 +143,22 @@ impl DaemonService for BridgeService {
                 // owner-only (`0600`), same trust as the token file.
                 Ok(json!({ "token": self.token.as_str() }))
             }
+            "request-command" => {
+                // A ready-to-run `request` command with the session key assigned
+                // to OMNI_BRIDGE_TOKEN. The token is URL-safe base64, so it is
+                // shell-safe; single-quoted for robustness. Backs the tray's
+                // "Copy request command" action.
+                let control_port = self.lock().as_ref().map(BridgeServer::control_port);
+                match control_port {
+                    Some(port) => Ok(json!({
+                        "command": format!(
+                            "{}='{}' omni-dev browser bridge request --control-port {port} --url /",
+                            auth::TOKEN_ENV, self.token
+                        )
+                    })),
+                    None => bail!("bridge is not running"),
+                }
+            }
             other => bail!("unknown browser-bridge op: {other}"),
         }
     }
@@ -189,6 +205,11 @@ impl DaemonService for BridgeService {
                 items.push(MenuItem::Action(MenuAction {
                     id: "copy-snippet".to_string(),
                     label: "Copy console snippet".to_string(),
+                    enabled: true,
+                }));
+                items.push(MenuItem::Action(MenuAction {
+                    id: "copy-request".to_string(),
+                    label: "Copy request command".to_string(),
                     enabled: true,
                 }));
                 for tab in &status.tabs {
@@ -320,6 +341,18 @@ mod tests {
         assert!(!token.is_empty());
         assert_eq!(std::fs::read_to_string(&token_path).unwrap().trim(), token);
 
+        // `request-command` op embeds the key in an OMNI_BRIDGE_TOKEN assignment.
+        let cmd = svc
+            .handle("request-command", Value::Null)
+            .await
+            .unwrap()
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        assert!(cmd.starts_with(&format!("OMNI_BRIDGE_TOKEN='{token}'")));
+        assert!(cmd.contains("browser bridge request --control-port"));
+
         // Unknown op is an error, not a panic.
         assert!(svc.handle("frobnicate", Value::Null).await.is_err());
 
@@ -343,6 +376,10 @@ mod tests {
         assert!(menu.items.iter().any(|i| matches!(
             i,
             MenuItem::Action(a) if a.id == "copy-key"
+        )));
+        assert!(menu.items.iter().any(|i| matches!(
+            i,
+            MenuItem::Action(a) if a.id == "copy-request"
         )));
         assert!(menu.items.iter().any(|i| matches!(
             i,

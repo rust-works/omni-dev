@@ -9,7 +9,7 @@
 //! → control plane returns the HTTP response.
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -284,6 +284,12 @@ impl BridgeServer {
         let max_body_bytes = config.max_body_bytes;
         let max_concurrent = config.max_concurrent;
 
+        // Also accept the WebSocket plane on IPv6 loopback (`::1`) at the same
+        // port, best-effort. A browser connecting to `ws://localhost` may resolve
+        // it to `::1` rather than `127.0.0.1`; binding both means the pasted
+        // snippet connects either way. Still loopback-only — ADR-0036 unchanged.
+        let ws_listener_v6 = TcpListener::bind((Ipv6Addr::LOCALHOST, ws_port)).await.ok();
+
         let state = AppState {
             token: Arc::new(token),
             config: Arc::new(config),
@@ -296,22 +302,13 @@ impl BridgeServer {
         let shutdown = CancellationToken::new();
         let mut tasks = JoinSet::new();
 
-        // WebSocket accept loop (cancellable).
-        let ws_state = state.clone();
-        let ws_shutdown = shutdown.clone();
-        tasks.spawn(async move {
-            loop {
-                tokio::select! {
-                    () = ws_shutdown.cancelled() => break,
-                    accepted = ws_listener.accept() => match accepted {
-                        Ok((stream, _peer)) => {
-                            tokio::spawn(handle_ws_conn(stream, ws_state.clone()));
-                        }
-                        Err(e) => tracing::warn!("WebSocket accept error: {e}"),
-                    },
-                }
-            }
-        });
+        // WebSocket accept loops (cancellable), one per bound loopback address.
+        spawn_ws_accept(&mut tasks, ws_listener, state.clone(), shutdown.clone());
+        if let Some(listener) = ws_listener_v6 {
+            spawn_ws_accept(&mut tasks, listener, state.clone(), shutdown.clone());
+        } else {
+            tracing::debug!("IPv6 loopback (::1) WebSocket bind unavailable; IPv4 only");
+        }
 
         // Control plane (axum) with graceful shutdown: drains in-flight requests
         // before the serve future resolves.
@@ -428,6 +425,30 @@ fn print_startup(config: &BridgeConfig, token: &str) {
 }
 
 // ── WebSocket plane ──────────────────────────────────────────────────
+
+/// Spawns a cancellable accept loop for one WebSocket-plane listener; each
+/// accepted connection is handled on its own task. Used once per bound loopback
+/// address (IPv4 and, when available, IPv6) feeding the shared [`AppState`].
+fn spawn_ws_accept(
+    tasks: &mut JoinSet<()>,
+    listener: TcpListener,
+    state: AppState,
+    shutdown: CancellationToken,
+) {
+    tasks.spawn(async move {
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                accepted = listener.accept() => match accepted {
+                    Ok((stream, _peer)) => {
+                        tokio::spawn(handle_ws_conn(stream, state.clone()));
+                    }
+                    Err(e) => tracing::warn!("WebSocket accept error: {e}"),
+                },
+            }
+        }
+    });
+}
 
 /// Handles one inbound TCP connection on the WebSocket plane: authenticates the
 /// upgrade, registers the connection, and pumps replies into the correlator.
