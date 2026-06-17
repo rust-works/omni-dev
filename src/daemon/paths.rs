@@ -86,3 +86,59 @@ pub fn check_socket_path_len(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_paths_sit_under_the_runtime_dir() {
+        let rt = runtime_dir().unwrap();
+        assert!(socket_path().unwrap().starts_with(&rt));
+        assert!(token_path().unwrap().starts_with(&rt));
+    }
+
+    #[test]
+    fn token_sits_beside_its_socket() {
+        assert_eq!(
+            token_path_for_socket(Path::new("/tmp/x/daemon.sock")),
+            Path::new("/tmp/x/bridge.token")
+        );
+        // A bare filename (parent is the empty path) still yields a token name.
+        assert_eq!(
+            token_path_for_socket(Path::new("daemon.sock")),
+            Path::new("bridge.token")
+        );
+    }
+
+    #[test]
+    fn socket_path_length_guard() {
+        check_socket_path_len(Path::new("/tmp/short.sock")).unwrap();
+        let too_long = PathBuf::from(format!("/{}", "a".repeat(MAX_SOCKET_PATH_LEN)));
+        assert!(check_socket_path_len(&too_long).is_err());
+    }
+
+    #[test]
+    fn ensure_dir_and_file_perms() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("run");
+        ensure_dir_0700(&sub).unwrap();
+        assert!(sub.is_dir());
+        let file = sub.join("k");
+        std::fs::write(&file, "x").unwrap();
+        set_file_0600(&file).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&sub).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+}

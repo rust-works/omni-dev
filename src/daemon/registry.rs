@@ -62,3 +62,39 @@ impl ServiceRegistry {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::daemon::services::echo::EchoService;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn routes_known_service_and_rejects_unknown() {
+        let mut registry = ServiceRegistry::new();
+        assert!(registry.services().is_empty());
+        registry.register(Arc::new(EchoService));
+
+        assert!(registry.get("echo").is_some());
+        assert!(registry.get("missing").is_none());
+
+        // Routed op reaches the service; an unknown service is an error.
+        assert_eq!(
+            registry
+                .dispatch("echo", "echo", json!({ "x": 1 }))
+                .await
+                .unwrap(),
+            json!({ "x": 1 })
+        );
+        let err = registry
+            .dispatch("missing", "echo", Value::Null)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown service"));
+
+        // Aggregation iterates every registered service.
+        assert_eq!(registry.statuses().await.len(), 1);
+        registry.shutdown_all().await;
+    }
+}
