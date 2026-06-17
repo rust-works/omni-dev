@@ -6,11 +6,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
-use crate::browser::auth;
+use crate::browser::bridge::DEFAULT_CONTROL_PORT;
 use crate::browser::harvest::facebook;
-
-/// Default control-plane port (matches `bridge`'s default).
-const DEFAULT_CONTROL_PORT: u16 = 9998;
 
 /// Harvest a logged-in browser session's own data through the bridge.
 ///
@@ -140,7 +137,7 @@ impl PostsCommand {
              changes. Your own account only. Stable alternative: Facebook's \"Download Your \
              Information\" export."
         );
-        let token = auth::resolve_existing_token(self.token_file.as_deref())?;
+        let token = super::resolve_client_token(self.token_file.as_deref())?;
         let since = self.since.as_deref().map(parse_since).transpose()?;
         let output = match self.output {
             Some(path) => facebook::Output::File(path),

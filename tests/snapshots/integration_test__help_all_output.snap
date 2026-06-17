@@ -15,6 +15,7 @@ Commands:
   config      Configuration and model information
   atlassian   Atlassian: JIRA and Confluence operations
   browser     Browser bridge: drive authenticated requests through a browser tab
+  daemon      Daemon: host long-lived services (e.g. the browser bridge)
   datadog     Datadog: read-only API operations
   coverage    Coverage: diff/patch coverage analysis for PR comments
   transcript  Transcript and caption fetching from media platforms
@@ -2206,6 +2207,104 @@ Options:
           Commit-URL prefix for linking SHAs (e.g. `https://…/<repo>/commit`)
   -h, --help
           Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev daemon - Daemon: host long-lived services (e.g. the browser bridge)
+
+Daemon: host long-lived services (e.g. the browser bridge)
+
+Usage: daemon <COMMAND>
+
+Commands:
+  run      Runs the daemon in the foreground (the process launchd execs)
+  start    Starts the daemon in the background
+  stop     Stops the running daemon
+  restart  Restarts the daemon
+  status   Reports daemon and per-service status
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev daemon restart - Restarts the daemon
+
+Restarts the daemon
+
+Usage: restart [OPTIONS]
+
+Options:
+      --socket <PATH>  Control-socket path. Defaults to the per-user runtime location
+  -h, --help           Print help
+
+
+================================================================================
+
+omni-dev daemon run - Runs the daemon in the foreground (the process launchd execs)
+
+Runs the daemon in the foreground (the process launchd execs)
+
+Usage: run [OPTIONS]
+
+Options:
+      --socket <PATH>
+          Control-socket path. Defaults to the per-user runtime location
+      --bridge-ws-port <BRIDGE_WS_PORT>
+          Browser-bridge WebSocket-plane port (`0` binds a random free port) [default: 9999]
+      --bridge-control-port <BRIDGE_CONTROL_PORT>
+          Browser-bridge HTTP control-plane port (`0` binds a random free port) [default: 9998]
+      --bridge-allow-origin <URL>
+          Permit this cross-origin for the bridge's WebSocket upgrade and outbound URLs (the bridge's `--allow-origin`)
+      --bridge-token-file <PATH>
+          Read the bridge session token from this `0600` file instead of generating one
+      --no-menu
+          Run headless: never show the macOS menu-bar tray (no effect on non-macOS or non-`menu-bar` builds, which are always headless)
+  -h, --help
+          Print help
+
+
+================================================================================
+
+omni-dev daemon start - Starts the daemon in the background
+
+Starts the daemon in the background
+
+Usage: start [OPTIONS]
+
+Options:
+      --socket <PATH>  Control-socket path. Defaults to the per-user runtime location
+  -h, --help           Print help
+
+
+================================================================================
+
+omni-dev daemon status - Reports daemon and per-service status
+
+Reports daemon and per-service status
+
+Usage: status [OPTIONS]
+
+Options:
+      --socket <PATH>  Control-socket path. Defaults to the per-user runtime location
+      --json           Emit machine-readable JSON instead of a table
+  -h, --help           Print help
+
+
+================================================================================
+
+omni-dev daemon stop - Stops the running daemon
+
+Stops the running daemon
+
+Usage: stop [OPTIONS]
+
+Options:
+      --socket <PATH>  Control-socket path. Defaults to the per-user runtime location
+  -h, --help           Print help
 
 
 ================================================================================
