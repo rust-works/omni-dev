@@ -18,16 +18,17 @@ add-on — both planes are authenticated and default-closed. See
 
 1. [How it works](#how-it-works)
 2. [Quick start](#quick-start)
-3. [Talking to the control plane](#talking-to-the-control-plane)
-4. [The `request` thin client](#the-request-thin-client)
-5. [Routing to a specific tab](#routing-to-a-specific-tab)
-6. [Security model](#security-model)
-7. [Flags](#flags)
-8. [Random ports](#random-ports)
-9. [Worked example: downloading Grafana / Loki logs](#worked-example-downloading-grafana--loki-logs)
-10. [Harvesting your own data (best-effort)](#harvesting-your-own-data-best-effort)
-11. [WebSocket wire protocol](#websocket-wire-protocol)
-12. [Caveats](#caveats)
+3. [Running under the daemon](#running-under-the-daemon)
+4. [Talking to the control plane](#talking-to-the-control-plane)
+5. [The `request` thin client](#the-request-thin-client)
+6. [Routing to a specific tab](#routing-to-a-specific-tab)
+7. [Security model](#security-model)
+8. [Flags](#flags)
+9. [Random ports](#random-ports)
+10. [Worked example: downloading Grafana / Loki logs](#worked-example-downloading-grafana--loki-logs)
+11. [Harvesting your own data (best-effort)](#harvesting-your-own-data-best-effort)
+12. [WebSocket wire protocol](#websocket-wire-protocol)
+13. [Caveats](#caveats)
 
 ## How it works
 
@@ -72,6 +73,76 @@ the HTTP response.**
    ```
 
 The bridge works only while the tab is open and the snippet is running.
+
+## Running under the daemon
+
+`serve` is the simplest way to run the bridge — one foreground process you start
+and stop by hand. The bridge can **also** be hosted by the long-lived omni-dev
+daemon ([ADR-0039](adrs/adr-0039.md)), which keeps it running across terminals,
+supervises its lifecycle, and (on macOS) gives it a menu-bar presence. Both ways
+run the *same* bridge core on the *same* loopback-TCP planes with the *same*
+[security model](#security-model) — `serve` is not deprecated, and which one you
+use is invisible to the `request` / `harvest` thin clients.
+
+| Command | What it does |
+|---|---|
+| `omni-dev daemon run` | **Becomes** the daemon in the foreground: binds the control socket (which doubles as the single-instance lock), starts the bridge on its planes, and blocks until `SIGTERM`/`SIGINT` or `daemon stop`. This is what a launcher execs. |
+| `omni-dev daemon start` | Launches the daemon in the background and returns once it is ready. On macOS it installs + loads a launchd LaunchAgent (auto-starts at login); elsewhere it spawns `daemon run` detached. |
+| `omni-dev daemon stop` | Stops the daemon (and, on macOS, unloads the LaunchAgent so it does not auto-restart). |
+| `omni-dev daemon restart` | `stop` then `start`. |
+| `omni-dev daemon status` | Reports the daemon and each hosted service (`--json` for machines). |
+
+`daemon run` accepts the bridge's port/scope flags as `--bridge-ws-port`,
+`--bridge-control-port`, `--bridge-allow-origin`, and `--bridge-token-file`
+(plus `--socket <PATH>` to override the control-socket location and `--no-menu`
+to stay headless on a macOS menu-bar build).
+
+### Token discovery (no foreground stdout)
+
+A standalone `serve` prints the session token to stdout; a backgrounded daemon
+has none. So the daemon **persists the resolved token to a `0600` file** —
+`bridge.token` under the per-user runtime directory (`dirs::data_dir()`:
+`~/Library/Application Support/omni-dev/` on macOS, `~/.local/share/omni-dev/` on
+Linux; this is *not* the `~/.omni-dev` config directory). The thin clients fall
+back to that file automatically, so under the daemon you usually need neither
+`OMNI_BRIDGE_TOKEN` nor `--token-file`:
+
+```bash
+omni-dev daemon start
+omni-dev browser bridge request --url /loki/api/v1/labels   # token discovered from the file
+```
+
+The token is still **generated** (never taken from argv), still compared in
+constant time, and the file is still required to be `0600` — see the
+[security model](#security-model). It is removed when the bridge shuts down.
+
+### Checking on it
+
+```bash
+omni-dev daemon status
+# daemon: running
+#   browser-bridge   ok         1 tab(s), 0 pending (control :9998, ws :9999)
+```
+
+Before any tab connects the line reads `no tab connected (control :9998, ws
+:9999)`; `omni-dev daemon status --json` emits the structured per-service report.
+The `GET /__bridge/status` endpoint is unchanged and still feeds this view.
+
+### Menu bar (macOS, `menu-bar` feature)
+
+Built with `--features menu-bar` on macOS, the daemon adds a **Browser Bridge**
+menu showing the connection line (`Connected — <origins> — N pending` /
+`No tab connected`) and the session key, with actions:
+
+- **Copy bridge key** — the raw session token, to paste into `OMNI_BRIDGE_TOKEN`.
+- **Copy console snippet** — the ready-to-paste DevTools snippet.
+- **Copy request command** — a complete `OMNI_BRIDGE_TOKEN='…' omni-dev browser
+  bridge request …` line.
+- **Disconnect tab `<id>`** — one entry per connected tab.
+- **Restart bridge** — stop and relaunch the planes with the same token.
+
+The menu is compiled out on non-macOS builds and when the `menu-bar` feature is
+off; those builds (and `daemon run --no-menu`) are headless.
 
 ## Talking to the control plane
 

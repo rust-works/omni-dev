@@ -159,6 +159,23 @@ The `omni-dev browser bridge` command tree drives HTTP requests **through an aut
 
 The security model is **core, not an add-on**: both planes are authenticated and default-closed. When touching the trust boundary (auth guards, outbound scope, token handling, the planes), keep [ADR-0036](docs/adrs/adr-0036.md) and the operator guide [docs/browser-bridge.md](docs/browser-bridge.md) in sync. Changes to the CLI surface require the [`update-snapshots`](.claude/skills/update-snapshots/SKILL.md) skill (see Code Changes §5).
 
+The bridge can also be hosted by the **omni-dev daemon** (see the [Daemon](#daemon) section below) as its first migrated service. The daemon supervises lifecycle and adds a menu-bar surface; it does **not** touch this trust boundary — `BridgeService` (`src/daemon/services/bridge.rs`) wraps the same `BridgeServer` planes verbatim, and standalone `serve` keeps working.
+
+### Daemon
+The `omni-dev daemon` command tree hosts long-lived **services** inside one supervised process behind a Unix-domain control socket, with an optional macOS menu-bar shell. The browser bridge is the first service migrated onto it (a trivial `echo` service exercises the framework in tests). Architectural rationale — the service abstraction, the control socket, single-instance supervision, the `run`/launcher split, and the main-thread/runtime inversion for the tray — lives in [ADR-0039](docs/adrs/adr-0039.md).
+
+- `src/daemon/service.rs` — the `DaemonService` trait (`name`/`handle`/`menu`/`menu_action`/`status`/`shutdown`) plus the menu/status types (`MenuSnapshot`, `MenuItem`, `MenuAction`, `ServiceStatus`).
+- `src/daemon/registry.rs` — `ServiceRegistry`: routes a request envelope's `service` field to the matching service; iterates them for `status`/`menu`/`shutdown`.
+- `src/daemon/protocol.rs` — the Unix-socket wire types `DaemonEnvelope { service, op, payload }` / `DaemonReply { ok, payload, error }`, newline-delimited JSON (`tokio_util` `LinesCodec`). A `service` of `None` or the reserved `"daemon"` targets the built-in ops `ping` / `status` / `shutdown`.
+- `src/daemon/server.rs` + `single_instance.rs` + `lifecycle.rs` — the accept loop and dispatch; the exclusive socket bind **is** the single-instance lock (`ping`-probe + stale-socket reclaim); `SIGTERM`/`SIGINT` cancel a shared `CancellationToken` for graceful shutdown.
+- `src/daemon/paths.rs` — runtime paths via `dirs::data_dir()` (`<data>/omni-dev/`, **not** `~/.omni-dev`): `daemon.sock` and `bridge.token`; directory `0700`, socket/token `0600`, 104-byte `sockaddr_un` guard.
+- `src/daemon/launchd.rs` — macOS LaunchAgent (`com.github.rust-works.omni-dev.daemon`, `RunAtLoad`, `KeepAlive.SuccessfulExit=false`) installed/loaded by `daemon start`.
+- `src/daemon/tray.rs` — the macOS menu bar, gated `#[cfg(all(target_os = "macos", feature = "menu-bar"))]` (off by default; pulls in `tray-icon`, `tao`, `arboard`). Compiled out elsewhere.
+- `src/daemon/services/bridge.rs` — `BridgeService`, the first migrated service; wraps `BridgeServer`, persists the session token to the `0600` `bridge.token` file for thin-client discovery.
+- `src/cli/daemon.rs` + `src/cli/daemon/{run,start,stop,restart,status}.rs` — the CLI surface. `run` becomes the daemon (foreground, what launchd execs); `start`/`stop`/`restart` are launchers/clients; `status` prints a per-service table (`--json` for machines).
+
+Hosting the bridge in the daemon does **not** change its security model — keep [ADR-0036](docs/adrs/adr-0036.md), [ADR-0039](docs/adrs/adr-0039.md), and [docs/browser-bridge.md](docs/browser-bridge.md) in sync. Changes to the `daemon` CLI surface require the [`update-snapshots`](.claude/skills/update-snapshots/SKILL.md) skill (see Code Changes §5).
+
 ### Skill Structure
 Claude skills are organized in `.claude/skills/`, one subdirectory per skill with a `SKILL.md` file.
 
