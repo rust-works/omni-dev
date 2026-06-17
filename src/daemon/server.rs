@@ -30,6 +30,19 @@ pub struct DaemonOptions {
 /// Binding the socket doubles as the single-instance lock (see
 /// [`single_instance`]).
 pub async fn run(registry: ServiceRegistry, opts: DaemonOptions) -> Result<()> {
+    run_with_shutdown(Arc::new(registry), opts, CancellationToken::new()).await
+}
+
+/// Like [`run`], but with a shared registry and an externally-owned token.
+///
+/// The menu-bar host uses this to share the [`ServiceRegistry`] with the tray
+/// and to stop the daemon from a "Quit" menu action via the
+/// [`CancellationToken`].
+pub async fn run_with_shutdown(
+    registry: Arc<ServiceRegistry>,
+    opts: DaemonOptions,
+    shutdown: CancellationToken,
+) -> Result<()> {
     if let Some(parent) = opts.socket_path.parent() {
         paths::ensure_dir_0700(parent)?;
     }
@@ -38,10 +51,7 @@ pub async fn run(registry: ServiceRegistry, opts: DaemonOptions) -> Result<()> {
     let listener = single_instance::bind_or_reclaim(&opts.socket_path).await?;
     tracing::info!("daemon listening on {}", opts.socket_path.display());
 
-    let shutdown = CancellationToken::new();
     lifecycle::install_signal_handlers(shutdown.clone());
-
-    let registry = Arc::new(registry);
 
     loop {
         tokio::select! {

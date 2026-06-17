@@ -1,0 +1,252 @@
+//! macOS menu-bar tray for the daemon (`cfg(all(target_os = "macos", feature =
+//! "menu-bar"))`).
+//!
+//! The tray must own the **main thread** (macOS GUI event loops require it), so
+//! [`run`] builds the tokio runtime, spawns the daemon server onto it, and
+//! hands the main thread to the `tao` event loop. Each registered service
+//! contributes a submenu built from its [`MenuSnapshot`]; clicks are routed
+//! back to [`DaemonService::menu_action`](crate::daemon::service::DaemonService::menu_action)
+//! (or, for "Copy console snippet", fulfilled locally via the clipboard). A
+//! "Quit" item cancels the shared shutdown token and drains the daemon.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use arboard::Clipboard;
+use serde_json::Value;
+use tao::event_loop::{ControlFlow, EventLoop};
+use tao::platform::run_return::EventLoopExtRunReturn;
+use tokio::runtime::Handle;
+use tokio_util::sync::CancellationToken;
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+use tray_icon::TrayIconBuilder;
+
+use crate::daemon::registry::ServiceRegistry;
+use crate::daemon::server::{self, DaemonOptions};
+use crate::daemon::service::{MenuItem as ServiceMenuItem, MenuSnapshot};
+use crate::daemon::{build_default_registry, DaemonRunConfig};
+
+/// Menu id of the daemon-level Quit item.
+const QUIT_ID: &str = "omni-dev:quit";
+/// Separator between a service name and its action id inside a tray menu id.
+/// `\u{1}` (SOH) never occurs in a service name or action id.
+const DELIM: char = '\u{1}';
+
+/// Runs the daemon with a macOS menu-bar tray, blocking until "Quit".
+///
+/// Builds the runtime, starts the services, spawns the control-socket server,
+/// then drives the tray event loop on the main thread.
+pub fn run(cfg: DaemonRunConfig) -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new().context("failed to start the tokio runtime")?;
+    let registry = runtime
+        .block_on(build_default_registry(
+            cfg.bridge_config,
+            cfg.bridge_token_file.as_deref(),
+            cfg.bridge_token_path,
+        ))
+        .context("failed to start the daemon services")?;
+    let registry = Arc::new(registry);
+
+    let shutdown = CancellationToken::new();
+    let server = runtime.spawn(server::run_with_shutdown(
+        registry.clone(),
+        DaemonOptions {
+            socket_path: cfg.socket_path,
+        },
+        shutdown.clone(),
+    ));
+
+    let result = event_loop(runtime.handle().clone(), registry, shutdown.clone());
+
+    // The tray exited ("Quit", or the daemon was stopped externally): stop the
+    // daemon and drain it.
+    shutdown.cancel();
+    match runtime.block_on(server) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!("daemon server error: {e}"),
+        Err(e) => tracing::warn!("daemon server task failed: {e}"),
+    }
+    result
+}
+
+/// Cheap per-service menu snapshots, in registration order.
+fn snapshots(registry: &ServiceRegistry) -> Vec<(&'static str, MenuSnapshot)> {
+    registry
+        .services()
+        .iter()
+        .map(|s| (s.name(), s.menu()))
+        .collect()
+}
+
+/// A stable signature of the current menu, so the tray rebuilds only on change.
+fn signature(snaps: &[(&'static str, MenuSnapshot)]) -> String {
+    let mut sig = String::new();
+    for (name, snap) in snaps {
+        sig.push_str(name);
+        sig.push('/');
+        sig.push_str(&snap.title);
+        sig.push('|');
+        for item in &snap.items {
+            match item {
+                ServiceMenuItem::Label(text) => {
+                    sig.push('L');
+                    sig.push_str(text);
+                }
+                ServiceMenuItem::Separator => sig.push('S'),
+                ServiceMenuItem::Action(action) => {
+                    sig.push('A');
+                    sig.push_str(&action.id);
+                    sig.push('=');
+                    sig.push_str(&action.label);
+                    sig.push(if action.enabled { '+' } else { '-' });
+                }
+            }
+            sig.push(';');
+        }
+    }
+    sig
+}
+
+/// Builds the full tray menu: one submenu per service, plus a Quit item. Action
+/// ids are prefixed with `"<service>{DELIM}"` so clicks route back to the right
+/// service.
+fn build_menu(snaps: &[(&'static str, MenuSnapshot)]) -> Menu {
+    let menu = Menu::new();
+    for (name, snap) in snaps {
+        let submenu = Submenu::new(&snap.title, true);
+        for item in &snap.items {
+            let appended = match item {
+                ServiceMenuItem::Label(text) => submenu.append(&MenuItem::new(text, false, None)),
+                ServiceMenuItem::Separator => submenu.append(&PredefinedMenuItem::separator()),
+                ServiceMenuItem::Action(action) => {
+                    let id = format!("{name}{DELIM}{}", action.id);
+                    submenu.append(&MenuItem::with_id(id, &action.label, action.enabled, None))
+                }
+            };
+            if let Err(e) = appended {
+                tracing::warn!("failed to build tray menu item: {e}");
+            }
+        }
+        if let Err(e) = menu.append(&submenu) {
+            tracing::warn!("failed to add tray submenu: {e}");
+        }
+    }
+    if let Err(e) = menu.append(&PredefinedMenuItem::separator()) {
+        tracing::warn!("failed to add tray separator: {e}");
+    }
+    if let Err(e) = menu.append(&MenuItem::with_id(
+        QUIT_ID,
+        "Quit omni-dev daemon",
+        true,
+        None,
+    )) {
+        tracing::warn!("failed to add quit item: {e}");
+    }
+    menu
+}
+
+/// Builds the tray and pumps the macOS event loop on the main thread, refreshing
+/// the menu ~1 Hz and dispatching clicks until "Quit" or until `shutdown` is
+/// cancelled (a signal, or `daemon stop` over the socket).
+fn event_loop(
+    handle: Handle,
+    registry: Arc<ServiceRegistry>,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    let mut event_loop: EventLoop<()> = EventLoop::new();
+
+    let initial = snapshots(&registry);
+    let mut last_sig = signature(&initial);
+    let tray = TrayIconBuilder::new()
+        .with_menu(Box::new(build_menu(&initial)))
+        .with_title("omni-dev")
+        .with_tooltip("omni-dev daemon")
+        .build()
+        .context("failed to create the menu-bar tray icon")?;
+
+    let menu_rx = MenuEvent::receiver();
+    let mut clipboard: Option<Clipboard> = None;
+
+    event_loop.run_return(move |_event, _target, control_flow| {
+        // Wake at least once per second to refresh the live menu state.
+        *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_secs(1));
+
+        // Close the tray when the daemon is stopped by a signal or `daemon stop`.
+        if shutdown.is_cancelled() {
+            *control_flow = ControlFlow::Exit;
+            return;
+        }
+
+        let snaps = snapshots(&registry);
+        let sig = signature(&snaps);
+        if sig != last_sig {
+            tray.set_menu(Some(Box::new(build_menu(&snaps))));
+            last_sig = sig;
+        }
+
+        while let Ok(event) = menu_rx.try_recv() {
+            if event.id.as_ref() == QUIT_ID {
+                *control_flow = ControlFlow::Exit;
+                return;
+            }
+            handle_action(&handle, &registry, &mut clipboard, event.id.as_ref());
+        }
+    });
+
+    Ok(())
+}
+
+/// Routes a clicked menu id back to its service: "copy-snippet" is fulfilled via
+/// the clipboard; everything else goes to the service's `menu_action`.
+fn handle_action(
+    handle: &Handle,
+    registry: &ServiceRegistry,
+    clipboard: &mut Option<Clipboard>,
+    full_id: &str,
+) {
+    let Some((service, action)) = full_id.split_once(DELIM) else {
+        tracing::debug!("ignoring tray menu id with no service prefix: {full_id}");
+        return;
+    };
+
+    if action == "copy-snippet" {
+        match handle.block_on(registry.dispatch(service, "snippet", Value::Null)) {
+            Ok(value) => {
+                if let Some(text) = value.get("snippet").and_then(Value::as_str) {
+                    copy_to_clipboard(clipboard, text);
+                } else {
+                    tracing::warn!("snippet op returned no snippet");
+                }
+            }
+            Err(e) => tracing::warn!("copy snippet failed: {e}"),
+        }
+        return;
+    }
+
+    let Some(svc) = registry.get(service) else {
+        tracing::warn!("tray menu action for unknown service: {service}");
+        return;
+    };
+    if let Err(e) = handle.block_on(svc.menu_action(action)) {
+        tracing::warn!("tray menu action {full_id} failed: {e}");
+    }
+}
+
+/// Copies `text` to the system clipboard, lazily creating the handle.
+fn copy_to_clipboard(clipboard: &mut Option<Clipboard>, text: &str) {
+    if clipboard.is_none() {
+        match Clipboard::new() {
+            Ok(handle) => *clipboard = Some(handle),
+            Err(e) => {
+                tracing::warn!("clipboard unavailable: {e}");
+                return;
+            }
+        }
+    }
+    if let Some(handle) = clipboard.as_mut() {
+        if let Err(e) = handle.set_text(text.to_string()) {
+            tracing::warn!("failed to copy to clipboard: {e}");
+        }
+    }
+}

@@ -12,11 +12,9 @@ use clap::{Parser, ValueEnum};
 use futures::StreamExt as _;
 
 use crate::browser::auth;
+use crate::browser::bridge::DEFAULT_CONTROL_PORT;
 use crate::browser::client::BridgeClient;
 use crate::browser::protocol::{ControlRequest, ResponseEnvelope, StreamLine};
-
-/// Default control-plane port (matches `bridge`'s default).
-const DEFAULT_CONTROL_PORT: u16 = 9998;
 
 /// Fetch credentials mode forwarded to the browser `fetch()`.
 ///
@@ -108,7 +106,7 @@ pub struct RequestCommand {
 impl RequestCommand {
     /// Executes the request command.
     pub async fn execute(self) -> Result<()> {
-        let token = auth::resolve_existing_token(self.token_file.as_deref())?;
+        let token = super::resolve_client_token(self.token_file.as_deref())?;
         let headers = parse_headers(&self.headers)?;
         let body = resolve_body(self.body.as_deref())?;
 

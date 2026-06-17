@@ -209,6 +209,22 @@ impl Cli {
     }
 }
 
+#[cfg(all(target_os = "macos", feature = "menu-bar"))]
+impl Cli {
+    /// If this invocation is `daemon run` without `--no-menu`, resolves the
+    /// daemon configuration so `main` can host it with a macOS menu-bar tray on
+    /// the main thread. Returns `None` for every other invocation (which runs
+    /// normally on the async runtime).
+    pub fn menu_bar_run_config(&self) -> Option<Result<crate::daemon::DaemonRunConfig>> {
+        match &self.command {
+            Commands::Daemon(daemon::DaemonCommand {
+                command: daemon::DaemonSubcommands::Run(run),
+            }) if !run.no_menu => Some(run.clone().into_run_config()),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

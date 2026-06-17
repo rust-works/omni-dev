@@ -28,9 +28,20 @@ pub fn socket_path() -> Result<PathBuf> {
     Ok(runtime_dir()?.join("daemon.sock"))
 }
 
-/// Default bridge token-file path: `<runtime_dir>/bridge.token`.
+/// Default bridge token-file path: `<runtime_dir>/bridge.token`. Thin clients
+/// (`request`/`harvest`) fall back to this when no `--token-file`/env is set.
 pub fn token_path() -> Result<PathBuf> {
     Ok(runtime_dir()?.join("bridge.token"))
+}
+
+/// The bridge token file co-located with a control socket
+/// (`<socket dir>/bridge.token`), so a custom `--socket` keeps its token beside
+/// it. For the default socket this equals [`token_path`].
+pub fn token_path_for_socket(socket: &Path) -> PathBuf {
+    socket.parent().map_or_else(
+        || PathBuf::from("bridge.token"),
+        |dir| dir.join("bridge.token"),
+    )
 }
 
 /// Creates `dir` (and ancestors) if absent and tightens it to owner-only

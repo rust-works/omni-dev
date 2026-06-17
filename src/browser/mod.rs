@@ -15,4 +15,4 @@ pub mod harvest;
 pub mod protocol;
 pub mod snippet;
 
-pub use bridge::{run, BridgeConfig};
+pub use bridge::{run, BridgeConfig, BridgeServer};
