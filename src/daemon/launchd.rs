@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
@@ -82,19 +83,51 @@ pub fn install_and_load(socket: &Path) -> Result<()> {
     let _ = Command::new("launchctl")
         .args(["bootout", &format!("{domain}/{LAUNCHD_LABEL}")])
         .output();
-    let output = Command::new("launchctl")
-        .arg("bootstrap")
-        .arg(&domain)
-        .arg(&plist)
-        .output()
-        .context("failed to run `launchctl bootstrap`")?;
-    if !output.status.success() {
-        bail!(
-            "launchctl bootstrap failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+    // `launchctl bootout` is asynchronous: it returns before launchd finishes
+    // tearing the job down. Bootstrapping into that window races the teardown
+    // and fails with EIO ("Bootstrap failed: 5: Input/output error") — the
+    // failure `daemon restart` hits, since it boots the old agent out and
+    // immediately re-bootstraps. Wait for the job to actually disappear first.
+    wait_until_unloaded(&domain);
+
+    // Even once the job is gone, launchd can briefly return a transient EIO
+    // while it settles, so retry a few times before giving up.
+    let mut last_err = String::new();
+    for attempt in 0..5 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let output = Command::new("launchctl")
+            .arg("bootstrap")
+            .arg(&domain)
+            .arg(&plist)
+            .output()
+            .context("failed to run `launchctl bootstrap`")?;
+        if output.status.success() {
+            return Ok(());
+        }
+        last_err = String::from_utf8_lossy(&output.stderr).trim().to_string();
     }
-    Ok(())
+    bail!("launchctl bootstrap failed: {last_err}");
+}
+
+/// Polls `launchctl print <domain>/<label>` until launchd no longer knows the
+/// job (a non-zero exit / "Could not find service"), or ~5s elapses.
+///
+/// This closes the window opened by the asynchronous `launchctl bootout`: a
+/// `bootstrap` issued while the prior job is still tearing down fails with EIO.
+fn wait_until_unloaded(domain: &str) {
+    let target = format!("{domain}/{LAUNCHD_LABEL}");
+    for _ in 0..50 {
+        let still_loaded = Command::new("launchctl")
+            .args(["print", &target])
+            .output()
+            .is_ok_and(|out| out.status.success());
+        if !still_loaded {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Boots out the agent (SIGTERM-ing a running daemon) so it stops and no longer
