@@ -134,7 +134,10 @@ async fn dispatch_line(
             .await
         {
             Ok(payload) => DaemonReply::ok(payload),
-            Err(e) => DaemonReply::err(e.to_string()),
+            // `{:#}` includes the full anyhow source chain (e.g. "Snowflake
+            // query failed: snowflake server error (000630): …") so the client
+            // can see the underlying cause, not just the top-level wrapper.
+            Err(e) => DaemonReply::err(format!("{e:#}")),
         },
     }
 }

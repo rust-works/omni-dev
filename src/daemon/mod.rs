@@ -38,9 +38,11 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::browser::BridgeConfig;
+use crate::snowflake::SnowflakeEngineConfig;
 use registry::ServiceRegistry;
 use server::DaemonOptions;
 use services::bridge::BridgeService;
+use services::snowflake::SnowflakeService;
 
 /// Everything `daemon run` needs to start the daemon, resolved from the CLI.
 ///
@@ -61,10 +63,13 @@ pub struct DaemonRunConfig {
 }
 
 /// Builds the daemon's default service registry: starts the browser bridge on
-/// its loopback-TCP planes and registers it.
+/// its loopback-TCP planes and registers it alongside the Snowflake query
+/// service.
 ///
 /// `bridge_token_file` overrides token generation; `bridge_token_path` is where
-/// the resolved token is persisted (`0600`) for thin-client discovery.
+/// the resolved token is persisted (`0600`) for thin-client discovery. The
+/// Snowflake service is registered cheaply (no eager auth or I/O); its sessions
+/// are authenticated lazily on first query.
 pub async fn build_default_registry(
     bridge_config: BridgeConfig,
     bridge_token_file: Option<&Path>,
@@ -73,6 +78,8 @@ pub async fn build_default_registry(
     let mut registry = ServiceRegistry::new();
     let bridge = BridgeService::start(bridge_config, bridge_token_file, bridge_token_path).await?;
     registry.register(Arc::new(bridge));
+    let snowflake = SnowflakeService::new(SnowflakeEngineConfig::from_env_and_settings()?);
+    registry.register(Arc::new(snowflake));
     Ok(registry)
 }
 
