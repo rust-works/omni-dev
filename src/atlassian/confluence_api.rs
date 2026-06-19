@@ -611,6 +611,73 @@ struct ConfluenceAttachmentVersion {
     number: u32,
 }
 
+// ── v1 attachment-upload response ───────────────────────────────────
+//
+// Attachment *creation* is only available on the Confluence Cloud v1 REST
+// API (`POST /wiki/rest/api/content/{id}/child/attachment`); the v2 API
+// exposes no attachment-creation endpoint. The v1 response nests its
+// metadata differently from the v2 list shape above, so it needs its own
+// deserialization structs.
+#[derive(Deserialize)]
+struct ConfluenceV1AttachmentResponse {
+    results: Vec<ConfluenceV1AttachmentEntry>,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceV1AttachmentEntry {
+    id: String,
+    title: String,
+    #[serde(default)]
+    extensions: Option<ConfluenceV1AttachmentExtensions>,
+    #[serde(default)]
+    version: Option<ConfluenceAttachmentVersion>,
+    #[serde(default)]
+    container: Option<ConfluenceV1AttachmentContainer>,
+    #[serde(rename = "_links", default)]
+    links: Option<ConfluenceV1AttachmentEntryLinks>,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceV1AttachmentExtensions {
+    #[serde(rename = "mediaType", default)]
+    media_type: Option<String>,
+    #[serde(rename = "fileSize", default)]
+    file_size: Option<u64>,
+    #[serde(rename = "fileId", default)]
+    file_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceV1AttachmentContainer {
+    #[serde(default)]
+    id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ConfluenceV1AttachmentEntryLinks {
+    #[serde(default)]
+    download: Option<String>,
+}
+
+impl From<ConfluenceV1AttachmentEntry> for ConfluenceAttachment {
+    fn from(e: ConfluenceV1AttachmentEntry) -> Self {
+        let (media_type, file_size, file_id) = match e.extensions {
+            Some(x) => (x.media_type, x.file_size, x.file_id),
+            None => (None, None, None),
+        };
+        Self {
+            id: e.id,
+            title: e.title,
+            media_type,
+            file_size,
+            download_url: e.links.and_then(|l| l.download),
+            version: e.version.map(|v| v.number),
+            page_id: e.container.and_then(|c| c.id),
+            file_id,
+        }
+    }
+}
+
 /// An attachment on a Confluence page.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfluenceAttachment {
@@ -1814,8 +1881,11 @@ impl ConfluenceApi {
         }
         form = form.text("minorEdit", if minor_edit { "true" } else { "false" });
 
+        // Attachment creation is v1-only: the v2 API has no
+        // attachment-creation endpoint, and POSTing to
+        // `/wiki/api/v2/pages/{id}/attachments` returns HTTP 405.
         let url = format!(
-            "{}/wiki/api/v2/pages/{}/attachments",
+            "{}/wiki/rest/api/content/{}/child/attachment",
             self.client.instance_url(),
             page_id
         );
@@ -1831,7 +1901,7 @@ impl ConfluenceApi {
             return Err(AtlassianError::ApiRequestFailed { status, body }.into());
         }
 
-        let resp: ConfluenceAttachmentsResponse = response
+        let resp: ConfluenceV1AttachmentResponse = response
             .json()
             .await
             .context("Failed to parse upload attachment response")?;
@@ -5101,7 +5171,7 @@ mod tests {
 
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path(
-                "/wiki/api/v2/pages/12345/attachments",
+                "/wiki/rest/api/content/12345/child/attachment",
             ))
             .and(wiremock::matchers::header("X-Atlassian-Token", "no-check"))
             .respond_with(
@@ -5109,12 +5179,14 @@ mod tests {
                     "results": [{
                         "id": "att-1",
                         "title": "hello.txt",
-                        "mediaType": "text/plain",
-                        "fileSize": 13,
-                        "downloadLink": "/download/att-1",
+                        "extensions": {
+                            "mediaType": "text/plain",
+                            "fileSize": 13,
+                            "fileId": "f-1"
+                        },
                         "version": {"number": 1},
-                        "pageId": "12345",
-                        "fileId": "f-1"
+                        "container": {"id": "12345"},
+                        "_links": {"download": "/download/att-1"}
                     }]
                 })),
             )
@@ -5143,6 +5215,11 @@ mod tests {
         assert_eq!(attachment.media_type.as_deref(), Some("text/plain"));
         assert_eq!(attachment.file_size, Some(13));
         assert_eq!(attachment.version, Some(1));
+        // The v1 response nests these under extensions/_links/container;
+        // assert they are mapped, not silently dropped to None.
+        assert_eq!(attachment.download_url.as_deref(), Some("/download/att-1"));
+        assert_eq!(attachment.page_id.as_deref(), Some("12345"));
+        assert_eq!(attachment.file_id.as_deref(), Some("f-1"));
     }
 
     #[tokio::test]
@@ -5151,7 +5228,7 @@ mod tests {
 
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path(
-                "/wiki/api/v2/pages/99999/attachments",
+                "/wiki/rest/api/content/99999/child/attachment",
             ))
             .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
             .expect(1)
@@ -5177,7 +5254,7 @@ mod tests {
 
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path(
-                "/wiki/api/v2/pages/12345/attachments",
+                "/wiki/rest/api/content/12345/child/attachment",
             ))
             .respond_with(
                 wiremock::ResponseTemplate::new(413).set_body_string("Request entity too large"),
@@ -5207,7 +5284,7 @@ mod tests {
 
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path(
-                "/wiki/api/v2/pages/12345/attachments",
+                "/wiki/rest/api/content/12345/child/attachment",
             ))
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -5229,6 +5306,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(attachment.title, "renamed.png");
+    }
+
+    // Regression for #1005: the v2 attachments path has no POST handler and
+    // returns HTTP 405. Mount it returning 405 *and* the correct v1 path
+    // returning success; the upload must succeed, proving it targets v1.
+    #[tokio::test]
+    async fn upload_attachment_uses_v1_endpoint_not_v2() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/attachments",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(405)
+                    .set_body_string(r#"{"errors":[{"status":405,"code":"METHOD_NOT_ALLOWED"}]}"#),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/wiki/rest/api/content/12345/child/attachment",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{"id": "att-9", "title": "ok.png"}]
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ok.png");
+        tokio::fs::write(&path, b"data").await.unwrap();
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let attachment = api
+            .upload_attachment("12345", &path, None, None, false)
+            .await
+            .unwrap();
+        assert_eq!(attachment.id, "att-9");
     }
 
     #[tokio::test]

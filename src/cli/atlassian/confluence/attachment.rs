@@ -435,7 +435,7 @@ mod tests {
 
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path(
-                "/wiki/api/v2/pages/12345/attachments",
+                "/wiki/rest/api/content/12345/child/attachment",
             ))
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -517,7 +517,7 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path(
-                "/wiki/api/v2/pages/12345/attachments",
+                "/wiki/rest/api/content/12345/child/attachment",
             ))
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
