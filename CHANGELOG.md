@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **`jira dev` auto-discovery for Bitbucket Server** ([#924](https://github.com/rust-works/omni-dev/issues/924)): provider auto-discovery now queries the DevStatus detail endpoint with the instance-type identifier (e.g. `applicationType=stash`) reported by the summary's `byInstanceType` map, rather than the human-readable display name (`Bitbucket Server`). Previously, any provider whose display name differed from its identifier — Bitbucket Server being the canonical case — was missed, returning empty results.
+- **Inline `code` in JFM headings no longer fails the ADF mark validator** ([#1005](https://github.com/rust-works/omni-dev/issues/1005)): A heading authored with backticks — e.g. `` ### `GET /api/services/example` `` — previously produced a `heading` node carrying a `code` mark, which ADF's heading content model forbids, so the document was rejected at write time with an opaque JSONPath-only error. The JFM→ADF converter now strips the `code` mark from heading content (keeping the text as plain — the safe lossy direction, since Atlassian renders no inline-code styling on headings) and emits a warning naming the affected heading. The validator remains the safety net for any other path that produces a code-marked heading.
 
 ## [0.29.0] - 2026-06-12
 

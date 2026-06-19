@@ -160,7 +160,18 @@ impl<'a> MarkdownParser<'a> {
         self.advance();
         // Collect indented continuation lines produced by hardBreaks (issue #433).
         self.collect_hardbreak_continuations(&mut full_text);
-        let inline_nodes = parse_inline(&full_text);
+        let mut inline_nodes = parse_inline(&full_text);
+        // ADF's `heading` content model forbids the `code` mark, but
+        // JFM/CommonMark parses inline-code spans inside `#`-headings. Strip
+        // them here (keeping the text as plain) so we don't build a document
+        // the validator only rejects at write time (issue #1005).
+        if strip_heading_code_marks(&mut inline_nodes) > 0 {
+            warn!(
+                "Stripped inline `code` from heading (ADF forbids code marks on \
+                 headings; kept the text as plain): {}",
+                full_text.trim()
+            );
+        }
 
         #[allow(clippy::cast_possible_truncation)]
         Some(AdfNode::heading(level as u8, inline_nodes))
@@ -2172,6 +2183,34 @@ fn add_mark(node: &mut AdfNode, mark: AdfMark) {
     } else {
         node.marks = Some(vec![mark]);
     }
+}
+
+/// Removes `code` marks from heading inline content, returning the count
+/// removed.
+///
+/// ADF's `heading` content model forbids the `code` mark (a heading styles
+/// its own text), but JFM/CommonMark parses inline-code spans inside
+/// `#`-headings. Stripping here keeps the text as plain — a lossy but safe
+/// direction, since Atlassian renders no inline-code styling on headings —
+/// rather than building a document the validator only rejects at write time
+/// (issue #1005). Recurses into `content` to be robust to future inline
+/// containers; today heading inline content is flat text nodes.
+fn strip_heading_code_marks(nodes: &mut [AdfNode]) -> usize {
+    let mut removed = 0;
+    for node in nodes.iter_mut() {
+        if let Some(marks) = node.marks.as_mut() {
+            let before = marks.len();
+            marks.retain(|m| m.mark_type != "code");
+            removed += before - marks.len();
+            if marks.is_empty() {
+                node.marks = None;
+            }
+        }
+        if let Some(children) = node.content.as_mut() {
+            removed += strip_heading_code_marks(children);
+        }
+    }
+    removed
 }
 
 /// Prepends a mark before existing marks to preserve outside-in ordering.
@@ -4964,6 +5003,64 @@ mod tests {
             let attrs = doc.content[0].attrs.as_ref().unwrap();
             assert_eq!(attrs["level"], level as u64);
         }
+    }
+
+    // ── issue #1005: inline `code` is not permitted on headings ─────
+
+    #[test]
+    fn heading_inline_code_mark_stripped() {
+        // `### `GET /api`` parses an inline-code span; ADF forbids the `code`
+        // mark on headings, so it is stripped and the text kept as plain.
+        let doc = markdown_to_adf("### `GET /api`").unwrap();
+        let heading = &doc.content[0];
+        assert_eq!(heading.node_type, "heading");
+        let content = heading.content.as_ref().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].text.as_deref(), Some("GET /api"));
+        assert!(
+            content[0].marks.is_none(),
+            "expected no marks, got: {:?}",
+            content[0].marks
+        );
+    }
+
+    #[test]
+    fn heading_code_strip_preserves_sibling_strong() {
+        // `### **`x`**` → text `x` carrying `strong`; only `code` is removed.
+        let doc = markdown_to_adf("### **`x`**").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        let marks = content[0].marks.as_ref().unwrap();
+        assert!(marks.iter().any(|m| m.mark_type == "strong"));
+        assert!(!marks.iter().any(|m| m.mark_type == "code"));
+    }
+
+    #[test]
+    fn heading_code_strip_preserves_link() {
+        // `### [`x`](url)` → text `x` carrying `link`; only `code` is removed.
+        let doc = markdown_to_adf("### [`x`](https://e.com)").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        let marks = content[0].marks.as_ref().unwrap();
+        assert!(marks.iter().any(|m| m.mark_type == "link"));
+        assert!(!marks.iter().any(|m| m.mark_type == "code"));
+    }
+
+    #[test]
+    fn heading_with_code_now_passes_validation() {
+        // End-to-end guard: the converted document no longer trips the ADF
+        // mark validator that previously rejected it at write time.
+        let doc = markdown_to_adf("### `GET /api`").unwrap();
+        let violations = crate::atlassian::adf_schema::validate_document(&doc);
+        assert!(violations.is_empty(), "got: {violations:?}");
+    }
+
+    #[test]
+    fn paragraph_inline_code_mark_preserved() {
+        // Regression guard: the strip is heading-only — paragraph inline code
+        // keeps its `code` mark.
+        let doc = markdown_to_adf("`x`").unwrap();
+        let content = doc.content[0].content.as_ref().unwrap();
+        let marks = content[0].marks.as_ref().unwrap();
+        assert!(marks.iter().any(|m| m.mark_type == "code"));
     }
 
     #[test]
