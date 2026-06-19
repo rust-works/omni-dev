@@ -250,4 +250,29 @@ mod tests {
         assert_eq!(parse_callback_token("GET /?foo=bar HTTP/1.1\r\n\r\n"), None);
         assert_eq!(parse_callback_token("garbage"), None);
     }
+
+    #[test]
+    fn open_browser_manual_logs_and_succeeds() {
+        assert!(open_browser(&BrowserLaunch::Manual, "https://example/sso").is_ok());
+    }
+
+    #[test]
+    fn open_browser_command_substitutes_url_placeholder() {
+        // `true` ignores its args and exits 0, exercising arg building + spawn
+        // (including the `{url}` substitution) without opening anything.
+        let launch = BrowserLaunch::Command(vec!["true".to_string(), "--url={url}".to_string()]);
+        assert!(open_browser(&launch, "https://example/sso").is_ok());
+    }
+
+    #[test]
+    fn open_browser_command_appends_url_when_no_placeholder() {
+        let launch = BrowserLaunch::Command(vec!["true".to_string()]);
+        assert!(open_browser(&launch, "https://example/sso").is_ok());
+    }
+
+    #[test]
+    fn open_browser_command_rejects_empty_args() {
+        let launch = BrowserLaunch::Command(vec![]);
+        assert!(matches!(open_browser(&launch, "u"), Err(Error::Auth(_))));
+    }
 }

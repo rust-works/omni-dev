@@ -71,3 +71,53 @@ impl SnowflakeClient {
         ))
     }
 }
+
+/// Builds a session whose transport targets `base_url` with placeholder tokens,
+/// so the engine's query orchestration can be exercised offline against a mock
+/// server without going through the (live-only) browser SSO flow.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+pub(crate) fn test_session(base_url: &str, query_timeout: std::time::Duration) -> SnowflakeSession {
+    use std::time::Duration;
+    let url = url::Url::parse(base_url).unwrap().join("/").unwrap();
+    let transport =
+        Arc::new(transport::Transport::with_base_url(url, Duration::from_secs(5)).unwrap());
+    SnowflakeSession::new(
+        transport,
+        session::LoginTokens {
+            session_token: "test-sess".to_string(),
+            master_token: "test-mast".to_string(),
+            session_validity_secs: 3600,
+            master_validity_secs: 14_400,
+        },
+        query_timeout,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_builds_a_client_and_exposes_its_config() {
+        let client = SnowflakeClient::new(SnowflakeClientConfig::external_browser("MyAcct", "me"))
+            .expect("a valid account resolves to a valid host");
+        assert_eq!(client.config().account, "MyAcct");
+        assert_eq!(client.config().user, "me");
+        assert_eq!(client.config().api_host(), "myacct.snowflakecomputing.com");
+    }
+
+    #[test]
+    fn new_rejects_an_invalid_host_override() {
+        let config = SnowflakeClientConfig {
+            // An unterminated IPv6 literal can never parse as a URL host.
+            host: Some("[".to_string()),
+            ..SnowflakeClientConfig::external_browser("acct", "me")
+        };
+        assert!(matches!(
+            SnowflakeClient::new(config),
+            Err(Error::Protocol(_))
+        ));
+    }
+}

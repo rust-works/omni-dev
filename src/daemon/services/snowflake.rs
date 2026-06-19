@@ -15,6 +15,7 @@ use chrono::Utc;
 use serde_json::{json, Value};
 
 use crate::daemon::service::{DaemonService, MenuAction, MenuItem, MenuSnapshot, ServiceStatus};
+use crate::snowflake::session::SessionInfo;
 use crate::snowflake::{QueryRequest, SnowflakeEngine, SnowflakeEngineConfig};
 
 /// The Snowflake service name (the control-socket routing key).
@@ -70,52 +71,11 @@ impl DaemonService for SnowflakeService {
 
     fn menu(&self) -> MenuSnapshot {
         let sessions = self.engine.sessions();
-        let mut items = Vec::new();
-        if sessions.is_empty() {
-            items.push(MenuItem::Label("No sessions".to_string()));
+        let items = if sessions.is_empty() {
+            vec![MenuItem::Label("No sessions".to_string())]
         } else {
-            for session in &sessions {
-                items.push(MenuItem::Label(format!(
-                    "{} · {} · {}/{} sessions · {} queries",
-                    session.account,
-                    session.user,
-                    session.sessions,
-                    session.max_sessions,
-                    session.query_count
-                )));
-                // One line per individual authenticated session (auth), with what
-                // it's doing: the running query + elapsed when busy, else idle time.
-                for member in &session.members {
-                    let state = if let Some(running) = &member.running {
-                        let secs = (Utc::now() - running.started_at).num_seconds().max(0);
-                        format!("running {secs}s: {}", running.sql)
-                    } else if member.busy {
-                        "busy".to_string()
-                    } else {
-                        let idle = (Utc::now() - member.last_used).num_seconds().max(0);
-                        format!("idle {idle}s · {} queries", member.query_count)
-                    };
-                    items.push(MenuItem::Label(format!(
-                        "    #{} {} · {state}",
-                        member.id,
-                        member.context.summary(),
-                    )));
-                }
-            }
-            items.push(MenuItem::Separator);
-            for session in &sessions {
-                items.push(MenuItem::Action(MenuAction {
-                    id: format!("disconnect:{}", session.id),
-                    label: format!("Disconnect {} · {}", session.account, session.user),
-                    enabled: true,
-                }));
-            }
-            items.push(MenuItem::Action(MenuAction {
-                id: "disconnect-all".to_string(),
-                label: "Disconnect all".to_string(),
-                enabled: true,
-            }));
-        }
+            session_menu_items(&sessions)
+        };
         MenuSnapshot {
             title: "Snowflake".to_string(),
             items,
@@ -151,6 +111,55 @@ impl DaemonService for SnowflakeService {
     async fn shutdown(&self) {
         self.engine.shutdown().await;
     }
+}
+
+/// Builds the tray items for a non-empty session list: a label per pool, an
+/// indented label per authenticated session (with what it's doing), a separator,
+/// and the per-pool + "Disconnect all" actions.
+fn session_menu_items(sessions: &[SessionInfo]) -> Vec<MenuItem> {
+    let mut items = Vec::new();
+    for session in sessions {
+        items.push(MenuItem::Label(format!(
+            "{} · {} · {}/{} sessions · {} queries",
+            session.account,
+            session.user,
+            session.sessions,
+            session.max_sessions,
+            session.query_count
+        )));
+        // One line per individual authenticated session (auth), with what it's
+        // doing: the running query + elapsed when busy, else idle time.
+        for member in &session.members {
+            let state = if let Some(running) = &member.running {
+                let secs = (Utc::now() - running.started_at).num_seconds().max(0);
+                format!("running {secs}s: {}", running.sql)
+            } else if member.busy {
+                "busy".to_string()
+            } else {
+                let idle = (Utc::now() - member.last_used).num_seconds().max(0);
+                format!("idle {idle}s · {} queries", member.query_count)
+            };
+            items.push(MenuItem::Label(format!(
+                "    #{} {} · {state}",
+                member.id,
+                member.context.summary(),
+            )));
+        }
+    }
+    items.push(MenuItem::Separator);
+    for session in sessions {
+        items.push(MenuItem::Action(MenuAction {
+            id: format!("disconnect:{}", session.id),
+            label: format!("Disconnect {} · {}", session.account, session.user),
+            enabled: true,
+        }));
+    }
+    items.push(MenuItem::Action(MenuAction {
+        id: "disconnect-all".to_string(),
+        label: "Disconnect all".to_string(),
+        enabled: true,
+    }));
+    items
 }
 
 #[cfg(test)]
@@ -235,5 +244,86 @@ mod tests {
         assert!(svc.menu_action("disconnect:not-a-number").await.is_err());
         assert!(svc.menu_action("bogus").await.is_err());
         svc.shutdown().await;
+    }
+
+    #[test]
+    fn session_menu_items_render_each_member_state_and_actions() {
+        use crate::snowflake::session::{MemberInfo, QueryContext, RunningQuery};
+
+        let now = Utc::now();
+        let wh_ctx = QueryContext {
+            warehouse: Some("WH".to_string()),
+            role: Some("R".to_string()),
+            ..QueryContext::default()
+        };
+        let sessions = vec![SessionInfo {
+            id: 5,
+            account: "ACME".to_string(),
+            user: "me".to_string(),
+            created_at: now,
+            last_used: now,
+            query_count: 9,
+            sessions: 3,
+            max_sessions: 4,
+            members: vec![
+                MemberInfo {
+                    id: 1,
+                    busy: true,
+                    context: wh_ctx,
+                    last_used: now,
+                    query_count: 3,
+                    running: Some(RunningQuery {
+                        sql: "SELECT 42".to_string(),
+                        started_at: now,
+                    }),
+                },
+                MemberInfo {
+                    id: 2,
+                    busy: true,
+                    context: QueryContext::default(),
+                    last_used: now,
+                    query_count: 1,
+                    running: None,
+                },
+                MemberInfo {
+                    id: 3,
+                    busy: false,
+                    context: QueryContext::default(),
+                    last_used: now,
+                    query_count: 0,
+                    running: None,
+                },
+            ],
+        }];
+
+        let items = session_menu_items(&sessions);
+        let labels: Vec<&str> = items
+            .iter()
+            .filter_map(|i| match i {
+                MenuItem::Label(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(labels
+            .iter()
+            .any(|l| l.contains("ACME · me · 3/4 sessions · 9 queries")));
+        assert!(labels
+            .iter()
+            .any(|l| l.contains("running") && l.contains("SELECT 42") && l.contains("WH/R")));
+        assert!(labels.iter().any(|l| l.contains("busy")));
+        assert!(labels
+            .iter()
+            .any(|l| l.contains("idle") && l.contains("(default)")));
+
+        assert!(items.iter().any(|i| matches!(i, MenuItem::Separator)));
+        let action_ids: Vec<&str> = items
+            .iter()
+            .filter_map(|i| match i {
+                MenuItem::Action(a) => Some(a.id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(action_ids.contains(&"disconnect:5"));
+        assert!(action_ids.contains(&"disconnect-all"));
     }
 }

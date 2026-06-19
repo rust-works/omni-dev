@@ -47,3 +47,41 @@ impl Error {
         matches!(self, Self::SessionExpired)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_session_expired_only_for_session_expired() {
+        assert!(Error::SessionExpired.is_session_expired());
+        assert!(!Error::Auth("x".into()).is_session_expired());
+        assert!(!Error::Unsupported("arrow".into()).is_session_expired());
+        assert!(!Error::Protocol("p".into()).is_session_expired());
+        assert!(!Error::Server {
+            code: "390112".into(),
+            message: "m".into(),
+        }
+        .is_session_expired());
+    }
+
+    #[test]
+    fn display_renders_code_and_message() {
+        assert_eq!(
+            Error::SessionExpired.to_string(),
+            "snowflake session expired"
+        );
+        assert_eq!(
+            Error::Server {
+                code: "001003".into(),
+                message: "boom".into(),
+            }
+            .to_string(),
+            "snowflake server error (001003): boom"
+        );
+        assert_eq!(
+            Error::Unsupported("arrow".into()).to_string(),
+            "unsupported snowflake feature: arrow"
+        );
+    }
+}

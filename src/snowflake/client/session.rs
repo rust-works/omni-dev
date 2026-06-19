@@ -351,6 +351,169 @@ fn cell_to_string(value: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use crate::snowflake::client::row::rows_to_payload;
+    use url::Url;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A session whose transport points at `server`, with the given session-token
+    /// validity. The master token is long-lived.
+    fn live_session(server: &MockServer, session_validity_secs: i64) -> SnowflakeSession {
+        let base = Url::parse(&server.uri()).unwrap().join("/").unwrap();
+        let transport = Arc::new(Transport::with_base_url(base, Duration::from_secs(5)).unwrap());
+        SnowflakeSession::new(
+            transport,
+            LoginTokens {
+                session_token: "sess".to_string(),
+                master_token: "mast".to_string(),
+                session_validity_secs,
+                master_validity_secs: 14_400,
+            },
+            Duration::from_secs(5),
+        )
+    }
+
+    #[test]
+    fn token_accessors_reflect_validities() {
+        // The token accessors never touch the network.
+        let base = Url::parse("https://acct.example/").unwrap();
+        let transport = Arc::new(Transport::with_base_url(base, Duration::from_secs(5)).unwrap());
+        let session = SnowflakeSession::new(
+            transport,
+            LoginTokens {
+                session_token: "s".to_string(),
+                master_token: "m".to_string(),
+                session_validity_secs: 3600,
+                master_validity_secs: 14_400,
+            },
+            Duration::from_secs(5),
+        );
+        assert!(session.master_expires_at() > Utc::now());
+        assert!(!session.session_expiring_within(TimeDelta::seconds(60)));
+        assert!(session.session_expiring_within(TimeDelta::seconds(7200)));
+    }
+
+    #[tokio::test]
+    async fn query_returns_inline_rows() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/queries/v1/query-request"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "data": {
+                    "queryResultFormat": "json",
+                    "rowtype": [{ "name": "N", "type": "fixed", "precision": 38, "scale": 0 }],
+                    "rowset": [["1"], ["2"]],
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let rows = live_session(&server, 3600).query("SELECT 1").await.unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn query_downloads_and_appends_external_chunks() {
+        let server = MockServer::start().await;
+        let chunk_url = format!("{}/chunk0", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/queries/v1/query-request"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "data": {
+                    "queryResultFormat": "json",
+                    "rowtype": [{ "name": "N", "type": "text" }],
+                    "rowset": [["a"]],
+                    "chunks": [{ "url": chunk_url }],
+                }
+            })))
+            .mount(&server)
+            .await;
+        // A real chunk is bare, comma-separated row arrays (no enclosing brackets).
+        Mock::given(method("GET"))
+            .and(path("/chunk0"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(br#"["b"],["c"]"#.to_vec()))
+            .mount(&server)
+            .await;
+
+        let rows = live_session(&server, 3600).query("SELECT 1").await.unwrap();
+        assert_eq!(rows.len(), 3, "1 inline + 2 chunked");
+    }
+
+    #[tokio::test]
+    async fn query_surfaces_session_expired() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/queries/v1/query-request"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": false, "code": "390112", "message": "expired", "data": {}
+            })))
+            .mount(&server)
+            .await;
+
+        let err = live_session(&server, 3600)
+            .query("SELECT 1")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::SessionExpired));
+    }
+
+    #[tokio::test]
+    async fn renew_swaps_in_a_fresh_session_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/session/token-request"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "data": { "sessionToken": "new-sess", "validityInSecondsST": 3600 }
+            })))
+            .mount(&server)
+            .await;
+
+        // A nearly-expired session is no longer about to expire after a renew.
+        let session = live_session(&server, 1);
+        assert!(session.session_expiring_within(TimeDelta::seconds(120)));
+        session.renew().await.unwrap();
+        assert!(!session.session_expiring_within(TimeDelta::seconds(120)));
+    }
+
+    #[tokio::test]
+    async fn renew_errors_when_response_lacks_a_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/session/token-request"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "success": true, "data": {} })),
+            )
+            .mount(&server)
+            .await;
+
+        let err = live_session(&server, 3600).renew().await.unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_and_close_post_successfully() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/session/heartbeat"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "success": true, "data": {} })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/session"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "success": true, "data": {} })),
+            )
+            .mount(&server)
+            .await;
+
+        let session = live_session(&server, 3600);
+        session.heartbeat().await.unwrap();
+        session.close().await.unwrap();
+    }
 
     #[test]
     fn parse_result_builds_columns_and_inline_rows() {
