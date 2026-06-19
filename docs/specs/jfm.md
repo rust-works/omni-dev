@@ -176,6 +176,15 @@ ADF v1.
 | `breakout`        | Trailing block attr: `{breakout=wide breakoutWidth=N}`  |
 | `border`          | On media/table cells: `border-color=#hex border-size=N` |
 
+> **Inline `code` in headings.** ADF's `heading` content model forbids the
+> `code` mark (a heading styles its own text, and Atlassian renders no
+> inline-code styling on headings). A heading authored with backticks —
+> e.g. `` ### `GET /api/services/example` `` — has its `code` mark stripped
+> during JFM→ADF conversion, keeping the text as plain, and a warning is
+> emitted naming the heading. The conversion is intentionally lossy in the
+> safe direction: without stripping, the document would be rejected by the
+> mark validator at write time (issue #1005).
+
 ### Unsupported Node Handling
 
 ADF nodes that cannot be represented in markdown are serialized as fenced
@@ -306,12 +315,12 @@ As of `SCHEMA_VERSION 52.9.5-2026-05-10`, the validator covers:
 - Per-term quantifiers and content-term sequences (e.g. empty `bulletList`,
   two-`media` `mediaSingle`, or a `layoutSection` with one column are all
   reported as `AdfSchemaViolation::Arity`).
-
-Out of scope and not enforced:
-
-- Mark whitelists (which marks may apply to which nodes).
-- Attribute-value schemas (allowed values for `panel.type`, `status.color`,
-  etc.).
+- Per-context mark allow-lists (which marks may apply to which nodes — e.g.
+  `code` is rejected on `heading`) and per-mark attribute schemas, reported as
+  `AdfSchemaViolation::DisallowedMark` / `InvalidMarkAttr`.
+- Node attribute-value schemas (allowed values for `panel.panelType`,
+  `status.color`, `heading.level`, etc.), reported as
+  `AdfSchemaViolation::MissingAttr` / `InvalidAttr`.
 
 ## Generic Directive System
 
