@@ -19,6 +19,14 @@ scopes:
     description: "Browser bridge: drive authenticated requests through a browser tab"
     examples: ["browser: add WebSocket bridge", "browser: support binary response bodies"]
     file_patterns: ["src/browser/**", "src/cli/browser/**", "src/cli/browser.rs"]
+  - name: "snowflake"
+    description: "Snowflake query service: authenticate-once SSO sessions on the daemon"
+    examples: ["snowflake: add account-agnostic session engine", "snowflake: map arbitrary rows to JSON"]
+    file_patterns: ["src/snowflake/**", "src/cli/snowflake.rs", "src/daemon/services/snowflake.rs"]
+  - name: "daemon"
+    description: "Daemon supervisor: control socket, lifecycle, service registry, menu-bar tray"
+    examples: ["daemon: add service registry", "daemon: update tray menu items in place"]
+    file_patterns: ["src/daemon/**", "src/cli/daemon.rs", "src/cli/daemon/**"]
   - name: "git"
     description: "Git operations and repository analysis"
     examples: ["git: enhance commit parsing", "git: add branch analysis"]
