@@ -17,6 +17,7 @@ Commands:
   browser     Browser bridge: drive authenticated requests through a browser tab
   daemon      Daemon: host long-lived services (e.g. the browser bridge)
   datadog     Datadog: read-only API operations
+  snowflake   Snowflake: run arbitrary SQL through the daemon's multiplexed sessions
   coverage    Coverage: diff/patch coverage analysis for PR comments
   transcript  Transcript and caption fetching from media platforms
   resources   Embedded reference resources (specs, etc.)
@@ -3042,6 +3043,76 @@ Arguments:
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev snowflake - Snowflake: run arbitrary SQL through the daemon's multiplexed sessions
+
+Snowflake: run arbitrary SQL through the daemon's multiplexed sessions
+
+Usage: snowflake <COMMAND>
+
+Commands:
+  query       Run SQL (from an argument or stdin) through a multiplexed session
+  sessions    List active multiplexed sessions
+  disconnect  Disconnect (evict) one session
+  help        Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+
+================================================================================
+
+omni-dev snowflake disconnect - Disconnect (evict) one session
+
+Disconnect (evict) one session
+
+Usage: disconnect [OPTIONS] --account <ACCOUNT> --user <USER>
+
+Options:
+      --account <ACCOUNT>  Account of the session to evict
+      --user <USER>        User of the session to evict
+      --socket <PATH>      Control-socket path. Defaults to the per-user runtime location
+  -h, --help               Print help
+
+
+================================================================================
+
+omni-dev snowflake query - Run SQL (from an argument or stdin) through a multiplexed session
+
+Run SQL (from an argument or stdin) through a multiplexed session
+
+Usage: query [OPTIONS] [SQL]
+
+Arguments:
+  [SQL]  SQL to run. Read from stdin when omitted
+
+Options:
+      --account <ACCOUNT>      Target account. Falls back to `SNOWFLAKE_ACCOUNT` / settings.json
+      --user <USER>            Authenticating user. Falls back to `SNOWFLAKE_USER` / settings.json
+      --warehouse <WAREHOUSE>  Per-query warehouse (`USE WAREHOUSE`)
+      --role <ROLE>            Per-query role (`USE ROLE`)
+      --database <DATABASE>    Per-query database (`USE DATABASE`)
+      --schema <SCHEMA>        Per-query schema (`USE SCHEMA`)
+      --socket <PATH>          Control-socket path. Defaults to the per-user runtime location
+      --format <FORMAT>        Output format [default: json] [possible values: json, yaml]
+  -h, --help                   Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev snowflake sessions - List active multiplexed sessions
+
+List active multiplexed sessions
+
+Usage: sessions [OPTIONS]
+
+Options:
+      --socket <PATH>  Control-socket path. Defaults to the per-user runtime location
+      --json           Emit machine-readable JSON instead of a table
+  -h, --help           Print help
 
 
 ================================================================================

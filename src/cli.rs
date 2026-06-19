@@ -15,6 +15,7 @@ pub mod datadog;
 pub mod git;
 pub mod help;
 pub mod resources;
+pub mod snowflake;
 pub mod transcript;
 
 /// CLI-side selector for the AI backend dispatched by
@@ -138,6 +139,8 @@ pub enum Commands {
     Daemon(daemon::DaemonCommand),
     /// Datadog: read-only API operations.
     Datadog(datadog::DatadogCommand),
+    /// Snowflake: run arbitrary SQL through the daemon's multiplexed sessions.
+    Snowflake(snowflake::SnowflakeCommand),
     /// Coverage: diff/patch coverage analysis for PR comments.
     Coverage(coverage::CoverageCommand),
     /// Transcript and caption fetching from media platforms.
@@ -199,6 +202,7 @@ impl Cli {
             Commands::Browser(cmd) => cmd.execute().await,
             Commands::Daemon(cmd) => cmd.execute().await,
             Commands::Datadog(cmd) => cmd.execute().await,
+            Commands::Snowflake(cmd) => cmd.execute().await,
             Commands::Coverage(cmd) => cmd.execute(repo).await,
             Commands::Transcript(cmd) => cmd.execute().await,
             Commands::Config(config_cmd) => config_cmd.execute(),
