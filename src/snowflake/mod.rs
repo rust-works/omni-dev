@@ -573,4 +573,167 @@ mod tests {
         assert!(!engine.disconnect_by_id(1));
         assert_eq!(engine.disconnect_all(), 0);
     }
+
+    #[test]
+    fn sql_preview_collapses_whitespace_and_truncates() {
+        // Whitespace/newlines collapse to single spaces; short SQL is unchanged.
+        assert_eq!(sql_preview("SELECT   1\n  FROM t", 60), "SELECT 1 FROM t");
+        // Over-length SQL is truncated with an ellipsis.
+        let long = format!("SELECT {}", "a".repeat(100));
+        let preview = sql_preview(&long, 20);
+        assert!(preview.ends_with('…'));
+        assert!(preview.chars().count() <= 21, "{preview}");
+    }
+
+    #[test]
+    fn overrides_extracts_only_the_set_dimensions() {
+        let req = QueryRequest {
+            warehouse: Some("WH".to_string()),
+            schema: Some("S".to_string()),
+            sql: "SELECT 1".to_string(),
+            ..QueryRequest::default()
+        };
+        let overrides = req.overrides();
+        assert_eq!(overrides.warehouse.as_deref(), Some("WH"));
+        assert_eq!(overrides.schema.as_deref(), Some("S"));
+        assert!(overrides.role.is_none());
+        assert!(overrides.database.is_none());
+    }
+
+    mod orchestration {
+        use super::*;
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// Mounts a `query-request` handler that returns `data` for every POST.
+        async fn mount_query(server: &MockServer, data: serde_json::Value) {
+            Mock::given(method("POST"))
+                .and(path("/queries/v1/query-request"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({ "success": true, "data": data })),
+                )
+                .mount(server)
+                .await;
+        }
+
+        #[tokio::test]
+        async fn capture_base_context_reads_current_context() {
+            let server = MockServer::start().await;
+            mount_query(
+                &server,
+                json!({
+                    "rowtype": [
+                        { "name": "CURRENT_WAREHOUSE()", "type": "text" },
+                        { "name": "CURRENT_ROLE()", "type": "text" },
+                        { "name": "CURRENT_DATABASE()", "type": "text" },
+                        { "name": "CURRENT_SCHEMA()", "type": "text" },
+                    ],
+                    "rowset": [["WH", "R", "DB", "S"]],
+                }),
+            )
+            .await;
+            let session = client::test_session(&server.uri(), Duration::from_secs(5));
+            let base = capture_base_context(&session).await.unwrap();
+            assert_eq!(base.warehouse.as_deref(), Some("WH"));
+            assert_eq!(base.role.as_deref(), Some("R"));
+            assert_eq!(base.database.as_deref(), Some("DB"));
+            assert_eq!(base.schema.as_deref(), Some("S"));
+        }
+
+        #[tokio::test]
+        async fn capture_base_context_defaults_when_no_rows() {
+            let server = MockServer::start().await;
+            mount_query(
+                &server,
+                json!({ "rowtype": [{ "name": "X", "type": "text" }], "rowset": [] }),
+            )
+            .await;
+            let session = client::test_session(&server.uri(), Duration::from_secs(5));
+            assert_eq!(
+                capture_base_context(&session).await.unwrap(),
+                QueryContext::default()
+            );
+        }
+
+        #[tokio::test]
+        async fn apply_context_issues_use_only_for_differing_dimensions() {
+            let server = MockServer::start().await;
+            mount_query(&server, json!({ "rowtype": [], "rowset": [] })).await;
+            let session = client::test_session(&server.uri(), Duration::from_secs(5));
+
+            let current = QueryContext {
+                warehouse: Some("WH".to_string()),
+                ..QueryContext::default()
+            };
+            let target = QueryContext {
+                warehouse: Some("WH".to_string()), // same → no USE
+                role: Some("R2".to_string()),      // differs → one USE
+                ..QueryContext::default()
+            };
+            apply_context(&session, &current, &target).await.unwrap();
+
+            let reqs = server.received_requests().await.unwrap();
+            assert_eq!(reqs.len(), 1, "only the differing dimension issues a USE");
+            assert!(String::from_utf8_lossy(&reqs[0].body).contains("USE ROLE R2"));
+        }
+
+        #[tokio::test]
+        async fn run_with_renew_runs_without_renew_when_not_expired() {
+            let server = MockServer::start().await;
+            mount_query(
+                &server,
+                json!({ "rowtype": [{ "name": "N", "type": "text" }], "rowset": [["x"]] }),
+            )
+            .await;
+            let session = client::test_session(&server.uri(), Duration::from_secs(5));
+            let ctx = QueryContext::default();
+            let rows = run_with_renew(&session, &ctx, &ctx, "SELECT 1")
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn run_with_renew_renews_and_retries_once_on_expiry() {
+            let server = MockServer::start().await;
+            // First query attempt: session expired (then this rule is exhausted).
+            Mock::given(method("POST"))
+                .and(path("/queries/v1/query-request"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "success": false, "code": "390112", "message": "expired", "data": {}
+                })))
+                .up_to_n_times(1)
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            // Renew succeeds.
+            Mock::given(method("POST"))
+                .and(path("/session/token-request"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "success": true,
+                    "data": { "sessionToken": "fresh", "validityInSecondsST": 3600 }
+                })))
+                .mount(&server)
+                .await;
+            // The retried query succeeds.
+            Mock::given(method("POST"))
+                .and(path("/queries/v1/query-request"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "success": true,
+                    "data": { "rowtype": [{ "name": "N", "type": "text" }], "rowset": [["x"]] }
+                })))
+                .with_priority(2)
+                .mount(&server)
+                .await;
+
+            let session = client::test_session(&server.uri(), Duration::from_secs(5));
+            let ctx = QueryContext::default();
+            let rows = run_with_renew(&session, &ctx, &ctx, "SELECT 1")
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1, "renewed and retried transparently");
+        }
+    }
 }

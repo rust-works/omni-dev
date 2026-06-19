@@ -145,63 +145,77 @@ impl SessionsCommand {
             println!("{}", serde_json::to_string_pretty(&result)?);
             return Ok(());
         }
-        let sessions = result
-            .get("sessions")
-            .and_then(Value::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        if sessions.is_empty() {
-            println!("No active sessions.");
-            return Ok(());
-        }
-        println!(
-            "{:<4} {:<28} {:<28} {:>8} {:>7}",
-            "ID", "ACCOUNT", "USER", "SESSIONS", "QUERIES"
-        );
-        for session in sessions {
-            let id = session.get("id").and_then(Value::as_u64).unwrap_or(0);
-            let account = session.get("account").and_then(Value::as_str).unwrap_or("");
-            let user = session.get("user").and_then(Value::as_str).unwrap_or("");
-            let live = session.get("sessions").and_then(Value::as_u64).unwrap_or(0);
-            let max = session
-                .get("max_sessions")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let count = session
-                .get("query_count")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let pool = format!("{live}/{max}");
-            println!("{id:<4} {account:<28} {user:<28} {pool:>8} {count:>7}");
-            // One indented line per individual authenticated session (auth),
-            // with what it's doing.
-            if let Some(members) = session.get("members").and_then(Value::as_array) {
-                for member in members {
-                    let mid = member.get("id").and_then(Value::as_u64).unwrap_or(0);
-                    let qc = member
-                        .get("query_count")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                    let context = member
-                        .get("context")
-                        .map_or_else(|| "(default)".to_string(), context_summary);
-                    let state =
-                        if let Some(running) = member.get("running").filter(|r| !r.is_null()) {
-                            let sql = running.get("sql").and_then(Value::as_str).unwrap_or("");
-                            let secs = age_secs(running.get("started_at").and_then(Value::as_str));
-                            format!("running {secs}s: {sql}")
-                        } else if member.get("busy").and_then(Value::as_bool).unwrap_or(false) {
-                            "busy".to_string()
-                        } else {
-                            let secs = age_secs(member.get("last_used").and_then(Value::as_str));
-                            format!("idle {secs}s")
-                        };
-                    println!("       #{mid} {context} · {state} · {qc} queries");
-                }
-            }
-        }
+        println!("{}", render_sessions(&result));
         Ok(())
     }
+}
+
+/// Renders a `sessions` reply as a human-readable table: a header, one row per
+/// pool, and an indented line per authenticated session (what each is doing).
+/// Returns a placeholder line when there are no active sessions.
+fn render_sessions(result: &Value) -> String {
+    let sessions = result
+        .get("sessions")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if sessions.is_empty() {
+        return "No active sessions.".to_string();
+    }
+    let mut out = format!(
+        "{:<4} {:<28} {:<28} {:>8} {:>7}",
+        "ID", "ACCOUNT", "USER", "SESSIONS", "QUERIES"
+    );
+    for session in sessions {
+        let id = session.get("id").and_then(Value::as_u64).unwrap_or(0);
+        let account = session.get("account").and_then(Value::as_str).unwrap_or("");
+        let user = session.get("user").and_then(Value::as_str).unwrap_or("");
+        let live = session.get("sessions").and_then(Value::as_u64).unwrap_or(0);
+        let max = session
+            .get("max_sessions")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let count = session
+            .get("query_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let pool = format!("{live}/{max}");
+        out.push_str(&format!(
+            "\n{id:<4} {account:<28} {user:<28} {pool:>8} {count:>7}"
+        ));
+        // One indented line per individual authenticated session (auth), with
+        // what it's doing.
+        if let Some(members) = session.get("members").and_then(Value::as_array) {
+            for member in members {
+                out.push_str(&format!("\n       {}", render_member(member)));
+            }
+        }
+    }
+    out
+}
+
+/// Renders one authenticated-session line: id, context, current state (running
+/// query + elapsed, busy, or idle time), and lifetime query count.
+fn render_member(member: &Value) -> String {
+    let mid = member.get("id").and_then(Value::as_u64).unwrap_or(0);
+    let qc = member
+        .get("query_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let context = member
+        .get("context")
+        .map_or_else(|| "(default)".to_string(), context_summary);
+    let state = if let Some(running) = member.get("running").filter(|r| !r.is_null()) {
+        let sql = running.get("sql").and_then(Value::as_str).unwrap_or("");
+        let secs = age_secs(running.get("started_at").and_then(Value::as_str));
+        format!("running {secs}s: {sql}")
+    } else if member.get("busy").and_then(Value::as_bool).unwrap_or(false) {
+        "busy".to_string()
+    } else {
+        let secs = age_secs(member.get("last_used").and_then(Value::as_str));
+        format!("idle {secs}s")
+    };
+    format!("#{mid} {context} · {state} · {qc} queries")
 }
 
 /// Evicts a single multiplexed session.
@@ -224,16 +238,25 @@ impl DisconnectCommand {
         let socket = server::resolve_socket(self.socket)?;
         let payload = json!({ "account": self.account, "user": self.user });
         let result = call(&socket, "disconnect", payload).await?;
-        if result
+        let disconnected = result
             .get("disconnected")
             .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            println!("Disconnected {} / {}.", self.account, self.user);
-        } else {
-            println!("No active session for {} / {}.", self.account, self.user);
-        }
+            .unwrap_or(false);
+        println!(
+            "{}",
+            disconnect_message(disconnected, &self.account, &self.user)
+        );
         Ok(())
+    }
+}
+
+/// The message printed after a `disconnect`, depending on whether a session was
+/// actually evicted.
+fn disconnect_message(disconnected: bool, account: &str, user: &str) -> String {
+    if disconnected {
+        format!("Disconnected {account} / {user}.")
+    } else {
+        format!("No active session for {account} / {user}.")
     }
 }
 
@@ -284,11 +307,21 @@ fn read_stdin() -> Result<String> {
     Ok(buf)
 }
 
-/// Prints a JSON value in the requested format.
+/// Formats a JSON value in the requested output format.
+fn format_value(value: &Value, format: OutputFormat) -> Result<String> {
+    Ok(match format {
+        OutputFormat::Json => serde_json::to_string_pretty(value)?,
+        OutputFormat::Yaml => serde_yaml::to_string(value)?,
+    })
+}
+
+/// Prints a JSON value in the requested format (JSON gets a trailing newline;
+/// `serde_yaml` already emits one).
 fn print_value(value: &Value, format: OutputFormat) -> Result<()> {
+    let text = format_value(value, format)?;
     match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(value)?),
-        OutputFormat::Yaml => print!("{}", serde_yaml::to_string(value)?),
+        OutputFormat::Json => println!("{text}"),
+        OutputFormat::Yaml => print!("{text}"),
     }
     Ok(())
 }
@@ -365,5 +398,90 @@ mod tests {
         // Missing required flags is a parse error.
         let mut full = vec!["omni-dev", "disconnect", "--account", "ACCT"];
         assert!(Wrapper::try_parse_from(std::mem::take(&mut full)).is_err());
+    }
+
+    #[test]
+    fn age_secs_handles_absent_and_unparseable_and_past() {
+        assert_eq!(age_secs(None), 0);
+        assert_eq!(age_secs(Some("not-a-timestamp")), 0);
+        assert!(age_secs(Some("2000-01-01T00:00:00Z")) > 0);
+    }
+
+    #[test]
+    fn context_summary_joins_set_dimensions_or_default() {
+        assert_eq!(context_summary(&json!({})), "(default)");
+        assert_eq!(
+            context_summary(&json!({ "warehouse": "WH", "role": "R" })),
+            "WH/R"
+        );
+        assert_eq!(
+            context_summary(&json!({ "warehouse": "WH", "database": "DB", "schema": "S" })),
+            "WH/DB/S"
+        );
+    }
+
+    #[test]
+    fn render_sessions_handles_empty_replies() {
+        assert_eq!(
+            render_sessions(&json!({ "sessions": [] })),
+            "No active sessions."
+        );
+        assert_eq!(render_sessions(&json!({})), "No active sessions.");
+    }
+
+    #[test]
+    fn render_sessions_renders_running_busy_and_idle_members() {
+        let result = json!({ "sessions": [{
+            "id": 1, "account": "ACME", "user": "me",
+            "sessions": 2, "max_sessions": 4, "query_count": 9,
+            "members": [
+                { "id": 1, "query_count": 3,
+                  "context": { "warehouse": "WH", "role": "R" },
+                  "running": { "sql": "SELECT 42", "started_at": "2000-01-01T00:00:00Z" } },
+                { "id": 2, "query_count": 1, "context": {}, "busy": true },
+                { "id": 3, "query_count": 0, "context": {}, "last_used": "2000-01-01T00:00:00Z" },
+            ],
+        }]});
+        let table = render_sessions(&result);
+        assert!(table.contains("ACME"), "{table}");
+        assert!(table.contains("2/4"), "{table}");
+        assert!(
+            table.contains("running") && table.contains("SELECT 42"),
+            "{table}"
+        );
+        assert!(table.contains("WH/R"), "{table}");
+        assert!(table.contains("busy"), "{table}");
+        assert!(table.contains("idle"), "{table}");
+        assert!(table.contains("(default)"), "{table}");
+    }
+
+    #[test]
+    fn format_value_renders_json_and_yaml() {
+        let value = json!({ "a": 1 });
+        assert!(format_value(&value, OutputFormat::Json)
+            .unwrap()
+            .contains("\"a\": 1"));
+        assert!(format_value(&value, OutputFormat::Yaml)
+            .unwrap()
+            .contains("a: 1"));
+    }
+
+    #[test]
+    fn disconnect_message_varies_on_outcome() {
+        assert_eq!(
+            disconnect_message(true, "ACME", "me"),
+            "Disconnected ACME / me."
+        );
+        assert_eq!(
+            disconnect_message(false, "ACME", "me"),
+            "No active session for ACME / me."
+        );
+    }
+
+    #[test]
+    fn print_value_emits_both_formats() {
+        // Exercises both arms; output goes to the test harness's captured stdout.
+        print_value(&json!({ "a": 1 }), OutputFormat::Json).unwrap();
+        print_value(&json!({ "a": 1 }), OutputFormat::Yaml).unwrap();
     }
 }
