@@ -108,20 +108,47 @@ fn signature(snaps: &[(&'static str, MenuSnapshot)]) -> String {
     sig
 }
 
+/// A handle to a built menu item, retained so its text/enabled can be updated
+/// **in place** — which does not close an open menu, unlike rebuilding it.
+enum ItemHandle {
+    Label(MenuItem),
+    Action { id: String, item: MenuItem },
+    Separator,
+}
+
+/// The ordered item handles for one service's submenu.
+struct SubmenuHandles {
+    items: Vec<ItemHandle>,
+}
+
 /// Builds the full tray menu: one submenu per service, plus a Quit item. Action
 /// ids are prefixed with `"<service>{DELIM}"` so clicks route back to the right
-/// service.
-fn build_menu(snaps: &[(&'static str, MenuSnapshot)]) -> Menu {
+/// service. Returns the menu plus per-submenu item handles for in-place updates.
+fn build_menu(snaps: &[(&'static str, MenuSnapshot)]) -> (Menu, Vec<SubmenuHandles>) {
     let menu = Menu::new();
+    let mut handles = Vec::new();
     for (name, snap) in snaps {
         let submenu = Submenu::new(&snap.title, true);
+        let mut items = Vec::new();
         for item in &snap.items {
             let appended = match item {
-                ServiceMenuItem::Label(text) => submenu.append(&MenuItem::new(text, false, None)),
-                ServiceMenuItem::Separator => submenu.append(&PredefinedMenuItem::separator()),
+                ServiceMenuItem::Label(text) => {
+                    let mi = MenuItem::new(text, false, None);
+                    let r = submenu.append(&mi);
+                    items.push(ItemHandle::Label(mi));
+                    r
+                }
+                ServiceMenuItem::Separator => {
+                    let r = submenu.append(&PredefinedMenuItem::separator());
+                    items.push(ItemHandle::Separator);
+                    r
+                }
                 ServiceMenuItem::Action(action) => {
                     let id = format!("{name}{DELIM}{}", action.id);
-                    submenu.append(&MenuItem::with_id(id, &action.label, action.enabled, None))
+                    let mi = MenuItem::with_id(id.clone(), &action.label, action.enabled, None);
+                    let r = submenu.append(&mi);
+                    items.push(ItemHandle::Action { id, item: mi });
+                    r
                 }
             };
             if let Err(e) = appended {
@@ -131,6 +158,7 @@ fn build_menu(snaps: &[(&'static str, MenuSnapshot)]) -> Menu {
         if let Err(e) = menu.append(&submenu) {
             tracing::warn!("failed to add tray submenu: {e}");
         }
+        handles.push(SubmenuHandles { items });
     }
     if let Err(e) = menu.append(&PredefinedMenuItem::separator()) {
         tracing::warn!("failed to add tray separator: {e}");
@@ -143,7 +171,48 @@ fn build_menu(snaps: &[(&'static str, MenuSnapshot)]) -> Menu {
     )) {
         tracing::warn!("failed to add quit item: {e}");
     }
-    menu
+    (menu, handles)
+}
+
+/// Refreshes item text/enabled **in place** when the menu structure is unchanged
+/// (same items, kinds, and action ids), so live stats update without closing an
+/// open menu. Returns `false` when the structure differs and the menu must be
+/// rebuilt via `set_menu` (which does close it — only on session add/remove).
+fn update_in_place(handles: &[SubmenuHandles], snaps: &[(&'static str, MenuSnapshot)]) -> bool {
+    if handles.len() != snaps.len() {
+        return false;
+    }
+    for (handle, (name, snap)) in handles.iter().zip(snaps) {
+        if handle.items.len() != snap.items.len() {
+            return false;
+        }
+        for (item, snap_item) in handle.items.iter().zip(&snap.items) {
+            let same_kind = match (item, snap_item) {
+                (ItemHandle::Label(_), ServiceMenuItem::Label(_))
+                | (ItemHandle::Separator, ServiceMenuItem::Separator) => true,
+                (ItemHandle::Action { id, .. }, ServiceMenuItem::Action(action)) => {
+                    *id == format!("{name}{DELIM}{}", action.id)
+                }
+                _ => false,
+            };
+            if !same_kind {
+                return false;
+            }
+        }
+    }
+    for (handle, (_, snap)) in handles.iter().zip(snaps) {
+        for (item, snap_item) in handle.items.iter().zip(&snap.items) {
+            match (item, snap_item) {
+                (ItemHandle::Label(mi), ServiceMenuItem::Label(text)) => mi.set_text(text),
+                (ItemHandle::Action { item, .. }, ServiceMenuItem::Action(action)) => {
+                    item.set_text(&action.label);
+                    item.set_enabled(action.enabled);
+                }
+                _ => {}
+            }
+        }
+    }
+    true
 }
 
 /// Builds the tray and pumps the macOS event loop on the main thread, refreshing
@@ -158,8 +227,9 @@ fn event_loop(
 
     let initial = snapshots(&registry);
     let mut last_sig = signature(&initial);
+    let (initial_menu, mut handles) = build_menu(&initial);
     let tray = TrayIconBuilder::new()
-        .with_menu(Box::new(build_menu(&initial)))
+        .with_menu(Box::new(initial_menu))
         .with_title("od")
         .with_tooltip("omni-dev daemon")
         .build()
@@ -181,7 +251,13 @@ fn event_loop(
         let snaps = snapshots(&registry);
         let sig = signature(&snaps);
         if sig != last_sig {
-            tray.set_menu(Some(Box::new(build_menu(&snaps))));
+            // Update item text/enabled in place so an open menu isn't closed;
+            // only a structural change (sessions added/removed) rebuilds it.
+            if !update_in_place(&handles, &snaps) {
+                let (menu, new_handles) = build_menu(&snaps);
+                tray.set_menu(Some(Box::new(menu)));
+                handles = new_handles;
+            }
             last_sig = sig;
         }
 
