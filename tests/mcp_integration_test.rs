@@ -1814,14 +1814,17 @@ async fn confluence_tools_success_paths_via_wiremock() -> Result<()> {
         .mount(&server)
         .await;
 
+    // Attachment *creation* is v1-only (the v2 API has no POST handler).
     Mock::given(method("POST"))
-        .and(path("/wiki/api/v2/pages/12345/attachments"))
+        .and(path("/wiki/rest/api/content/12345/child/attachment"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "results": [{
                 "id": "att-1",
                 "title": "hello.txt",
-                "mediaType": "text/plain",
-                "fileSize": 13,
+                "extensions": {
+                    "mediaType": "text/plain",
+                    "fileSize": 13
+                },
                 "version": {"number": 1}
             }]
         })))
