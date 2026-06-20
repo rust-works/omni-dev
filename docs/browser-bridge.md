@@ -132,7 +132,9 @@ The `GET /__bridge/status` endpoint is unchanged and still feeds this view.
 
 Built with `--features menu-bar` on macOS, the daemon adds a **Browser Bridge**
 menu showing the connection line (`Connected — <origins> — N pending` /
-`No tab connected`) and the session key, with actions:
+`No tab connected`) and a **masked** session key (`Key: ••••<last 4 chars>`, so
+the full token never appears in the menu bar, screenshots, or screen shares),
+with actions:
 
 - **Copy bridge key** — the raw session token, to paste into `OMNI_BRIDGE_TOKEN`.
 - **Copy console snippet** — the ready-to-paste DevTools snippet.
