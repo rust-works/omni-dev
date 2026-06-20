@@ -20,10 +20,16 @@ impl ServiceRegistry {
         Self::default()
     }
 
-    /// Adds a service. Later lookups match by [`DaemonService::name`]; the
-    /// caller is responsible for not registering two services with the same
-    /// name (the first registered wins on lookup).
+    /// Adds a service. Lookups match by [`DaemonService::name`] and the first
+    /// registration wins; a second service sharing a name would be dead code
+    /// for routing and would double-count in status/menu iteration, so it is
+    /// rejected with a warning rather than silently kept.
     pub fn register(&mut self, service: Arc<dyn DaemonService>) {
+        let name = service.name();
+        if self.services.iter().any(|s| s.name() == name) {
+            tracing::warn!("ignoring duplicate registration of daemon service `{name}`");
+            return;
+        }
         self.services.push(service);
     }
 
@@ -96,5 +102,15 @@ mod tests {
         // Aggregation iterates every registered service.
         assert_eq!(registry.statuses().await.len(), 1);
         registry.shutdown_all().await;
+    }
+
+    #[test]
+    fn duplicate_registration_is_ignored() {
+        let mut registry = ServiceRegistry::new();
+        registry.register(Arc::new(EchoService));
+        registry.register(Arc::new(EchoService));
+        // The second registration shares `echo`'s name, so it is dropped: the
+        // first wins on lookup and iteration is not double-counted.
+        assert_eq!(registry.services().len(), 1);
     }
 }
