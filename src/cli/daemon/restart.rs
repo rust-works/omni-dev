@@ -24,12 +24,13 @@ impl RestartCommand {
         let client = DaemonClient::new(&socket_path);
         if client.ping().await.is_ok() {
             client.shutdown().await.ok();
-            #[cfg(target_os = "macos")]
-            {
-                let _ = crate::daemon::launchd::unload();
-            }
             control::wait_until_down(&socket_path).await?;
         }
+        // On macOS `launch` re-bootstraps via `install_and_load`, which already
+        // boots out any prior agent before bootstrapping. Do *not* boot out
+        // separately first: that would unregister auto-start in a window where a
+        // failed/aborted re-bootstrap leaves the daemon both stopped and
+        // unregistered — strictly worse than before `restart` ran. See #994.
         control::launch(&socket_path)?;
         control::wait_until_ready(&socket_path).await?;
         println!("daemon restarted (socket {})", socket_path.display());
