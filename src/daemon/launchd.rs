@@ -80,9 +80,7 @@ pub fn install_and_load(socket: &Path) -> Result<()> {
 
     let domain = gui_domain();
     // Bootout any prior instance first so bootstrap does not fail as already loaded.
-    let _ = Command::new("launchctl")
-        .args(["bootout", &format!("{domain}/{LAUNCHD_LABEL}")])
-        .output();
+    bootout(&domain);
     // `launchctl bootout` is asynchronous: it returns before launchd finishes
     // tearing the job down. Bootstrapping into that window races the teardown
     // and fails with EIO ("Bootstrap failed: 5: Input/output error") — the
@@ -133,9 +131,25 @@ fn wait_until_unloaded(domain: &str) {
 /// Boots out the agent (SIGTERM-ing a running daemon) so it stops and no longer
 /// auto-starts. Best-effort: a not-loaded agent is not an error.
 pub fn unload() -> Result<()> {
-    let domain = gui_domain();
-    let _ = Command::new("launchctl")
-        .args(["bootout", &format!("{domain}/{LAUNCHD_LABEL}")])
-        .output();
+    bootout(&gui_domain());
     Ok(())
+}
+
+/// Runs `launchctl bootout <domain>/<label>`, the teardown that `start` (to
+/// clear a prior instance before bootstrap) and `stop`/`restart` (to disable
+/// auto-start) both rely on.
+///
+/// A non-zero exit is ignored on purpose: "already not loaded" is the common,
+/// benign case. A *spawn* failure (e.g. `launchctl` missing or the GUI domain
+/// unreachable) means the teardown silently did nothing, so it is logged rather
+/// than discarded — otherwise `stop`/`restart` would claim to have disabled
+/// auto-start when they had not. See issue #996.
+fn bootout(domain: &str) {
+    let target = format!("{domain}/{LAUNCHD_LABEL}");
+    if let Err(e) = Command::new("launchctl")
+        .args(["bootout", &target])
+        .output()
+    {
+        tracing::warn!("failed to run `launchctl bootout {target}`: {e}");
+    }
 }
