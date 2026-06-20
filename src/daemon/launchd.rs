@@ -135,9 +135,9 @@ pub fn unload() -> Result<()> {
     Ok(())
 }
 
-/// Runs `launchctl bootout <domain>/<label>`, the teardown that `start` (to
-/// clear a prior instance before bootstrap) and `stop`/`restart` (to disable
-/// auto-start) both rely on.
+/// Runs `launchctl bootout <domain>/<label>`, the teardown relied on by
+/// `start`/`restart` (clearing a prior instance before bootstrap, inside
+/// `install_and_load`) and `stop` (disabling auto-start, via `unload`).
 ///
 /// A non-zero exit is ignored on purpose: "already not loaded" is the common,
 /// benign case. A *spawn* failure (e.g. `launchctl` missing or the GUI domain
