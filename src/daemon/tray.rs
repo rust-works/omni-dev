@@ -6,8 +6,9 @@
 //! hands the main thread to the `tao` event loop. Each registered service
 //! contributes a submenu built from its [`MenuSnapshot`]; clicks are routed
 //! back to [`DaemonService::menu_action`](crate::daemon::service::DaemonService::menu_action)
-//! (or, for "Copy console snippet", fulfilled locally via the clipboard). A
-//! "Quit" item cancels the shared shutdown token and drains the daemon.
+//! (or, for the `copy-*` clipboard actions, fulfilled locally via the
+//! clipboard). A "Quit" item cancels the shared shutdown token and drains the
+//! daemon.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -273,8 +274,10 @@ fn event_loop(
     Ok(())
 }
 
-/// Routes a clicked menu id back to its service: "copy-snippet" is fulfilled via
-/// the clipboard; everything else goes to the service's `menu_action`.
+/// Routes a clicked menu id back to its service: the `copy-*` actions
+/// (`copy-key`/`copy-snippet`/`copy-request`) each read a string field from a
+/// service op and copy it to the clipboard; everything else goes to the
+/// service's `menu_action`.
 fn handle_action(
     handle: &Handle,
     registry: &ServiceRegistry,
