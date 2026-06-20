@@ -22,6 +22,11 @@ use crate::daemon::service::{DaemonService, MenuAction, MenuItem, MenuSnapshot, 
 /// The browser-bridge service name (the control-socket routing key).
 pub const SERVICE_NAME: &str = "browser-bridge";
 
+/// Number of trailing characters revealed in the tray's masked `Key:` label.
+/// The full token never appears in the menu bar — it stays behind the "Copy
+/// bridge key" action — so this only has to disambiguate *which* key is live.
+const TOKEN_LABEL_VISIBLE_CHARS: usize = 4;
+
 /// Hosts a [`BridgeServer`] under the daemon, persisting its session token for
 /// thin-client discovery and allowing in-place restart.
 pub struct BridgeService {
@@ -80,6 +85,24 @@ fn write_token(path: &Path, token: &str) -> Result<()> {
         .with_context(|| format!("failed to write token file {}", path.display()))?;
     paths::set_file_0600(path)?;
     Ok(())
+}
+
+/// Renders the tray's `Key:` label, revealing only the last
+/// [`TOKEN_LABEL_VISIBLE_CHARS`] characters of `token`. A visible full token is
+/// redundant exposure to shoulder-surfing, screen-sharing, and screenshots
+/// (#997); the complete value stays behind the "Copy bridge key" action. Tokens
+/// too short to keep most of their entropy hidden are masked outright.
+fn masked_key_label(token: &str) -> String {
+    let len = token.chars().count();
+    if len > TOKEN_LABEL_VISIBLE_CHARS * 2 {
+        let tail: String = token
+            .chars()
+            .skip(len - TOKEN_LABEL_VISIBLE_CHARS)
+            .collect();
+        format!("Key: \u{2022}\u{2022}\u{2022}\u{2022}{tail}")
+    } else {
+        "Key: \u{2022}\u{2022}\u{2022}\u{2022}".to_string()
+    }
 }
 
 /// A one-line summary for `daemon status` / the tray.
@@ -194,7 +217,7 @@ impl DaemonService for BridgeService {
                 };
                 let mut items = vec![
                     MenuItem::Label(line),
-                    MenuItem::Label(format!("Key: {}", self.token)),
+                    MenuItem::Label(masked_key_label(&self.token)),
                     MenuItem::Separator,
                 ];
                 items.push(MenuItem::Action(MenuAction {
@@ -368,11 +391,26 @@ mod tests {
         let menu = svc.menu();
         assert_eq!(menu.title, "Browser Bridge");
         assert!(matches!(menu.items.first(), Some(MenuItem::Label(_))));
-        // The key is shown as a label and is copyable.
-        assert!(menu.items.iter().any(|i| matches!(
-            i,
-            MenuItem::Label(text) if text.starts_with("Key: ")
-        )));
+        // The key label is masked: the full token never reaches the menu bar,
+        // only its last few characters (#997). The full value stays copyable.
+        let token = svc.token.as_str();
+        let key_label = menu
+            .items
+            .iter()
+            .find_map(|i| match i {
+                MenuItem::Label(text) if text.starts_with("Key: ") => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("menu has a masked Key label");
+        assert!(
+            !key_label.contains(token),
+            "full token leaked into tray label: {key_label}"
+        );
+        let tail: String = token
+            .chars()
+            .skip(token.chars().count() - TOKEN_LABEL_VISIBLE_CHARS)
+            .collect();
+        assert!(key_label.ends_with(&tail));
         assert!(menu.items.iter().any(|i| matches!(
             i,
             MenuItem::Action(a) if a.id == "copy-key"
@@ -386,6 +424,24 @@ mod tests {
             MenuItem::Action(a) if a.id == "restart-bridge"
         )));
         svc.shutdown().await;
+    }
+
+    #[test]
+    fn masked_key_label_hides_all_but_the_tail() {
+        // A long token reveals only its last four characters behind the mask.
+        assert_eq!(
+            masked_key_label("abcdefghijklmnop"),
+            "Key: \u{2022}\u{2022}\u{2022}\u{2022}mnop"
+        );
+        // A token too short to keep most of its entropy hidden is fully masked.
+        assert_eq!(
+            masked_key_label("secret"),
+            "Key: \u{2022}\u{2022}\u{2022}\u{2022}"
+        );
+        assert_eq!(
+            masked_key_label(""),
+            "Key: \u{2022}\u{2022}\u{2022}\u{2022}"
+        );
     }
 
     #[tokio::test]
