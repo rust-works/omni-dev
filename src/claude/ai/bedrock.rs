@@ -201,11 +201,10 @@ impl AiClient for BedrockAiClient {
                 builder = builder.header(key, value);
             }
 
-            let response = builder
-                .json(&request)
-                .send()
-                .await
-                .map_err(|e| ClaudeError::NetworkError(e.to_string()))?;
+            let started = std::time::Instant::now();
+            let send_result = builder.json(&request).send().await;
+            super::record_ai_http(&api_url, started, &send_result);
+            let response = send_result.map_err(|e| ClaudeError::NetworkError(e.to_string()))?;
 
             let response = super::check_error_response(response).await?;
 

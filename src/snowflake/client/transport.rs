@@ -21,6 +21,7 @@ use serde_json::Value;
 use url::Url;
 
 use super::error::{Error, Result};
+use crate::request_log;
 
 /// Response codes that mean the session token is no longer valid.
 const SESSION_EXPIRED_CODES: &[&str] = &["390112", "390114", "390108"];
@@ -87,7 +88,7 @@ impl Transport {
     ) -> Result<Value> {
         let url = self.resolve(path, query)?;
         let raw = self
-            .send_with_retry(|| self.post_request(url.clone(), body, token))
+            .send_with_retry("POST", &url, || self.post_request(url.clone(), body, token))
             .await?;
         finalize(raw)
     }
@@ -109,7 +110,9 @@ impl Transport {
     ) -> Result<Value> {
         let url = self.resolve("queries/v1/query-request", query)?;
         let mut raw = self
-            .send_with_retry(|| self.post_request(url.clone(), body, Some(token)))
+            .send_with_retry("POST", &url, || {
+                self.post_request(url.clone(), body, Some(token))
+            })
             .await?;
 
         if SESSION_EXPIRED_CODES.contains(&raw.code.as_str()) {
@@ -144,7 +147,7 @@ impl Transport {
         loop {
             tokio::time::sleep(poll_interval).await;
             let raw = self
-                .send_with_retry(|| self.get_request(url.clone(), Some(token)))
+                .send_with_retry("GET", &url, || self.get_request(url.clone(), Some(token)))
                 .await?;
             if !IN_PROGRESS_CODES.contains(&raw.code.as_str()) {
                 return Ok(raw);
@@ -236,14 +239,47 @@ impl Transport {
         request
     }
 
+    /// Appends a best-effort HTTP record for one Snowflake request attempt,
+    /// flagging `via_daemon` when running inside the daemon process. The pooled
+    /// `daemon_session_id` is not visible at this transport boundary (one
+    /// `Transport` is shared across pooled sessions); threading it is a follow-up.
+    fn log_request(
+        &self,
+        method: &str,
+        url: &Url,
+        started: Instant,
+        status: Option<u16>,
+        error: Option<&str>,
+    ) {
+        let via_daemon = matches!(
+            request_log::current_context().source,
+            request_log::Source::Daemon
+        );
+        request_log::record_http_with(
+            "snowflake",
+            method,
+            url.as_str(),
+            started,
+            status,
+            error,
+            request_log::HttpExtra {
+                via_daemon,
+                ..Default::default()
+            },
+        );
+    }
+
     /// Sends a freshly built request, retrying transient failures with backoff.
+    /// `method`/`url` are passed only for the request log.
     async fn send_with_retry(
         &self,
+        method: &str,
+        url: &Url,
         build: impl Fn() -> reqwest::RequestBuilder,
     ) -> Result<RawResponse> {
         let mut attempt = 1;
         loop {
-            match self.send_once(build()).await {
+            match self.send_once(method, url, build()).await {
                 Ok(raw) => return Ok(raw),
                 Err(err) if attempt < MAX_ATTEMPTS && is_retryable(&err) => {
                     tokio::time::sleep(BACKOFF_BASE * 2u32.pow(attempt - 1)).await;
@@ -255,7 +291,13 @@ impl Transport {
     }
 
     /// Sends one request (bounded by `request_timeout`) and parses the envelope.
-    async fn send_once(&self, request: reqwest::RequestBuilder) -> Result<RawResponse> {
+    async fn send_once(
+        &self,
+        method: &str,
+        url: &Url,
+        request: reqwest::RequestBuilder,
+    ) -> Result<RawResponse> {
+        let started = Instant::now();
         let send = async {
             let response = request.send().await?;
             let status = response.status();
@@ -264,14 +306,19 @@ impl Transport {
         };
         let (status, text) = match tokio::time::timeout(self.request_timeout, send).await {
             Ok(Ok(v)) => v,
-            Ok(Err(e)) => return Err(Error::Transport(e)),
+            Ok(Err(e)) => {
+                self.log_request(method, url, started, None, Some(&e.to_string()));
+                return Err(Error::Transport(e));
+            }
             Err(_) => {
+                self.log_request(method, url, started, None, Some("request timed out"));
                 return Err(Error::Server {
                     code: "timeout".to_string(),
                     message: format!("request exceeded {:?}", self.request_timeout),
-                })
+                });
             }
         };
+        self.log_request(method, url, started, Some(status.as_u16()), None);
         if !status.is_success() {
             return Err(Error::Server {
                 code: status.as_u16().to_string(),
