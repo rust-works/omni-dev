@@ -40,6 +40,18 @@ use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+/// Serializes every socket bind in this test binary.
+///
+/// `bind_private` tightens the **process-global** umask across its `bind` with a
+/// non-reentrant guard. Two binds racing on separate test threads nest that
+/// guard, so one restores the default umask while the other is still mid-bind —
+/// landing its socket at `0o755` instead of `0o600` (and corrupting the umask for
+/// later binds). Production never binds concurrently (a single startup bind), so
+/// the guard is sound there; here we simply run the binds one at a time. The
+/// `tempdir_0700` helper covers the *directory*-permission half of the same race;
+/// this lock covers the *socket-mode* half. See issue #1017.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Creates a temp dir and force-restores its mode to `0700`.
 ///
 /// A sibling test in this binary may have tightened the process-global umask
@@ -58,6 +70,7 @@ fn tempdir_0700() -> TempDir {
 /// `set_file_0600`. Needs a Tokio runtime to register the listener fd.
 #[tokio::test]
 async fn bind_private_creates_an_owner_only_socket() {
+    let _serial = SERIAL.lock().await;
     let dir = tempdir_0700();
     let socket = dir.path().join("d.sock");
     let listener = bind_private(&socket).unwrap();
@@ -73,6 +86,7 @@ where
     F: FnOnce(PathBuf) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
+    let _serial = SERIAL.lock().await;
     let dir = tempdir_0700();
     let socket = dir.path().join("d.sock");
     let mut registry = ServiceRegistry::new();
@@ -154,6 +168,7 @@ async fn second_bind_is_refused_while_first_is_live() {
 
 #[tokio::test]
 async fn stale_socket_is_reclaimed() {
+    let _serial = SERIAL.lock().await;
     let dir = tempdir_0700();
     let socket = dir.path().join("d.sock");
     // A leftover regular file at the socket path stands in for a stale
@@ -210,6 +225,7 @@ impl DaemonService for SlowService {
 /// not abandoned: `run()` waits for it to finish before returning (#992).
 #[tokio::test]
 async fn in_flight_request_is_drained_on_shutdown() {
+    let _serial = SERIAL.lock().await;
     let dir = tempdir_0700();
     let socket = dir.path().join("d.sock");
 
@@ -284,6 +300,7 @@ async fn invalid_utf8_line_yields_read_error_reply() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
+    let _serial = SERIAL.lock().await;
     let dir = tempdir_0700();
     let socket = dir.path().join("d.sock");
     let mut registry = ServiceRegistry::new();
@@ -416,6 +433,7 @@ impl DaemonService for GatedService {
 /// instead of sitting unaccepted until process exit.
 #[tokio::test]
 async fn stray_ping_fails_fast_while_draining() {
+    let _serial = SERIAL.lock().await;
     let dir = tempdir_0700();
     let socket = dir.path().join("d.sock");
 
