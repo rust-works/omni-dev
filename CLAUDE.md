@@ -187,6 +187,15 @@ The daemon's **second** service (after the browser bridge) authenticates Snowfla
 
 **No new trust boundary:** requests ride the daemon's existing `0600` Unix socket; **no secret is persisted** (in-memory session only). Keep the operator guide + lumon contract [docs/snowflake-service.md](docs/snowflake-service.md) in sync, and run the [`update-snapshots`](.claude/skills/update-snapshots/SKILL.md) skill on any CLI-surface change (see Code Changes §5).
 
+### Request log
+A local, append-only NDJSON log (`log.jsonl`) of every invocation **and** the HTTP requests it issues, plus an `omni-dev log` subcommand to search and pretty-print it. Best-effort and default-on; a write failure never changes the caller's exit code.
+
+- `src/request_log.rs` — the schema (one forward-compatible `LogRecord` for both write and read, same `#[serde(default)]` + `skip_serializing_if` contract the daemon wire types use), the `record`/`record_http`/`record_invocation` writers, path resolution (`OMNI_DEV_LOG_FILE` → `state_dir`→`data_dir`/`omni-dev/log.jsonl`, dir `0700`/file `0600`), and the per-invocation `RequestLogContext` (process-global `OnceLock` + a `tokio` task-local override) that lets HTTP records inherit their parent `invocation_id`/`source`/`mcp_tool` without threading state through call sites.
+- `src/cli/log.rs` + `src/cli/log/{format,query,stream}.rs` — the read-only `omni-dev log` command: the filter matrix, the `--query` mini-language (AND/OR/NOT, `field:value`, fuzzy tokens), `oneline`/`json`/`full` renderers (`json` is byte-identical to the on-disk lines), and the streaming reader (`--limit` ring buffer, `-f/--follow`).
+- The invocation record is emitted by the [`main.rs`](src/main.rs) shell around `cli.execute()`; HTTP records are emitted from one hook per transport method (Atlassian, Datadog, Snowflake `send_once`, the Claude/AI backends + `claude-cli`, and the browser bridge `dispatch`/`start_stream`). The MCP server's hand-written `call_tool` scopes the task-local context to `source=mcp` per tool call.
+
+**No secret is ever written:** auth headers are redacted centrally and request/response bodies are opt-in via `OMNI_DEV_LOG_BODIES` (headers via `OMNI_DEV_LOG_HEADERS`); `OMNI_DEV_LOG_DISABLE` is an absolute opt-out. **No new trust boundary** — the log is local-machine state with the same `0700`/`0600` posture as other runtime state. Keep the operator guide [docs/log.md](docs/log.md) in sync, and run the [`update-snapshots`](.claude/skills/update-snapshots/SKILL.md) skill on any CLI-surface change (see Code Changes §5).
+
 ### Skill Structure
 Claude skills are organized in `.claude/skills/`, one subdirectory per skill with a `SKILL.md` file.
 
