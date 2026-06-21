@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -39,6 +39,7 @@ use crate::browser::protocol::{
     ResponseEnvelope, StatusResponse, StreamItem, StreamLine, TabInfo,
 };
 use crate::browser::snippet;
+use crate::request_log;
 
 /// Default WebSocket-plane port.
 pub const DEFAULT_WS_PORT: u16 = 9999;
@@ -915,10 +916,38 @@ fn resolve_allow_origin<'a>(req: &'a ControlRequest, state: &'a AppState) -> Opt
 
 /// The shared request path: scope-check, register a waiter, send the command,
 /// and await the browser's reply (or time out).
+/// Appends a best-effort `service = browser-bridge` HTTP record for one proxied
+/// request, flagging `via_daemon` when the bridge is hosted by the daemon.
+fn record_bridge_http(
+    method: &str,
+    url: &str,
+    started: Instant,
+    status: Option<u16>,
+    error: Option<&str>,
+) {
+    let via_daemon = matches!(
+        request_log::current_context().source,
+        request_log::Source::Daemon
+    );
+    request_log::record_http_with(
+        "browser-bridge",
+        method,
+        url,
+        started,
+        status,
+        error,
+        request_log::HttpExtra {
+            via_daemon,
+            ..Default::default()
+        },
+    );
+}
+
 async fn dispatch(
     state: &AppState,
     req: ControlRequest,
 ) -> Result<ResponseEnvelope, (StatusCode, String)> {
+    let started = Instant::now();
     auth::validate_outbound_url(&req.url, resolve_allow_origin(&req, state)).map_err(|_| {
         (
             StatusCode::FORBIDDEN,
@@ -942,6 +971,9 @@ async fn dispatch(
         )
     })?;
 
+    // Clone the method/URL for the request log before they move into `Command`.
+    let log_method = req.method.clone();
+    let log_url = req.url.clone();
     let (id, rx) = state.correlator.register();
     let command = Command {
         id,
@@ -989,6 +1021,7 @@ async fn dispatch(
                 body,
                 encoding,
             } => {
+                record_bridge_http(&log_method, &log_url, started, Some(status), None);
                 // Size is accounted against the *decoded* body. For base64 that
                 // means decoding here to learn the true byte length; the envelope
                 // still carries the base64 string (the caller / proxy decodes).
@@ -1030,17 +1063,36 @@ async fn dispatch(
                     encoding,
                 })
             }
-            ReplyOutcome::Error(msg) => Err((
-                StatusCode::BAD_GATEWAY,
-                format!("browser fetch failed: {msg}"),
-            )),
+            ReplyOutcome::Error(msg) => {
+                record_bridge_http(&log_method, &log_url, started, None, Some(&msg));
+                Err((
+                    StatusCode::BAD_GATEWAY,
+                    format!("browser fetch failed: {msg}"),
+                ))
+            }
         },
-        Ok(Err(_)) => Err((
-            StatusCode::BAD_GATEWAY,
-            "browser connection closed before replying".to_string(),
-        )),
+        Ok(Err(_)) => {
+            record_bridge_http(
+                &log_method,
+                &log_url,
+                started,
+                None,
+                Some("browser connection closed before replying"),
+            );
+            Err((
+                StatusCode::BAD_GATEWAY,
+                "browser connection closed before replying".to_string(),
+            ))
+        }
         Err(_) => {
             state.correlator.remove(id);
+            record_bridge_http(
+                &log_method,
+                &log_url,
+                started,
+                None,
+                Some("browser did not reply in time"),
+            );
             Err((
                 StatusCode::GATEWAY_TIMEOUT,
                 "browser did not reply in time".to_string(),
@@ -1073,6 +1125,7 @@ async fn start_stream(
     state: &AppState,
     req: ControlRequest,
 ) -> Result<(u16, BTreeMap<String, String>, StreamDriver), (StatusCode, String)> {
+    let started = Instant::now();
     auth::validate_outbound_url(&req.url, resolve_allow_origin(&req, state)).map_err(|_| {
         (
             StatusCode::FORBIDDEN,
@@ -1096,6 +1149,9 @@ async fn start_stream(
         )
     })?;
 
+    // Clone the method/URL for the request log before they move into `Command`.
+    let log_method = req.method.clone();
+    let log_url = req.url.clone();
     let (id, mut rx) = state.correlator.register_stream();
     let command = Command {
         id,
@@ -1138,9 +1194,13 @@ async fn start_stream(
 
     let idle = state.config.request_timeout;
     let (status, headers) = match tokio::time::timeout(idle, rx.recv()).await {
-        Ok(Some(StreamItem::Head { status, headers })) => (status, headers),
+        Ok(Some(StreamItem::Head { status, headers })) => {
+            record_bridge_http(&log_method, &log_url, started, Some(status), None);
+            (status, headers)
+        }
         Ok(Some(StreamItem::Error(msg))) => {
             state.correlator.remove(id);
+            record_bridge_http(&log_method, &log_url, started, None, Some(&msg));
             return Err((
                 StatusCode::BAD_GATEWAY,
                 format!("browser fetch failed: {msg}"),
@@ -1148,12 +1208,26 @@ async fn start_stream(
         }
         Ok(Some(_)) => {
             state.correlator.remove(id);
+            record_bridge_http(
+                &log_method,
+                &log_url,
+                started,
+                None,
+                Some("browser streamed a body chunk before the response head"),
+            );
             return Err((
                 StatusCode::BAD_GATEWAY,
                 "browser streamed a body chunk before the response head".to_string(),
             ));
         }
         Ok(None) => {
+            record_bridge_http(
+                &log_method,
+                &log_url,
+                started,
+                None,
+                Some("browser connection closed before replying"),
+            );
             return Err((
                 StatusCode::BAD_GATEWAY,
                 "browser connection closed before replying".to_string(),
@@ -1161,6 +1235,13 @@ async fn start_stream(
         }
         Err(_) => {
             send_cancel(state, conn_id, id).await;
+            record_bridge_http(
+                &log_method,
+                &log_url,
+                started,
+                None,
+                Some("browser did not start streaming in time"),
+            );
             return Err((
                 StatusCode::GATEWAY_TIMEOUT,
                 "browser did not start streaming in time".to_string(),

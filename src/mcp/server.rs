@@ -15,6 +15,7 @@ use rmcp::{
 
 use super::catalogue_cache::CatalogueCache;
 use super::resources;
+use crate::request_log;
 
 /// The omni-dev MCP server.
 ///
@@ -55,6 +56,40 @@ impl OmniDevServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for OmniDevServer {
+    /// Routes an MCP tool call, scoping a task-local request-log context
+    /// (`source = mcp`, the tool name) around the dispatch so any HTTP the tool
+    /// issues correlates to it, and appending one invocation record per call.
+    ///
+    /// Mirrors the dispatch the `#[tool_handler]` macro would otherwise
+    /// generate; defining it here makes the macro skip its own `call_tool`.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, McpError> {
+        let tool = request.name.to_string();
+        let ctx = request_log::RequestLogContext::mcp(tool.clone());
+        request_log::CTX
+            .scope(ctx, async move {
+                let started = std::time::Instant::now();
+                let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+                let result = self.tool_router.call(tcc).await;
+                let (exit_code, error) = match &result {
+                    Ok(_) => (0, None),
+                    Err(e) => (1, Some(e.to_string())),
+                };
+                request_log::record_invocation(request_log::InvocationOutcome {
+                    command: vec![tool],
+                    command_line: Vec::new(),
+                    exit_code,
+                    error,
+                    duration: started.elapsed(),
+                });
+                result
+            })
+            .await
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder()

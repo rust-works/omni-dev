@@ -7,7 +7,7 @@ pub mod openai;
 
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use reqwest::Client;
@@ -15,6 +15,7 @@ use serde_json::Value;
 
 use crate::claude::error::ClaudeError;
 use crate::claude::model_config::get_model_registry;
+use crate::request_log;
 
 /// HTTP request timeout for AI API calls.
 ///
@@ -75,6 +76,30 @@ pub(crate) fn build_http_client() -> Result<Client> {
         .timeout(REQUEST_TIMEOUT)
         .build()
         .context("Failed to build HTTP client")
+}
+
+/// Appends a best-effort `service = claude` HTTP record for one AI-backend
+/// `POST` attempt (direct Anthropic, Bedrock, or OpenAI-compatible).
+pub(crate) fn record_ai_http(
+    url: &str,
+    started: Instant,
+    result: &reqwest::Result<reqwest::Response>,
+) {
+    match result {
+        Ok(r) => {
+            request_log::record_http(
+                "claude",
+                "POST",
+                url,
+                started,
+                Some(r.status().as_u16()),
+                None,
+            );
+        }
+        Err(e) => {
+            request_log::record_http("claude", "POST", url, started, None, Some(&e.to_string()));
+        }
+    }
 }
 
 /// Returns the maximum output tokens for a model from the registry,
