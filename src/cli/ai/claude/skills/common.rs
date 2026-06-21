@@ -33,9 +33,29 @@ pub enum OutputFormat {
     Yaml,
 }
 
+/// Builds a `git` [`Command`] whose child receives an explicit, lock-synchronized
+/// copy of the current environment rather than inheriting the live process-global
+/// `environ` table at `exec` time.
+///
+/// `env_clear` flips `std` onto the path where it constructs the child's `envp`
+/// **in the parent** — `env::vars_os` snapshots the environment under `std`'s
+/// internal env lock, and the post-`fork` child execs with that captured array,
+/// never reading the global `environ`. That removes these `git` spawns from the
+/// data race against a concurrent `std::env::set_var`/`remove_var` on another
+/// thread (the cause of the intermittent skills-test failures in issue #1022):
+/// a writer mutating the global table is invisible to a child whose `envp` was
+/// already captured. The snapshot preserves the inherited environment, so
+/// production behaviour is unchanged.
+pub(super) fn git_command() -> Command {
+    let mut cmd = Command::new("git");
+    cmd.env_clear();
+    cmd.envs(std::env::vars_os());
+    cmd
+}
+
 /// Runs `git rev-parse --show-toplevel` from `path` and returns the absolute root.
 pub(super) fn resolve_toplevel(path: &Path) -> Result<PathBuf> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(path)
         .output()
@@ -57,7 +77,7 @@ pub(super) fn resolve_toplevel(path: &Path) -> Result<PathBuf> {
 /// The command may return a relative path (e.g. `.git`) when executed inside the
 /// main worktree; this helper resolves any such relative path against `path`.
 pub(super) fn resolve_git_common_dir(path: &Path) -> Result<PathBuf> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(["rev-parse", "--git-common-dir"])
         .current_dir(path)
         .output()
@@ -81,7 +101,7 @@ pub(super) fn resolve_git_common_dir(path: &Path) -> Result<PathBuf> {
 
 /// Lists all worktree root paths for the repository containing `path`.
 pub(super) fn list_worktrees(path: &Path) -> Result<Vec<PathBuf>> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(["worktree", "list", "--porcelain"])
         .current_dir(path)
         .output()
@@ -286,20 +306,22 @@ fn ctx_spawn_failure(command: &str, path: &Path) -> String {
     format!("Failed to run {command} in {}", path.display())
 }
 
+/// Git-repository fixtures shared by every skills command's test module.
+///
+/// All spawns route through [`git_command`] so the child gets an explicit,
+/// race-free environment — see that function for why this matters under the
+/// parallel test run (issue #1022). Centralizing these here also retires the
+/// per-module copies of `init_repo`/`init_repo_with_commit` that previously
+/// each spawned `git` directly.
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
-    use super::*;
+pub(crate) mod test_git {
+    use super::git_command;
+    use std::path::Path;
 
-    use tempfile::TempDir;
-
-    fn tempdir() -> TempDir {
-        std::fs::create_dir_all("tmp").ok();
-        TempDir::new_in("tmp").unwrap()
-    }
-
-    fn init_repo(dir: &Path) {
-        let status = Command::new("git")
+    /// `git init <dir>`; panics on a spawn failure or non-zero exit.
+    pub(crate) fn init_repo(dir: &Path) {
+        let status = git_command()
             .arg("init")
             .arg(dir)
             .output()
@@ -307,32 +329,62 @@ mod tests {
         assert!(status.status.success(), "git init failed: {status:?}");
     }
 
-    fn init_repo_with_commit(dir: &Path) {
+    /// `init_repo` plus a single committed `README.md`. Identity and signing
+    /// are pinned inline (`-c`) so the fixture neither needs ambient git user
+    /// config nor invokes the developer's commit-signing key — a throwaway test
+    /// commit must not depend on (or flake on) the host's `commit.gpgsign`.
+    pub(crate) fn init_repo_with_commit(dir: &Path) {
         init_repo(dir);
-        fs::write(dir.join("README.md"), "readme").unwrap();
-        for (k, v) in [
-            ("add", vec!["add", "README.md"]),
-            (
+        std::fs::write(dir.join("README.md"), "readme").expect("write README");
+        let add = git_command()
+            .args(["add", "README.md"])
+            .current_dir(dir)
+            .output()
+            .expect("git add failed to spawn");
+        assert!(add.status.success(), "git add failed: {add:?}");
+        let commit = git_command()
+            .args([
+                "-c",
+                "user.email=x@x",
+                "-c",
+                "user.name=x",
+                "-c",
+                "commit.gpgsign=false",
                 "commit",
-                vec![
-                    "-c",
-                    "user.email=x@x",
-                    "-c",
-                    "user.name=x",
-                    "commit",
-                    "-q",
-                    "-m",
-                    "init",
-                ],
-            ),
-        ] {
-            let status = Command::new("git")
-                .args(&v)
-                .current_dir(dir)
-                .output()
-                .unwrap_or_else(|_| panic!("git {k} failed to spawn"));
-            assert!(status.status.success(), "git {k} failed: {status:?}");
-        }
+                "-q",
+                "-m",
+                "init",
+            ])
+            .current_dir(dir)
+            .output()
+            .expect("git commit failed to spawn");
+        assert!(commit.status.success(), "git commit failed: {commit:?}");
+    }
+
+    /// `git worktree add -q <linked>` run from inside `repo`.
+    pub(crate) fn worktree_add(repo: &Path, linked: &Path) {
+        let add = git_command()
+            .args(["worktree", "add", "-q"])
+            .arg(linked)
+            .current_dir(repo)
+            .output()
+            .expect("git worktree add failed to spawn");
+        assert!(add.status.success(), "git worktree add failed: {add:?}");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    use tempfile::TempDir;
+
+    use super::test_git::{init_repo, init_repo_with_commit, worktree_add};
+
+    fn tempdir() -> TempDir {
+        std::fs::create_dir_all("tmp").ok();
+        TempDir::new_in("tmp").unwrap()
     }
 
     #[test]
@@ -379,13 +431,7 @@ mod tests {
         init_repo_with_commit(main.path());
         let wt = tempdir();
         let linked = wt.path().join("linked");
-        let status = Command::new("git")
-            .args(["worktree", "add", "-q"])
-            .arg(&linked)
-            .current_dir(main.path())
-            .output()
-            .expect("git worktree add failed");
-        assert!(status.status.success(), "git worktree add: {status:?}");
+        worktree_add(main.path(), &linked);
 
         let common = resolve_git_common_dir(&linked).unwrap();
         let main_git = fs::canonicalize(main.path().join(".git")).unwrap();
@@ -420,13 +466,7 @@ mod tests {
         init_repo_with_commit(main.path());
         let wt = tempdir();
         let linked = wt.path().join("linked");
-        let status = Command::new("git")
-            .args(["worktree", "add", "-q"])
-            .arg(&linked)
-            .current_dir(main.path())
-            .output()
-            .expect("git worktree add failed");
-        assert!(status.status.success());
+        worktree_add(main.path(), &linked);
 
         let trees = list_worktrees(main.path()).unwrap();
         assert_eq!(trees.len(), 2);
