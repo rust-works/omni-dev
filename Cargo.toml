@@ -81,6 +81,8 @@ mcp = ["dep:rmcp"]
 menu-bar = ["dep:tray-icon", "dep:tao", "dep:arboard"]
 
 [dev-dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
 tempfile = "3.27"
 insta = { version = "1.47", features = ["filters"] }
 proptest = "1"
