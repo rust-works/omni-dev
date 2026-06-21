@@ -712,6 +712,12 @@
             },
             "localId": {
               "type": "string"
+            },
+            "wrap": {
+              "type": "boolean"
+            },
+            "hideLineNumbers": {
+              "type": "boolean"
             }
           },
           "additionalProperties": false
@@ -749,6 +755,12 @@
             },
             "localId": {
               "type": "string"
+            },
+            "wrap": {
+              "type": "boolean"
+            },
+            "hideLineNumbers": {
+              "type": "boolean"
             }
           },
           "additionalProperties": false
@@ -1579,6 +1591,9 @@
             },
             "localId": {
               "type": "string"
+            },
+            "valign": {
+              "enum": ["top", "middle", "bottom"]
             }
           },
           "required": ["width"],
