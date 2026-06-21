@@ -9,7 +9,7 @@ use futures::{SinkExt, StreamExt};
 use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LinesCodec};
 
-use super::protocol::{DaemonEnvelope, DaemonReply, StatusReport};
+use super::protocol::{DaemonEnvelope, DaemonReply, StatusReport, MAX_LINE_BYTES};
 
 /// A one-shot client over the daemon's Unix-domain control socket. Each call
 /// opens a fresh connection, sends one [`DaemonEnvelope`], and reads one
@@ -42,7 +42,7 @@ impl DaemonClient {
                     self.socket_path.display()
                 )
             })?;
-        let mut framed = Framed::new(stream, LinesCodec::new());
+        let mut framed = Framed::new(stream, LinesCodec::new_with_max_length(MAX_LINE_BYTES));
         let line = serde_json::to_string(&envelope).context("failed to encode daemon request")?;
         framed
             .send(line)

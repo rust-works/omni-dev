@@ -30,13 +30,15 @@ use serde_json::{json, Value};
 use tokio::sync::Notify;
 
 use omni_dev::daemon::client::DaemonClient;
-use omni_dev::daemon::protocol::DaemonEnvelope;
+use omni_dev::daemon::protocol::{DaemonEnvelope, DaemonReply, MAX_LINE_BYTES};
 use omni_dev::daemon::registry::ServiceRegistry;
 use omni_dev::daemon::server::{run, DaemonOptions};
 use omni_dev::daemon::service::{DaemonService, MenuSnapshot, ServiceStatus};
 use omni_dev::daemon::services::echo::EchoService;
 use omni_dev::daemon::single_instance::{bind_or_reclaim, bind_private};
 use tempfile::TempDir;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 
 /// Creates a temp dir and force-restores its mode to `0700`.
 ///
@@ -315,4 +317,59 @@ async fn invalid_utf8_line_yields_read_error_reply() {
     drop(stream);
     client.shutdown().await.ok();
     let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+}
+
+/// A request line past `MAX_LINE_BYTES` must get one error reply and then have
+/// the connection closed, rather than growing the read buffer without bound
+/// (#989) or looping in the codec's post-overflow discard mode.
+#[tokio::test]
+async fn over_limit_line_is_rejected_and_closes() {
+    with_daemon(|socket| async move {
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+
+        // One byte past the cap with no newline: the unbounded-growth attack
+        // the cap exists to stop.
+        let payload = vec![b'x'; MAX_LINE_BYTES + 1];
+        stream.write_all(&payload).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut reader = BufReader::new(stream);
+
+        // The daemon replies once with an error naming the limit.
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).await.unwrap();
+        assert!(n > 0, "expected an error reply line");
+        let reply: DaemonReply = serde_json::from_str(line.trim_end()).unwrap();
+        assert!(!reply.ok);
+        assert!(reply.error.unwrap().contains("limit"));
+
+        // Then it closes the connection rather than entering an error storm.
+        line.clear();
+        let n = reader.read_line(&mut line).await.unwrap();
+        assert_eq!(n, 0, "daemon should close after an over-limit line");
+    })
+    .await;
+}
+
+/// If the client hangs up before reading, the daemon's reply write fails
+/// (BrokenPipe) and that connection is closed cleanly — the daemon keeps
+/// serving other clients rather than wedging (#989).
+#[tokio::test]
+async fn client_hangup_before_reply_keeps_daemon_serving() {
+    with_daemon(|socket| async move {
+        {
+            let mut stream = UnixStream::connect(&socket).await.unwrap();
+            let env = serde_json::to_string(&DaemonEnvelope::builtin("ping")).unwrap();
+            stream.write_all(env.as_bytes()).await.unwrap();
+            stream.write_all(b"\n").await.unwrap();
+            stream.flush().await.unwrap();
+            // Dropped here without reading the reply: the daemon's write hits a
+            // closed peer, exercising the write-failure close path.
+        }
+
+        // The daemon must still answer a fresh client.
+        let client = DaemonClient::new(&socket);
+        client.ping().await.unwrap();
+    })
+    .await;
 }
