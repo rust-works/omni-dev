@@ -177,6 +177,48 @@ pub async fn fetch_player_response(
     Ok(response.text().await?)
 }
 
+/// POST `videoId` to the InnerTube `/player` endpoint using the **WEB**
+/// client and return the raw response body. Callers feed the body to
+/// [`super::metadata::parse`].
+///
+/// Unlike [`fetch_player_response`], this carries no device fingerprint and
+/// **no `visitorData`** — the WEB `/player` call is not bot-gated for the
+/// metadata it returns. It reports `playabilityStatus: UNPLAYABLE` for
+/// streaming purposes, but still includes both `videoDetails` and the
+/// `microformat.playerMicroformatRenderer` block (publish date, like count,
+/// category, …) that the `ANDROID_VR` transcript path lacks. That
+/// independence is what lets metadata be refreshed for already-synced videos
+/// without touching the gated transcript path.
+///
+/// `base_url` is normally `https://www.youtube.com`; tests inject a
+/// `wiremock::MockServer::uri()` instead.
+pub async fn fetch_player_response_web(
+    http: &reqwest::Client,
+    base_url: &str,
+    video_id: &str,
+) -> Result<String> {
+    let url = format!(
+        "{base}{path}",
+        base = base_url.trim_end_matches('/'),
+        path = PLAYER_PATH,
+    );
+    let body = json!({
+        "context": web_client_context(),
+        "videoId": video_id,
+        "contentCheckOk": true,
+        "racyCheckOk": true,
+    });
+
+    let response = http
+        .post(&url)
+        .header(API_KEY_HEADER, WEB_INNERTUBE_API_KEY)
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(response.text().await?)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -390,5 +432,47 @@ mod tests {
         let _ = fetch_player_response(&http(), &with_slash, VIDEO_ID, VISITOR_DATA)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn web_player_posts_with_web_key_and_web_client_and_no_visitor_data() {
+        // The metadata path uses the WEB client and key (un-gated), and must
+        // NOT carry a visitorData token — that is the ANDROID_VR-only signal.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(PLAYER_PATH))
+            .and(header(API_KEY_HEADER, WEB_INNERTUBE_API_KEY))
+            .respond_with(|req: &Request| {
+                let parsed: Value = serde_json::from_slice(&req.body).unwrap();
+                assert_eq!(parsed["videoId"], VIDEO_ID);
+                assert_eq!(parsed["context"]["client"]["clientName"], WEB_CLIENT_NAME);
+                assert!(
+                    parsed["context"]["client"]["visitorData"].is_null(),
+                    "WEB metadata call must not carry visitorData"
+                );
+                ResponseTemplate::new(200).set_body_string("{}")
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let _ = fetch_player_response_web(&http(), &server.uri(), VIDEO_ID)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn web_player_surfaces_non_2xx_as_http_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(PLAYER_PATH))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let err = fetch_player_response_web(&http(), &server.uri(), VIDEO_ID)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::transcript::TranscriptError::Http(_)));
     }
 }

@@ -10,18 +10,21 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::{SubsecRound, Utc};
 
 use crate::transcript::error::Result;
 use crate::transcript::source::{FetchOpts, LanguageInfo, MediaInfo, Transcript, TranscriptSource};
 
 pub mod channel;
 pub mod innertube;
+pub mod metadata;
 pub mod player_response;
 pub mod timedtext;
 pub mod url;
 pub mod watch_page;
 
 pub use channel::VideoEntry;
+pub use metadata::VideoMetadata;
 
 pub use player_response::{
     check_playability, extract_media_info, list_languages, parse as parse_player_response,
@@ -151,6 +154,21 @@ impl Youtube {
     /// [`channel::fetch_all_video_ids`].
     pub async fn all_channel_video_ids(&self, channel_id: &str) -> Result<Vec<String>> {
         channel::fetch_all_video_ids(&self.http, &self.base_url, channel_id).await
+    }
+
+    /// Fetch per-video metadata (title, channel, publish date, view/like
+    /// counts, …) via a single WEB-client `/player` call.
+    ///
+    /// Independent of the transcript path: it uses the un-gated WEB client
+    /// (see [`innertube::fetch_player_response_web`]) and needs **no
+    /// `visitorData` bootstrap**, so already-synced videos can be backfilled
+    /// or refreshed without touching the bot-gated `ANDROID_VR` path.
+    /// `fetched_at` is stamped at fetch time (UTC, second precision).
+    pub async fn fetch_video_metadata(&self, video_id: &str) -> Result<VideoMetadata> {
+        let raw =
+            innertube::fetch_player_response_web(&self.http, &self.base_url, video_id).await?;
+        let fetched_at = Utc::now().trunc_subsecs(0);
+        metadata::parse(&raw, fetched_at)
     }
 }
 
@@ -623,6 +641,42 @@ mod tests {
         let yt = Youtube::with_base_url(server.uri()).unwrap();
         let err = yt.fetch(VIDEO_ID, &FetchOpts::new("en")).await.unwrap_err();
         assert!(matches!(err, TranscriptError::ParseError(_)));
+    }
+
+    #[tokio::test]
+    async fn fetch_video_metadata_projects_web_player_without_watch_bootstrap() {
+        // The metadata path is independent of the gated transcript path: a
+        // single WEB /player call, no watch-page (visitorData) mock mounted.
+        const WEB_METADATA: &str =
+            include_str!("youtube/fixtures/player_response_web_metadata.json");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(innertube::PLAYER_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_string(WEB_METADATA))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let yt = Youtube::with_base_url(server.uri()).unwrap();
+        let meta = yt.fetch_video_metadata("dQw4w9WgXcQ").await.unwrap();
+        assert_eq!(meta.video_id, "dQw4w9WgXcQ");
+        assert_eq!(meta.category.as_deref(), Some("Music"));
+        assert_eq!(meta.like_count, Some(19_148_727));
+        // fetched_at is stamped at fetch time.
+        assert!((Utc::now() - meta.fetched_at).num_seconds().abs() < 60);
+    }
+
+    #[tokio::test]
+    async fn fetch_video_metadata_surfaces_http_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(innertube::PLAYER_PATH))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let yt = Youtube::with_base_url(server.uri()).unwrap();
+        let err = yt.fetch_video_metadata("dQw4w9WgXcQ").await.unwrap_err();
+        assert!(matches!(err, TranscriptError::Http(_)));
     }
 
     // ── Online integration test ──
