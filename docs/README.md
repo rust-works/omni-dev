@@ -28,6 +28,7 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 ### Browser Bridge
 
 - **[Browser Bridge Guide](browser-bridge.md)** - Drive authenticated HTTP requests through a browser tab (Grafana/Loki, internal dashboards); the two planes, the `request` thin client, and the security model
+- **[Recipe: querying your own Facebook data](recipes/browser-bridge-facebook.md)** - Page your own Facebook timeline via internal Relay/GraphQL; the worked example for the `--allow-origin` + `--credentials omit` cross-origin flags
 - **[ADR-0036](adrs/adr-0036.md)** - Confused-deputy trust boundary and dual-plane default-closed authentication
 
 ### MCP Server

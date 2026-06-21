@@ -29,6 +29,7 @@ add-on — both planes are authenticated and default-closed. See
 11. [Harvesting your own data (best-effort)](#harvesting-your-own-data-best-effort)
 12. [WebSocket wire protocol](#websocket-wire-protocol)
 13. [Caveats](#caveats)
+14. [Recipes](#recipes)
 
 ## How it works
 
@@ -458,7 +459,9 @@ The command reuses the same `bridge request` dispatch path: it needs a running
 and its cross-origin `doc_id`-discovery step requires the bridge to permit
 `https://static.xx.fbcdn.net` (it sends that per-request via the same machinery
 as `request --allow-origin … --credentials omit`). The full manual recipe this
-encapsulates is documented separately (issue #922).
+encapsulates — harvesting tokens, discovering the pagination `doc_id`, and the
+paginating GraphQL loop, with the field map — is written up in
+[Recipe: querying your own Facebook data](recipes/browser-bridge-facebook.md).
 
 > **Best-effort contract.** This drives **reverse-engineered, undocumented**
 > Facebook internals. It re-harvests every volatile value (GraphQL `doc_id`s,
@@ -560,3 +563,15 @@ Rules:
 - Remaining limitations: no stdin piping, and a request fans out to at most one
   tab. Multiple concurrent tabs (with routing), binary bodies, *and*
   streaming/chunked responses are all supported (see the wire protocol above).
+
+## Recipes
+
+Worked end-to-end procedures that drive a specific service through the bridge:
+
+- [Querying your own Facebook data](recipes/browser-bridge-facebook.md) — page
+  your own profile timeline via Facebook's internal Relay/GraphQL API: harvest
+  CSRF/session tokens, discover the pagination `doc_id` from a cross-origin
+  bundle (the worked example for `request --allow-origin` + `--credentials omit`),
+  and run the paginating GraphQL loop. This is the manual recipe the built-in
+  [`harvest facebook posts`](#harvesting-your-own-data-best-effort) command
+  automates.
