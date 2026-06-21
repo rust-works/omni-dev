@@ -260,4 +260,34 @@ mod tests {
         // All sample lines are status 200, so nothing matches 5xx.
         assert!(String::from_utf8(out).unwrap().is_empty());
     }
+
+    #[test]
+    fn run_on_missing_file_without_follow_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.jsonl");
+        // No file yet and not following: clean no-op.
+        assert!(run(&missing, &empty_filter(), Format::Json, None, false).is_ok());
+    }
+
+    #[test]
+    fn run_reads_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        std::fs::write(&path, sample_lines()).unwrap();
+        // Exercises the open + backlog path (output goes to captured stdout).
+        assert!(run(&path, &empty_filter(), Format::Json, Some(2), false).is_ok());
+    }
+
+    #[test]
+    fn broken_pipe_is_swallowed_other_errors_propagate() {
+        use std::io::{Error, ErrorKind};
+
+        assert!(ignore_broken_pipe(Error::from(ErrorKind::BrokenPipe)).is_ok());
+        assert!(ignore_broken_pipe(Error::from(ErrorKind::PermissionDenied)).is_err());
+
+        assert!(
+            swallow_broken_pipe(anyhow::Error::from(Error::from(ErrorKind::BrokenPipe))).is_ok()
+        );
+        assert!(swallow_broken_pipe(anyhow::anyhow!("unrelated")).is_err());
+    }
 }

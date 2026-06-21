@@ -586,4 +586,179 @@ mod tests {
         .unwrap();
         assert!(!fail.matches(&rec, "{}"));
     }
+
+    fn empty_input<'a>() -> FilterInput<'a> {
+        FilterInput {
+            since: None,
+            method: None,
+            status: None,
+            service: None,
+            command: None,
+            url: None,
+            grep: None,
+            fuzzy: &[],
+            query: &[],
+            id: None,
+        }
+    }
+
+    fn rec_http() -> LogRecord {
+        LogRecord {
+            id: "rec-1".to_string(),
+            invocation_id: "inv-9".to_string(),
+            kind: RecordKind::Http,
+            timestamp: "2026-06-22T10:00:00.000Z".to_string(),
+            service: Some("jira".to_string()),
+            method: Some("GET".to_string()),
+            url: Some("https://acme.atlassian.net/rest/api/3/issue/X-1".to_string()),
+            status_code: Some(200),
+            ..LogRecord::default()
+        }
+    }
+
+    #[test]
+    fn build_rejects_bad_inputs() {
+        let mut i = empty_input();
+        i.grep = Some("(");
+        assert!(Filter::build(i).is_err(), "bad regex");
+
+        let mut i = empty_input();
+        i.status = Some("9xx");
+        assert!(Filter::build(i).is_err(), "bad status class");
+
+        let mut i = empty_input();
+        i.since = Some("bogus");
+        assert!(Filter::build(i).is_err(), "bad since");
+
+        let bad_query = vec!["(unclosed".to_string()];
+        let mut i = empty_input();
+        i.query = &bad_query;
+        assert!(Filter::build(i).is_err(), "bad query");
+    }
+
+    #[test]
+    fn matches_each_flag() {
+        let rec = rec_http();
+        let raw = serde_json::to_string(&rec).unwrap();
+
+        let mut i = empty_input();
+        i.method = Some("get");
+        assert!(Filter::build(i).unwrap().matches(&rec, &raw));
+        let mut i = empty_input();
+        i.method = Some("post");
+        assert!(!Filter::build(i).unwrap().matches(&rec, &raw));
+
+        let mut i = empty_input();
+        i.service = Some("jira");
+        assert!(Filter::build(i).unwrap().matches(&rec, &raw));
+
+        let mut i = empty_input();
+        i.url = Some("issue/X-1");
+        assert!(Filter::build(i).unwrap().matches(&rec, &raw));
+        let mut i = empty_input();
+        i.url = Some("nope");
+        assert!(!Filter::build(i).unwrap().matches(&rec, &raw));
+
+        let mut i = empty_input();
+        i.grep = Some("X-\\d+");
+        assert!(Filter::build(i).unwrap().matches(&rec, &raw));
+
+        let toks = vec!["jira".to_string(), "issue".to_string()];
+        let mut i = empty_input();
+        i.fuzzy = &toks;
+        assert!(Filter::build(i).unwrap().matches(&rec, &raw));
+        let toks = vec!["absent".to_string()];
+        let mut i = empty_input();
+        i.fuzzy = &toks;
+        assert!(!Filter::build(i).unwrap().matches(&rec, &raw));
+
+        for id in ["rec-1", "inv-9"] {
+            let mut i = empty_input();
+            i.id = Some(id);
+            assert!(Filter::build(i).unwrap().matches(&rec, &raw), "id {id}");
+        }
+        let mut i = empty_input();
+        i.id = Some("other");
+        assert!(!Filter::build(i).unwrap().matches(&rec, &raw));
+    }
+
+    #[test]
+    fn since_filters_by_recency() {
+        let raw = "{}";
+        let mut past = rec_http();
+        past.timestamp = "2000-01-01T00:00:00.000Z".to_string();
+        let mut future = rec_http();
+        future.timestamp = "2999-01-01T00:00:00.000Z".to_string();
+        let mut undated = rec_http();
+        undated.timestamp = String::new();
+
+        let mut i = empty_input();
+        i.since = Some("1d");
+        let f = Filter::build(i).unwrap();
+        assert!(!f.matches(&past, raw));
+        assert!(f.matches(&future, raw));
+        assert!(
+            !f.matches(&undated, raw),
+            "unparseable timestamp is excluded"
+        );
+    }
+
+    #[test]
+    fn query_covers_every_field_arm() {
+        let mut rec = rec_http();
+        rec.source = Some(Source::Mcp);
+        rec.mcp_tool = Some("jira_read".to_string());
+        rec.via_daemon = true;
+        rec.error = Some("boom timeout".to_string());
+        rec.command = vec!["jira".to_string(), "read".to_string()];
+        let raw = serde_json::to_string(&rec).unwrap().to_ascii_lowercase();
+
+        let cases = [
+            ("kind:http", true),
+            ("kind:invocation", false),
+            ("source:mcp", true),
+            ("source:cli", false),
+            ("service:jira", true),
+            ("method:GET", true),
+            ("status:2xx", true),
+            ("status:5xx", false),
+            ("command:jira", true),
+            ("cmd:\"jira read\"", true),
+            ("url:issue", true),
+            ("id:rec-1", true),
+            ("id:inv-9", true),
+            ("id:nope", false),
+            ("inv:inv-9", true),
+            ("invocation_id:inv-9", true),
+            ("tool:jira_read", true),
+            ("mcp_tool:other", false),
+            ("via_daemon:true", true),
+            ("via_daemon:false", false),
+            ("error:timeout", true),
+            ("err:absent", false),
+            ("error:", true),
+            ("unknownfield:x", false),
+        ];
+        for (q, expected) in cases {
+            let parsed = parse_query(q).unwrap();
+            assert_eq!(parsed.eval(&rec, &raw), expected, "query: {q}");
+        }
+    }
+
+    #[test]
+    fn query_parser_edge_cases() {
+        let rec = LogRecord::default();
+        let raw = r#"{"x":"hello world"}"#.to_ascii_lowercase();
+
+        assert!(parse_query("\"hello world\"").unwrap().eval(&rec, &raw));
+        assert!(parse_query("hello AND world").unwrap().eval(&rec, &raw));
+        assert!(!parse_query("NOT hello").unwrap().eval(&rec, &raw));
+        assert!(parse_query("(hello OR nope) AND world")
+            .unwrap()
+            .eval(&rec, &raw));
+
+        assert!(parse_query("(hello").is_err());
+        assert!(parse_query("hello )").is_err());
+        assert!(parse_query("").is_err());
+    }
 }
