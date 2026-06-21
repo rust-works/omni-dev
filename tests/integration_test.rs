@@ -701,3 +701,25 @@ fn log_write_failure_does_not_change_exit_code() {
         "command must exit 0 even when the log cannot be written"
     );
 }
+
+#[test]
+fn bodies_flag_creates_parent_and_writes_record() {
+    // A nested path whose parent does not exist exercises directory creation,
+    // and OMNI_DEV_LOG_BODIES=1 routes the write through the advisory-locked
+    // path. (A local command makes no HTTP, so only the invocation is logged.)
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("nested").join("log.jsonl");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .arg("help-all")
+        .env("OMNI_DEV_LOG_FILE", &log)
+        .env("OMNI_DEV_LOG_BODIES", "1")
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success());
+
+    let contents = fs::read_to_string(&log).expect("nested log file should be created");
+    assert!(contents
+        .lines()
+        .any(|l| l.contains(r#""kind":"invocation""#)));
+}

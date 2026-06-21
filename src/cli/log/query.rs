@@ -436,10 +436,7 @@ impl Parser {
                     _ => bail!("unbalanced parenthesis in query"),
                 }
             }
-            Some(Token::Word(_)) => {
-                let Some(Token::Word(word)) = self.tokens.get(self.pos) else {
-                    unreachable!()
-                };
+            Some(Token::Word(word)) => {
                 let word = word.clone();
                 self.pos += 1;
                 Ok(match word.split_once(':') {
@@ -760,5 +757,90 @@ mod tests {
         assert!(parse_query("(hello").is_err());
         assert!(parse_query("hello )").is_err());
         assert!(parse_query("").is_err());
+    }
+
+    #[test]
+    fn matches_rejects_on_each_clause() {
+        let mut rec = rec_http();
+        rec.command = vec!["jira".to_string(), "read".to_string()];
+        let raw = serde_json::to_string(&rec).unwrap();
+
+        // Each clause, set to a value the record does NOT satisfy, fails the match.
+        let mut status = empty_input();
+        status.status = Some("5xx");
+        assert!(!Filter::build(status).unwrap().matches(&rec, &raw));
+
+        let mut service = empty_input();
+        service.service = Some("datadog");
+        assert!(!Filter::build(service).unwrap().matches(&rec, &raw));
+
+        let mut command = empty_input();
+        command.command = Some("git");
+        assert!(!Filter::build(command).unwrap().matches(&rec, &raw));
+        // …and the matching command passes.
+        let mut command = empty_input();
+        command.command = Some("jira");
+        assert!(Filter::build(command).unwrap().matches(&rec, &raw));
+
+        let mut url = empty_input();
+        url.url = Some("absent-path");
+        assert!(!Filter::build(url).unwrap().matches(&rec, &raw));
+
+        let mut grep = empty_input();
+        grep.grep = Some("ZZZ-not-present");
+        assert!(!Filter::build(grep).unwrap().matches(&rec, &raw));
+
+        // A --query clause that fails also rejects the record.
+        let q = vec!["service:datadog".to_string()];
+        let mut query = empty_input();
+        query.query = &q;
+        assert!(!Filter::build(query).unwrap().matches(&rec, &raw));
+    }
+
+    #[test]
+    fn since_rejects_all_digit_and_empty_number() {
+        // No unit (all digits) hits the "no non-digit found" error path.
+        let mut all_digits = empty_input();
+        all_digits.since = Some("30");
+        assert!(Filter::build(all_digits).is_err());
+
+        // A leading non-digit yields an empty number, hitting the parse error.
+        let mut empty_num = empty_input();
+        empty_num.since = Some("xh");
+        assert!(Filter::build(empty_num).is_err());
+    }
+
+    #[test]
+    fn query_covers_kind_source_and_error_variants() {
+        let raw = "{}".to_ascii_lowercase();
+
+        for (kind, q, want) in [
+            (RecordKind::Invocation, "kind:invocation", true),
+            (RecordKind::Http, "kind:invocation", false),
+            (RecordKind::Unknown, "kind:unknown", true),
+        ] {
+            let rec = LogRecord {
+                kind,
+                ..LogRecord::default()
+            };
+            assert_eq!(parse_query(q).unwrap().eval(&rec, &raw), want, "{q}");
+        }
+
+        for (source, q, want) in [
+            (Source::Cli, "source:cli", true),
+            (Source::Daemon, "source:daemon", true),
+            (Source::Unknown, "source:unknown", true),
+            (Source::Daemon, "source:cli", false),
+        ] {
+            let rec = LogRecord {
+                source: Some(source),
+                ..LogRecord::default()
+            };
+            assert_eq!(parse_query(q).unwrap().eval(&rec, &raw), want, "{q}");
+        }
+
+        // The error arm with no error present returns false.
+        let rec = LogRecord::default();
+        assert!(!parse_query("error:boom").unwrap().eval(&rec, &raw));
     }
 }

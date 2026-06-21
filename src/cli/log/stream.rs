@@ -102,31 +102,47 @@ fn follow_loop<W: Write>(
     out: &mut W,
 ) -> Result<()> {
     loop {
-        if let Ok(file) = File::open(path) {
-            let len = file.metadata().map_or(pos, |m| m.len());
-            if len < pos {
-                pos = 0; // truncated or rotated — restart
-            }
-            if len > pos {
-                let mut reader = BufReader::new(file);
-                reader.seek(SeekFrom::Start(pos))?;
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    let n = reader.read_line(&mut line)?;
-                    if n == 0 || !line.ends_with('\n') {
-                        break; // EOF or partial trailing line — wait for more
-                    }
-                    pos += n as u64;
-                    if let Some(rendered) = render_if_match(&line, filter, format) {
-                        writeln!(out, "{rendered}")?;
-                        out.flush()?;
-                    }
-                }
-            }
-        }
+        pos = drain_appended(path, filter, format, pos, out)?;
         std::thread::sleep(FOLLOW_POLL);
     }
+}
+
+/// Reads and emits any complete lines appended past `pos`, returning the new
+/// position. Restarts from the top if the file shrank (truncation/rotation);
+/// a no-op (returns `pos` unchanged) if the file is absent or has not grown.
+/// A trailing partial line (no newline yet) is left for the next call.
+fn drain_appended<W: Write>(
+    path: &Path,
+    filter: &Filter,
+    format: Format,
+    mut pos: u64,
+    out: &mut W,
+) -> Result<u64> {
+    let Ok(file) = File::open(path) else {
+        return Ok(pos);
+    };
+    let len = file.metadata().map_or(pos, |m| m.len());
+    if len < pos {
+        pos = 0; // truncated or rotated — restart
+    }
+    if len > pos {
+        let mut reader = BufReader::new(file);
+        reader.seek(SeekFrom::Start(pos))?;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line)?;
+            if n == 0 || !line.ends_with('\n') {
+                break; // EOF or partial trailing line — wait for more
+            }
+            pos += n as u64;
+            if let Some(rendered) = render_if_match(&line, filter, format) {
+                writeln!(out, "{rendered}")?;
+                out.flush()?;
+            }
+        }
+    }
+    Ok(pos)
 }
 
 /// Parses one raw line, returning its rendering when it matches the filter.
@@ -289,5 +305,60 @@ mod tests {
             swallow_broken_pipe(anyhow::Error::from(Error::from(ErrorKind::BrokenPipe))).is_ok()
         );
         assert!(swallow_broken_pipe(anyhow::anyhow!("unrelated")).is_err());
+    }
+
+    #[test]
+    fn drain_appended_reads_only_new_complete_lines() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        std::fs::write(&path, sample_lines()).unwrap();
+
+        // First drain reads the whole backlog and advances the position.
+        let mut out = Vec::new();
+        let pos = drain_appended(&path, &empty_filter(), Format::Json, 0, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap().lines().count(), 5);
+        assert!(pos > 0);
+
+        // Appending two lines and draining from `pos` yields only those.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(f, r#"{{"id":"5","kind":"http"}}"#).unwrap();
+        writeln!(f, r#"{{"id":"6","kind":"http"}}"#).unwrap();
+        let mut out = Vec::new();
+        let pos2 = drain_appended(&path, &empty_filter(), Format::Json, pos, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        assert!(text.contains(r#""id":"5""#));
+        assert!(pos2 > pos);
+
+        // A trailing partial line (no newline) is left for the next call.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        write!(f, r#"{{"id":"7","kind":"http"}}"#).unwrap();
+        let mut out = Vec::new();
+        let pos3 = drain_appended(&path, &empty_filter(), Format::Json, pos2, &mut out).unwrap();
+        assert!(String::from_utf8(out).unwrap().is_empty());
+        assert_eq!(pos3, pos2, "partial line does not advance the position");
+
+        // Truncation resets to the top and re-reads.
+        std::fs::write(&path, "{\"id\":\"x\",\"kind\":\"http\"}\n").unwrap();
+        let mut out = Vec::new();
+        drain_appended(&path, &empty_filter(), Format::Json, pos2, &mut out).unwrap();
+        assert!(String::from_utf8(out).unwrap().contains(r#""id":"x""#));
+
+        // A missing file is a no-op that preserves the position.
+        let missing = dir.path().join("gone.jsonl");
+        let mut out = Vec::new();
+        assert_eq!(
+            drain_appended(&missing, &empty_filter(), Format::Json, 7, &mut out).unwrap(),
+            7
+        );
+        assert!(String::from_utf8(out).unwrap().is_empty());
     }
 }
