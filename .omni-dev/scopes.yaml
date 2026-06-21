@@ -35,6 +35,10 @@ scopes:
     description: "MCP server implementation and tool handlers"
     examples: ["mcp: add git_view_commits tool", "mcp: wire up stdio transport"]
     file_patterns: ["src/mcp/**", "src/mcp.rs", "src/mcp_server.rs"]
+  - name: "request-log"
+    description: "Local append-only invocation + HTTP request log and its reader"
+    examples: ["request-log: add append-only log writer", "request-log: add omni-dev log reader"]
+    file_patterns: ["src/request_log.rs", "src/cli/log.rs", "src/cli/log/**"]
   - name: "resources"
     description: "Embedded reference content registry shared by CLI and MCP"
     examples: ["resources: add jfm spec entry", "resources: extract specs into shared registry"]
