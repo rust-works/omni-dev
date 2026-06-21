@@ -1,7 +1,7 @@
 //! The daemon server core: bind the control socket, accept NDJSON connections,
 //! route envelopes to services (or built-in ops), and shut down gracefully.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -91,19 +91,33 @@ pub async fn run_with_shutdown(
         }
     }
 
+    // Close and unlink the control socket *before* draining (see #993). The
+    // accept loop has already exited, so any `connect`+`ping` arriving during the
+    // drain below would otherwise sit unaccepted in the backlog and block the
+    // caller until process exit. Dropping the listener makes those connects fail
+    // fast (ECONNREFUSED). Removing the path here too — rather than after the
+    // drain — avoids a restart race: a replacement daemon could reclaim the stale
+    // socket and rebind its *own* listener mid-drain, and a late unlink would then
+    // delete that fresh socket out from under it.
+    drop(listener);
+    remove_socket(&opts.socket_path);
+
+    // Drain in-flight connection handlers before stopping services (#992).
     drain_connections(&mut conns, DRAIN_TIMEOUT).await;
 
     tracing::info!("daemon shutting down; draining services");
     registry.shutdown_all().await;
-    if let Err(e) = std::fs::remove_file(&opts.socket_path) {
+    Ok(())
+}
+
+/// Removes the control-socket file, tolerating its absence (a replacement
+/// daemon may have already reclaimed it). Any other error is logged, not fatal.
+fn remove_socket(path: &Path) {
+    if let Err(e) = std::fs::remove_file(path) {
         if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(
-                "failed to remove socket {}: {e}",
-                opts.socket_path.display()
-            );
+            tracing::warn!("failed to remove socket {}: {e}", path.display());
         }
     }
-    Ok(())
 }
 
 /// Logs a reaped connection task that ended by panicking; clean exits and
