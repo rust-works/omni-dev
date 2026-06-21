@@ -205,4 +205,25 @@ mod tests {
         // No 'T' separator and no tz marker returns the input unchanged.
         assert_eq!(short_time("12:00:00"), "12:00:00");
     }
+
+    #[test]
+    fn oneline_renders_daemon_and_absent_source() {
+        let daemon = LogRecord {
+            kind: RecordKind::Invocation,
+            timestamp: "2026-06-22T12:00:00.000Z".to_string(),
+            source: Some(Source::Daemon),
+            command: vec!["daemon".to_string(), "run".to_string()],
+            ..LogRecord::default()
+        };
+        assert!(render(&daemon, "", Format::Oneline).contains("daemon"));
+
+        // A record with no source renders the "-" placeholder.
+        let none = LogRecord {
+            kind: RecordKind::Invocation,
+            command: vec!["x".to_string()],
+            ..LogRecord::default()
+        };
+        let line = render(&none, "", Format::Oneline);
+        assert!(line.contains(" - "));
+    }
 }
