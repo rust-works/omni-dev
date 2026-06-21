@@ -505,8 +505,10 @@ mod tests {
 
     #[test]
     fn command_prefix_matches() {
-        let mut rec = LogRecord::default();
-        rec.command = vec!["jira".to_string(), "read".to_string()];
+        let rec = LogRecord {
+            command: vec!["jira".to_string(), "read".to_string()],
+            ..LogRecord::default()
+        };
         assert!(command_matches(&rec, "jira"));
         assert!(command_matches(&rec, "jira read"));
         assert!(!command_matches(&rec, "git"));
