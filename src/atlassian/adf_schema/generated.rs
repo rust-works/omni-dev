@@ -17,15 +17,15 @@
 pub const UPSTREAM_PACKAGE: &str = "@atlaskit/adf-schema";
 
 /// Upstream npm package version this snapshot was generated from.
-pub const UPSTREAM_VERSION: &str = "52.9.5";
+pub const UPSTREAM_VERSION: &str = "54.0.4";
 
 /// SHA-256 of the upstream tarball that produced this snapshot.
 pub const UPSTREAM_TARBALL_SHA256: &str =
-    "90b9b26f5cdf6f0850cebe5cf2df7662601b249322d6bcbeead712ca018e0b56";
+    "cca2f68e83a09d9df0abc74391730f34606f0b868d8418f5dd336117164c20fd";
 
 /// SHA-256 of the vendored `assets/adf-schema/full.json` bytes.
 pub const UPSTREAM_FULL_JSON_SHA256: &str =
-    "9c4c8237e8ecdb5088438421be2f9fc7becf1ffb6096951af4eb4d4c85a06190";
+    "a14ecfc57aa10c06f34b0337b2bcfbd2829c053ac17269adaec3aee2114bc902";
 
 /// Per-parent allowed-children atoms, derived faithfully from the upstream
 /// `@atlaskit/adf-schema` JSON schema in `assets/adf-schema/full.json`.
@@ -34,13 +34,13 @@ pub const UPSTREAM_FULL_JSON_SHA256: &str =
 /// sorted alphabetically and deduplicated. Quantifier and order information
 /// (`+`, `*`, `?`, `{n}`, `{m,n}`, sequence order) is *not* preserved here —
 /// the upstream JSON schema's `anyOf`-of-`$ref` shape does not encode it in
-/// a parseable way. See `super::CONTENT_ENTRIES` in
+/// a parseable way. See [`super::CONTENT_ENTRIES`] in
 /// `src/atlassian/adf_schema/mod.rs` for the runtime model that layers
 /// quantifier arity on top of these atoms.
 ///
 /// The unit test `generated_upstream_atoms_match_local_snapshot` in
 /// `src/atlassian/adf_schema/mod.rs` asserts that the flattened atoms from
-/// `super::CONTENT_ENTRIES` agree with `UPSTREAM_ENTRIES` modulo a small
+/// [`super::CONTENT_ENTRIES`] agree with `UPSTREAM_ENTRIES` modulo a small
 /// allowlist of documented leniency deviations.
 pub const UPSTREAM_ENTRIES: &[(&str, &[&str])] = &[
     ("blockTaskItem", &["extension", "paragraph"]),
