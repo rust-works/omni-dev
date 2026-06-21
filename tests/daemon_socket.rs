@@ -12,8 +12,11 @@
 //! umask is per-process, so this binary's umask windows never touch the unit
 //! tests. See issue #1017.
 //!
-//! Within *this* binary the few tests below still share one process, so each
-//! restores its own temp dir to `0700` via [`tempdir_0700`] before binding.
+//! Within *this* binary the tests below still share one process, and `umask` is
+//! process-global, so every socket-binding test holds [`UMASK_GATE`] for its
+//! whole body. That serializes the `bind_private` umask save/restore spans,
+//! closing both the socket-mode race (#1023) and the intra-binary temp-dir race
+//! a per-test `0700` restore used to guard.
 
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -36,42 +39,30 @@ use omni_dev::daemon::server::{run, DaemonOptions};
 use omni_dev::daemon::service::{DaemonService, MenuSnapshot, ServiceStatus};
 use omni_dev::daemon::services::echo::EchoService;
 use omni_dev::daemon::single_instance::{bind_or_reclaim, bind_private};
-use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-/// Serializes every socket bind in this test binary.
+/// Serializes every umask-mutating test in this binary.
 ///
-/// `bind_private` tightens the **process-global** umask across its `bind` with a
-/// non-reentrant guard. Two binds racing on separate test threads nest that
-/// guard, so one restores the default umask while the other is still mid-bind —
-/// landing its socket at `0o755` instead of `0o600` (and corrupting the umask for
-/// later binds). Production never binds concurrently (a single startup bind), so
-/// the guard is sound there; here we simply run the binds one at a time. The
-/// `tempdir_0700` helper covers the *directory*-permission half of the same race;
-/// this lock covers the *socket-mode* half. See issue #1017.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// Creates a temp dir and force-restores its mode to `0700`.
-///
-/// A sibling test in this binary may have tightened the process-global umask
-/// (via a concurrent `bind_private`) at the instant `tempdir()` created this
-/// dir, stripping its owner **search** bit and leaving it `0600` — which would
-/// then fail any socket/file creation inside it with `EACCES`. Restoring `0700`
-/// up front closes that intra-binary race.
-fn tempdir_0700() -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    dir
-}
+/// `bind_private` (reached directly, or via `bind_or_reclaim`/`run`) saves the
+/// process-global umask, tightens it to `0o177`, binds, then restores the prior
+/// value on guard drop. Two such save/restore spans that interleave corrupt the
+/// shared umask — one span restores the *other's* already-tightened value — so a
+/// later `bind` yields a `0755` socket instead of `0600` (#1023), or a `tempdir`
+/// loses its owner **search** bit (the intra-binary directory race #1017 first
+/// surfaced). Each socket-binding test holds this gate for its whole body, so no
+/// two umask spans ever overlap. The tests are few and fast, so full
+/// serialization is effectively free; an async `Mutex` lets the `#[tokio::test]`
+/// bodies hold it across their `.await`s.
+static UMASK_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// `bind_private` alone — with no follow-up `chmod` — must yield a `0600`
 /// socket, proving the umask closes the window rather than a post-bind
 /// `set_file_0600`. Needs a Tokio runtime to register the listener fd.
 #[tokio::test]
 async fn bind_private_creates_an_owner_only_socket() {
-    let _serial = SERIAL.lock().await;
-    let dir = tempdir_0700();
+    let _gate = UMASK_GATE.lock().await;
+    let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("d.sock");
     let listener = bind_private(&socket).unwrap();
     let mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
@@ -86,8 +77,7 @@ where
     F: FnOnce(PathBuf) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    let _serial = SERIAL.lock().await;
-    let dir = tempdir_0700();
+    let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("d.sock");
     let mut registry = ServiceRegistry::new();
     registry.register(Arc::new(EchoService));
@@ -113,6 +103,7 @@ where
 
 #[tokio::test]
 async fn ping_and_status_and_routing() {
+    let _gate = UMASK_GATE.lock().await;
     with_daemon(|socket| async move {
         let client = DaemonClient::new(&socket);
 
@@ -157,6 +148,7 @@ async fn ping_and_status_and_routing() {
 
 #[tokio::test]
 async fn second_bind_is_refused_while_first_is_live() {
+    let _gate = UMASK_GATE.lock().await;
     with_daemon(|socket| async move {
         let mut registry = ServiceRegistry::new();
         registry.register(Arc::new(EchoService));
@@ -168,8 +160,8 @@ async fn second_bind_is_refused_while_first_is_live() {
 
 #[tokio::test]
 async fn stale_socket_is_reclaimed() {
-    let _serial = SERIAL.lock().await;
-    let dir = tempdir_0700();
+    let _gate = UMASK_GATE.lock().await;
+    let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("d.sock");
     // A leftover regular file at the socket path stands in for a stale
     // socket: nothing is listening, so the ping probe fails and we reclaim.
@@ -225,8 +217,8 @@ impl DaemonService for SlowService {
 /// not abandoned: `run()` waits for it to finish before returning (#992).
 #[tokio::test]
 async fn in_flight_request_is_drained_on_shutdown() {
-    let _serial = SERIAL.lock().await;
-    let dir = tempdir_0700();
+    let _gate = UMASK_GATE.lock().await;
+    let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("d.sock");
 
     let started = Arc::new(Notify::new());
@@ -297,11 +289,8 @@ async fn in_flight_request_is_drained_on_shutdown() {
 /// silently.
 #[tokio::test]
 async fn invalid_utf8_line_yields_read_error_reply() {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
-
-    let _serial = SERIAL.lock().await;
-    let dir = tempdir_0700();
+    let _gate = UMASK_GATE.lock().await;
+    let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("d.sock");
     let mut registry = ServiceRegistry::new();
     registry.register(Arc::new(EchoService));
@@ -341,6 +330,7 @@ async fn invalid_utf8_line_yields_read_error_reply() {
 /// (#989) or looping in the codec's post-overflow discard mode.
 #[tokio::test]
 async fn over_limit_line_is_rejected_and_closes() {
+    let _gate = UMASK_GATE.lock().await;
     with_daemon(|socket| async move {
         let mut stream = UnixStream::connect(&socket).await.unwrap();
 
@@ -373,6 +363,7 @@ async fn over_limit_line_is_rejected_and_closes() {
 /// serving other clients rather than wedging (#989).
 #[tokio::test]
 async fn client_hangup_before_reply_keeps_daemon_serving() {
+    let _gate = UMASK_GATE.lock().await;
     with_daemon(|socket| async move {
         {
             let mut stream = UnixStream::connect(&socket).await.unwrap();
@@ -433,8 +424,8 @@ impl DaemonService for GatedService {
 /// instead of sitting unaccepted until process exit.
 #[tokio::test]
 async fn stray_ping_fails_fast_while_draining() {
-    let _serial = SERIAL.lock().await;
-    let dir = tempdir_0700();
+    let _gate = UMASK_GATE.lock().await;
+    let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("d.sock");
 
     let entered = Arc::new(Notify::new());
