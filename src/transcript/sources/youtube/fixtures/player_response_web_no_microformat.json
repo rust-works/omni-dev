@@ -1,0 +1,22 @@
+{
+  "playabilityStatus": {
+    "status": "UNPLAYABLE",
+    "reason": "This video is not available on this client."
+  },
+  "videoDetails": {
+    "videoId": "noMicro1234",
+    "title": "Private-ish video",
+    "lengthSeconds": "100",
+    "channelId": "UCuAXFkgsw1L7xaCfnd5JJOw",
+    "author": "Some Channel",
+    "shortDescription": "A video whose WEB response carries no microformat block.",
+    "viewCount": "42",
+    "isLiveContent": false,
+    "isPrivate": true,
+    "thumbnail": {
+      "thumbnails": [
+        { "url": "https://i.ytimg.com/vi/noMicro1234/hqdefault.jpg", "width": 480, "height": 360 }
+      ]
+    }
+  }
+}

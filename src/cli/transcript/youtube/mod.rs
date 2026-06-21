@@ -83,6 +83,7 @@ mod tests {
                 auto: false,
                 full: false,
                 since: None,
+                refresh_metadata_older_than: None,
                 concurrency: 4,
                 dry_run: false,
             }),

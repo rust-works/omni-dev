@@ -10,10 +10,11 @@
 //! Videos without a usable transcript (no captions, age-gated, region-locked)
 //! are recorded and skipped — never abort the whole run.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Duration, Months, NaiveDate, Utc};
 use clap::Parser;
 use futures::stream::{self, StreamExt};
 
@@ -21,7 +22,7 @@ use crate::cli::transcript::format::CliFormat;
 use crate::transcript::error::TranscriptError;
 use crate::transcript::format::Format;
 use crate::transcript::source::{FetchOpts, TranscriptSource};
-use crate::transcript::sources::youtube::Youtube;
+use crate::transcript::sources::youtube::{metadata, Youtube};
 
 /// Syncs transcripts for all videos in one or more YouTube channels to the
 /// filesystem, incrementally (skips videos already synced).
@@ -70,6 +71,14 @@ pub struct SyncCommand {
     #[arg(long, default_value_t = 4)]
     pub concurrency: usize,
 
+    /// Re-fetch metadata sidecars whose `fetched_at` is older than this
+    /// cutoff. Accepts `YYYY-MM-DD` (midnight UTC), a full RFC 3339 timestamp,
+    /// or a relative spec like `"2 days ago"` (units: minute, hour, day, week,
+    /// month, year). Without this flag existing sidecars are never refreshed,
+    /// but missing ones are always downloaded.
+    #[arg(long, value_name = "DATE_SPEC")]
+    pub refresh_metadata_older_than: Option<String>,
+
     /// List what would be fetched without downloading or writing anything.
     #[arg(long)]
     pub dry_run: bool,
@@ -100,6 +109,12 @@ impl SyncCommand {
             .map(parse_since)
             .transpose()
             .context("Invalid --since date")?;
+        let refresh_cutoff = self
+            .refresh_metadata_older_than
+            .as_deref()
+            .map(|s| parse_date_spec(s, Utc::now()))
+            .transpose()
+            .context("Invalid --refresh-metadata-older-than")?;
         Ok(SyncPlan {
             channels: self.channels,
             out: self.out,
@@ -108,6 +123,7 @@ impl SyncCommand {
             allow_auto: self.auto,
             full: self.full,
             since,
+            refresh_cutoff,
             concurrency: self.concurrency.max(1),
             dry_run: self.dry_run,
         })
@@ -129,6 +145,63 @@ fn parse_since(s: &str) -> Result<DateTime<Utc>> {
     Ok(DateTime::from_naive_utc_and_offset(naive, Utc))
 }
 
+/// Parse a `--refresh-metadata-older-than` value into an absolute cutoff,
+/// resolving relative forms against `now`.
+///
+/// Accepted forms:
+/// - RFC 3339 timestamp (`2026-06-01T12:00:00+10:00`) — exact instant;
+/// - `YYYY-MM-DD` (`2026-06-01`) — midnight UTC (consistent with `--since`);
+/// - relative `<N> <unit>[s] ago` (`2 days ago`, `1 hour ago`) — units
+///   minute, hour, day, week, month, year.
+fn parse_date_spec(s: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    let s = s.trim();
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.with_timezone(&Utc));
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        #[allow(clippy::expect_used)]
+        let naive = date
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is always a valid time");
+        return Ok(DateTime::from_naive_utc_and_offset(naive, Utc));
+    }
+    parse_relative(s, now)
+        .with_context(|| format!("expected YYYY-MM-DD, RFC 3339, or `<N> <unit> ago`, got `{s}`"))
+}
+
+/// Resolve a relative `<N> <unit>[s] ago` spec against `now`. Months and years
+/// use calendar arithmetic ([`chrono::Months`]); smaller units use fixed
+/// [`chrono::Duration`] offsets.
+fn parse_relative(s: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    let lower = s.to_lowercase();
+    let parts: Vec<&str> = lower.split_whitespace().collect();
+    if parts.len() != 3 || parts[2] != "ago" {
+        anyhow::bail!("not a relative date spec");
+    }
+    let n: i64 = parts[0]
+        .parse()
+        .with_context(|| format!("relative count `{}` is not an integer", parts[0]))?;
+    if n < 0 {
+        anyhow::bail!("relative count must be non-negative");
+    }
+    // Normalise an optional trailing plural, e.g. `days` -> `day`.
+    let unit = parts[1].strip_suffix('s').unwrap_or(parts[1]);
+    let cutoff = match unit {
+        "minute" => now - Duration::minutes(n),
+        "hour" => now - Duration::hours(n),
+        "day" => now - Duration::days(n),
+        "week" => now - Duration::weeks(n),
+        "month" => now
+            .checked_sub_months(Months::new(n as u32))
+            .context("date underflow")?,
+        "year" => now
+            .checked_sub_months(Months::new(n as u32 * 12))
+            .context("date underflow")?,
+        other => anyhow::bail!("unknown relative unit `{other}`"),
+    };
+    Ok(cutoff)
+}
+
 /// Validated, normalised sync parameters (independent of the HTTP source so
 /// the core loop is testable).
 struct SyncPlan {
@@ -139,6 +212,10 @@ struct SyncPlan {
     allow_auto: bool,
     full: bool,
     since: Option<DateTime<Utc>>,
+    /// When set, metadata sidecars whose `fetched_at` predates this are
+    /// re-fetched. `None` means missing sidecars are still backfilled but
+    /// existing ones are never refreshed.
+    refresh_cutoff: Option<DateTime<Utc>>,
     concurrency: usize,
     dry_run: bool,
 }
@@ -155,8 +232,19 @@ struct SyncReport {
     no_transcript: usize,
     /// Failed for another reason (HTTP, parse, I/O).
     failed: usize,
-    /// `--dry-run`: would have been fetched.
+    /// `--dry-run`: transcripts that would have been fetched.
     would_fetch: usize,
+    /// Metadata sidecars newly written (backfill or for a freshly synced
+    /// video).
+    metadata_synced: usize,
+    /// Existing metadata sidecars re-fetched because they were older than the
+    /// `--refresh-metadata-older-than` cutoff.
+    metadata_refreshed: usize,
+    /// Metadata fetches/writes that failed. Tallied separately and never block
+    /// or fail transcript syncing.
+    metadata_failed: usize,
+    /// `--dry-run`: metadata sidecars that would have been fetched.
+    metadata_would_fetch: usize,
     /// Channels that could not be resolved or enumerated.
     channel_errors: usize,
 }
@@ -165,14 +253,20 @@ impl SyncReport {
     fn print(&self) {
         println!("\nSync complete:");
         if self.would_fetch > 0 {
-            println!("  would fetch:      {}", self.would_fetch);
+            println!("  would fetch:        {}", self.would_fetch);
         }
-        println!("  synced:           {}", self.synced);
-        println!("  already present:  {}", self.already_present);
-        println!("  no transcript:    {}", self.no_transcript);
-        println!("  failed:           {}", self.failed);
+        if self.metadata_would_fetch > 0 {
+            println!("  would fetch meta:   {}", self.metadata_would_fetch);
+        }
+        println!("  synced:             {}", self.synced);
+        println!("  already present:    {}", self.already_present);
+        println!("  no transcript:      {}", self.no_transcript);
+        println!("  failed:             {}", self.failed);
+        println!("  metadata synced:    {}", self.metadata_synced);
+        println!("  metadata refreshed: {}", self.metadata_refreshed);
+        println!("  metadata failed:    {}", self.metadata_failed);
         if self.channel_errors > 0 {
-            println!("  channel errors:   {}", self.channel_errors);
+            println!("  channel errors:     {}", self.channel_errors);
         }
     }
 }
@@ -223,6 +317,20 @@ async fn sync_channel(
             println!("  would fetch {id} -> {}", path.display());
         }
         report.would_fetch += plan_result.to_fetch.len();
+
+        // Optimistic preview: existing transcripts on disk plus the ones we
+        // would sync this run, all assumed to gain a sidecar.
+        let mut candidate_ids = scan_synced_ids(&dir);
+        for (id, _) in &plan_result.to_fetch {
+            if !candidate_ids.contains(id) {
+                candidate_ids.push(id.clone());
+            }
+        }
+        let meta_items = plan_metadata(&dir, &candidate_ids, plan.refresh_cutoff);
+        for item in &meta_items {
+            println!("  would fetch meta {} -> {}", item.id, item.path.display());
+        }
+        report.metadata_would_fetch += meta_items.len();
         return Ok(());
     }
 
@@ -257,7 +365,45 @@ async fn sync_channel(
             }
         }
     }
+
+    sync_metadata(plan, yt, &dir, report).await;
     Ok(())
+}
+
+/// Plan and write metadata sidecars for a channel directory. Scans the
+/// directory *after* transcripts are written, so only videos with a transcript
+/// on disk are considered (a video with no usable transcript leaves no anchor
+/// file and gets no sidecar — see issue #976 open question 2). Backfills
+/// missing sidecars and, when a refresh cutoff is set, re-fetches stale ones.
+///
+/// Metadata failures are tallied in `report` and never affect transcript
+/// outcomes — they share the transcript `--concurrency` budget but run as a
+/// separate pass.
+async fn sync_metadata(plan: &SyncPlan, yt: &Youtube, dir: &Path, report: &mut SyncReport) {
+    let candidate_ids = scan_synced_ids(dir);
+    let meta_items = plan_metadata(dir, &candidate_ids, plan.refresh_cutoff);
+
+    let outcomes = stream::iter(meta_items)
+        .map(|item| async move {
+            let outcome = fetch_and_write_metadata(yt, &item.id, &item.path).await;
+            (item.reason, item.id, outcome)
+        })
+        .buffer_unordered(plan.concurrency)
+        .collect::<Vec<_>>()
+        .await;
+
+    for (reason, id, outcome) in outcomes {
+        match outcome {
+            Ok(()) => match reason {
+                MetaReason::Missing => report.metadata_synced += 1,
+                MetaReason::Stale => report.metadata_refreshed += 1,
+            },
+            Err(e) => {
+                report.metadata_failed += 1;
+                eprintln!("  meta fail {id}: {e}");
+            }
+        }
+    }
 }
 
 /// Enumerate a channel's video IDs, newest-first. `--full` pages the whole
@@ -338,6 +484,105 @@ fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// Why a metadata sidecar is being (re)fetched. Drives which report counter
+/// the outcome lands in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetaReason {
+    /// No sidecar on disk, or its `fetched_at` was unparseable (corrupt).
+    Missing,
+    /// A sidecar exists but predates the `--refresh-metadata-older-than`
+    /// cutoff.
+    Stale,
+}
+
+/// A planned metadata sidecar write.
+struct MetaItem {
+    id: String,
+    path: PathBuf,
+    reason: MetaReason,
+}
+
+/// Distinct video IDs that have a transcript file in `dir`. Sidecars
+/// (`*.meta.yaml`) and in-flight temp files (`.*` / `*.tmp`) are ignored;
+/// every other file is a transcript output `<id>.<lang>.<ext>`, whose `<id>`
+/// is the segment before the first `.` (YouTube IDs never contain one). A
+/// missing directory yields no IDs.
+fn scan_synced_ids(dir: &Path) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return ids;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with('.') || name.ends_with(".tmp") || name.ends_with(".meta.yaml") {
+            continue;
+        }
+        let Some(id) = name.split('.').next().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if seen.insert(id.to_string()) {
+            ids.push(id.to_string());
+        }
+    }
+    ids
+}
+
+/// Decide which of `candidate_ids` need a metadata sidecar written. A sidecar
+/// that is absent or whose `fetched_at` cannot be parsed (corrupt YAML /
+/// missing key) is treated as [`MetaReason::Missing`]; a parseable one older
+/// than `refresh_cutoff` (when set) is [`MetaReason::Stale`]. Anything else is
+/// left untouched.
+fn plan_metadata(
+    dir: &Path,
+    candidate_ids: &[String],
+    refresh_cutoff: Option<DateTime<Utc>>,
+) -> Vec<MetaItem> {
+    let mut items = Vec::new();
+    for id in candidate_ids {
+        let path = dir.join(format!("{id}.meta.yaml"));
+        let reason = match std::fs::read_to_string(&path) {
+            // Absent or unreadable → backfill.
+            Err(_) => Some(MetaReason::Missing),
+            Ok(contents) => match metadata::read_fetched_at(&contents) {
+                // Corrupt / no parseable fetched_at → treat as missing.
+                None => Some(MetaReason::Missing),
+                Some(fetched_at) => match refresh_cutoff {
+                    Some(cutoff) if fetched_at < cutoff => Some(MetaReason::Stale),
+                    _ => None,
+                },
+            },
+        };
+        if let Some(reason) = reason {
+            items.push(MetaItem {
+                id: id.clone(),
+                path,
+                reason,
+            });
+        }
+    }
+    items
+}
+
+/// Fetch a video's metadata via the un-gated WEB `/player` call and write the
+/// sidecar atomically (temp file + rename), stamping `fetched_at` at fetch
+/// time inside [`Youtube::fetch_video_metadata`].
+async fn fetch_and_write_metadata(
+    yt: &Youtube,
+    id: &str,
+    path: &Path,
+) -> Result<(), TranscriptError> {
+    let meta = yt.fetch_video_metadata(id).await?;
+    let yaml = serde_yaml::to_string(&meta)
+        .map_err(|e| TranscriptError::ParseError(format!("serialise metadata sidecar: {e}")))?;
+    write_atomic(path, &yaml)?;
+    Ok(())
+}
+
 /// Whether `err` means "this video simply has no transcript we can use" — a
 /// skip-and-record condition rather than a run-aborting failure.
 fn is_no_transcript(err: &TranscriptError) -> bool {
@@ -371,6 +616,7 @@ mod tests {
         assert!(!cmd.auto);
         assert!(!cmd.full);
         assert_eq!(cmd.since, None);
+        assert_eq!(cmd.refresh_metadata_older_than, None);
         assert_eq!(cmd.concurrency, 4);
         assert!(!cmd.dry_run);
     }
@@ -390,6 +636,8 @@ mod tests {
             "--full",
             "--since",
             "2024-01-01",
+            "--refresh-metadata-older-than",
+            "2 days ago",
             "--concurrency",
             "8",
             "--dry-run",
@@ -400,6 +648,10 @@ mod tests {
         assert!(cmd.auto);
         assert!(cmd.full);
         assert_eq!(cmd.since.as_deref(), Some("2024-01-01"));
+        assert_eq!(
+            cmd.refresh_metadata_older_than.as_deref(),
+            Some("2 days ago")
+        );
         assert_eq!(cmd.concurrency, 8);
         assert!(cmd.dry_run);
     }
@@ -421,6 +673,74 @@ mod tests {
     #[test]
     fn parse_since_rejects_garbage() {
         assert!(parse_since("not-a-date").is_err());
+    }
+
+    fn now_fixed() -> DateTime<Utc> {
+        "2026-06-21T12:00:00Z".parse().unwrap()
+    }
+
+    #[test]
+    fn parse_date_spec_accepts_absolute_forms() {
+        let now = now_fixed();
+        assert_eq!(
+            parse_date_spec("2026-06-01", now).unwrap().to_rfc3339(),
+            "2026-06-01T00:00:00+00:00"
+        );
+        assert_eq!(
+            parse_date_spec("2026-06-01T12:00:00+10:00", now)
+                .unwrap()
+                .to_rfc3339(),
+            "2026-06-01T02:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn parse_date_spec_resolves_relative_units_against_now() {
+        let now = now_fixed();
+        assert_eq!(
+            parse_date_spec("30 minutes ago", now).unwrap().to_rfc3339(),
+            "2026-06-21T11:30:00+00:00"
+        );
+        assert_eq!(
+            parse_date_spec("2 hours ago", now).unwrap().to_rfc3339(),
+            "2026-06-21T10:00:00+00:00"
+        );
+        assert_eq!(
+            parse_date_spec("2 days ago", now).unwrap().to_rfc3339(),
+            "2026-06-19T12:00:00+00:00"
+        );
+        assert_eq!(
+            parse_date_spec("1 week ago", now).unwrap().to_rfc3339(),
+            "2026-06-14T12:00:00+00:00"
+        );
+        // Calendar arithmetic for months/years.
+        assert_eq!(
+            parse_date_spec("3 months ago", now).unwrap().to_rfc3339(),
+            "2026-03-21T12:00:00+00:00"
+        );
+        assert_eq!(
+            parse_date_spec("1 year ago", now).unwrap().to_rfc3339(),
+            "2025-06-21T12:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn parse_date_spec_accepts_singular_and_is_case_insensitive() {
+        let now = now_fixed();
+        assert_eq!(
+            parse_date_spec("1 Day Ago", now).unwrap().to_rfc3339(),
+            "2026-06-20T12:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn parse_date_spec_rejects_garbage() {
+        let now = now_fixed();
+        assert!(parse_date_spec("not-a-date", now).is_err());
+        assert!(parse_date_spec("2 fortnights ago", now).is_err());
+        assert!(parse_date_spec("yesterday", now).is_err());
+        assert!(parse_date_spec("-1 days ago", now).is_err());
+        assert!(parse_date_spec("2 days", now).is_err());
     }
 
     #[test]
@@ -523,6 +843,9 @@ mod tests {
         include_str!("../../../transcript/sources/youtube/fixtures/browse_videos_page1.json");
     const BROWSE_PAGE2: &str =
         include_str!("../../../transcript/sources/youtube/fixtures/browse_videos_page2.json");
+    const WEB_METADATA: &str = include_str!(
+        "../../../transcript/sources/youtube/fixtures/player_response_web_metadata.json"
+    );
 
     /// Point every caption track's `baseUrl` at the mock so `select_track`
     /// yields a URL the same server answers (mirrors the youtube.rs test
@@ -600,6 +923,55 @@ mod tests {
         (server, yt)
     }
 
+    /// Mount the `/player` endpoint as two client-keyed mocks: the `ANDROID_VR`
+    /// transcript call gets the basic caption fixture; the `WEB` metadata call
+    /// gets the rich microformat fixture. The matchers are mutually exclusive
+    /// (`clientName`), so each request resolves to exactly one. Lets metadata
+    /// tests assert sidecar *content* distinct from the transcript fixture.
+    async fn mount_player_split(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/youtubei/v1/player"))
+            .and(body_partial_json(
+                serde_json::json!({ "context": { "client": { "clientName": "ANDROID_VR" } } }),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(player_response_for(&server.uri())),
+            )
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/youtubei/v1/player"))
+            .and(body_partial_json(
+                serde_json::json!({ "context": { "client": { "clientName": "WEB" } } }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string(WEB_METADATA))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/timedtext"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(TIMEDTEXT))
+            .mount(server)
+            .await;
+    }
+
+    /// Happy-path server with the transcript and metadata `/player` calls
+    /// answered by *distinct* fixtures.
+    async fn mock_youtube_split() -> (MockServer, Youtube) {
+        let server = MockServer::start().await;
+        mount_rss(&server).await;
+        mount_watch(&server).await;
+        mount_player_split(&server).await;
+        let yt = Youtube::with_base_url(server.uri()).unwrap();
+        (server, yt)
+    }
+
+    /// Channel directory for the standard `CHANNEL_ID`, created on disk.
+    fn channel_dir(root: &Path) -> PathBuf {
+        let dir = root.join(CHANNEL_ID);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     fn plan_for(out: PathBuf) -> SyncPlan {
         SyncPlan {
             channels: vec![CHANNEL_ID.to_string()],
@@ -609,6 +981,7 @@ mod tests {
             allow_auto: false,
             full: false,
             since: None,
+            refresh_cutoff: None,
             concurrency: 2,
             dry_run: false,
         }
@@ -760,6 +1133,7 @@ mod tests {
             auto: false,
             full: false,
             since: None,
+            refresh_metadata_older_than: None,
             concurrency: 2,
             dry_run: false,
         };
@@ -784,11 +1158,214 @@ mod tests {
             auto: false,
             full: false,
             since: Some("not-a-date".to_string()),
+            refresh_metadata_older_than: None,
             concurrency: 2,
             dry_run: false,
         };
         let err = cmd.sync_with(&yt).await.unwrap_err();
         assert!(err.to_string().contains("Invalid --since date"));
+    }
+
+    // ── metadata sidecars ──
+
+    #[tokio::test]
+    async fn run_writes_metadata_sidecars_alongside_transcripts() {
+        let (_server, yt) = mock_youtube_split().await;
+        let dir = tempfile::tempdir().unwrap();
+        let report = run(&plan_for(dir.path().to_path_buf()), &yt).await;
+
+        assert_eq!(report.synced, 3);
+        assert_eq!(report.metadata_synced, 3);
+        assert_eq!(report.metadata_refreshed, 0);
+        assert_eq!(report.metadata_failed, 0);
+
+        let cdir = dir.path().join(CHANNEL_ID);
+        for id in ["aaaaaaaaaaa", "bbbbbbbbbbb", "ccccccccccc"] {
+            let sidecar = cdir.join(format!("{id}.meta.yaml"));
+            assert!(sidecar.exists(), "missing sidecar for {id}");
+            let body = std::fs::read_to_string(&sidecar).unwrap();
+            // Content comes from the WEB metadata fixture, not the transcript one.
+            assert!(body.contains("schema: 1"));
+            assert!(body.contains("category: Music"));
+            assert!(body.contains("like_count: 19148727"));
+            assert!(body.contains("fetched_at:"));
+        }
+    }
+
+    #[tokio::test]
+    async fn run_backfills_missing_sidecars_without_refetching_transcripts() {
+        // Simulate a directory synced by an older version: transcripts on disk,
+        // no sidecars. The incremental early-stop skips transcript fetches, but
+        // the filesystem scan backfills every sidecar.
+        let (_server, yt) = mock_youtube_split().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cdir = channel_dir(dir.path());
+        for id in ["aaaaaaaaaaa", "bbbbbbbbbbb", "ccccccccccc"] {
+            std::fs::write(cdir.join(format!("{id}.en.srt")), "x").unwrap();
+        }
+
+        let report = run(&plan_for(dir.path().to_path_buf()), &yt).await;
+
+        assert_eq!(report.synced, 0, "transcripts already present");
+        assert_eq!(report.metadata_synced, 3, "all sidecars backfilled");
+        for id in ["aaaaaaaaaaa", "bbbbbbbbbbb", "ccccccccccc"] {
+            assert!(cdir.join(format!("{id}.meta.yaml")).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn run_refreshes_stale_sidecar_only_with_flag() {
+        let (_server, yt) = mock_youtube_split().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cdir = channel_dir(dir.path());
+        std::fs::write(cdir.join("aaaaaaaaaaa.en.srt"), "x").unwrap();
+        let sidecar = cdir.join("aaaaaaaaaaa.meta.yaml");
+        let stale = "schema: 1\nvideo_id: aaaaaaaaaaa\ntitle: stale\n\
+                     is_live_content: false\nfetched_at: \"2000-01-01T00:00:00Z\"\n";
+        std::fs::write(&sidecar, stale).unwrap();
+
+        // No flag → existing sidecar is left untouched.
+        let report = run(&plan_for(dir.path().to_path_buf()), &yt).await;
+        assert_eq!(report.metadata_refreshed, 0);
+        assert_eq!(report.metadata_synced, 0);
+        assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), stale);
+
+        // Cutoff newer than the sidecar's fetched_at → refreshed.
+        let mut plan = plan_for(dir.path().to_path_buf());
+        plan.refresh_cutoff = Some("2026-01-01T00:00:00Z".parse().unwrap());
+        let report = run(&plan, &yt).await;
+        assert_eq!(report.metadata_refreshed, 1);
+        assert_eq!(report.metadata_synced, 0);
+        let refreshed = std::fs::read_to_string(&sidecar).unwrap();
+        assert_ne!(refreshed, stale);
+        assert!(refreshed.contains("category: Music"));
+    }
+
+    #[tokio::test]
+    async fn run_treats_corrupt_sidecar_as_missing() {
+        let (_server, yt) = mock_youtube_split().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cdir = channel_dir(dir.path());
+        std::fs::write(cdir.join("aaaaaaaaaaa.en.srt"), "x").unwrap();
+        let sidecar = cdir.join("aaaaaaaaaaa.meta.yaml");
+        // Parseable as YAML scalars but with no recoverable fetched_at.
+        std::fs::write(&sidecar, "schema: 1\nvideo_id: aaaaaaaaaaa\n").unwrap();
+
+        let report = run(&plan_for(dir.path().to_path_buf()), &yt).await;
+
+        // Corrupt → treated as missing → rewritten and counted as synced.
+        assert_eq!(report.metadata_synced, 1);
+        assert_eq!(report.metadata_refreshed, 0);
+        assert!(std::fs::read_to_string(&sidecar)
+            .unwrap()
+            .contains("category: Music"));
+    }
+
+    #[tokio::test]
+    async fn run_metadata_failure_does_not_block_transcripts() {
+        // Transcript path healthy (ANDROID_VR), metadata call (WEB) 500s.
+        let server = MockServer::start().await;
+        mount_rss(&server).await;
+        mount_watch(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/youtubei/v1/player"))
+            .and(body_partial_json(
+                serde_json::json!({ "context": { "client": { "clientName": "ANDROID_VR" } } }),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(player_response_for(&server.uri())),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/youtubei/v1/player"))
+            .and(body_partial_json(
+                serde_json::json!({ "context": { "client": { "clientName": "WEB" } } }),
+            ))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/timedtext"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(TIMEDTEXT))
+            .mount(&server)
+            .await;
+        let yt = Youtube::with_base_url(server.uri()).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let report = run(&plan_for(dir.path().to_path_buf()), &yt).await;
+
+        assert_eq!(report.synced, 3, "transcripts unaffected");
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.metadata_failed, 3);
+        assert_eq!(report.metadata_synced, 0);
+
+        let cdir = dir.path().join(CHANNEL_ID);
+        assert!(cdir.join("aaaaaaaaaaa.en.srt").exists());
+        assert!(!cdir.join("aaaaaaaaaaa.meta.yaml").exists());
+    }
+
+    #[tokio::test]
+    async fn run_dry_run_counts_sidecars_but_writes_nothing() {
+        let (_server, yt) = mock_youtube_split().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = plan_for(dir.path().to_path_buf());
+        plan.dry_run = true;
+
+        let report = run(&plan, &yt).await;
+        assert_eq!(report.would_fetch, 3);
+        assert_eq!(report.metadata_would_fetch, 3);
+        assert_eq!(report.metadata_synced, 0);
+        assert!(!dir.path().join(CHANNEL_ID).exists());
+    }
+
+    #[test]
+    fn scan_synced_ids_ignores_sidecars_and_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        std::fs::write(p.join("aaaaaaaaaaa.en.srt"), "x").unwrap();
+        std::fs::write(p.join("aaaaaaaaaaa.fr.vtt"), "x").unwrap(); // same id, other lang
+        std::fs::write(p.join("bbbbbbbbbbb.en.srt"), "x").unwrap();
+        std::fs::write(p.join("bbbbbbbbbbb.meta.yaml"), "x").unwrap(); // sidecar
+        std::fs::write(p.join(".ccccccccccc.en.srt.tmp"), "x").unwrap(); // in-flight temp
+
+        let mut ids = scan_synced_ids(p);
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["aaaaaaaaaaa".to_string(), "bbbbbbbbbbb".to_string()]
+        );
+    }
+
+    #[test]
+    fn plan_metadata_classifies_missing_stale_and_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        // `miss` has no sidecar; `stale` and `fresh` do.
+        std::fs::write(
+            p.join("stale.meta.yaml"),
+            "fetched_at: \"2000-01-01T00:00:00Z\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            p.join("fresh.meta.yaml"),
+            "fetched_at: \"2026-12-31T00:00:00Z\"\n",
+        )
+        .unwrap();
+        let cutoff: DateTime<Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
+        let ids = vec!["miss".to_string(), "stale".to_string(), "fresh".to_string()];
+
+        let items = plan_metadata(p, &ids, Some(cutoff));
+        let by_id: std::collections::HashMap<_, _> =
+            items.iter().map(|i| (i.id.as_str(), i.reason)).collect();
+        assert_eq!(by_id.get("miss"), Some(&MetaReason::Missing));
+        assert_eq!(by_id.get("stale"), Some(&MetaReason::Stale));
+        assert_eq!(by_id.get("fresh"), None, "fresh sidecar is left alone");
+
+        // Without a cutoff, only the missing one is planned.
+        let items = plan_metadata(p, &ids, None);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "miss");
     }
 
     #[test]
@@ -800,6 +1377,10 @@ mod tests {
             no_transcript: 3,
             failed: 4,
             would_fetch: 5,
+            metadata_synced: 7,
+            metadata_refreshed: 8,
+            metadata_failed: 9,
+            metadata_would_fetch: 10,
             channel_errors: 6,
         };
         report.print();

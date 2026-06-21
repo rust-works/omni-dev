@@ -1,0 +1,49 @@
+{
+  "playabilityStatus": {
+    "status": "UNPLAYABLE",
+    "reason": "This video is not available on this client."
+  },
+  "videoDetails": {
+    "videoId": "dQw4w9WgXcQ",
+    "title": "Rick Astley - Never Gonna Give You Up",
+    "lengthSeconds": "213",
+    "channelId": "UCuAXFkgsw1L7xaCfnd5JJOw",
+    "author": "Rick Astley",
+    "shortDescription": "The official video for \"Never Gonna Give You Up\" by Rick Astley.",
+    "viewCount": "1781429760",
+    "isLiveContent": false,
+    "isPrivate": false,
+    "keywords": [
+      "rick astley",
+      "Never Gonna Give You Up"
+    ],
+    "thumbnail": {
+      "thumbnails": [
+        { "url": "https://i.ytimg.com/vi/dQw4w9WgXcQ/default.jpg", "width": 120, "height": 90 },
+        { "url": "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg", "width": 480, "height": 360 }
+      ]
+    }
+  },
+  "microformat": {
+    "playerMicroformatRenderer": {
+      "thumbnail": {
+        "thumbnails": [
+          { "url": "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg", "width": 480, "height": 360 },
+          { "url": "https://i.ytimg.com/vi/dQw4w9WgXcQ/maxresdefault.jpg", "width": 1280, "height": 720 }
+        ]
+      },
+      "category": "Music",
+      "publishDate": "2009-10-24T23:57:33-07:00",
+      "uploadDate": "2009-10-24T23:57:33-07:00",
+      "ownerChannelName": "Rick Astley",
+      "externalChannelId": "UCuAXFkgsw1L7xaCfnd5JJOw",
+      "ownerProfileUrl": "http://www.youtube.com/@RickAstleyYT",
+      "viewCount": "1781429760",
+      "likeCount": "19148727",
+      "isUnlisted": false,
+      "isFamilySafe": true,
+      "isShortsEligible": false,
+      "canonicalUrl": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    }
+  }
+}

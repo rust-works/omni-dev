@@ -30,6 +30,15 @@ omni-dev transcript youtube list-langs <url>
 
 # Show top-level metadata (title, channel, duration, available languages).
 omni-dev transcript youtube info <url> --output json
+
+# Sync every captioned video in one or more channels to a directory,
+# incrementally. Writes a transcript and a metadata sidecar per video.
+omni-dev transcript youtube sync @RickAstleyYT --out ./transcripts --auto
+
+# Re-fetch metadata sidecars older than two days (missing ones are always
+# backfilled; this also refreshes stale ones).
+omni-dev transcript youtube sync @RickAstleyYT --out ./transcripts \
+  --refresh-metadata-older-than "2 days ago"
 ```
 
 ### `fetch` flags
@@ -41,6 +50,71 @@ omni-dev transcript youtube info <url> --output json
 | `--auto`            | off     | Allow falling through to auto-generated (ASR) captions.                    |
 | `--translate <lang>`| —       | Synthesise a translated track in `<lang>` when no native track matches.    |
 | `-o`, `--output`    | stdout  | Write the rendered transcript to a file instead of stdout.                 |
+
+### `sync` output layout and metadata sidecars
+
+`sync` enumerates a channel's videos and writes, per video, into
+`<out>/<channel-id>/`:
+
+- a **transcript** `<video-id>.<lang>.<format>` (e.g. `dQw4w9WgXcQ.en.srt`); and
+- a **metadata sidecar** `<video-id>.meta.yaml` — one per video,
+  language-independent, written atomically (temp file + rename).
+
+"Already synced" is filesystem state: an existing transcript file means the
+transcript is skipped. Sidecars are planned by a separate **directory scan** of
+`<out>/<channel-id>/` (every transcript file is a synced video; `*.meta.yaml`
+and in-flight `.*`/`*.tmp` files are ignored), so backfill and refresh cover the
+full set of already-synced videos **without** re-enumerating the channel
+(`--full`) and **without** touching the bot-gated transcript path. A video with
+no usable transcript leaves no anchor file and so gets no sidecar.
+
+Metadata is fetched with a single **WEB-client** `/player` call — un-gated, no
+`visitorData` bootstrap — which carries the `microformat` block (publish date,
+like count, category) that the `ANDROID_VR` transcript path lacks. Metadata
+failures are tallied separately and never block or fail transcript syncing.
+
+A sidecar looks like:
+
+```yaml
+schema: 1
+video_id: dQw4w9WgXcQ
+title: Rick Astley - Never Gonna Give You Up (Official Video) (4K Remaster)
+channel: Rick Astley
+channel_id: UCuAXFkgsw1L7xaCfnd5JJOw
+channel_url: http://www.youtube.com/@RickAstleyYT
+category: Music
+published_at: 2009-10-24T23:57:33-07:00
+duration_seconds: 213
+description: |
+  The official video for "Never Gonna Give You Up" by Rick Astley.
+keywords:
+  - rick astley
+view_count: 1781429760
+like_count: 19148727
+is_live_content: false
+is_unlisted: false
+thumbnail_url: https://i.ytimg.com/vi/dQw4w9WgXcQ/maxresdefault.jpg
+fetched_at: 2026-06-11T03:12:45Z
+```
+
+`fetched_at` (UTC) is the snapshot time for the point-in-time `view_count` /
+`like_count`, and the staleness key for refresh. `schema: 1` versions the
+format. `microformat`-sourced fields (`like_count`, `category`, `published_at`,
+`is_unlisted`, …) are omitted when absent — `like_count` when ratings are
+disabled, all of them for private/removed videos (the sidecar is then written
+from `videoDetails` alone).
+
+#### `sync` metadata flags
+
+| Flag                                  | Default | Effect                                                                                          |
+|---------------------------------------|---------|------------------------------------------------------------------------------------------------|
+| `--refresh-metadata-older-than <spec>`| —       | Re-fetch sidecars whose `fetched_at` predates `<spec>`. Missing sidecars are always backfilled. |
+
+`<spec>` accepts an absolute date (`YYYY-MM-DD`, midnight UTC), a full RFC 3339
+timestamp, or a relative spec `<N> <unit>[s] ago` (units: `minute`, `hour`,
+`day`, `week`, `month`, `year`) resolved against now. Without the flag, no
+refresh occurs; missing sidecars are still downloaded. An invalid spec errors at
+plan time.
 
 ### Locator forms
 
@@ -304,3 +378,16 @@ returning empty or refused responses for known-healthy videos, refresh:
 The `BROWSER_USER_AGENT` used for the watch-page bootstrap is independent
 of the InnerTube User-Agent — they target different YouTube surfaces and
 must not be conflated.
+
+The metadata sidecar path (`sync`) reads a different surface again: the
+**WEB-client** `/player` response and its `microformat.playerMicroformatRenderer`
+block, parsed in
+[`metadata.rs`](../src/transcript/sources/youtube/metadata.rs). This shape can
+drift independently of the `ANDROID_VR` constants above. If sidecars start
+coming back empty or [`metadata::parse`] begins failing for known-healthy
+videos, re-check the field paths there (`publishDate`, `likeCount`, the
+`microformat` nesting) against a live WEB response — count fields in particular
+have flipped between JSON string and number forms before, which the parser
+tolerates but is the first thing to verify.
+
+[`metadata::parse`]: ../src/transcript/sources/youtube/metadata.rs
