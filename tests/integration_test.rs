@@ -615,3 +615,89 @@ async fn cli_execute_dispatches_ai_chat() {
     // Either way the async dispatch chain is exercised.
     let _ = cli.execute().await;
 }
+
+// ── Request log (#1025) ─────────────────────────────────────────────────
+
+/// Runs the binary with `OMNI_DEV_LOG_FILE` pointed at a temp file and the
+/// given args, returning the spawned process output.
+fn run_with_log(log_file: &std::path::Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .args(args)
+        .env("OMNI_DEV_LOG_FILE", log_file)
+        .output()
+        .expect("failed to run binary")
+}
+
+#[test]
+fn invocation_appends_at_least_one_line() {
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("log.jsonl");
+
+    let output = run_with_log(&log, &["help-all"]);
+    assert!(output.status.success());
+
+    let contents = fs::read_to_string(&log).expect("log file should exist");
+    let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
+    assert!(!lines.is_empty(), "expected at least one log line");
+
+    // The last line is this invocation, with the resolved command path.
+    let rec: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+    assert_eq!(rec["kind"], "invocation");
+    assert_eq!(rec["command"], serde_json::json!(["help-all"]));
+    assert_eq!(rec["exit_code"], 0);
+    assert_eq!(rec["source"], "cli");
+}
+
+#[test]
+fn omni_dev_log_reads_back_records_byte_identically() {
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("log.jsonl");
+
+    // Populate the log with one invocation, then read it back as JSON.
+    assert!(run_with_log(&log, &["help-all"]).status.success());
+
+    let on_disk = fs::read_to_string(&log).unwrap();
+    let output = run_with_log(&log, &["log", "--format", "json"]);
+    assert!(output.status.success());
+    let rendered = String::from_utf8(output.stdout).unwrap();
+
+    // `omni-dev log --format json` reproduces the on-disk NDJSON verbatim,
+    // except its own (later) invocation line, which is appended after the read.
+    for line in on_disk.lines().filter(|l| !l.is_empty()) {
+        assert!(
+            rendered.contains(line),
+            "json output should contain on-disk line verbatim:\n{line}"
+        );
+    }
+}
+
+#[test]
+fn log_disable_appends_nothing() {
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("log.jsonl");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+        .arg("help-all")
+        .env("OMNI_DEV_LOG_FILE", &log)
+        .env("OMNI_DEV_LOG_DISABLE", "1")
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success());
+    assert!(!log.exists(), "no log file should be written when disabled");
+}
+
+#[test]
+fn log_write_failure_does_not_change_exit_code() {
+    // A log path under a non-directory cannot be created; the command must
+    // still succeed because logging is best-effort.
+    let dir = TempDir::new().unwrap();
+    let not_a_dir = dir.path().join("file");
+    fs::write(&not_a_dir, b"x").unwrap();
+    let unwritable = not_a_dir.join("nested").join("log.jsonl");
+
+    let output = run_with_log(&unwritable, &["help-all"]);
+    assert!(
+        output.status.success(),
+        "command must exit 0 even when the log cannot be written"
+    );
+}
