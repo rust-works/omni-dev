@@ -260,34 +260,34 @@ fn render_status_report(report: &status::StatusReport, format: OutputFormat) -> 
 }
 
 fn render_status_text(report: &status::StatusReport) -> String {
+    report
+        .targets
+        .iter()
+        .filter(|t| !(t.symlinks.is_empty() && t.exclude_entries.is_empty()))
+        .map(render_status_target)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_status_target(target: &status::TargetStatus) -> String {
     use std::fmt::Write;
     let mut out = String::new();
-    let mut first = true;
-    for target in &report.targets {
-        if target.symlinks.is_empty() && target.exclude_entries.is_empty() {
-            continue;
+    let _ = writeln!(out, "{}", target.root.display());
+    if !target.symlinks.is_empty() {
+        out.push_str("  symlinks:\n");
+        for link in &target.symlinks {
+            let _ = writeln!(
+                out,
+                "    {} -> {}",
+                link.path.display(),
+                link.points_to.display()
+            );
         }
-        if !first {
-            out.push('\n');
-        }
-        first = false;
-        let _ = writeln!(out, "{}", target.root.display());
-        if !target.symlinks.is_empty() {
-            out.push_str("  symlinks:\n");
-            for link in &target.symlinks {
-                let _ = writeln!(
-                    out,
-                    "    {} -> {}",
-                    link.path.display(),
-                    link.points_to.display()
-                );
-            }
-        }
-        if !target.exclude_entries.is_empty() {
-            let _ = writeln!(out, "  exclude block ({}):", target.exclude_file.display());
-            for entry in &target.exclude_entries {
-                let _ = writeln!(out, "    {entry}");
-            }
+    }
+    if !target.exclude_entries.is_empty() {
+        let _ = writeln!(out, "  exclude block ({}):", target.exclude_file.display());
+        for entry in &target.exclude_entries {
+            let _ = writeln!(out, "    {entry}");
         }
     }
     out
@@ -533,6 +533,12 @@ mod skills_api_tests {
                     exclude_entries: Vec::new(),
                 },
                 status::TargetStatus {
+                    root: PathBuf::from("/first"),
+                    symlinks: Vec::new(),
+                    exclude_file: PathBuf::from("/first/.git/info/exclude"),
+                    exclude_entries: vec![".claude/skills/beta/".into()],
+                },
+                status::TargetStatus {
                     root: PathBuf::from("/both"),
                     symlinks: vec![status::SymlinkInfo {
                         path: PathBuf::from("/both/.claude/skills/alpha"),
@@ -544,11 +550,17 @@ mod skills_api_tests {
             ],
         };
         let out = render_status_text(&report);
+        assert!(out.contains("/first"), "missing /first: {out}");
         assert!(out.contains("/both"), "missing /both: {out}");
         assert!(out.contains("symlinks:"), "missing symlinks: {out}");
         assert!(
             out.contains("exclude block"),
             "missing exclude block: {out}"
+        );
+        // Two rendered targets must be separated by a blank line (the join).
+        assert!(
+            out.contains("\n\n"),
+            "missing blank-line separator between targets: {out}"
         );
         assert!(
             !out.contains("/empty\n"),
