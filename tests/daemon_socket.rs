@@ -20,15 +20,20 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Result;
+use async_trait::async_trait;
 use serde_json::{json, Value};
+use tokio::sync::Notify;
 
 use omni_dev::daemon::client::DaemonClient;
 use omni_dev::daemon::protocol::DaemonEnvelope;
 use omni_dev::daemon::registry::ServiceRegistry;
 use omni_dev::daemon::server::{run, DaemonOptions};
+use omni_dev::daemon::service::{DaemonService, MenuSnapshot, ServiceStatus};
 use omni_dev::daemon::services::echo::EchoService;
 use omni_dev::daemon::single_instance::{bind_or_reclaim, bind_private};
 use tempfile::TempDir;
@@ -154,4 +159,160 @@ async fn stale_socket_is_reclaimed() {
     std::fs::write(&socket, b"stale").unwrap();
     let listener = bind_or_reclaim(&socket).await.unwrap();
     drop(listener);
+}
+
+/// A service whose `slow` op blocks until released, then echoes. It signals when
+/// its handler has *started* (so the test can guarantee the request is genuinely
+/// in-flight before shutting down) and records when it has *completed*, standing
+/// in for in-flight work that must be drained rather than abandoned on shutdown.
+struct SlowService {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+    completed: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl DaemonService for SlowService {
+    fn name(&self) -> &'static str {
+        "slow"
+    }
+    async fn handle(&self, op: &str, payload: Value) -> Result<Value> {
+        match op {
+            "slow" => {
+                self.started.notify_one();
+                self.release.notified().await;
+                self.completed.store(true, Ordering::SeqCst);
+                Ok(payload)
+            }
+            other => anyhow::bail!("unknown slow op: {other}"),
+        }
+    }
+    fn menu(&self) -> MenuSnapshot {
+        MenuSnapshot::default()
+    }
+    async fn menu_action(&self, _action_id: &str) -> Result<()> {
+        Ok(())
+    }
+    async fn status(&self) -> ServiceStatus {
+        ServiceStatus {
+            name: self.name().to_string(),
+            healthy: true,
+            summary: "ready".to_string(),
+            detail: Value::Null,
+        }
+    }
+    async fn shutdown(&self) {}
+}
+
+/// An accepted request still mid-`handle()` when shutdown fires must be drained,
+/// not abandoned: `run()` waits for it to finish before returning (#992).
+#[tokio::test]
+async fn in_flight_request_is_drained_on_shutdown() {
+    let dir = tempdir_0700();
+    let socket = dir.path().join("d.sock");
+
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let completed = Arc::new(AtomicBool::new(false));
+
+    let mut registry = ServiceRegistry::new();
+    registry.register(Arc::new(SlowService {
+        started: started.clone(),
+        release: release.clone(),
+        completed: completed.clone(),
+    }));
+    let opts = DaemonOptions {
+        socket_path: socket.clone(),
+    };
+    let mut server = tokio::spawn(run(registry, opts));
+
+    // Wait for the socket to accept.
+    let client = DaemonClient::new(&socket);
+    for _ in 0..50 {
+        if client.ping().await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Fire a slow request and wait until it is genuinely in `handle()`.
+    let slow = tokio::spawn({
+        let socket = socket.clone();
+        async move {
+            DaemonClient::new(&socket)
+                .request(DaemonEnvelope::service("slow", "slow", json!({ "v": 1 })))
+                .await
+        }
+    });
+    started.notified().await;
+
+    // Ask the daemon to shut down while that request is mid-`handle()`.
+    DaemonClient::new(&socket).shutdown().await.ok();
+
+    // `run()` must not return while the request is still in flight: it is
+    // draining, not abandoning it. Pre-fix, the handler was a detached task and
+    // `run()` returned at once, so this `timeout` would observe it already done.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut server)
+            .await
+            .is_err(),
+        "run() returned before the in-flight request was drained"
+    );
+    assert!(!completed.load(Ordering::SeqCst));
+
+    // Release the handler: the drain completes, the reply is delivered, and only
+    // then does the server stop.
+    release.notify_one();
+    let reply = slow.await.unwrap().unwrap();
+    assert!(reply.ok);
+    assert_eq!(reply.payload, json!({ "v": 1 }));
+    assert!(completed.load(Ordering::SeqCst));
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("server should stop after draining")
+        .expect("server task should not panic")
+        .expect("run() should return Ok");
+}
+
+/// A line that is not valid UTF-8 fails the `LinesCodec` decode; the connection
+/// handler must answer with a `read error` reply rather than drop the client
+/// silently.
+#[tokio::test]
+async fn invalid_utf8_line_yields_read_error_reply() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let dir = tempdir_0700();
+    let socket = dir.path().join("d.sock");
+    let mut registry = ServiceRegistry::new();
+    registry.register(Arc::new(EchoService));
+    let opts = DaemonOptions {
+        socket_path: socket.clone(),
+    };
+    let server = tokio::spawn(run(registry, opts));
+
+    let client = DaemonClient::new(&socket);
+    for _ in 0..50 {
+        if client.ping().await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Raw connection so we can send bytes the JSON client never would.
+    let mut stream = UnixStream::connect(&socket).await.unwrap();
+    let mut line = String::new();
+    {
+        stream.write_all(b"\xff\xff\n").await.unwrap();
+        let mut reader = BufReader::new(&mut stream);
+        reader.read_line(&mut line).await.unwrap();
+    }
+    let reply: Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(reply["ok"], json!(false));
+    assert!(reply["error"].as_str().unwrap().contains("read error"));
+
+    // Drop the raw connection before shutdown so the drain does not wait on it.
+    drop(stream);
+    client.shutdown().await.ok();
+    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
 }
