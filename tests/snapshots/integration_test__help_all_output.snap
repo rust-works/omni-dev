@@ -3214,12 +3214,23 @@ Arguments:
   <CHANNELS>...  One or more channel references: a `UC…` ID, a channel URL (`/channel/UC…`, `/@handle`, `/c/Name`, `/user/Name`), or a bare `@handle`
 
 Options:
-      --out <OUT>                  Output directory. Transcripts are written under `<out>/<channel-id>/<video-id>.<lang>.<format>`
-      --lang <LANG>                Preferred caption language (e.g. `en`, `en-US`). Prefix fallback is applied — `en` matches `en-US` [default: en]
-      --format <FORMAT>            Output format [default: srt] [possible values: srt, vtt, txt, json]
-      --auto                       Allow falling through to auto-generated (ASR) captions when no manual track matches. Recommended for channel syncs — many uploads only have auto captions
-      --full                       Backfill the channel's entire upload history via the InnerTube `/browse` endpoint. Without this, only the ~15 most recent uploads (the RSS feed) are considered
-      --since <DATE>               Only sync videos published on or after this date (`YYYY-MM-DD` or an RFC 3339 timestamp). Reliable for the default (RSS) path, which carries per-video publish dates; best-effort under `--full` (the browse grid has no per-item dates, so this is ignored there)
-      --concurrency <CONCURRENCY>  Maximum number of transcripts to fetch concurrently [default: 4]
-      --dry-run                    List what would be fetched without downloading or writing anything
-  -h, --help                       Print help (see more with '--help')
+      --out <OUT>
+          Output directory. Transcripts are written under `<out>/<channel-id>/<video-id>.<lang>.<format>`
+      --lang <LANG>
+          Preferred caption language (e.g. `en`, `en-US`). Prefix fallback is applied — `en` matches `en-US` [default: en]
+      --format <FORMAT>
+          Output format [default: srt] [possible values: srt, vtt, txt, json]
+      --auto
+          Allow falling through to auto-generated (ASR) captions when no manual track matches. Recommended for channel syncs — many uploads only have auto captions
+      --full
+          Backfill the channel's entire upload history via the InnerTube `/browse` endpoint. Without this, only the ~15 most recent uploads (the RSS feed) are considered
+      --since <DATE>
+          Only sync videos published on or after this date (`YYYY-MM-DD` or an RFC 3339 timestamp). Reliable for the default (RSS) path, which carries per-video publish dates; best-effort under `--full` (the browse grid has no per-item dates, so this is ignored there)
+      --concurrency <CONCURRENCY>
+          Maximum number of transcripts to fetch concurrently [default: 4]
+      --refresh-metadata-older-than <DATE_SPEC>
+          Re-fetch metadata sidecars whose `fetched_at` is older than this cutoff. Accepts `YYYY-MM-DD` (midnight UTC), a full RFC 3339 timestamp, or a relative spec like `"2 days ago"` (units: minute, hour, day, week, month, year). Without this flag existing sidecars are never refreshed, but missing ones are always downloaded
+      --dry-run
+          List what would be fetched without downloading or writing anything
+  -h, --help
+          Print help (see more with '--help')
