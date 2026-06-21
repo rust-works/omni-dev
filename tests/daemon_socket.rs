@@ -373,3 +373,93 @@ async fn client_hangup_before_reply_keeps_daemon_serving() {
     })
     .await;
 }
+
+/// A service whose `shutdown` blocks until released, so a test can hold the
+/// daemon in its drain window and probe behaviour there.
+struct GatedService {
+    /// Notified the instant `shutdown` starts draining.
+    entered: Arc<Notify>,
+    /// `shutdown` parks on this until the test lets the drain finish.
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl DaemonService for GatedService {
+    fn name(&self) -> &'static str {
+        "gated"
+    }
+    async fn handle(&self, _op: &str, payload: Value) -> Result<Value> {
+        Ok(payload)
+    }
+    fn menu(&self) -> MenuSnapshot {
+        MenuSnapshot::default()
+    }
+    async fn menu_action(&self, _action_id: &str) -> Result<()> {
+        Ok(())
+    }
+    async fn status(&self) -> ServiceStatus {
+        ServiceStatus {
+            name: self.name().to_string(),
+            healthy: true,
+            summary: "gated".to_string(),
+            detail: Value::Null,
+        }
+    }
+    async fn shutdown(&self) {
+        self.entered.notify_one();
+        self.release.notified().await;
+    }
+}
+
+/// Regression test for #993: once the accept loop breaks, the listener must be
+/// closed *before* draining, so a stray ping during a slow drain fails fast
+/// instead of sitting unaccepted until process exit.
+#[tokio::test]
+async fn stray_ping_fails_fast_while_draining() {
+    let dir = tempdir_0700();
+    let socket = dir.path().join("d.sock");
+
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+
+    let mut registry = ServiceRegistry::new();
+    registry.register(Arc::new(GatedService {
+        entered: entered.clone(),
+        release: release.clone(),
+    }));
+    let opts = DaemonOptions {
+        socket_path: socket.clone(),
+    };
+    let handle = tokio::spawn(run(registry, opts));
+
+    // Wait until the daemon is accepting.
+    let client = DaemonClient::new(&socket);
+    for _ in 0..50 {
+        if client.ping().await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    client.ping().await.unwrap();
+
+    // Ask it to stop; the gated service blocks the drain so we stay inside the
+    // shutdown window.
+    client.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .expect("drain should begin");
+
+    // The listener is now closed, so a stray ping must fail fast rather than sit
+    // unaccepted until process exit. Before the fix the connect succeeded but was
+    // never accepted, so this `ping` hung and the timeout elapsed (`Err(Elapsed)`)
+    // instead of resolving to a connection error.
+    let probe = tokio::time::timeout(Duration::from_millis(500), client.ping()).await;
+    assert!(
+        matches!(probe, Ok(Err(_))),
+        "stray ping during drain should fail fast, got {probe:?}"
+    );
+
+    // Let the drain complete and the server task return cleanly.
+    release.notify_one();
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+}
