@@ -27,8 +27,21 @@ pub fn plist_path() -> Result<PathBuf> {
 }
 
 /// Renders a LaunchAgent plist that execs `omni-dev daemon run --socket <socket>`.
-fn render_plist(exe: &Path, socket: &Path) -> String {
-    format!(
+///
+/// Paths are XML-escaped before interpolation: `&`, `<`, `>` are all legal in
+/// filenames (a home or `--socket` dir named `A&B`), and unescaped they would
+/// produce malformed plist XML that `launchctl bootstrap` rejects with an opaque
+/// parse error. A non-UTF-8 path cannot be faithfully represented in the UTF-8
+/// plist, so it is rejected here rather than silently corrupted by
+/// `Path::display()`. See issue #991.
+fn render_plist(exe: &Path, socket: &Path) -> Result<String> {
+    let exe = exe
+        .to_str()
+        .with_context(|| format!("executable path is not valid UTF-8: {}", exe.display()))?;
+    let socket = socket
+        .to_str()
+        .with_context(|| format!("socket path is not valid UTF-8: {}", socket.display()))?;
+    Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -55,10 +68,12 @@ fn render_plist(exe: &Path, socket: &Path) -> String {
 </dict>
 </plist>
 "#,
+        // `LAUNCHD_LABEL` is a compile-time ASCII reverse-DNS constant with no
+        // XML metacharacters, so it needs no escaping.
         label = LAUNCHD_LABEL,
-        exe = exe.display(),
-        socket = socket.display(),
-    )
+        exe = quick_xml::escape::escape(exe),
+        socket = quick_xml::escape::escape(socket),
+    ))
 }
 
 /// The current user's launchd GUI domain target (`gui/<uid>`).
@@ -75,7 +90,7 @@ pub fn install_and_load(socket: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    std::fs::write(&plist, render_plist(&exe, socket))
+    std::fs::write(&plist, render_plist(&exe, socket)?)
         .with_context(|| format!("failed to write {}", plist.display()))?;
 
     let domain = gui_domain();
@@ -151,5 +166,83 @@ fn bootout(domain: &str) {
         .output()
     {
         tracing::warn!("failed to run `launchctl bootout {target}`: {e}");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// Parses `xml` to the end, asserting it is well-formed (no quick-xml
+    /// error). This is the property that actually matters: an unescaped `&` in a
+    /// path makes `launchctl bootstrap` reject the plist with an opaque parse
+    /// error (issue #991).
+    fn assert_well_formed(xml: &str) {
+        use quick_xml::events::Event;
+        use quick_xml::reader::Reader;
+
+        let mut reader = Reader::from_str(xml);
+        loop {
+            match reader.read_event() {
+                Ok(Event::Eof) => break,
+                Ok(_) => {}
+                Err(e) => panic!("plist XML is not well-formed: {e}\n---\n{xml}"),
+            }
+        }
+    }
+
+    #[test]
+    fn escapes_xml_metacharacters_in_paths() {
+        // `&`, `<`, `>` are all legal in filenames but must be escaped in XML.
+        let plist = render_plist(
+            Path::new("/Users/A&B/bin/omni-dev"),
+            Path::new("/tmp/<sock>/daemon.sock"),
+        )
+        .expect("ASCII paths render");
+
+        // The metacharacters are escaped...
+        assert!(plist.contains("/Users/A&amp;B/bin/omni-dev"), "{plist}");
+        assert!(plist.contains("/tmp/&lt;sock&gt;/daemon.sock"), "{plist}");
+        // ...and no raw metacharacter survives inside the path strings.
+        assert!(!plist.contains("A&B"), "{plist}");
+        assert!(!plist.contains("<sock>"), "{plist}");
+
+        assert_well_formed(&plist);
+    }
+
+    #[test]
+    fn renders_plain_paths_verbatim() {
+        let plist = render_plist(
+            Path::new("/usr/local/bin/omni-dev"),
+            Path::new("/tmp/omni-dev/daemon.sock"),
+        )
+        .expect("ASCII paths render");
+
+        assert!(
+            plist.contains("<string>/usr/local/bin/omni-dev</string>"),
+            "{plist}"
+        );
+        assert!(
+            plist.contains("<string>/tmp/omni-dev/daemon.sock</string>"),
+            "{plist}"
+        );
+        assert!(
+            plist.contains(&format!("<string>{LAUNCHD_LABEL}</string>")),
+            "{plist}"
+        );
+        assert_well_formed(&plist);
+    }
+
+    #[test]
+    fn rejects_non_utf8_paths() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        // 0xFF is not valid UTF-8; such a path cannot be placed in the UTF-8
+        // plist, so it must be rejected rather than silently corrupted.
+        let bad = Path::new(OsStr::from_bytes(b"/tmp/\xFF/omni-dev"));
+        assert!(render_plist(bad, Path::new("/tmp/daemon.sock")).is_err());
+        assert!(render_plist(Path::new("/usr/bin/omni-dev"), bad).is_err());
     }
 }
