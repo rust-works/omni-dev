@@ -150,4 +150,59 @@ mod tests {
         assert!(line.contains("exit=0"));
         assert!(line.contains("120ms"));
     }
+
+    #[test]
+    fn oneline_invocation_falls_back_to_mcp_tool() {
+        let rec = LogRecord {
+            kind: RecordKind::Invocation,
+            timestamp: "2026-06-22T12:00:00.000Z".to_string(),
+            source: Some(Source::Mcp),
+            mcp_tool: Some("jira_read".to_string()),
+            ..LogRecord::default()
+        };
+        let line = render(&rec, "", Format::Oneline);
+        assert!(line.contains("mcp"));
+        assert!(line.contains("jira_read"));
+    }
+
+    #[test]
+    fn oneline_http_flags_daemon_and_handles_unknown_kind() {
+        let rec = LogRecord {
+            kind: RecordKind::Http,
+            timestamp: "2026-06-22T12:00:00.000Z".to_string(),
+            service: Some("snowflake".to_string()),
+            method: Some("POST".to_string()),
+            status_code: Some(200),
+            via_daemon: true,
+            ..LogRecord::default()
+        };
+        assert!(render(&rec, "", Format::Oneline).contains("[daemon]"));
+
+        // An unknown (future) kind falls through the invocation arm without panic.
+        let unknown = LogRecord {
+            kind: RecordKind::Unknown,
+            ..LogRecord::default()
+        };
+        let _ = render(&unknown, "", Format::Oneline);
+    }
+
+    #[test]
+    fn full_format_is_pretty_json() {
+        let rec = LogRecord {
+            kind: RecordKind::Http,
+            service: Some("jira".to_string()),
+            ..LogRecord::default()
+        };
+        let out = render(&rec, "", Format::Full);
+        assert!(out.contains("\"service\": \"jira\""));
+        assert!(out.contains('\n'), "pretty output spans multiple lines");
+    }
+
+    #[test]
+    fn short_time_handles_negative_offset_and_no_t() {
+        // Negative tz offset exercises the rfind('-') fallback.
+        assert_eq!(short_time("2026-06-22T01:02:03-05:00"), "01:02:03");
+        // No 'T' separator and no tz marker returns the input unchanged.
+        assert_eq!(short_time("12:00:00"), "12:00:00");
+    }
 }
