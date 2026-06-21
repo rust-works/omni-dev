@@ -315,8 +315,13 @@ fn try_record(entry: &LogRecord) -> anyhow::Result<()> {
     use anyhow::Context;
 
     let path = log_file_path().context("could not resolve the log file path")?;
+    // Only create and tighten the parent when it's missing — re-`chmod`ing an
+    // existing dir (e.g. a user-chosen OMNI_DEV_LOG_FILE location, or a shared
+    // temp dir) is both wrong and may fail; the file itself is always 0600.
     if let Some(parent) = path.parent() {
-        crate::daemon::paths::ensure_dir_0700(parent)?;
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            crate::daemon::paths::ensure_dir_0700(parent)?;
+        }
     }
     let mut line = serde_json::to_string(entry).context("failed to serialize record")?;
     line.push('\n');
