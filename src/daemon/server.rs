@@ -10,12 +10,12 @@ use futures::{SinkExt, StreamExt};
 use serde_json::json;
 use tokio::net::UnixStream;
 use tokio::task::{JoinError, JoinSet};
-use tokio_util::codec::{Framed, LinesCodec};
+use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 use tokio_util::sync::CancellationToken;
 
 use super::lifecycle;
 use super::paths;
-use super::protocol::{DaemonEnvelope, DaemonReply, StatusReport, DAEMON_SERVICE};
+use super::protocol::{DaemonEnvelope, DaemonReply, StatusReport, DAEMON_SERVICE, MAX_LINE_BYTES};
 use super::registry::ServiceRegistry;
 use super::single_instance;
 
@@ -157,24 +157,50 @@ async fn handle_connection(
     registry: Arc<ServiceRegistry>,
     shutdown: CancellationToken,
 ) {
-    let mut framed = Framed::new(stream, LinesCodec::new());
+    let mut framed = Framed::new(stream, LinesCodec::new_with_max_length(MAX_LINE_BYTES));
     while let Some(line) = framed.next().await {
-        let reply = match line {
-            Ok(line) => dispatch_line(&line, &registry, &shutdown).await,
-            Err(e) => DaemonReply::err(format!("read error: {e}")),
-        };
-        let encoded = match serde_json::to_string(&reply) {
-            Ok(encoded) => encoded,
+        match line {
+            Ok(line) => {
+                let reply = dispatch_line(&line, &registry, &shutdown).await;
+                if !send_reply(&mut framed, reply).await {
+                    break;
+                }
+            }
             Err(e) => {
-                tracing::warn!("failed to encode daemon reply: {e}");
+                // A decode error ends the `Framed` stream (the next poll yields
+                // `None`), so there is nothing more to serve on this connection:
+                // reply once (best effort) and close. `MaxLineLengthExceeded`
+                // additionally puts the codec in discard mode — the
+                // unbounded-growth case the cap exists to stop (#989) — so it
+                // gets a clearer message.
+                let msg = match e {
+                    LinesCodecError::MaxLineLengthExceeded => {
+                        format!("request line exceeds the {MAX_LINE_BYTES}-byte limit")
+                    }
+                    LinesCodecError::Io(io) => format!("read error: {io}"),
+                };
+                let _ = send_reply(&mut framed, DaemonReply::err(msg)).await;
                 break;
             }
-        };
-        if let Err(e) = framed.send(encoded).await {
-            tracing::debug!("daemon client write failed: {e}");
-            break;
         }
     }
+}
+
+/// Encodes and writes one reply line. Returns `false` when the connection
+/// should be closed (encode failed, or the write failed).
+async fn send_reply(framed: &mut Framed<UnixStream, LinesCodec>, reply: DaemonReply) -> bool {
+    let encoded = match serde_json::to_string(&reply) {
+        Ok(encoded) => encoded,
+        Err(e) => {
+            tracing::warn!("failed to encode daemon reply: {e}");
+            return false;
+        }
+    };
+    if let Err(e) = framed.send(encoded).await {
+        tracing::debug!("daemon client write failed: {e}");
+        return false;
+    }
+    true
 }
 
 /// Parses one NDJSON request line and produces its reply.
