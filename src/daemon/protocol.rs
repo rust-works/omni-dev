@@ -14,6 +14,13 @@ use super::service::ServiceStatus;
 /// (`ping`, `status`, `shutdown`). A `None` `service` targets the same.
 pub const DAEMON_SERVICE: &str = "daemon";
 
+/// Maximum length, in bytes, of a single NDJSON line on the control socket.
+///
+/// Applies to both requests and replies, capping the per-connection read buffer
+/// so a peer that never sends a newline can't exhaust memory. 1 MiB is far above
+/// any real envelope.
+pub const MAX_LINE_BYTES: usize = 1024 * 1024;
+
 /// A request sent to the daemon over the control socket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonEnvelope {
