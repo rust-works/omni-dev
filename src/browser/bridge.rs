@@ -9,7 +9,7 @@
 //! → control plane returns the HTTP response.
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -27,7 +27,7 @@ use axum::{
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use futures::{SinkExt, StreamExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::Message;
@@ -253,27 +253,44 @@ pub struct BridgeServer {
     tasks: JoinSet<()>,
 }
 
+/// Binds a loopback TCP listener with `SO_REUSEADDR` so the bridge can rebind
+/// its fixed ports immediately after a restart even when a just-closed
+/// connection still holds the address in `TIME_WAIT` (#990). `SO_REUSEADDR`
+/// does *not* permit a second live listener on the same address, so the
+/// fail-closed-on-a-live-squatter guarantee (see
+/// `start_fails_closed_on_taken_control_port`) is unchanged.
+fn bind_loopback_reuse(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.listen(1024) // matches tokio's default `TcpListener::bind` backlog
+}
+
 impl BridgeServer {
     /// Binds both planes (fail-closed), spawns the accept loops, and returns
     /// immediately. `token` is the already-resolved session token (never
     /// sourced from argv).
     pub async fn start(mut config: BridgeConfig, token: String) -> Result<Self> {
-        let control_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.control_port))
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to bind control plane to 127.0.0.1:{} (already in use?)",
-                    config.control_port
-                )
-            })?;
-        let ws_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.ws_port))
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to bind WebSocket plane to 127.0.0.1:{} (already in use?)",
-                    config.ws_port
-                )
-            })?;
+        let control_listener =
+            bind_loopback_reuse(SocketAddr::from((Ipv4Addr::LOCALHOST, config.control_port)))
+                .with_context(|| {
+                    format!(
+                        "Failed to bind control plane to 127.0.0.1:{} (already in use?)",
+                        config.control_port
+                    )
+                })?;
+        let ws_listener =
+            bind_loopback_reuse(SocketAddr::from((Ipv4Addr::LOCALHOST, config.ws_port)))
+                .with_context(|| {
+                    format!(
+                        "Failed to bind WebSocket plane to 127.0.0.1:{} (already in use?)",
+                        config.ws_port
+                    )
+                })?;
 
         // Read back the OS-assigned ports so port-0 (random) is reflected
         // everywhere: the snippet, the printed instructions, and the Host check.
@@ -288,7 +305,8 @@ impl BridgeServer {
         // port, best-effort. A browser connecting to `ws://localhost` may resolve
         // it to `::1` rather than `127.0.0.1`; binding both means the pasted
         // snippet connects either way. Still loopback-only — ADR-0036 unchanged.
-        let ws_listener_v6 = TcpListener::bind((Ipv6Addr::LOCALHOST, ws_port)).await.ok();
+        let ws_listener_v6 =
+            bind_loopback_reuse(SocketAddr::from((Ipv6Addr::LOCALHOST, ws_port))).ok();
 
         let state = AppState {
             token: Arc::new(token),
@@ -1787,5 +1805,45 @@ mod tests {
         assert!(BridgeServer::start(config, "tok".to_string())
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn rebind_same_fixed_port_after_close_succeeds() {
+        // Regression for #990: a daemon/tray restart tears the planes down and
+        // rebinds the *same* fixed ports. A just-closed connection can leave the
+        // listener address in TIME_WAIT; without SO_REUSEADDR the rebind fails
+        // with EADDRINUSE and the bridge is wedged not-running. With it, the
+        // rebind succeeds.
+        let server = BridgeServer::start(ephemeral_config(), "tok".to_string())
+            .await
+            .unwrap();
+        let control_port = server.control_port();
+        let ws_port = server.ws_port();
+
+        // Hold loopback connections to both planes across the teardown so the
+        // server is the active closer and its listener ports pass through
+        // TIME_WAIT.
+        let control_conn = TcpStream::connect((Ipv4Addr::LOCALHOST, control_port))
+            .await
+            .unwrap();
+        let ws_conn = TcpStream::connect((Ipv4Addr::LOCALHOST, ws_port))
+            .await
+            .unwrap();
+
+        server.shutdown().await;
+        drop(control_conn);
+        drop(ws_conn);
+        // Let the four-way close settle so the ports are genuinely in TIME_WAIT.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let config = BridgeConfig {
+            ws_port,
+            control_port,
+            ..ephemeral_config()
+        };
+        let server2 = BridgeServer::start(config, "tok".to_string())
+            .await
+            .expect("rebinding just-released fixed ports must succeed with SO_REUSEADDR");
+        server2.shutdown().await;
     }
 }
