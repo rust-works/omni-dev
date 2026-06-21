@@ -65,6 +65,15 @@ impl BridgeService {
 
     /// Stops the running bridge and starts a fresh one with the same config and
     /// token. The lock is never held across the awaits.
+    ///
+    /// On the daemon's fixed ports the old planes must release before the new
+    /// ones can bind, so this is teardown-then-rebind rather than a zero-downtime
+    /// swap. The rebind is made reliable by `SO_REUSEADDR` on the bridge
+    /// listeners (see `BridgeServer::start`), which lets it succeed even when a
+    /// just-closed connection still holds the address in `TIME_WAIT` (#990). A
+    /// genuine bind failure (another process owns the port) still returns the
+    /// error, but leaves `inner` empty and recoverable: a later restart simply
+    /// retries the bind — it is not a permanent kill.
     async fn restart(&self) -> Result<()> {
         let old = self.lock().take();
         if let Some(server) = old {
