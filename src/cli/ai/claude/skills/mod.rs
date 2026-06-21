@@ -260,34 +260,34 @@ fn render_status_report(report: &status::StatusReport, format: OutputFormat) -> 
 }
 
 fn render_status_text(report: &status::StatusReport) -> String {
+    report
+        .targets
+        .iter()
+        .filter(|t| !(t.symlinks.is_empty() && t.exclude_entries.is_empty()))
+        .map(render_status_target)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_status_target(target: &status::TargetStatus) -> String {
     use std::fmt::Write;
     let mut out = String::new();
-    let mut first = true;
-    for target in &report.targets {
-        if target.symlinks.is_empty() && target.exclude_entries.is_empty() {
-            continue;
+    let _ = writeln!(out, "{}", target.root.display());
+    if !target.symlinks.is_empty() {
+        out.push_str("  symlinks:\n");
+        for link in &target.symlinks {
+            let _ = writeln!(
+                out,
+                "    {} -> {}",
+                link.path.display(),
+                link.points_to.display()
+            );
         }
-        if !first {
-            out.push('\n');
-        }
-        first = false;
-        let _ = writeln!(out, "{}", target.root.display());
-        if !target.symlinks.is_empty() {
-            out.push_str("  symlinks:\n");
-            for link in &target.symlinks {
-                let _ = writeln!(
-                    out,
-                    "    {} -> {}",
-                    link.path.display(),
-                    link.points_to.display()
-                );
-            }
-        }
-        if !target.exclude_entries.is_empty() {
-            let _ = writeln!(out, "  exclude block ({}):", target.exclude_file.display());
-            for entry in &target.exclude_entries {
-                let _ = writeln!(out, "    {entry}");
-            }
+    }
+    if !target.exclude_entries.is_empty() {
+        let _ = writeln!(out, "  exclude block ({}):", target.exclude_file.display());
+        for entry in &target.exclude_entries {
+            let _ = writeln!(out, "    {entry}");
         }
     }
     out
@@ -300,9 +300,10 @@ mod skills_api_tests {
 
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
 
     use tempfile::TempDir;
+
+    use super::common::test_git::{init_repo, init_repo_with_commit, worktree_add};
 
     fn tempdir() -> TempDir {
         // Anchor tmp at an absolute path so concurrent chdir-ing tests can't
@@ -310,37 +311,6 @@ mod skills_api_tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
         fs::create_dir_all(&root).ok();
         TempDir::new_in(&root).unwrap()
-    }
-
-    fn init_repo(dir: &Path) {
-        let status = Command::new("git").arg("init").arg(dir).output().unwrap();
-        assert!(status.status.success());
-    }
-
-    fn init_repo_with_commit(dir: &Path) {
-        init_repo(dir);
-        fs::write(dir.join("README.md"), "readme").unwrap();
-        let add = Command::new("git")
-            .args(["add", "README.md"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        assert!(add.status.success());
-        let commit = Command::new("git")
-            .args([
-                "-c",
-                "user.email=x@x",
-                "-c",
-                "user.name=x",
-                "commit",
-                "-q",
-                "-m",
-                "init",
-            ])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        assert!(commit.status.success());
     }
 
     fn make_source_skills(root: &Path, names: &[&str]) {
@@ -360,13 +330,7 @@ mod skills_api_tests {
         let linked = wt_parent.path().join("linked");
         init_repo_with_commit(src.path());
         make_source_skills(src.path(), &["alpha"]);
-        let add_wt = Command::new("git")
-            .args(["worktree", "add", "-q"])
-            .arg(&linked)
-            .current_dir(src.path())
-            .output()
-            .unwrap();
-        assert!(add_wt.status.success());
+        worktree_add(src.path(), &linked);
 
         let out = run_sync(Some(&linked), true, OutputFormat::Yaml).unwrap();
         assert!(out.contains("dry_run: false"), "missing dry_run: {out}");
@@ -405,13 +369,7 @@ mod skills_api_tests {
         init_repo_with_commit(main.path());
         let wt_parent = tempdir();
         let linked = wt_parent.path().join("linked");
-        let add_wt = Command::new("git")
-            .args(["worktree", "add", "-q"])
-            .arg(&linked)
-            .current_dir(main.path())
-            .output()
-            .unwrap();
-        assert!(add_wt.status.success());
+        worktree_add(main.path(), &linked);
 
         let out = run_clean(Some(main.path()), true, OutputFormat::Yaml).unwrap();
         assert!(out.contains("actions:"), "missing actions: {out}");
@@ -455,13 +413,7 @@ mod skills_api_tests {
         let wt_parent = tempdir();
         let linked = wt_parent.path().join("linked");
         init_repo_with_commit(tgt_main.path());
-        let add_wt = Command::new("git")
-            .args(["worktree", "add", "-q"])
-            .arg(&linked)
-            .current_dir(tgt_main.path())
-            .output()
-            .unwrap();
-        assert!(add_wt.status.success());
+        worktree_add(tgt_main.path(), &linked);
 
         let out = run_status(Some(tgt_main.path()), true, OutputFormat::Yaml).unwrap();
         assert!(out.contains("targets:"), "missing targets: {out}");
@@ -581,6 +533,12 @@ mod skills_api_tests {
                     exclude_entries: Vec::new(),
                 },
                 status::TargetStatus {
+                    root: PathBuf::from("/first"),
+                    symlinks: Vec::new(),
+                    exclude_file: PathBuf::from("/first/.git/info/exclude"),
+                    exclude_entries: vec![".claude/skills/beta/".into()],
+                },
+                status::TargetStatus {
                     root: PathBuf::from("/both"),
                     symlinks: vec![status::SymlinkInfo {
                         path: PathBuf::from("/both/.claude/skills/alpha"),
@@ -592,11 +550,17 @@ mod skills_api_tests {
             ],
         };
         let out = render_status_text(&report);
+        assert!(out.contains("/first"), "missing /first: {out}");
         assert!(out.contains("/both"), "missing /both: {out}");
         assert!(out.contains("symlinks:"), "missing symlinks: {out}");
         assert!(
             out.contains("exclude block"),
             "missing exclude block: {out}"
+        );
+        // Two rendered targets must be separated by a blank line (the join).
+        assert!(
+            out.contains("\n\n"),
+            "missing blank-line separator between targets: {out}"
         );
         assert!(
             !out.contains("/empty\n"),
@@ -647,10 +611,10 @@ mod tests {
 
     use std::fs;
     use std::path::Path;
-    use std::process::Command;
 
     use tempfile::TempDir;
 
+    use super::common::test_git::init_repo;
     use common::OutputFormat;
 
     fn tempdir() -> TempDir {
@@ -659,11 +623,6 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
         fs::create_dir_all(&root).ok();
         TempDir::new_in(&root).unwrap()
-    }
-
-    fn init_repo(dir: &Path) {
-        let status = Command::new("git").arg("init").arg(dir).output().unwrap();
-        assert!(status.status.success());
     }
 
     #[test]

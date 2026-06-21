@@ -317,6 +317,7 @@ fn print_report_text(report: &SyncReport, dry_run: bool) {
 mod tests {
     use super::*;
 
+    use super::super::common::test_git::{init_repo, init_repo_with_commit, worktree_add};
     use super::super::common::{BLOCK_BEGIN, BLOCK_END};
 
     use tempfile::TempDir;
@@ -334,15 +335,6 @@ mod tests {
             fs::create_dir_all(&skill_dir).unwrap();
             fs::write(skill_dir.join("SKILL.md"), format!("# {name}")).unwrap();
         }
-    }
-
-    fn init_repo(dir: &Path) {
-        let status = std::process::Command::new("git")
-            .arg("init")
-            .arg(dir)
-            .output()
-            .expect("git init failed to spawn");
-        assert!(status.status.success(), "git init failed: {status:?}");
     }
 
     fn make_fake_repo(dir: &Path) {
@@ -604,32 +596,6 @@ mod tests {
         cmd.execute().unwrap();
     }
 
-    fn init_repo_with_commit(dir: &Path) {
-        init_repo(dir);
-        fs::write(dir.join("README.md"), "readme").unwrap();
-        let add = std::process::Command::new("git")
-            .args(["add", "README.md"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        assert!(add.status.success());
-        let commit = std::process::Command::new("git")
-            .args([
-                "-c",
-                "user.email=x@x",
-                "-c",
-                "user.name=x",
-                "commit",
-                "-q",
-                "-m",
-                "init",
-            ])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        assert!(commit.status.success());
-    }
-
     #[test]
     fn execute_source_defaults_to_cwd() {
         let tgt = tempdir();
@@ -787,13 +753,7 @@ mod tests {
         make_source_skills(src.path(), &["alpha"]);
         init_repo_with_commit(tgt_main.path());
 
-        let add_wt = std::process::Command::new("git")
-            .args(["worktree", "add", "-q"])
-            .arg(&linked)
-            .current_dir(tgt_main.path())
-            .output()
-            .unwrap();
-        assert!(add_wt.status.success(), "git worktree add: {add_wt:?}");
+        worktree_add(tgt_main.path(), &linked);
 
         let cmd = SyncCommand {
             source: Some(src.path().to_path_buf()),
