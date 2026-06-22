@@ -6,7 +6,6 @@ use clap::Parser;
 
 use crate::cli::datadog::events::{render_event_table, EventRow};
 use crate::cli::datadog::format::{output_as, OutputFormat};
-use crate::cli::datadog::helpers::create_client;
 use crate::datadog::client::DatadogClient;
 use crate::datadog::events_api::{EventsApi, EventsListFilter};
 use crate::datadog::time::parse_time_range;
@@ -48,16 +47,10 @@ pub struct ListCommand {
 }
 
 impl ListCommand {
-    /// Executes the list against a freshly-created Datadog client.
-    pub async fn execute(self) -> Result<()> {
-        let (client, _site) = create_client()?;
-        self.execute_with(&client).await
-    }
-
-    /// Runs the command against an injected client — the value-in seam used by
-    /// tests (wiremock) so the execute-level glue is covered without touching
-    /// credentials or the environment (issue #1030).
-    async fn execute_with(self, client: &DatadogClient) -> Result<()> {
+    /// Runs the command against the shared client resolved by the parent
+    /// `DatadogCommand::execute`. Taking the client as a parameter keeps this
+    /// entry point free of process env and fully testable (issue #1030).
+    pub async fn execute(self, client: &DatadogClient) -> Result<()> {
         let (from_str, to_str) = resolve_time_range(&self.from, &self.to)?;
         let filter = EventsListFilter {
             query: self.filter.clone(),
@@ -284,15 +277,15 @@ mod tests {
         assert!(err.to_string().contains("500"));
     }
 
-    // ── ListCommand::execute_with glue ─────────────────────────────
+    // ── ListCommand::execute glue ──────────────────────────────────
     //
-    // Tests inject a wiremock-backed client into `execute_with`, covering the
+    // Tests inject a wiremock-backed client into `execute`, covering the
     // execute-level time-range/filter-construction glue without touching
     // credentials or the environment. (Credential resolution itself is covered
     // by the `load_credentials_with` / `create_client_from` tests.)
 
     #[tokio::test]
-    async fn execute_with_propagates_time_range_parse_errors() {
+    async fn execute_propagates_time_range_parse_errors() {
         let server = wiremock::MockServer::start().await;
         let client = DatadogClient::new(&server.uri(), "api", "app").unwrap();
 
@@ -305,12 +298,12 @@ mod tests {
             tags: None,
             output: OutputFormat::Table,
         };
-        let err = cmd.execute_with(&client).await.unwrap_err();
+        let err = cmd.execute(&client).await.unwrap_err();
         assert!(err.to_string().contains("Failed to parse"));
     }
 
     #[tokio::test]
-    async fn execute_with_end_to_end() {
+    async fn execute_end_to_end() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/api/v2/events"))
@@ -329,6 +322,6 @@ mod tests {
             tags: None,
             output: OutputFormat::Json,
         };
-        cmd.execute_with(&client).await.unwrap();
+        cmd.execute(&client).await.unwrap();
     }
 }

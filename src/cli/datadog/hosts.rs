@@ -7,6 +7,8 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+use crate::datadog::client::DatadogClient;
+
 /// Inspects Datadog reporting hosts.
 #[derive(Parser)]
 pub struct HostsCommand {
@@ -24,9 +26,9 @@ pub enum HostsSubcommands {
 
 impl HostsCommand {
     /// Executes the hosts command.
-    pub async fn execute(self) -> Result<()> {
+    pub async fn execute(self, client: &DatadogClient) -> Result<()> {
         match self.command {
-            HostsSubcommands::List(cmd) => cmd.execute().await,
+            HostsSubcommands::List(cmd) => cmd.execute(client).await,
         }
     }
 }

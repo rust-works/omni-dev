@@ -8,7 +8,6 @@ use chrono::{DateTime, TimeZone, Utc};
 use clap::Parser;
 
 use crate::cli::datadog::format::{output_as, OutputFormat};
-use crate::cli::datadog::helpers::create_client;
 use crate::datadog::client::DatadogClient;
 use crate::datadog::metrics_api::MetricsApi;
 use crate::datadog::time::parse_time_range;
@@ -40,16 +39,10 @@ pub struct QueryCommand {
 }
 
 impl QueryCommand {
-    /// Executes the query against a freshly-created Datadog client.
-    pub async fn execute(self) -> Result<()> {
-        let (client, _site) = create_client()?;
-        self.execute_with(&client).await
-    }
-
-    /// Runs the command against an injected client — the value-in seam used by
-    /// tests (wiremock) so the execute-level glue is covered without touching
-    /// credentials or the environment (issue #1030).
-    async fn execute_with(self, client: &DatadogClient) -> Result<()> {
+    /// Runs the command against the shared client resolved by the parent
+    /// `DatadogCommand::execute`. Taking the client as a parameter keeps this
+    /// entry point free of process env and fully testable (issue #1030).
+    pub async fn execute(self, client: &DatadogClient) -> Result<()> {
         let (from_ts, to_ts) = parse_time_range(&self.from, self.to.as_deref())?;
         run_query(client, &self.query, from_ts, to_ts, &self.output).await
     }
@@ -562,15 +555,15 @@ mod tests {
         assert!(err.to_string().contains("403"));
     }
 
-    // ── QueryCommand::execute_with glue ────────────────────────────
+    // ── QueryCommand::execute glue ─────────────────────────────────
     //
-    // Tests inject a wiremock-backed client into `execute_with`, covering the
+    // Tests inject a wiremock-backed client into `execute`, covering the
     // execute-level time-range parsing and query glue without touching
     // credentials or the environment. (Credential resolution itself is covered
-    // by the `load_credentials_with` / `create_client_from` tests.)
+    // by the credential-loading tests.)
 
     #[tokio::test]
-    async fn execute_with_rejects_invalid_time_range() {
+    async fn execute_rejects_invalid_time_range() {
         // `parse_time_range` fails before any HTTP call, so the client's URL
         // is never contacted.
         let client = DatadogClient::new("http://127.0.0.1:1", "api", "app").unwrap();
@@ -580,12 +573,12 @@ mod tests {
             to: None,
             output: OutputFormat::Table,
         };
-        let err = cmd.execute_with(&client).await.unwrap_err();
+        let err = cmd.execute(&client).await.unwrap_err();
         assert!(err.to_string().contains("Invalid time range"));
     }
 
     #[tokio::test]
-    async fn execute_with_end_to_end() {
+    async fn execute_end_to_end() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/api/v1/query"))
@@ -605,6 +598,6 @@ mod tests {
             to: Some("2023-11-14T23:00:00Z".into()),
             output: OutputFormat::Json,
         };
-        cmd.execute_with(&client).await.unwrap();
+        cmd.execute(&client).await.unwrap();
     }
 }

@@ -5,7 +5,6 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use clap::{Parser, ValueEnum};
 
 use crate::cli::datadog::format::{output_as, OutputFormat};
-use crate::cli::datadog::helpers::create_client;
 use crate::cli::datadog::logs::{render_log_table, LogRow};
 use crate::datadog::client::DatadogClient;
 use crate::datadog::logs_api::LogsApi;
@@ -69,16 +68,10 @@ pub struct SearchCommand {
 }
 
 impl SearchCommand {
-    /// Executes the search against a freshly-created Datadog client.
-    pub async fn execute(self) -> Result<()> {
-        let (client, _site) = create_client()?;
-        self.execute_with(&client).await
-    }
-
-    /// Runs the command against an injected client — the value-in seam used by
-    /// tests (wiremock) so the execute-level glue (time-range resolution) is
-    /// covered without touching credentials or the environment (issue #1030).
-    async fn execute_with(self, client: &DatadogClient) -> Result<()> {
+    /// Runs the command against the shared client resolved by the parent
+    /// `DatadogCommand::execute`. Taking the client as a parameter keeps this
+    /// entry point free of process env and fully testable (issue #1030).
+    pub async fn execute(self, client: &DatadogClient) -> Result<()> {
         let (from_str, to_str) = resolve_time_range(&self.from, &self.to)?;
         run_search(
             client,
@@ -366,15 +359,15 @@ mod tests {
         .unwrap();
     }
 
-    // ── SearchCommand::execute_with glue ───────────────────────────
+    // ── SearchCommand::execute glue ────────────────────────────────
     //
-    // Tests inject a wiremock-backed client into `execute_with`, covering the
+    // Tests inject a wiremock-backed client into `execute`, covering the
     // execute-level time-range resolution glue without touching credentials or
     // the environment. (Credential resolution itself is covered by the
     // `load_credentials_with` / `create_client_from` tests.)
 
     #[tokio::test]
-    async fn execute_with_resolves_time_range_and_searches() {
+    async fn execute_resolves_time_range_and_searches() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/api/v2/logs/events/search"))
@@ -392,11 +385,11 @@ mod tests {
             sort: SortArg::TimestampDesc,
             output: OutputFormat::Json,
         };
-        cmd.execute_with(&client).await.unwrap();
+        cmd.execute(&client).await.unwrap();
     }
 
     #[tokio::test]
-    async fn execute_with_propagates_time_range_parse_errors() {
+    async fn execute_propagates_time_range_parse_errors() {
         // --from is intentionally garbage; the time-range parse step runs
         // before any request reaches the injected client.
         let server = wiremock::MockServer::start().await;
@@ -409,7 +402,7 @@ mod tests {
             sort: SortArg::TimestampDesc,
             output: OutputFormat::Table,
         };
-        let err = cmd.execute_with(&client).await.unwrap_err();
+        let err = cmd.execute(&client).await.unwrap_err();
         assert!(err.to_string().contains("Failed to parse"));
     }
 }

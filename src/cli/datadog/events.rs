@@ -7,6 +7,8 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+use crate::datadog::client::DatadogClient;
+
 /// Inspects the Datadog events stream.
 #[derive(Parser)]
 pub struct EventsCommand {
@@ -24,9 +26,9 @@ pub enum EventsSubcommands {
 
 impl EventsCommand {
     /// Executes the events command.
-    pub async fn execute(self) -> Result<()> {
+    pub async fn execute(self, client: &DatadogClient) -> Result<()> {
         match self.command {
-            EventsSubcommands::List(cmd) => cmd.execute().await,
+            EventsSubcommands::List(cmd) => cmd.execute(client).await,
         }
     }
 }

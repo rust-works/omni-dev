@@ -7,6 +7,8 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+use crate::datadog::client::DatadogClient;
+
 /// Inspects Datadog scheduled downtimes.
 #[derive(Parser)]
 pub struct DowntimeCommand {
@@ -24,9 +26,9 @@ pub enum DowntimeSubcommands {
 
 impl DowntimeCommand {
     /// Executes the downtime command.
-    pub async fn execute(self) -> Result<()> {
+    pub async fn execute(self, client: &DatadogClient) -> Result<()> {
         match self.command {
-            DowntimeSubcommands::List(cmd) => cmd.execute().await,
+            DowntimeSubcommands::List(cmd) => cmd.execute(client).await,
         }
     }
 }

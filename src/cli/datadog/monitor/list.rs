@@ -4,7 +4,6 @@ use anyhow::Result;
 use clap::Parser;
 
 use crate::cli::datadog::format::{output_as, OutputFormat};
-use crate::cli::datadog::helpers::create_client;
 use crate::cli::datadog::monitor::{render_monitor_table, MonitorRow};
 use crate::datadog::client::DatadogClient;
 use crate::datadog::monitors_api::{MonitorListFilter, MonitorsApi};
@@ -37,16 +36,10 @@ pub struct ListCommand {
 }
 
 impl ListCommand {
-    /// Executes the list against a freshly-created Datadog client.
-    pub async fn execute(self) -> Result<()> {
-        let (client, _site) = create_client()?;
-        self.execute_with(&client).await
-    }
-
-    /// Runs the command against an injected client — the value-in seam used by
-    /// tests (wiremock) so the execute-level glue is covered without touching
-    /// credentials or the environment (issue #1030).
-    async fn execute_with(self, client: &DatadogClient) -> Result<()> {
+    /// Runs the command against the shared client resolved by the parent
+    /// `DatadogCommand::execute`. Taking the client as a parameter keeps this
+    /// entry point free of process env and fully testable (issue #1030).
+    pub async fn execute(self, client: &DatadogClient) -> Result<()> {
         let filter = MonitorListFilter {
             name: self.name,
             tags: self.tags,
@@ -187,15 +180,15 @@ mod tests {
         assert!(err.to_string().contains("500"));
     }
 
-    // ── ListCommand::execute_with glue ─────────────────────────────
+    // ── ListCommand::execute glue ──────────────────────────────────
     //
-    // Tests inject a wiremock-backed client into `execute_with`, covering the
+    // Tests inject a wiremock-backed client into `execute`, covering the
     // execute-level filter-construction glue without touching credentials or
     // the environment. (Credential resolution itself is covered by the
     // `load_credentials_with` / `create_client_from` tests.)
 
     #[tokio::test]
-    async fn execute_with_passes_name_filter_through() {
+    async fn execute_passes_name_filter_through() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/api/v1/monitor"))
@@ -216,6 +209,6 @@ mod tests {
             limit: 5,
             output: OutputFormat::Json,
         };
-        cmd.execute_with(&client).await.unwrap();
+        cmd.execute(&client).await.unwrap();
     }
 }
