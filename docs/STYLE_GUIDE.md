@@ -28,6 +28,7 @@ which tags apply to the changes and search this file for those tags. Each rule h
 | Writing or updating an ADR                       | `adrs`                                   |
 | Adding an MCP tool, resource, or param struct    | `api-design`, `module-organization`, `testing` |
 | Adding or modifying a docs/plan/ file            | `documentation`, `adrs`                  |
+| Reading env vars, or testing env-dependent code  | `testing`, `module-organization`         |
 | Reviewing code for style compliance              | All tags relevant to the changed code    |
 
 ---
@@ -1411,3 +1412,61 @@ Adding or substantially editing a file in [`docs/plan/`](plan/).
 ### Motivation
 
 A plan directory that mixes shipped, in-progress, and superseded content with no signalling forces every new contributor to read every file and cross-check the codebase before they can act on it. A one-line status header costs the author nothing and gives the reader an immediate orientation; ADR cross-links make the canonical decision discoverable.
+
+## STYLE-0028: Inject the environment, don't mutate it in tests
+
+**Tags:** `testing`, `module-organization`
+
+### Situation
+
+Writing code that reads an environment variable, or writing a test for code
+whose behaviour depends on the environment (`HOME`, `XDG_CONFIG_HOME`,
+`USE_OPENAI`, `ATLASSIAN_*`, `OMNI_DEV_*`, provider/API-key vars, …).
+
+### Guidance
+
+**Read the environment only at a thin boundary wrapper; put the logic in an
+inner seam that takes the resolved input as a value.** Then tests exercise the
+inner seam with a constructed value and **never mutate the process-global
+environment**. Pick the seam by what is read:
+
+1. **Resolved domain value** — incidental config. Provide a `*_from(value)`
+   constructor alongside the env-resolving entry point. (e.g.
+   [`create_client_from`](../src/cli/atlassian/helpers.rs),
+   [`DatadogClient::from_credentials`](../src/datadog/client.rs).)
+
+   ```rust
+   pub fn create_client() -> Result<(Client, String)> {
+       create_client_from(load_credentials()?)        // prod: resolve env → value
+   }
+   pub fn create_client_from(creds: Credentials) -> Result<(Client, String)> { /* … */ }
+   ```
+
+2. **`std::env::var` parsing boundary** — "given these vars, what do we do?".
+   Take `&impl EnvSource` (see [`crate::utils::env`](../src/utils/env.rs)); the
+   prod wrapper passes `&SystemEnv`, tests pass a `MapEnv`.
+
+   ```rust
+   pub fn check_ai_credentials(model: Option<&str>) -> Result<Info> {
+       check_ai_credentials_with(&SystemEnv, model)    // thin wrapper
+   }
+   fn check_ai_credentials_with(env: &impl EnvSource, model: Option<&str>) -> Result<Info> { /* … */ }
+   ```
+
+3. **`dirs::home_dir()` / `dirs::config_dir()`** — these read `HOME` /
+   `XDG_CONFIG_HOME` *inside* the `dirs` crate, where `EnvSource` can't reach.
+   Thread the resolved base directory as a parameter (prod default =
+   `dirs::home_dir()`). For a subprocess that needs `HOME`, set it scoped on
+   the `Command` (`.env("HOME", …)`), never on the process.
+
+**Never** call `std::env::set_var` / `remove_var` in a test, and **never** add
+a per-module env mutex to "protect" such mutation.
+
+### Motivation
+
+The process environment is a single shared mutable global. Per-module mutexes
+over it provide **no** mutual exclusion across modules (issue #821/#950/#1030),
+and `set_var`/`remove_var` are `unsafe` in Rust 2024. Injecting the resolved
+value removes the shared hazard entirely: env-dependent tests become pure,
+order-independent, lock-free, and fully parallel. A fresh bespoke env lock
+added *after* #821 (`datadog/*`) is exactly the regression this rule prevents.
