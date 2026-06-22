@@ -32,7 +32,14 @@ impl SearchCommand {
     /// Executes the search against a freshly-created Datadog client.
     pub async fn execute(self) -> Result<()> {
         let (client, _site) = create_client()?;
-        run_search(&client, &self.query, self.limit, &self.output).await
+        self.execute_with(&client).await
+    }
+
+    /// Runs the command against an injected client — the value-in seam used by
+    /// tests (wiremock) so the execute-level glue is covered without touching
+    /// credentials or the environment (issue #1030).
+    async fn execute_with(self, client: &DatadogClient) -> Result<()> {
+        run_search(client, &self.query, self.limit, &self.output).await
     }
 }
 
@@ -157,30 +164,15 @@ mod tests {
         assert!(err.to_string().contains("400"));
     }
 
-    // ── SearchCommand::execute error paths ─────────────────────────
+    // ── SearchCommand::execute_with glue ───────────────────────────
+    //
+    // Tests inject a wiremock-backed client into `execute_with`, covering the
+    // execute-level glue without touching credentials or the environment.
+    // (Credential resolution itself is covered by the `load_credentials_with`
+    // / `create_client_from` tests.)
 
     #[tokio::test]
-    async fn search_command_execute_errors_when_credentials_missing() {
-        use crate::datadog::test_support::{with_empty_home, EnvGuard};
-        let guard = EnvGuard::take();
-        let _dir = with_empty_home(&guard);
-
-        let cmd = SearchCommand {
-            query: "q".into(),
-            limit: 10,
-            output: OutputFormat::Table,
-        };
-        let err = cmd.execute().await.unwrap_err();
-        assert!(err.to_string().contains("not configured"));
-    }
-
-    #[tokio::test]
-    async fn search_command_execute_end_to_end_via_api_url_override() {
-        use std::fs;
-
-        use crate::datadog::auth::{DATADOG_API_KEY, DATADOG_API_URL, DATADOG_APP_KEY};
-        use crate::datadog::test_support::{with_empty_home, EnvGuard};
-
+    async fn search_command_execute_with_passes_query_and_limit_through() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/api/v1/monitor/search"))
@@ -190,24 +182,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let guard = EnvGuard::take();
-        let dir = with_empty_home(&guard);
-        let omni_dir = dir.path().join(".omni-dev");
-        fs::create_dir_all(&omni_dir).unwrap();
-        fs::write(
-            omni_dir.join("settings.json"),
-            r#"{"env":{"DATADOG_API_KEY":"api","DATADOG_APP_KEY":"app","DATADOG_SITE":"datadoghq.com"}}"#,
-        )
-        .unwrap();
-        std::env::set_var(DATADOG_API_KEY, "api");
-        std::env::set_var(DATADOG_APP_KEY, "app");
-        std::env::set_var(DATADOG_API_URL, server.uri());
-
+        let client = DatadogClient::new(&server.uri(), "api", "app").unwrap();
         let cmd = SearchCommand {
             query: "status:alert".into(),
             limit: 30,
             output: OutputFormat::Json,
         };
-        cmd.execute().await.unwrap();
+        cmd.execute_with(&client).await.unwrap();
     }
 }
