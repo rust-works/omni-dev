@@ -423,6 +423,13 @@ mod tests {
     }
 
     #[test]
+    fn openai_errors_without_api_key() {
+        let env = MapEnv::new().with("USE_OPENAI", "true");
+        let err = check_ai_credentials_with(&env, None).unwrap_err();
+        assert!(err.to_string().contains("OpenAI API key not found"));
+    }
+
+    #[test]
     fn bedrock_default_model_from_registry() {
         let env = MapEnv::new()
             .with("CLAUDE_CODE_USE_BEDROCK", "true")

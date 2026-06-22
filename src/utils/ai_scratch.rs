@@ -125,6 +125,16 @@ mod tests {
     }
 
     #[test]
+    fn public_wrappers_resolve_without_panicking() {
+        // The thin `SystemEnv` wrappers read the real environment (no mutation,
+        // no network, no side effects), so we exercise them for coverage and
+        // assert only that resolution completes — the path depends on the
+        // ambient AI_SCRATCH/TMPDIR, which we deliberately don't control here.
+        let _ = get_ai_scratch_dir();
+        let _ = get_ai_scratch_dir_at(Path::new("/tmp"));
+    }
+
+    #[test]
     fn find_git_root_from_path() {
         let temp_dir = {
             std::fs::create_dir_all("tmp").ok();
