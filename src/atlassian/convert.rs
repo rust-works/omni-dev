@@ -16416,6 +16416,26 @@ mod tests {
     }
 
     #[test]
+    fn file_media_pixel_width_above_100_passes_validation() {
+        // Issue #1037: confluence_read emits pixel widths well above 100 for
+        // editor-sized images (here width=900). Lowering carries width=900
+        // widthType=pixel onto the mediaSingle, which is valid ADF — the
+        // upstream schema's pixel branch is unbounded. A read→write round-trip
+        // must clear the write-path validator, not be rejected as out of range
+        // (the original failure: "value 900 is outside the allowed range
+        // [0, 100]"). Unlike `file_media_width_type_roundtrip`, this asserts on
+        // the validator, which the conversion-only round-trip never exercises.
+        let md = "![alt](){type=file id=11111111-2222-3333-4444-555555555555 collection=contentId-98765 height=904 width=900 mediaWidth=900 widthType=pixel}\n";
+        let adf = markdown_to_adf(md).unwrap();
+
+        let ms_attrs = adf.content[0].attrs.as_ref().unwrap();
+        assert_eq!(ms_attrs["width"], 900);
+        assert_eq!(ms_attrs["widthType"], "pixel");
+
+        crate::atlassian::adf_validated::validate(&adf).unwrap();
+    }
+
+    #[test]
     fn file_media_mode_roundtrip() {
         // mediaSingle with mode attr should survive round-trip (issue #431)
         let adf_doc = serde_json::json!({

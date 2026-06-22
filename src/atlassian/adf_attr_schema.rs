@@ -71,6 +71,27 @@ pub enum AttrType {
     IntRange(i64, i64),
     /// A number in `[lo, hi]` inclusive (accepts integers).
     NumRange(f64, f64),
+    /// A number whose accepted `[lo, hi]` range depends on a sibling
+    /// attribute's value.
+    ///
+    /// When the sibling attribute named `sibling` equals the string `equals`,
+    /// the value is checked against `when_true`; otherwise (sibling absent,
+    /// non-string, or a different string) against `when_false`.
+    ///
+    /// Models the upstream `mediaSingle.width` `anyOf`: pixel widths
+    /// (`widthType = "pixel"`) are unbounded, percentage widths (the default)
+    /// cap at 100. Resolution requires the full attr map, so it happens in
+    /// [`validate_attrs`] before [`check_value`] runs.
+    CondNumRange {
+        /// Name of the sibling attribute that selects the range.
+        sibling: &'static str,
+        /// Sibling string value that selects [`Self::CondNumRange::when_true`].
+        equals: &'static str,
+        /// Inclusive `(lo, hi)` used when the sibling equals `equals`.
+        when_true: (f64, f64),
+        /// Inclusive `(lo, hi)` used otherwise.
+        when_false: (f64, f64),
+    },
     /// A boolean.
     Bool,
     /// Any JSON string (no further validation).
@@ -389,6 +410,11 @@ const ATTR_ENTRIES: &[AttrEntry] = &[
         },
     ),
     // mediaSingle — definitions/mediaSingle_node
+    // upstream `attrs` is an `anyOf`: width ∈ [0, 100] for the percentage
+    // branch (the default when widthType is absent), width ∈ [0, ∞) for the
+    // pixel branch (widthType = "pixel"). Real Confluence emits pixel widths
+    // well above 100 for editor-sized images, so the range must branch on
+    // widthType rather than cap unconditionally (issue #1037).
     (
         "mediaSingle",
         AttrSchema {
@@ -400,7 +426,12 @@ const ATTR_ENTRIES: &[AttrEntry] = &[
                 ),
                 (
                     "width",
-                    AttrType::NumRange(0.0, 100.0),
+                    AttrType::CondNumRange {
+                        sibling: "widthType",
+                        equals: "pixel",
+                        when_true: (0.0, f64::MAX),
+                        when_false: (0.0, 100.0),
+                    },
                     AttrPresence::Optional,
                 ),
                 ("widthType", AttrType::String, AttrPresence::Optional),
@@ -573,7 +604,11 @@ pub fn validate_attrs(
                 // Absent and optional — fine.
             }
             (Some(v), _) => {
-                if let Some(problem) = check_value(ty, v) {
+                // Resolve sibling-conditional types (e.g. mediaSingle.width
+                // depends on widthType) against the full attr map before
+                // shape-checking; non-conditional types pass through unchanged.
+                let effective = resolve_attr_type(ty, attr_obj);
+                if let Some(problem) = check_value(&effective, v) {
                     out.push(AdfSchemaViolation::InvalidAttr {
                         node_type: node_type.to_string(),
                         attr_name: (*field).to_string(),
@@ -586,11 +621,39 @@ pub fn validate_attrs(
     }
 }
 
+/// Resolves a possibly sibling-conditional [`AttrType`] into a concrete one,
+/// using the node's full attribute map to pick the branch.
+///
+/// [`AttrType::CondNumRange`] collapses to a plain [`AttrType::NumRange`]
+/// chosen by the sibling attribute; every other type is returned unchanged
+/// (a cheap clone — all variants hold only `Copy` data or `&'static` slices).
+fn resolve_attr_type(ty: &AttrType, attrs: Option<&serde_json::Map<String, Value>>) -> AttrType {
+    match ty {
+        AttrType::CondNumRange {
+            sibling,
+            equals,
+            when_true,
+            when_false,
+        } => {
+            let selected =
+                attrs.and_then(|m| m.get(*sibling)).and_then(Value::as_str) == Some(*equals);
+            let (lo, hi) = if selected { *when_true } else { *when_false };
+            AttrType::NumRange(lo, hi)
+        }
+        other => other.clone(),
+    }
+}
+
 /// Validates a single value against an [`AttrType`].
 ///
 /// Returns `Some(problem)` describing what's wrong, or `None` if the value
 /// is acceptable. Public so that mark-attribute validation
 /// ([`crate::atlassian::adf_mark_schema`]) can reuse the same shape rules.
+///
+/// [`AttrType::CondNumRange`] should be resolved via [`resolve_attr_type`]
+/// before reaching here (it needs sibling context this function lacks); if one
+/// arrives unresolved, the stricter `when_false` range is applied so the check
+/// is never silently permissive.
 #[must_use]
 pub fn check_value(ty: &AttrType, value: &Value) -> Option<AttrProblem> {
     match ty {
@@ -622,6 +685,11 @@ pub fn check_value(ty: &AttrType, value: &Value) -> Option<AttrProblem> {
             }),
             None => Some(AttrProblem::WrongType { expected: "number" }),
         },
+        AttrType::CondNumRange { when_false, .. } => {
+            // Reached only if a conditional type bypassed `resolve_attr_type`
+            // (no sibling context). Apply the stricter branch defensively.
+            check_value(&AttrType::NumRange(when_false.0, when_false.1), value)
+        }
         AttrType::Bool => match value.as_bool() {
             Some(_) => None,
             None => Some(AttrProblem::WrongType { expected: "bool" }),
@@ -809,6 +877,55 @@ mod tests {
             &v[0],
             AdfSchemaViolation::InvalidAttr { attr_name, .. } if attr_name == "layout"
         ));
+    }
+
+    #[test]
+    fn media_single_pixel_width_above_100_validates() {
+        // The issue #1037 reproducer: real Confluence emits pixel widths well
+        // above 100 for editor-sized images. With widthType:pixel the value is
+        // unbounded, so width=900 must validate.
+        assert!(run(
+            "mediaSingle",
+            json!({ "layout": "center", "width": 900, "widthType": "pixel" })
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn media_single_percentage_width_above_100_flagged() {
+        // The percentage branch (default when widthType is absent, or explicit)
+        // still caps at 100 — width=900 must be flagged in both forms.
+        for attrs in [
+            json!({ "layout": "center", "width": 900 }),
+            json!({ "layout": "center", "width": 900, "widthType": "percentage" }),
+        ] {
+            let v = run("mediaSingle", attrs.clone());
+            assert_eq!(v.len(), 1, "expected one violation for {attrs}");
+            match &v[0] {
+                AdfSchemaViolation::InvalidAttr {
+                    attr_name, problem, ..
+                } => {
+                    assert_eq!(attr_name, "width");
+                    assert!(matches!(
+                        problem,
+                        AttrProblem::OutOfRangeF { lo, hi, actual }
+                            if *lo == 0.0 && *hi == 100.0 && *actual == 900.0
+                    ));
+                }
+                other => panic!("expected InvalidAttr, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn media_single_percentage_width_in_range_validates() {
+        assert!(run(
+            "mediaSingle",
+            json!({ "layout": "center", "width": 75, "widthType": "percentage" })
+        )
+        .is_empty());
+        // widthType absent defaults to the percentage branch.
+        assert!(run("mediaSingle", json!({ "layout": "center", "width": 75 })).is_empty());
     }
 
     #[test]
