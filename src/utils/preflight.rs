@@ -50,16 +50,29 @@ impl std::fmt::Display for AiProvider {
 /// creating a full AI client. Use this at the start of commands that
 /// require AI to fail fast if credentials are missing.
 pub fn check_ai_credentials(model_override: Option<&str>) -> Result<AiCredentialInfo> {
-    use crate::utils::settings::{get_env_var, get_env_vars};
+    check_ai_credentials_with(&crate::utils::settings::SettingsEnv::load(), model_override)
+}
 
+/// [`check_ai_credentials`] over an injected
+/// [`EnvSource`](crate::utils::env::EnvSource).
+///
+/// The production wrapper passes `&SettingsEnv::load()` (process env with a
+/// settings.json fallback); tests pass a pure `MapEnv`, so this env-parsing
+/// boundary is exercised without mutating the process environment or taking a
+/// lock (issue #1030).
+pub(crate) fn check_ai_credentials_with(
+    env: &impl crate::utils::env::EnvSource,
+    model_override: Option<&str>,
+) -> Result<AiCredentialInfo> {
     // The `claude -p` subprocess backend is checked first so it wins over
     // the existing USE_* flags if multiple are set. Credentials for this
     // backend live inside the `claude` binary's own auth state, so we just
     // verify the binary is on PATH.
-    if let Ok(val) = get_env_var("OMNI_DEV_AI_BACKEND") {
+    if let Some(val) = env.var("OMNI_DEV_AI_BACKEND") {
         if matches!(val.as_str(), "claude-cli" | "claude_cli") {
-            let binary =
-                get_env_var("OMNI_DEV_CLAUDE_CLI_BIN").unwrap_or_else(|_| "claude".to_string());
+            let binary = env
+                .var("OMNI_DEV_CLAUDE_CLI_BIN")
+                .unwrap_or_else(|| "claude".to_string());
             let probe = std::process::Command::new(&binary)
                 .arg("--version")
                 .output();
@@ -68,9 +81,9 @@ pub fn check_ai_credentials(model_override: Option<&str>) -> Result<AiCredential
                     let registry = get_model_registry();
                     let model = model_override
                         .map(String::from)
-                        .or_else(|| get_env_var("CLAUDE_MODEL").ok())
-                        .or_else(|| get_env_var("CLAUDE_CODE_MODEL").ok())
-                        .or_else(|| get_env_var("ANTHROPIC_MODEL").ok())
+                        .or_else(|| env.var("CLAUDE_MODEL"))
+                        .or_else(|| env.var("CLAUDE_CODE_MODEL"))
+                        .or_else(|| env.var("ANTHROPIC_MODEL"))
                         .unwrap_or_else(|| {
                             registry
                                 .get_default_model("claude")
@@ -92,17 +105,19 @@ pub fn check_ai_credentials(model_override: Option<&str>) -> Result<AiCredential
     }
 
     // Check provider selection flags
-    let use_openai = get_env_var("USE_OPENAI").is_ok_and(|val| val == "true");
+    let use_openai = env.var("USE_OPENAI").is_some_and(|val| val == "true");
 
-    let use_ollama = get_env_var("USE_OLLAMA").is_ok_and(|val| val == "true");
+    let use_ollama = env.var("USE_OLLAMA").is_some_and(|val| val == "true");
 
-    let use_bedrock = get_env_var("CLAUDE_CODE_USE_BEDROCK").is_ok_and(|val| val == "true");
+    let use_bedrock = env
+        .var("CLAUDE_CODE_USE_BEDROCK")
+        .is_some_and(|val| val == "true");
 
     // Check Ollama (no credentials required, just model)
     if use_ollama {
         let model = model_override
             .map(String::from)
-            .or_else(|| get_env_var("OLLAMA_MODEL").ok())
+            .or_else(|| env.var("OLLAMA_MODEL"))
             .unwrap_or_else(|| "llama2".to_string());
 
         return Ok(AiCredentialInfo {
@@ -116,7 +131,7 @@ pub fn check_ai_credentials(model_override: Option<&str>) -> Result<AiCredential
         let registry = get_model_registry();
         let model = model_override
             .map(String::from)
-            .or_else(|| get_env_var("OPENAI_MODEL").ok())
+            .or_else(|| env.var("OPENAI_MODEL"))
             .unwrap_or_else(|| {
                 registry
                     .get_default_model("openai")
@@ -125,14 +140,15 @@ pub fn check_ai_credentials(model_override: Option<&str>) -> Result<AiCredential
             });
 
         // Verify API key exists
-        get_env_vars(&["OPENAI_API_KEY", "OPENAI_AUTH_TOKEN"]).map_err(|_| {
-            anyhow::anyhow!(
-                "OpenAI API key not found.\n\
+        env.var_any(&["OPENAI_API_KEY", "OPENAI_AUTH_TOKEN"])
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "OpenAI API key not found.\n\
                  Set one of these environment variables:\n\
                  - OPENAI_API_KEY\n\
                  - OPENAI_AUTH_TOKEN"
-            )
-        })?;
+                )
+            })?;
 
         return Ok(AiCredentialInfo {
             provider: AiProvider::OpenAi,
@@ -145,7 +161,7 @@ pub fn check_ai_credentials(model_override: Option<&str>) -> Result<AiCredential
         let registry = get_model_registry();
         let model = model_override
             .map(String::from)
-            .or_else(|| get_env_var("ANTHROPIC_MODEL").ok())
+            .or_else(|| env.var("ANTHROPIC_MODEL"))
             .unwrap_or_else(|| {
                 registry
                     .get_default_model("claude")
@@ -154,14 +170,14 @@ pub fn check_ai_credentials(model_override: Option<&str>) -> Result<AiCredential
             });
 
         // Verify Bedrock configuration
-        get_env_var("ANTHROPIC_AUTH_TOKEN").map_err(|_| {
+        env.var("ANTHROPIC_AUTH_TOKEN").ok_or_else(|| {
             anyhow::anyhow!(
                 "AWS Bedrock authentication not configured.\n\
                  Set ANTHROPIC_AUTH_TOKEN environment variable."
             )
         })?;
 
-        get_env_var("ANTHROPIC_BEDROCK_BASE_URL").map_err(|_| {
+        env.var("ANTHROPIC_BEDROCK_BASE_URL").ok_or_else(|| {
             anyhow::anyhow!(
                 "AWS Bedrock base URL not configured.\n\
                  Set ANTHROPIC_BEDROCK_BASE_URL environment variable."
@@ -178,7 +194,7 @@ pub fn check_ai_credentials(model_override: Option<&str>) -> Result<AiCredential
     let registry = get_model_registry();
     let model = model_override
         .map(String::from)
-        .or_else(|| get_env_var("ANTHROPIC_MODEL").ok())
+        .or_else(|| env.var("ANTHROPIC_MODEL"))
         .unwrap_or_else(|| {
             registry
                 .get_default_model("claude")
@@ -187,12 +203,12 @@ pub fn check_ai_credentials(model_override: Option<&str>) -> Result<AiCredential
         });
 
     // Verify API key exists
-    get_env_vars(&[
+    env.var_any(&[
         "CLAUDE_API_KEY",
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
     ])
-    .map_err(|_| {
+    .ok_or_else(|| {
         anyhow::anyhow!(
             "Claude API key not found.\n\
                  Set one of these environment variables:\n\
@@ -341,52 +357,7 @@ pub fn check_pr_command_prerequisites(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-
-    use std::env;
-    use std::sync::Mutex;
-    use std::sync::OnceLock;
-
-    /// Global lock to ensure environment variable tests don't interfere with each other.
-    static ENV_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-    /// Manages environment variables in tests to avoid interference.
-    struct EnvGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        vars: Vec<(String, Option<String>)>,
-    }
-
-    impl EnvGuard {
-        fn new() -> Self {
-            let lock = ENV_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-            Self {
-                _lock: lock,
-                vars: Vec::new(),
-            }
-        }
-
-        fn set(&mut self, key: &str, value: &str) {
-            let original = env::var(key).ok();
-            self.vars.push((key.to_string(), original));
-            env::set_var(key, value);
-        }
-
-        fn remove(&mut self, key: &str) {
-            let original = env::var(key).ok();
-            self.vars.push((key.to_string(), original));
-            env::remove_var(key);
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, original_value) in self.vars.drain(..).rev() {
-                match original_value {
-                    Some(value) => env::set_var(&key, value),
-                    None => env::remove_var(&key),
-                }
-            }
-        }
-    }
+    use crate::test_support::env::MapEnv;
 
     #[test]
     fn ai_provider_display() {
@@ -430,57 +401,51 @@ mod tests {
 
     #[test]
     fn claude_default_model_from_registry() {
-        let mut guard = EnvGuard::new();
-        // Enable Claude API path with a dummy key, no model override
-        guard.remove("USE_OPENAI");
-        guard.remove("USE_OLLAMA");
-        guard.remove("CLAUDE_CODE_USE_BEDROCK");
-        guard.remove("ANTHROPIC_MODEL");
-        guard.set("ANTHROPIC_API_KEY", "sk-test-dummy");
+        // Claude API path with a dummy key, no model override. A pure MapEnv
+        // means absent vars (USE_OPENAI, …) simply read as None — no need to
+        // clear anything, and no process-global env is touched.
+        let env = MapEnv::new().with("ANTHROPIC_API_KEY", "sk-test-dummy");
 
-        let info = check_ai_credentials(None).unwrap();
+        let info = check_ai_credentials_with(&env, None).unwrap();
         assert_eq!(info.provider, AiProvider::Claude);
         assert_eq!(info.model, "claude-sonnet-4-6");
     }
 
     #[test]
     fn openai_default_model_from_registry() {
-        let mut guard = EnvGuard::new();
-        guard.set("USE_OPENAI", "true");
-        guard.remove("USE_OLLAMA");
-        guard.remove("OPENAI_MODEL");
-        guard.set("OPENAI_API_KEY", "sk-test-dummy");
+        let env = MapEnv::new()
+            .with("USE_OPENAI", "true")
+            .with("OPENAI_API_KEY", "sk-test-dummy");
 
-        let info = check_ai_credentials(None).unwrap();
+        let info = check_ai_credentials_with(&env, None).unwrap();
         assert_eq!(info.provider, AiProvider::OpenAi);
         assert_eq!(info.model, "gpt-5-mini");
     }
 
     #[test]
-    fn bedrock_default_model_from_registry() {
-        let mut guard = EnvGuard::new();
-        guard.remove("USE_OPENAI");
-        guard.remove("USE_OLLAMA");
-        guard.set("CLAUDE_CODE_USE_BEDROCK", "true");
-        guard.remove("ANTHROPIC_MODEL");
-        guard.set("ANTHROPIC_AUTH_TOKEN", "test-token");
-        guard.set("ANTHROPIC_BEDROCK_BASE_URL", "https://bedrock.example.com");
+    fn openai_errors_without_api_key() {
+        let env = MapEnv::new().with("USE_OPENAI", "true");
+        let err = check_ai_credentials_with(&env, None).unwrap_err();
+        assert!(err.to_string().contains("OpenAI API key not found"));
+    }
 
-        let info = check_ai_credentials(None).unwrap();
+    #[test]
+    fn bedrock_default_model_from_registry() {
+        let env = MapEnv::new()
+            .with("CLAUDE_CODE_USE_BEDROCK", "true")
+            .with("ANTHROPIC_AUTH_TOKEN", "test-token")
+            .with("ANTHROPIC_BEDROCK_BASE_URL", "https://bedrock.example.com");
+
+        let info = check_ai_credentials_with(&env, None).unwrap();
         assert_eq!(info.provider, AiProvider::Bedrock);
         assert_eq!(info.model, "claude-sonnet-4-6");
     }
 
     #[test]
     fn model_override_takes_precedence() {
-        let mut guard = EnvGuard::new();
-        guard.remove("USE_OPENAI");
-        guard.remove("USE_OLLAMA");
-        guard.remove("CLAUDE_CODE_USE_BEDROCK");
-        guard.remove("ANTHROPIC_MODEL");
-        guard.set("ANTHROPIC_API_KEY", "sk-test-dummy");
+        let env = MapEnv::new().with("ANTHROPIC_API_KEY", "sk-test-dummy");
 
-        let info = check_ai_credentials(Some("claude-opus-4-6")).unwrap();
+        let info = check_ai_credentials_with(&env, Some("claude-opus-4-6")).unwrap();
         assert_eq!(info.model, "claude-opus-4-6");
     }
 
@@ -497,21 +462,16 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn claude_cli_backend_uses_version_probe() {
+        // shim_lock guards the exec-script/ETXTBSY race (#642), not env.
         let _guard = crate::test_support::shim::shim_lock();
         let tmp = tempfile::TempDir::new().unwrap();
         let shim = make_version_shim(&tmp, 0);
 
-        let mut guard = EnvGuard::new();
-        guard.remove("USE_OPENAI");
-        guard.remove("USE_OLLAMA");
-        guard.remove("CLAUDE_CODE_USE_BEDROCK");
-        guard.remove("ANTHROPIC_MODEL");
-        guard.remove("CLAUDE_MODEL");
-        guard.remove("CLAUDE_CODE_MODEL");
-        guard.set("OMNI_DEV_AI_BACKEND", "claude-cli");
-        guard.set("OMNI_DEV_CLAUDE_CLI_BIN", shim.to_str().unwrap());
+        let env = MapEnv::new()
+            .with("OMNI_DEV_AI_BACKEND", "claude-cli")
+            .with("OMNI_DEV_CLAUDE_CLI_BIN", shim.to_str().unwrap());
 
-        let info = check_ai_credentials(None).unwrap();
+        let info = check_ai_credentials_with(&env, None).unwrap();
         assert_eq!(info.provider, AiProvider::ClaudeCli);
         assert_eq!(info.model, "claude-sonnet-4-6");
     }
@@ -519,35 +479,29 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn claude_cli_backend_uses_model_from_env() {
+        // shim_lock guards the exec-script/ETXTBSY race (#642), not env.
         let _guard = crate::test_support::shim::shim_lock();
         let tmp = tempfile::TempDir::new().unwrap();
         let shim = make_version_shim(&tmp, 0);
 
-        let mut guard = EnvGuard::new();
-        guard.remove("USE_OPENAI");
-        guard.remove("USE_OLLAMA");
-        guard.remove("CLAUDE_CODE_USE_BEDROCK");
-        guard.remove("ANTHROPIC_MODEL");
-        guard.remove("CLAUDE_CODE_MODEL");
-        guard.set("OMNI_DEV_AI_BACKEND", "claude-cli");
-        guard.set("OMNI_DEV_CLAUDE_CLI_BIN", shim.to_str().unwrap());
-        guard.set("CLAUDE_MODEL", "haiku");
+        let env = MapEnv::new()
+            .with("OMNI_DEV_AI_BACKEND", "claude-cli")
+            .with("OMNI_DEV_CLAUDE_CLI_BIN", shim.to_str().unwrap())
+            .with("CLAUDE_MODEL", "haiku");
 
-        let info = check_ai_credentials(None).unwrap();
+        let info = check_ai_credentials_with(&env, None).unwrap();
         assert_eq!(info.provider, AiProvider::ClaudeCli);
         assert_eq!(info.model, "haiku");
     }
 
     #[test]
     fn claude_cli_backend_missing_binary_fails_preflight() {
-        let mut guard = EnvGuard::new();
-        guard.remove("USE_OPENAI");
-        guard.remove("USE_OLLAMA");
-        guard.remove("CLAUDE_CODE_USE_BEDROCK");
-        guard.set("OMNI_DEV_AI_BACKEND", "claude-cli");
-        guard.set("OMNI_DEV_CLAUDE_CLI_BIN", "/nonexistent/claude-binary-xyz");
+        // A nonexistent binary path never spawns, so no shim_lock is needed.
+        let env = MapEnv::new()
+            .with("OMNI_DEV_AI_BACKEND", "claude-cli")
+            .with("OMNI_DEV_CLAUDE_CLI_BIN", "/nonexistent/claude-binary-xyz");
 
-        let err = check_ai_credentials(None).expect_err("expected missing-binary error");
+        let err = check_ai_credentials_with(&env, None).expect_err("expected missing-binary error");
         let chain = format!("{err:#}");
         assert!(
             chain.contains("Claude Code CLI not available"),
@@ -560,14 +514,11 @@ mod tests {
         // The factory/preflight accept both `claude-cli` and `claude_cli`.
         // Verify the second spelling routes the same way (missing-binary
         // path exercises the selector cheaply).
-        let mut guard = EnvGuard::new();
-        guard.remove("USE_OPENAI");
-        guard.remove("USE_OLLAMA");
-        guard.remove("CLAUDE_CODE_USE_BEDROCK");
-        guard.set("OMNI_DEV_AI_BACKEND", "claude_cli");
-        guard.set("OMNI_DEV_CLAUDE_CLI_BIN", "/nonexistent/claude-binary-xyz");
+        let env = MapEnv::new()
+            .with("OMNI_DEV_AI_BACKEND", "claude_cli")
+            .with("OMNI_DEV_CLAUDE_CLI_BIN", "/nonexistent/claude-binary-xyz");
 
-        let err = check_ai_credentials(None).expect_err("expected missing-binary error");
+        let err = check_ai_credentials_with(&env, None).expect_err("expected missing-binary error");
         let chain = format!("{err:#}");
         assert!(chain.contains("Claude Code CLI not available"));
     }

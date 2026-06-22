@@ -5,7 +5,6 @@ use clap::Parser;
 
 use crate::cli::datadog::dashboard::{render_dashboard_table, DashboardRow};
 use crate::cli::datadog::format::{output_as, OutputFormat};
-use crate::cli::datadog::helpers::create_client;
 use crate::datadog::client::DatadogClient;
 use crate::datadog::dashboards_api::{DashboardListFilter, DashboardsApi};
 use crate::datadog::types::DashboardSummary;
@@ -27,13 +26,14 @@ pub struct ListCommand {
 }
 
 impl ListCommand {
-    /// Executes the list against a freshly-created Datadog client.
-    pub async fn execute(self) -> Result<()> {
-        let (client, _site) = create_client()?;
+    /// Runs the command against the shared client resolved by the parent
+    /// `DatadogCommand::execute`. Taking the client as a parameter keeps this
+    /// entry point free of process env and fully testable (issue #1030).
+    pub async fn execute(self, client: &DatadogClient) -> Result<()> {
         let filter = DashboardListFilter {
             filter_shared: if self.filter_shared { Some(true) } else { None },
         };
-        run_list(&client, &filter, &self.output).await
+        run_list(client, &filter, &self.output).await
     }
 }
 
@@ -188,33 +188,16 @@ mod tests {
         assert!(err.to_string().contains("500"));
     }
 
-    // ── ListCommand::execute error paths ───────────────────────────
+    // ── ListCommand::execute glue ──────────────────────────────────
+    //
+    // Tests inject a wiremock-backed client into `execute`, covering the
+    // execute-level filter-construction glue without touching credentials or
+    // the environment. (Credential resolution itself is covered by the
+    // `load_credentials_with` / `create_client_from` tests.)
 
     #[tokio::test]
-    async fn list_command_execute_errors_when_credentials_missing() {
-        use crate::datadog::test_support::{with_empty_home, EnvGuard};
-        let guard = EnvGuard::take();
-        let _dir = with_empty_home(&guard);
-
-        let cmd = ListCommand {
-            filter_shared: false,
-            output: OutputFormat::Table,
-        };
-        let err = cmd.execute().await.unwrap_err();
-        assert!(err.to_string().contains("not configured"));
-    }
-
-    #[tokio::test]
-    async fn list_command_execute_omits_filter_shared_when_flag_unset() {
-        // Covers the `else { None }` branch of the filter-construction
-        // ternary in `ListCommand::execute`, which the credential-missing
-        // test never reaches because it errors before constructing the
-        // filter struct.
-        use std::fs;
-
-        use crate::datadog::auth::{DATADOG_API_KEY, DATADOG_API_URL, DATADOG_APP_KEY};
-        use crate::datadog::test_support::{with_empty_home, EnvGuard};
-
+    async fn execute_omits_filter_shared_when_flag_unset() {
+        // Covers the `else { None }` branch of the filter-construction ternary.
         let server = wiremock::MockServer::start().await;
         // Match only when `filter_shared` is *absent* from the query string.
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -228,33 +211,16 @@ mod tests {
             .mount(&server)
             .await;
 
-        let guard = EnvGuard::take();
-        let dir = with_empty_home(&guard);
-        let omni_dir = dir.path().join(".omni-dev");
-        fs::create_dir_all(&omni_dir).unwrap();
-        fs::write(
-            omni_dir.join("settings.json"),
-            r#"{"env":{"DATADOG_API_KEY":"api","DATADOG_APP_KEY":"app","DATADOG_SITE":"datadoghq.com"}}"#,
-        )
-        .unwrap();
-        std::env::set_var(DATADOG_API_KEY, "api");
-        std::env::set_var(DATADOG_APP_KEY, "app");
-        std::env::set_var(DATADOG_API_URL, server.uri());
-
+        let client = DatadogClient::new(&server.uri(), "api", "app").unwrap();
         let cmd = ListCommand {
             filter_shared: false,
             output: OutputFormat::Json,
         };
-        cmd.execute().await.unwrap();
+        cmd.execute(&client).await.unwrap();
     }
 
     #[tokio::test]
-    async fn list_command_execute_end_to_end_via_api_url_override() {
-        use std::fs;
-
-        use crate::datadog::auth::{DATADOG_API_KEY, DATADOG_API_URL, DATADOG_APP_KEY};
-        use crate::datadog::test_support::{with_empty_home, EnvGuard};
-
+    async fn execute_sets_filter_shared_when_flag_set() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/api/v1/dashboard"))
@@ -268,23 +234,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let guard = EnvGuard::take();
-        let dir = with_empty_home(&guard);
-        let omni_dir = dir.path().join(".omni-dev");
-        fs::create_dir_all(&omni_dir).unwrap();
-        fs::write(
-            omni_dir.join("settings.json"),
-            r#"{"env":{"DATADOG_API_KEY":"api","DATADOG_APP_KEY":"app","DATADOG_SITE":"datadoghq.com"}}"#,
-        )
-        .unwrap();
-        std::env::set_var(DATADOG_API_KEY, "api");
-        std::env::set_var(DATADOG_APP_KEY, "app");
-        std::env::set_var(DATADOG_API_URL, server.uri());
-
+        let client = DatadogClient::new(&server.uri(), "api", "app").unwrap();
         let cmd = ListCommand {
             filter_shared: true,
             output: OutputFormat::Json,
         };
-        cmd.execute().await.unwrap();
+        cmd.execute(&client).await.unwrap();
     }
 }

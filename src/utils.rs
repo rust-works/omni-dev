@@ -1,8 +1,11 @@
 //! Utility functions and helpers.
 
 pub mod ai_scratch;
+pub mod env;
 pub mod preflight;
 pub mod settings;
+
+pub use env::{EnvSource, SystemEnv};
 
 pub use preflight::{
     check_ai_command_prerequisites, check_ai_credentials, check_git_repository_at,

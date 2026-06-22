@@ -6,6 +6,8 @@ pub(crate) mod query;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use crate::datadog::client::DatadogClient;
+
 /// Queries Datadog metrics.
 #[derive(Parser)]
 pub struct MetricsCommand {
@@ -25,10 +27,10 @@ pub enum MetricsSubcommands {
 
 impl MetricsCommand {
     /// Executes the metrics command.
-    pub async fn execute(self) -> Result<()> {
+    pub async fn execute(self, client: &DatadogClient) -> Result<()> {
         match self.command {
-            MetricsSubcommands::Query(cmd) => cmd.execute().await,
-            MetricsSubcommands::Catalog(cmd) => cmd.execute().await,
+            MetricsSubcommands::Query(cmd) => cmd.execute(client).await,
+            MetricsSubcommands::Catalog(cmd) => cmd.execute(client).await,
         }
     }
 }

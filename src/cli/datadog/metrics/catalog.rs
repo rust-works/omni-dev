@@ -11,6 +11,8 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+use crate::datadog::client::DatadogClient;
+
 /// Inspects the Datadog metric catalog.
 #[derive(Parser)]
 pub struct CatalogCommand {
@@ -28,9 +30,9 @@ pub enum CatalogSubcommands {
 
 impl CatalogCommand {
     /// Executes the catalog command.
-    pub async fn execute(self) -> Result<()> {
+    pub async fn execute(self, client: &DatadogClient) -> Result<()> {
         match self.command {
-            CatalogSubcommands::List(cmd) => cmd.execute().await,
+            CatalogSubcommands::List(cmd) => cmd.execute(client).await,
         }
     }
 }
