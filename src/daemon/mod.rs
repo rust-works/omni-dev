@@ -15,14 +15,27 @@
 //! - `daemon start` launches it in the background (a launchd LaunchAgent on
 //!   macOS); `stop` / `restart` / `status` are thin [`client::DaemonClient`]s.
 
-pub mod client;
-pub mod lifecycle;
+// The control plane is a Unix-domain socket (`UnixListener`/`UnixStream`), so the
+// daemon runtime is Unix-only and gated `#[cfg(unix)]`; running the daemon on
+// Windows is future work (#1041). `paths` stays cross-platform because the
+// request log and the browser thin-client token discovery depend on it.
 pub mod paths;
+
+#[cfg(unix)]
+pub mod client;
+#[cfg(unix)]
+pub mod lifecycle;
+#[cfg(unix)]
 pub mod protocol;
+#[cfg(unix)]
 pub mod registry;
+#[cfg(unix)]
 pub mod server;
+#[cfg(unix)]
 pub mod service;
+#[cfg(unix)]
 pub mod services;
+#[cfg(unix)]
 pub mod single_instance;
 
 #[cfg(target_os = "macos")]
@@ -31,17 +44,27 @@ pub mod launchd;
 #[cfg(all(target_os = "macos", feature = "menu-bar"))]
 pub mod tray;
 
+#[cfg(unix)]
 use std::path::Path;
+#[cfg(unix)]
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::sync::Arc;
 
+#[cfg(unix)]
 use anyhow::Result;
 
+#[cfg(unix)]
 use crate::browser::BridgeConfig;
+#[cfg(unix)]
 use crate::snowflake::SnowflakeEngineConfig;
+#[cfg(unix)]
 use registry::ServiceRegistry;
+#[cfg(unix)]
 use server::DaemonOptions;
+#[cfg(unix)]
 use services::bridge::BridgeService;
+#[cfg(unix)]
 use services::snowflake::SnowflakeService;
 
 /// Everything `daemon run` needs to start the daemon, resolved from the CLI.
@@ -50,6 +73,7 @@ use services::snowflake::SnowflakeService;
 /// (`tray::run`) so both start an identical daemon. The latter is a plain code
 /// span, not an intra-doc link, because the `tray` module is feature- and
 /// target-gated and absent from the docs build.
+#[cfg(unix)]
 #[derive(Debug, Clone)]
 pub struct DaemonRunConfig {
     /// Control-socket path (also the single-instance lock).
@@ -70,6 +94,7 @@ pub struct DaemonRunConfig {
 /// the resolved token is persisted (`0600`) for thin-client discovery. The
 /// Snowflake service is registered cheaply (no eager auth or I/O); its sessions
 /// are authenticated lazily on first query.
+#[cfg(unix)]
 pub async fn build_default_registry(
     bridge_config: BridgeConfig,
     bridge_token_file: Option<&Path>,
@@ -88,6 +113,7 @@ pub async fn build_default_registry(
 /// Builds the registry and serves until a signal or `daemon stop`. The default
 /// `daemon run` path on every platform, and the only path when the `menu-bar`
 /// feature is off.
+#[cfg(unix)]
 pub async fn run_headless(cfg: DaemonRunConfig) -> Result<()> {
     let registry = build_default_registry(
         cfg.bridge_config,
