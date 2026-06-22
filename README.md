@@ -349,6 +349,26 @@ omni-dev log --format json -n 20
 Set `OMNI_DEV_LOG_DISABLE=1` to turn it off, or `OMNI_DEV_LOG_BODIES=1` /
 `OMNI_DEV_LOG_HEADERS=1` to opt into capturing bodies/headers.
 
+### 📈 Coverage Diff
+
+Attribute a per-line coverage report to a git diff and report **patch
+coverage** — the share of added lines that are tested — plus the uncovered new
+lines, per-file deltas, and indirect coverage changes. Reads lcov, llvm-cov
+JSON, or Cobertura XML (auto-detected), renders markdown/YAML/JSON, and can gate
+a branch. It powers the project's PR coverage comment and runs locally too. See
+[docs/coverage.md](docs/coverage.md).
+
+```bash
+# Patch coverage for the working tree against the default merge-base
+omni-dev coverage diff --report head.lcov
+
+# Fail if patch coverage is under 80% (a CI gate or a pre-push check)
+omni-dev coverage diff --report head.lcov --fail-under-patch 80
+
+# Full report with project deltas, as JSON
+omni-dev coverage diff --report head.lcov --baseline-report base.lcov --format json
+```
+
 ### ✏️ Manual Amendment
 
 ```bash
