@@ -901,16 +901,35 @@ mod tests {
         ] {
             let v = run("mediaSingle", attrs.clone());
             assert_eq!(v.len(), 1, "expected one violation for {attrs}");
-            match &v[0] {
-                AdfSchemaViolation::InvalidAttr {
-                    attr_name, problem, ..
-                } => {
-                    assert_eq!(attr_name, "width");
-                    assert!(matches!(problem, AttrProblem::OutOfRangeF { .. }));
-                }
-                other => panic!("expected InvalidAttr, got {other:?}"),
-            }
+            assert!(
+                matches!(
+                    &v[0],
+                    AdfSchemaViolation::InvalidAttr { attr_name, problem, .. }
+                        if attr_name == "width"
+                            && matches!(problem, AttrProblem::OutOfRangeF { .. })
+                ),
+                "expected width OutOfRangeF for {attrs}, got {:?}",
+                v[0]
+            );
         }
+    }
+
+    #[test]
+    fn check_value_cond_num_range_falls_back_to_strict_branch() {
+        // `check_value` has no sibling context, so a `CondNumRange` reaching it
+        // directly (bypassing `resolve_attr_type`) applies the stricter
+        // `when_false` branch: 900 is rejected, 50 accepted.
+        let ty = AttrType::CondNumRange {
+            sibling: "widthType",
+            equals: "pixel",
+            when_true: (0.0, f64::MAX),
+            when_false: (0.0, 100.0),
+        };
+        assert!(matches!(
+            check_value(&ty, &json!(900)),
+            Some(AttrProblem::OutOfRangeF { .. })
+        ));
+        assert!(check_value(&ty, &json!(50)).is_none());
     }
 
     #[test]
