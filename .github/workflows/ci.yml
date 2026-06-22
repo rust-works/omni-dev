@@ -24,7 +24,7 @@ jobs:
           - ""
           - "mcp"
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - uses: dtolnay/rust-toolchain@master
       with:
         toolchain: ${{ matrix.rust }}
@@ -42,7 +42,7 @@ jobs:
     name: MCP Release Build
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - uses: dtolnay/rust-toolchain@stable
     - uses: Swatinem/rust-cache@v2
     - name: Build omni-dev-mcp (release)
@@ -52,7 +52,7 @@ jobs:
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - uses: dtolnay/rust-toolchain@stable
       with:
         components: rustfmt
@@ -68,7 +68,7 @@ jobs:
           - ""
           - "mcp"
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - uses: dtolnay/rust-toolchain@stable
       with:
         components: clippy
@@ -85,7 +85,7 @@ jobs:
     name: Docs
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - uses: dtolnay/rust-toolchain@stable
     - uses: Swatinem/rust-cache@v2
     - name: Build docs
@@ -98,7 +98,7 @@ jobs:
       contents: read
       pull-requests: write        # required to post the coverage comment
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
       with:
         fetch-depth: 0          # full history so `git merge-base` can resolve the PR's fork point
     # The coverage pipeline — cargo-llvm-cov run, merge-base baseline (download
@@ -117,7 +117,7 @@ jobs:
     name: Security Audit
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Install cargo-audit
       run: cargo install cargo-audit --locked
     - name: Run cargo-audit
@@ -127,7 +127,7 @@ jobs:
     name: Dependency Policy
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - uses: EmbarkStudios/cargo-deny-action@v2.0.20
       with:
         command: check all
@@ -136,7 +136,7 @@ jobs:
     name: Secret Scanning
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
       with:
         fetch-depth: 0
     - name: TruffleHog scan
