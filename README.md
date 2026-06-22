@@ -277,6 +277,98 @@ Supports binary and streaming response bodies, multi-tab routing via
 `X-Omni-Bridge-Target`, per-request `--credentials` and `--allow-origin`
 overrides, and a transparent proxy for tools that speak plain HTTP.
 
+### 🛰️ Daemon
+
+Host long-lived services in one supervised process behind a private per-user
+Unix-domain control socket. The browser bridge is the first service migrated
+onto it (Snowflake is the second), and on macOS an optional menu-bar app gives
+live control. `daemon start` installs a launchd LaunchAgent for auto-start at
+login, and `status` reports every hosted service. See
+[Running under the daemon](docs/browser-bridge.md#running-under-the-daemon) and
+[ADR-0039](docs/adrs/adr-0039.md) for the architecture.
+
+```bash
+# Start the background daemon (installs a launchd LaunchAgent on macOS)
+omni-dev daemon start
+
+# Per-service status (add --json for machines)
+omni-dev daemon status
+
+# Restart or stop it
+omni-dev daemon restart
+omni-dev daemon stop
+```
+
+The daemon is Unix-only — its control plane is a Unix-domain socket — while the
+rest of omni-dev runs everywhere.
+
+### ❄️ Snowflake
+
+Authenticate a Snowflake session once via external-browser SSO, then run
+concurrent arbitrary SQL across any account **without an SSO popup on every
+query**. The daemon holds the session in memory and multiplexes a bounded pool,
+so each query can still set its own warehouse/role/database/schema. See
+[docs/snowflake-service.md](docs/snowflake-service.md).
+
+```bash
+# Run SQL (from an argument or stdin); the first query opens the SSO browser
+omni-dev snowflake query "select current_version()"
+
+# Per-query context overrides and JSON output
+omni-dev snowflake query "select * from t limit 10" \
+  --warehouse WH --role ANALYST --database DB --schema PUBLIC --format json
+
+# Inspect or evict live sessions
+omni-dev snowflake sessions
+omni-dev snowflake disconnect --account <ACCOUNT> --user <USER>
+```
+
+Account/user/context default from `SNOWFLAKE_*` env vars then
+`~/.omni-dev/settings.json` — no accounts are hardcoded. Runs on the daemon, so
+it is Unix-only.
+
+### 📓 Request Log
+
+Every invocation and the HTTP requests it issues are recorded to a local,
+append-only log you can search and tail. Best-effort and default-on; **no
+secret is ever written** (auth headers are redacted, bodies opt-in). See
+[docs/log.md](docs/log.md).
+
+```bash
+# Recent activity (one line each)
+omni-dev log
+
+# Filter by service and status class, or a query expression; follow live
+omni-dev log --service jira --status 5xx
+omni-dev log --query 'method:POST AND status:4xx' --follow
+
+# Full records as JSON (byte-identical to the on-disk lines)
+omni-dev log --format json -n 20
+```
+
+Set `OMNI_DEV_LOG_DISABLE=1` to turn it off, or `OMNI_DEV_LOG_BODIES=1` /
+`OMNI_DEV_LOG_HEADERS=1` to opt into capturing bodies/headers.
+
+### 📈 Coverage Diff
+
+Attribute a per-line coverage report to a git diff and report **patch
+coverage** — the share of added lines that are tested — plus the uncovered new
+lines, per-file deltas, and indirect coverage changes. Reads lcov, llvm-cov
+JSON, or Cobertura XML (auto-detected), renders markdown/YAML/JSON, and can gate
+a branch. It powers the project's PR coverage comment and runs locally too. See
+[docs/coverage.md](docs/coverage.md).
+
+```bash
+# Patch coverage for the working tree against the default merge-base
+omni-dev coverage diff --report head.lcov
+
+# Fail if patch coverage is under 80% (a CI gate or a pre-push check)
+omni-dev coverage diff --report head.lcov --fail-under-patch 80
+
+# Full report with project deltas, as JSON
+omni-dev coverage diff --report head.lcov --baseline-report base.lcov --format json
+```
+
 ### ✏️ Manual Amendment
 
 ```bash

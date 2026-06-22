@@ -31,6 +31,23 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 - **[Recipe: querying your own Facebook data](recipes/browser-bridge-facebook.md)** - Page your own Facebook timeline via internal Relay/GraphQL; the worked example for the `--allow-origin` + `--credentials omit` cross-origin flags
 - **[ADR-0036](adrs/adr-0036.md)** - Confused-deputy trust boundary and dual-plane default-closed authentication
 
+### Daemon
+
+- **[Running under the daemon](browser-bridge.md#running-under-the-daemon)** - Host long-lived services (the browser bridge, Snowflake) in one supervised process behind a per-user Unix-domain control socket; `daemon run/start/stop/restart/status` and the optional macOS menu-bar app
+- **[ADR-0039](adrs/adr-0039.md)** - Daemon architecture: service abstraction, Unix-socket control plane, single-instance supervision, and lifecycle
+
+### Snowflake Integration
+
+- **[Snowflake Service](snowflake-service.md)** - Authenticate once via external-browser SSO, then run concurrent SQL across any account through the daemon's multiplexed session pool; `omni-dev snowflake query/sessions/disconnect`
+
+### Request Log
+
+- **[Request Log](log.md)** - The local, append-only invocation + HTTP log and the `omni-dev log` reader (filter matrix, query mini-language, `--follow`); central header redaction and the `OMNI_DEV_LOG_*` opt-ins/opt-out
+
+### Coverage
+
+- **[Coverage Diff](coverage.md)** - `omni-dev coverage diff`: patch coverage, uncovered new lines, per-file deltas, and indirect changes from lcov / llvm-cov-json / Cobertura reports; output formats, the `--fail-under-patch` gate, and the PR-comment renderer
+
 ### MCP Server
 
 - **[MCP Reference](mcp.md)** - Tool catalog, resources, and setup for Claude Desktop / Claude Code / MCP Inspector

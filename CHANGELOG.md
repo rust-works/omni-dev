@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+- **Surface the daemon, request log, and Snowflake in the README and docs index** ([#1043](https://github.com/rust-works/omni-dev/issues/1043)): these v0.30.0 features shipped with substantive reference docs (`docs/log.md`, `docs/snowflake-service.md`, and the daemon coverage in `docs/browser-bridge.md` / [ADR-0039](docs/adrs/adr-0039.md)) but weren't discoverable — the top-level README never mentioned them and the docs index left `log.md` and `snowflake-service.md` unlinked. Adds README feature sections for the **Daemon**, **Snowflake**, and the **Request log** (`omni-dev log`), and docs-index subsections linking those guides plus a daemon pointer.
+- **Document `coverage diff`** ([#1045](https://github.com/rust-works/omni-dev/issues/1045)): the `omni-dev coverage diff` command (added in v0.29.0) had no user documentation at all. Adds a [docs/coverage.md](docs/coverage.md) reference (what it computes, the accepted report formats, output formats, the `--fail-under-patch` gate, diff scoping, and the full flag table), a README feature section, and a docs-index entry.
+
 ## [0.30.0] - 2026-06-22
 
 ### Added
