@@ -42,9 +42,16 @@ pub struct QueryCommand {
 impl QueryCommand {
     /// Executes the query against a freshly-created Datadog client.
     pub async fn execute(self) -> Result<()> {
-        let (from_ts, to_ts) = parse_time_range(&self.from, self.to.as_deref())?;
         let (client, _site) = create_client()?;
-        run_query(&client, &self.query, from_ts, to_ts, &self.output).await
+        self.execute_with(&client).await
+    }
+
+    /// Runs the command against an injected client — the value-in seam used by
+    /// tests (wiremock) so the execute-level glue is covered without touching
+    /// credentials or the environment (issue #1030).
+    async fn execute_with(self, client: &DatadogClient) -> Result<()> {
+        let (from_ts, to_ts) = parse_time_range(&self.from, self.to.as_deref())?;
+        run_query(client, &self.query, from_ts, to_ts, &self.output).await
     }
 }
 
@@ -555,43 +562,30 @@ mod tests {
         assert!(err.to_string().contains("403"));
     }
 
-    // ── QueryCommand::execute error paths ──────────────────────────
+    // ── QueryCommand::execute_with glue ────────────────────────────
+    //
+    // Tests inject a wiremock-backed client into `execute_with`, covering the
+    // execute-level time-range parsing and query glue without touching
+    // credentials or the environment. (Credential resolution itself is covered
+    // by the `load_credentials_with` / `create_client_from` tests.)
 
     #[tokio::test]
-    async fn query_command_execute_rejects_invalid_time_range() {
+    async fn execute_with_rejects_invalid_time_range() {
+        // `parse_time_range` fails before any HTTP call, so the client's URL
+        // is never contacted.
+        let client = DatadogClient::new("http://127.0.0.1:1", "api", "app").unwrap();
         let cmd = QueryCommand {
             query: "m".into(),
             from: "garbage".into(),
             to: None,
             output: OutputFormat::Table,
         };
-        let err = cmd.execute().await.unwrap_err();
+        let err = cmd.execute_with(&client).await.unwrap_err();
         assert!(err.to_string().contains("Invalid time range"));
     }
 
     #[tokio::test]
-    async fn query_command_execute_errors_when_credentials_missing() {
-        use crate::datadog::test_support::{with_empty_home, EnvGuard};
-        let guard = EnvGuard::take();
-        let _dir = with_empty_home(&guard);
-
-        let cmd = QueryCommand {
-            query: "m".into(),
-            from: "1h".into(),
-            to: Some("now".into()),
-            output: OutputFormat::Table,
-        };
-        let err = cmd.execute().await.unwrap_err();
-        assert!(err.to_string().contains("not configured"));
-    }
-
-    #[tokio::test]
-    async fn query_command_execute_end_to_end_via_api_url_override() {
-        use std::fs;
-
-        use crate::datadog::auth::{DATADOG_API_KEY, DATADOG_API_URL, DATADOG_APP_KEY};
-        use crate::datadog::test_support::{with_empty_home, EnvGuard};
-
+    async fn execute_with_end_to_end() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/api/v1/query"))
@@ -604,27 +598,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let guard = EnvGuard::take();
-        let dir = with_empty_home(&guard);
-        let omni_dir = dir.path().join(".omni-dev");
-        fs::create_dir_all(&omni_dir).unwrap();
-        fs::write(
-            omni_dir.join("settings.json"),
-            r#"{"env":{"DATADOG_API_KEY":"api","DATADOG_APP_KEY":"app","DATADOG_SITE":"datadoghq.com"}}"#,
-        )
-        .unwrap();
-        // Need the env vars too so load_credentials sees them regardless of
-        // whether the settings loader decides to consult the environment.
-        std::env::set_var(DATADOG_API_KEY, "api");
-        std::env::set_var(DATADOG_APP_KEY, "app");
-        std::env::set_var(DATADOG_API_URL, server.uri());
-
+        let client = DatadogClient::new(&server.uri(), "api", "app").unwrap();
         let cmd = QueryCommand {
             query: "avg:system.cpu.user{*}".into(),
             from: "2023-11-14T22:00:00Z".into(),
             to: Some("2023-11-14T23:00:00Z".into()),
             output: OutputFormat::Json,
         };
-        cmd.execute().await.unwrap();
+        cmd.execute_with(&client).await.unwrap();
     }
 }

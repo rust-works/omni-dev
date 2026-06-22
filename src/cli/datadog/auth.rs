@@ -60,6 +60,22 @@ impl LoginCommand {
 /// site-normalisation branches are reachable from tests without mocking
 /// stdin.
 fn run_login(api_key: &str, app_key: &str, site_raw: &str) -> Result<()> {
+    run_login_to(
+        &crate::utils::settings::Settings::get_settings_path()?,
+        api_key,
+        app_key,
+        site_raw,
+    )
+}
+
+/// [`run_login`], persisting to an explicit settings-file path so tests inject
+/// a tempdir instead of redirecting `HOME` (issue #1030).
+fn run_login_to(
+    settings_path: &std::path::Path,
+    api_key: &str,
+    app_key: &str,
+    site_raw: &str,
+) -> Result<()> {
     if api_key.is_empty() {
         anyhow::bail!("API key is required");
     }
@@ -78,7 +94,7 @@ fn run_login(api_key: &str, app_key: &str, site_raw: &str) -> Result<()> {
         site: site.clone(),
     };
 
-    auth::save_credentials(&credentials)?;
+    auth::save_credentials_to(settings_path, &credentials)?;
     println!("\nCredentials saved to ~/.omni-dev/settings.json");
     println!("  Site: {site}");
     println!("\nRun `omni-dev datadog auth status` to verify.");
@@ -93,14 +109,20 @@ pub struct LogoutCommand;
 impl LogoutCommand {
     /// Removes Datadog credential keys from settings.json.
     pub fn execute(self) -> Result<()> {
-        let removed = auth::remove_credentials()?;
-        if removed {
-            println!("Datadog credentials removed from ~/.omni-dev/settings.json");
-        } else {
-            println!("No Datadog credentials were configured.");
-        }
-        Ok(())
+        run_logout(&crate::utils::settings::Settings::get_settings_path()?)
     }
+}
+
+/// Removes Datadog credential keys from an explicit settings-file path so
+/// tests inject a tempdir instead of redirecting `HOME` (issue #1030).
+fn run_logout(settings_path: &std::path::Path) -> Result<()> {
+    let removed = auth::remove_credentials_at(settings_path)?;
+    if removed {
+        println!("Datadog credentials removed from ~/.omni-dev/settings.json");
+    } else {
+        println!("No Datadog credentials were configured.");
+    }
+    Ok(())
 }
 
 /// Shows the current authentication status.
@@ -170,8 +192,15 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::datadog::auth::{DATADOG_API_KEY, DATADOG_API_URL, DATADOG_APP_KEY, DATADOG_SITE};
-    use crate::datadog::test_support::{with_empty_home, EnvGuard};
+    use crate::datadog::auth::{DATADOG_API_KEY, DATADOG_APP_KEY, DATADOG_SITE};
+
+    /// Builds a settings-file path inside a fresh project-local tempdir.
+    fn temp_settings() -> (tempfile::TempDir, std::path::PathBuf) {
+        std::fs::create_dir_all("tmp").ok();
+        let dir = tempfile::TempDir::new_in("tmp").unwrap();
+        let path = dir.path().join(".omni-dev").join("settings.json");
+        (dir, path)
+    }
 
     #[test]
     fn auth_command_login_dispatch() {
@@ -219,13 +248,11 @@ mod tests {
 
     #[test]
     fn run_login_defaults_site_when_blank_and_persists() {
-        let guard = EnvGuard::take();
-        let dir = with_empty_home(&guard);
+        let (_dir, settings_path) = temp_settings();
 
-        run_login("api-1", "app-1", "").unwrap();
+        run_login_to(&settings_path, "api-1", "app-1", "").unwrap();
 
-        let content =
-            fs::read_to_string(dir.path().join(".omni-dev").join("settings.json")).unwrap();
+        let content = fs::read_to_string(&settings_path).unwrap();
         let val: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(val["env"]["DATADOG_API_KEY"], "api-1");
         assert_eq!(val["env"]["DATADOG_APP_KEY"], "app-1");
@@ -234,27 +261,29 @@ mod tests {
 
     #[test]
     fn run_login_normalises_provided_site() {
-        let guard = EnvGuard::take();
-        let dir = with_empty_home(&guard);
+        let (_dir, settings_path) = temp_settings();
 
-        run_login("api", "app", "https://api.us5.datadoghq.com/").unwrap();
+        run_login_to(
+            &settings_path,
+            "api",
+            "app",
+            "https://api.us5.datadoghq.com/",
+        )
+        .unwrap();
 
-        let content =
-            fs::read_to_string(dir.path().join(".omni-dev").join("settings.json")).unwrap();
+        let content = fs::read_to_string(&settings_path).unwrap();
         let val: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(val["env"]["DATADOG_SITE"], "us5.datadoghq.com");
     }
 
-    // ── LogoutCommand::execute ────────────────────────────────────
+    // ── run_logout ────────────────────────────────────────────────
 
     #[test]
-    fn logout_command_removes_credentials_when_present() {
-        let guard = EnvGuard::take();
-        let dir = with_empty_home(&guard);
-        let omni_dir = dir.path().join(".omni-dev");
-        fs::create_dir_all(&omni_dir).unwrap();
+    fn run_logout_removes_credentials_when_present() {
+        let (dir, settings_path) = temp_settings();
+        fs::create_dir_all(dir.path().join(".omni-dev")).unwrap();
         fs::write(
-            omni_dir.join("settings.json"),
+            &settings_path,
             r#"{"env": {
                 "DATADOG_API_KEY": "a",
                 "DATADOG_APP_KEY": "b",
@@ -264,11 +293,10 @@ mod tests {
         )
         .unwrap();
 
-        LogoutCommand.execute().unwrap();
+        run_logout(&settings_path).unwrap();
 
         let val: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(omni_dir.join("settings.json")).unwrap())
-                .unwrap();
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
         assert!(val["env"].get(DATADOG_API_KEY).is_none());
         assert!(val["env"].get(DATADOG_APP_KEY).is_none());
         assert!(val["env"].get(DATADOG_SITE).is_none());
@@ -276,22 +304,9 @@ mod tests {
     }
 
     #[test]
-    fn logout_command_is_idempotent_when_no_credentials() {
-        let guard = EnvGuard::take();
-        let _dir = with_empty_home(&guard);
-        LogoutCommand.execute().unwrap();
-    }
-
-    // ── AuthCommand::execute dispatch ─────────────────────────────
-
-    #[tokio::test]
-    async fn auth_command_dispatches_logout() {
-        let guard = EnvGuard::take();
-        let _dir = with_empty_home(&guard);
-        let cmd = AuthCommand {
-            command: AuthSubcommands::Logout(LogoutCommand),
-        };
-        cmd.execute().await.unwrap();
+    fn run_logout_is_idempotent_when_no_credentials() {
+        let (_dir, settings_path) = temp_settings();
+        run_logout(&settings_path).unwrap();
     }
 
     #[tokio::test]
@@ -345,66 +360,10 @@ mod tests {
         assert!(msg.contains("Forbidden"));
     }
 
-    // ── StatusCommand::execute end-to-end via DATADOG_API_URL ─────
-
-    fn write_settings(dir: &std::path::Path, site: &str) {
-        let omni_dir = dir.join(".omni-dev");
-        fs::create_dir_all(&omni_dir).unwrap();
-        let json = format!(
-            r#"{{"env":{{"DATADOG_API_KEY":"api","DATADOG_APP_KEY":"app","DATADOG_SITE":"{site}"}}}}"#
-        );
-        fs::write(omni_dir.join("settings.json"), json).unwrap();
-    }
-
-    #[tokio::test]
-    async fn status_command_execute_success_via_api_url_override() {
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/api/v1/validate"))
-            .and(wiremock::matchers::header("DD-API-KEY", "api"))
-            .and(wiremock::matchers::header("DD-APPLICATION-KEY", "app"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"valid": true})),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let guard = EnvGuard::take();
-        let dir = with_empty_home(&guard);
-        write_settings(dir.path(), "datadoghq.com");
-        std::env::set_var(DATADOG_API_URL, server.uri());
-
-        StatusCommand.execute().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn status_command_execute_propagates_api_errors() {
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/api/v1/validate"))
-            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
-            .mount(&server)
-            .await;
-
-        let guard = EnvGuard::take();
-        let dir = with_empty_home(&guard);
-        write_settings(dir.path(), "datadoghq.com");
-        std::env::set_var(DATADOG_API_URL, server.uri());
-
-        let err = StatusCommand.execute().await.unwrap_err();
-        assert!(err.to_string().contains("403"));
-    }
-
-    #[tokio::test]
-    async fn status_command_execute_errors_when_credentials_missing() {
-        let guard = EnvGuard::take();
-        let _dir = with_empty_home(&guard);
-
-        let err = StatusCommand.execute().await.unwrap_err();
-        assert!(err.to_string().contains("not configured"));
-    }
+    // StatusCommand::execute is trivial glue (create_client + run_auth_status);
+    // the validate success/error paths are covered by the run_auth_status
+    // wiremock tests above, and credential resolution by load_credentials_with /
+    // create_client_from. No env-mutating execute-level test is needed (#1030).
 
     #[tokio::test]
     async fn run_auth_status_surfaces_rate_limit_on_exhausted_retries() {
