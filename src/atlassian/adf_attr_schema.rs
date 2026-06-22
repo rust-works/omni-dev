@@ -901,16 +901,12 @@ mod tests {
         ] {
             let v = run("mediaSingle", attrs.clone());
             assert_eq!(v.len(), 1, "expected one violation for {attrs}");
-            assert!(
-                matches!(
-                    &v[0],
-                    AdfSchemaViolation::InvalidAttr { attr_name, problem, .. }
-                        if attr_name == "width"
-                            && matches!(problem, AttrProblem::OutOfRangeF { .. })
-                ),
-                "expected width OutOfRangeF for {attrs}, got {:?}",
-                v[0]
-            );
+            assert!(matches!(
+                &v[0],
+                AdfSchemaViolation::InvalidAttr { attr_name, problem, .. }
+                    if attr_name == "width"
+                        && matches!(problem, AttrProblem::OutOfRangeF { .. })
+            ));
         }
     }
 
