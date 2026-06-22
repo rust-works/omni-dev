@@ -48,6 +48,19 @@ jobs:
     - name: Build omni-dev-mcp (release)
       run: cargo build --release --features mcp --bin omni-dev-mcp
 
+  windows-build:
+    name: Windows Build
+    runs-on: windows-latest
+    # Mirrors the release.yml win-msvc binary build so platform-portability
+    # regressions (e.g. the Unix-only daemon, #1041) are caught on every PR
+    # rather than only when a release tag is pushed.
+    steps:
+    - uses: actions/checkout@v7
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+    - name: Build binaries (release, mcp)
+      run: cargo build --release --features mcp --bin omni-dev --bin omni-dev-mcp
+
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
