@@ -4,13 +4,14 @@
 //! `DD-APPLICATION-KEY` headers on every request and retries 429 responses
 //! with `Retry-After` / `X-RateLimit-Reset` awareness.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use reqwest::Client;
 
 use crate::datadog::auth::{base_url_for_site, DatadogCredentials};
 use crate::datadog::error::DatadogError;
+use crate::request_log;
 
 /// HTTP request timeout for Datadog API calls.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -70,18 +71,47 @@ impl DatadogClient {
         &self.base_url
     }
 
+    /// Appends a best-effort HTTP record for one Datadog request attempt.
+    fn log_request(
+        method: &str,
+        url: &str,
+        started: Instant,
+        result: &reqwest::Result<reqwest::Response>,
+    ) {
+        match result {
+            Ok(r) => request_log::record_http(
+                "datadog",
+                method,
+                url,
+                started,
+                Some(r.status().as_u16()),
+                None,
+            ),
+            Err(e) => request_log::record_http(
+                "datadog",
+                method,
+                url,
+                started,
+                None,
+                Some(&e.to_string()),
+            ),
+        }
+    }
+
     /// Sends an authenticated GET request and returns the raw response.
     pub async fn get_json(&self, url: &str) -> Result<reqwest::Response> {
         for attempt in 0..=MAX_RETRIES {
-            let response = self
+            let started = Instant::now();
+            let result = self
                 .client
                 .get(url)
                 .header("DD-API-KEY", &self.api_key)
                 .header("DD-APPLICATION-KEY", &self.app_key)
                 .header("Accept", "application/json")
                 .send()
-                .await
-                .context("Failed to send GET request to Datadog API")?;
+                .await;
+            Self::log_request("GET", url, started, &result);
+            let response = result.context("Failed to send GET request to Datadog API")?;
 
             if response.status().as_u16() != 429 || attempt == MAX_RETRIES {
                 return Ok(response);
@@ -98,7 +128,8 @@ impl DatadogClient {
         body: &T,
     ) -> Result<reqwest::Response> {
         for attempt in 0..=MAX_RETRIES {
-            let response = self
+            let started = Instant::now();
+            let result = self
                 .client
                 .post(url)
                 .header("DD-API-KEY", &self.api_key)
@@ -107,8 +138,9 @@ impl DatadogClient {
                 .header("Accept", "application/json")
                 .json(body)
                 .send()
-                .await
-                .context("Failed to send POST request to Datadog API")?;
+                .await;
+            Self::log_request("POST", url, started, &result);
+            let response = result.context("Failed to send POST request to Datadog API")?;
 
             if response.status().as_u16() != 429 || attempt == MAX_RETRIES {
                 return Ok(response);

@@ -22,7 +22,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
@@ -32,6 +32,7 @@ use tracing::{debug, info, warn};
 
 use super::{AiClient, AiClientCapabilities, AiClientMetadata, RequestOptions};
 use crate::claude::error::ClaudeError;
+use crate::request_log;
 
 /// Default subprocess timeout.
 pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
@@ -341,11 +342,40 @@ impl ClaudeCliAiClient {
 
     /// Variant of [`Self::run`] that materialises any options on the request.
     ///
+    /// Times the whole subprocess run and appends one `service = claude-cli`
+    /// record (a non-HTTP entry: the subprocess makes its own API calls) so the
+    /// `claude-cli` backend appears in the request log alongside the HTTP ones.
+    async fn run_with_options(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+        options: &RequestOptions,
+    ) -> Result<String> {
+        let started = Instant::now();
+        let result = self
+            .run_with_options_inner(system_prompt, user_prompt, options)
+            .await;
+        let error = result.as_ref().err().map(|e| format!("{e:#}"));
+        request_log::record_http_with(
+            "claude-cli",
+            "EXEC",
+            &self.model,
+            started,
+            None,
+            error.as_deref(),
+            request_log::HttpExtra::default(),
+        );
+        result
+    }
+
+    /// Inner implementation of [`Self::run_with_options`] (the actual subprocess
+    /// drive); the public method wraps this to time and record the run.
+    ///
     /// When `options.response_schema` is `Some`, the schema is serialised
     /// to a JSON string and passed inline via `--json-schema <json>`.
     /// `claude -p` requires the schema on argv; passing a file path makes
     /// the subprocess exit silently with empty output.
-    async fn run_with_options(
+    async fn run_with_options_inner(
         &self,
         system_prompt: &str,
         user_prompt: &str,

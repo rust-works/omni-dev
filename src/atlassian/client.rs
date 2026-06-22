@@ -4,7 +4,7 @@
 //! writing issues. Uses Basic Auth (email + API token).
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -15,6 +15,7 @@ use crate::atlassian::adf::AdfDocument;
 use crate::atlassian::adf_validated::ValidatedAdfDocument;
 use crate::atlassian::convert::adf_to_markdown;
 use crate::atlassian::error::AtlassianError;
+use crate::request_log;
 
 /// HTTP request timeout for Atlassian API calls.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -6767,20 +6768,51 @@ impl AtlassianClient {
         &self.instance_url
     }
 
+    /// Appends a best-effort HTTP record for one request attempt. The service
+    /// tag is `confluence` for `/wiki/` paths, else `jira`.
+    fn log_request(
+        &self,
+        method: &str,
+        url: &str,
+        started: Instant,
+        result: &reqwest::Result<reqwest::Response>,
+    ) {
+        let service = if url.contains("/wiki/") {
+            "confluence"
+        } else {
+            "jira"
+        };
+        match result {
+            Ok(r) => request_log::record_http(
+                service,
+                method,
+                url,
+                started,
+                Some(r.status().as_u16()),
+                None,
+            ),
+            Err(e) => {
+                request_log::record_http(service, method, url, started, None, Some(&e.to_string()));
+            }
+        }
+    }
+
     /// Sends an authenticated GET request and returns the raw response.
     ///
     /// Shared transport method used by both JIRA and Confluence API
     /// implementations.
     pub async fn get_json(&self, url: &str) -> Result<reqwest::Response> {
         for attempt in 0..=MAX_RETRIES {
-            let response = self
+            let started = Instant::now();
+            let result = self
                 .client
                 .get(url)
                 .header("Authorization", &self.auth_header)
                 .header("Accept", "application/json")
                 .send()
-                .await
-                .context("Failed to send GET request to Atlassian API")?;
+                .await;
+            self.log_request("GET", url, started, &result);
+            let response = result.context("Failed to send GET request to Atlassian API")?;
 
             if response.status().as_u16() != 429 || attempt == MAX_RETRIES {
                 return Ok(response);
@@ -6800,15 +6832,17 @@ impl AtlassianClient {
         body: &T,
     ) -> Result<reqwest::Response> {
         for attempt in 0..=MAX_RETRIES {
-            let response = self
+            let started = Instant::now();
+            let result = self
                 .client
                 .put(url)
                 .header("Authorization", &self.auth_header)
                 .header("Content-Type", "application/json")
                 .json(body)
                 .send()
-                .await
-                .context("Failed to send PUT request to Atlassian API")?;
+                .await;
+            self.log_request("PUT", url, started, &result);
+            let response = result.context("Failed to send PUT request to Atlassian API")?;
 
             if response.status().as_u16() != 429 || attempt == MAX_RETRIES {
                 return Ok(response);
@@ -6825,15 +6859,17 @@ impl AtlassianClient {
         body: &T,
     ) -> Result<reqwest::Response> {
         for attempt in 0..=MAX_RETRIES {
-            let response = self
+            let started = Instant::now();
+            let result = self
                 .client
                 .post(url)
                 .header("Authorization", &self.auth_header)
                 .header("Content-Type", "application/json")
                 .json(body)
                 .send()
-                .await
-                .context("Failed to send POST request to Atlassian API")?;
+                .await;
+            self.log_request("POST", url, started, &result);
+            let response = result.context("Failed to send POST request to Atlassian API")?;
 
             if response.status().as_u16() != 429 || attempt == MAX_RETRIES {
                 return Ok(response);
@@ -6863,13 +6899,15 @@ impl AtlassianClient {
     /// Sends an authenticated DELETE request and returns the raw response.
     pub async fn delete(&self, url: &str) -> Result<reqwest::Response> {
         for attempt in 0..=MAX_RETRIES {
-            let response = self
+            let started = Instant::now();
+            let result = self
                 .client
                 .delete(url)
                 .header("Authorization", &self.auth_header)
                 .send()
-                .await
-                .context("Failed to send DELETE request to Atlassian API")?;
+                .await;
+            self.log_request("DELETE", url, started, &result);
+            let response = result.context("Failed to send DELETE request to Atlassian API")?;
 
             if response.status().as_u16() != 429 || attempt == MAX_RETRIES {
                 return Ok(response);
@@ -6897,22 +6935,25 @@ impl AtlassianClient {
         for (name, value) in extra_headers {
             req = req.header(*name, *value);
         }
-        req.send()
-            .await
-            .context("Failed to send multipart POST request to Atlassian API")
+        let started = Instant::now();
+        let result = req.send().await;
+        self.log_request("POST", url, started, &result);
+        result.context("Failed to send multipart POST request to Atlassian API")
     }
 
     /// Internal: GET with custom Accept header and 429 retry.
     async fn get_json_raw_accept(&self, url: &str, accept: &str) -> Result<reqwest::Response> {
         for attempt in 0..=MAX_RETRIES {
-            let response = self
+            let started = Instant::now();
+            let result = self
                 .client
                 .get(url)
                 .header("Authorization", &self.auth_header)
                 .header("Accept", accept)
                 .send()
-                .await
-                .context("Failed to send GET request to Atlassian API")?;
+                .await;
+            self.log_request("GET", url, started, &result);
+            let response = result.context("Failed to send GET request to Atlassian API")?;
 
             if response.status().as_u16() != 429 || attempt == MAX_RETRIES {
                 return Ok(response);
