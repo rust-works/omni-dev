@@ -53,7 +53,8 @@ pub fn check_ai_credentials(model_override: Option<&str>) -> Result<AiCredential
     check_ai_credentials_with(&crate::utils::settings::SettingsEnv::load(), model_override)
 }
 
-/// [`check_ai_credentials`] over an injected [`EnvSource`].
+/// [`check_ai_credentials`] over an injected
+/// [`EnvSource`](crate::utils::env::EnvSource).
 ///
 /// The production wrapper passes `&SettingsEnv::load()` (process env with a
 /// settings.json fallback); tests pass a pure `MapEnv`, so this env-parsing

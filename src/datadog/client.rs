@@ -61,7 +61,8 @@ impl DatadogClient {
         Self::from_credentials_with(&crate::utils::env::SystemEnv, creds)
     }
 
-    /// [`from_credentials`] over an injected [`EnvSource`](crate::utils::env::EnvSource).
+    /// [`from_credentials`](Self::from_credentials) over an injected
+    /// [`EnvSource`](crate::utils::env::EnvSource).
     ///
     /// Tests pass a pure `MapEnv` to exercise the `DATADOG_API_URL` override
     /// without mutating the process environment (issue #1030).

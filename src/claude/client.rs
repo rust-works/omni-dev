@@ -1755,7 +1755,8 @@ pub async fn create_default_claude_client(
     .await
 }
 
-/// [`create_default_claude_client`] over an injected [`EnvSource`].
+/// [`create_default_claude_client`] over an injected
+/// [`EnvSource`](crate::utils::env::EnvSource).
 ///
 /// This is the backend-dispatch boundary — it reads `OMNI_DEV_AI_BACKEND`,
 /// the `USE_*` flags, model vars and API keys. The production wrapper passes
