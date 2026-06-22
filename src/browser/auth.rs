@@ -16,6 +16,8 @@ use anyhow::{bail, Context, Result};
 use base64::Engine;
 use rand::Rng;
 
+use crate::utils::env::{EnvSource, SystemEnv};
+
 /// Environment variable an operator may use to pin the session token instead of
 /// letting the bridge generate one. Never read from argv (`ps`/`/proc` expose
 /// it).
@@ -54,10 +56,19 @@ pub fn generate_token() -> String {
 ///
 /// The token is **never** accepted from argv.
 pub fn resolve_token(token_file: Option<&Path>) -> Result<String> {
+    resolve_token_with(&SystemEnv, token_file)
+}
+
+/// [`resolve_token`] over an injected [`EnvSource`], so the `OMNI_BRIDGE_TOKEN`
+/// branch is tested without mutating the process environment (issue #1030).
+pub(crate) fn resolve_token_with(
+    env: &impl EnvSource,
+    token_file: Option<&Path>,
+) -> Result<String> {
     if let Some(path) = token_file {
         return read_token_file(path);
     }
-    if let Ok(value) = std::env::var(TOKEN_ENV) {
+    if let Some(value) = env.var(TOKEN_ENV) {
         let trimmed = value.trim();
         if !trimmed.is_empty() {
             return Ok(trimmed.to_string());
@@ -72,11 +83,20 @@ pub fn resolve_token(token_file: Option<&Path>) -> Result<String> {
 /// Unlike [`resolve_token`], it never generates one — a client must use the
 /// token the running bridge printed.
 pub fn resolve_existing_token(token_file: Option<&Path>) -> Result<String> {
+    resolve_existing_token_with(&SystemEnv, token_file)
+}
+
+/// [`resolve_existing_token`] over an injected [`EnvSource`]; never generates a
+/// token. Tests pass a `MapEnv` rather than mutating the process environment.
+pub(crate) fn resolve_existing_token_with(
+    env: &impl EnvSource,
+    token_file: Option<&Path>,
+) -> Result<String> {
     if let Some(path) = token_file {
         return read_token_file(path);
     }
-    match std::env::var(TOKEN_ENV) {
-        Ok(value) if !value.trim().is_empty() => Ok(value.trim().to_string()),
+    match env.var(TOKEN_ENV) {
+        Some(value) if !value.trim().is_empty() => Ok(value.trim().to_string()),
         _ => bail!(
             "No session token found. Set {TOKEN_ENV} or pass --token-file with the token the \
              running bridge printed."
@@ -453,74 +473,47 @@ mod tests {
 
     // ── token resolution from env / file ─────────────────────────────
     //
-    // `OMNI_BRIDGE_TOKEN` is process-global, so these tests serialise on a
-    // shared lock and snapshot/restore the variable around each case.
+    // `OMNI_BRIDGE_TOKEN` is read through an injected `EnvSource`, so these
+    // tests pass a pure `MapEnv` and never touch the process environment —
+    // no lock, fully parallel (issue #1030).
 
-    static TOKEN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Holds the env lock and restores `OMNI_BRIDGE_TOKEN` on drop.
-    struct TokenEnvGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        saved: Option<String>,
-    }
-
-    impl TokenEnvGuard {
-        fn new() -> Self {
-            let lock = TOKEN_ENV_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let saved = std::env::var(TOKEN_ENV).ok();
-            std::env::remove_var(TOKEN_ENV);
-            Self { _lock: lock, saved }
-        }
-    }
-
-    impl Drop for TokenEnvGuard {
-        fn drop(&mut self) {
-            match &self.saved {
-                Some(v) => std::env::set_var(TOKEN_ENV, v),
-                None => std::env::remove_var(TOKEN_ENV),
-            }
-        }
-    }
+    use crate::test_support::env::MapEnv;
 
     #[test]
     fn resolve_token_reads_trimmed_env_var() {
-        let _g = TokenEnvGuard::new();
-        std::env::set_var(TOKEN_ENV, "  env-token  ");
-        assert_eq!(resolve_token(None).unwrap(), "env-token");
+        let env = MapEnv::new().with(TOKEN_ENV, "  env-token  ");
+        assert_eq!(resolve_token_with(&env, None).unwrap(), "env-token");
     }
 
     #[test]
     fn resolve_token_generates_when_env_empty_or_absent() {
-        let _g = TokenEnvGuard::new();
         // Absent → freshly generated (long, URL-safe).
-        let a = resolve_token(None).unwrap();
+        let a = resolve_token_with(&MapEnv::new(), None).unwrap();
         assert!(a.len() >= 40);
         // Blank/whitespace env is ignored and also generates.
-        std::env::set_var(TOKEN_ENV, "   ");
-        let b = resolve_token(None).unwrap();
+        let env = MapEnv::new().with(TOKEN_ENV, "   ");
+        let b = resolve_token_with(&env, None).unwrap();
         assert!(b.len() >= 40);
         assert_ne!(a, b);
     }
 
     #[test]
     fn resolve_existing_token_reads_env_var() {
-        let _g = TokenEnvGuard::new();
-        std::env::set_var(TOKEN_ENV, "client-token");
-        assert_eq!(resolve_existing_token(None).unwrap(), "client-token");
+        let env = MapEnv::new().with(TOKEN_ENV, "client-token");
+        assert_eq!(
+            resolve_existing_token_with(&env, None).unwrap(),
+            "client-token"
+        );
     }
 
     #[test]
     fn resolve_existing_token_errors_without_source() {
-        let _g = TokenEnvGuard::new();
-        let err = resolve_existing_token(None).unwrap_err();
+        let err = resolve_existing_token_with(&MapEnv::new(), None).unwrap_err();
         assert!(err.to_string().contains(TOKEN_ENV));
     }
 
     #[test]
     fn resolve_existing_token_reads_file() {
-        let _g = TokenEnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tok");
         std::fs::write(&path, "  file-token\n").unwrap();
