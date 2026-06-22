@@ -10,12 +10,17 @@ pub mod commands;
 pub mod completions;
 pub mod config;
 pub mod coverage;
+// The daemon and the Snowflake client (which talks to the daemon over its
+// Unix-domain control socket) are Unix-only; running them on Windows is future
+// work (#1041).
+#[cfg(unix)]
 pub mod daemon;
 pub mod datadog;
 pub mod git;
 pub mod help;
 pub mod log;
 pub mod resources;
+#[cfg(unix)]
 pub mod snowflake;
 pub mod transcript;
 
@@ -137,10 +142,12 @@ pub enum Commands {
     /// Browser bridge: drive authenticated requests through a browser tab.
     Browser(browser::BrowserCommand),
     /// Daemon: host long-lived services (e.g. the browser bridge).
+    #[cfg(unix)]
     Daemon(daemon::DaemonCommand),
     /// Datadog: read-only API operations.
     Datadog(datadog::DatadogCommand),
     /// Snowflake: run arbitrary SQL through the daemon's multiplexed sessions.
+    #[cfg(unix)]
     Snowflake(snowflake::SnowflakeCommand),
     /// Coverage: diff/patch coverage analysis for PR comments.
     Coverage(coverage::CoverageCommand),
@@ -203,8 +210,10 @@ impl Cli {
             Commands::Commands(commands_cmd) => commands_cmd.execute(),
             Commands::Atlassian(cmd) => cmd.execute().await,
             Commands::Browser(cmd) => cmd.execute().await,
+            #[cfg(unix)]
             Commands::Daemon(cmd) => cmd.execute().await,
             Commands::Datadog(cmd) => cmd.execute().await,
+            #[cfg(unix)]
             Commands::Snowflake(cmd) => cmd.execute().await,
             Commands::Coverage(cmd) => cmd.execute(repo).await,
             Commands::Transcript(cmd) => cmd.execute().await,
