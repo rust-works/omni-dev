@@ -218,6 +218,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_with_runs_against_injected_client() {
+        // Covers the GetCommand::execute_with seam (the execute-level glue)
+        // without going through credential loading.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v1/dashboard/x"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(dashboard_json()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = DatadogClient::new(&server.uri(), "api", "app").unwrap();
+        let cmd = GetCommand {
+            id: "x".to_string(),
+            output: OutputFormat::Json,
+        };
+        cmd.execute_with(&client).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn run_get_propagates_404() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))

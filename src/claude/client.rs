@@ -4664,4 +4664,76 @@ mod tests {
         let metadata = client.get_ai_client_metadata();
         assert_eq!(metadata.max_context_length, 12288);
     }
+
+    // The OpenAI / Bedrock / default-Claude branches construct their clients
+    // synchronously (no network probe, unlike Ollama), so a pure MapEnv drives
+    // them with no env mutation. These cover the non-Ollama dispatch arms.
+
+    #[tokio::test]
+    async fn factory_openai_branch_builds_client() {
+        let env = MapEnv::new()
+            .with("USE_OPENAI", "true")
+            .with("OPENAI_MODEL", "gpt-4.1")
+            .with("OPENAI_API_KEY", "sk-test");
+
+        let client = create_default_claude_client_with(&env, None, None)
+            .await
+            .expect("factory should succeed");
+        assert_eq!(client.get_ai_client_metadata().model, "gpt-4.1");
+    }
+
+    #[tokio::test]
+    async fn factory_openai_branch_errors_without_api_key() {
+        let env = MapEnv::new().with("USE_OPENAI", "true");
+        let result = create_default_claude_client_with(&env, None, None).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn factory_bedrock_branch_builds_client() {
+        let env = MapEnv::new()
+            .with("CLAUDE_CODE_USE_BEDROCK", "true")
+            .with("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+            .with("ANTHROPIC_AUTH_TOKEN", "tok")
+            .with("ANTHROPIC_BEDROCK_BASE_URL", "https://bedrock.example.com");
+
+        let client = create_default_claude_client_with(&env, None, None)
+            .await
+            .expect("factory should succeed");
+        assert_eq!(client.get_ai_client_metadata().model, "claude-sonnet-4-6");
+    }
+
+    #[tokio::test]
+    async fn factory_bedrock_branch_errors_without_auth_token() {
+        let env = MapEnv::new().with("CLAUDE_CODE_USE_BEDROCK", "true");
+        let result = create_default_claude_client_with(&env, None, None).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn factory_bedrock_branch_errors_without_base_url() {
+        let env = MapEnv::new()
+            .with("CLAUDE_CODE_USE_BEDROCK", "true")
+            .with("ANTHROPIC_AUTH_TOKEN", "tok");
+        let result = create_default_claude_client_with(&env, None, None).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn factory_default_claude_branch_builds_client() {
+        let env = MapEnv::new()
+            .with("ANTHROPIC_MODEL", "claude-opus-4-6")
+            .with("CLAUDE_API_KEY", "sk-test");
+
+        let client = create_default_claude_client_with(&env, None, None)
+            .await
+            .expect("factory should succeed");
+        assert_eq!(client.get_ai_client_metadata().model, "claude-opus-4-6");
+    }
+
+    #[tokio::test]
+    async fn factory_default_claude_branch_errors_without_api_key() {
+        let result = create_default_claude_client_with(&MapEnv::new(), None, None).await;
+        assert!(result.is_err());
+    }
 }
