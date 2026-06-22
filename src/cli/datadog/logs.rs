@@ -7,6 +7,8 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+use crate::datadog::client::DatadogClient;
+
 /// Searches Datadog logs.
 #[derive(Parser)]
 pub struct LogsCommand {
@@ -24,9 +26,9 @@ pub enum LogsSubcommands {
 
 impl LogsCommand {
     /// Executes the logs command.
-    pub async fn execute(self) -> Result<()> {
+    pub async fn execute(self, client: &DatadogClient) -> Result<()> {
         match self.command {
-            LogsSubcommands::Search(cmd) => cmd.execute().await,
+            LogsSubcommands::Search(cmd) => cmd.execute(client).await,
         }
     }
 }

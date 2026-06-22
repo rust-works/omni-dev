@@ -9,6 +9,8 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+use crate::datadog::client::DatadogClient;
+
 /// Inspects Datadog monitors.
 #[derive(Parser)]
 pub struct MonitorCommand {
@@ -30,11 +32,11 @@ pub enum MonitorSubcommands {
 
 impl MonitorCommand {
     /// Executes the monitor command.
-    pub async fn execute(self) -> Result<()> {
+    pub async fn execute(self, client: &DatadogClient) -> Result<()> {
         match self.command {
-            MonitorSubcommands::List(cmd) => cmd.execute().await,
-            MonitorSubcommands::Get(cmd) => cmd.execute().await,
-            MonitorSubcommands::Search(cmd) => cmd.execute().await,
+            MonitorSubcommands::List(cmd) => cmd.execute(client).await,
+            MonitorSubcommands::Get(cmd) => cmd.execute(client).await,
+            MonitorSubcommands::Search(cmd) => cmd.execute(client).await,
         }
     }
 }

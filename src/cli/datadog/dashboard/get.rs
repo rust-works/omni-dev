@@ -7,7 +7,6 @@ use clap::Parser;
 
 use crate::cli::datadog::dashboard::{render_dashboard_table, DashboardRow};
 use crate::cli::datadog::format::{output_as, OutputFormat};
-use crate::cli::datadog::helpers::create_client;
 use crate::datadog::client::DatadogClient;
 use crate::datadog::dashboards_api::DashboardsApi;
 use crate::datadog::types::Dashboard;
@@ -24,16 +23,11 @@ pub struct GetCommand {
 }
 
 impl GetCommand {
-    /// Executes the fetch against a freshly-created Datadog client.
-    pub async fn execute(self) -> Result<()> {
-        let (client, _site) = create_client()?;
-        self.execute_with(&client).await
-    }
-
-    /// Runs the command against an injected client — the value-in seam used by
-    /// tests (wiremock) so the execute-level glue is covered without touching
-    /// credentials or the environment (issue #1030).
-    async fn execute_with(self, client: &DatadogClient) -> Result<()> {
+    /// Runs the command against the shared client resolved by the parent
+    /// `DatadogCommand::execute`. Taking the client as a parameter (rather than
+    /// calling `create_client` here) keeps this entry point free of process
+    /// env and fully testable with a wiremock client (issue #1030).
+    pub async fn execute(self, client: &DatadogClient) -> Result<()> {
         run_get(client, &self.id, &self.output).await
     }
 }
@@ -218,9 +212,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_with_runs_against_injected_client() {
-        // Covers the GetCommand::execute_with seam (the execute-level glue)
-        // without going through credential loading.
+    async fn execute_runs_against_injected_client() {
+        // Covers GetCommand::execute (the execute-level glue) without going
+        // through credential loading.
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/api/v1/dashboard/x"))
@@ -234,7 +228,7 @@ mod tests {
             id: "x".to_string(),
             output: OutputFormat::Json,
         };
-        cmd.execute_with(&client).await.unwrap();
+        cmd.execute(&client).await.unwrap();
     }
 
     #[tokio::test]
@@ -252,12 +246,4 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("404"));
     }
-
-    // ── GetCommand::execute_with glue ──────────────────────────────
-    //
-    // `execute_with` is a thin passthrough to `run_get` (no execute-level
-    // glue to construct), so a wiremock-backed test of it would be
-    // byte-for-byte equivalent to the `run_get` tests above and is omitted.
-    // Credential resolution is covered by the `load_credentials_with` /
-    // `create_client_from` tests (issue #1030).
 }

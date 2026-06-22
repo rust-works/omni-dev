@@ -8,6 +8,8 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+use crate::datadog::client::DatadogClient;
+
 /// Inspects Datadog Service Level Objectives.
 #[derive(Parser)]
 pub struct SloCommand {
@@ -27,10 +29,10 @@ pub enum SloSubcommands {
 
 impl SloCommand {
     /// Executes the SLO command.
-    pub async fn execute(self) -> Result<()> {
+    pub async fn execute(self, client: &DatadogClient) -> Result<()> {
         match self.command {
-            SloSubcommands::List(cmd) => cmd.execute().await,
-            SloSubcommands::Get(cmd) => cmd.execute().await,
+            SloSubcommands::List(cmd) => cmd.execute(client).await,
+            SloSubcommands::Get(cmd) => cmd.execute(client).await,
         }
     }
 }
