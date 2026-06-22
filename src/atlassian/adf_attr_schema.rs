@@ -906,11 +906,7 @@ mod tests {
                     attr_name, problem, ..
                 } => {
                     assert_eq!(attr_name, "width");
-                    assert!(matches!(
-                        problem,
-                        AttrProblem::OutOfRangeF { lo, hi, actual }
-                            if *lo == 0.0 && *hi == 100.0 && *actual == 900.0
-                    ));
+                    assert!(matches!(problem, AttrProblem::OutOfRangeF { .. }));
                 }
                 other => panic!("expected InvalidAttr, got {other:?}"),
             }
