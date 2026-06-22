@@ -27,3 +27,4 @@ jobs:
           guidelines: .omni-dev/commit-guidelines.md
           model: claude-haiku-4-5
           verbose: true
+          github-token: ${{ github.token }} # authenticate `version: latest` resolution (1000/hr vs 60/hr)
