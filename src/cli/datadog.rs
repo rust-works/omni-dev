@@ -15,6 +15,8 @@ pub(crate) mod slo;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use crate::datadog::client::DatadogClient;
+
 /// Datadog: read-only API operations.
 #[derive(Parser)]
 pub struct DatadogCommand {
@@ -48,17 +50,42 @@ pub enum DatadogSubcommands {
 
 impl DatadogCommand {
     /// Executes the Datadog command.
+    ///
+    /// `auth` manages credentials and must run without them; every other
+    /// subcommand needs an authenticated client, which is resolved **once**
+    /// here and threaded down so each leaf takes `&DatadogClient` and stays
+    /// free of process env (issue #1030).
     pub async fn execute(self) -> Result<()> {
         match self.command {
             DatadogSubcommands::Auth(cmd) => cmd.execute().await,
-            DatadogSubcommands::Dashboard(cmd) => cmd.execute().await,
-            DatadogSubcommands::Downtime(cmd) => cmd.execute().await,
-            DatadogSubcommands::Events(cmd) => cmd.execute().await,
-            DatadogSubcommands::Hosts(cmd) => cmd.execute().await,
-            DatadogSubcommands::Logs(cmd) => cmd.execute().await,
-            DatadogSubcommands::Metrics(cmd) => cmd.execute().await,
-            DatadogSubcommands::Monitor(cmd) => cmd.execute().await,
-            DatadogSubcommands::Slo(cmd) => cmd.execute().await,
+            data => {
+                // The one `create_client` call for the read-only surface.
+                let (client, _site) = helpers::create_client()?;
+                data.dispatch(&client).await
+            }
+        }
+    }
+}
+
+impl DatadogSubcommands {
+    /// Routes a non-`Auth` subcommand against the shared client. Kept separate
+    /// from credential resolution so it is testable without env (tests pass a
+    /// client pointed at an unreachable URL). The `Auth` arm is unreachable
+    /// because it is handled before client resolution in
+    /// [`DatadogCommand::execute`].
+    async fn dispatch(self, client: &DatadogClient) -> Result<()> {
+        match self {
+            Self::Auth(_) => {
+                unreachable!("Auth is dispatched before client resolution")
+            }
+            Self::Dashboard(cmd) => cmd.execute(client).await,
+            Self::Downtime(cmd) => cmd.execute(client).await,
+            Self::Events(cmd) => cmd.execute(client).await,
+            Self::Hosts(cmd) => cmd.execute(client).await,
+            Self::Logs(cmd) => cmd.execute(client).await,
+            Self::Metrics(cmd) => cmd.execute(client).await,
+            Self::Monitor(cmd) => cmd.execute(client).await,
+            Self::Slo(cmd) => cmd.execute(client).await,
         }
     }
 }
@@ -68,7 +95,15 @@ impl DatadogCommand {
 mod tests {
     use super::*;
     use crate::cli::datadog::format::OutputFormat;
-    use crate::datadog::test_support::{with_empty_home, EnvGuard};
+    use crate::datadog::client::DatadogClient;
+
+    /// A client pointed at an unreachable URL. Routing tests use it so a
+    /// command runs through dispatch -> mid -> leaf to the HTTP layer and fails
+    /// with a connection error — exercising the routing without touching
+    /// credentials, the process environment, or a mock server.
+    fn dead_client() -> DatadogClient {
+        DatadogClient::new("http://127.0.0.1:1", "api", "app").unwrap()
+    }
 
     #[test]
     fn datadog_subcommands_auth_variant() {
@@ -96,89 +131,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn datadog_command_dispatches_auth_logout() {
-        let guard = EnvGuard::take();
-        let _dir = with_empty_home(&guard);
-        let cmd = DatadogCommand {
-            command: DatadogSubcommands::Auth(auth::AuthCommand {
-                command: auth::AuthSubcommands::Logout(auth::LogoutCommand),
+    async fn dispatch_routes_metrics_query() {
+        let cmd = DatadogSubcommands::Metrics(metrics::MetricsCommand {
+            command: metrics::MetricsSubcommands::Query(metrics::query::QueryCommand {
+                query: "m".into(),
+                from: "1h".into(),
+                to: None,
+                output: OutputFormat::Table,
             }),
-        };
-        cmd.execute().await.unwrap();
+        });
+        // Verifies routing reaches the leaf's HTTP call without env.
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
     }
 
     #[tokio::test]
-    async fn datadog_command_dispatches_metrics_query() {
-        let guard = EnvGuard::take();
-        let _dir = with_empty_home(&guard);
-        let cmd = DatadogCommand {
-            command: DatadogSubcommands::Metrics(metrics::MetricsCommand {
-                command: metrics::MetricsSubcommands::Query(metrics::query::QueryCommand {
-                    query: "m".into(),
-                    from: "1h".into(),
-                    to: None,
-                    output: OutputFormat::Table,
-                }),
+    async fn dispatch_routes_monitor_get() {
+        let cmd = DatadogSubcommands::Monitor(monitor::MonitorCommand {
+            command: monitor::MonitorSubcommands::Get(monitor::get::GetCommand {
+                id: 1,
+                output: OutputFormat::Table,
             }),
-        };
-        // Fails at credential loading, not at dispatch — which is what we're
-        // verifying here: the Metrics arm is wired through.
-        let err = cmd.execute().await.unwrap_err();
-        assert!(err.to_string().contains("not configured"));
+        });
+        // Verifies routing reaches the leaf's HTTP call without env.
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
     }
 
     #[tokio::test]
-    async fn datadog_command_dispatches_monitor_get() {
-        let guard = EnvGuard::take();
-        let _dir = with_empty_home(&guard);
-        let cmd = DatadogCommand {
-            command: DatadogSubcommands::Monitor(monitor::MonitorCommand {
-                command: monitor::MonitorSubcommands::Get(monitor::get::GetCommand {
-                    id: 1,
-                    output: OutputFormat::Table,
-                }),
+    async fn dispatch_routes_monitor_list() {
+        let cmd = DatadogSubcommands::Monitor(monitor::MonitorCommand {
+            command: monitor::MonitorSubcommands::List(monitor::list::ListCommand {
+                name: None,
+                tags: None,
+                monitor_tags: None,
+                limit: 5,
+                output: OutputFormat::Table,
             }),
-        };
-        // Fails at credential loading, not at dispatch — verifies the Monitor
-        // arm is wired through to a leaf command's `execute`.
-        let err = cmd.execute().await.unwrap_err();
-        assert!(err.to_string().contains("not configured"));
+        });
+        // Verifies routing reaches the leaf's HTTP call without env.
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
     }
 
     #[tokio::test]
-    async fn datadog_command_dispatches_monitor_list() {
-        let guard = EnvGuard::take();
-        let _dir = with_empty_home(&guard);
-        let cmd = DatadogCommand {
-            command: DatadogSubcommands::Monitor(monitor::MonitorCommand {
-                command: monitor::MonitorSubcommands::List(monitor::list::ListCommand {
-                    name: None,
-                    tags: None,
-                    monitor_tags: None,
-                    limit: 5,
-                    output: OutputFormat::Table,
-                }),
+    async fn dispatch_routes_monitor_search() {
+        let cmd = DatadogSubcommands::Monitor(monitor::MonitorCommand {
+            command: monitor::MonitorSubcommands::Search(monitor::search::SearchCommand {
+                query: "q".into(),
+                limit: 5,
+                output: OutputFormat::Table,
             }),
-        };
-        let err = cmd.execute().await.unwrap_err();
-        assert!(err.to_string().contains("not configured"));
-    }
-
-    #[tokio::test]
-    async fn datadog_command_dispatches_monitor_search() {
-        let guard = EnvGuard::take();
-        let _dir = with_empty_home(&guard);
-        let cmd = DatadogCommand {
-            command: DatadogSubcommands::Monitor(monitor::MonitorCommand {
-                command: monitor::MonitorSubcommands::Search(monitor::search::SearchCommand {
-                    query: "q".into(),
-                    limit: 5,
-                    output: OutputFormat::Table,
-                }),
-            }),
-        };
-        let err = cmd.execute().await.unwrap_err();
-        assert!(err.to_string().contains("not configured"));
+        });
+        // Verifies routing reaches the leaf's HTTP call without env.
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
     }
 
     #[test]
@@ -195,35 +198,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn datadog_command_dispatches_dashboard_list() {
-        let guard = EnvGuard::take();
-        let _dir = with_empty_home(&guard);
-        let cmd = DatadogCommand {
-            command: DatadogSubcommands::Dashboard(dashboard::DashboardCommand {
-                command: dashboard::DashboardSubcommands::List(dashboard::list::ListCommand {
-                    filter_shared: true,
-                    output: OutputFormat::Table,
-                }),
+    async fn dispatch_routes_dashboard_list() {
+        let cmd = DatadogSubcommands::Dashboard(dashboard::DashboardCommand {
+            command: dashboard::DashboardSubcommands::List(dashboard::list::ListCommand {
+                filter_shared: true,
+                output: OutputFormat::Table,
             }),
-        };
-        let err = cmd.execute().await.unwrap_err();
-        assert!(err.to_string().contains("not configured"));
+        });
+        // Verifies routing reaches the leaf's HTTP call without env.
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
     }
 
     #[tokio::test]
-    async fn datadog_command_dispatches_dashboard_get() {
-        let guard = EnvGuard::take();
-        let _dir = with_empty_home(&guard);
-        let cmd = DatadogCommand {
-            command: DatadogSubcommands::Dashboard(dashboard::DashboardCommand {
-                command: dashboard::DashboardSubcommands::Get(dashboard::get::GetCommand {
-                    id: "abc".into(),
-                    output: OutputFormat::Table,
-                }),
+    async fn dispatch_routes_dashboard_get() {
+        let cmd = DatadogSubcommands::Dashboard(dashboard::DashboardCommand {
+            command: dashboard::DashboardSubcommands::Get(dashboard::get::GetCommand {
+                id: "abc".into(),
+                output: OutputFormat::Table,
             }),
-        };
-        let err = cmd.execute().await.unwrap_err();
-        assert!(err.to_string().contains("not configured"));
+        });
+        // Verifies routing reaches the leaf's HTTP call without env.
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
     }
 
     #[test]
@@ -244,23 +239,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn datadog_command_dispatches_logs_search() {
-        let guard = EnvGuard::take();
-        let _dir = with_empty_home(&guard);
-        let cmd = DatadogCommand {
-            command: DatadogSubcommands::Logs(logs::LogsCommand {
-                command: logs::LogsSubcommands::Search(logs::search::SearchCommand {
-                    filter: "*".into(),
-                    from: "15m".into(),
-                    to: "now".into(),
-                    limit: 10,
-                    sort: logs::search::SortArg::TimestampDesc,
-                    output: OutputFormat::Table,
-                }),
+    async fn dispatch_routes_logs_search() {
+        let cmd = DatadogSubcommands::Logs(logs::LogsCommand {
+            command: logs::LogsSubcommands::Search(logs::search::SearchCommand {
+                filter: "*".into(),
+                from: "15m".into(),
+                to: "now".into(),
+                limit: 10,
+                sort: logs::search::SortArg::TimestampDesc,
+                output: OutputFormat::Table,
             }),
-        };
-        let err = cmd.execute().await.unwrap_err();
-        assert!(err.to_string().contains("not configured"));
+        });
+        // Verifies routing reaches the leaf's HTTP call without env.
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
     }
 
     #[test]
@@ -282,24 +273,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn datadog_command_dispatches_events_list() {
-        let guard = EnvGuard::take();
-        let _dir = with_empty_home(&guard);
-        let cmd = DatadogCommand {
-            command: DatadogSubcommands::Events(events::EventsCommand {
-                command: events::EventsSubcommands::List(events::list::ListCommand {
-                    filter: None,
-                    from: "1h".into(),
-                    to: "now".into(),
-                    limit: 10,
-                    sources: None,
-                    tags: None,
-                    output: OutputFormat::Table,
-                }),
+    async fn dispatch_routes_events_list() {
+        let cmd = DatadogSubcommands::Events(events::EventsCommand {
+            command: events::EventsSubcommands::List(events::list::ListCommand {
+                filter: None,
+                from: "1h".into(),
+                to: "now".into(),
+                limit: 10,
+                sources: None,
+                tags: None,
+                output: OutputFormat::Table,
             }),
-        };
-        let err = cmd.execute().await.unwrap_err();
-        assert!(err.to_string().contains("not configured"));
+        });
+        // Verifies routing reaches the leaf's HTTP call without env.
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
     }
 
     #[test]
@@ -320,39 +307,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn datadog_command_dispatches_slo_list() {
-        let guard = EnvGuard::take();
-        let _dir = with_empty_home(&guard);
-        let cmd = DatadogCommand {
-            command: DatadogSubcommands::Slo(slo::SloCommand {
-                command: slo::SloSubcommands::List(slo::list::ListCommand {
-                    tags: None,
-                    query: None,
-                    ids: None,
-                    metrics_query: None,
-                    limit: 5,
-                    output: OutputFormat::Table,
-                }),
+    async fn dispatch_routes_slo_list() {
+        let cmd = DatadogSubcommands::Slo(slo::SloCommand {
+            command: slo::SloSubcommands::List(slo::list::ListCommand {
+                tags: None,
+                query: None,
+                ids: None,
+                metrics_query: None,
+                limit: 5,
+                output: OutputFormat::Table,
             }),
-        };
-        let err = cmd.execute().await.unwrap_err();
-        assert!(err.to_string().contains("not configured"));
+        });
+        // Verifies routing reaches the leaf's HTTP call without env.
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
     }
 
     #[tokio::test]
-    async fn datadog_command_dispatches_slo_get() {
-        let guard = EnvGuard::take();
-        let _dir = with_empty_home(&guard);
-        let cmd = DatadogCommand {
-            command: DatadogSubcommands::Slo(slo::SloCommand {
-                command: slo::SloSubcommands::Get(slo::get::GetCommand {
-                    id: "abc".into(),
-                    output: OutputFormat::Table,
-                }),
+    async fn dispatch_routes_slo_get() {
+        let cmd = DatadogSubcommands::Slo(slo::SloCommand {
+            command: slo::SloSubcommands::Get(slo::get::GetCommand {
+                id: "abc".into(),
+                output: OutputFormat::Table,
             }),
-        };
-        let err = cmd.execute().await.unwrap_err();
-        assert!(err.to_string().contains("not configured"));
+        });
+        // Verifies routing reaches the leaf's HTTP call without env.
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
     }
 
     #[test]
@@ -371,21 +350,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn datadog_command_dispatches_hosts_list() {
-        let guard = EnvGuard::take();
-        let _dir = with_empty_home(&guard);
-        let cmd = DatadogCommand {
-            command: DatadogSubcommands::Hosts(hosts::HostsCommand {
-                command: hosts::HostsSubcommands::List(hosts::list::ListCommand {
-                    filter: None,
-                    from: None,
-                    limit: 5,
-                    output: OutputFormat::Table,
-                }),
+    async fn dispatch_routes_hosts_list() {
+        let cmd = DatadogSubcommands::Hosts(hosts::HostsCommand {
+            command: hosts::HostsSubcommands::List(hosts::list::ListCommand {
+                filter: None,
+                from: None,
+                limit: 5,
+                output: OutputFormat::Table,
             }),
-        };
-        let err = cmd.execute().await.unwrap_err();
-        assert!(err.to_string().contains("not configured"));
+        });
+        // Verifies routing reaches the leaf's HTTP call without env.
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
     }
 
     #[test]
@@ -402,39 +377,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn datadog_command_dispatches_downtime_list() {
-        let guard = EnvGuard::take();
-        let _dir = with_empty_home(&guard);
-        let cmd = DatadogCommand {
-            command: DatadogSubcommands::Downtime(downtime::DowntimeCommand {
-                command: downtime::DowntimeSubcommands::List(downtime::list::ListCommand {
-                    active_only: true,
-                    output: OutputFormat::Table,
-                }),
+    async fn dispatch_routes_downtime_list() {
+        let cmd = DatadogSubcommands::Downtime(downtime::DowntimeCommand {
+            command: downtime::DowntimeSubcommands::List(downtime::list::ListCommand {
+                active_only: true,
+                output: OutputFormat::Table,
             }),
-        };
-        let err = cmd.execute().await.unwrap_err();
-        assert!(err.to_string().contains("not configured"));
+        });
+        // Verifies routing reaches the leaf's HTTP call without env.
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
     }
 
     #[tokio::test]
-    async fn datadog_command_dispatches_metrics_catalog_list() {
-        let guard = EnvGuard::take();
-        let _dir = with_empty_home(&guard);
-        let cmd = DatadogCommand {
-            command: DatadogSubcommands::Metrics(metrics::MetricsCommand {
-                command: metrics::MetricsSubcommands::Catalog(metrics::catalog::CatalogCommand {
-                    command: metrics::catalog::CatalogSubcommands::List(
-                        metrics::catalog::list::ListCommand {
-                            host: None,
-                            from: None,
-                            output: OutputFormat::Table,
-                        },
-                    ),
-                }),
+    async fn dispatch_routes_metrics_catalog_list() {
+        let cmd = DatadogSubcommands::Metrics(metrics::MetricsCommand {
+            command: metrics::MetricsSubcommands::Catalog(metrics::catalog::CatalogCommand {
+                command: metrics::catalog::CatalogSubcommands::List(
+                    metrics::catalog::list::ListCommand {
+                        host: None,
+                        from: None,
+                        output: OutputFormat::Table,
+                    },
+                ),
             }),
-        };
-        let err = cmd.execute().await.unwrap_err();
-        assert!(err.to_string().contains("not configured"));
+        });
+        // Verifies routing reaches the leaf's HTTP call without env.
+        assert!(cmd.dispatch(&dead_client()).await.is_err());
     }
 }

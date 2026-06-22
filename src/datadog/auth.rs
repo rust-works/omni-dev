@@ -3,7 +3,6 @@
 //! Loads and saves Datadog API credentials from/to the
 //! `~/.omni-dev/settings.json` file using the existing `env` map.
 
-use std::collections::HashMap;
 use std::fs;
 
 use anyhow::{Context, Result};
@@ -83,18 +82,26 @@ pub fn base_url_for_site(site: &str) -> String {
 /// Environment variables take precedence over the settings file. Emits a
 /// warning on stderr when the configured site is not in [`KNOWN_SITES`].
 pub fn load_credentials() -> Result<DatadogCredentials> {
-    let settings = Settings::load().unwrap_or(Settings {
-        env: HashMap::new(),
-    });
+    load_credentials_with(&crate::utils::settings::SettingsEnv::load())
+}
 
-    let api_key = settings
-        .get_env_var(DATADOG_API_KEY)
+/// [`load_credentials`] over an injected [`EnvSource`](crate::utils::env::EnvSource).
+///
+/// The production wrapper passes `&SettingsEnv::load()` (process env with a
+/// settings.json fallback); tests pass a pure `MapEnv`, so credential
+/// resolution is exercised without mutating the process environment or `HOME`
+/// (issue #1030).
+pub(crate) fn load_credentials_with(
+    env: &impl crate::utils::env::EnvSource,
+) -> Result<DatadogCredentials> {
+    let api_key = env
+        .var(DATADOG_API_KEY)
         .ok_or(DatadogError::CredentialsNotFound)?;
-    let app_key = settings
-        .get_env_var(DATADOG_APP_KEY)
+    let app_key = env
+        .var(DATADOG_APP_KEY)
         .ok_or(DatadogError::CredentialsNotFound)?;
-    let site = settings
-        .get_env_var(DATADOG_SITE)
+    let site = env
+        .var(DATADOG_SITE)
         .map(|s| normalize_site(&s))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| DEFAULT_SITE.to_string());
@@ -141,14 +148,18 @@ pub struct AuthStatus {
 /// Reports credential presence without leaking any secret values. Safe to
 /// call with no credentials configured.
 pub fn status() -> AuthStatus {
-    let settings = Settings::load().unwrap_or(Settings {
-        env: HashMap::new(),
-    });
+    status_with(&crate::utils::settings::SettingsEnv::load())
+}
 
-    let has_api_key = settings.get_env_var(DATADOG_API_KEY).is_some();
-    let has_app_key = settings.get_env_var(DATADOG_APP_KEY).is_some();
-    let site = settings
-        .get_env_var(DATADOG_SITE)
+/// [`status`] over an injected [`EnvSource`](crate::utils::env::EnvSource).
+///
+/// Tests pass a pure `MapEnv` to report presence without mutating the process
+/// environment or `HOME` (issue #1030).
+pub(crate) fn status_with(env: &impl crate::utils::env::EnvSource) -> AuthStatus {
+    let has_api_key = env.var(DATADOG_API_KEY).is_some();
+    let has_app_key = env.var(DATADOG_APP_KEY).is_some();
+    let site = env
+        .var(DATADOG_SITE)
         .map(|s| normalize_site(&s))
         .filter(|s| !s.is_empty());
 
@@ -167,8 +178,17 @@ pub fn status() -> AuthStatus {
 /// Reads the existing settings file, merges the three credential keys into
 /// the `env` map, and writes back. Preserves all other settings.
 pub fn save_credentials(credentials: &DatadogCredentials) -> Result<()> {
-    let settings_path = Settings::get_settings_path()?;
-    let mut settings_value = read_or_default_settings(&settings_path)?;
+    save_credentials_to(&Settings::get_settings_path()?, credentials)
+}
+
+/// [`save_credentials`], writing to an explicit settings-file path.
+///
+/// Tests inject a tempdir path instead of redirecting `HOME` (issue #1030).
+pub(crate) fn save_credentials_to(
+    settings_path: &std::path::Path,
+    credentials: &DatadogCredentials,
+) -> Result<()> {
+    let mut settings_value = read_or_default_settings(settings_path)?;
     ensure_env_object(&mut settings_value);
 
     let Some(env) = settings_value["env"].as_object_mut() else {
@@ -187,7 +207,7 @@ pub fn save_credentials(credentials: &DatadogCredentials) -> Result<()> {
         serde_json::Value::String(credentials.site.clone()),
     );
 
-    write_settings(&settings_path, &settings_value)
+    write_settings(settings_path, &settings_value)
 }
 
 /// Removes Datadog credential keys from `~/.omni-dev/settings.json`.
@@ -196,11 +216,17 @@ pub fn save_credentials(credentials: &DatadogCredentials) -> Result<()> {
 /// present and removed, `false` when the file was already free of them (or
 /// did not exist).
 pub fn remove_credentials() -> Result<bool> {
-    let settings_path = Settings::get_settings_path()?;
+    remove_credentials_at(&Settings::get_settings_path()?)
+}
+
+/// [`remove_credentials`], operating on an explicit settings-file path.
+///
+/// Tests inject a tempdir path instead of redirecting `HOME` (issue #1030).
+pub(crate) fn remove_credentials_at(settings_path: &std::path::Path) -> Result<bool> {
     if !settings_path.exists() {
         return Ok(false);
     }
-    let mut settings_value = read_or_default_settings(&settings_path)?;
+    let mut settings_value = read_or_default_settings(settings_path)?;
 
     let mut removed = false;
     if let Some(env) = settings_value
@@ -215,7 +241,7 @@ pub fn remove_credentials() -> Result<bool> {
     }
 
     if removed {
-        write_settings(&settings_path, &settings_value)?;
+        write_settings(settings_path, &settings_value)?;
     }
     Ok(removed)
 }
@@ -324,16 +350,13 @@ mod tests {
         assert!(KNOWN_SITES.contains(&"us5.datadoghq.com"));
     }
 
-    // ── Tests that mutate process-wide env ────────────────────────────
+    // ── Env-parsing boundary tests (injected, no process-env mutation) ──
 
-    use crate::datadog::test_support::{with_empty_home, EnvGuard};
+    use crate::test_support::env::MapEnv;
 
     #[test]
     fn status_reports_all_false_when_nothing_configured() {
-        let guard = EnvGuard::take();
-        let _dir = with_empty_home(&guard);
-
-        let status = status();
+        let status = status_with(&MapEnv::new());
         assert_eq!(status.scopes.len(), 1);
         let scope = &status.scopes[0];
         assert_eq!(scope.name, "default");
@@ -344,21 +367,12 @@ mod tests {
 
     #[test]
     fn status_reports_presence_flags_without_leaking_secrets() {
-        let guard = EnvGuard::take();
-        let dir = with_empty_home(&guard);
-        let omni_dir = dir.path().join(".omni-dev");
-        fs::create_dir_all(&omni_dir).unwrap();
-        fs::write(
-            omni_dir.join("settings.json"),
-            r#"{"env":{
-                "DATADOG_API_KEY":"sekret-api-do-not-leak",
-                "DATADOG_APP_KEY":"sekret-app-do-not-leak",
-                "DATADOG_SITE":"datadoghq.com"
-            }}"#,
-        )
-        .unwrap();
+        let env = MapEnv::new()
+            .with(DATADOG_API_KEY, "sekret-api-do-not-leak")
+            .with(DATADOG_APP_KEY, "sekret-app-do-not-leak")
+            .with(DATADOG_SITE, "datadoghq.com");
 
-        let status = status();
+        let status = status_with(&env);
         let scope = &status.scopes[0];
         assert!(scope.has_api_key);
         assert!(scope.has_app_key);
@@ -371,69 +385,57 @@ mod tests {
 
     #[test]
     fn status_normalises_site_value() {
-        let guard = EnvGuard::take();
-        let _dir = with_empty_home(&guard);
-        std::env::set_var(DATADOG_SITE, "https://api.us3.datadoghq.com/");
-
-        let status = status();
+        let env = MapEnv::new().with(DATADOG_SITE, "https://api.us3.datadoghq.com/");
+        let status = status_with(&env);
         assert_eq!(status.scopes[0].site.as_deref(), Some("us3.datadoghq.com"));
     }
 
     #[test]
     fn load_credentials_errors_when_api_key_missing() {
-        let guard = EnvGuard::take();
-        let _dir = with_empty_home(&guard);
-        std::env::set_var(DATADOG_APP_KEY, "app");
-
-        let err = load_credentials().unwrap_err();
+        let env = MapEnv::new().with(DATADOG_APP_KEY, "app");
+        let err = load_credentials_with(&env).unwrap_err();
         assert!(err.to_string().contains("not configured"));
     }
 
     #[test]
     fn load_credentials_defaults_site_when_unset() {
-        let guard = EnvGuard::take();
-        let _dir = with_empty_home(&guard);
-        std::env::set_var(DATADOG_API_KEY, "api");
-        std::env::set_var(DATADOG_APP_KEY, "app");
-
-        let creds = load_credentials().unwrap();
+        let env = MapEnv::new()
+            .with(DATADOG_API_KEY, "api")
+            .with(DATADOG_APP_KEY, "app");
+        let creds = load_credentials_with(&env).unwrap();
         assert_eq!(creds.site, DEFAULT_SITE);
     }
 
     #[test]
     fn load_credentials_warns_on_unknown_site_but_succeeds() {
-        let guard = EnvGuard::take();
-        let _dir = with_empty_home(&guard);
-        std::env::set_var(DATADOG_API_KEY, "api");
-        std::env::set_var(DATADOG_APP_KEY, "app");
-        std::env::set_var(DATADOG_SITE, "custom.example");
-
-        let creds = load_credentials().unwrap();
+        let env = MapEnv::new()
+            .with(DATADOG_API_KEY, "api")
+            .with(DATADOG_APP_KEY, "app")
+            .with(DATADOG_SITE, "custom.example");
+        let creds = load_credentials_with(&env).unwrap();
         assert_eq!(creds.site, "custom.example");
     }
 
-    /// Single test for save + remove credentials to avoid HOME races.
-    /// Covers fresh-file creation, merge-with-existing, and removal.
+    /// Save + remove round-trip against injected settings-file paths — no
+    /// `HOME` mutation, so the test needs no lock. Covers fresh-file creation,
+    /// merge-with-existing, and removal.
     #[test]
     fn save_then_remove_round_trip() {
-        let _guard = EnvGuard::take();
-
         // ── Part 1: creates file from scratch ──────────────────────
         {
             let temp_dir = {
                 std::fs::create_dir_all("tmp").ok();
                 tempfile::TempDir::new_in("tmp").unwrap()
             };
-            std::env::set_var("HOME", temp_dir.path());
+            let settings_path = temp_dir.path().join(".omni-dev").join("settings.json");
 
             let creds = DatadogCredentials {
                 api_key: "api-1".to_string(),
                 app_key: "app-1".to_string(),
                 site: "datadoghq.com".to_string(),
             };
-            save_credentials(&creds).unwrap();
+            save_credentials_to(&settings_path, &creds).unwrap();
 
-            let settings_path = temp_dir.path().join(".omni-dev").join("settings.json");
             assert!(settings_path.exists());
             let content = fs::read_to_string(&settings_path).unwrap();
             let val: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -457,14 +459,12 @@ mod tests {
             )
             .unwrap();
 
-            std::env::set_var("HOME", temp_dir.path());
-
             let creds = DatadogCredentials {
                 api_key: "api-2".to_string(),
                 app_key: "app-2".to_string(),
                 site: "datadoghq.eu".to_string(),
             };
-            save_credentials(&creds).unwrap();
+            save_credentials_to(&settings_path, &creds).unwrap();
 
             let val: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
@@ -492,9 +492,8 @@ mod tests {
                 }}"#,
             )
             .unwrap();
-            std::env::set_var("HOME", temp_dir.path());
 
-            let removed = remove_credentials().unwrap();
+            let removed = remove_credentials_at(&settings_path).unwrap();
             assert!(removed);
 
             let val: serde_json::Value =
@@ -511,8 +510,8 @@ mod tests {
                 std::fs::create_dir_all("tmp").ok();
                 tempfile::TempDir::new_in("tmp").unwrap()
             };
-            std::env::set_var("HOME", temp_dir.path());
-            let removed = remove_credentials().unwrap();
+            let settings_path = temp_dir.path().join(".omni-dev").join("settings.json");
+            let removed = remove_credentials_at(&settings_path).unwrap();
             assert!(!removed);
         }
     }

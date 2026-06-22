@@ -38,6 +38,42 @@ pub(crate) mod failing_io {
     }
 }
 
+pub(crate) mod env {
+    //! Pure in-memory [`EnvSource`](crate::utils::env::EnvSource) for tests.
+    //!
+    //! `MapEnv` lets env-parsing boundaries be tested without mutating the
+    //! process-global environment: a test builds its own map and passes
+    //! `&map` to the seam's `*_with(&impl EnvSource, …)` entry point. Because
+    //! the map is an owned value with no shared state, such tests need no
+    //! lock and run fully in parallel (issue #1030 / #821).
+    use std::collections::HashMap;
+
+    /// An [`EnvSource`](crate::utils::env::EnvSource) backed by an in-memory
+    /// map — the test counterpart to
+    /// [`SystemEnv`](crate::utils::env::SystemEnv).
+    #[derive(Debug, Default, Clone)]
+    pub(crate) struct MapEnv(HashMap<String, String>);
+
+    impl MapEnv {
+        /// Creates an empty environment (every lookup returns `None`).
+        pub(crate) fn new() -> Self {
+            Self::default()
+        }
+
+        /// Inserts `key = value` and returns `self`, for builder-style setup.
+        pub(crate) fn with(mut self, key: &str, value: &str) -> Self {
+            self.0.insert(key.to_string(), value.to_string());
+            self
+        }
+    }
+
+    impl crate::utils::env::EnvSource for MapEnv {
+        fn var(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+    }
+}
+
 pub(crate) mod atlassian_env {
     //! In-process Atlassian env-var guard for tests that drive
     //! `cli::atlassian::helpers::create_client()` end-to-end.

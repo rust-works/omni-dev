@@ -8,6 +8,8 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+use crate::datadog::client::DatadogClient;
+
 /// Inspects Datadog dashboards.
 #[derive(Parser)]
 pub struct DashboardCommand {
@@ -27,10 +29,10 @@ pub enum DashboardSubcommands {
 
 impl DashboardCommand {
     /// Executes the dashboard command.
-    pub async fn execute(self) -> Result<()> {
+    pub async fn execute(self, client: &DatadogClient) -> Result<()> {
         match self.command {
-            DashboardSubcommands::List(cmd) => cmd.execute().await,
-            DashboardSubcommands::Get(cmd) => cmd.execute().await,
+            DashboardSubcommands::List(cmd) => cmd.execute(client).await,
+            DashboardSubcommands::Get(cmd) => cmd.execute(client).await,
         }
     }
 }
