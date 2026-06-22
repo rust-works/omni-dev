@@ -159,6 +159,10 @@ pub struct ConfluenceDownloadParams {
     /// Output format: `"jfm"` (default) or `"adf"`.
     #[serde(default)]
     pub format: Option<String>,
+    /// Also download each page's attachment binaries into an `attachments/`
+    /// subdirectory beside its content file. Defaults to false.
+    #[serde(default)]
+    pub include_attachments: Option<bool>,
 }
 
 /// Parameters for the `confluence_children` tool.
@@ -321,6 +325,20 @@ pub struct ConfluenceAttachmentListParams {
     /// Maximum number of attachments per page. Defaults to 25.
     #[serde(default)]
     pub limit: Option<u32>,
+}
+
+/// Parameters for the `confluence_attachment_download` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceAttachmentDownloadParams {
+    /// Attachment ID (from `confluence_attachment_list`).
+    pub attachment_id: String,
+    /// Destination path on the MCP server's filesystem. If omitted, the file
+    /// is written to a fresh temp directory whose path is returned in the
+    /// result so the assistant can read it via the filesystem tool. If this
+    /// names an existing directory, the file is written inside it under the
+    /// attachment's filename.
+    #[serde(default)]
+    pub output_path: Option<String>,
 }
 
 /// Parameters for the `confluence_attachment_delete` tool.
@@ -1026,6 +1044,69 @@ pub async fn fetch_space_pages_yaml(
     to_yaml(&page)
 }
 
+/// YAML result for the `confluence_attachment_download` tool.
+#[derive(Debug, Serialize)]
+struct AttachmentDownloadResult {
+    /// Attachment ID.
+    id: String,
+    /// Attachment filename/title.
+    title: String,
+    /// MIME type, when reported by the API.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    media_type: Option<String>,
+    /// Number of bytes written.
+    bytes: usize,
+    /// Absolute path on disk where the attachment was written.
+    path: String,
+}
+
+/// Downloads an attachment to disk and returns YAML metadata describing it
+/// (including its on-disk path).
+pub async fn download_attachment_yaml(
+    api: &ConfluenceApi,
+    attachment_id: &str,
+    output_path: Option<&str>,
+) -> Result<String> {
+    let (attachment, bytes) = api.download_attachment(attachment_id).await?;
+    let path = resolve_attachment_path(output_path, &attachment.title)?;
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::fs::create_dir_all)
+        .transpose()
+        .with_context(|| format!("Failed to create parent directory for {}", path.display()))?;
+    std::fs::write(&path, &bytes).with_context(|| format!("Failed to write {}", path.display()))?;
+    let result = AttachmentDownloadResult {
+        id: attachment.id,
+        title: attachment.title,
+        media_type: attachment.media_type,
+        bytes: bytes.len(),
+        path: path.to_string_lossy().into_owned(),
+    };
+    to_yaml(&result)
+}
+
+/// Resolves the destination path for a single downloaded attachment.
+///
+/// With no `output_path`, a fresh temp directory is created and the
+/// attachment's title is written inside it. An `output_path` that names an
+/// existing directory is joined with the title; otherwise it is used verbatim.
+fn resolve_attachment_path(output_path: Option<&str>, title: &str) -> Result<PathBuf> {
+    if let Some(p) = output_path {
+        let path = PathBuf::from(p);
+        if path.is_dir() {
+            Ok(path.join(title))
+        } else {
+            Ok(path)
+        }
+    } else {
+        let tmp = tempfile::Builder::new()
+            .prefix("omni-dev-confluence-attachment-")
+            .tempdir()
+            .context("Failed to create temp dir for attachment download")?;
+        Ok(tmp.keep().join(title))
+    }
+}
+
 /// Deletes an attachment and returns a YAML confirmation.
 pub async fn delete_attachment_result(
     api: &ConfluenceApi,
@@ -1160,6 +1241,8 @@ impl OmniDevServer {
     #[tool(
         description = "Recursively download a Confluence page or an entire space into a directory. \
                        Either `id` (root page) or `space` (space key) must be provided. \
+                       Set `include_attachments: true` to also fetch each page's attachment \
+                       binaries into an `attachments/` subdirectory beside its content file. \
                        Returns a YAML manifest summary of downloaded pages. \
                        Mirrors `omni-dev atlassian confluence download`."
     )]
@@ -1432,6 +1515,28 @@ impl OmniDevServer {
         Ok(CallToolResult::success(vec![Content::text(yaml)]))
     }
 
+    /// Downloads an attachment binary by ID to disk.
+    #[tool(
+        description = "Download a Confluence attachment by ID to disk. Returns YAML \
+                       metadata (id, title, media_type, bytes, on-disk path). If \
+                       `output_path` is omitted, the file is written to a fresh temp \
+                       directory whose path is in the result; the assistant can then \
+                       read it via the filesystem tool. Mirrors \
+                       `omni-dev atlassian confluence attachment download`."
+    )]
+    pub async fn confluence_attachment_download(
+        &self,
+        Parameters(params): Parameters<ConfluenceAttachmentDownloadParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _url) = create_client().map_err(tool_error)?;
+        let api = ConfluenceApi::new(client);
+        let yaml =
+            download_attachment_yaml(&api, &params.attachment_id, params.output_path.as_deref())
+                .await
+                .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
     /// Lists Confluence spaces (paginated).
     #[tool(
         description = "List Confluence spaces (one page per call). Optional filters: \
@@ -1684,6 +1789,7 @@ async fn run_confluence_download(params: ConfluenceDownloadParams) -> Result<Str
         max_depth: params.max_depth.unwrap_or(0),
         title_filter: params.title_filter,
         resume: false,
+        include_attachments: params.include_attachments.unwrap_or(false),
         on_conflict: OnConflict::Overwrite,
         instance_url,
     };
@@ -2479,6 +2585,7 @@ mod tests {
             concurrency: None,
             max_depth: None,
             format: None,
+            include_attachments: None,
         };
         let err = run_confluence_download(params).await.unwrap_err();
         assert!(err.to_string().contains("`id` or `space`"));
@@ -2532,6 +2639,7 @@ mod tests {
             concurrency: Some(1),
             max_depth: None,
             format: None,
+            include_attachments: None,
         };
 
         let summary = run_confluence_download(params).await.unwrap();
@@ -2862,6 +2970,155 @@ mod tests {
         assert!(yaml.contains("Home"));
         assert!(yaml.contains("authorId: u1"));
         assert!(yaml.contains("2024-01-02T03:04:05Z"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn download_attachment_yaml_writes_file_and_reports_metadata() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/attachments/att-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "att-1",
+                    "title": "diagram.png",
+                    "mediaType": "image/png",
+                    "downloadLink": "/download/attachments/12345/diagram.png"
+                })),
+            )
+            .mount(&srv)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/download/attachments/12345/diagram.png",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"PNGDATA".to_vec()))
+            .mount(&srv)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.png");
+        let client = AtlassianClient::new(&srv.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        let yaml = download_attachment_yaml(&api, "att-1", Some(out.to_str().unwrap()))
+            .await
+            .unwrap();
+
+        assert!(yaml.contains("id: att-1"));
+        assert!(yaml.contains("title: diagram.png"));
+        assert!(yaml.contains("media_type: image/png"));
+        assert!(yaml.contains("bytes: 7"));
+        assert_eq!(std::fs::read(&out).unwrap(), b"PNGDATA");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_attachment_download_handler_success_via_mock() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/attachments/att-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "att-1",
+                    "title": "diagram.png",
+                    "mediaType": "image/png",
+                    "downloadLink": "/download/attachments/12345/diagram.png"
+                })),
+            )
+            .mount(&srv)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/download/attachments/12345/diagram.png",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"PNGDATA".to_vec()))
+            .mount(&srv)
+            .await;
+        let _env = EnvGuard::set(&srv.uri());
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.png");
+        let server = make_server();
+        let result = server
+            .confluence_attachment_download(Parameters(ConfluenceAttachmentDownloadParams {
+                attachment_id: "att-1".to_string(),
+                output_path: Some(out.to_string_lossy().into_owned()),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        assert_eq!(std::fs::read(&out).unwrap(), b"PNGDATA");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_attachment_download_handler_error_path_without_credentials() {
+        let _lock = env_lock();
+        clear_env();
+        let server = make_server();
+        let result = server
+            .confluence_attachment_download(Parameters(ConfluenceAttachmentDownloadParams {
+                attachment_id: "att-1".to_string(),
+                output_path: None,
+            }))
+            .await;
+        assert!(result.is_err());
+    }
+
+    /// Drives the `create_dir_all` branch of `download_attachment_yaml` by
+    /// pointing `output_path` at a not-yet-existing nested directory.
+    #[tokio::test(flavor = "current_thread")]
+    async fn download_attachment_yaml_creates_missing_parent_dirs() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/attachments/att-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "att-1",
+                    "title": "diagram.png",
+                    "downloadLink": "/download/attachments/12345/diagram.png"
+                })),
+            )
+            .mount(&srv)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/download/attachments/12345/diagram.png",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"PNGDATA".to_vec()))
+            .mount(&srv)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("nested").join("sub").join("out.png");
+        let client = AtlassianClient::new(&srv.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        download_attachment_yaml(&api, "att-1", Some(out.to_str().unwrap()))
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&out).unwrap(), b"PNGDATA");
+    }
+
+    #[test]
+    fn resolve_attachment_path_defaults_to_tempdir() {
+        let path = resolve_attachment_path(None, "x.txt").unwrap();
+        assert_eq!(path.file_name().unwrap(), "x.txt");
+        assert!(path.parent().unwrap().is_dir());
+    }
+
+    #[test]
+    fn resolve_attachment_path_existing_dir_joins_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = resolve_attachment_path(Some(dir.path().to_str().unwrap()), "x.txt").unwrap();
+        assert_eq!(path, dir.path().join("x.txt"));
+    }
+
+    #[test]
+    fn resolve_attachment_path_explicit_file_used_verbatim() {
+        let path = resolve_attachment_path(Some("/tmp/foo/bar.bin"), "x.txt").unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/foo/bar.bin"));
     }
 
     /// Covers the Err branch of `resolve_space_id` inside
@@ -3301,6 +3558,7 @@ mod tests {
                 concurrency: None,
                 max_depth: None,
                 format: None,
+                include_attachments: None,
             }))
             .await;
         let err = result.unwrap_err();
@@ -3354,6 +3612,7 @@ mod tests {
                 concurrency: Some(1),
                 max_depth: None,
                 format: None,
+                include_attachments: None,
             }))
             .await
             .unwrap();
@@ -3385,6 +3644,7 @@ mod tests {
             "confluence_user_search",
             "confluence_attachment_upload",
             "confluence_attachment_list",
+            "confluence_attachment_download",
             "confluence_attachment_delete",
             "confluence_space_list",
             "confluence_space_pages",

@@ -1991,6 +1991,73 @@ impl ConfluenceApi {
         Ok(())
     }
 
+    /// Fetches metadata for a single attachment by ID (v2 API).
+    ///
+    /// Returns the same [`ConfluenceAttachment`] shape as
+    /// [`ConfluenceApi::list_attachments`], including the `download_url`
+    /// needed by [`ConfluenceApi::download_attachment_bytes`].
+    pub async fn get_attachment(&self, attachment_id: &str) -> Result<ConfluenceAttachment> {
+        let url = format!(
+            "{}/wiki/api/v2/attachments/{}",
+            self.client.instance_url(),
+            attachment_id
+        );
+
+        let response = self
+            .client
+            .get_json(&url)
+            .await
+            .context("Failed to fetch attachment metadata")?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let entry: ConfluenceAttachmentEntry = response
+            .json()
+            .await
+            .context("Failed to parse attachment response")?;
+        Ok(entry.into())
+    }
+
+    /// Downloads the binary content of an attachment whose metadata is
+    /// already in hand (e.g. from [`ConfluenceApi::list_attachments`]).
+    ///
+    /// The v1/v2 APIs report `download_url` as a path relative to the
+    /// Confluence context root; it is resolved against the instance URL and
+    /// fetched via the shared client, which follows the media-CDN redirect.
+    pub async fn download_attachment_bytes(
+        &self,
+        attachment: &ConfluenceAttachment,
+    ) -> Result<Vec<u8>> {
+        let link = attachment.download_url.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Attachment {} ({}) has no download URL",
+                attachment.id,
+                attachment.title
+            )
+        })?;
+        let url = resolve_attachment_download_url(self.client.instance_url(), link);
+        self.client.get_bytes(&url).await
+    }
+
+    /// Fetches an attachment's metadata by ID, then downloads its binary.
+    ///
+    /// Convenience for the single-attachment download path (CLI/MCP) where
+    /// only the ID is known; the fan-out path uses
+    /// [`ConfluenceApi::download_attachment_bytes`] directly to avoid an
+    /// extra metadata round-trip per attachment.
+    pub async fn download_attachment(
+        &self,
+        attachment_id: &str,
+    ) -> Result<(ConfluenceAttachment, Vec<u8>)> {
+        let attachment = self.get_attachment(attachment_id).await?;
+        let bytes = self.download_attachment_bytes(&attachment).await?;
+        Ok((attachment, bytes))
+    }
+
     /// Fetches a Confluence page pinned to a specific version number.
     ///
     /// Like [`AtlassianApi::get_content`] but returns the historical
@@ -2077,6 +2144,27 @@ fn urlencoding(s: &str) -> String {
         }
     }
     out
+}
+
+/// Resolves a Confluence attachment download link to an absolute URL.
+///
+/// The v1/v2 APIs report `downloadLink` as a path relative to the Confluence
+/// context root (e.g. `/download/attachments/123/foo.png?...`). Absolute URLs
+/// pass through unchanged; root-relative paths that already carry the `/wiki`
+/// context prefix are joined to the bare instance origin; all other
+/// root-relative (and bare-relative) paths get the `/wiki` prefix added.
+fn resolve_attachment_download_url(instance_url: &str, link: &str) -> String {
+    if link.starts_with("http://") || link.starts_with("https://") {
+        return link.to_string();
+    }
+    let base = instance_url.trim_end_matches('/');
+    if link == "/wiki" || link.starts_with("/wiki/") {
+        format!("{base}{link}")
+    } else if let Some(rest) = link.strip_prefix('/') {
+        format!("{base}/wiki/{rest}")
+    } else {
+        format!("{base}/wiki/{link}")
+    }
 }
 
 /// Extracts the `cursor` query parameter value from a `_links.next` URL or path.
@@ -5501,6 +5589,163 @@ mod tests {
         let api = ConfluenceApi::new(client);
         let err = api.delete_attachment("missing", false).await.unwrap_err();
         assert!(err.to_string().contains("404"));
+    }
+
+    // ── resolve_attachment_download_url ────────────────────────────────
+
+    #[test]
+    fn resolve_download_url_root_relative_gets_wiki_prefix() {
+        assert_eq!(
+            resolve_attachment_download_url(
+                "https://org.atlassian.net",
+                "/download/attachments/123/foo.png?version=1"
+            ),
+            "https://org.atlassian.net/wiki/download/attachments/123/foo.png?version=1"
+        );
+    }
+
+    #[test]
+    fn resolve_download_url_already_has_wiki_prefix() {
+        assert_eq!(
+            resolve_attachment_download_url(
+                "https://org.atlassian.net/",
+                "/wiki/download/attachments/123/foo.png"
+            ),
+            "https://org.atlassian.net/wiki/download/attachments/123/foo.png"
+        );
+    }
+
+    #[test]
+    fn resolve_download_url_absolute_passes_through() {
+        let abs = "https://api.media.atlassian.com/file/abc/binary?token=xyz";
+        assert_eq!(
+            resolve_attachment_download_url("https://org.atlassian.net", abs),
+            abs
+        );
+    }
+
+    #[test]
+    fn resolve_download_url_bare_relative_gets_wiki_prefix() {
+        assert_eq!(
+            resolve_attachment_download_url("https://org.atlassian.net", "download/x"),
+            "https://org.atlassian.net/wiki/download/x"
+        );
+    }
+
+    // ── get_attachment / download_attachment ───────────────────────────
+
+    #[tokio::test]
+    async fn get_attachment_maps_v2_fields() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/attachments/att-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "att-1",
+                    "title": "diagram.png",
+                    "mediaType": "image/png",
+                    "fileSize": 2048,
+                    "downloadLink": "/download/attachments/12345/diagram.png?version=2",
+                    "version": {"number": 2},
+                    "pageId": "12345",
+                    "fileId": "file-1"
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let attachment = api.get_attachment("att-1").await.unwrap();
+
+        assert_eq!(attachment.id, "att-1");
+        assert_eq!(attachment.title, "diagram.png");
+        assert_eq!(attachment.media_type.as_deref(), Some("image/png"));
+        assert_eq!(attachment.file_size, Some(2048));
+        assert_eq!(
+            attachment.download_url.as_deref(),
+            Some("/download/attachments/12345/diagram.png?version=2")
+        );
+        assert_eq!(attachment.version, Some(2));
+        assert_eq!(attachment.page_id.as_deref(), Some("12345"));
+        assert_eq!(attachment.file_id.as_deref(), Some("file-1"));
+    }
+
+    #[tokio::test]
+    async fn get_attachment_not_found() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/attachments/missing"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not Found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let err = api.get_attachment("missing").await.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn download_attachment_fetches_metadata_then_bytes() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/attachments/att-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "att-1",
+                    "title": "notes.txt",
+                    "mediaType": "text/plain",
+                    "fileSize": 5,
+                    "downloadLink": "/download/attachments/12345/notes.txt"
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/download/attachments/12345/notes.txt",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let (attachment, bytes) = api.download_attachment("att-1").await.unwrap();
+
+        assert_eq!(attachment.title, "notes.txt");
+        assert_eq!(bytes, b"hello");
+    }
+
+    #[tokio::test]
+    async fn download_attachment_bytes_missing_url_errors() {
+        let server = wiremock::MockServer::start().await;
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let api = ConfluenceApi::new(client);
+        let attachment = ConfluenceAttachment {
+            id: "att-1".to_string(),
+            title: "x.txt".to_string(),
+            media_type: None,
+            file_size: None,
+            download_url: None,
+            version: None,
+            page_id: None,
+            file_id: None,
+        };
+        let err = api
+            .download_attachment_bytes(&attachment)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no download URL"));
     }
 
     #[test]

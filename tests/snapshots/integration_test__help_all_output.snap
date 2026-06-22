@@ -349,10 +349,11 @@ Manages attachments on Confluence pages
 Usage: attachment <COMMAND>
 
 Commands:
-  upload  Uploads a file as an attachment to a Confluence page
-  list    Lists attachments on a Confluence page
-  delete  Deletes an attachment by ID
-  help    Print this message or the help of the given subcommand(s)
+  upload    Uploads a file as an attachment to a Confluence page
+  list      Lists attachments on a Confluence page
+  download  Downloads an attachment binary by ID
+  delete    Deletes an attachment by ID
+  help      Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
@@ -373,6 +374,22 @@ Options:
       --force  Skips the confirmation prompt
       --purge  Permanently purges the attachment instead of moving to trash (requires space admin)
   -h, --help   Print help
+
+
+================================================================================
+
+omni-dev atlassian confluence attachment download - Downloads an attachment binary by ID
+
+Downloads an attachment binary by ID
+
+Usage: download [OPTIONS] <ATTACHMENT_ID>
+
+Arguments:
+  <ATTACHMENT_ID>  Attachment ID (from `attachment list`)
+
+Options:
+  -o, --output <OUTPUT>  Destination path. If omitted, the file is written to the attachment's filename in the current directory. If this names an existing directory, the file is written inside it under the attachment's filename
+  -h, --help             Print help
 
 
 ================================================================================
@@ -644,6 +661,7 @@ Options:
       --max-depth <MAX_DEPTH>        Maximum tree depth (0 = unlimited) [default: 0]
       --title-filter <TITLE_FILTER>  Only download pages whose title contains this substring (case-insensitive). Children of non-matching pages are still traversed
       --resume                       Use manifest for ID-aware resume (skip already-downloaded pages)
+      --include-attachments          Also download each page's attachment binaries into an `attachments/` subdirectory beside its content file
       --on-conflict <ON_CONFLICT>    What to do when a file already exists [default: backup] [possible values: backup, skip, overwrite]
   -h, --help                         Print help (see more with '--help')
 
