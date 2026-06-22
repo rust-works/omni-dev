@@ -1,9 +1,9 @@
 //! CLI commands for managing Confluence page attachments.
 
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::atlassian::confluence_api::{
@@ -27,6 +27,8 @@ pub enum AttachmentSubcommands {
     Upload(UploadCommand),
     /// Lists attachments on a Confluence page.
     List(ListCommand),
+    /// Downloads an attachment binary by ID.
+    Download(DownloadCommand),
     /// Deletes an attachment by ID.
     Delete(DeleteCommand),
 }
@@ -37,6 +39,7 @@ impl AttachmentCommand {
         match self.command {
             AttachmentSubcommands::Upload(cmd) => cmd.execute().await,
             AttachmentSubcommands::List(cmd) => cmd.execute().await,
+            AttachmentSubcommands::Download(cmd) => cmd.execute().await,
             AttachmentSubcommands::Delete(cmd) => cmd.execute().await,
         }
     }
@@ -219,6 +222,60 @@ fn print_attachments(page: &ConfluenceAttachmentPage) {
     }
 }
 
+/// Downloads an attachment binary by ID.
+#[derive(Parser)]
+pub struct DownloadCommand {
+    /// Attachment ID (from `attachment list`).
+    pub attachment_id: String,
+
+    /// Destination path. If omitted, the file is written to the attachment's
+    /// filename in the current directory. If this names an existing
+    /// directory, the file is written inside it under the attachment's
+    /// filename.
+    #[arg(short = 'o', long)]
+    pub output: Option<PathBuf>,
+}
+
+impl DownloadCommand {
+    /// Executes the download command.
+    pub async fn execute(self) -> Result<()> {
+        let (client, _instance_url) = create_client()?;
+        let api = ConfluenceApi::new(client);
+        run_download(&api, &self.attachment_id, self.output.as_deref()).await
+    }
+}
+
+/// Downloads an attachment to disk and prints a confirmation.
+async fn run_download(
+    api: &ConfluenceApi,
+    attachment_id: &str,
+    output: Option<&Path>,
+) -> Result<()> {
+    let (attachment, bytes) = api.download_attachment(attachment_id).await?;
+    let path = resolve_output_path(output, &attachment.title);
+    std::fs::write(&path, &bytes).with_context(|| format!("Failed to write {}", path.display()))?;
+    println!(
+        "Downloaded {} ({} bytes) to {}.",
+        attachment.title,
+        bytes.len(),
+        path.display()
+    );
+    Ok(())
+}
+
+/// Resolves the on-disk destination for a downloaded attachment.
+///
+/// An explicit `--output` that points at an existing directory is joined
+/// with the attachment's title; otherwise it is used verbatim. With no
+/// `--output`, the attachment's title is written to the current directory.
+fn resolve_output_path(output: Option<&Path>, title: &str) -> PathBuf {
+    match output {
+        Some(p) if p.is_dir() => p.join(title),
+        Some(p) => p.to_path_buf(),
+        None => PathBuf::from(title),
+    }
+}
+
 /// Deletes an attachment by ID.
 #[derive(Parser)]
 pub struct DeleteCommand {
@@ -343,6 +400,17 @@ mod tests {
             }),
         };
         assert!(matches!(cmd.command, AttachmentSubcommands::List(_)));
+    }
+
+    #[test]
+    fn attachment_subcommands_download_variant() {
+        let cmd = AttachmentCommand {
+            command: AttachmentSubcommands::Download(DownloadCommand {
+                attachment_id: "att-1".to_string(),
+                output: None,
+            }),
+        };
+        assert!(matches!(cmd.command, AttachmentSubcommands::Download(_)));
     }
 
     #[test]
@@ -489,6 +557,68 @@ mod tests {
             .is_ok());
     }
 
+    // ── resolve_output_path ───────────────────────────────────────
+
+    #[test]
+    fn resolve_output_path_defaults_to_title_in_cwd() {
+        assert_eq!(
+            resolve_output_path(None, "diagram.png"),
+            PathBuf::from("diagram.png")
+        );
+    }
+
+    #[test]
+    fn resolve_output_path_explicit_file() {
+        assert_eq!(
+            resolve_output_path(Some(Path::new("/tmp/out.png")), "diagram.png"),
+            PathBuf::from("/tmp/out.png")
+        );
+    }
+
+    #[test]
+    fn resolve_output_path_existing_dir_joins_title() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_output_path(Some(dir.path()), "diagram.png"),
+            dir.path().join("diagram.png")
+        );
+    }
+
+    // ── run_download (wiremock) ───────────────────────────────────
+
+    #[tokio::test]
+    async fn run_download_writes_file() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/attachments/att-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "att-1",
+                    "title": "notes.txt",
+                    "downloadLink": "/download/attachments/12345/notes.txt"
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/download/attachments/12345/notes.txt",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("downloaded.txt");
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "u@t.com", "tok")
+                .unwrap();
+        let api = ConfluenceApi::new(client);
+        assert!(run_download(&api, "att-1", Some(&out)).await.is_ok());
+        assert_eq!(std::fs::read(&out).unwrap(), b"hello");
+    }
+
     // ── *Command::execute (env-mutex serialised) ──────────────────
 
     fn set_atlassian_env(uri: &str) {
@@ -577,6 +707,47 @@ mod tests {
         let result = cmd.execute().await;
         clear_atlassian_env();
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn download_command_execute_runs_through_dispatch() {
+        let _lock = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/attachments/att-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "att-1",
+                    "title": "x.txt",
+                    "downloadLink": "/download/attachments/12345/x.txt"
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/download/attachments/12345/x.txt",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"hi".to_vec()))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("x.txt");
+        set_atlassian_env(&server.uri());
+        let cmd = AttachmentCommand {
+            command: AttachmentSubcommands::Download(DownloadCommand {
+                attachment_id: "att-1".to_string(),
+                output: Some(out.clone()),
+            }),
+        };
+        let result = cmd.execute().await;
+        clear_atlassian_env();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(std::fs::read(&out).unwrap(), b"hi");
     }
 
     #[tokio::test(flavor = "current_thread")]
