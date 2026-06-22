@@ -189,6 +189,7 @@ mod tests {
             "confluence_user_search",
             "confluence_attachment_upload",
             "confluence_attachment_list",
+            "confluence_attachment_download",
             "confluence_attachment_delete",
             "confluence_space_list",
         ] {

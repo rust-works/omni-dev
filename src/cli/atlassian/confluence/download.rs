@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 
 use crate::atlassian::api::AtlassianApi;
-use crate::atlassian::confluence_api::{ChildPage, ConfluenceApi};
+use crate::atlassian::confluence_api::{ChildPage, ConfluenceApi, ConfluenceAttachment};
 use crate::atlassian::document::content_item_to_document;
 use crate::cli::atlassian::format::ContentFormat;
 use crate::cli::atlassian::helpers::create_client;
@@ -74,6 +74,11 @@ pub struct DownloadCommand {
     #[arg(long)]
     pub resume: bool,
 
+    /// Also download each page's attachment binaries into an `attachments/`
+    /// subdirectory beside its content file.
+    #[arg(long)]
+    pub include_attachments: bool,
+
     /// What to do when a file already exists.
     #[arg(long, value_enum, default_value_t = OnConflict::Backup)]
     pub on_conflict: OnConflict,
@@ -95,6 +100,7 @@ struct DownloadConfig {
     instance_url: String,
     on_conflict: OnConflict,
     backup_dir: PathBuf,
+    include_attachments: bool,
 }
 
 /// Download statistics.
@@ -161,6 +167,8 @@ pub struct DownloadParams {
     pub title_filter: Option<String>,
     /// Use manifest to skip already-downloaded pages.
     pub resume: bool,
+    /// Also download each page's attachment binaries.
+    pub include_attachments: bool,
     /// Behavior when a file already exists at the target.
     pub on_conflict: OnConflict,
     /// Atlassian instance URL for building JFM frontmatter links.
@@ -179,6 +187,7 @@ impl DownloadParams {
             max_depth: cmd.max_depth,
             title_filter: cmd.title_filter,
             resume: cmd.resume,
+            include_attachments: cmd.include_attachments,
             on_conflict: cmd.on_conflict,
             instance_url,
         }
@@ -214,6 +223,7 @@ pub async fn run_download(api: &Arc<ConfluenceApi>, params: &DownloadParams) -> 
         instance_url: params.instance_url.clone(),
         on_conflict: params.on_conflict.clone(),
         backup_dir,
+        include_attachments: params.include_attachments,
     });
 
     // Load existing manifest for resume
@@ -683,7 +693,121 @@ async fn download_page(
         detail: String::new(),
     });
 
+    // Best-effort: fetch attachment binaries beside the page content.
+    if config.include_attachments {
+        download_page_attachments(api, id, title, dir, log_entries).await;
+    }
+
     true
+}
+
+/// Downloads every attachment on a page into `dir/attachments/`.
+///
+/// Best-effort: listing failures and individual binary failures are logged
+/// and swallowed — a broken attachment shouldn't fail an otherwise-successful
+/// page download, mirroring how child-listing errors are tolerated.
+async fn download_page_attachments(
+    api: &ConfluenceApi,
+    id: &str,
+    title: &str,
+    dir: &Path,
+    log_entries: &Mutex<Vec<LogEntry>>,
+) {
+    let attachments = match drain_attachments(api, id).await {
+        Ok(list) => list,
+        Err(e) => {
+            eprintln!("  WARNING: failed to list attachments of {id} - {title}: {e}");
+            log_entries.lock().await.push(LogEntry {
+                action: "attachment-failed".to_string(),
+                id: id.to_string(),
+                path: String::new(),
+                detail: format!("list failed: {e}"),
+            });
+            return;
+        }
+    };
+    if attachments.is_empty() {
+        return;
+    }
+
+    let att_dir = dir.join("attachments");
+    if let Err(e) = tokio::fs::create_dir_all(&att_dir).await {
+        eprintln!("  WARNING: failed to create attachments dir for {id}: {e}");
+        return;
+    }
+
+    for att in &attachments {
+        let dest = att_dir.join(attachment_filename(&att.title, &att.id));
+        let entry = match api.download_attachment_bytes(att).await {
+            Ok(bytes) => match tokio::fs::write(&dest, &bytes).await {
+                Ok(()) => {
+                    eprintln!("    Attachment: {} - {}", att.id, att.title);
+                    LogEntry {
+                        action: "attachment".to_string(),
+                        id: att.id.clone(),
+                        path: dest.to_string_lossy().to_string(),
+                        detail: String::new(),
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  WARNING: failed to write attachment {}: {e}", att.title);
+                    LogEntry {
+                        action: "attachment-failed".to_string(),
+                        id: att.id.clone(),
+                        path: dest.to_string_lossy().to_string(),
+                        detail: format!("{e}"),
+                    }
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "  WARNING: failed to download attachment {}: {e}",
+                    att.title
+                );
+                LogEntry {
+                    action: "attachment-failed".to_string(),
+                    id: att.id.clone(),
+                    path: dest.to_string_lossy().to_string(),
+                    detail: format!("{e}"),
+                }
+            }
+        };
+        log_entries.lock().await.push(entry);
+    }
+}
+
+/// Drains every page of a page's attachment list into one vector.
+async fn drain_attachments(
+    api: &ConfluenceApi,
+    page_id: &str,
+) -> Result<Vec<ConfluenceAttachment>> {
+    let mut all = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = api
+            .list_attachments(page_id, cursor.as_deref(), 100)
+            .await?;
+        all.extend(page.results);
+        match page.next_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    Ok(all)
+}
+
+/// Returns a safe, single-component filename for an attachment.
+///
+/// Attachment titles are remote-controlled, so strip everything but the final
+/// path component to prevent a malicious title (e.g. `../../etc/passwd`) from
+/// escaping the `attachments/` directory. Falls back to the attachment ID when
+/// the title has no usable file name.
+fn attachment_filename(title: &str, id: &str) -> String {
+    Path::new(title)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty() && s != "." && s != "..")
+        .unwrap_or_else(|| format!("attachment-{id}"))
 }
 
 /// Backs up a file before overwriting it.
@@ -853,6 +977,24 @@ mod tests {
     #[test]
     fn extension_adf() {
         assert_eq!(file_extension(&ContentFormat::Adf), "json");
+    }
+
+    // ── attachment_filename ────────────────────────────────────────
+
+    #[test]
+    fn attachment_filename_keeps_plain_name() {
+        assert_eq!(attachment_filename("diagram.png", "att-1"), "diagram.png");
+    }
+
+    #[test]
+    fn attachment_filename_strips_path_traversal() {
+        assert_eq!(attachment_filename("../../etc/passwd", "att-1"), "passwd");
+    }
+
+    #[test]
+    fn attachment_filename_falls_back_to_id() {
+        assert_eq!(attachment_filename("", "att-1"), "attachment-att-1");
+        assert_eq!(attachment_filename("..", "att-9"), "attachment-att-9");
     }
 
     // ── OnConflict ─────────────────────────────────────────────────
@@ -1030,6 +1172,7 @@ mod tests {
             max_depth: 0,
             title_filter: None,
             resume: false,
+            include_attachments: false,
             on_conflict: OnConflict::Backup,
         };
         assert_eq!(cmd.id.as_deref(), Some("12345"));
@@ -1089,6 +1232,7 @@ mod tests {
             max_depth: 7,
             title_filter: Some("needle".to_string()),
             resume: true,
+            include_attachments: true,
             on_conflict: OnConflict::Overwrite,
         };
         let params = DownloadParams::from_command(cmd, "https://org.atlassian.net".to_string());
@@ -1100,6 +1244,7 @@ mod tests {
         assert_eq!(params.max_depth, 7);
         assert_eq!(params.title_filter.as_deref(), Some("needle"));
         assert!(params.resume);
+        assert!(params.include_attachments);
         assert!(matches!(params.format, ContentFormat::Adf));
         assert!(matches!(params.on_conflict, OnConflict::Overwrite));
         assert_eq!(params.instance_url, "https://org.atlassian.net");
@@ -1142,6 +1287,7 @@ mod tests {
             max_depth: 0,
             title_filter: None,
             resume: false,
+            include_attachments: false,
             on_conflict: OnConflict::Overwrite,
         };
         let err = cmd.execute().await.unwrap_err();
@@ -1417,6 +1563,7 @@ mod tests {
             max_depth: 0,
             title_filter: None,
             resume: false,
+            include_attachments: false,
             on_conflict: OnConflict::Overwrite,
             instance_url,
         }
@@ -1440,6 +1587,243 @@ mod tests {
 
         assert!(run_download(&api, &params).await.is_ok());
         assert!(temp.path().join("manifest.json").exists());
+    }
+
+    #[tokio::test]
+    async fn run_download_include_attachments_fetches_binaries() {
+        let server = wiremock::MockServer::start().await;
+        mock_leaf_page(&server, "12345").await;
+
+        // Page "12345" has one attachment.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/attachments",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{
+                        "id": "att-1",
+                        "title": "img.png",
+                        "downloadLink": "/download/attachments/12345/img.png"
+                    }]
+                })),
+            )
+            .mount(&server)
+            .await;
+        // Its binary.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/download/attachments/12345/img.png",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"PNG".to_vec()))
+            .mount(&server)
+            .await;
+
+        let api = build_arc_api(&server);
+        let temp = tempfile::tempdir().unwrap();
+        let mut params = base_params(temp.path(), server.uri());
+        params.include_attachments = true;
+
+        assert!(run_download(&api, &params).await.is_ok());
+        let att = temp.path().join("12345-root-page/attachments/img.png");
+        assert_eq!(std::fs::read(&att).unwrap(), b"PNG");
+    }
+
+    #[tokio::test]
+    async fn run_download_include_attachments_tolerates_list_failure() {
+        let server = wiremock::MockServer::start().await;
+        mock_leaf_page(&server, "12345").await;
+
+        // Attachment listing fails — the page download must still succeed.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/attachments",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let api = build_arc_api(&server);
+        let temp = tempfile::tempdir().unwrap();
+        let mut params = base_params(temp.path(), server.uri());
+        params.include_attachments = true;
+
+        assert!(run_download(&api, &params).await.is_ok());
+        assert!(temp.path().join("12345-root-page/index.md").exists());
+        assert!(!temp.path().join("12345-root-page/attachments").exists());
+    }
+
+    // ── download_page_attachments / drain_attachments edge paths ───
+
+    /// A plain (non-`Arc`) API for calling the attachment helpers directly.
+    fn build_api(server: &wiremock::MockServer) -> ConfluenceApi {
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "user@test.com", "token")
+                .unwrap();
+        ConfluenceApi::new(client)
+    }
+
+    /// Mocks the v2 attachment-list endpoint for a page with a canned body.
+    async fn mock_attachment_list(
+        server: &wiremock::MockServer,
+        page_id: &str,
+        body: serde_json::Value,
+    ) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!(
+                "/wiki/api/v2/pages/{page_id}/attachments"
+            )))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn download_page_attachments_empty_list_is_noop() {
+        let server = wiremock::MockServer::start().await;
+        mock_attachment_list(&server, "EMPTY", serde_json::json!({"results": []})).await;
+
+        let api = build_api(&server);
+        let temp = tempfile::tempdir().unwrap();
+        let log: Mutex<Vec<LogEntry>> = Mutex::new(Vec::new());
+
+        download_page_attachments(&api, "EMPTY", "Empty Page", temp.path(), &log).await;
+
+        assert!(!temp.path().join("attachments").exists());
+        assert!(log.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn download_page_attachments_create_dir_failure_is_swallowed() {
+        let server = wiremock::MockServer::start().await;
+        mock_attachment_list(
+            &server,
+            "PG",
+            serde_json::json!({"results": [{
+                "id": "att-1",
+                "title": "img.png",
+                "downloadLink": "/download/attachments/PG/img.png"
+            }]}),
+        )
+        .await;
+
+        let api = build_api(&server);
+        let temp = tempfile::tempdir().unwrap();
+        // Plant a *file* where the `attachments/` directory would go so that
+        // `create_dir_all` fails; the helper must swallow it and return.
+        std::fs::write(temp.path().join("attachments"), b"not a dir").unwrap();
+
+        let log: Mutex<Vec<LogEntry>> = Mutex::new(Vec::new());
+        download_page_attachments(&api, "PG", "Page", temp.path(), &log).await;
+
+        assert!(temp.path().join("attachments").is_file());
+        assert!(log.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn download_page_attachments_write_failure_is_logged() {
+        let server = wiremock::MockServer::start().await;
+        mock_attachment_list(
+            &server,
+            "PG",
+            serde_json::json!({"results": [{
+                "id": "att-1",
+                "title": "blocked",
+                "downloadLink": "/download/attachments/PG/blocked"
+            }]}),
+        )
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/download/attachments/PG/blocked",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"DATA".to_vec()))
+            .mount(&server)
+            .await;
+
+        let api = build_api(&server);
+        let temp = tempfile::tempdir().unwrap();
+        // Make the destination path itself a directory so the file write fails
+        // *after* a successful download.
+        std::fs::create_dir_all(temp.path().join("attachments").join("blocked")).unwrap();
+
+        let log: Mutex<Vec<LogEntry>> = Mutex::new(Vec::new());
+        download_page_attachments(&api, "PG", "Page", temp.path(), &log).await;
+
+        let entries = log.lock().await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].action, "attachment-failed");
+        assert_eq!(entries[0].id, "att-1");
+    }
+
+    #[tokio::test]
+    async fn download_page_attachments_download_failure_is_logged() {
+        let server = wiremock::MockServer::start().await;
+        mock_attachment_list(
+            &server,
+            "PG",
+            serde_json::json!({"results": [{
+                "id": "att-1",
+                "title": "img.png",
+                "downloadLink": "/download/attachments/PG/img.png"
+            }]}),
+        )
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/download/attachments/PG/img.png",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let api = build_api(&server);
+        let temp = tempfile::tempdir().unwrap();
+        let log: Mutex<Vec<LogEntry>> = Mutex::new(Vec::new());
+        download_page_attachments(&api, "PG", "Page", temp.path(), &log).await;
+
+        let entries = log.lock().await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].action, "attachment-failed");
+        assert!(entries[0].path.ends_with("img.png"));
+    }
+
+    #[tokio::test]
+    async fn drain_attachments_follows_pagination_cursor() {
+        let server = wiremock::MockServer::start().await;
+        // First page: one attachment plus a `_links.next` cursor.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/PAGED/attachments",
+            ))
+            .and(wiremock::matchers::query_param_is_missing("cursor"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{"id": "att-1", "title": "a.png"}],
+                    "_links": {"next": "/wiki/api/v2/pages/PAGED/attachments?cursor=PAGE2&limit=100"}
+                })),
+            )
+            .mount(&server)
+            .await;
+        // Second page (cursor=PAGE2): one more attachment, no further cursor.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/PAGED/attachments",
+            ))
+            .and(wiremock::matchers::query_param("cursor", "PAGE2"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{"id": "att-2", "title": "b.png"}]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let api = build_api(&server);
+        let all = drain_attachments(&api, "PAGED").await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].id, "att-1");
+        assert_eq!(all[1].id, "att-2");
     }
 
     #[tokio::test]

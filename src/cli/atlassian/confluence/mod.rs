@@ -486,6 +486,7 @@ mod tests {
                 max_depth: 0,
                 title_filter: None,
                 resume: false,
+                include_attachments: false,
                 on_conflict: download::OnConflict::Backup,
             }),
         };
@@ -504,6 +505,7 @@ mod tests {
                 max_depth: 0,
                 title_filter: Some("architecture".to_string()),
                 resume: false,
+                include_attachments: false,
                 on_conflict: download::OnConflict::Backup,
             }),
         };
