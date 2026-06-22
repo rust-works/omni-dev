@@ -1213,7 +1213,33 @@ omni-dev atlassian confluence download --space ENG --concurrency 16 --max-depth 
 # Conflict resolution when a file already exists
 omni-dev atlassian confluence download --space ENG --on-conflict overwrite
 omni-dev atlassian confluence download --space ENG --on-conflict skip
+
+# Also fetch each page's attachment binaries into an `attachments/`
+# subdirectory beside its content file (full-page snapshots)
+omni-dev atlassian confluence download --space ENG --include-attachments
 ```
+
+#### Confluence: Attachments
+
+Manage attachment binaries on a page. Use `list` to discover attachment IDs,
+then `download` to pull a single binary off the page without dropping out to
+`curl` (credentials stay inside the wrapper).
+
+```bash
+# List a page's attachments (the ID column feeds `download`/`delete`)
+omni-dev atlassian confluence attachment list 12345
+
+# Download one attachment by ID — defaults to its filename in the cwd
+omni-dev atlassian confluence attachment download att-98765
+
+# Write it to an explicit path (an existing directory is joined with the
+# attachment's filename)
+omni-dev atlassian confluence attachment download att-98765 --output ./diagram.png
+omni-dev atlassian confluence attachment download att-98765 --output ./downloads/
+```
+
+To capture a whole page tree *with* its attachment binaries in one command,
+use `confluence download --include-attachments` (above).
 
 `--on-conflict` accepts `backup` (default — writes `.bak` and overwrites),
 `skip`, or `overwrite`.
