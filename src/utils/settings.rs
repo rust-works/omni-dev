@@ -12,11 +12,41 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 /// Settings loaded from $HOME/.omni-dev/settings.json.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct Settings {
     /// Environment variable overrides.
     #[serde(default)]
     pub env: HashMap<String, String>,
+}
+
+/// An [`EnvSource`](crate::utils::env::EnvSource) that reads the real process
+/// environment first and falls back to the `env` map in
+/// `$HOME/.omni-dev/settings.json` — the value form of [`get_env_var`].
+///
+/// Pass `&SettingsEnv::load()` from a thin production wrapper; tests inject a
+/// pure `MapEnv` into the same `*_with(&impl EnvSource, …)` seam instead of
+/// mutating the process environment.
+#[derive(Debug, Default)]
+pub struct SettingsEnv {
+    settings: Settings,
+}
+
+impl SettingsEnv {
+    /// Loads settings from the default location, falling back to an empty
+    /// settings map if they are absent or unreadable (env-only behaviour).
+    pub fn load() -> Self {
+        Self {
+            settings: Settings::load().unwrap_or_default(),
+        }
+    }
+}
+
+impl crate::utils::env::EnvSource for SettingsEnv {
+    fn var(&self, key: &str) -> Option<String> {
+        env::var(key)
+            .ok()
+            .or_else(|| self.settings.env.get(key).cloned())
+    }
 }
 
 impl Settings {
