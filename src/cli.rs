@@ -14,6 +14,7 @@ pub mod daemon;
 pub mod datadog;
 pub mod git;
 pub mod help;
+pub mod log;
 pub mod resources;
 pub mod snowflake;
 pub mod transcript;
@@ -145,6 +146,8 @@ pub enum Commands {
     Coverage(coverage::CoverageCommand),
     /// Transcript and caption fetching from media platforms.
     Transcript(transcript::TranscriptCommand),
+    /// Search the local invocation + HTTP request log.
+    Log(log::LogCommand),
     /// Embedded reference resources (specs, etc.).
     Resources(resources::ResourcesCommand),
     /// Generates shell completion scripts.
@@ -205,6 +208,7 @@ impl Cli {
             Commands::Snowflake(cmd) => cmd.execute().await,
             Commands::Coverage(cmd) => cmd.execute(repo).await,
             Commands::Transcript(cmd) => cmd.execute().await,
+            Commands::Log(log_cmd) => log_cmd.execute(),
             Commands::Config(config_cmd) => config_cmd.execute(),
             Commands::Resources(resources_cmd) => resources_cmd.execute(),
             Commands::Completions(completions_cmd) => completions_cmd.execute(),

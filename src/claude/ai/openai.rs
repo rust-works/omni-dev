@@ -342,10 +342,10 @@ impl OpenAiAiClient {
             req_builder = req_builder.header("Authorization", format!("Bearer {api_key}"));
         }
 
-        let response = req_builder
-            .send()
-            .await
-            .map_err(|e| ClaudeError::NetworkError(e.to_string()))?;
+        let started = std::time::Instant::now();
+        let send_result = req_builder.send().await;
+        super::record_ai_http(&api_url, started, &send_result);
+        let response = send_result.map_err(|e| ClaudeError::NetworkError(e.to_string()))?;
 
         let response = super::check_error_response(response).await?;
 

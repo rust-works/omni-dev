@@ -49,6 +49,7 @@ pub mod datadog;
 pub mod git;
 #[cfg(feature = "mcp")]
 pub mod mcp;
+pub mod request_log;
 pub mod resources;
 pub mod snowflake;
 pub mod transcript;
