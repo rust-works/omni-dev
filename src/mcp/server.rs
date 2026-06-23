@@ -241,6 +241,9 @@ mod tests {
             "jira_link_list",
             "jira_link_types",
             "jira_link_remove",
+            "jira_link_remote_list",
+            "jira_link_create",
+            "jira_link_parent",
             "jira_project_list",
             "jira_sprint_list",
             "jira_sprint_issues",
@@ -334,7 +337,6 @@ mod tests {
             "jira_transition_list",
             "jira_comment",
             "jira_comment_edit",
-            "jira_link",
             "jira_dev",
             "jira_user_search",
         ] {

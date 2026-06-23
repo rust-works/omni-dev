@@ -82,7 +82,7 @@ explicit `confirm: true`.
 | `git_twiddle_commits` | AI-powered commit message improvement | `omni-dev git commit message twiddle` |
 | `git_create_pr` | AI-drafted PR title + body, optionally pushed | `omni-dev git branch create pr` |
 
-### JIRA — core (10 tools)
+### JIRA — core (9 tools)
 
 | Tool | Purpose |
 |------|---------|
@@ -92,15 +92,14 @@ explicit `confirm: true`.
 | `jira_write` | Update an issue body, `parent`, `assignee`, `reporter`, or arbitrary `fields`. At least one of `content` or another field is required |
 | `jira_transition` | Apply or list workflow transitions (call with `list = true` first to discover names) |
 | `jira_comment` | Add a comment to an issue |
-| `jira_link` | Manage issue links: `create` (typed link), `parent` (set system parent), or list/remove. `remove` requires `confirm: true` |
 | `jira_dev` | Fetch development info (commits, branches, PRs) attached to an issue |
 | `jira_user_search` | Resolve a display name or email substring to an Atlassian `accountId` (call before `jira_write` for assignee/reporter) |
 | `jira_delete` | Permanently delete an issue. Requires `confirm: true` |
 
-### JIRA — extensions (18 tools)
+### JIRA — extensions (24 tools)
 
-Sprints, boards, watchers, worklogs, field metadata, attachments, project
-listing, and changelog history.
+Sprints, boards, watchers, worklogs, links, field metadata, attachments,
+project listing, and changelog history.
 
 | Family | Tools |
 |--------|-------|
@@ -108,6 +107,7 @@ listing, and changelog history.
 | Boards | `jira_board_list`, `jira_board_issues` |
 | Watchers | `jira_watcher_list`, `jira_watcher_add`, `jira_watcher_remove` (requires `confirm: true`) |
 | Worklogs | `jira_worklog_list`, `jira_worklog_add` |
+| Links | `jira_link_list`, `jira_link_types`, `jira_link_create`, `jira_link_parent`, `jira_link_remove` (requires `confirm: true`), `jira_link_remote_list` — one tool per `omni-dev atlassian jira link` subcommand |
 | Fields | `jira_field_list`, `jira_field_options` (custom-field discovery — see [user guide](user-guide.md#jira-fields)) |
 | Attachments | `jira_attachment_download`, `jira_attachment_images` |
 | Projects | `jira_project_list` |
