@@ -519,6 +519,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_assignee_only_no_file_skips_body_via_field_flag() {
+        // No file and no `--no-content`: the field-update flag alone signals a
+        // fields-only update (the `file.is_none() && other_fields_present`
+        // skip-body branch), so the description is left untouched and only the
+        // assignee is sent — without blocking on stdin.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "fields": {"assignee": {"accountId": "abc123"}}
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut c = cmd("PROJ-1");
+        c.assignee = Some("abc123".to_string());
+        c.execute_with_client(mock_client(&server.uri()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn execute_jfm_body_with_assignee_sends_combined_payload() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_jfm_file(&dir, "Body line");
@@ -639,4 +663,42 @@ mod tests {
         assert!(msg.contains("JFM markdown"), "got: {msg}");
     }
 
+    #[tokio::test]
+    async fn execute_assignee_collision_with_set_field_errors() {
+        // `--set-field` resolving to the `assignee` field id PLUS a typed
+        // `--assignee` must be rejected by `apply_user_field_overrides` rather
+        // than silently overriding. The editmeta field name matches the
+        // set-field key and uses a resolvable (string) schema so resolution
+        // succeeds and the collision is reached at the overrides layer.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/editmeta",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "fields": {
+                        "assignee": {
+                            "name": "assignee",
+                            "schema": {"type": "string"}
+                        }
+                    }
+                })),
+            )
+            .mount(&server)
+            .await;
+        // No PUT mock — the collision must short-circuit before any write.
+
+        let mut c = cmd("PROJ-1");
+        c.no_content = true;
+        c.assignee = Some("typed-id".to_string());
+        c.set_fields = vec!["assignee=set-id".to_string()];
+
+        let err = c
+            .execute_with_client(mock_client(&server.uri()))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("collides"), "unexpected error: {msg}");
+    }
 }

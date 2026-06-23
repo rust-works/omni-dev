@@ -1229,6 +1229,35 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn run_write_jira_with_resolved_fields_omits_description_when_none() {
+        // A fields-only update passes `description_adf = None` so the existing
+        // description is left untouched; only the custom field is sent.
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/ACCS-2"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "fields": {
+                    "customfield_10001": {"value": "Unplanned"}
+                }
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let mut custom = std::collections::BTreeMap::new();
+        custom.insert(
+            "customfield_10001".to_string(),
+            serde_json::json!({"value": "Unplanned"}),
+        );
+        run_write_jira_with_resolved_fields("ACCS-2", None, "", true, &custom, &client)
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn print_jira_dry_run_with_scalars_and_sections() {
         use crate::atlassian::document::CustomFieldSection;
