@@ -712,10 +712,13 @@ Output is a formatted table: `KEY | STATUS | ASSIGNEE | SUMMARY`.
 Create issues from JFM markdown or CLI flags:
 
 ```bash
-# From JFM file (project, type, summary from frontmatter)
+# From a plain markdown body — no frontmatter needed (all metadata via flags)
+omni-dev atlassian jira create body.md --project PROJ --type Story --summary "Fix login"
+
+# From a JFM file (project, type, summary read from frontmatter)
 omni-dev atlassian jira create issue.md
 
-# From CLI flags
+# Flags override matching frontmatter fields
 omni-dev atlassian jira create issue.md --project PROJ --type Bug --summary "Fix login"
 
 # From ADF JSON (all metadata via flags)
@@ -728,6 +731,15 @@ omni-dev atlassian jira create issue.md --set-field "Story Points=5" \
 # Preview without creating
 omni-dev atlassian jira create issue.md --dry-run
 ```
+
+Metadata is resolved with this precedence: **CLI flags first, then JFM
+frontmatter, then a derived or default value** (issue type defaults to
+`Task`). Flags always win.
+
+Frontmatter is optional. A file with no `---` block is treated entirely as
+the issue body, with every field taken from flags — the same way the MCP
+`jira_create` tool works. No `instance` is required: the target instance comes
+from auth config (`ATLASSIAN_*` env / `settings.json`), not the document.
 
 Prints the created issue key (e.g., `PROJ-124`) to stdout. `--set-field`
 values are parsed as YAML scalars (numbers, bools) when possible, falling
