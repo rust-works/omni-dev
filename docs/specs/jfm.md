@@ -6,6 +6,10 @@ JFM provides bidirectional conversion between Markdown and Atlassian Document
 Format (ADF), enabling JIRA Cloud issues and Confluence Cloud pages to be
 read, edited, and updated as local markdown files.
 
+For *why* this layer exists — its advantages over editing raw ADF JSON
+directly — see [Why JFM?](../why-jfm.md). This document covers the syntax
+itself.
+
 ## JFM Document Format
 
 A JFM document consists of YAML frontmatter followed by a markdown body,
