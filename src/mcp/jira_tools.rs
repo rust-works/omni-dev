@@ -596,6 +596,45 @@ pub(crate) async fn link_remote_list_yaml(client: &AtlassianClient, key: &str) -
     serde_yaml::to_string(&links).context("Failed to serialize remote issue links as YAML")
 }
 
+/// Parameters for the `jira_link_create` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LinkCreateParams {
+    /// Link type name, e.g. `Blocks` (use `jira_link_types` to list options).
+    pub link_type: String,
+    /// Source (inward) issue key — e.g. for `Blocks`, the issue doing the blocking.
+    pub inward: String,
+    /// Target (outward) issue key — e.g. for `Blocks`, the issue being blocked.
+    pub outward: String,
+}
+
+pub(crate) async fn link_create_yaml(
+    client: &AtlassianClient,
+    link_type: &str,
+    inward: &str,
+    outward: &str,
+) -> Result<String> {
+    client.create_issue_link(link_type, inward, outward).await?;
+    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+}
+
+/// Parameters for the `jira_link_parent` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LinkParentParams {
+    /// Parent issue key (e.g. the epic).
+    pub parent: String,
+    /// Child issue key to place under the parent.
+    pub child: String,
+}
+
+pub(crate) async fn link_parent_yaml(
+    client: &AtlassianClient,
+    parent: &str,
+    child: &str,
+) -> Result<String> {
+    client.set_issue_parent(child, parent).await?;
+    serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Worklog tools
 // ─────────────────────────────────────────────────────────────────────────
@@ -1212,6 +1251,50 @@ impl OmniDevServer {
         let yaml = (async {
             let (client, _) = create_client()?;
             link_remote_list_yaml(&client, &params.key).await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: create a typed link between two issues.
+    #[tool(
+        description = "Create a typed link between two JIRA issues (e.g. `Blocks`, \
+                       `Relates`). `link_type` is the type name (list options with \
+                       `jira_link_types`); `inward` is the source issue and `outward` \
+                       the target. To set hierarchy (Epic → Story / Story → Sub-task) \
+                       use `jira_link_parent` instead. Returns YAML `{status: ok}`. \
+                       Mirrors `omni-dev atlassian jira link create`."
+    )]
+    pub async fn jira_link_create(
+        &self,
+        Parameters(params): Parameters<LinkCreateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            link_create_yaml(&client, &params.link_type, &params.inward, &params.outward).await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: set an issue's parent (hierarchy link).
+    #[tool(
+        description = "Set a JIRA issue's parent — the system `parent` field for \
+                       Epic → Story / Story → Sub-task hierarchy, distinct from the \
+                       relationship links created by `jira_link_create`. `parent` is \
+                       the parent issue key (e.g. the epic); `child` is the issue placed \
+                       under it. Returns YAML `{status: ok}`. Mirrors `omni-dev \
+                       atlassian jira link parent`."
+    )]
+    pub async fn jira_link_parent(
+        &self,
+        Parameters(params): Parameters<LinkParentParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            link_parent_yaml(&client, &params.parent, &params.child).await
         })
         .await
         .map_err(tool_error)?;
@@ -2217,6 +2300,65 @@ mod tests {
         let client = mock_client(&server.uri());
         let err = link_remove_yaml(&client, "99", true).await.unwrap_err();
         assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn link_create_yaml_calls_api() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issueLink"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = link_create_yaml(&client, "Blocks", "PROJ-1", "PROJ-2")
+            .await
+            .unwrap();
+        assert!(yaml.contains("ok"));
+    }
+
+    #[tokio::test]
+    async fn link_create_yaml_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issueLink"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("Bad"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = link_create_yaml(&client, "Bad", "PROJ-1", "PROJ-2")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("400"));
+    }
+
+    #[tokio::test]
+    async fn link_parent_yaml_calls_api() {
+        let server = MockServer::start().await;
+        // The child issue (`PROJ-2`) is the one PUT-updated with the parent field.
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-2"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = link_parent_yaml(&client, "EPIC-1", "PROJ-2").await.unwrap();
+        assert!(yaml.contains("ok"));
+    }
+
+    #[tokio::test]
+    async fn link_parent_yaml_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-2"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = link_parent_yaml(&client, "EPIC-1", "PROJ-2")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("403"));
     }
 
     // ── worklogs ───────────────────────────────────────────────────

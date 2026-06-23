@@ -1328,11 +1328,11 @@ Manages JIRA issue links
 Usage: link <COMMAND>
 
 Commands:
-  list    Lists links on a JIRA issue
-  types   Lists available issue link types
-  create  Creates a link between two issues
-  remove  Removes an issue link by ID
-  epic    Links an issue to an epic (sets parent)
+  list    Lists links on a JIRA issue (mirrors the `jira_link_list` MCP tool)
+  types   Lists available issue link types (mirrors the `jira_link_types` MCP tool)
+  create  Creates a link between two issues (mirrors the `jira_link_create` MCP tool)
+  remove  Removes an issue link by ID (mirrors the `jira_link_remove` MCP tool)
+  parent  Sets an issue's parent — Epic → Story or Story → Sub-task (mirrors the `jira_link_parent` MCP tool)
   remote  Manages remote (external URL) issue links
   help    Print this message or the help of the given subcommand(s)
 
@@ -1342,9 +1342,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira link create - Creates a link between two issues
+omni-dev atlassian jira link create - Creates a link between two issues (mirrors the `jira_link_create` MCP tool)
 
-Creates a link between two issues
+Creates a link between two issues (mirrors the `jira_link_create` MCP tool)
 
 Usage: create --type <TYPE> --inward <INWARD> --outward <OUTWARD>
 
@@ -1357,23 +1357,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira link epic - Links an issue to an epic (sets parent)
+omni-dev atlassian jira link list - Lists links on a JIRA issue (mirrors the `jira_link_list` MCP tool)
 
-Links an issue to an epic (sets parent)
-
-Usage: epic --epic <EPIC> --issue <ISSUE>
-
-Options:
-      --epic <EPIC>    Epic issue key
-      --issue <ISSUE>  Issue key to link to the epic
-  -h, --help           Print help
-
-
-================================================================================
-
-omni-dev atlassian jira link list - Lists links on a JIRA issue
-
-Lists links on a JIRA issue
+Lists links on a JIRA issue (mirrors the `jira_link_list` MCP tool)
 
 Usage: list [OPTIONS] <KEY>
 
@@ -1383,6 +1369,20 @@ Arguments:
 Options:
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian jira link parent - Sets an issue's parent — Epic → Story or Story → Sub-task (mirrors the `jira_link_parent` MCP tool)
+
+Sets an issue's parent — Epic → Story or Story → Sub-task (mirrors the `jira_link_parent` MCP tool)
+
+Usage: parent --parent <PARENT> --child <CHILD>
+
+Options:
+      --parent <PARENT>  Parent issue key (e.g., the epic). Accepts `--epic` as an alias
+      --child <CHILD>    Child issue key to place under the parent. Accepts `--issue` as an alias
+  -h, --help             Print help
 
 
 ================================================================================
@@ -1394,7 +1394,7 @@ Manages remote (external URL) issue links
 Usage: remote <COMMAND>
 
 Commands:
-  list  Lists remote (external URL) links on a JIRA issue
+  list  Lists remote (external URL) links on a JIRA issue (mirrors the `jira_link_remote_list` MCP tool)
   help  Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1403,9 +1403,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira link remote list - Lists remote (external URL) links on a JIRA issue
+omni-dev atlassian jira link remote list - Lists remote (external URL) links on a JIRA issue (mirrors the `jira_link_remote_list` MCP tool)
 
-Lists remote (external URL) links on a JIRA issue
+Lists remote (external URL) links on a JIRA issue (mirrors the `jira_link_remote_list` MCP tool)
 
 Usage: list [OPTIONS] <KEY>
 
@@ -1419,9 +1419,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira link remove - Removes an issue link by ID
+omni-dev atlassian jira link remove - Removes an issue link by ID (mirrors the `jira_link_remove` MCP tool)
 
-Removes an issue link by ID
+Removes an issue link by ID (mirrors the `jira_link_remove` MCP tool)
 
 Usage: remove [OPTIONS] --link-id <LINK_ID>
 
@@ -1434,9 +1434,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira link types - Lists available issue link types
+omni-dev atlassian jira link types - Lists available issue link types (mirrors the `jira_link_types` MCP tool)
 
-Lists available issue link types
+Lists available issue link types (mirrors the `jira_link_types` MCP tool)
 
 Usage: types [OPTIONS]
 
