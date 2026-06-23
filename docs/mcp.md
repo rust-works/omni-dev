@@ -88,7 +88,7 @@ explicit `confirm: true`.
 |------|---------|
 | `jira_read` | Fetch a single issue (JFM markdown or ADF JSON). Supports `output_file`, `--fields`, `--all-fields` |
 | `jira_search` | JQL search; returns matching issues as YAML |
-| `jira_create` | Create a new issue. Supports `set_field` for custom fields |
+| `jira_create` | Create a new issue. Supports `custom_fields` (a `{name-or-id: value}` map resolved against the create screen) for fields a project requires at create time |
 | `jira_write` | Update an issue body, `assignee`, `reporter`, or arbitrary `fields`. At least one of `content` or another field is required. (Set the parent for hierarchy via the `jira_link_parent` tool.) |
 | `jira_transition` | Apply or list workflow transitions (call with `list = true` first to discover names) |
 | `jira_comment` | Add a comment to an issue |
