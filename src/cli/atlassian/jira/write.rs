@@ -10,7 +10,7 @@ use crate::atlassian::convert::markdown_to_adf;
 use crate::atlassian::custom_fields::{
     apply_user_field_overrides, merge_set_field_overrides, parse_set_field, resolve_custom_fields,
 };
-use crate::atlassian::document::{validate_issue_key, CustomFieldSection, JfmDocument};
+use crate::atlassian::document::{CustomFieldSection, JfmDocument};
 use crate::atlassian::jira_api::JiraApi;
 use crate::cli::atlassian::format::ContentFormat;
 use crate::cli::atlassian::helpers::{
@@ -25,8 +25,8 @@ pub struct WriteCommand {
     pub key: String,
 
     /// Input file (reads from stdin if omitted or "-"). Pass `--no-content`,
-    /// or omit when `--parent`/`--assignee`/`--reporter`/`--set-field` is
-    /// supplied alone, to leave the description untouched.
+    /// or omit when `--assignee`/`--reporter`/`--set-field` is supplied
+    /// alone, to leave the description untouched.
     pub file: Option<String>,
 
     /// Input format.
@@ -56,12 +56,6 @@ pub struct WriteCommand {
     /// frontmatter `custom_fields:` map for the same name.
     #[arg(long = "set-field", value_name = "NAME=VALUE")]
     pub set_fields: Vec<String>,
-
-    /// Sets the parent issue key (e.g., establishes Epic → Story or
-    /// Story → Sub-task hierarchy). Maps to JIRA's `parent` system field;
-    /// distinct from "Composition" links created via `omni-dev jira link`.
-    #[arg(long, value_name = "KEY")]
-    pub parent: Option<String>,
 
     /// Skips the confirmation prompt.
     #[arg(long)]
@@ -96,17 +90,12 @@ impl WriteCommand {
             .map(|s| parse_set_field(s))
             .collect::<Result<Vec<_>>>()?;
 
-        if let Some(ref parent_key) = self.parent {
-            validate_issue_key(parent_key)?;
-        }
-        let parent = self.parent.as_deref();
-
         let user_fields_present = self.assignee.is_some() || self.reporter.is_some();
-        let other_fields_present = user_fields_present || parent.is_some() || !overrides.is_empty();
+        let other_fields_present = user_fields_present || !overrides.is_empty();
 
         if self.no_content && !other_fields_present {
             anyhow::bail!(
-                "nothing to update: pass --assignee, --reporter, --parent, or --set-field, \
+                "nothing to update: pass --assignee, --reporter, or --set-field, \
                  or remove --no-content to update the description"
             );
         }
@@ -120,8 +109,8 @@ impl WriteCommand {
         // Read body / title / frontmatter scalars / custom-field sections.
         // Skip body parsing when --no-content is explicit, OR when the user
         // supplied no file *and* one of the field-update flags is set
-        // (parent/assignee/reporter/--set-field) — that combination signals
-        // a "fields-only" update and should not block on stdin.
+        // (assignee/reporter/--set-field) — that combination signals a
+        // "fields-only" update and should not block on stdin.
         let skip_body = self.no_content || (self.file.is_none() && other_fields_present);
         let (body_adf, title, frontmatter_scalars, sections): (
             Option<AdfDocument>,
@@ -159,7 +148,6 @@ impl WriteCommand {
                 &self.key,
                 body_adf.as_ref(),
                 &title,
-                parent,
                 self.assignee.as_deref(),
                 self.reporter.as_deref(),
                 &scalars,
@@ -170,7 +158,7 @@ impl WriteCommand {
         let client = make_client()?;
 
         // Fast path: simple description+title update with no other field changes.
-        if !user_fields_present && scalars.is_empty() && sections.is_empty() && parent.is_none() {
+        if !user_fields_present && scalars.is_empty() && sections.is_empty() {
             // SAFETY: `body_adf` is always Some here because the
             // skip_body && !other_fields_present case was rejected above.
             let Some(body_adf) = body_adf else {
@@ -203,7 +191,6 @@ impl WriteCommand {
             &self.key,
             validated_body.as_ref(),
             &title,
-            parent,
             self.force,
             &resolved,
             &client,
@@ -232,7 +219,6 @@ mod tests {
             assignee: None,
             reporter: None,
             set_fields: vec![],
-            parent: None,
             force: true,
             dry_run: false,
         }
@@ -376,77 +362,6 @@ mod tests {
         assert!(rt.block_on(c.execute()).is_ok());
     }
 
-    #[test]
-    fn dry_run_parent_only_skips_description() {
-        let mut c = cmd("PROJ-1");
-        c.parent = Some("PROJ-99".to_string());
-        c.force = false;
-        c.dry_run = true;
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(c.execute());
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn invalid_parent_key_errors() {
-        let mut c = cmd("PROJ-1");
-        c.parent = Some("not a key".to_string());
-        c.force = false;
-        c.dry_run = true;
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let err = rt.block_on(c.execute()).unwrap_err();
-        assert!(err.to_string().contains("Invalid JIRA issue key"));
-    }
-
-    #[test]
-    fn dry_run_body_with_parent_prints_both() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let file_path = temp_dir.path().join("issue.md");
-        let content = "---\ntype: jira\ninstance: https://org.atlassian.net\nkey: PROJ-1\nsummary: T\n---\n\nBody\n";
-        fs::write(&file_path, content).unwrap();
-
-        let mut c = cmd("PROJ-1");
-        c.file = Some(file_path.to_str().unwrap().to_string());
-        c.parent = Some("PROJ-99".to_string());
-        c.force = false;
-        c.dry_run = true;
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        assert!(rt.block_on(c.execute()).is_ok());
-    }
-
-    #[test]
-    fn dry_run_adf_parent_only_skips_description() {
-        let mut c = cmd("PROJ-1");
-        c.format = ContentFormat::Adf;
-        c.parent = Some("PROJ-99".to_string());
-        c.force = false;
-        c.dry_run = true;
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        assert!(rt.block_on(c.execute()).is_ok());
-    }
-
-    #[test]
-    fn dry_run_adf_body_with_parent_prints_both() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let file_path = temp_dir.path().join("issue.json");
-        let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"Hi"}]}]}"#;
-        fs::write(&file_path, adf_json).unwrap();
-
-        let mut c = cmd("PROJ-1");
-        c.file = Some(file_path.to_str().unwrap().to_string());
-        c.format = ContentFormat::Adf;
-        c.parent = Some("PROJ-99".to_string());
-        c.force = false;
-        c.dry_run = true;
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        assert!(rt.block_on(c.execute()).is_ok());
-    }
-
     // ── execute_with_client (real-write paths) ────────────────────────
 
     fn mock_client(base_url: &str) -> AtlassianClient {
@@ -469,62 +384,6 @@ mod tests {
         );
         fs::write(&p, content).unwrap();
         p.to_str().unwrap().to_string()
-    }
-
-    #[tokio::test]
-    async fn execute_adf_parent_only_sends_parent_field() {
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("PUT"))
-            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
-            .and(wiremock::matchers::body_json(serde_json::json!({
-                "fields": {"parent": {"key": "PROJ-99"}}
-            })))
-            .respond_with(wiremock::ResponseTemplate::new(204))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let mut c = cmd("PROJ-1");
-        c.format = ContentFormat::Adf;
-        c.parent = Some("PROJ-99".to_string());
-        c.execute_with_client(mock_client(&server.uri()))
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn execute_adf_body_with_parent_sends_both() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_adf_file(&dir, "Hello");
-
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("PUT"))
-            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
-            .and(wiremock::matchers::body_json(serde_json::json!({
-                "fields": {
-                    "description": {
-                        "version": 1,
-                        "type": "doc",
-                        "content": [{
-                            "type": "paragraph",
-                            "content": [{"type": "text", "text": "Hello"}]
-                        }]
-                    },
-                    "parent": {"key": "PROJ-99"}
-                }
-            })))
-            .respond_with(wiremock::ResponseTemplate::new(204))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let mut c = cmd("PROJ-1");
-        c.file = Some(path);
-        c.format = ContentFormat::Adf;
-        c.parent = Some("PROJ-99".to_string());
-        c.execute_with_client(mock_client(&server.uri()))
-            .await
-            .unwrap();
     }
 
     #[tokio::test]
@@ -575,26 +434,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_jfm_parent_only_sends_parent_field() {
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("PUT"))
-            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
-            .and(wiremock::matchers::body_json(serde_json::json!({
-                "fields": {"parent": {"key": "PROJ-99"}}
-            })))
-            .respond_with(wiremock::ResponseTemplate::new(204))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let mut c = cmd("PROJ-1");
-        c.parent = Some("PROJ-99".to_string());
-        c.execute_with_client(mock_client(&server.uri()))
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
     async fn execute_jfm_body_no_parent_no_fields_uses_run_write() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_jfm_file(&dir, "Body");
@@ -609,41 +448,6 @@ mod tests {
 
         let mut c = cmd("PROJ-1");
         c.file = Some(path);
-        c.execute_with_client(mock_client(&server.uri()))
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn execute_jfm_body_with_parent_sends_both() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_jfm_file(&dir, "Body");
-
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("PUT"))
-            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
-            .and(wiremock::matchers::body_json(serde_json::json!({
-                "fields": {
-                    "description": {
-                        "version": 1,
-                        "type": "doc",
-                        "content": [{
-                            "type": "paragraph",
-                            "content": [{"type": "text", "text": "Body"}]
-                        }]
-                    },
-                    "summary": "T",
-                    "parent": {"key": "PROJ-99"}
-                }
-            })))
-            .respond_with(wiremock::ResponseTemplate::new(204))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let mut c = cmd("PROJ-1");
-        c.file = Some(path);
-        c.parent = Some("PROJ-99".to_string());
         c.execute_with_client(mock_client(&server.uri()))
             .await
             .unwrap();
@@ -709,6 +513,30 @@ mod tests {
         let mut c = cmd("PROJ-1");
         c.no_content = true;
         c.reporter = Some("rep123".to_string());
+        c.execute_with_client(mock_client(&server.uri()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_assignee_only_no_file_skips_body_via_field_flag() {
+        // No file and no `--no-content`: the field-update flag alone signals a
+        // fields-only update (the `file.is_none() && other_fields_present`
+        // skip-body branch), so the description is left untouched and only the
+        // assignee is sent — without blocking on stdin.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "fields": {"assignee": {"accountId": "abc123"}}
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut c = cmd("PROJ-1");
+        c.assignee = Some("abc123".to_string());
         c.execute_with_client(mock_client(&server.uri()))
             .await
             .unwrap();
@@ -837,9 +665,11 @@ mod tests {
 
     #[tokio::test]
     async fn execute_assignee_collision_with_set_field_errors() {
-        // When --set-field assignee=... is also supplied, the typed --assignee
-        // collides via apply_user_field_overrides. Exercised via editmeta
-        // because resolve_custom_fields runs first.
+        // `--set-field` resolving to the `assignee` field id PLUS a typed
+        // `--assignee` must be rejected by `apply_user_field_overrides` rather
+        // than silently overriding. The editmeta field name matches the
+        // set-field key and uses a resolvable (string) schema so resolution
+        // succeeds and the collision is reached at the overrides layer.
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path(
@@ -849,14 +679,15 @@ mod tests {
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "fields": {
                         "assignee": {
-                            "name": "Assignee",
-                            "schema": {"type": "user"}
+                            "name": "assignee",
+                            "schema": {"type": "string"}
                         }
                     }
                 })),
             )
             .mount(&server)
             .await;
+        // No PUT mock — the collision must short-circuit before any write.
 
         let mut c = cmd("PROJ-1");
         c.no_content = true;
@@ -868,13 +699,6 @@ mod tests {
             .await
             .unwrap_err();
         let msg = err.to_string();
-        // Either resolve_custom_fields rejects the user-typed schema kind, or
-        // apply_user_field_overrides catches the duplicate key. Either is a
-        // legitimate failure mode — the user-facing guarantee is that the
-        // collision does not silently override.
-        assert!(
-            msg.contains("collides") || msg.contains("user") || msg.contains("assignee"),
-            "unexpected error: {msg}"
-        );
+        assert!(msg.contains("collides"), "unexpected error: {msg}");
     }
 }

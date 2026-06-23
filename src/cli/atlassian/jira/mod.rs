@@ -135,7 +135,6 @@ mod tests {
                 assignee: None,
                 reporter: None,
                 set_fields: vec![],
-                parent: None,
                 force: false,
                 dry_run: false,
             }),

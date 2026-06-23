@@ -653,7 +653,6 @@ omni-dev atlassian jira write PROJ-123 issue.md --dry-run
 
 # Update fields without re-posting the description body
 omni-dev atlassian jira write PROJ-123 --no-content --assignee 5b10a2844c20165700ede21g
-omni-dev atlassian jira write PROJ-123 --no-content --parent EPIC-1
 omni-dev atlassian jira write PROJ-123 --no-content --reporter "" --set-field "Priority=High"
 
 # Interactive edit: fetch -> $EDITOR -> push
@@ -663,9 +662,9 @@ omni-dev atlassian jira edit PROJ-123
 `--assignee` / `--reporter` take an Atlassian `accountId` — pass the empty
 string `""` to clear, or `"-1"` to trigger automatic assignment. Use
 [`jira user search`](#jira-user-search) to resolve a display name or email
-to an `accountId`. `--parent` sets JIRA's system parent field (Epic → Story
-or Story → Sub-task); it is distinct from "Composition" links created via
-[`jira link`](#jira-issue-links).
+to an `accountId`. To set an issue's parent for hierarchy (Epic → Story or
+Story → Sub-task), use [`jira link parent`](#jira-issue-links) — the canonical
+hierarchy surface.
 
 The edit command opens an interactive loop:
 1. Fetches the issue and writes JFM to a temp file
