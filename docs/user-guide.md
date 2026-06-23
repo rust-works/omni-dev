@@ -939,8 +939,9 @@ omni-dev atlassian jira link create --type Blocks --inward PROJ-1 --outward PROJ
 # Remove a link by ID (get IDs from `link list`)
 omni-dev atlassian jira link remove --link-id 12345
 
-# Link an issue to an epic
-omni-dev atlassian jira link epic --epic EPIC-1 --issue PROJ-2
+# Set an issue's parent — Epic → Story or Story → Sub-task
+# (`--epic`/`--issue` are accepted as aliases for `--parent`/`--child`)
+omni-dev atlassian jira link parent --parent EPIC-1 --child PROJ-2
 ```
 
 #### JIRA: Changelog

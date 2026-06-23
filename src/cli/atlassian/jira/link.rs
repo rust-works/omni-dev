@@ -21,16 +21,17 @@ pub struct LinkCommand {
 /// Link subcommands.
 #[derive(Subcommand)]
 pub enum LinkSubcommands {
-    /// Lists links on a JIRA issue.
+    /// Lists links on a JIRA issue (mirrors the `jira_link_list` MCP tool).
     List(ListLinksCommand),
-    /// Lists available issue link types.
+    /// Lists available issue link types (mirrors the `jira_link_types` MCP tool).
     Types(TypesCommand),
-    /// Creates a link between two issues.
+    /// Creates a link between two issues (mirrors the `jira_link_create` MCP tool).
     Create(CreateLinkCommand),
-    /// Removes an issue link by ID.
+    /// Removes an issue link by ID (mirrors the `jira_link_remove` MCP tool).
     Remove(RemoveLinkCommand),
-    /// Links an issue to an epic (sets parent).
-    Epic(EpicLinkCommand),
+    /// Sets an issue's parent — Epic → Story or Story → Sub-task (mirrors the `jira_link_parent` MCP tool).
+    #[command(alias = "epic")]
+    Parent(ParentLinkCommand),
     /// Manages remote (external URL) issue links.
     Remote(RemoteLinkCommand),
 }
@@ -43,7 +44,7 @@ impl LinkCommand {
             LinkSubcommands::Types(cmd) => cmd.execute().await,
             LinkSubcommands::Create(cmd) => cmd.execute().await,
             LinkSubcommands::Remove(cmd) => cmd.execute().await,
-            LinkSubcommands::Epic(cmd) => cmd.execute().await,
+            LinkSubcommands::Parent(cmd) => cmd.execute().await,
             LinkSubcommands::Remote(cmd) => cmd.execute().await,
         }
     }
@@ -166,23 +167,23 @@ impl RemoveLinkCommand {
     }
 }
 
-/// Links an issue to an epic.
+/// Sets an issue's parent (e.g., Epic → Story or Story → Sub-task).
 #[derive(Parser)]
-pub struct EpicLinkCommand {
-    /// Epic issue key.
-    #[arg(long)]
-    pub epic: String,
+pub struct ParentLinkCommand {
+    /// Parent issue key (e.g., the epic). Accepts `--epic` as an alias.
+    #[arg(long, alias = "epic")]
+    pub parent: String,
 
-    /// Issue key to link to the epic.
-    #[arg(long)]
-    pub issue: String,
+    /// Child issue key to place under the parent. Accepts `--issue` as an alias.
+    #[arg(long, alias = "issue")]
+    pub child: String,
 }
 
-impl EpicLinkCommand {
-    /// Sets the epic as the parent of the issue.
+impl ParentLinkCommand {
+    /// Sets the parent of the child issue.
     pub async fn execute(self) -> Result<()> {
         let (client, _instance_url) = create_client()?;
-        run_epic_link(&client, &self.epic, &self.issue).await
+        run_parent_link(&client, &self.parent, &self.child).await
     }
 }
 
@@ -197,7 +198,7 @@ pub struct RemoteLinkCommand {
 /// Remote link subcommands.
 #[derive(Subcommand)]
 pub enum RemoteLinkSubcommands {
-    /// Lists remote (external URL) links on a JIRA issue.
+    /// Lists remote (external URL) links on a JIRA issue (mirrors the `jira_link_remote_list` MCP tool).
     List(ListRemoteLinksCommand),
 }
 
@@ -267,10 +268,10 @@ async fn run_create_link(
     Ok(())
 }
 
-/// Links an issue to an epic.
-async fn run_epic_link(client: &AtlassianClient, epic: &str, issue: &str) -> Result<()> {
-    client.set_issue_parent(issue, epic).await?;
-    println!("Linked {issue} to epic {epic}.");
+/// Sets the parent of an issue.
+async fn run_parent_link(client: &AtlassianClient, parent: &str, child: &str) -> Result<()> {
+    client.set_issue_parent(child, parent).await?;
+    println!("Set parent of {child} to {parent}.");
     Ok(())
 }
 
@@ -566,14 +567,14 @@ mod tests {
     }
 
     #[test]
-    fn link_command_epic_variant() {
+    fn link_command_parent_variant() {
         let cmd = LinkCommand {
-            command: LinkSubcommands::Epic(EpicLinkCommand {
-                epic: "EPIC-1".to_string(),
-                issue: "PROJ-2".to_string(),
+            command: LinkSubcommands::Parent(ParentLinkCommand {
+                parent: "EPIC-1".to_string(),
+                child: "PROJ-2".to_string(),
             }),
         };
-        assert!(matches!(cmd.command, LinkSubcommands::Epic(_)));
+        assert!(matches!(cmd.command, LinkSubcommands::Parent(_)));
     }
 
     // ── struct fields ──────────────────────────────────────────────
@@ -591,13 +592,13 @@ mod tests {
     }
 
     #[test]
-    fn epic_link_command_fields() {
-        let cmd = EpicLinkCommand {
-            epic: "EPIC-1".to_string(),
-            issue: "STORY-1".to_string(),
+    fn parent_link_command_fields() {
+        let cmd = ParentLinkCommand {
+            parent: "EPIC-1".to_string(),
+            child: "STORY-1".to_string(),
         };
-        assert_eq!(cmd.epic, "EPIC-1");
-        assert_eq!(cmd.issue, "STORY-1");
+        assert_eq!(cmd.parent, "EPIC-1");
+        assert_eq!(cmd.child, "STORY-1");
     }
 
     // ── run_* link functions ───────────────────────────────────────
@@ -827,7 +828,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_epic_link_success() {
+    async fn run_parent_link_success() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("PUT"))
             .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-2"))
@@ -836,11 +837,11 @@ mod tests {
             .await;
 
         let client = mock_client(&server.uri());
-        assert!(run_epic_link(&client, "EPIC-1", "PROJ-2").await.is_ok());
+        assert!(run_parent_link(&client, "EPIC-1", "PROJ-2").await.is_ok());
     }
 
     #[tokio::test]
-    async fn run_epic_link_api_error() {
+    async fn run_parent_link_api_error() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("PUT"))
             .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-2"))
@@ -849,7 +850,7 @@ mod tests {
             .await;
 
         let client = mock_client(&server.uri());
-        let err = run_epic_link(&client, "EPIC-1", "PROJ-2")
+        let err = run_parent_link(&client, "EPIC-1", "PROJ-2")
             .await
             .unwrap_err();
         assert!(err.to_string().contains("403"));
