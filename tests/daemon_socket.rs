@@ -38,6 +38,7 @@ use omni_dev::daemon::registry::ServiceRegistry;
 use omni_dev::daemon::server::{run, DaemonOptions};
 use omni_dev::daemon::service::{DaemonService, MenuSnapshot, ServiceStatus};
 use omni_dev::daemon::services::echo::EchoService;
+use omni_dev::daemon::services::worktrees::WorktreesService;
 use omni_dev::daemon::single_instance::{bind_or_reclaim, bind_private};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -144,6 +145,96 @@ async fn ping_and_status_and_routing() {
         assert!(!reply.ok);
     })
     .await;
+}
+
+/// The worktrees service round-trips its register/heartbeat/list/unregister ops
+/// over the real control socket: a window registers, appears in `list`,
+/// heartbeats as `known`, then unregisters and is gone. This proves the wire
+/// routing end to end; TTL reaping is covered by the service's own unit tests.
+#[tokio::test]
+async fn worktrees_register_list_unregister_round_trip() {
+    let _gate = UMASK_GATE.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("d.sock");
+    let mut registry = ServiceRegistry::new();
+    registry.register(Arc::new(WorktreesService::new()));
+    let opts = DaemonOptions {
+        socket_path: socket.clone(),
+    };
+    let handle = tokio::spawn(run(registry, opts));
+
+    let client = DaemonClient::new(&socket);
+    for _ in 0..50 {
+        if client.ping().await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // A window registers itself.
+    let reply = client
+        .request(DaemonEnvelope::service(
+            "worktrees",
+            "register",
+            json!({
+                "key": "win-1",
+                "folders": ["/tmp/project"],
+                "repo": "project",
+                "title": "project — main",
+                "pid": 4321,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert!(reply.ok, "register failed: {:?}", reply.error);
+
+    // It shows up in the live cross-window list.
+    let reply = client
+        .request(DaemonEnvelope::service("worktrees", "list", Value::Null))
+        .await
+        .unwrap();
+    assert!(reply.ok);
+    let windows = reply.payload["windows"].as_array().unwrap();
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0]["key"], json!("win-1"));
+    assert_eq!(windows[0]["repo"], json!("project"));
+
+    // A heartbeat for a registered window is `known`.
+    let reply = client
+        .request(DaemonEnvelope::service(
+            "worktrees",
+            "heartbeat",
+            json!({ "key": "win-1" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reply.payload, json!({ "known": true }));
+
+    // The built-in status aggregates the service summary.
+    let report = client.status().await.unwrap();
+    assert_eq!(report.services.len(), 1);
+    assert_eq!(report.services[0].name, "worktrees");
+    assert_eq!(report.services[0].summary, "1 window(s) across 1 repo(s)");
+
+    // The window closes and is removed.
+    let reply = client
+        .request(DaemonEnvelope::service(
+            "worktrees",
+            "unregister",
+            json!({ "key": "win-1" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reply.payload, json!({ "removed": true }));
+
+    let reply = client
+        .request(DaemonEnvelope::service("worktrees", "list", Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(reply.payload, json!({ "windows": [] }));
+
+    client.shutdown().await.ok();
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
 }
 
 #[tokio::test]
