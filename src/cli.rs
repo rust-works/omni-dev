@@ -23,6 +23,8 @@ pub mod resources;
 #[cfg(unix)]
 pub mod snowflake;
 pub mod transcript;
+#[cfg(unix)]
+pub mod worktrees;
 
 /// CLI-side selector for the AI backend dispatched by
 /// [`create_default_claude_client`][crate::claude::client::create_default_claude_client].
@@ -149,6 +151,9 @@ pub enum Commands {
     /// Snowflake: run arbitrary SQL through the daemon's multiplexed sessions.
     #[cfg(unix)]
     Snowflake(snowflake::SnowflakeCommand),
+    /// Worktrees: list the repos/worktrees open across all VS Code windows.
+    #[cfg(unix)]
+    Worktrees(worktrees::WorktreesCommand),
     /// Coverage: diff/patch coverage analysis for PR comments.
     Coverage(coverage::CoverageCommand),
     /// Transcript and caption fetching from media platforms.
@@ -215,6 +220,8 @@ impl Cli {
             Commands::Datadog(cmd) => cmd.execute().await,
             #[cfg(unix)]
             Commands::Snowflake(cmd) => cmd.execute().await,
+            #[cfg(unix)]
+            Commands::Worktrees(cmd) => cmd.execute().await,
             Commands::Coverage(cmd) => cmd.execute(repo).await,
             Commands::Transcript(cmd) => cmd.execute().await,
             Commands::Log(log_cmd) => log_cmd.execute(),

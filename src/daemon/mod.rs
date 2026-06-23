@@ -66,6 +66,8 @@ use server::DaemonOptions;
 use services::bridge::BridgeService;
 #[cfg(unix)]
 use services::snowflake::SnowflakeService;
+#[cfg(unix)]
+use services::worktrees::WorktreesService;
 
 /// Everything `daemon run` needs to start the daemon, resolved from the CLI.
 ///
@@ -88,12 +90,13 @@ pub struct DaemonRunConfig {
 
 /// Builds the daemon's default service registry: starts the browser bridge on
 /// its loopback-TCP planes and registers it alongside the Snowflake query
-/// service.
+/// service and the cross-window worktrees registry.
 ///
 /// `bridge_token_file` overrides token generation; `bridge_token_path` is where
 /// the resolved token is persisted (`0600`) for thin-client discovery. The
 /// Snowflake service is registered cheaply (no eager auth or I/O); its sessions
-/// are authenticated lazily on first query.
+/// are authenticated lazily on first query. The worktrees service is likewise
+/// cheap (in-memory only); it fills as VS Code windows register.
 #[cfg(unix)]
 pub async fn build_default_registry(
     bridge_config: BridgeConfig,
@@ -105,6 +108,7 @@ pub async fn build_default_registry(
     registry.register(Arc::new(bridge));
     let snowflake = SnowflakeService::new(SnowflakeEngineConfig::from_env_and_settings()?);
     registry.register(Arc::new(snowflake));
+    registry.register(Arc::new(WorktreesService::new()));
     Ok(registry)
 }
 
