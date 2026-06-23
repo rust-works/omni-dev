@@ -212,6 +212,76 @@ impl EditMetaField {
     }
 }
 
+/// Introspection of the create screen for a project + issue type, returned by
+/// [`AtlassianClient::get_project_create_meta`].
+///
+/// Unlike [`EditMeta`] (which keeps only `name` + `schema`), this carries the
+/// `required` flag, allowed values, and defaults — collapsing the
+/// create→HTTP&nbsp;400→`field list`→`field options` recovery loop into a single
+/// pre-flight call.
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateMeta {
+    /// Project key the metadata was requested for (e.g., `PROJ`).
+    pub project: String,
+
+    /// Issue type the metadata was requested for (e.g., `Task`).
+    pub issue_type: String,
+
+    /// Fields on the create screen, sorted required-first then by name.
+    pub fields: Vec<CreateMetaField>,
+}
+
+/// A single field on the create screen.
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateMetaField {
+    /// Field ID (e.g., `summary` or `customfield_10001`).
+    pub field_id: String,
+
+    /// Human-readable field name.
+    pub name: String,
+
+    /// Whether the field must be supplied to create the issue.
+    pub required: bool,
+
+    /// Base schema type: `string`, `option`, `array`, `user`, `date`, etc.
+    pub schema_type: String,
+
+    /// For `array` fields: the element type (`schema.items`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub items: Option<String>,
+
+    /// For custom fields: the plugin type URI, e.g.
+    /// `com.atlassian.jira.plugin.system.customfieldtypes:select`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom: Option<String>,
+
+    /// Allowed values for option/select/cascading-select fields (empty for
+    /// free-form fields).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allowed_values: Vec<CreateMetaAllowedValue>,
+
+    /// The field's default value, if the create screen defines one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_value: Option<serde_json::Value>,
+}
+
+/// One allowed value for a field, normalized across the shapes JIRA returns
+/// (option `value`, version/component/priority `name`, cascading `children`).
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateMetaAllowedValue {
+    /// Option ID, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+
+    /// Display value: the option's `value`, falling back to its `name`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+
+    /// Nested options for cascading-select fields.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<Self>,
+}
+
 /// A JIRA user, returned by `GET /rest/api/3/myself` and embedded in
 /// [`JiraWatcherList::watchers`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1021,6 +1091,79 @@ struct JiraCreateMetaProject {
 struct JiraCreateMetaIssueType {
     #[serde(default)]
     fields: std::collections::BTreeMap<String, JiraEditMetaField>,
+}
+
+/// Full createmeta response, parsed for the richer `create-meta` introspection
+/// (keeps `required`, `allowedValues`, and `defaultValue`, which the lean
+/// `JiraCreateMeta*` path above discards).
+#[derive(Deserialize)]
+struct JiraCreateMetaFullResponse {
+    #[serde(default)]
+    projects: Vec<JiraCreateMetaFullProject>,
+}
+
+#[derive(Deserialize)]
+struct JiraCreateMetaFullProject {
+    #[serde(default)]
+    issuetypes: Vec<JiraCreateMetaFullIssueType>,
+}
+
+#[derive(Deserialize)]
+struct JiraCreateMetaFullIssueType {
+    #[serde(default)]
+    fields: std::collections::BTreeMap<String, JiraCreateMetaFieldRaw>,
+}
+
+#[derive(Deserialize)]
+struct JiraCreateMetaFieldRaw {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    required: bool,
+    #[serde(default)]
+    schema: Option<JiraCreateMetaSchemaRaw>,
+    #[serde(rename = "allowedValues", default)]
+    allowed_values: Vec<JiraAllowedValueRaw>,
+    #[serde(rename = "defaultValue", default)]
+    default_value: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct JiraCreateMetaSchemaRaw {
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    #[serde(default)]
+    items: Option<String>,
+    #[serde(default)]
+    custom: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct JiraAllowedValueRaw {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    children: Vec<Self>,
+}
+
+impl JiraAllowedValueRaw {
+    /// Normalizes one raw allowed value: display value is `value` falling back
+    /// to `name`; children recurse.
+    fn into_allowed_value(self) -> CreateMetaAllowedValue {
+        CreateMetaAllowedValue {
+            id: self.id,
+            value: self.value.or(self.name),
+            children: self
+                .children
+                .into_iter()
+                .map(Self::into_allowed_value)
+                .collect(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -2755,6 +2898,156 @@ mod tests {
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
         let err = client.get_createmeta("NOPE", "Task").await.unwrap_err();
         assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn get_project_create_meta_parses_required_allowed_and_default() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/createmeta"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "projects": [{
+                        "issuetypes": [{
+                            "fields": {
+                                "summary": {
+                                    "name": "Summary",
+                                    "required": true,
+                                    "schema": { "type": "string" }
+                                },
+                                "customfield_10001": {
+                                    "name": "Work Type",
+                                    "required": true,
+                                    "schema": {
+                                        "type": "option",
+                                        "custom": "com.atlassian.jira.plugin.system.customfieldtypes:select"
+                                    },
+                                    "defaultValue": { "id": "10100", "value": "Planned" },
+                                    "allowedValues": [
+                                        { "id": "10100", "value": "Planned" },
+                                        { "id": "10101", "value": "Unplanned" }
+                                    ]
+                                },
+                                "customfield_10002": {
+                                    "name": "Region",
+                                    "required": false,
+                                    "schema": {
+                                        "type": "option-with-child",
+                                        "custom": "com.atlassian.jira.plugin.system.customfieldtypes:cascadingselect"
+                                    },
+                                    "allowedValues": [
+                                        {
+                                            "id": "20000",
+                                            "value": "APAC",
+                                            "children": [
+                                                { "id": "20001", "value": "AU" },
+                                                { "id": "20002", "value": "NZ" }
+                                            ]
+                                        }
+                                    ]
+                                },
+                                "labels": {
+                                    "name": "Labels",
+                                    "required": false,
+                                    "schema": { "type": "array", "items": "string" }
+                                }
+                            }
+                        }]
+                    }]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let meta = client
+            .get_project_create_meta("PROJ", "Task")
+            .await
+            .unwrap();
+
+        assert_eq!(meta.project, "PROJ");
+        assert_eq!(meta.issue_type, "Task");
+        assert_eq!(meta.fields.len(), 4);
+
+        // Required fields sort first (Summary before Work Type by name).
+        assert_eq!(meta.fields[0].field_id, "summary");
+        assert!(meta.fields[0].required);
+        assert_eq!(meta.fields[1].field_id, "customfield_10001");
+        assert!(meta.fields[1].required);
+        // Optional fields follow, alphabetically by name (Labels, Region).
+        assert!(!meta.fields[2].required);
+        assert_eq!(meta.fields[2].name, "Labels");
+        assert!(!meta.fields[3].required);
+        assert_eq!(meta.fields[3].name, "Region");
+
+        let work_type = &meta.fields[1];
+        assert_eq!(work_type.schema_type, "option");
+        assert_eq!(
+            work_type.custom.as_deref(),
+            Some("com.atlassian.jira.plugin.system.customfieldtypes:select")
+        );
+        assert_eq!(work_type.allowed_values.len(), 2);
+        assert_eq!(
+            work_type.allowed_values[0].value.as_deref(),
+            Some("Planned")
+        );
+        assert!(work_type.default_value.is_some());
+
+        // labels (array) carries its element type.
+        let labels = &meta.fields[2];
+        assert_eq!(labels.schema_type, "array");
+        assert_eq!(labels.items.as_deref(), Some("string"));
+
+        // Cascading select resolves nested children.
+        let region = &meta.fields[3];
+        assert_eq!(region.allowed_values.len(), 1);
+        assert_eq!(region.allowed_values[0].value.as_deref(), Some("APAC"));
+        assert_eq!(region.allowed_values[0].children.len(), 2);
+        assert_eq!(
+            region.allowed_values[0].children[0].value.as_deref(),
+            Some("AU")
+        );
+    }
+
+    #[tokio::test]
+    async fn get_project_create_meta_empty_projects_returns_empty_fields() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/createmeta"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "projects": [] })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let meta = client
+            .get_project_create_meta("PROJ", "Task")
+            .await
+            .unwrap();
+        assert!(meta.fields.is_empty());
+        assert_eq!(meta.project, "PROJ");
+    }
+
+    #[tokio::test]
+    async fn get_project_create_meta_api_error_surfaces_status() {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/createmeta"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .get_project_create_meta("NOPE", "Task")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("403"));
     }
 
     #[tokio::test]
@@ -7275,6 +7568,95 @@ impl AtlassianClient {
             })
             .collect();
         Ok(EditMeta { fields })
+    }
+
+    /// Introspects the create screen for a project + issue type, returning each
+    /// field with its `required` flag, schema type, allowed values, and default.
+    ///
+    /// `GET /rest/api/3/issue/createmeta?projectKeys={p}&issuetypeNames={t}&expand=projects.issuetypes.fields`
+    /// — the same endpoint as [`get_createmeta`](Self::get_createmeta), parsed
+    /// for the full field metadata an agent needs to prompt before creating.
+    pub async fn get_project_create_meta(
+        &self,
+        project_key: &str,
+        issue_type: &str,
+    ) -> Result<CreateMeta> {
+        let base = format!("{}/rest/api/3/issue/createmeta", self.instance_url);
+        let url = reqwest::Url::parse_with_params(
+            &base,
+            &[
+                ("projectKeys", project_key),
+                ("issuetypeNames", issue_type),
+                ("expand", "projects.issuetypes.fields"),
+            ],
+        )
+        .context("Failed to build JIRA createmeta URL")?;
+
+        let response = self
+            .client
+            .get(url)
+            .header("Authorization", &self.auth_header)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .context("Failed to send createmeta request to JIRA API")?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+        }
+
+        let raw: JiraCreateMetaFullResponse = response
+            .json()
+            .await
+            .context("Failed to parse JIRA createmeta response")?;
+
+        let mut fields: Vec<CreateMetaField> = raw
+            .projects
+            .into_iter()
+            .next()
+            .and_then(|p| p.issuetypes.into_iter().next())
+            .map(|it| {
+                it.fields
+                    .into_iter()
+                    .map(|(field_id, field)| {
+                        let schema = field.schema.unwrap_or(JiraCreateMetaSchemaRaw {
+                            kind: None,
+                            items: None,
+                            custom: None,
+                        });
+                        CreateMetaField {
+                            field_id,
+                            name: field.name.unwrap_or_default(),
+                            required: field.required,
+                            schema_type: schema.kind.unwrap_or_default(),
+                            items: schema.items,
+                            custom: schema.custom,
+                            allowed_values: field
+                                .allowed_values
+                                .into_iter()
+                                .map(JiraAllowedValueRaw::into_allowed_value)
+                                .collect(),
+                            default_value: field.default_value,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Required fields first, then alphabetically by name for stable output.
+        fields.sort_by(|a, b| {
+            b.required
+                .cmp(&a.required)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+
+        Ok(CreateMeta {
+            project: project_key.to_string(),
+            issue_type: issue_type.to_string(),
+            fields,
+        })
     }
 
     /// Lists comments on a JIRA issue with auto-pagination.

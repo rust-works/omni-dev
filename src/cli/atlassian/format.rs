@@ -8,8 +8,8 @@ use serde::Serialize;
 
 use crate::atlassian::client::{
     AgileBoardList, AgileSprintList, ConfluenceSearchResults, ConfluenceUserSearchResults,
-    JiraDevStatus, JiraDevStatusSummary, JiraProjectList, JiraProjectVersionList, JiraSearchResult,
-    JiraUserSearchResults, JiraWatcherList, JiraWorklogList,
+    CreateMeta, JiraDevStatus, JiraDevStatusSummary, JiraProjectList, JiraProjectVersionList,
+    JiraSearchResult, JiraUserSearchResults, JiraWatcherList, JiraWorklogList,
 };
 use crate::atlassian::confluence_api::{
     ConfluenceAttachmentPage, ConfluenceSpacePage, PageSummaryPage,
@@ -98,6 +98,12 @@ impl JsonlSerialize for JiraSearchResult {
 impl JsonlSerialize for JiraProjectList {
     fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
         write_items_jsonl(self.projects.iter(), out)
+    }
+}
+
+impl JsonlSerialize for CreateMeta {
+    fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
+        write_items_jsonl(self.fields.iter(), out)
     }
 }
 
