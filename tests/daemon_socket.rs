@@ -32,6 +32,9 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::Notify;
 
+use clap::Parser as _;
+use omni_dev::cli::worktrees::{ListCommand, WorktreesCommand, WorktreesSubcommands};
+use omni_dev::cli::Cli;
 use omni_dev::daemon::client::DaemonClient;
 use omni_dev::daemon::protocol::{DaemonEnvelope, DaemonReply, MAX_LINE_BYTES};
 use omni_dev::daemon::registry::ServiceRegistry;
@@ -235,6 +238,99 @@ async fn worktrees_register_list_unregister_round_trip() {
 
     client.shutdown().await.ok();
     let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+}
+
+/// Drives the real `omni-dev worktrees` CLI command structs against a live
+/// daemon: the table path, the `--json` path, the top-level `Cli` dispatch, and
+/// the daemon-down error path. This is the only way to cover the CLI's
+/// socket-connecting code (it cannot run in the lib unit-test binary, which must
+/// not bind sockets — see the module header).
+#[tokio::test]
+async fn worktrees_cli_list_against_live_daemon() {
+    let _gate = UMASK_GATE.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("d.sock");
+    let mut registry = ServiceRegistry::new();
+    registry.register(Arc::new(WorktreesService::new()));
+    let handle = tokio::spawn(run(
+        registry,
+        DaemonOptions {
+            socket_path: socket.clone(),
+        },
+    ));
+
+    let client = DaemonClient::new(&socket);
+    for _ in 0..50 {
+        if client.ping().await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Seed one window so the table path has a row to render.
+    client
+        .request(DaemonEnvelope::service(
+            "worktrees",
+            "register",
+            json!({ "key": "k1", "folders": ["/tmp/p"], "repo": "p", "title": "p" }),
+        ))
+        .await
+        .unwrap();
+
+    // Table path (json = false) and JSON path (json = true).
+    ListCommand {
+        socket: Some(socket.clone()),
+        json: false,
+    }
+    .execute()
+    .await
+    .unwrap();
+    ListCommand {
+        socket: Some(socket.clone()),
+        json: true,
+    }
+    .execute()
+    .await
+    .unwrap();
+
+    // Through the subcommand wrapper.
+    WorktreesCommand {
+        command: WorktreesSubcommands::List(ListCommand {
+            socket: Some(socket.clone()),
+            json: false,
+        }),
+    }
+    .execute()
+    .await
+    .unwrap();
+
+    // Through the top-level CLI parse + dispatch (covers the dispatch arm).
+    let sock_str = socket.to_str().unwrap();
+    Cli::try_parse_from([
+        "omni-dev",
+        "worktrees",
+        "list",
+        "--socket",
+        sock_str,
+        "--json",
+    ])
+    .unwrap()
+    .execute()
+    .await
+    .unwrap();
+
+    client.shutdown().await.ok();
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+    // With the daemon down, the CLI surfaces the connection failure.
+    let missing = dir.path().join("absent.sock");
+    assert!(ListCommand {
+        socket: Some(missing),
+        json: false,
+    }
+    .execute()
+    .await
+    .is_err());
 }
 
 #[tokio::test]

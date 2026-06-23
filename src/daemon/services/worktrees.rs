@@ -16,7 +16,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -291,11 +291,28 @@ fn window_menu_items(entries: &[WindowEntry]) -> Vec<MenuItem> {
     items
 }
 
+/// Well-known absolute locations for the VS Code launcher, tried in order so a
+/// daemon running under launchd (with a minimal `PATH`) still finds it.
+const CODE_BINARY_CANDIDATES: &[&str] = &[
+    "/usr/local/bin/code",
+    "/opt/homebrew/bin/code",
+    "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
+    "/usr/bin/code",
+];
+
 /// Focuses (or opens, since VS Code reuses an already-open window) `folder` in
-/// VS Code by spawning its CLI. Best-effort: the daemon may run under launchd
-/// with a minimal `PATH`, so [`resolve_code_binary`] resolves the launcher from
-/// well-known locations before falling back to bare `code` on `PATH`.
+/// VS Code by spawning its CLI, resolved via [`resolve_code_binary`].
 fn focus_window(folder: &Path) -> Result<()> {
+    focus_window_with(&resolve_code_binary(), folder)
+}
+
+/// Spawns `program` on `folder` after validating the folder. Split out from
+/// [`focus_window`] so the validation and spawn paths are testable with an
+/// explicit launcher (no environment or installed-editor dependency).
+///
+/// Best-effort and non-blocking: the spawned child is reaped on a detached
+/// thread so a long-lived daemon does not accumulate zombies one per focus.
+fn focus_window_with(program: &Path, folder: &Path) -> Result<()> {
     // Workspace-folder paths are absolute; requiring it also rules out a path
     // that begins with `-` being parsed by `code` as a flag.
     if !folder.is_absolute() {
@@ -307,9 +324,13 @@ fn focus_window(folder: &Path) -> Result<()> {
     if !folder.is_dir() {
         bail!("worktree folder no longer exists: {}", folder.display());
     }
-    let program = resolve_code_binary();
-    Command::new(&program)
+    // Detach the launcher's stdio so its output never interleaves into the
+    // long-lived daemon's own stdout/stderr (or the test harness's).
+    let child = Command::new(program)
         .arg(folder)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .with_context(|| {
             format!(
@@ -318,23 +339,32 @@ fn focus_window(folder: &Path) -> Result<()> {
                 folder.display()
             )
         })?;
+    // Reap the child without blocking so it never lingers as a zombie.
+    std::thread::spawn(move || {
+        let mut child = child;
+        let _ = child.wait();
+    });
     Ok(())
 }
 
-/// Resolves the VS Code launcher: the `OMNI_DEV_VSCODE_BIN` override, then a
-/// short list of well-known absolute locations (so a launchd daemon with a
-/// minimal `PATH` still finds it), then bare `code` resolved via `PATH`.
+/// Resolves the VS Code launcher from the real environment: the
+/// `OMNI_DEV_VSCODE_BIN` override, then [`CODE_BINARY_CANDIDATES`], then bare
+/// `code` on `PATH`. The pure resolution logic lives in
+/// [`resolve_code_binary_from`] for testing.
 fn resolve_code_binary() -> PathBuf {
-    if let Some(path) = std::env::var_os(VSCODE_BIN_ENV) {
+    resolve_code_binary_from(std::env::var_os(VSCODE_BIN_ENV), CODE_BINARY_CANDIDATES)
+}
+
+/// Pure launcher resolution: `env_override` wins; otherwise the first existing
+/// `candidate`; otherwise bare `code`.
+fn resolve_code_binary_from(
+    env_override: Option<std::ffi::OsString>,
+    candidates: &[&str],
+) -> PathBuf {
+    if let Some(path) = env_override {
         return PathBuf::from(path);
     }
-    const CANDIDATES: &[&str] = &[
-        "/usr/local/bin/code",
-        "/opt/homebrew/bin/code",
-        "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
-        "/usr/bin/code",
-    ];
-    for candidate in CANDIDATES {
+    for candidate in candidates {
         let path = Path::new(candidate);
         if path.exists() {
             return path.to_path_buf();
@@ -550,9 +580,70 @@ mod tests {
         let nothing = WindowEntry {
             repo: None,
             folders: vec![],
-            ..base
+            ..base.clone()
         };
         assert_eq!(display_name(&nothing), "(no folder)");
+
+        // A folder with no basename (the filesystem root) falls back to its
+        // displayed path rather than panicking or yielding an empty name.
+        let rootish = WindowEntry {
+            repo: None,
+            folders: vec![PathBuf::from("/")],
+            ..base
+        };
+        assert_eq!(display_name(&rootish), "/");
+    }
+
+    #[test]
+    fn default_constructs_an_empty_service() {
+        let svc = WorktreesService::default();
+        assert!(svc.lock().is_empty());
+    }
+
+    #[test]
+    fn window_menu_items_label_omits_redundant_title_and_skips_folderless_actions() {
+        let now = Utc::now();
+        let entries = vec![
+            // Title differs from the repo name → "name · title".
+            WindowEntry {
+                key: "k1".to_string(),
+                folders: vec![PathBuf::from("/tmp/a")],
+                repo: Some("repo".to_string()),
+                title: Some("a branch".to_string()),
+                pid: None,
+                last_seen: now,
+            },
+            // Title equals the display name → label is just the name (the
+            // `_ => name` arm), and no folder means no Focus action.
+            WindowEntry {
+                key: "k2".to_string(),
+                folders: vec![],
+                repo: Some("solo".to_string()),
+                title: Some("solo".to_string()),
+                pid: None,
+                last_seen: now,
+            },
+        ];
+        let items = window_menu_items(&entries);
+        let labels: Vec<&str> = items
+            .iter()
+            .filter_map(|i| match i {
+                MenuItem::Label(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(labels.contains(&"repo · a branch"));
+        assert!(labels.contains(&"solo")); // not "solo · solo"
+
+        let action_ids: Vec<&str> = items
+            .iter()
+            .filter_map(|i| match i {
+                MenuItem::Action(a) => Some(a.id.as_str()),
+                _ => None,
+            })
+            .collect();
+        // Only the folder-bearing window gets a Focus action.
+        assert_eq!(action_ids, vec!["focus:k1"]);
     }
 
     #[tokio::test]
@@ -604,20 +695,71 @@ mod tests {
         svc.shutdown().await;
     }
 
-    #[test]
-    fn resolve_code_binary_honors_env_override() {
-        // Use a guard so the process-global env mutation is undone.
-        struct Guard(Option<std::ffi::OsString>);
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(v) => std::env::set_var(VSCODE_BIN_ENV, v),
-                    None => std::env::remove_var(VSCODE_BIN_ENV),
-                }
+    /// Restores `OMNI_DEV_VSCODE_BIN` on drop. Only this test reads the variable
+    /// (via `resolve_code_binary` → `focus_window`), so there is no cross-test
+    /// race despite the process-global mutation.
+    struct VscodeBinGuard(Option<std::ffi::OsString>);
+    impl Drop for VscodeBinGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var(VSCODE_BIN_ENV, v),
+                None => std::env::remove_var(VSCODE_BIN_ENV),
             }
         }
-        let _g = Guard(std::env::var_os(VSCODE_BIN_ENV));
-        std::env::set_var(VSCODE_BIN_ENV, "/custom/code");
-        assert_eq!(resolve_code_binary(), PathBuf::from("/custom/code"));
+    }
+
+    #[tokio::test]
+    async fn menu_action_focus_resolves_folder_and_spawns() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = WorktreesService::new();
+        svc.handle(
+            "register",
+            json!({ "key": "w1", "folders": [dir.path()], "repo": "r" }),
+        )
+        .await
+        .unwrap();
+
+        // Point the launcher at a harmless binary so the spawn deterministically
+        // succeeds and the focus path returns Ok.
+        let _g = VscodeBinGuard(std::env::var_os(VSCODE_BIN_ENV));
+        std::env::set_var(VSCODE_BIN_ENV, "/bin/sh");
+        svc.menu_action("focus:w1").await.unwrap();
+    }
+
+    #[test]
+    fn focus_window_with_validates_folder_then_spawns() {
+        let dir = tempfile::tempdir().unwrap();
+        // Non-absolute and missing-directory folders are rejected before spawn.
+        assert!(focus_window_with(Path::new("/bin/sh"), Path::new("relative/dir")).is_err());
+        assert!(
+            focus_window_with(Path::new("/bin/sh"), Path::new("/no/such/abs/dir/xyzzy")).is_err()
+        );
+        // A valid absolute directory spawns the launcher successfully.
+        focus_window_with(Path::new("/bin/sh"), dir.path()).unwrap();
+        // A missing launcher surfaces the spawn error (with context), not Ok.
+        assert!(focus_window_with(Path::new("/no/such/launcher/xyzzy"), dir.path()).is_err());
+    }
+
+    #[test]
+    fn resolve_code_binary_from_prefers_env_then_candidate_then_fallback() {
+        // Env override wins outright.
+        assert_eq!(
+            resolve_code_binary_from(Some("/custom/code".into()), &["/usr/bin/code"]),
+            PathBuf::from("/custom/code")
+        );
+        // No override: the first existing candidate is chosen.
+        let existing = tempfile::NamedTempFile::new().unwrap();
+        let existing_path = existing.path().to_str().unwrap();
+        assert_eq!(
+            resolve_code_binary_from(None, &["/no/such/candidate/xyzzy", existing_path]),
+            PathBuf::from(existing_path)
+        );
+        // Nothing exists: fall back to bare `code` on PATH.
+        assert_eq!(
+            resolve_code_binary_from(None, &["/no/such/candidate/xyzzy"]),
+            PathBuf::from("code")
+        );
+        // The real-env wrapper resolves without panicking.
+        let _ = resolve_code_binary();
     }
 }
