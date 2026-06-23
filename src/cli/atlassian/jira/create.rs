@@ -12,11 +12,22 @@ use crate::atlassian::convert::markdown_to_adf;
 use crate::atlassian::custom_fields::{
     merge_set_field_overrides, parse_set_field, resolve_custom_fields,
 };
-use crate::atlassian::document::{CustomFieldSection, JfmDocument, JfmFrontmatter};
+use crate::atlassian::document::{
+    split_custom_sections, split_frontmatter, CustomFieldSection, JiraCreateFrontmatter,
+};
 use crate::cli::atlassian::format::ContentFormat;
 use crate::cli::atlassian::helpers::{create_client, print_create_dry_run, read_input};
 
 /// Creates a new JIRA issue.
+///
+/// Metadata is resolved with this precedence: CLI flags first, then JFM
+/// frontmatter, then a derived or default value. Flags always win.
+///
+/// Frontmatter is optional. A file with no `---` block is treated entirely as
+/// the issue body, with every field taken from flags (the same way the MCP
+/// `jira_create` tool works) — so `--project` and `--summary` (plus an
+/// optional `--type`) are enough to create an issue from a plain markdown
+/// body. No `instance` is needed: the target is taken from auth config.
 #[derive(Parser)]
 pub struct CreateCommand {
     /// Input file containing JFM markdown or ADF JSON (reads from stdin if omitted or "-").
@@ -102,38 +113,40 @@ impl CreateCommand {
     }
 
     /// Resolves parameters from JFM input, with CLI flags as overrides.
+    ///
+    /// Frontmatter is optional: an input with no `---` block is treated
+    /// entirely as the issue body, with all metadata sourced from flags
+    /// (parity with the MCP `jira_create` tool). Resolution precedence is
+    /// flags → frontmatter → derived/default.
     fn resolve_from_jfm(
         &self,
         overrides: Vec<(String, serde_yaml::Value)>,
     ) -> Result<CreateParams> {
         let input = read_input(self.file.as_deref())?;
-        let doc = JfmDocument::parse(&input)?;
-        let (body_md, custom_sections) = doc.split_custom_sections();
+        let (fm_yaml, raw_body) = split_frontmatter(&input)?;
+
+        let fm: JiraCreateFrontmatter = match fm_yaml {
+            Some(yaml) => {
+                serde_yaml::from_str(yaml).context("Failed to parse JFM frontmatter YAML")?
+            }
+            None => JiraCreateFrontmatter::default(),
+        };
+
+        if fm.r#type.as_deref() == Some("confluence") {
+            anyhow::bail!("Cannot create a JIRA issue from Confluence frontmatter");
+        }
+
+        let (body_md, custom_sections) = split_custom_sections(&raw_body);
         let adf = ValidatedAdfDocument::try_new(markdown_to_adf(&body_md)?)?;
 
-        let (fm_project, fm_issue_type, fm_summary, fm_labels, fm_scalars) = match &doc.frontmatter
-        {
-            JfmFrontmatter::Jira(fm) => {
-                // Derive project from key if project field is absent
-                let project = fm.project.clone().or_else(|| {
-                    if fm.key.is_empty() {
-                        None
-                    } else {
-                        fm.key.split('-').next().map(String::from)
-                    }
-                });
-                (
-                    project,
-                    fm.issue_type.clone(),
-                    Some(fm.summary.clone()),
-                    fm.labels.clone(),
-                    fm.custom_fields.clone(),
-                )
+        // Derive project from key when no explicit project field is present.
+        let fm_project = fm.project.clone().or_else(|| {
+            if fm.key.is_empty() {
+                None
+            } else {
+                fm.key.split('-').next().map(String::from)
             }
-            JfmFrontmatter::Confluence(_) => {
-                anyhow::bail!("Cannot create a JIRA issue from Confluence frontmatter");
-            }
-        };
+        });
 
         let project = self.project.clone().or(fm_project).ok_or_else(|| {
             anyhow::anyhow!("Project key is required (use --project or set in frontmatter)")
@@ -142,20 +155,24 @@ impl CreateCommand {
         let issue_type = self
             .r#type
             .clone()
-            .or(fm_issue_type)
+            .or(fm.issue_type)
             .unwrap_or_else(|| "Task".to_string());
 
-        let summary = self.summary.clone().or(fm_summary).ok_or_else(|| {
-            anyhow::anyhow!("Summary is required (use --summary or set in frontmatter)")
-        })?;
+        let summary = self
+            .summary
+            .clone()
+            .or_else(|| fm.summary.filter(|s| !s.is_empty()))
+            .ok_or_else(|| {
+                anyhow::anyhow!("Summary is required (use --summary or set in frontmatter)")
+            })?;
 
-        let custom_scalars = merge_set_field_overrides(fm_scalars, overrides);
+        let custom_scalars = merge_set_field_overrides(fm.custom_fields, overrides);
 
         Ok(CreateParams {
             project,
             issue_type,
             summary,
-            labels: fm_labels,
+            labels: fm.labels,
             adf,
             custom_scalars,
             custom_sections,
@@ -442,6 +459,117 @@ mod tests {
 
         let params = cmd.resolve_params().unwrap();
         assert_eq!(params.issue_type, "Task");
+    }
+
+    #[test]
+    fn resolve_from_jfm_no_frontmatter_uses_flags() {
+        // Issue #1050: a plain markdown body with no `---` block resolves all
+        // metadata from flags (MCP `jira_create` parity).
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("body.md");
+        fs::write(&file_path, "Just a plain markdown body.\n").unwrap();
+
+        let cmd = CreateCommand {
+            file: Some(file_path.to_str().unwrap().to_string()),
+            format: ContentFormat::Jfm,
+            project: Some("PROJ".to_string()),
+            r#type: Some("Story".to_string()),
+            summary: Some("Flag-driven".to_string()),
+            set_fields: vec![],
+            dry_run: false,
+        };
+
+        let params = cmd.resolve_params().unwrap();
+        assert_eq!(params.project, "PROJ");
+        assert_eq!(params.issue_type, "Story");
+        assert_eq!(params.summary, "Flag-driven");
+    }
+
+    #[test]
+    fn resolve_from_jfm_no_frontmatter_defaults_issue_type_to_task() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("body.md");
+        fs::write(&file_path, "Body.\n").unwrap();
+
+        let cmd = CreateCommand {
+            file: Some(file_path.to_str().unwrap().to_string()),
+            format: ContentFormat::Jfm,
+            project: Some("PROJ".to_string()),
+            r#type: None,
+            summary: Some("S".to_string()),
+            set_fields: vec![],
+            dry_run: false,
+        };
+
+        let params = cmd.resolve_params().unwrap();
+        assert_eq!(params.issue_type, "Task");
+    }
+
+    #[test]
+    fn resolve_from_jfm_no_frontmatter_missing_project_errors() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("body.md");
+        fs::write(&file_path, "Body only.\n").unwrap();
+
+        let cmd = CreateCommand {
+            file: Some(file_path.to_str().unwrap().to_string()),
+            format: ContentFormat::Jfm,
+            project: None,
+            r#type: None,
+            summary: Some("Has summary".to_string()),
+            set_fields: vec![],
+            dry_run: false,
+        };
+
+        let err = cmd.resolve_params().unwrap_err();
+        assert!(err.to_string().contains("Project key is required"));
+    }
+
+    #[test]
+    fn resolve_from_jfm_no_frontmatter_missing_summary_errors() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("body.md");
+        fs::write(&file_path, "Body only.\n").unwrap();
+
+        let cmd = CreateCommand {
+            file: Some(file_path.to_str().unwrap().to_string()),
+            format: ContentFormat::Jfm,
+            project: Some("PROJ".to_string()),
+            r#type: None,
+            summary: None,
+            set_fields: vec![],
+            dry_run: false,
+        };
+
+        let err = cmd.resolve_params().unwrap_err();
+        assert!(err.to_string().contains("Summary is required"));
+    }
+
+    #[test]
+    fn resolve_from_jfm_partial_frontmatter_without_instance_falls_back_to_flags() {
+        // Issue #1050: frontmatter present but missing `instance` and
+        // `summary` — previously a hard parse error. Now `instance` is
+        // irrelevant to create and `summary` falls back to the flag, while
+        // frontmatter-only fields (project, labels) are still honored.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("issue.md");
+        let content = "---\ntype: jira\nproject: PROJ\nlabels:\n  - backend\n---\n\nBody\n";
+        fs::write(&file_path, content).unwrap();
+
+        let cmd = CreateCommand {
+            file: Some(file_path.to_str().unwrap().to_string()),
+            format: ContentFormat::Jfm,
+            project: None,
+            r#type: None,
+            summary: Some("From flag".to_string()),
+            set_fields: vec![],
+            dry_run: false,
+        };
+
+        let params = cmd.resolve_params().unwrap();
+        assert_eq!(params.project, "PROJ");
+        assert_eq!(params.summary, "From flag");
+        assert_eq!(params.labels, vec!["backend"]);
     }
 
     #[test]

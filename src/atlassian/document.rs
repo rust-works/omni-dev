@@ -94,6 +94,41 @@ pub struct JiraFrontmatter {
     pub custom_fields: BTreeMap<String, serde_yaml::Value>,
 }
 
+/// Lenient JIRA frontmatter used **only** by the `jira create` path.
+///
+/// Unlike [`JiraFrontmatter`] — which backs the strict read/write/edit
+/// round-trip and requires `instance` and `summary` — every field here is
+/// optional, so the create command can fall back to CLI flags for anything
+/// the document omits (or accept a document with no frontmatter at all).
+/// Unknown fields carried over from a round-tripped issue (`instance`,
+/// `status`, `assignee`, …) are ignored: `instance` is irrelevant to create
+/// because the client is built from auth config, not the document.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct JiraCreateFrontmatter {
+    /// Document type tag, when present. Used to reject `confluence` documents.
+    pub r#type: Option<String>,
+
+    /// JIRA issue key (e.g., "PROJ-123"). The project is derived from it when
+    /// no explicit project is given.
+    pub key: String,
+
+    /// Project key (e.g., "PROJ").
+    pub project: Option<String>,
+
+    /// Issue summary (title).
+    pub summary: Option<String>,
+
+    /// Issue type name (Bug, Story, Task, etc.).
+    pub issue_type: Option<String>,
+
+    /// Labels applied to the issue.
+    pub labels: Vec<String>,
+
+    /// Scalar custom field values keyed by human-readable field name.
+    pub custom_fields: BTreeMap<String, serde_yaml::Value>,
+}
+
 /// Confluence-specific frontmatter fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfluenceFrontmatter {
@@ -471,38 +506,56 @@ pub fn content_item_to_document(item: &ContentItem, instance_url: &str) -> Resul
     Ok(JfmDocument { frontmatter, body })
 }
 
+/// Splits a JFM document into its raw frontmatter YAML (if present) and its
+/// markdown body.
+///
+/// Returns `(None, whole_input)` when `input` has no opening `---` delimiter —
+/// the entire input is the body. Returns `(Some(yaml), body)` when a
+/// frontmatter block is present; a `---` opener with no matching closing
+/// delimiter is an error.
+///
+/// This is the mechanical delimiter split only — it performs no typed
+/// deserialization, so callers choose how strictly to interpret the
+/// frontmatter: the strict round-trip via [`JfmDocument::parse`], or the
+/// lenient flag-fallback on the `jira create` path.
+pub(crate) fn split_frontmatter(input: &str) -> Result<(Option<&str>, String)> {
+    let trimmed = input.trim_start();
+
+    if !trimmed.starts_with("---") {
+        return Ok((None, input.to_string()));
+    }
+
+    // Find the closing '---' delimiter (skip the opening one)
+    let after_opening = &trimmed[3..];
+    let after_opening = after_opening.strip_prefix('\n').unwrap_or(after_opening);
+
+    let closing_pos = after_opening.find("\n---").ok_or_else(|| {
+        AtlassianError::InvalidDocument("Missing closing '---' frontmatter delimiter".to_string())
+    })?;
+
+    let frontmatter_yaml = &after_opening[..closing_pos];
+    let after_closing = &after_opening[closing_pos + 4..]; // skip "\n---"
+
+    // Strip the first newline after the closing delimiter
+    let body = after_closing
+        .strip_prefix('\n')
+        .unwrap_or(after_closing)
+        .to_string();
+
+    Ok((Some(frontmatter_yaml), body))
+}
+
 impl JfmDocument {
     /// Parses a JFM document from a string.
     ///
     /// Expects the format: `---\n<yaml frontmatter>\n---\n<markdown body>`
     pub fn parse(input: &str) -> Result<Self> {
-        let trimmed = input.trim_start();
-
-        if !trimmed.starts_with("---") {
-            return Err(AtlassianError::InvalidDocument(
+        let (frontmatter_yaml, body) = split_frontmatter(input)?;
+        let frontmatter_yaml = frontmatter_yaml.ok_or_else(|| {
+            AtlassianError::InvalidDocument(
                 "Document must start with '---' frontmatter delimiter".to_string(),
             )
-            .into());
-        }
-
-        // Find the closing '---' delimiter (skip the opening one)
-        let after_opening = &trimmed[3..];
-        let after_opening = after_opening.strip_prefix('\n').unwrap_or(after_opening);
-
-        let closing_pos = after_opening.find("\n---").ok_or_else(|| {
-            AtlassianError::InvalidDocument(
-                "Missing closing '---' frontmatter delimiter".to_string(),
-            )
         })?;
-
-        let frontmatter_yaml = &after_opening[..closing_pos];
-        let after_closing = &after_opening[closing_pos + 4..]; // skip "\n---"
-
-        // Strip the first newline after the closing delimiter
-        let body = after_closing
-            .strip_prefix('\n')
-            .unwrap_or(after_closing)
-            .to_string();
 
         let frontmatter: JfmFrontmatter = serde_yaml::from_str(frontmatter_yaml)
             .context("Failed to parse JFM frontmatter YAML")?;
@@ -602,6 +655,54 @@ mod tests {
         let input = "---\ntype: jira\nkey: PROJ-1\n";
         let result = JfmDocument::parse(input);
         assert!(result.is_err());
+    }
+
+    // ── split_frontmatter ──────────────────────────────────────────
+
+    #[test]
+    fn split_frontmatter_with_block() {
+        let input = "---\nsummary: T\n---\nBody text\n";
+        let (yaml, body) = split_frontmatter(input).unwrap();
+        assert_eq!(yaml, Some("summary: T"));
+        assert_eq!(body, "Body text\n");
+    }
+
+    #[test]
+    fn split_frontmatter_without_block_returns_whole_input_as_body() {
+        let input = "Just a plain markdown body.\n";
+        let (yaml, body) = split_frontmatter(input).unwrap();
+        assert!(yaml.is_none());
+        assert_eq!(body, "Just a plain markdown body.\n");
+    }
+
+    #[test]
+    fn split_frontmatter_missing_close_errors() {
+        let input = "---\nsummary: T\n\nBody without a closing delimiter\n";
+        let err = split_frontmatter(input).unwrap_err();
+        assert!(err.to_string().contains("Missing closing"));
+    }
+
+    // ── JiraCreateFrontmatter ──────────────────────────────────────
+
+    #[test]
+    fn jira_create_frontmatter_tolerates_round_tripped_fields() {
+        // A full round-tripped issue (instance/status/assignee present) must
+        // parse — the create-irrelevant fields are simply ignored.
+        let yaml = "type: jira\ninstance: https://org.atlassian.net\nkey: PROJ-1\nproject: PROJ\nsummary: Title\nstatus: Open\nassignee: alice\nlabels:\n  - a\n";
+        let fm: JiraCreateFrontmatter = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(fm.r#type.as_deref(), Some("jira"));
+        assert_eq!(fm.project.as_deref(), Some("PROJ"));
+        assert_eq!(fm.summary.as_deref(), Some("Title"));
+        assert_eq!(fm.labels, vec!["a"]);
+    }
+
+    #[test]
+    fn jira_create_frontmatter_all_fields_optional() {
+        let fm: JiraCreateFrontmatter = serde_yaml::from_str("{}").unwrap();
+        assert!(fm.r#type.is_none());
+        assert!(fm.project.is_none());
+        assert!(fm.summary.is_none());
+        assert!(fm.labels.is_empty());
     }
 
     #[test]
