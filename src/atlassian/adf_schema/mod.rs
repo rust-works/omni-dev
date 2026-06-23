@@ -264,6 +264,28 @@ pub enum AdfSchemaViolation {
         /// malformed.
         path: Vec<usize>,
     },
+
+    /// Two marks on one inline text node that ADF does not allow together.
+    ///
+    /// The upstream JSON schema models text marks as two mutually-exclusive
+    /// node variants (`code_inline_node` vs `formatted_text_inline_node`):
+    /// a text node's marks must all fit within a single variant's mark group.
+    /// The `code` mark lives only in the code group (`{annotation, code,
+    /// link}`), so pairing it with a styling mark such as `strong` or
+    /// `textColor` is rejected by the API as an opaque `INVALID_INPUT`
+    /// (issue #1047).
+    ForbiddenMarkCombination {
+        /// One of the two conflicting marks (the earlier one in `marks`).
+        mark_type: String,
+        /// The other conflicting mark (the later one in `marks`).
+        conflicts_with: String,
+        /// The inline-content parent of the text node (e.g. `"paragraph"`).
+        parent_type: String,
+        /// The position of the offending inline node within its parent.
+        inline_index: Option<usize>,
+        /// Index path from the document root to the node whose marks conflict.
+        path: Vec<usize>,
+    },
 }
 
 impl AdfSchemaViolation {
@@ -280,7 +302,8 @@ impl AdfSchemaViolation {
             | Self::MissingAttr { path, .. }
             | Self::InvalidAttr { path, .. }
             | Self::DisallowedMark { path, .. }
-            | Self::InvalidMarkAttr { path, .. } => path,
+            | Self::InvalidMarkAttr { path, .. }
+            | Self::ForbiddenMarkCombination { path, .. } => path,
         }
     }
 }
@@ -347,6 +370,14 @@ impl std::fmt::Display for AdfSchemaViolation {
             } => write!(
                 f,
                 "ADF schema violation at /{path_str}: '{mark_type}' mark's '{attr_name}' is invalid — {problem}",
+            ),
+            Self::ForbiddenMarkCombination {
+                mark_type,
+                conflicts_with,
+                ..
+            } => write!(
+                f,
+                "ADF schema violation at /{path_str}: '{mark_type}' mark cannot be combined with '{conflicts_with}' mark on the same text",
             ),
         }
     }

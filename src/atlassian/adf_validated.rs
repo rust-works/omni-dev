@@ -85,6 +85,12 @@ impl std::fmt::Display for AdfValidationError {
                     out.push_str(&format!("invalid ADF mark — {v}.\n"));
                     out.push_str("hint: remove or correct the offending mark before retrying.");
                 }
+                AdfSchemaViolation::ForbiddenMarkCombination { .. } => {
+                    out.push_str(&format!("invalid ADF mark combination — {v}.\n"));
+                    out.push_str(
+                        "hint: ADF does not allow these marks on the same text — the `code` (monospace) mark only combines with a link; split the run so each piece carries a single style (e.g. drop the backticks or the surrounding bold/italic).",
+                    );
+                }
             }
         }
         f.write_str(&out)
@@ -478,6 +484,51 @@ mod tests {
         assert!(msg.contains("invalid ADF mark"), "got: {msg}");
         assert!(msg.contains("'code' mark"), "got: {msg}");
         assert!(msg.contains("hint: remove or correct"), "got: {msg}");
+    }
+
+    #[test]
+    fn error_display_for_forbidden_mark_combination() {
+        let err = AdfValidationError {
+            violations: vec![AdfSchemaViolation::ForbiddenMarkCombination {
+                mark_type: "strong".to_string(),
+                conflicts_with: "code".to_string(),
+                parent_type: "paragraph".to_string(),
+                inline_index: Some(0),
+                path: vec![0, 0],
+            }],
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("invalid ADF mark combination"), "got: {msg}");
+        assert!(
+            msg.contains("'strong' mark cannot be combined with 'code' mark"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("hint:"), "got: {msg}");
+    }
+
+    #[test]
+    fn try_new_rejects_strong_plus_code_text() {
+        // Issue #1047 reproducer at the validator boundary: a paragraph whose
+        // text carries both `strong` and `code` is rejected before send.
+        let text = AdfNode {
+            node_type: "text".to_string(),
+            attrs: None,
+            content: None,
+            text: Some("x".to_string()),
+            marks: Some(vec![
+                crate::atlassian::adf::AdfMark::strong(),
+                crate::atlassian::adf::AdfMark::code(),
+            ]),
+            local_id: None,
+            parameters: None,
+        };
+        let d = doc(vec![AdfNode::paragraph(vec![text])]);
+        let err = ValidatedAdfDocument::try_new(d).unwrap_err();
+        assert!(err.violations.iter().any(|v| matches!(
+            v,
+            AdfSchemaViolation::ForbiddenMarkCombination { mark_type, conflicts_with, .. }
+                if mark_type == "strong" && conflicts_with == "code"
+        )));
     }
 
     #[test]
