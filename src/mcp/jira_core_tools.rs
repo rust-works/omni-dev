@@ -20,7 +20,9 @@ use crate::atlassian::client::{
     AtlassianClient, JiraTransition, JiraVisibility, JiraVisibilityType,
 };
 use crate::atlassian::convert::markdown_to_adf;
-use crate::atlassian::custom_fields::{apply_user_field_overrides, convert_textarea_string_values};
+use crate::atlassian::custom_fields::{
+    apply_user_field_overrides, convert_textarea_string_values, resolve_custom_fields,
+};
 use crate::atlassian::document::{issue_to_jfm_document, JfmDocument};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -78,6 +80,17 @@ pub struct JiraCreateParams {
     /// Issue type (defaults to `Task`).
     #[serde(default)]
     pub issue_type: Option<String>,
+    /// Custom fields to set at create time, as a map of field name *or*
+    /// canonical id (e.g. `"Story Points"` or `"customfield_10016"`) to its
+    /// value. Names are resolved against the project/issue-type create screen
+    /// (`createmeta`), so pass the name back from a `400`
+    /// "`<Field> is required`" error directly. Values are natural JSON: a
+    /// string or number for scalar/number/date fields, a string for
+    /// select/option fields (sent as `{"value": ...}`), an array of strings
+    /// for multi-selects. Use this for fields a project requires at create
+    /// time — without them JIRA rejects the create with HTTP 400.
+    #[serde(default)]
+    pub custom_fields: Option<std::collections::BTreeMap<String, serde_json::Value>>,
 }
 
 /// Parameters for the `jira_write` tool.
@@ -291,19 +304,49 @@ async fn run_jira_search(client: &AtlassianClient, jql: &str, limit: u32) -> Res
 }
 
 /// Creates a JIRA issue and returns the new issue key.
+///
+/// Fast path when no custom fields are requested: a single POST to
+/// `/rest/api/3/issue`. With custom fields, `createmeta` is fetched first to
+/// resolve human names to ids and dispatch values by schema (mirroring the
+/// CLI `--set-field` flow).
 async fn run_jira_create(
     client: &AtlassianClient,
     project: &str,
     summary: &str,
     description: Option<&str>,
     issue_type: &str,
+    custom_fields: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
 ) -> Result<String> {
     let adf = match description {
         Some(md) if !md.is_empty() => Some(ValidatedAdfDocument::try_new(markdown_to_adf(md)?)?),
         _ => None,
     };
+
+    let resolved = match custom_fields {
+        Some(fields) if !fields.is_empty() => {
+            // The CLI's resolver works on YAML scalars (numbers/bools/strings)
+            // so it can coerce inline `NAME=VALUE` flags; bridge the JSON
+            // values from the MCP request into the same shape before reusing
+            // it. A `serde_json::Value` always serialises into a
+            // `serde_yaml::Value` (JSON is a subset of YAML), so `.ok()` never
+            // actually drops a field — this mirrors the same conversion in
+            // `document.rs::json_to_yaml`.
+            let scalars: std::collections::BTreeMap<String, serde_yaml::Value> = fields
+                .iter()
+                .filter_map(|(name, value)| {
+                    serde_yaml::to_value(value)
+                        .ok()
+                        .map(|yaml| (name.clone(), yaml))
+                })
+                .collect();
+            let createmeta = client.get_createmeta(project, issue_type).await?;
+            resolve_custom_fields(&scalars, &[], &createmeta)?
+        }
+        _ => std::collections::BTreeMap::new(),
+    };
+
     let created = client
-        .create_issue(project, issue_type, summary, adf.as_ref(), &[])
+        .create_issue_with_custom_fields(project, issue_type, summary, adf.as_ref(), &[], &resolved)
         .await?;
     yaml_result(&created)
 }
@@ -600,7 +643,12 @@ impl OmniDevServer {
 
     /// Tool: create a new JIRA issue.
     #[tool(
-        description = "Create a new JIRA issue. Returns the new issue key and self URL as YAML."
+        description = "Create a new JIRA issue. Returns the new issue key and self URL as YAML. \
+                       `custom_fields` is an optional map of field name or canonical id (e.g. \
+                       `{\"Story Points\": 8}` or `{\"Planned / Unplanned Work\": \"Unplanned\"}`) \
+                       to value, resolved against the create screen and shaped for the API — use \
+                       it to satisfy fields a project requires at create time (otherwise JIRA \
+                       returns HTTP 400)."
     )]
     pub async fn jira_create(
         &self,
@@ -614,6 +662,7 @@ impl OmniDevServer {
             &params.summary,
             params.description.as_deref(),
             issue_type,
+            params.custom_fields.as_ref(),
         )
         .await
         .map_err(tool_error)?;
@@ -1137,7 +1186,7 @@ mod tests {
             .await;
 
         let client = mock_client(&server.uri());
-        let yaml = run_jira_create(&client, "PROJ", "A task", Some("Body text"), "Task")
+        let yaml = run_jira_create(&client, "PROJ", "A task", Some("Body text"), "Task", None)
             .await
             .unwrap();
         assert!(yaml.contains("PROJ-100"));
@@ -1157,7 +1206,7 @@ mod tests {
             .await;
 
         let client = mock_client(&server.uri());
-        run_jira_create(&client, "PROJ", "Terse", None, "Task")
+        run_jira_create(&client, "PROJ", "Terse", None, "Task", None)
             .await
             .unwrap();
     }
@@ -1170,7 +1219,7 @@ mod tests {
     #[tokio::test]
     async fn run_jira_create_rejects_invalid_adf_nesting() {
         let client = mock_client("http://127.0.0.1:1");
-        let err = run_jira_create(&client, "PROJ", "Title", Some(BAD_ADF_JFM), "Task")
+        let err = run_jira_create(&client, "PROJ", "Title", Some(BAD_ADF_JFM), "Task", None)
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -1187,10 +1236,96 @@ mod tests {
             .mount(&server)
             .await;
         let client = mock_client(&server.uri());
-        let err = run_jira_create(&client, "PROJ", "Title", None, "Task")
+        let err = run_jira_create(&client, "PROJ", "Title", None, "Task", None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("400"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_create_with_custom_fields_resolves_via_createmeta() {
+        // Issue #1052: a custom field passed by human name is resolved to its
+        // id via createmeta and shaped for the API ({"value": ...} for an
+        // option field) before the create POST.
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/createmeta"))
+            .and(query_param("projectKeys", "PROJ"))
+            .and(query_param("issuetypeNames", "Epic"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "projects": [{
+                    "issuetypes": [{
+                        "fields": {
+                            "customfield_10001": {
+                                "name": "Planned / Unplanned Work",
+                                "schema": {
+                                    "type": "option",
+                                    "custom": "com.atlassian.jira.plugin.system.customfieldtypes:select"
+                                }
+                            }
+                        }
+                    }]
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue"))
+            .and(body_json(serde_json::json!({
+                "fields": {
+                    "project": {"key": "PROJ"},
+                    "issuetype": {"name": "Epic"},
+                    "summary": "An epic",
+                    "customfield_10001": {"value": "Unplanned"}
+                }
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": "100",
+                "key": "PROJ-100",
+                "self": "https://example.atlassian.net/rest/api/3/issue/100"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert(
+            "Planned / Unplanned Work".to_string(),
+            serde_json::Value::String("Unplanned".to_string()),
+        );
+        let yaml = run_jira_create(&client, "PROJ", "An epic", None, "Epic", Some(&fields))
+            .await
+            .unwrap();
+        assert!(yaml.contains("PROJ-100"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_create_without_custom_fields_skips_createmeta() {
+        // The fast path must not hit createmeta when no custom fields are
+        // requested — only the create POST. An empty map behaves like None.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": "100",
+                "key": "PROJ-100",
+                "self": "https://example.atlassian.net/rest/api/3/issue/100"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // No createmeta mock is mounted, so any GET to it surfaces a
+        // wiremock unmatched-request panic and fails the test.
+
+        let client = mock_client(&server.uri());
+        let empty = std::collections::BTreeMap::new();
+        run_jira_create(&client, "PROJ", "Terse", None, "Task", Some(&empty))
+            .await
+            .unwrap();
     }
 
     // ── run_jira_write ─────────────────────────────────────────────────────
