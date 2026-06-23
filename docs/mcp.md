@@ -233,6 +233,30 @@ lists exactly which issues/links succeeded, so a retry can re-send only the
 remainder (referencing already-created issues by their returned keys) without
 creating duplicates.
 
+### `dry_run: true` on mutating tools
+
+The mutating Atlassian tools accept an optional `dry_run` flag, mirroring the
+CLI's `--dry-run`:
+
+- `jira_create`
+- `jira_write`
+- `jira_link_create`
+- `jira_link_parent`
+- `jira_link_remove`
+- `confluence_create`
+- `confluence_write`
+
+When `dry_run: true`, the tool performs all local resolution and ADF
+validation (so malformed JFM/ADF still errors) but stops short of the network
+call, returning the would-be HTTP request as YAML — `dry_run: true`, the
+`method` and `path`, and the request `body` (for JIRA, the exact
+`{"fields": {…}}` payload; for Confluence, the caller-supplied fields plus the
+resolved ADF, with server-resolved values like the numeric space id and the
+next version number filled in at send time). Use it to validate required fields
+and formatting before committing an irreversible mutation. For `jira_link_remove`,
+a dry-run previews the `DELETE` without requiring the destructive `confirm`
+guard. See [issue #1048](https://github.com/rust-works/omni-dev/issues/1048).
+
 ### `confirm: true` on destructive tools
 
 Five destructive Atlassian tools refuse to run unless the caller explicitly

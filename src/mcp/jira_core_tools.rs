@@ -24,10 +24,11 @@ use crate::atlassian::create::{create_resolved_jira_issue, prepend_warnings, res
 use crate::atlassian::custom_fields::{
     apply_user_field_overrides, convert_textarea_string_values, resolve_custom_fields,
 };
-use crate::atlassian::document::{issue_to_jfm_document, JfmDocument};
+use crate::atlassian::document::{issue_to_jfm_document, CustomFieldSection, JfmDocument};
 use crate::cli::atlassian::helpers::create_client;
 
 use super::catalogue_cache::CatalogueCache;
+use super::dry_run::dry_run_request_yaml;
 use super::error::tool_error;
 use super::output_file::write_to_file_yaml;
 use super::server::OmniDevServer;
@@ -110,6 +111,10 @@ pub struct JiraCreateParams {
     /// time — without them JIRA rejects the create with HTTP 400.
     #[serde(default)]
     pub custom_fields: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    /// When true, validate and return the would-be request (method, path,
+    /// body) without creating the issue. Defaults to `false`.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 /// One issue spec within a [`JiraBulkCreateParams`] batch.
@@ -251,6 +256,10 @@ pub struct JiraWriteParams {
     /// typed parameters and is rejected — pass the typed parameter instead.
     #[serde(default)]
     pub fields: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    /// When true, validate and return the would-be request (method, path,
+    /// body) without updating the issue. Defaults to `false`.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 /// Parameters for the `jira_transition` tool.
@@ -427,7 +436,9 @@ async fn run_jira_search(client: &AtlassianClient, jql: &str, limit: u32) -> Res
 /// explicit `project`/`summary` fields plus an optional `custom_fields` map.
 /// When the document path shadows a frontmatter value with an explicit
 /// parameter, a `warning:` line is prepended to the returned text (and logged)
-/// so the assistant has a signal.
+/// so the assistant has a signal. When `dry_run` is set, the input is fully
+/// resolved (custom fields included — a `createmeta` read) and the would-be
+/// request is returned without creating anything.
 async fn run_jira_create(client: &AtlassianClient, params: &JiraCreateParams) -> Result<String> {
     if let Some(document) = params.document.as_deref() {
         if params.description.is_some() {
@@ -452,6 +463,21 @@ async fn run_jira_create(client: &AtlassianClient, params: &JiraCreateParams) ->
         )?;
         for shadowed in &resolved.shadowed {
             tracing::warn!("{}", shadowed.warning_line());
+        }
+
+        if params.dry_run {
+            let preview = jira_create_dry_run_preview(
+                client,
+                &resolved.project,
+                &resolved.issue_type,
+                &resolved.summary,
+                Some(&resolved.adf),
+                &resolved.labels,
+                &resolved.custom_scalars,
+                &resolved.custom_sections,
+            )
+            .await?;
+            return Ok(prepend_warnings(&resolved.shadowed, preview));
         }
 
         let created = create_resolved_jira_issue(
@@ -487,27 +513,40 @@ async fn run_jira_create(client: &AtlassianClient, params: &JiraCreateParams) ->
         _ => None,
     };
 
-    let resolved = match params.custom_fields.as_ref() {
-        Some(fields) if !fields.is_empty() => {
-            // The CLI's resolver works on YAML scalars (numbers/bools/strings)
-            // so it can coerce inline `NAME=VALUE` flags; bridge the JSON
-            // values from the MCP request into the same shape before reusing
-            // it. A `serde_json::Value` always serialises into a
-            // `serde_yaml::Value` (JSON is a subset of YAML), so `.ok()` never
-            // actually drops a field — this mirrors the same conversion in
-            // `document.rs::json_to_yaml`.
-            let scalars: std::collections::BTreeMap<String, serde_yaml::Value> = fields
-                .iter()
-                .filter_map(|(name, value)| {
-                    serde_yaml::to_value(value)
-                        .ok()
-                        .map(|yaml| (name.clone(), yaml))
-                })
-                .collect();
-            let createmeta = client.get_createmeta(project, issue_type).await?;
-            resolve_custom_fields(&scalars, &[], &createmeta)?
-        }
-        _ => std::collections::BTreeMap::new(),
+    // Bridge the JSON `custom_fields` map into the CLI resolver's YAML-scalar
+    // shape (a `serde_json::Value` always serialises into a `serde_yaml::Value`,
+    // so `.ok()` never drops a field).
+    let custom_scalars: std::collections::BTreeMap<String, serde_yaml::Value> = match params
+        .custom_fields
+        .as_ref()
+    {
+        Some(fields) => fields
+            .iter()
+            .filter_map(|(name, value)| serde_yaml::to_value(value).ok().map(|y| (name.clone(), y)))
+            .collect(),
+        None => std::collections::BTreeMap::new(),
+    };
+
+    if params.dry_run {
+        let preview = jira_create_dry_run_preview(
+            client,
+            project,
+            issue_type,
+            summary,
+            adf.as_ref(),
+            &[],
+            &custom_scalars,
+            &[],
+        )
+        .await?;
+        return Ok(preview);
+    }
+
+    let resolved = if custom_scalars.is_empty() {
+        std::collections::BTreeMap::new()
+    } else {
+        let createmeta = client.get_createmeta(project, issue_type).await?;
+        resolve_custom_fields(&custom_scalars, &[], &createmeta)?
     };
 
     let created = client
@@ -663,6 +702,58 @@ async fn run_jira_bulk_create(
     yaml_result(&report)
 }
 
+/// Builds the would-be `POST /rest/api/3/issue` request for a create dry-run,
+/// resolving custom fields against `createmeta` exactly as the real create path
+/// (`create_resolved_jira_issue` / `create_issue_with_custom_fields`) would, but
+/// returning the payload as YAML instead of sending it.
+#[allow(clippy::too_many_arguments)]
+async fn jira_create_dry_run_preview(
+    client: &AtlassianClient,
+    project: &str,
+    issue_type: &str,
+    summary: &str,
+    adf: Option<&ValidatedAdfDocument>,
+    labels: &[String],
+    custom_scalars: &std::collections::BTreeMap<String, serde_yaml::Value>,
+    custom_sections: &[CustomFieldSection],
+) -> Result<String> {
+    let custom_fields = if custom_scalars.is_empty() && custom_sections.is_empty() {
+        std::collections::BTreeMap::new()
+    } else {
+        let createmeta = client.get_createmeta(project, issue_type).await?;
+        resolve_custom_fields(custom_scalars, custom_sections, &createmeta)?
+    };
+
+    let mut fields = serde_json::Map::new();
+    fields.insert("project".to_string(), serde_json::json!({ "key": project }));
+    fields.insert(
+        "issuetype".to_string(),
+        serde_json::json!({ "name": issue_type }),
+    );
+    fields.insert(
+        "summary".to_string(),
+        serde_json::Value::String(summary.to_string()),
+    );
+    if let Some(adf) = adf {
+        fields.insert(
+            "description".to_string(),
+            serde_json::to_value(adf).context("Failed to serialize ADF document")?,
+        );
+    }
+    if !labels.is_empty() {
+        fields.insert("labels".to_string(), serde_json::to_value(labels)?);
+    }
+    for (id, value) in &custom_fields {
+        fields.insert(id.clone(), value.clone());
+    }
+
+    dry_run_request_yaml(
+        "POST",
+        "/rest/api/3/issue".to_string(),
+        Some(serde_json::json!({ "fields": fields })),
+    )
+}
+
 /// Updates a JIRA issue. Any combination of description (`content`),
 /// `assignee`, `reporter`, and arbitrary `fields` may be supplied; absent
 /// inputs leave the corresponding JIRA values untouched. At least one of
@@ -677,6 +768,7 @@ async fn run_jira_write(
     assignee: Option<&str>,
     reporter: Option<&str>,
     extra_fields: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
+    dry_run: bool,
 ) -> Result<String> {
     let adf: Option<ValidatedAdfDocument> = match content {
         Some(c) => {
@@ -734,6 +826,25 @@ async fn run_jira_write(
     if adf.is_none() && merged.is_empty() {
         anyhow::bail!(
             "no changes supplied for {key}: provide `content`, `assignee`, `reporter`, or `fields`"
+        );
+    }
+
+    if dry_run {
+        // Mirror the wire body built by `update_issue_with_custom_fields`.
+        let mut fields = serde_json::Map::new();
+        if let Some(adf) = &adf {
+            fields.insert(
+                "description".to_string(),
+                serde_json::to_value(adf).context("Failed to serialize ADF document")?,
+            );
+        }
+        for (id, value) in &merged {
+            fields.insert(id.clone(), value.clone());
+        }
+        return dry_run_request_yaml(
+            "PUT",
+            format!("/rest/api/3/issue/{key}"),
+            Some(serde_json::json!({ "fields": fields })),
         );
     }
 
@@ -965,8 +1076,12 @@ impl OmniDevServer {
                        is an optional map of field name or canonical id (e.g. `{\"Story Points\": 8}` \
                        or `{\"Planned / Unplanned Work\": \"Unplanned\"}`) to value, resolved against \
                        the create screen and shaped for the API — use it to satisfy fields a project \
-                       requires at create time (otherwise JIRA returns HTTP 400). Returns the new \
-                       issue key and self URL as YAML."
+                       requires at create time (otherwise JIRA returns HTTP 400). Set `dry_run: true` \
+                       first when uncertain about required fields or formatting — validates and \
+                       resolves the input and returns the request that would be sent (method, path, \
+                       body) without creating the issue (mirrors the CLI's \
+                       `omni-dev atlassian jira create --dry-run`). Returns the new issue key and \
+                       self URL as YAML."
     )]
     pub async fn jira_create(
         &self,
@@ -1030,7 +1145,10 @@ impl OmniDevServer {
                        auto-converted from JFM to ADF; pass the empty string `\"\"` to clear \
                        such a field. Pass a JSON object value to bypass conversion (raw ADF). \
                        At least one of `content`, `assignee`, `reporter`, or `fields` must be \
-                       supplied."
+                       supplied. Set `dry_run: true` first when uncertain about required fields \
+                       or formatting — validates the input and returns the request that would be \
+                       sent (method, path, body) without updating the issue. Mirrors the CLI's \
+                       `omni-dev atlassian jira write --dry-run`."
     )]
     pub async fn jira_write(
         &self,
@@ -1047,6 +1165,7 @@ impl OmniDevServer {
             params.assignee.as_deref(),
             params.reporter.as_deref(),
             params.fields.as_ref(),
+            params.dry_run,
         )
         .await
         .map_err(tool_error)?;
@@ -1529,6 +1648,7 @@ mod tests {
             description: description.map(String::from),
             issue_type: issue_type.map(String::from),
             custom_fields: None,
+            dry_run: false,
         }
     }
 
@@ -1541,6 +1661,7 @@ mod tests {
             description: None,
             issue_type: None,
             custom_fields: None,
+            dry_run: false,
         }
     }
 
@@ -1774,6 +1895,7 @@ mod tests {
             description: Some("conflicting body".to_string()),
             issue_type: None,
             custom_fields: None,
+            dry_run: false,
         };
         let err = run_jira_create(&client, &params).await.unwrap_err();
         assert!(err
@@ -1794,6 +1916,7 @@ mod tests {
             description: None,
             issue_type: None,
             custom_fields: Some(fields),
+            dry_run: false,
         };
         let err = run_jira_create(&client, &params).await.unwrap_err();
         assert!(err
@@ -1873,6 +1996,7 @@ mod tests {
             description: None,
             issue_type: Some("Epic".to_string()),
             custom_fields: Some(fields),
+            dry_run: false,
         };
         let yaml = run_jira_create(&client, &params).await.unwrap();
         assert!(yaml.contains("PROJ-100"));
@@ -1904,6 +2028,7 @@ mod tests {
             description: None,
             issue_type: Some("Task".to_string()),
             custom_fields: Some(std::collections::BTreeMap::new()),
+            dry_run: false,
         };
         run_jira_create(&client, &params).await.unwrap();
     }
@@ -1929,6 +2054,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1954,6 +2080,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1978,6 +2105,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1995,6 +2123,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await
         .unwrap_err();
@@ -2014,6 +2143,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await
         .unwrap_err();
@@ -2040,6 +2170,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await
         .unwrap_err();
@@ -2077,6 +2208,7 @@ mod tests {
             None,
             None,
             Some(&extras),
+            false,
         )
         .await
         .unwrap_err();
@@ -2117,6 +2249,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await
         .unwrap_err();
@@ -2153,6 +2286,7 @@ mod tests {
             Some("abc123"),
             None,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -2180,6 +2314,7 @@ mod tests {
             Some("-1"),
             None,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -2207,6 +2342,7 @@ mod tests {
             Some(""),
             None,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -2234,6 +2370,7 @@ mod tests {
             None,
             Some("rep123"),
             None,
+            false,
         )
         .await
         .unwrap();
@@ -2267,6 +2404,7 @@ mod tests {
             None,
             None,
             Some(&extra),
+            false,
         )
         .await
         .unwrap();
@@ -2289,6 +2427,7 @@ mod tests {
             Some("y"),
             None,
             Some(&extra),
+            false,
         )
         .await
         .unwrap_err();
@@ -2312,6 +2451,7 @@ mod tests {
             None,
             Some("y"),
             Some(&extra),
+            false,
         )
         .await
         .unwrap_err();
@@ -2330,6 +2470,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await
         .unwrap_err();
@@ -2411,6 +2552,7 @@ mod tests {
             None,
             None,
             Some(&extras),
+            false,
         )
         .await
         .unwrap();
@@ -2450,6 +2592,7 @@ mod tests {
             None,
             None,
             Some(&extras),
+            false,
         )
         .await
         .unwrap();
@@ -2484,6 +2627,7 @@ mod tests {
             None,
             None,
             Some(&extras),
+            false,
         )
         .await
         .unwrap();
@@ -2521,6 +2665,7 @@ mod tests {
             None,
             None,
             Some(&extras),
+            false,
         )
         .await
         .unwrap();
@@ -2563,6 +2708,7 @@ mod tests {
             None,
             None,
             Some(&extras),
+            false,
         )
         .await
         .unwrap();
@@ -2590,6 +2736,7 @@ mod tests {
             None,
             None,
             Some(&extras),
+            false,
         )
         .await
         .unwrap_err();
@@ -2634,6 +2781,7 @@ mod tests {
             None,
             None,
             Some(&extras),
+            false,
         )
         .await
         .unwrap();
@@ -3708,5 +3856,216 @@ mod tests {
         let result = ok_text("hello".to_string()).unwrap();
         assert!(!result.is_error.unwrap_or(false));
         assert_eq!(result.content.len(), 1);
+    }
+
+    // ── dry_run (issue #1048) ───────────────────────────────────────────────
+    //
+    // The unreachable `http://127.0.0.1:1` client is the short-circuit proof:
+    // if any branch made a network call, it would error instead of returning
+    // the preview. Validation runs before the dry-run branch, so malformed ADF
+    // still errors.
+
+    #[tokio::test]
+    async fn run_jira_create_dry_run_returns_request_without_calling_api() {
+        let client = mock_client("http://127.0.0.1:1");
+        let params = JiraCreateParams {
+            document: None,
+            project: Some("PROJ".to_string()),
+            summary: Some("A task".to_string()),
+            description: Some("Body text".to_string()),
+            issue_type: Some("Task".to_string()),
+            custom_fields: None,
+            dry_run: true,
+        };
+        let yaml = run_jira_create(&client, &params).await.unwrap();
+        assert!(yaml.contains("dry_run: true"));
+        assert!(yaml.contains("method: POST"));
+        assert!(yaml.contains("path: /rest/api/3/issue"));
+        assert!(yaml.contains("summary: A task"));
+        assert!(yaml.contains("PROJ"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_create_dry_run_still_validates_adf() {
+        let client = mock_client("http://127.0.0.1:1");
+        let params = JiraCreateParams {
+            document: None,
+            project: Some("PROJ".to_string()),
+            summary: Some("Title".to_string()),
+            description: Some(BAD_ADF_JFM.to_string()),
+            issue_type: Some("Task".to_string()),
+            custom_fields: None,
+            dry_run: true,
+        };
+        let err = run_jira_create(&client, &params).await.unwrap_err();
+        assert!(err.to_string().contains("invalid ADF nesting"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_create_dry_run_resolves_custom_fields_into_preview() {
+        // A dry-run with custom fields still resolves them against createmeta
+        // (a read) and includes the resolved id/value in the previewed payload,
+        // but performs no create POST — only the GET mock is mounted, so a POST
+        // would surface a wiremock unmatched-request panic.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/createmeta"))
+            .and(query_param("projectKeys", "PROJ"))
+            .and(query_param("issuetypeNames", "Epic"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "projects": [{
+                    "issuetypes": [{
+                        "fields": {
+                            "customfield_10001": {
+                                "name": "Planned / Unplanned Work",
+                                "schema": {
+                                    "type": "option",
+                                    "custom": "com.atlassian.jira.plugin.system.customfieldtypes:select"
+                                }
+                            }
+                        }
+                    }]
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert(
+            "Planned / Unplanned Work".to_string(),
+            serde_json::Value::String("Unplanned".to_string()),
+        );
+        let params = JiraCreateParams {
+            document: None,
+            project: Some("PROJ".to_string()),
+            summary: Some("An epic".to_string()),
+            description: None,
+            issue_type: Some("Epic".to_string()),
+            custom_fields: Some(fields),
+            dry_run: true,
+        };
+        let yaml = run_jira_create(&client, &params).await.unwrap();
+        assert!(yaml.contains("dry_run: true"));
+        assert!(yaml.contains("method: POST"));
+        assert!(yaml.contains("customfield_10001"));
+        assert!(yaml.contains("Unplanned"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_write_dry_run_returns_request_without_calling_api() {
+        let client = mock_client("http://127.0.0.1:1");
+        let mut extras = std::collections::BTreeMap::new();
+        extras.insert(
+            "priority".to_string(),
+            serde_json::json!({ "name": "High" }),
+        );
+        let yaml = run_jira_write(
+            &client,
+            &mock_cache(),
+            "PROJ-1",
+            Some("New body\n"),
+            ReadFormat::Jfm,
+            None,
+            None,
+            Some(&extras),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(yaml.contains("dry_run: true"));
+        assert!(yaml.contains("method: PUT"));
+        assert!(yaml.contains("path: /rest/api/3/issue/PROJ-1"));
+        assert!(yaml.contains("description"));
+        assert!(yaml.contains("priority"));
+        assert!(yaml.contains("High"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_write_dry_run_still_validates_adf() {
+        let client = mock_client("http://127.0.0.1:1");
+        let err = run_jira_write(
+            &client,
+            &mock_cache(),
+            "PROJ-1",
+            Some(BAD_ADF_JFM),
+            ReadFormat::Jfm,
+            None,
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid ADF nesting"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_create_dry_run_without_description_omits_body() {
+        // Exercises the `adf` is `None` path of the create dry-run branch
+        // (no `description` key in the previewed payload).
+        let client = mock_client("http://127.0.0.1:1");
+        let params = JiraCreateParams {
+            document: None,
+            project: Some("PROJ".to_string()),
+            summary: Some("Terse".to_string()),
+            description: None,
+            issue_type: Some("Task".to_string()),
+            custom_fields: None,
+            dry_run: true,
+        };
+        let yaml = run_jira_create(&client, &params).await.unwrap();
+        assert!(yaml.contains("method: POST"));
+        assert!(yaml.contains("summary: Terse"));
+        assert!(!yaml.contains("description"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_create_dry_run_from_document_previews_without_api() {
+        // Document-mode dry-run resolves the JFM frontmatter (including labels)
+        // and previews the create without any network call (unreachable client
+        // proves it).
+        let client = mock_client("http://127.0.0.1:1");
+        let doc = "---\ntype: jira\ninstance: https://org.atlassian.net\nkey: PROJ-7\nsummary: Round-tripped\nlabels:\n  - backend\n---\n\nBody from document\n";
+        let params = JiraCreateParams {
+            dry_run: true,
+            ..jira_create_doc_params(doc, None)
+        };
+        let yaml = run_jira_create(&client, &params).await.unwrap();
+        assert!(yaml.contains("dry_run: true"));
+        assert!(yaml.contains("method: POST"));
+        assert!(yaml.contains("summary: Round-tripped"));
+        // Project derives from the `key: PROJ-7` frontmatter; labels flow through.
+        assert!(yaml.contains("PROJ"));
+        assert!(yaml.contains("backend"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_write_dry_run_fields_only_omits_description() {
+        // Exercises the `adf` is `None` path of the write dry-run branch:
+        // a fields-only update previews without a `description` key.
+        let client = mock_client("http://127.0.0.1:1");
+        let mut extras = std::collections::BTreeMap::new();
+        extras.insert(
+            "priority".to_string(),
+            serde_json::json!({ "name": "High" }),
+        );
+        let yaml = run_jira_write(
+            &client,
+            &mock_cache(),
+            "PROJ-1",
+            None,
+            ReadFormat::Jfm,
+            None,
+            None,
+            Some(&extras),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(yaml.contains("method: PUT"));
+        assert!(yaml.contains("priority"));
+        assert!(!yaml.contains("description"));
     }
 }
