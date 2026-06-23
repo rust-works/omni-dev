@@ -132,7 +132,10 @@ async fn list_tools_includes_jira_extension_tools() -> Result<()> {
         "jira_field_options",
         "jira_link_list",
         "jira_link_types",
+        "jira_link_create",
+        "jira_link_parent",
         "jira_link_remove",
+        "jira_link_remote_list",
         "jira_project_list",
         "jira_sprint_list",
         "jira_sprint_issues",
@@ -167,7 +170,6 @@ async fn list_tools_includes_all_jira_tools() -> Result<()> {
         "jira_write",
         "jira_transition",
         "jira_comment",
-        "jira_link",
         "jira_dev",
         "jira_user_search",
     ] {
@@ -266,6 +268,14 @@ async fn jira_extension_tools_route_through_mcp() -> Result<()> {
         ),
         ("jira_link_list", serde_json::json!({"key": "PROJ-1"})),
         ("jira_link_types", serde_json::json!({})),
+        (
+            "jira_link_create",
+            serde_json::json!({"link_type": "Blocks", "inward": "PROJ-1", "outward": "PROJ-2"}),
+        ),
+        (
+            "jira_link_parent",
+            serde_json::json!({"parent": "EPIC-1", "child": "PROJ-1"}),
+        ),
         (
             "jira_link_remove",
             serde_json::json!({"link_id": "1", "confirm": true}),
@@ -538,7 +548,7 @@ async fn jira_tool_handlers_round_trip_through_wiremock() -> Result<()> {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};
 
-    // jira_read / jira_link list (issuelinks) / jira_dev (issue id)
+    // jira_read / jira_link_list (issuelinks) / jira_dev (issue id)
     Mock::given(method("GET"))
         .and(path("/rest/api/3/issue/PROJ-1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -608,7 +618,7 @@ async fn jira_tool_handlers_round_trip_through_wiremock() -> Result<()> {
         .mount(&server)
         .await;
 
-    // jira_link (types)
+    // jira_link_types
     Mock::given(method("GET"))
         .and(path("/rest/api/3/issueLinkType"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -616,6 +626,20 @@ async fn jira_tool_handlers_round_trip_through_wiremock() -> Result<()> {
                 {"id": "1", "name": "Blocks", "inward": "is blocked by", "outward": "blocks"}
             ]
         })))
+        .mount(&server)
+        .await;
+
+    // jira_link_create
+    Mock::given(method("POST"))
+        .and(path("/rest/api/3/issueLink"))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&server)
+        .await;
+
+    // jira_link_parent (PUTs the system parent field onto the child issue)
+    Mock::given(method("PUT"))
+        .and(path("/rest/api/3/issue/PROJ-2"))
+        .respond_with(ResponseTemplate::new(204))
         .mount(&server)
         .await;
 
@@ -649,7 +673,7 @@ async fn jira_tool_handlers_round_trip_through_wiremock() -> Result<()> {
     let _env = AtlassianEnvGuard::new(&server.uri(), "test@test.com", "token")?;
     let (client, server_handle) = spawn_server().await;
 
-    let calls: [(&str, serde_json::Value); 9] = [
+    let calls: [(&str, serde_json::Value); 11] = [
         ("jira_read", serde_json::json!({"key": "PROJ-1"})),
         ("jira_search", serde_json::json!({"jql": "project = PROJ"})),
         (
@@ -668,7 +692,15 @@ async fn jira_tool_handlers_round_trip_through_wiremock() -> Result<()> {
             "jira_comment",
             serde_json::json!({"key": "PROJ-1", "action": "list"}),
         ),
-        ("jira_link", serde_json::json!({"action": "types"})),
+        ("jira_link_types", serde_json::json!({})),
+        (
+            "jira_link_create",
+            serde_json::json!({"link_type": "Blocks", "inward": "PROJ-1", "outward": "PROJ-2"}),
+        ),
+        (
+            "jira_link_parent",
+            serde_json::json!({"parent": "EPIC-1", "child": "PROJ-2"}),
+        ),
         (
             "jira_link_remote_list",
             serde_json::json!({"key": "PROJ-1"}),
@@ -711,7 +743,8 @@ async fn jira_tool_handlers_surface_tool_error_without_credentials() -> Result<(
         "jira_write",
         "jira_transition",
         "jira_comment",
-        "jira_link",
+        "jira_link_create",
+        "jira_link_parent",
         "jira_link_remote_list",
         "jira_dev",
         "jira_user_search",
@@ -722,7 +755,10 @@ async fn jira_tool_handlers_surface_tool_error_without_credentials() -> Result<(
             "jira_create" => serde_json::json!({"project": "P", "summary": "s"}),
             "jira_write" => serde_json::json!({"key": "X-1", "content": "b"}),
             "jira_comment" => serde_json::json!({"key": "X-1", "action": "list"}),
-            "jira_link" => serde_json::json!({"action": "types"}),
+            "jira_link_create" => {
+                serde_json::json!({"link_type": "Blocks", "inward": "X-1", "outward": "X-2"})
+            }
+            "jira_link_parent" => serde_json::json!({"parent": "X-1", "child": "X-2"}),
             "jira_user_search" => serde_json::json!({"query": "alice"}),
             _ => serde_json::json!({"key": "X-1"}),
         };
