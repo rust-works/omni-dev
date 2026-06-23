@@ -128,19 +128,24 @@ Atlassian capability depth.
 |-----------------------------------------|---------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------|
 | Jira REST surface                       | ✅ 36 tools (agile, fields, dev panel, links, watchers, worklogs, versions, changelog) | ✅ 49 tools (above + JSM, proforma forms, SLA, batch ops)                          | ⚠ 14 tools (basic CRUD, search, transitions, worklogs only)                                                 |
 | Confluence REST surface                 | ✅ 25 tools (history, diff, attachments, labels, spaces, inline + footer comments)     | ✅ 24 tools (history, diff, attachments, labels; **no inline comments / spaces**)  | ⚠ 12 tools (inline + footer comments, spaces; **no delete / move / history / diff / attachments / labels**) |
-| Lossless JFM ↔ ADF round-trip           | ✅ full ADF node set (schema v54.0.4) + unsupported-node escape                        | ❌                                                                                 | ❌ raw ADF only                                                                                              |
-| Anchored review-comment preservation    | ✅ annotation marks survive round-trip                                                 | ❌ anchor stripped, comments orphaned                                              | ❌ raw ADF, no managed preservation                                                                          |
+| Lossless JFM ↔ ADF round-trip           | ✅ full ADF node set (schema v54.0.4) + unsupported-node escape                        | ❌                                                                                 | ⚠ raw ADF, model-dependent                                                                                  |
+| Anchored review-comment preservation    | ✅ annotation marks survive round-trip                                                 | ❌ anchor stripped, comments orphaned                                              | ⚠ ADF carries anchors; model-dependent                                                                      |
 | Pre-flight ADF schema validation        | ✅ nesting + arity, before write                                                       | ❌                                                                                 | ❌                                                                                                           |
 | Offline JFM ↔ ADF conversion (no creds) | ✅ `atlassian_convert`                                                                 | ❌                                                                                 | ❌                                                                                                           |
 | Cloud + Server + Data Center            | ⚠ Cloud verified                                                                      | ✅ Cloud + Server (v6+) + DC (Jira v8.14+)                                         | ❌ Cloud only                                                                                                |
 | Auth                                    | ⚠ API token only                                                                      | ✅ API token / PAT / OAuth 2.0                                                     | ✅ OAuth 2.1 / API token                                                                                     |
 
-_Last verified: 2026-06-22. omni-dev and sooperset counts come from live
+_Last verified: 2026-06-23. omni-dev and sooperset rows are live-tested — a
 `tools/list` enumeration (omni-dev branch build vs
-`ghcr.io/sooperset/mcp-atlassian:latest`); Atlassian Rovo is from its
+`ghcr.io/sooperset/mcp-atlassian:latest`) plus a live read→write→read fidelity
+cycle on a complex page. Atlassian Rovo's server accepts the API token but
+gates tool **execution** behind an org-admin grant, so its rows combine
+Atlassian's
 [Supported tools](https://support.atlassian.com/atlassian-rovo-mcp-server/docs/supported-tools/)
-docs (OAuth-gated, not live-enumerated). Refresh quarterly or whenever a
-release-note search for the comparators flags a relevant change._
+docs with the ADF-passthrough reasoning (raw ADF can round-trip, but only if
+the model echoes it faithfully — no deterministic guarantee), not a live run.
+Refresh quarterly or whenever a release-note search for the comparators flags
+a relevant change._
 
 ## 📋 Core Commands
 
@@ -798,6 +803,8 @@ We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.
 - **[User Guide](docs/user-guide.md)** - Comprehensive usage guide with examples
 - **[Configuration Guide](docs/configuration.md)** - Set up contextual
   intelligence
+- **[Why JFM?](docs/why-jfm.md)** - Why omni-dev edits Atlassian content as
+  Markdown instead of raw ADF
 - **[API Documentation](https://docs.rs/omni-dev)** - Rust API reference
 - **[Troubleshooting](docs/troubleshooting.md)** - Common issues and
   solutions
