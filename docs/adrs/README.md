@@ -63,3 +63,4 @@ by Michael Nygard.
 | [ADR-0037](adr-0037.md)  | 🔄 Superseded by [ADR-0038](adr-0038.md) | 2026-06-06 | Pure-C Native ASR Backends Behind a Rust FFI Boundary on Non-Windows Targets           |
 | [ADR-0038](adr-0038.md)  | ✅ Accepted                              | 2026-06-13 | Voice Functionality Extracted to the omni-voice Repository                             |
 | [ADR-0039](adr-0039.md)  | ✅ Accepted                              | 2026-06-18 | Extensible omni-dev Daemon Hosting Pluggable Services over a Unix Control Socket       |
+| [ADR-0040](adr-0040.md)  | ✅ Accepted                              | 2026-06-23 | Cross-Window Worktrees Daemon Service Fed by a Companion VS Code Extension             |
