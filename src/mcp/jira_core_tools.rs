@@ -87,7 +87,7 @@ pub struct JiraWriteParams {
     pub key: String,
     /// New description body. Interpreted per `format`. Omit to leave the
     /// existing description unchanged (useful when only updating
-    /// `parent`/`assignee`/`reporter`/`fields`).
+    /// `assignee`/`reporter`/`fields`).
     ///
     /// For `format = "jfm"` (the default), this is GitHub-style markdown,
     /// NOT JIRA wiki markup. Use `##` not `h2.`, triple-backtick fences not
@@ -99,13 +99,6 @@ pub struct JiraWriteParams {
     /// a raw ADF JSON document.
     #[serde(default)]
     pub format: Option<String>,
-    /// Parent issue key (e.g., `PROJ-100`). When set, establishes a
-    /// parent-child hierarchy on the issue (Epic → Story, Story → Sub-task,
-    /// etc.). Equivalent to the `jira_link_parent` tool; distinct from
-    /// `jira_link_create`, which creates "Composition"-style relationship
-    /// links rather than the system parent field.
-    #[serde(default)]
-    pub parent: Option<String>,
     /// Assignee `accountId`. The empty string `""` clears the assignee;
     /// `"-1"` triggers JIRA automatic assignment. Use `jira_user_search` to
     /// resolve a name or email to an `accountId`.
@@ -316,9 +309,9 @@ async fn run_jira_create(
 }
 
 /// Updates a JIRA issue. Any combination of description (`content`),
-/// `parent`, `assignee`, `reporter`, and arbitrary `fields` may be supplied;
-/// absent inputs leave the corresponding JIRA values untouched. At least one
-/// of these must be supplied.
+/// `assignee`, `reporter`, and arbitrary `fields` may be supplied; absent
+/// inputs leave the corresponding JIRA values untouched. At least one of
+/// these must be supplied.
 #[allow(clippy::too_many_arguments)]
 async fn run_jira_write(
     client: &AtlassianClient,
@@ -326,7 +319,6 @@ async fn run_jira_write(
     key: &str,
     content: Option<&str>,
     format: ReadFormat,
-    parent: Option<&str>,
     assignee: Option<&str>,
     reporter: Option<&str>,
     extra_fields: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
@@ -384,14 +376,14 @@ async fn run_jira_write(
         "the same key inside `fields`",
     )?;
 
-    if adf.is_none() && merged.is_empty() && parent.is_none() {
+    if adf.is_none() && merged.is_empty() {
         anyhow::bail!(
-            "no changes supplied for {key}: provide `content`, `parent`, `assignee`, `reporter`, or `fields`"
+            "no changes supplied for {key}: provide `content`, `assignee`, `reporter`, or `fields`"
         );
     }
 
     client
-        .update_issue_with_custom_fields(key, adf.as_ref(), None, parent, &merged)
+        .update_issue_with_custom_fields(key, adf.as_ref(), None, &merged)
         .await?;
     Ok(format!("Updated {key}.\n"))
 }
@@ -628,16 +620,15 @@ impl OmniDevServer {
         ok_text(text)
     }
 
-    /// Tool: update a JIRA issue's description, parent, assignee, reporter,
-    /// or arbitrary fields.
+    /// Tool: update a JIRA issue's description, assignee, reporter, or
+    /// arbitrary fields.
     #[tool(
         description = "Update a JIRA issue. `content` updates the description (JFM markdown by \
                        default, or raw ADF JSON when `format = \"adf\"`); omit it to leave the \
                        description unchanged. JFM is GitHub-style markdown — see resource \
-                       `omni-dev://specs/jfm` for syntax. `parent` sets the system parent field \
-                       for hierarchy (Epic → Story, Story → Sub-task) — distinct from \
-                       `jira_link_create`, which creates relationship links (Blocks, \
-                       Composition, etc.) rather than the parent field. `assignee`/`reporter` \
+                       `omni-dev://specs/jfm` for syntax. To set the parent for hierarchy \
+                       (Epic → Story, Story → Sub-task) use the `jira_link_parent` tool — \
+                       the canonical hierarchy surface. `assignee`/`reporter` \
                        accept an `accountId` (use the empty string `\"\"` to clear, `\"-1\"` for \
                        JIRA automatic assignment); call `jira_user_search` first if you only \
                        have a name or email. `fields` is an escape hatch — a map of canonical \
@@ -646,8 +637,8 @@ impl OmniDevServer {
                        targeting rich-text custom fields (e.g. Acceptance Criteria) are \
                        auto-converted from JFM to ADF; pass the empty string `\"\"` to clear \
                        such a field. Pass a JSON object value to bypass conversion (raw ADF). \
-                       At least one of `content`, `parent`, `assignee`, `reporter`, or \
-                       `fields` must be supplied."
+                       At least one of `content`, `assignee`, `reporter`, or `fields` must be \
+                       supplied."
     )]
     pub async fn jira_write(
         &self,
@@ -661,7 +652,6 @@ impl OmniDevServer {
             &params.key,
             params.content.as_deref(),
             format,
-            params.parent.as_deref(),
             params.assignee.as_deref(),
             params.reporter.as_deref(),
             params.fields.as_ref(),
@@ -1224,7 +1214,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         )
         .await
         .unwrap();
@@ -1247,7 +1236,6 @@ mod tests {
             "PROJ-1",
             Some(content),
             ReadFormat::Jfm,
-            None,
             None,
             None,
             None,
@@ -1275,7 +1263,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         )
         .await
         .unwrap();
@@ -1290,7 +1277,6 @@ mod tests {
             "PROJ-1",
             Some("not json"),
             ReadFormat::Adf,
-            None,
             None,
             None,
             None,
@@ -1310,7 +1296,6 @@ mod tests {
             "PROJ-1",
             Some(BAD_ADF_JFM),
             ReadFormat::Jfm,
-            None,
             None,
             None,
             None,
@@ -1337,7 +1322,6 @@ mod tests {
             "PROJ-1",
             Some("Body"),
             ReadFormat::Jfm,
-            None,
             None,
             None,
             None,
@@ -1375,7 +1359,6 @@ mod tests {
             "PROJ-1",
             None,
             ReadFormat::Jfm,
-            None,
             None,
             None,
             Some(&extras),
@@ -1419,7 +1402,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         )
         .await
         .unwrap_err();
@@ -1453,7 +1435,6 @@ mod tests {
             "PROJ-1",
             Some(""),
             ReadFormat::Jfm,
-            None,
             Some("abc123"),
             None,
             None,
@@ -1481,7 +1462,6 @@ mod tests {
             "PROJ-1",
             None,
             ReadFormat::Jfm,
-            None,
             Some("-1"),
             None,
             None,
@@ -1509,7 +1489,6 @@ mod tests {
             "PROJ-1",
             None,
             ReadFormat::Jfm,
-            None,
             Some(""),
             None,
             None,
@@ -1537,7 +1516,6 @@ mod tests {
             "PROJ-1",
             None,
             ReadFormat::Jfm,
-            None,
             None,
             Some("rep123"),
             None,
@@ -1573,7 +1551,6 @@ mod tests {
             ReadFormat::Jfm,
             None,
             None,
-            None,
             Some(&extra),
         )
         .await
@@ -1594,7 +1571,6 @@ mod tests {
             "PROJ-1",
             None,
             ReadFormat::Jfm,
-            None,
             Some("y"),
             None,
             Some(&extra),
@@ -1619,7 +1595,6 @@ mod tests {
             None,
             ReadFormat::Jfm,
             None,
-            None,
             Some("y"),
             Some(&extra),
         )
@@ -1640,77 +1615,10 @@ mod tests {
             None,
             None,
             None,
-            None,
         )
         .await
         .unwrap_err();
         assert!(err.to_string().contains("no changes supplied"));
-    }
-
-    #[tokio::test]
-    async fn run_jira_write_parent_only_sends_parent_key() {
-        let server = MockServer::start().await;
-        Mock::given(method("PUT"))
-            .and(path("/rest/api/3/issue/PROJ-1"))
-            .and(wiremock::matchers::body_json(serde_json::json!({
-                "fields": {"parent": {"key": "EPIC-1"}}
-            })))
-            .respond_with(ResponseTemplate::new(204))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let client = mock_client(&server.uri());
-        run_jira_write(
-            &client,
-            &mock_cache(),
-            "PROJ-1",
-            None,
-            ReadFormat::Jfm,
-            Some("EPIC-1"),
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn run_jira_write_content_and_parent_sends_both() {
-        let server = MockServer::start().await;
-        Mock::given(method("PUT"))
-            .and(path("/rest/api/3/issue/PROJ-1"))
-            .and(wiremock::matchers::body_json(serde_json::json!({
-                "fields": {
-                    "description": {
-                        "version": 1,
-                        "type": "doc",
-                        "content": [{
-                            "type": "paragraph",
-                            "content": [{"type": "text", "text": "Body"}]
-                        }]
-                    },
-                    "parent": {"key": "EPIC-1"}
-                }
-            })))
-            .respond_with(ResponseTemplate::new(204))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let client = mock_client(&server.uri());
-        run_jira_write(
-            &client,
-            &mock_cache(),
-            "PROJ-1",
-            Some("Body"),
-            ReadFormat::Jfm,
-            Some("EPIC-1"),
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
     }
 
     // ── run_jira_write: JFM→ADF for rich-text fields (issue #866) ─────────
@@ -1787,7 +1695,6 @@ mod tests {
             ReadFormat::Jfm,
             None,
             None,
-            None,
             Some(&extras),
         )
         .await
@@ -1827,7 +1734,6 @@ mod tests {
             ReadFormat::Jfm,
             None,
             None,
-            None,
             Some(&extras),
         )
         .await
@@ -1860,7 +1766,6 @@ mod tests {
             "PROJ-1",
             None,
             ReadFormat::Jfm,
-            None,
             None,
             None,
             Some(&extras),
@@ -1898,7 +1803,6 @@ mod tests {
             "PROJ-1",
             None,
             ReadFormat::Jfm,
-            None,
             None,
             None,
             Some(&extras),
@@ -1943,7 +1847,6 @@ mod tests {
             ReadFormat::Jfm,
             None,
             None,
-            None,
             Some(&extras),
         )
         .await
@@ -1969,7 +1872,6 @@ mod tests {
             "PROJ-1",
             None,
             ReadFormat::Jfm,
-            None,
             None,
             None,
             Some(&extras),
@@ -2014,7 +1916,6 @@ mod tests {
             "PROJ-1",
             None,
             ReadFormat::Jfm,
-            None,
             None,
             None,
             Some(&extras),
