@@ -856,6 +856,31 @@ mod tests {
         assert!(err.to_string().contains("403"));
     }
 
+    /// End-to-end exercise of the public `execute()` chain for the `parent`
+    /// subcommand: `LinkCommand::execute` → `ParentLinkCommand::execute` →
+    /// `create_client` → API. Covers the dispatch arm and the wrapper the
+    /// `run_parent_link` unit tests skip.
+    #[tokio::test]
+    async fn link_command_parent_execute_drives_create_client_and_calls_api() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-2"))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        let cmd = LinkCommand {
+            command: LinkSubcommands::Parent(ParentLinkCommand {
+                parent: "EPIC-1".to_string(),
+                child: "PROJ-2".to_string(),
+            }),
+        };
+        cmd.execute().await.unwrap();
+    }
+
     /// Force-mode + failing writer covers `?` on the post-API writeln.
     #[tokio::test]
     async fn remove_link_execute_force_propagates_writeln_error() {
