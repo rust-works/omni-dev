@@ -749,6 +749,15 @@ pub struct ProjectListParams {
     pub limit: u32,
 }
 
+/// Parameters for the `jira_project_create_meta` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectCreateMetaParams {
+    /// Project key (e.g., `PROJ`).
+    pub project: String,
+    /// Issue type name (e.g., `Task`, `Bug`).
+    pub issue_type: String,
+}
+
 pub(crate) async fn project_list_yaml(
     client: &AtlassianClient,
     cache: &CatalogueCache,
@@ -769,6 +778,15 @@ pub(crate) async fn project_list_yaml(
     let total = projects.len() as u32;
     let view = crate::atlassian::client::JiraProjectList { projects, total };
     serde_yaml::to_string(&view).context("Failed to serialize projects as YAML")
+}
+
+pub(crate) async fn project_create_meta_yaml(
+    client: &AtlassianClient,
+    project: &str,
+    issue_type: &str,
+) -> Result<String> {
+    let meta = client.get_project_create_meta(project, issue_type).await?;
+    serde_yaml::to_string(&meta).context("Failed to serialize create metadata as YAML")
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1406,6 +1424,28 @@ impl OmniDevServer {
         let yaml = (async {
             let (client, _) = create_client()?;
             project_list_yaml(&client, &cache, params.limit).await
+        })
+        .await
+        .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Tool: introspect the create screen for a project + issue type.
+    #[tool(
+        description = "Introspect which fields a JIRA issue type needs: for each field on the \
+                       create screen, returns `required`, `schema_type`, allowed values \
+                       (resolving option/select/cascading-select), and any default. Collapses the \
+                       create→HTTP 400→`jira_field_list`→`jira_field_options` recovery loop into a \
+                       single pre-flight call. Returns YAML. Mirrors `omni-dev atlassian jira \
+                       project create-meta`."
+    )]
+    pub async fn jira_project_create_meta(
+        &self,
+        Parameters(params): Parameters<ProjectCreateMetaParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let yaml = (async {
+            let (client, _) = create_client()?;
+            project_create_meta_yaml(&client, &params.project, &params.issue_type).await
         })
         .await
         .map_err(tool_error)?;
@@ -2612,6 +2652,95 @@ mod tests {
         let cache = CatalogueCache::new(std::time::Duration::from_secs(60));
         let err = project_list_yaml(&client, &cache, 50).await.unwrap_err();
         assert!(err.to_string().contains("500"));
+    }
+
+    #[tokio::test]
+    async fn project_create_meta_yaml_returns_yaml() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/createmeta"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "projects": [{
+                    "issuetypes": [{
+                        "fields": {
+                            "customfield_1": {
+                                "name": "Work Type",
+                                "required": true,
+                                "schema": {"type": "option"},
+                                "allowedValues": [{"id": "1", "value": "Planned"}]
+                            }
+                        }
+                    }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let yaml = project_create_meta_yaml(&client, "PROJ", "Task")
+            .await
+            .unwrap();
+        assert!(yaml.contains("Work Type"));
+        assert!(yaml.contains("required: true"));
+        assert!(yaml.contains("Planned"));
+    }
+
+    #[tokio::test]
+    async fn project_create_meta_yaml_propagates_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/createmeta"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("nope"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let err = project_create_meta_yaml(&client, "PROJ", "Task")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    /// Drives the production `jira_project_create_meta` tool handler end-to-end
+    /// — `OmniDevServer::new()` -> `create_client()` (reading credentials from
+    /// env) -> `project_create_meta_yaml` — with credentials pointed at a mock
+    /// server behind the canonical `EnvGuard`, covering the env-reading handler
+    /// wrapper the helper tests above bypass.
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn jira_project_create_meta_handler_returns_success() {
+        use crate::atlassian::auth::test_util::EnvGuard;
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/createmeta"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "projects": [{
+                    "issuetypes": [{
+                        "fields": {
+                            "summary": {
+                                "name": "Summary",
+                                "required": true,
+                                "schema": {"type": "string"}
+                            }
+                        }
+                    }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let guard = EnvGuard::take();
+        let _home = guard.set_credentials(&server.uri());
+
+        let srv = OmniDevServer::new();
+        let result = srv
+            .jira_project_create_meta(Parameters(ProjectCreateMetaParams {
+                project: "PROJ".to_string(),
+                issue_type: "Task".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
     }
 
     // ── changelog ──────────────────────────────────────────────────
