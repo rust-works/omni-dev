@@ -2282,67 +2282,7 @@ mod tests {
             serde_json::json!({"type": "doc", "version": 1, "content": [{"type": "paragraph"}]}),
         );
         let result = client
-            .update_issue_with_custom_fields("ACCS-1", Some(&adf), Some("New title"), None, &custom)
-            .await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn update_issue_with_parent_sends_parent_key() {
-        let server = wiremock::MockServer::start().await;
-
-        wiremock::Mock::given(wiremock::matchers::method("PUT"))
-            .and(wiremock::matchers::path("/rest/api/3/issue/ACCS-2"))
-            .and(wiremock::matchers::body_json(serde_json::json!({
-                "fields": {
-                    "description": {"version": 1, "type": "doc", "content": []},
-                    "parent": {"key": "ACCS-1"}
-                }
-            })))
-            .respond_with(wiremock::ResponseTemplate::new(204))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
-        let adf = ValidatedAdfDocument::empty();
-        let result = client
-            .update_issue_with_custom_fields(
-                "ACCS-2",
-                Some(&adf),
-                None,
-                Some("ACCS-1"),
-                &std::collections::BTreeMap::new(),
-            )
-            .await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn update_issue_with_parent_only_omits_description() {
-        let server = wiremock::MockServer::start().await;
-
-        wiremock::Mock::given(wiremock::matchers::method("PUT"))
-            .and(wiremock::matchers::path("/rest/api/3/issue/ACCS-2"))
-            .and(wiremock::matchers::body_json(serde_json::json!({
-                "fields": {
-                    "parent": {"key": "ACCS-1"}
-                }
-            })))
-            .respond_with(wiremock::ResponseTemplate::new(204))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
-        let result = client
-            .update_issue_with_custom_fields(
-                "ACCS-2",
-                None,
-                None,
-                Some("ACCS-1"),
-                &std::collections::BTreeMap::new(),
-            )
+            .update_issue_with_custom_fields("ACCS-1", Some(&adf), Some("New title"), &custom)
             .await;
         assert!(result.is_ok());
     }
@@ -2355,7 +2295,6 @@ mod tests {
         let err = client
             .update_issue_with_custom_fields(
                 "ACCS-1",
-                None,
                 None,
                 None,
                 &std::collections::BTreeMap::new(),
@@ -7061,7 +7000,6 @@ impl AtlassianClient {
             key,
             Some(description_adf),
             summary,
-            None,
             &std::collections::BTreeMap::new(),
         )
         .await
@@ -7069,19 +7007,18 @@ impl AtlassianClient {
 
     /// Updates a JIRA issue with any subset of supported fields.
     ///
-    /// `description_adf`, `summary`, and `parent` are each `Option`: `None`
-    /// leaves the field untouched, `Some` overwrites it. `custom_fields` is
-    /// merged verbatim into the `fields` payload, keyed by stable JIRA field
-    /// id — both standard fields (`assignee`, `reporter`, `priority`,
-    /// `labels`) and custom fields (`customfield_19300`). Returns an error
-    /// when nothing would be sent (avoids a no-op PUT that JIRA still
-    /// validates).
+    /// `description_adf` and `summary` are each `Option`: `None` leaves the
+    /// field untouched, `Some` overwrites it. `custom_fields` is merged
+    /// verbatim into the `fields` payload, keyed by stable JIRA field id —
+    /// both standard fields (`assignee`, `reporter`, `priority`, `labels`)
+    /// and custom fields (`customfield_19300`). The system `parent` field is
+    /// set via [`Self::set_issue_parent`], not here. Returns an error when
+    /// nothing would be sent (avoids a no-op PUT that JIRA still validates).
     pub async fn update_issue_with_custom_fields(
         &self,
         key: &str,
         description_adf: Option<&ValidatedAdfDocument>,
         summary: Option<&str>,
-        parent: Option<&str>,
         custom_fields: &std::collections::BTreeMap<String, serde_json::Value>,
     ) -> Result<()> {
         let url = format!("{}/rest/api/3/issue/{}", self.instance_url, key);
@@ -7097,12 +7034,6 @@ impl AtlassianClient {
             fields.insert(
                 "summary".to_string(),
                 serde_json::Value::String(summary_text.to_string()),
-            );
-        }
-        if let Some(parent_key) = parent {
-            fields.insert(
-                "parent".to_string(),
-                serde_json::json!({ "key": parent_key }),
             );
         }
         for (id, value) in custom_fields {

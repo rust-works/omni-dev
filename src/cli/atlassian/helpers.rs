@@ -204,19 +204,17 @@ pub async fn run_write(
     Ok(())
 }
 
-/// Confirms and pushes content (description, title, parent, and custom
-/// fields) to a JIRA issue via
-/// [`AtlassianClient::update_issue_with_custom_fields`].
+/// Confirms and pushes content (description, title, and custom fields) to a
+/// JIRA issue via [`AtlassianClient::update_issue_with_custom_fields`].
 ///
-/// `description_adf` is `None` for parent-only, assignee-only, reporter-only,
-/// or fields-only updates that must not overwrite the existing description.
+/// `description_adf` is `None` for assignee-only, reporter-only, or
+/// fields-only updates that must not overwrite the existing description.
 /// Goes direct to the client rather than through [`AtlassianApi`] since the
-/// trait does not model custom fields or parent.
+/// trait does not model custom fields.
 pub async fn run_write_jira_with_resolved_fields(
     key: &str,
     description_adf: Option<&ValidatedAdfDocument>,
     title: &str,
-    parent: Option<&str>,
     force: bool,
     custom_fields: &std::collections::BTreeMap<String, serde_json::Value>,
     client: &AtlassianClient,
@@ -225,9 +223,6 @@ pub async fn run_write_jira_with_resolved_fields(
         println!("About to update {key}:");
         if !title.is_empty() {
             println!("  Title: {title}");
-        }
-        if let Some(parent_key) = parent {
-            println!("  Parent: {parent_key}");
         }
         if description_adf.is_some() {
             println!("  Description: (will overwrite)");
@@ -249,7 +244,7 @@ pub async fn run_write_jira_with_resolved_fields(
     let title_ref = if title.is_empty() { None } else { Some(title) };
 
     client
-        .update_issue_with_custom_fields(key, description_adf, title_ref, parent, custom_fields)
+        .update_issue_with_custom_fields(key, description_adf, title_ref, custom_fields)
         .await?;
     println!("Updated {key} successfully.");
 
@@ -260,12 +255,10 @@ pub async fn run_write_jira_with_resolved_fields(
 /// `adf` of `None` indicates the description will not be updated.
 /// `assignee` / `reporter` of `None` indicate the field will not be updated;
 /// `Some("")` indicates it will be cleared.
-#[allow(clippy::too_many_arguments)]
 pub fn print_jira_dry_run_with_custom_fields(
     key: &str,
     adf: Option<&AdfDocument>,
     title: &str,
-    parent: Option<&str>,
     assignee: Option<&str>,
     reporter: Option<&str>,
     scalars: &std::collections::BTreeMap<String, serde_yaml::Value>,
@@ -274,9 +267,6 @@ pub fn print_jira_dry_run_with_custom_fields(
     println!("Dry run for {key}:");
     if !title.is_empty() {
         println!("  Title: {title}");
-    }
-    if let Some(parent_key) = parent {
-        println!("  Parent: {parent_key}");
     }
     if let Some(value) = assignee {
         let rendered = if value.is_empty() {
@@ -1204,44 +1194,12 @@ mod tests {
             "ACCS-1",
             Some(&adf),
             "New",
-            None,
             true,
             &custom,
             &client,
         )
         .await;
         assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn run_write_jira_with_resolved_fields_parent_only_omits_description() {
-        let server = wiremock::MockServer::start().await;
-
-        wiremock::Mock::given(wiremock::matchers::method("PUT"))
-            .and(wiremock::matchers::path("/rest/api/3/issue/ACCS-2"))
-            .and(wiremock::matchers::body_json(serde_json::json!({
-                "fields": {
-                    "parent": {"key": "ACCS-1"}
-                }
-            })))
-            .respond_with(wiremock::ResponseTemplate::new(204))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
-        let custom = std::collections::BTreeMap::new();
-        run_write_jira_with_resolved_fields(
-            "ACCS-2",
-            None,
-            "",
-            Some("ACCS-1"),
-            true,
-            &custom,
-            &client,
-        )
-        .await
-        .unwrap();
     }
 
     #[tokio::test]
@@ -1266,7 +1224,7 @@ mod tests {
         let mut custom = std::collections::BTreeMap::new();
         custom.insert("customfield_10001".to_string(), serde_json::json!(42));
 
-        run_write_jira_with_resolved_fields("ACCS-1", Some(&adf), "", None, true, &custom, &client)
+        run_write_jira_with_resolved_fields("ACCS-1", Some(&adf), "", true, &custom, &client)
             .await
             .unwrap();
     }
@@ -1291,7 +1249,6 @@ mod tests {
             "T",
             None,
             None,
-            None,
             &scalars,
             &sections,
         );
@@ -1308,23 +1265,6 @@ mod tests {
             "",
             None,
             None,
-            None,
-            &scalars,
-            &[],
-        );
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn print_jira_dry_run_parent_only_no_description() {
-        let scalars = std::collections::BTreeMap::new();
-        let result = print_jira_dry_run_with_custom_fields(
-            "ACCS-2",
-            None,
-            "",
-            Some("ACCS-1"),
-            None,
-            None,
             &scalars,
             &[],
         );
@@ -1338,7 +1278,6 @@ mod tests {
             "ACCS-1",
             None,
             "",
-            None,
             Some("abc123"),
             None,
             &scalars,
@@ -1354,7 +1293,6 @@ mod tests {
             "ACCS-1",
             None,
             "",
-            None,
             Some(""),
             None,
             &scalars,
@@ -1371,7 +1309,6 @@ mod tests {
             None,
             "",
             None,
-            None,
             Some("rep123"),
             &scalars,
             &[],
@@ -1386,7 +1323,6 @@ mod tests {
             "ACCS-1",
             None,
             "",
-            None,
             None,
             Some(""),
             &scalars,

@@ -1877,7 +1877,7 @@ Usage: write [OPTIONS] <KEY> [FILE]
 
 Arguments:
   <KEY>   JIRA issue key (e.g., PROJ-123)
-  [FILE]  Input file (reads from stdin if omitted or "-"). Pass `--no-content`, or omit when `--parent`/`--assignee`/`--reporter`/`--set-field` is supplied alone, to leave the description untouched
+  [FILE]  Input file (reads from stdin if omitted or "-"). Pass `--no-content`, or omit when `--assignee`/`--reporter`/`--set-field` is supplied alone, to leave the description untouched
 
 Options:
       --format <FORMAT>         Input format [default: jfm] [possible values: jfm, adf]
@@ -1885,7 +1885,6 @@ Options:
       --assignee <ACCOUNT_ID>   Sets the assignee `accountId`. The empty string `""` clears the assignee; `"-1"` triggers JIRA automatic assignment. Use `omni-dev atlassian jira user search` to resolve a name or email to an `accountId`
       --reporter <ACCOUNT_ID>   Sets the reporter `accountId`. Same conventions as `--assignee`
       --set-field <NAME=VALUE>  Set a custom field inline: `--set-field "NAME=VALUE"`. Can be used multiple times. Values are parsed as YAML scalars (numbers, bools) when possible, falling back to strings. Overrides values from the frontmatter `custom_fields:` map for the same name
-      --parent <KEY>            Sets the parent issue key (e.g., establishes Epic → Story or Story → Sub-task hierarchy). Maps to JIRA's `parent` system field; distinct from "Composition" links created via `omni-dev jira link`
       --force                   Skips the confirmation prompt
       --dry-run                 Shows what would change without writing
   -h, --help                    Print help (see more with '--help')
