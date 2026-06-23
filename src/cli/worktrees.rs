@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand};
 use serde_json::Value;
 
 use crate::daemon::client::DaemonClient;
-use crate::daemon::protocol::DaemonEnvelope;
+use crate::daemon::protocol::{DaemonEnvelope, DaemonReply};
 use crate::daemon::server;
 
 /// The `worktrees` service routing key on the daemon control socket.
@@ -77,6 +77,12 @@ async fn call(socket: &Path, op: &str, payload: Value) -> Result<Value> {
     let reply = DaemonClient::new(socket)
         .request(DaemonEnvelope::service(SERVICE, op, payload))
         .await?;
+    reply_payload(reply)
+}
+
+/// Unwraps a daemon reply into its payload, turning an `ok: false` reply into an
+/// error. Pure (no socket), so both mappings are unit-testable.
+fn reply_payload(reply: DaemonReply) -> Result<Value> {
     if reply.ok {
         Ok(reply.payload)
     } else {
@@ -212,5 +218,25 @@ mod tests {
         assert_eq!(age_secs(None), 0);
         assert_eq!(age_secs(Some("not-a-timestamp")), 0);
         assert!(age_secs(Some("2000-01-01T00:00:00Z")) > 0);
+    }
+
+    #[test]
+    fn reply_payload_unwraps_ok_and_maps_errors() {
+        // ok → payload.
+        assert_eq!(
+            reply_payload(DaemonReply::ok(json!({ "a": 1 }))).unwrap(),
+            json!({ "a": 1 })
+        );
+        // ok: false with a message → that message.
+        let err = reply_payload(DaemonReply::err("boom")).unwrap_err();
+        assert!(err.to_string().contains("boom"), "{err}");
+        // ok: false with no message → the "unknown error" fallback.
+        let err = reply_payload(DaemonReply {
+            ok: false,
+            payload: Value::Null,
+            error: None,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown error"), "{err}");
     }
 }
