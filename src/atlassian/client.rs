@@ -2815,6 +2815,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_issue_surfaces_adf_field_required_on_400() {
+        // Issue #1047: a 400 whose error envelope reports a field needs an
+        // "Atlassian document" must surface as the actionable
+        // JiraAdfFieldRequired, matching the update path's behaviour.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/issue"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "errorMessages": [],
+                    "errors": {
+                        "description": "Operation value must be an Atlassian document."
+                    }
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let err = client
+            .create_issue_with_custom_fields(
+                "PROJ",
+                "Task",
+                "Test",
+                None,
+                &[],
+                &std::collections::BTreeMap::new(),
+            )
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("description"), "got: {msg}");
+        assert!(msg.contains("ADF"), "got: {msg}");
+    }
+
+    #[tokio::test]
     async fn create_issue_shim_sends_no_custom_fields() {
         let server = wiremock::MockServer::start().await;
 
@@ -7515,7 +7551,10 @@ impl AtlassianClient {
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
+            // Parity with update: surface JIRA's `{ "errors": {...} }` envelope
+            // as the actionable `JiraAdfFieldRequired` when a field reports it
+            // needs ADF, instead of an opaque `ApiRequestFailed` (issue #1047).
+            return Err(jira_write_error(status, body));
         }
 
         let create_response: JiraCreateResponse = response

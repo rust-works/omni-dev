@@ -49,6 +49,11 @@ pub fn hint_for(violation: &AdfSchemaViolation) -> Option<&'static str> {
             problem,
             ..
         } => invalid_mark_attr_hint(mark_type, attr_name, problem),
+        AdfSchemaViolation::ForbiddenMarkCombination {
+            mark_type,
+            conflicts_with,
+            ..
+        } => forbidden_mark_combination_hint(mark_type, conflicts_with),
     }
 }
 
@@ -190,6 +195,16 @@ fn invalid_mark_attr_hint(
         }
         _ => None,
     }
+}
+
+fn forbidden_mark_combination_hint(mark_type: &str, conflicts_with: &str) -> Option<&'static str> {
+    // The dominant real-world case is `code` paired with a styling mark.
+    if mark_type == "code" || conflicts_with == "code" {
+        return Some(
+            "the `code` (monospace) mark only combines with a link — drop the backticks or the other style so the text run carries a single mark",
+        );
+    }
+    Some("ADF does not allow these marks on one text run; split the run so each piece carries a single style")
 }
 
 #[cfg(test)]
@@ -661,5 +676,35 @@ mod tests {
             AttrProblem::WrongType { expected: "string" }
         ))
         .is_none());
+    }
+
+    // ── forbidden_mark_combination_hint coverage ───────────────────────
+
+    fn fmc(mark: &str, conflicts: &str) -> AdfSchemaViolation {
+        AdfSchemaViolation::ForbiddenMarkCombination {
+            mark_type: mark.to_string(),
+            conflicts_with: conflicts.to_string(),
+            parent_type: "paragraph".to_string(),
+            inline_index: Some(0),
+            path: vec![0, 0],
+        }
+    }
+
+    #[test]
+    fn forbidden_mark_combination_hint_code_specific() {
+        assert!(hint_for(&fmc("strong", "code"))
+            .unwrap()
+            .contains("monospace"));
+        assert!(hint_for(&fmc("code", "textColor"))
+            .unwrap()
+            .contains("monospace"));
+    }
+
+    #[test]
+    fn forbidden_mark_combination_hint_generic() {
+        // A non-code pairing still returns the generic split-the-run hint.
+        assert!(hint_for(&fmc("strong", "em"))
+            .unwrap()
+            .contains("single style"));
     }
 }

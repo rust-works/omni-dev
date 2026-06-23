@@ -97,6 +97,54 @@ const HEADING_BLOCK_MARKS: &[&str] = &["alignment", "indentation"];
 const TABLE_CELL_BLOCK_MARKS: &[&str] = &["backgroundColor", "border"];
 const TABLE_HEADER_BLOCK_MARKS: &[&str] = &["backgroundColor", "border"];
 
+// -----------------------------------------------------------------------------
+// Inline-mark combination groups (issue #1047)
+// -----------------------------------------------------------------------------
+
+/// Marks permitted together on a *monospace* text node, transcribed from the
+/// `code_inline_node` variant in the pinned upstream schema
+/// (`assets/adf-schema/full.json`).
+const CODE_INLINE_MARK_GROUP: &[&str] = &["annotation", "code", "link"];
+
+/// Marks permitted together on a *styled* (non-monospace) text node,
+/// transcribed from the `formatted_text_inline_node` variant.
+const FORMATTED_INLINE_MARK_GROUP: &[&str] = &[
+    "annotation",
+    "backgroundColor",
+    "em",
+    "link",
+    "strike",
+    "strong",
+    "subsup",
+    "textColor",
+    "underline",
+];
+
+/// The mutually-exclusive inline-mark groups. A text node's marks must all
+/// fit within a *single* group — the upstream schema offers a text node as an
+/// `anyOf` over these variants, so mixing marks from different groups (most
+/// commonly `code` with any styling mark) is what the API rejects as opaque
+/// `INVALID_INPUT`.
+///
+/// Note: `link` and `annotation` appear in both groups, so they never
+/// conflict with anything. `code` appears only in the code group, which is
+/// why it combines with nothing but `link`/`annotation`.
+const INLINE_MARK_GROUPS: &[&[&str]] = &[CODE_INLINE_MARK_GROUP, FORMATTED_INLINE_MARK_GROUP];
+
+/// True when some single group contains both marks (i.e. they may coexist on
+/// one text node). Marks that belong to no group are treated as
+/// non-conflicting here — their legality is decided by the allow-list check,
+/// not the combination check.
+fn marks_may_coexist(a: &str, b: &str) -> bool {
+    let in_a_group = |m: &str| INLINE_MARK_GROUPS.iter().any(|g| g.contains(&m));
+    if !in_a_group(a) || !in_a_group(b) {
+        return true;
+    }
+    INLINE_MARK_GROUPS
+        .iter()
+        .any(|g| g.contains(&a) && g.contains(&b))
+}
+
 const INLINE_MARKS_ENTRIES: &[(&str, &[&str])] = &[
     ("caption", CAPTION_INLINE_MARKS),
     ("codeBlock", CODE_BLOCK_INLINE_MARKS),
@@ -380,6 +428,50 @@ pub fn validate_marks(
                 path,
                 out,
             );
+        }
+    }
+
+    // Cross-mark combination check (issue #1047). Only inline text marks are
+    // partitioned into mutually-exclusive groups; block marks have no such
+    // constraint, so restrict the check to inline nodes.
+    if is_inline_node(node_type) {
+        check_inline_mark_combination(parent_type, marks, path, out);
+    }
+}
+
+/// Emits a single [`AdfSchemaViolation::ForbiddenMarkCombination`] for the
+/// first pair of marks on `node` that cannot coexist on one text node per
+/// [`INLINE_MARK_GROUPS`]. Reporting only the first pair keeps the diagnosis
+/// focused (the same "surface the first violation" convention the rest of the
+/// validator follows).
+fn check_inline_mark_combination(
+    parent_type: &str,
+    marks: &[crate::atlassian::adf::AdfMark],
+    path: &[usize],
+    out: &mut Vec<AdfSchemaViolation>,
+) {
+    // Distinct mark types in first-seen order; skip the round-trip wrappers.
+    let mut seen: Vec<&str> = Vec::new();
+    for mark in marks {
+        let m = mark.mark_type.as_str();
+        if is_unsupported_mark(m) || seen.contains(&m) {
+            continue;
+        }
+        seen.push(m);
+    }
+
+    for i in 0..seen.len() {
+        for j in (i + 1)..seen.len() {
+            if !marks_may_coexist(seen[i], seen[j]) {
+                out.push(AdfSchemaViolation::ForbiddenMarkCombination {
+                    mark_type: seen[i].to_string(),
+                    conflicts_with: seen[j].to_string(),
+                    parent_type: parent_type.to_string(),
+                    inline_index: Some(*path.last().unwrap_or(&0)),
+                    path: path.to_vec(),
+                });
+                return;
+            }
         }
     }
 }
@@ -781,6 +873,158 @@ mod tests {
         // bare `return;` arm at the bottom of the malformed-attrs match).
         let node = text_with_marks("x", vec![mark("code", Some(serde_json::json!([1, 2, 3])))]);
         assert!(run_inline("paragraph", node).is_empty());
+    }
+
+    // ── inline mark combinations (issue #1047) ────────────────────────
+
+    fn combos(v: &[AdfSchemaViolation]) -> Vec<(&str, &str)> {
+        v.iter()
+            .filter_map(|x| match x {
+                AdfSchemaViolation::ForbiddenMarkCombination {
+                    mark_type,
+                    conflicts_with,
+                    ..
+                } => Some((mark_type.as_str(), conflicts_with.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn strong_plus_code_is_forbidden() {
+        // The issue's repeatable trigger: `**`text`**` → strong + code.
+        let node = text_with_marks("hi", vec![mark("strong", None), mark("code", None)]);
+        let v = run_inline("paragraph", node);
+        assert_eq!(combos(&v), vec![("strong", "code")], "got: {v:?}");
+    }
+
+    #[test]
+    fn code_plus_background_color_is_forbidden() {
+        let node = text_with_marks(
+            "hi",
+            vec![
+                mark("code", None),
+                mark(
+                    "backgroundColor",
+                    Some(serde_json::json!({"color": "#ff0000"})),
+                ),
+            ],
+        );
+        let v = run_inline("paragraph", node);
+        assert_eq!(combos(&v), vec![("code", "backgroundColor")], "got: {v:?}");
+    }
+
+    #[test]
+    fn code_plus_link_is_allowed() {
+        // `link` and `code` share the code-inline group, so a monospace link
+        // is valid.
+        let node = text_with_marks(
+            "hi",
+            vec![
+                mark("code", None),
+                mark("link", Some(serde_json::json!({"href": "https://x.com"}))),
+            ],
+        );
+        let v = run_inline("paragraph", node);
+        assert!(combos(&v).is_empty(), "got: {v:?}");
+    }
+
+    #[test]
+    fn code_plus_annotation_is_allowed() {
+        let node = text_with_marks(
+            "hi",
+            vec![
+                mark("code", None),
+                mark(
+                    "annotation",
+                    Some(serde_json::json!({"id": "a1", "annotationType": "inlineComment"})),
+                ),
+            ],
+        );
+        let v = run_inline("paragraph", node);
+        assert!(combos(&v).is_empty(), "got: {v:?}");
+    }
+
+    #[test]
+    fn styling_marks_combine_freely() {
+        // strong + em + strike + underline all live in the formatted group.
+        let node = text_with_marks(
+            "hi",
+            vec![
+                mark("strong", None),
+                mark("em", None),
+                mark("strike", None),
+                mark("underline", None),
+            ],
+        );
+        let v = run_inline("paragraph", node);
+        assert!(combos(&v).is_empty(), "got: {v:?}");
+    }
+
+    #[test]
+    fn link_plus_text_color_is_allowed() {
+        // Both live in the formatted group per the pinned upstream schema, so
+        // this is NOT flagged (despite issue #1047's example listing it).
+        let node = text_with_marks(
+            "hi",
+            vec![
+                mark("link", Some(serde_json::json!({"href": "https://x.com"}))),
+                mark("textColor", Some(serde_json::json!({"color": "#0000ff"}))),
+            ],
+        );
+        let v = run_inline("paragraph", node);
+        assert!(combos(&v).is_empty(), "got: {v:?}");
+    }
+
+    #[test]
+    fn heading_bold_code_flags_both_disallowed_and_combination() {
+        // In a heading, `code` is disallowed outright (DisallowedMark) AND the
+        // bold+code pairing is a forbidden combination — so the violation list
+        // mixes variants. `combos` must surface only the combination, ignoring
+        // the DisallowedMark.
+        let node = text_with_marks("hi", vec![mark("strong", None), mark("code", None)]);
+        let v = run_inline("heading", node);
+        assert!(
+            v.iter()
+                .any(|x| matches!(x, AdfSchemaViolation::DisallowedMark { .. })),
+            "expected a DisallowedMark for code-on-heading too, got: {v:?}"
+        );
+        assert_eq!(combos(&v), vec![("strong", "code")], "got: {v:?}");
+    }
+
+    #[test]
+    fn only_first_conflicting_pair_is_reported() {
+        // code conflicts with both strong and em; only the first pair fires.
+        let node = text_with_marks(
+            "hi",
+            vec![mark("code", None), mark("strong", None), mark("em", None)],
+        );
+        let v = run_inline("paragraph", node);
+        assert_eq!(combos(&v), vec![("code", "strong")], "got: {v:?}");
+    }
+
+    #[test]
+    fn combination_check_records_parent_and_inline_index() {
+        let node = text_with_marks("hi", vec![mark("code", None), mark("strong", None)]);
+        let mut out = Vec::new();
+        validate_marks("paragraph", &node, &[3_usize], &mut out);
+        assert_eq!(out.len(), 1, "got: {out:?}");
+        assert!(
+            matches!(
+                &out[0],
+                AdfSchemaViolation::ForbiddenMarkCombination { parent_type, inline_index, path, .. }
+                    if parent_type == "paragraph" && *inline_index == Some(3) && path.as_slice() == [3]
+            ),
+            "got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn marks_may_coexist_treats_unknown_marks_as_non_conflicting() {
+        // A mark outside every group is not flagged by the combination check
+        // (its legality is the allow-list's job).
+        assert!(marks_may_coexist("code", "madeUpMark"));
+        assert!(marks_may_coexist("madeUpMark", "strong"));
     }
 
     // ── inline node under a parent without an inline-mark allow-list ──
