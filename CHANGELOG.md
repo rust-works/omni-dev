@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **MCP tools `jira_link_create` and `jira_link_parent`** ([#1049](https://github.com/rust-works/omni-dev/issues/1049)): complete the per-operation JIRA link tool family so every `omni-dev atlassian jira link` subcommand has a 1:1 MCP tool. `jira_link_create` creates a typed relationship link (`link_type`/`inward`/`outward`); `jira_link_parent` sets the system `parent` field for Epic → Story / Story → Sub-task hierarchy (`parent`/`child`). Both return YAML `{status: ok}` and join the existing `jira_link_list` / `jira_link_types` / `jira_link_remove` / `jira_link_remote_list` tools.
+
+### Changed
+- **JIRA link surfaces aligned across MCP and CLI** ([#1049](https://github.com/rust-works/omni-dev/issues/1049)): the MCP and CLI shapes for managing JIRA links had diverged — the same set-parent operation was named `action: "parent"` on MCP but `jira link epic` on the CLI — so an agent moving between surfaces hit a `parent`↔`epic` naming mismatch. The CLI `jira link epic` subcommand is renamed to **`jira link parent`** (flags `--parent`/`--child`), with the subcommand alias `epic` and the flag aliases `--epic`/`--issue` retained so existing scripts keep working unchanged. Each tool/subcommand description now cross-references its counterpart on the other surface.
+
+### Removed
+- **BREAKING (MCP) — monolithic `jira_link` tool removed** ([#1049](https://github.com/rust-works/omni-dev/issues/1049)): the `jira_link` tool (the `action: list|types|create|remove|parent|remote_list` discriminator) is removed in favour of the per-operation `jira_link_*` tools, leaving exactly one shape that mirrors the CLI subcommands. MCP callers using `jira_link` with an `action` must switch to the matching tool (e.g. `action: "parent"` → `jira_link_parent`, `action: "create"` → `jira_link_create`).
+
 ### Documentation
 - **Surface the daemon, request log, and Snowflake in the README and docs index** ([#1043](https://github.com/rust-works/omni-dev/issues/1043)): these v0.30.0 features shipped with substantive reference docs (`docs/log.md`, `docs/snowflake-service.md`, and the daemon coverage in `docs/browser-bridge.md` / [ADR-0039](docs/adrs/adr-0039.md)) but weren't discoverable — the top-level README never mentioned them and the docs index left `log.md` and `snowflake-service.md` unlinked. Adds README feature sections for the **Daemon**, **Snowflake**, and the **Request log** (`omni-dev log`), and docs-index subsections linking those guides plus a daemon pointer.
 - **Document `coverage diff`** ([#1045](https://github.com/rust-works/omni-dev/issues/1045)): the `omni-dev coverage diff` command (added in v0.29.0) had no user documentation at all. Adds a [docs/coverage.md](docs/coverage.md) reference (what it computes, the accepted report formats, output formats, the `--fail-under-patch` gate, diff scoping, and the full flag table), a README feature section, and a docs-index entry.
