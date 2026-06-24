@@ -192,6 +192,15 @@ pub struct EditMetaField {
 
     /// Schema describing the field's wire type.
     pub schema: EditMetaSchema,
+
+    /// Permitted option `value`s for option-like fields (`select`,
+    /// `radiobuttons`, multi-select), taken from the meta `allowedValues`.
+    /// Empty when the field does not enumerate values (free text, numbers,
+    /// user pickers, cascading selects) — in which case `--set-field` values
+    /// pass through for the API to validate. Used to reject an out-of-range
+    /// option before the request; see
+    /// [`crate::atlassian::custom_fields`].
+    pub allowed_values: Vec<String>,
 }
 
 /// Schema type information for an editable field.
@@ -1065,6 +1074,20 @@ struct JiraEditMetaField {
     name: Option<String>,
     #[serde(default)]
     schema: Option<JiraEditMetaSchemaRaw>,
+    #[serde(rename = "allowedValues", default)]
+    allowed_values: Vec<JiraAllowedValueRaw>,
+}
+
+impl JiraEditMetaField {
+    /// Flattens the raw `allowedValues` to their display `value`s (falling back
+    /// to `name`) for option validation. Cascading `children` are ignored —
+    /// `--set-field` targets only the top-level option.
+    fn allowed_value_strings(&self) -> Vec<String> {
+        self.allowed_values
+            .iter()
+            .filter_map(|v| v.value.clone().or_else(|| v.name.clone()))
+            .collect()
+    }
 }
 
 #[derive(Deserialize)]
@@ -2847,7 +2870,11 @@ mod tests {
                                         "type": "option",
                                         "custom": "com.atlassian.jira.plugin.system.customfieldtypes:select",
                                         "customId": 10001
-                                    }
+                                    },
+                                    "allowedValues": [
+                                        {"value": "Planned", "id": "10100"},
+                                        {"value": "Unplanned", "id": "10101"}
+                                    ]
                                 }
                             }
                         }]
@@ -2864,6 +2891,8 @@ mod tests {
         let field = meta.fields.get("customfield_10001").unwrap();
         assert_eq!(field.name, "Planned / Unplanned Work");
         assert_eq!(field.schema.kind, "option");
+        // allowedValues flow into EditMetaField for --set-field validation.
+        assert_eq!(field.allowed_values, vec!["Planned", "Unplanned"]);
     }
 
     #[tokio::test]
@@ -7390,6 +7419,7 @@ impl AtlassianClient {
             .fields
             .into_iter()
             .map(|(id, field)| {
+                let allowed_values = field.allowed_value_strings();
                 let schema = field.schema.map_or_else(
                     || EditMetaSchema {
                         kind: String::new(),
@@ -7405,6 +7435,7 @@ impl AtlassianClient {
                     EditMetaField {
                         name: field.name.unwrap_or_default(),
                         schema,
+                        allowed_values,
                     },
                 )
             })
@@ -7548,6 +7579,7 @@ impl AtlassianClient {
             .fields
             .into_iter()
             .map(|(id, field)| {
+                let allowed_values = field.allowed_value_strings();
                 let schema = field.schema.map_or_else(
                     || EditMetaSchema {
                         kind: String::new(),
@@ -7563,6 +7595,7 @@ impl AtlassianClient {
                     EditMetaField {
                         name: field.name.unwrap_or_default(),
                         schema,
+                        allowed_values,
                     },
                 )
             })
