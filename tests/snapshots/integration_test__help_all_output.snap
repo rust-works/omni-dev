@@ -1470,11 +1470,27 @@ Lists JIRA projects
 Usage: project <COMMAND>
 
 Commands:
-  list  Lists all accessible JIRA projects
-  help  Print this message or the help of the given subcommand(s)
+  list         Lists all accessible JIRA projects
+  create-meta  Shows the create-screen fields for a project + issue type
+  help         Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian jira project create-meta - Shows the create-screen fields for a project + issue type
+
+Shows the create-screen fields for a project + issue type
+
+Usage: create-meta [OPTIONS] --project <PROJECT> --issue-type <ISSUE_TYPE>
+
+Options:
+      --project <PROJECT>        Project key (e.g., "PROJ")
+      --issue-type <ISSUE_TYPE>  Issue type name (e.g., "Task", "Bug")
+  -o, --output <OUTPUT>          Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                     Print help (see more with '--help')
 
 
 ================================================================================

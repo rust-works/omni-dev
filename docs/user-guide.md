@@ -800,6 +800,27 @@ omni-dev atlassian jira project list
 omni-dev atlassian jira project list --limit 100
 ```
 
+**Create-screen introspection** — before creating an issue, ask which fields
+the project + issue type actually requires and what values they accept. This is
+the pre-flight alternative to attempting a create, parsing the HTTP 400
+(`customfield_NNNNN is required`), and chasing down `field list` / `field
+options` to recover:
+
+```bash
+# What does it take to create a Task in PROJ?
+omni-dev atlassian jira project create-meta --project PROJ --issue-type Task
+
+# Machine-readable output for scripting / agents
+omni-dev atlassian jira project create-meta --project PROJ --issue-type Bug -o yaml
+```
+
+For each field on the create screen this reports `field_id`, `name`,
+`required`, `schema_type`, any `custom` plugin URI, the `allowed_values`
+(resolving option / select / cascading-select, including nested `children`),
+and a `default_value` when the screen defines one. The table view sorts
+required fields first. Output formats match the other list commands: `table`
+(default), `json`, `yaml`, `yamls`, and `jsonl` (one line per field).
+
 #### JIRA: Fields
 
 JIRA installations are heavily customised — most real projects add custom
@@ -853,9 +874,9 @@ omni-dev atlassian jira field options --field-id customfield_10042
 #    (see `jira create` / `jira write` for the syntax).
 ```
 
-See also: [`jira_field_list` / `jira_field_options`](mcp.md#jira--extensions-18-tools)
-for the MCP equivalents (`search` and `field_id` parameters mirror the CLI
-flags).
+See also: [`jira_field_list` / `jira_field_options` / `jira_project_create_meta`](mcp.md#jira--extensions-25-tools)
+for the MCP equivalents (`search`, `field_id`, and `project` / `issue_type`
+parameters mirror the CLI flags).
 
 #### JIRA: Agile Boards
 
