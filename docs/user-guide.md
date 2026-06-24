@@ -728,6 +728,9 @@ omni-dev atlassian jira create body.json --format adf --project PROJ --summary "
 omni-dev atlassian jira create issue.md --set-field "Story Points=5" \
   --set-field "Sprint=customfield_10020"
 
+# Target a specific instance (overrides ATLASSIAN_INSTANCE_URL / settings.json)
+omni-dev atlassian jira create issue.md --instance https://other.atlassian.net
+
 # Preview without creating
 omni-dev atlassian jira create issue.md --dry-run
 ```
@@ -738,8 +741,10 @@ frontmatter, then a derived or default value** (issue type defaults to
 
 Frontmatter is optional. A file with no `---` block is treated entirely as
 the issue body, with every field taken from flags — the same way the MCP
-`jira_create` tool works. No `instance` is required: the target instance comes
-from auth config (`ATLASSIAN_*` env / `settings.json`), not the document.
+`jira_create` tool works. The frontmatter `instance:` field, if present, is
+ignored: it never routes requests. The target instance comes from `--instance`
+(when given), otherwise from auth config (`ATLASSIAN_INSTANCE_URL` env /
+`settings.json`), never from the document.
 
 Prints the created issue key (e.g., `PROJ-124`) to stdout. `--set-field`
 values are parsed as YAML scalars (numbers, bools) when possible, falling

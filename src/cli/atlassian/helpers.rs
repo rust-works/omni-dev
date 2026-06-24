@@ -404,6 +404,19 @@ pub fn create_client() -> Result<(AtlassianClient, String)> {
     create_client_from(auth::load_credentials()?)
 }
 
+/// Creates an authenticated Atlassian API client, optionally overriding the
+/// instance URL (e.g. from `jira create --instance`).
+///
+/// When `instance_override` is `Some`, that URL takes precedence over
+/// `ATLASSIAN_INSTANCE_URL` from the environment / `settings.json`; email and
+/// token are still resolved from credentials. When `None`, this is identical to
+/// [`create_client`].
+pub fn create_client_with_instance(
+    instance_override: Option<&str>,
+) -> Result<(AtlassianClient, String)> {
+    create_client_from(auth::load_credentials_with_instance(instance_override)?)
+}
+
 /// Builds an Atlassian API client from explicitly-provided credentials,
 /// bypassing all environment / `settings.json` resolution.
 ///
@@ -632,6 +645,39 @@ mod tests {
     fn read_input_missing_file() {
         let result = read_input(Some("/nonexistent/file.md"));
         assert!(result.is_err());
+    }
+
+    // ── create_client_with_instance ────────────────────────────────
+
+    #[test]
+    fn create_client_with_instance_override_targets_supplied_url() {
+        // Issue #1051: --instance overrides the env/settings instance URL.
+        // The override wins even when ATLASSIAN_INSTANCE_URL is unset, as long
+        // as email and token are configured.
+        let guard = crate::atlassian::auth::test_util::EnvGuard::take();
+        let _dir = guard.clear_credentials();
+        std::env::set_var(
+            crate::atlassian::auth::ATLASSIAN_EMAIL,
+            "person@example.com",
+        );
+        std::env::set_var(crate::atlassian::auth::ATLASSIAN_API_TOKEN, "token");
+
+        let (client, instance_url) =
+            create_client_with_instance(Some("https://override.atlassian.net/")).unwrap();
+        assert_eq!(instance_url, "https://override.atlassian.net");
+        assert_eq!(client.instance_url(), "https://override.atlassian.net");
+    }
+
+    #[test]
+    fn create_client_with_instance_none_uses_env_instance() {
+        // With no override, the instance is resolved from the environment —
+        // identical to create_client().
+        let guard = crate::atlassian::auth::test_util::EnvGuard::take();
+        let _dir = guard.set_credentials("https://env.atlassian.net");
+
+        let (client, instance_url) = create_client_with_instance(None).unwrap();
+        assert_eq!(instance_url, "https://env.atlassian.net");
+        assert_eq!(client.instance_url(), "https://env.atlassian.net");
     }
 
     // ── open_editor ────────────────────────────────────────────────
