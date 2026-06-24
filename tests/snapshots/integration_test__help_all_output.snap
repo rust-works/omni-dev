@@ -1218,7 +1218,7 @@ Options:
       --project <PROJECT>       Project key (e.g., "PROJ"). Overrides frontmatter
       --type <TYPE>             Issue type (e.g., "Task", "Bug", "Story"). Overrides frontmatter
       --summary <SUMMARY>       Issue summary/title. Overrides frontmatter
-      --set-field <NAME=VALUE>  Set a custom field inline: `--set-field "NAME=VALUE"`. Can be used multiple times. Values are parsed as YAML scalars (numbers, bools) when possible, falling back to strings. Overrides values from the frontmatter `custom_fields:` map for the same name
+      --set-field <NAME=VALUE>  Set a custom field inline, e.g. `--set-field "Story Points=5"`. Repeatable
       --dry-run                 Shows what would be sent without creating
   -h, --help                    Print help (see more with '--help')
 

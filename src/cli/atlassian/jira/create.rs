@@ -75,10 +75,25 @@ pub struct CreateCommand {
     #[arg(long)]
     pub summary: Option<String>,
 
-    /// Set a custom field inline: `--set-field "NAME=VALUE"`. Can be used
-    /// multiple times. Values are parsed as YAML scalars (numbers, bools)
-    /// when possible, falling back to strings. Overrides values from the
-    /// frontmatter `custom_fields:` map for the same name.
+    /// Set a custom field inline, e.g. `--set-field "Story Points=5"`.
+    /// Repeatable.
+    ///
+    /// Split on the FIRST `=`: NAME is everything before it (surrounding
+    /// spaces trimmed), VALUE everything after — spaces, parentheses, and
+    /// further `=` are kept verbatim, so only your shell's quoting is needed
+    /// (e.g. `--set-field "Work Type=Product Features (Planned)"`).
+    ///
+    /// VALUE is parsed as a YAML scalar (number, bool) when possible, else a
+    /// string; the wire type then follows the field's schema — option fields
+    /// send `{"value": ...}`, number fields send a number, and so on.
+    ///
+    /// NAME resolves against the project + issue-type create screen: a
+    /// `customfield_<digits>` id matches first, otherwise the display name.
+    /// The field must be on the create screen or the command errors listing
+    /// the accepted fields; for option fields a value outside the allowed set
+    /// is rejected up front. Run `omni-dev atlassian jira project create-meta`
+    /// to list accepted fields, their types, and allowed values. Overrides the
+    /// frontmatter `custom_fields:` entry of the same name.
     #[arg(long = "set-field", value_name = "NAME=VALUE")]
     pub set_fields: Vec<String>,
 
