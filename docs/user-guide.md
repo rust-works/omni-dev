@@ -728,6 +728,10 @@ omni-dev atlassian jira create body.json --format adf --project PROJ --summary "
 omni-dev atlassian jira create issue.md --set-field "Story Points=5" \
   --set-field "Sprint=customfield_10020"
 
+# Values may contain spaces, parentheses, and '=' — only shell quoting is needed
+omni-dev atlassian jira create issue.md \
+  --set-field "Work Type=Product Features (Planned)"
+
 # Target a specific instance (overrides ATLASSIAN_INSTANCE_URL / settings.json)
 omni-dev atlassian jira create issue.md --instance https://other.atlassian.net
 
@@ -746,10 +750,36 @@ ignored: it never routes requests. The target instance comes from `--instance`
 (when given), otherwise from auth config (`ATLASSIAN_INSTANCE_URL` env /
 `settings.json`), never from the document.
 
-Prints the created issue key (e.g., `PROJ-124`) to stdout. `--set-field`
-values are parsed as YAML scalars (numbers, bools) when possible, falling
-back to strings; entries override the frontmatter `custom_fields:` map for
-the same name.
+Prints the created issue key (e.g., `PROJ-124`) to stdout.
+
+`--set-field "NAME=VALUE"` semantics:
+
+- **Splitting.** The argument is split on the **first** `=` only. `NAME` is
+  everything before it (surrounding whitespace trimmed); `VALUE` is everything
+  after, kept verbatim — spaces, parentheses, and further `=` are all literal,
+  so the only quoting needed is your shell's.
+- **Value typing.** `VALUE` is parsed as a YAML scalar (number, bool) when
+  possible, otherwise a string. The shape actually sent then follows the
+  field's schema: option/select fields send `{"value": "…"}`, number fields
+  send a JSON number, array-of-option fields take a YAML list, and rich-text
+  (ADF) fields take JFM markdown. So `--set-field "Story Points=5"` sends the
+  number `5` for a numeric field, whereas an option field receives the string
+  `"5"` wrapped as `{"value": "5"}`.
+- **Field resolution.** `NAME` resolves against the create screen for the
+  target project + issue type. A `customfield_<digits>` id is matched first;
+  otherwise the **display name** is matched exactly. The field **must be on the
+  create screen** — an unknown name fails up front with the list of accepted
+  fields (it is never silently dropped), and an ambiguous display name lists
+  the matching ids.
+- **Option validation.** For option fields whose allowed values are known, a
+  value outside that set is rejected before the request with a clear,
+  field-named error. Fields that do not enumerate their values are sent as-is
+  and validated by JIRA (its error is surfaced verbatim).
+- **Precedence.** A `--set-field` entry overrides the frontmatter
+  `custom_fields:` entry of the same name.
+
+Run [`jira project create-meta`](#jira-projects) to see which fields a
+project + issue type accepts, their types, and allowed values.
 
 #### JIRA: Transitions
 

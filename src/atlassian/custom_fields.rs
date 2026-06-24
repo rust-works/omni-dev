@@ -46,7 +46,7 @@ pub fn resolve_custom_fields(
             out.insert(id, payload);
             continue;
         }
-        let payload = scalar_to_api_value(value, field).with_context(|| {
+        let payload = scalar_to_api_value(value, field, &id).with_context(|| {
             format!(
                 "Failed to convert custom field '{}' ({}) to API value",
                 field.name, id
@@ -223,6 +223,7 @@ pub fn convert_textarea_string_values(
 fn scalar_to_api_value(
     value: &serde_yaml::Value,
     field: &EditMetaField,
+    id: &str,
 ) -> Result<serde_json::Value> {
     let kind = field.schema.kind.as_str();
     let custom = field.schema.custom.as_deref();
@@ -231,6 +232,7 @@ fn scalar_to_api_value(
             let s = yaml_as_string(value).with_context(|| {
                 format!("expected a string for option field '{}'", field.name)
             })?;
+            validate_option_value(field, id, &s)?;
             Ok(serde_json::json!({ "value": s }))
         }
         ("array", _) => {
@@ -246,6 +248,7 @@ fn scalar_to_api_value(
                             field.name
                         )
                     })?;
+                    validate_option_value(field, id, &s)?;
                     Ok(serde_json::json!({ "value": s }))
                 })
                 .collect::<Result<_>>()?;
@@ -257,6 +260,31 @@ fn scalar_to_api_value(
             field.name
         )),
     }
+}
+
+/// Validates a supplied option string against a field's enumerated
+/// `allowedValues`, when the meta reports them.
+///
+/// Matching is exact and case-sensitive — JIRA's own contract for option
+/// `value`s. Fuzzy matching is deliberately avoided: silently coercing a
+/// value the caller did not type is worse than a clear error.
+///
+/// When the field does not enumerate values — free text, numbers, user
+/// pickers, cascading selects — `allowed_values` is empty, so the check is
+/// skipped and the API performs final validation (surfaced verbatim as an
+/// HTTP error). This turns the common "typo'd select value → opaque HTTP 400"
+/// failure into an actionable, field-named error before the request.
+fn validate_option_value(field: &EditMetaField, id: &str, value: &str) -> Result<()> {
+    if field.allowed_values.is_empty() || field.allowed_values.iter().any(|v| v == value) {
+        return Ok(());
+    }
+    bail!(
+        "Field '{}' ({}): '{}' is not an allowed option. Valid options: {}",
+        field.name,
+        id,
+        value,
+        field.allowed_values.join(", ")
+    )
 }
 
 fn yaml_as_string(value: &serde_yaml::Value) -> Result<String> {
@@ -366,9 +394,28 @@ mod tests {
                         kind: (*kind).to_string(),
                         custom: custom.map(str::to_string),
                     },
+                    allowed_values: Vec::new(),
                 },
             );
         }
+        EditMeta { fields }
+    }
+
+    /// Builds a single-field [`EditMeta`] for an option-like field that
+    /// enumerates `allowedValues`.
+    fn meta_with_allowed(id: &str, name: &str, kind: &str, allowed: &[&str]) -> EditMeta {
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            id.to_string(),
+            EditMetaField {
+                name: name.to_string(),
+                schema: EditMetaSchema {
+                    kind: kind.to_string(),
+                    custom: None,
+                },
+                allowed_values: allowed.iter().map(|v| (*v).to_string()).collect(),
+            },
+        );
         EditMeta { fields }
     }
 
@@ -806,6 +853,106 @@ mod tests {
             out.get("customfield_num").unwrap(),
             &serde_json::json!({"value": "3"})
         );
+    }
+
+    #[test]
+    fn option_value_matching_allowed_values_passes() {
+        let editmeta = meta_with_allowed(
+            "customfield_21051",
+            "Work Attribution",
+            "option",
+            &["Planned", "Unplanned"],
+        );
+        let mut scalars = BTreeMap::new();
+        scalars.insert(
+            "Work Attribution".to_string(),
+            serde_yaml::Value::String("Planned".to_string()),
+        );
+        let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
+        assert_eq!(
+            out.get("customfield_21051").unwrap(),
+            &serde_json::json!({ "value": "Planned" })
+        );
+    }
+
+    #[test]
+    fn option_value_not_in_allowed_values_errors_with_field_and_options() {
+        let editmeta = meta_with_allowed(
+            "customfield_21051",
+            "Work Attribution",
+            "option",
+            &["Planned", "Unplanned"],
+        );
+        let mut scalars = BTreeMap::new();
+        scalars.insert(
+            "Work Attribution".to_string(),
+            serde_yaml::Value::String("Plnned".to_string()),
+        );
+        let err = resolve_custom_fields(&scalars, &[], &editmeta).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Work Attribution"), "got: {msg}");
+        assert!(msg.contains("customfield_21051"), "got: {msg}");
+        assert!(
+            msg.contains("'Plnned' is not an allowed option"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("Planned, Unplanned"), "got: {msg}");
+    }
+
+    #[test]
+    fn option_value_matching_is_case_sensitive() {
+        // "planned" != "Planned" — JIRA's option contract is case-sensitive,
+        // and fuzzy coercion is deliberately avoided.
+        let editmeta = meta_with_allowed(
+            "customfield_21051",
+            "Work Attribution",
+            "option",
+            &["Planned"],
+        );
+        let mut scalars = BTreeMap::new();
+        scalars.insert(
+            "Work Attribution".to_string(),
+            serde_yaml::Value::String("planned".to_string()),
+        );
+        let err = resolve_custom_fields(&scalars, &[], &editmeta).unwrap_err();
+        assert!(format!("{err:#}").contains("not an allowed option"));
+    }
+
+    #[test]
+    fn option_field_without_allowed_values_passes_any_value_through() {
+        // No enumerated allowedValues: skip local validation, let the API decide.
+        let editmeta = meta(&[("customfield_21051", "Work Attribution", "option", None)]);
+        let mut scalars = BTreeMap::new();
+        scalars.insert(
+            "Work Attribution".to_string(),
+            serde_yaml::Value::String("Anything".to_string()),
+        );
+        let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
+        assert_eq!(
+            out.get("customfield_21051").unwrap(),
+            &serde_json::json!({ "value": "Anything" })
+        );
+    }
+
+    #[test]
+    fn array_option_element_not_in_allowed_values_errors() {
+        let editmeta =
+            meta_with_allowed("customfield_10004", "Teams", "array", &["backend", "auth"]);
+        let mut scalars = BTreeMap::new();
+        scalars.insert(
+            "Teams".to_string(),
+            serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String("backend".to_string()),
+                serde_yaml::Value::String("frontend".to_string()),
+            ]),
+        );
+        let err = resolve_custom_fields(&scalars, &[], &editmeta).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("'frontend' is not an allowed option"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("backend, auth"), "got: {msg}");
     }
 
     #[test]
