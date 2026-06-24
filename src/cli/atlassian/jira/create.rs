@@ -16,7 +16,27 @@ use crate::atlassian::document::{
     split_custom_sections, split_frontmatter, CustomFieldSection, JiraCreateFrontmatter,
 };
 use crate::cli::atlassian::format::ContentFormat;
-use crate::cli::atlassian::helpers::{create_client, print_create_dry_run, read_input};
+use crate::cli::atlassian::helpers::{
+    create_client_with_instance, print_create_dry_run, read_input,
+};
+
+/// `--help` epilogue documenting the fields accepted only via JFM frontmatter,
+/// so they are discoverable without first triggering a runtime error.
+const CREATE_AFTER_HELP: &str = "\
+JFM FRONTMATTER (--format jfm):
+  These fields are read from the document's YAML frontmatter. The flags above,
+  when given, override the matching frontmatter field:
+    project        project key (or derived from `key:` for an existing issue)
+    summary        issue title
+    issue_type     issue type (overridden by --type)
+    labels         list of labels
+    custom_fields  map of custom field name -> value (overridden by --set-field)
+    instance       OPTIONAL, informational only; NOT used for routing. The
+                   target instance comes from --instance, else
+                   ATLASSIAN_INSTANCE_URL / settings.json.
+
+ADF INPUT (--format adf):
+  The body is a raw ADF payload; supply --project and --summary as flags.";
 
 /// Creates a new JIRA issue.
 ///
@@ -29,6 +49,7 @@ use crate::cli::atlassian::helpers::{create_client, print_create_dry_run, read_i
 /// optional `--type`) are enough to create an issue from a plain markdown
 /// body. No `instance` is needed: the target is taken from auth config.
 #[derive(Parser)]
+#[command(after_help = CREATE_AFTER_HELP)]
 pub struct CreateCommand {
     /// Input file containing JFM markdown or ADF JSON (reads from stdin if omitted or "-").
     pub file: Option<String>,
@@ -36,6 +57,11 @@ pub struct CreateCommand {
     /// Input format.
     #[arg(long, value_enum, default_value_t = ContentFormat::Jfm)]
     pub format: ContentFormat,
+
+    /// Atlassian instance URL (e.g. "https://org.atlassian.net"). Overrides
+    /// ATLASSIAN_INSTANCE_URL / settings.json for this invocation.
+    #[arg(long, value_name = "URL")]
+    pub instance: Option<String>,
 
     /// Project key (e.g., "PROJ"). Overrides frontmatter.
     #[arg(long)]
@@ -88,7 +114,7 @@ impl CreateCommand {
             );
         }
 
-        let (client, _instance_url) = create_client()?;
+        let (client, _instance_url) = create_client_with_instance(self.instance.as_deref())?;
         run_create(&client, &params).await
     }
 
@@ -251,6 +277,7 @@ mod tests {
         let cmd = CreateCommand {
             file: None,
             format: ContentFormat::default(),
+            instance: None,
             project: None,
             r#type: None,
             summary: None,
@@ -258,8 +285,35 @@ mod tests {
             dry_run: false,
         };
         assert!(cmd.file.is_none());
+        assert!(cmd.instance.is_none());
         assert!(cmd.project.is_none());
         assert!(!cmd.dry_run);
+    }
+
+    #[test]
+    fn resolve_from_jfm_without_instance_frontmatter_succeeds() {
+        // Issue #1051: `instance` is no longer a required frontmatter field;
+        // a JFM doc that omits it must resolve rather than failing with
+        // "missing field `instance`". Routing is independent of this field.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("issue.md");
+        let content = "---\ntype: jira\nproject: PROJ\nsummary: No instance here\n---\n\nBody\n";
+        fs::write(&file_path, content).unwrap();
+
+        let cmd = CreateCommand {
+            file: Some(file_path.to_str().unwrap().to_string()),
+            format: ContentFormat::Jfm,
+            instance: None,
+            project: None,
+            r#type: None,
+            summary: None,
+            set_fields: vec![],
+            dry_run: false,
+        };
+
+        let params = cmd.resolve_params().unwrap();
+        assert_eq!(params.project, "PROJ");
+        assert_eq!(params.summary, "No instance here");
     }
 
     #[test]
@@ -272,6 +326,7 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
+            instance: None,
             project: None,
             r#type: None,
             summary: None,
@@ -296,6 +351,7 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
+            instance: None,
             project: None,
             r#type: None,
             summary: None,
@@ -317,6 +373,7 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
+            instance: None,
             project: Some("NEW".to_string()),
             r#type: Some("Story".to_string()),
             summary: Some("New Title".to_string()),
@@ -342,6 +399,7 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
+            instance: None,
             project: None,
             r#type: None,
             summary: None,
@@ -364,6 +422,7 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
+            instance: None,
             project: None,
             r#type: None,
             summary: None,
@@ -385,6 +444,7 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Adf,
+            instance: None,
             project: Some("PROJ".to_string()),
             r#type: Some("Bug".to_string()),
             summary: Some("Fix it".to_string()),
@@ -408,6 +468,7 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Adf,
+            instance: None,
             project: None,
             r#type: None,
             summary: Some("Title".to_string()),
@@ -429,6 +490,7 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Adf,
+            instance: None,
             project: Some("PROJ".to_string()),
             r#type: None,
             summary: None,
@@ -450,6 +512,7 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
+            instance: None,
             project: None,
             r#type: None,
             summary: None,
@@ -472,6 +535,7 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
+            instance: None,
             project: Some("PROJ".to_string()),
             r#type: Some("Story".to_string()),
             summary: Some("Flag-driven".to_string()),
@@ -494,6 +558,7 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
+            instance: None,
             project: Some("PROJ".to_string()),
             r#type: None,
             summary: Some("S".to_string()),
@@ -514,6 +579,7 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
+            instance: None,
             project: None,
             r#type: None,
             summary: Some("Has summary".to_string()),
@@ -534,6 +600,7 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
+            instance: None,
             project: Some("PROJ".to_string()),
             r#type: None,
             summary: None,
@@ -559,6 +626,7 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
+            instance: None,
             project: None,
             r#type: None,
             summary: Some("From flag".to_string()),
@@ -582,6 +650,7 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
+            instance: None,
             project: None,
             r#type: None,
             summary: None,
@@ -604,6 +673,7 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Adf,
+            instance: None,
             project: Some("PROJ".to_string()),
             r#type: None,
             summary: Some("Test".to_string()),
@@ -626,6 +696,7 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
+            instance: None,
             project: None,
             r#type: None,
             summary: None,
@@ -670,6 +741,48 @@ mod tests {
 
         let client = mock_client(&server.uri());
         assert!(run_create(&client, &sample_params()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn execute_routes_create_to_instance_flag_url() {
+        // Issue #1051: --instance routes the create request to the supplied
+        // URL end-to-end. Covers execute()'s non-dry-run path (flag → client →
+        // run_create) and proves the override actually targets that instance.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/rest/api/3/issue"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "id": "100", "key": "PROJ-100", "self": "https://x/rest/api/3/issue/100"
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("body.md");
+        fs::write(&file_path, "Plain body.\n").unwrap();
+
+        // Email/token from env; instance comes from the --instance flag, which
+        // points at the mock server.
+        let guard = crate::atlassian::auth::test_util::EnvGuard::take();
+        let _home = guard.clear_credentials();
+        std::env::set_var(crate::atlassian::auth::ATLASSIAN_EMAIL, "u@test.com");
+        std::env::set_var(crate::atlassian::auth::ATLASSIAN_API_TOKEN, "token");
+
+        let cmd = CreateCommand {
+            file: Some(file_path.to_str().unwrap().to_string()),
+            format: ContentFormat::Jfm,
+            instance: Some(server.uri()),
+            project: Some("PROJ".to_string()),
+            r#type: None,
+            summary: Some("From flag".to_string()),
+            set_fields: vec![],
+            dry_run: false,
+        };
+
+        cmd.execute().await.unwrap();
     }
 
     #[tokio::test]
@@ -779,6 +892,7 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
+            instance: None,
             project: None,
             r#type: None,
             summary: None,
@@ -803,6 +917,7 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Jfm,
+            instance: None,
             project: None,
             r#type: None,
             summary: None,
@@ -824,6 +939,7 @@ mod tests {
         let cmd = CreateCommand {
             file: Some(file_path.to_str().unwrap().to_string()),
             format: ContentFormat::Adf,
+            instance: None,
             project: Some("PROJ".to_string()),
             r#type: None,
             summary: Some("T".to_string()),
