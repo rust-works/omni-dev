@@ -1214,12 +1214,28 @@ Arguments:
 
 Options:
       --format <FORMAT>         Input format [default: jfm] [possible values: jfm, adf]
+      --instance <URL>          Atlassian instance URL (e.g. "https://org.atlassian.net"). Overrides ATLASSIAN_INSTANCE_URL / settings.json for this invocation
       --project <PROJECT>       Project key (e.g., "PROJ"). Overrides frontmatter
       --type <TYPE>             Issue type (e.g., "Task", "Bug", "Story"). Overrides frontmatter
       --summary <SUMMARY>       Issue summary/title. Overrides frontmatter
       --set-field <NAME=VALUE>  Set a custom field inline: `--set-field "NAME=VALUE"`. Can be used multiple times. Values are parsed as YAML scalars (numbers, bools) when possible, falling back to strings. Overrides values from the frontmatter `custom_fields:` map for the same name
       --dry-run                 Shows what would be sent without creating
   -h, --help                    Print help (see more with '--help')
+
+JFM FRONTMATTER (--format jfm):
+  These fields are read from the document's YAML frontmatter. The flags above,
+  when given, override the matching frontmatter field:
+    project        project key (or derived from `key:` for an existing issue)
+    summary        issue title
+    issue_type     issue type (overridden by --type)
+    labels         list of labels
+    custom_fields  map of custom field name -> value (overridden by --set-field)
+    instance       OPTIONAL, informational only; NOT used for routing. The
+                   target instance comes from --instance, else
+                   ATLASSIAN_INSTANCE_URL / settings.json.
+
+ADF INPUT (--format adf):
+  The body is a raw ADF payload; supply --project and --summary as flags.
 
 
 ================================================================================

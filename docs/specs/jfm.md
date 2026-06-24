@@ -57,7 +57,7 @@ Page body content here.
 | Field        | Required | Description                                                               |
 |--------------|----------|---------------------------------------------------------------------------|
 | `type`       | Yes      | Always `"jira"`                                                           |
-| `instance`   | Yes      | Atlassian Cloud instance URL                                              |
+| `instance`   | Yes      | Atlassian Cloud instance URL (informational; see note below)              |
 | `key`        | No       | JIRA issue key (e.g., `PROJ-123`). Absent when creating a new issue.      |
 | `project`    | No       | Project key (e.g., `PROJ`). Used for issue creation when `key` is absent. |
 | `summary`    | Yes      | Issue title/summary                                                       |
@@ -72,13 +72,22 @@ Page body content here.
 | Field        | Required | Description                                          |
 |--------------|----------|------------------------------------------------------|
 | `type`       | Yes      | Always `"confluence"`                                |
-| `instance`   | Yes      | Atlassian Cloud instance URL                         |
+| `instance`   | Yes      | Atlassian instance URL (informational; see note)     |
 | `page_id`    | No       | Confluence page ID. Absent when creating a new page. |
 | `title`      | Yes      | Page title                                           |
 | `space_key`  | Yes      | Space key (e.g., `ENG`)                              |
 | `status`     | No       | Page status (`"current"` or `"draft"`)               |
 | `version`    | No       | Page version number (for optimistic locking)         |
 | `parent_id`  | No       | Parent page ID                                       |
+
+> **Note on `instance`:** This field records the Atlassian instance URL but is
+> **not** used to route requests — the target instance is resolved from
+> `omni-dev atlassian jira create --instance <URL>` (when given), otherwise from
+> the `ATLASSIAN_INSTANCE_URL` environment variable / `settings.json`. It is
+> required by the canonical format above (the read → edit → write round-trip,
+> and `read` populates it), but **`jira create` is lenient**: it treats every
+> frontmatter field — `instance` included — as optional, filling any gaps from
+> CLI flags, and even accepts a body with no frontmatter block at all.
 
 ### Issue Key Validation
 

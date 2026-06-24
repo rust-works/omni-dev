@@ -158,6 +158,7 @@ mod tests {
             command: JiraSubcommands::Create(create::CreateCommand {
                 file: None,
                 format: ContentFormat::Jfm,
+                instance: None,
                 project: Some("PROJ".to_string()),
                 r#type: None,
                 summary: Some("Test".to_string()),

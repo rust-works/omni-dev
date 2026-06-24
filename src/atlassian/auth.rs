@@ -38,13 +38,30 @@ pub struct AtlassianCredentials {
 ///
 /// Checks environment variables first, then falls back to the settings file.
 pub fn load_credentials() -> Result<AtlassianCredentials> {
+    load_credentials_with_instance(None)
+}
+
+/// Loads Atlassian credentials, optionally overriding the instance URL.
+///
+/// When `instance_override` is `Some`, that URL is used verbatim (after
+/// trailing-slash normalization) and the `ATLASSIAN_INSTANCE_URL` env /
+/// settings lookup is skipped — so a caller-supplied instance (e.g.
+/// `jira create --instance`) works even when no instance is configured in the
+/// environment. `ATLASSIAN_EMAIL` and `ATLASSIAN_API_TOKEN` are still required.
+/// When `None`, behaves exactly like [`load_credentials`].
+pub fn load_credentials_with_instance(
+    instance_override: Option<&str>,
+) -> Result<AtlassianCredentials> {
     let settings = Settings::load().unwrap_or(Settings {
         env: HashMap::new(),
     });
 
-    let instance_url = settings
-        .get_env_var(ATLASSIAN_INSTANCE_URL)
-        .ok_or(AtlassianError::CredentialsNotFound)?;
+    let instance_url = match instance_override {
+        Some(url) => url.to_string(),
+        None => settings
+            .get_env_var(ATLASSIAN_INSTANCE_URL)
+            .ok_or(AtlassianError::CredentialsNotFound)?,
+    };
     let email = settings
         .get_env_var(ATLASSIAN_EMAIL)
         .ok_or(AtlassianError::CredentialsNotFound)?;
@@ -484,5 +501,34 @@ mod tests {
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
         }
+    }
+
+    #[test]
+    fn load_credentials_with_instance_override_supplies_instance_url() {
+        // The override lets a caller (e.g. `jira create --instance`) target an
+        // instance even when ATLASSIAN_INSTANCE_URL is unset, as long as email
+        // and token are present. The trailing slash is normalized.
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        std::env::set_var(ATLASSIAN_EMAIL, "person@example.com");
+        std::env::set_var(ATLASSIAN_API_TOKEN, "token");
+
+        let creds =
+            load_credentials_with_instance(Some("https://override.atlassian.net/")).unwrap();
+        assert_eq!(creds.instance_url, "https://override.atlassian.net");
+        assert_eq!(creds.email, "person@example.com");
+        assert_eq!(creds.api_token, "token");
+    }
+
+    #[test]
+    fn load_credentials_with_instance_none_requires_env_instance() {
+        // Without an override and without ATLASSIAN_INSTANCE_URL configured,
+        // resolution fails just like load_credentials() does today.
+        let guard = EnvGuard::take();
+        let _dir = with_empty_home(&guard);
+        std::env::set_var(ATLASSIAN_EMAIL, "person@example.com");
+        std::env::set_var(ATLASSIAN_API_TOKEN, "token");
+
+        assert!(load_credentials_with_instance(None).is_err());
     }
 }
