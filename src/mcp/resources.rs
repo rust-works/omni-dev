@@ -595,11 +595,19 @@ mod tests {
     //
     // These tests exercise the JIRA/Confluence branches by pointing
     // `ATLASSIAN_*` env vars at a wiremock server and checking the
-    // full handler path. `ENV_MUTEX` serialises env-var access — the
-    // stdlib warns that process-env access races across threads, and
-    // `create_client` reads these vars internally.
-
-    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // full handler path. `create_client` reads these vars internally, so
+    // env-var access must be serialised across threads.
+    //
+    // Route through the crate-wide `AUTH_ENV_MUTEX` rather than a local
+    // mutex: it is the *one* canonical lock for every test that mutates the
+    // Atlassian credential env vars. Independent mutexes over the same
+    // process-global vars provide no mutual exclusion and caused a flaky env
+    // race (issues #950, #1075).
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     struct EnvGuard {
         keys: Vec<&'static str>,
@@ -653,7 +661,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         let _env = EnvGuard::set(&[
             ("ATLASSIAN_INSTANCE_URL", server.uri()),
             ("ATLASSIAN_EMAIL", "test@example.com".to_string()),
@@ -708,7 +716,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         let _env = EnvGuard::set(&[
             ("ATLASSIAN_INSTANCE_URL", server.uri()),
             ("ATLASSIAN_EMAIL", "test@example.com".to_string()),
@@ -743,7 +751,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         let _env = EnvGuard::set(&[
             ("ATLASSIAN_INSTANCE_URL", server.uri()),
             ("ATLASSIAN_EMAIL", "test@example.com".to_string()),
@@ -804,7 +812,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         let _env = EnvGuard::set(&[
             ("ATLASSIAN_INSTANCE_URL", server.uri()),
             ("ATLASSIAN_EMAIL", "test@example.com".to_string()),
@@ -849,7 +857,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         let _env = EnvGuard::set(&[
             ("ATLASSIAN_INSTANCE_URL", server.uri()),
             ("ATLASSIAN_EMAIL", "test@example.com".to_string()),
@@ -872,7 +880,7 @@ mod tests {
         // No ATLASSIAN_* env vars set → create_client() fails in the JIRA
         // branch of read_resource, exercising the "Failed to load Atlassian
         // credentials" context wrap.
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         // Scrub any stray vars the surrounding process may have set so
         // create_client() definitively fails.
         for key in [
@@ -900,7 +908,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn read_resource_confluence_without_credentials_errors() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = env_lock();
         for key in [
             "ATLASSIAN_INSTANCE_URL",
             "ATLASSIAN_EMAIL",
