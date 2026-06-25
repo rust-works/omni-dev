@@ -115,6 +115,13 @@ fn format_diagnosis(diagnosis: &AdfSchemaViolation, hint: Option<&str>) -> Strin
         } => format!(
             "Diagnosis: the submitted ADF's `{mark_type}` mark has invalid `{attr_name}` — {problem}."
         ),
+        AdfSchemaViolation::ForbiddenMarkCombination {
+            mark_type,
+            conflicts_with,
+            ..
+        } => format!(
+            "Diagnosis: the submitted ADF combines the `{mark_type}` and `{conflicts_with}` marks on one text run, which ADF does not allow."
+        ),
     };
     let mut out = format!("{header}\n{diag_line}");
     if let Some(hint) = hint {
@@ -334,6 +341,25 @@ mod tests {
         assert!(msg.contains("`link` mark"), "got: {msg}");
         assert!(msg.contains("`href`"), "got: {msg}");
         assert!(msg.contains("not a valid URL"), "got: {msg}");
+    }
+
+    #[test]
+    fn api_request_failed_with_diagnosis_display_for_forbidden_mark_combination() {
+        let err = AtlassianError::ApiRequestFailedWithDiagnosis {
+            body: String::new(),
+            diagnosis: AdfSchemaViolation::ForbiddenMarkCombination {
+                mark_type: "strong".to_string(),
+                conflicts_with: "code".to_string(),
+                parent_type: "paragraph".to_string(),
+                inline_index: Some(0),
+                path: vec![0, 0],
+            },
+            hint: None,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("`strong`"), "got: {msg}");
+        assert!(msg.contains("`code`"), "got: {msg}");
+        assert!(msg.contains("does not allow"), "got: {msg}");
     }
 
     #[test]

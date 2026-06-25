@@ -198,6 +198,20 @@ ADF v1.
 > safe direction: without stripping, the document would be rejected by the
 > mark validator at write time (issue #1005).
 
+> **Mark combinations.** ADF models inline text marks as two
+> mutually-exclusive groups: a *monospace* run (`code`, optionally with
+> `link`/`annotation`) and a *styled* run (`strong`, `em`, `strike`,
+> `underline`, `subsup`, `textColor`, `backgroundColor`, optionally with
+> `link`/`annotation`). Marks from the two groups cannot apply to the same
+> text — most commonly, `code` cannot combine with `strong`, `em`,
+> `textColor`, etc. So `` **`text`** `` (bold + monospace) is invalid ADF,
+> even though each mark is individually legal. The API rejects such a
+> document as an opaque `INVALID_INPUT`; the mark validator catches it at
+> write time (and under `--dry-run`) with a `cannot be combined with`
+> message naming the two conflicting marks (issue #1047). The groups are
+> transcribed from the `code_inline_node` / `formatted_text_inline_node`
+> variants in the pinned `@atlaskit/adf-schema`.
+
 ### Unsupported Node Handling
 
 ADF nodes that cannot be represented in markdown are serialized as fenced
