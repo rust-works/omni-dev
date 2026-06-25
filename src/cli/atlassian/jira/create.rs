@@ -428,6 +428,32 @@ mod tests {
     }
 
     #[test]
+    fn resolve_from_jfm_rejects_forbidden_mark_combination() {
+        // Issue #1047: a body with `**`text`**` produces a text node carrying
+        // both `strong` and `code` marks, which ADF rejects. It must be
+        // caught at resolve time, before the API call.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("issue.md");
+        let content = "---\ntype: jira\ninstance: https://org.atlassian.net\nproject: PROJ\nsummary: Bad\n---\n\nThis is **`bolded code`** in a sentence.\n";
+        fs::write(&file_path, content).unwrap();
+
+        let cmd = CreateCommand {
+            file: Some(file_path.to_str().unwrap().to_string()),
+            format: ContentFormat::Jfm,
+            instance: None,
+            project: None,
+            r#type: None,
+            summary: None,
+            set_fields: vec![],
+            dry_run: false,
+        };
+        let err = cmd.resolve_params().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid ADF mark combination"), "got: {msg}");
+        assert!(msg.contains("cannot be combined with"), "got: {msg}");
+    }
+
+    #[test]
     fn resolve_from_jfm_missing_project_errors() {
         let temp_dir = tempfile::tempdir().unwrap();
         let file_path = temp_dir.path().join("issue.md");
