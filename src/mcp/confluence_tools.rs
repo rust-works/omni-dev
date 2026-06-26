@@ -26,6 +26,7 @@ use crate::atlassian::confluence_api::{
     MovePosition, PageSummaryPage,
 };
 use crate::atlassian::convert::markdown_to_adf;
+use crate::atlassian::create::{prepend_warnings, resolve_confluence_create};
 use crate::atlassian::document::{content_item_to_document, JfmDocument, JfmFrontmatter};
 use crate::cli::atlassian::confluence::download::{
     run_download, DownloadParams, ManifestEntry, OnConflict,
@@ -70,21 +71,38 @@ pub struct ConfluenceSearchParams {
 /// Parameters for the `confluence_create` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ConfluenceCreateParams {
-    /// Target Confluence space key (e.g., `"ENG"`).
-    pub space_key: String,
-    /// Page title.
-    pub title: String,
-    /// Page body. Parsed according to `format`.
+    /// Full JFM document (YAML frontmatter + markdown body), e.g. the output
+    /// of `confluence_read` with the frontmatter edited. When provided,
+    /// `space_key`, `title` and `parent_id` are taken from the frontmatter and
+    /// the body becomes the page body — so the read → edit → create round-trip
+    /// works. The `space_key`/`title`/`parent_id` parameters below still
+    /// override their frontmatter counterparts (a warning is returned when they
+    /// do); passing `content` together with `document` is an error. See resource
+    /// `omni-dev://specs/jfm`.
+    #[serde(default)]
+    pub document: Option<String>,
+    /// Target Confluence space key (e.g., `"ENG"`). Required unless `document`
+    /// carries a `space_key:`. Overrides frontmatter.
+    #[serde(default)]
+    pub space_key: Option<String>,
+    /// Page title. Required unless `document` carries one. Overrides frontmatter.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Page body. Parsed according to `format`. Required unless `document` is
+    /// provided (and rejected when it is — the document body is the page body).
     ///
     /// For `format = "jfm"` (the default), this is GitHub-style markdown,
     /// NOT Confluence wiki markup. Use `##` not `h2.`, triple-backtick fences
     /// not `{code}`, backtick inline code not `{{...}}`. Full reference:
     /// MCP resource `omni-dev://specs/jfm`.
-    pub content: String,
-    /// Optional parent page ID for nesting under an existing page.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// Optional parent page ID for nesting under an existing page. Overrides
+    /// frontmatter `parent_id:`.
     #[serde(default)]
     pub parent_id: Option<String>,
     /// Format of `content`: `"jfm"` (default markdown) or `"adf"` (raw ADF JSON).
+    /// Ignored for the `document` path (a document is always JFM).
     #[serde(default)]
     pub format: Option<String>,
 }
@@ -1166,20 +1184,22 @@ impl OmniDevServer {
 
     /// Tool: create a new Confluence page.
     #[tool(
-        description = "Create a new Confluence page from JFM markdown (default) or raw ADF JSON. \
-                       JFM is GitHub-style markdown, NOT Confluence wiki markup — see resource \
-                       `omni-dev://specs/jfm` for syntax. Returns the new page's ID. \
+        description = "Create a new Confluence page, from explicit fields or from a full JFM \
+                       `document` (frontmatter + body, e.g. the output of `confluence_read`). \
+                       With a `document`, `space_key`/`title`/`parent_id` come from the \
+                       frontmatter and the body becomes the page body — enabling the \
+                       read → edit → create round-trip. Explicit `space_key`/`title`/`parent_id` \
+                       override frontmatter and a warning is returned when they do. JFM is \
+                       GitHub-style markdown, NOT Confluence wiki markup — see resource \
+                       `omni-dev://specs/jfm`. Returns the new page's ID. \
                        Mirrors `omni-dev atlassian confluence create`."
     )]
     pub async fn confluence_create(
         &self,
         Parameters(params): Parameters<ConfluenceCreateParams>,
     ) -> Result<CallToolResult, McpError> {
-        let format = parse_format(params.format.as_deref()).map_err(tool_error)?;
-        let page_id = run_confluence_create(&params, format)
-            .await
-            .map_err(tool_error)?;
-        Ok(CallToolResult::success(vec![Content::text(page_id)]))
+        let text = run_confluence_create(&params).await.map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
     /// Tool: update a Confluence page's body (and optionally title).
@@ -1700,25 +1720,72 @@ async fn run_confluence_search(cql: &str, limit: u32) -> Result<String> {
     serialize_search_results(&result)
 }
 
-async fn run_confluence_create(
-    params: &ConfluenceCreateParams,
-    format: ContentFormat,
-) -> Result<String> {
+/// Creates a Confluence page and returns the new page ID.
+///
+/// Two modes: from a full JFM `document` (frontmatter resolved like the CLI),
+/// or from explicit `space_key`/`title`/`content` fields. When the document
+/// path shadows a frontmatter value with an explicit parameter, a `warning:`
+/// line is prepended to the returned text (and logged). Validation runs before
+/// any client construction so input errors short-circuit before the wire.
+async fn run_confluence_create(params: &ConfluenceCreateParams) -> Result<String> {
+    if let Some(document) = params.document.as_deref() {
+        if params.content.is_some() {
+            anyhow::bail!(
+                "Provide either `document` or `content`, not both — the document body becomes \
+                 the page body"
+            );
+        }
+
+        let resolved = resolve_confluence_create(
+            document,
+            params.space_key.as_deref(),
+            params.title.as_deref(),
+            params.parent_id.as_deref(),
+        )?;
+        for shadowed in &resolved.shadowed {
+            tracing::warn!("{}", shadowed.warning_line());
+        }
+
+        let (client, _instance_url) = create_client()?;
+        let api = ConfluenceApi::new(client);
+        let id = api
+            .create_page(
+                &resolved.space_key,
+                &resolved.title,
+                &resolved.adf,
+                resolved.parent_id.as_deref(),
+            )
+            .await?;
+        return Ok(prepend_warnings(&resolved.shadowed, id));
+    }
+
+    let space_key = params.space_key.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "`space_key` is required (or provide a `document` whose frontmatter carries \
+             `space_key:`)"
+        )
+    })?;
+    let title = params.title.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "`title` is required (or provide a `document` whose frontmatter carries `title:`)"
+        )
+    })?;
+    let content = params
+        .content
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("`content` is required (or provide a `document`)"))?;
+
+    let format = parse_format(params.format.as_deref())?;
     let adf = match format {
-        ContentFormat::Jfm => markdown_to_adf(&params.content)?,
-        ContentFormat::Adf => AdfDocument::from_json_str(&params.content)?,
+        ContentFormat::Jfm => markdown_to_adf(content)?,
+        ContentFormat::Adf => AdfDocument::from_json_str(content)?,
     };
     let adf = ValidatedAdfDocument::try_new(adf)?;
 
     let (client, _instance_url) = create_client()?;
     let api = ConfluenceApi::new(client);
     let id = api
-        .create_page(
-            &params.space_key,
-            &params.title,
-            &adf,
-            params.parent_id.as_deref(),
-        )
+        .create_page(space_key, title, &adf, params.parent_id.as_deref())
         .await?;
     Ok(id)
 }
@@ -2366,15 +2433,14 @@ mod tests {
         let _env = EnvGuard::set(&server.uri());
 
         let params = ConfluenceCreateParams {
-            space_key: "ENG".to_string(),
-            title: "New Page".to_string(),
-            content: "Body".to_string(),
+            document: None,
+            space_key: Some("ENG".to_string()),
+            title: Some("New Page".to_string()),
+            content: Some("Body".to_string()),
             parent_id: None,
             format: None,
         };
-        let id = run_confluence_create(&params, ContentFormat::Jfm)
-            .await
-            .unwrap();
+        let id = run_confluence_create(&params).await.unwrap();
         assert_eq!(id, "54321");
     }
 
@@ -2401,15 +2467,14 @@ mod tests {
         let _env = EnvGuard::set(&server.uri());
 
         let params = ConfluenceCreateParams {
-            space_key: "ENG".to_string(),
-            title: "ADF Page".to_string(),
-            content: r#"{"version":1,"type":"doc","content":[]}"#.to_string(),
+            document: None,
+            space_key: Some("ENG".to_string()),
+            title: Some("ADF Page".to_string()),
+            content: Some(r#"{"version":1,"type":"doc","content":[]}"#.to_string()),
             parent_id: Some("11111".to_string()),
             format: Some("adf".to_string()),
         };
-        let id = run_confluence_create(&params, ContentFormat::Adf)
-            .await
-            .unwrap();
+        let id = run_confluence_create(&params).await.unwrap();
         assert_eq!(id, "999");
     }
 
@@ -2418,15 +2483,16 @@ mod tests {
         // Issue #714: validation runs before any HTTP call. No EnvGuard
         // needed because the function returns before reaching create_client().
         let params = ConfluenceCreateParams {
-            space_key: "ENG".to_string(),
-            title: "Bad".to_string(),
-            content: ":::panel{type=info}\n:::expand{title=\"x\"}\nbody\n:::\n:::".to_string(),
+            document: None,
+            space_key: Some("ENG".to_string()),
+            title: Some("Bad".to_string()),
+            content: Some(
+                ":::panel{type=info}\n:::expand{title=\"x\"}\nbody\n:::\n:::".to_string(),
+            ),
             parent_id: None,
             format: Some("jfm".to_string()),
         };
-        let err = run_confluence_create(&params, ContentFormat::Jfm)
-            .await
-            .unwrap_err();
+        let err = run_confluence_create(&params).await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("invalid ADF nesting"));
         assert!(msg.contains("`expand` cannot be a child of `panel`"));
@@ -2451,15 +2517,155 @@ mod tests {
         let _env = EnvGuard::set(&server.uri());
 
         let params = ConfluenceCreateParams {
-            space_key: "ENG".to_string(),
-            title: "Bad".to_string(),
-            content: "not json".to_string(),
+            document: None,
+            space_key: Some("ENG".to_string()),
+            title: Some("Bad".to_string()),
+            content: Some("not json".to_string()),
             parent_id: None,
             format: Some("adf".to_string()),
         };
-        assert!(run_confluence_create(&params, ContentFormat::Adf)
+        assert!(run_confluence_create(&params).await.is_err());
+    }
+
+    // ── run_confluence_create: #1058 document (frontmatter) round-trip ──────
+
+    /// Builds a document-path `ConfluenceCreateParams` with an optional override.
+    fn confluence_create_doc_params(
+        document: &str,
+        space_key: Option<&str>,
+    ) -> ConfluenceCreateParams {
+        ConfluenceCreateParams {
+            document: Some(document.to_string()),
+            space_key: space_key.map(String::from),
+            title: None,
+            content: None,
+            parent_id: None,
+            format: None,
+        }
+    }
+
+    async fn mount_space_and_page(server: &wiremock::MockServer, page_id: &str) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": [{"id": "98765"}]})),
+            )
+            .mount(server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "id": page_id })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_confluence_create_from_document_resolves_space_and_title() {
+        let _lock = env_lock();
+        let server = wiremock::MockServer::start().await;
+        mount_space_and_page(&server, "54321").await;
+        let _env = EnvGuard::set(&server.uri());
+
+        let doc = "---\ntype: confluence\ninstance: https://org.atlassian.net\npage_id: '7'\ntitle: Round-tripped\nspace_key: ENG\n---\n\nBody from document\n";
+        let id = run_confluence_create(&confluence_create_doc_params(doc, None))
             .await
-            .is_err());
+            .unwrap();
+        assert_eq!(id, "54321");
+        assert!(!id.contains("warning:"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_confluence_create_document_param_override_warns_in_text() {
+        let _lock = env_lock();
+        let server = wiremock::MockServer::start().await;
+        mount_space_and_page(&server, "54321").await;
+        let _env = EnvGuard::set(&server.uri());
+
+        let doc = "---\ntype: confluence\ninstance: https://org.atlassian.net\ntitle: T\nspace_key: OLD\n---\n\nBody\n";
+        let text = run_confluence_create(&confluence_create_doc_params(doc, Some("NEW")))
+            .await
+            .unwrap();
+        assert!(text.contains("warning:"));
+        assert!(text.contains("OLD"));
+        assert!(text.contains("NEW"));
+        assert!(text.contains("54321"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_confluence_create_document_and_content_errors() {
+        let params = ConfluenceCreateParams {
+            document: Some(
+                "---\ntype: confluence\ninstance: https://o.net\ntitle: T\nspace_key: ENG\n---\n\nB\n"
+                    .to_string(),
+            ),
+            space_key: None,
+            title: None,
+            content: Some("conflicting".to_string()),
+            parent_id: None,
+            format: None,
+        };
+        let err = run_confluence_create(&params).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Provide either `document` or `content`"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_confluence_create_document_rejects_jira_frontmatter() {
+        let doc = "---\ntype: jira\ninstance: https://org.atlassian.net\nkey: PROJ-1\nsummary: T\n---\n\nB\n";
+        let err = run_confluence_create(&confluence_create_doc_params(doc, None))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("JIRA"));
+    }
+
+    // The non-document (explicit-fields) path required-field errors short-circuit
+    // before any client/HTTP, so they need no env or mock.
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_confluence_create_requires_space_key() {
+        let params = ConfluenceCreateParams {
+            document: None,
+            space_key: None,
+            title: None,
+            content: None,
+            parent_id: None,
+            format: None,
+        };
+        let err = run_confluence_create(&params).await.unwrap_err();
+        assert!(err.to_string().contains("`space_key` is required"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_confluence_create_requires_title() {
+        let params = ConfluenceCreateParams {
+            document: None,
+            space_key: Some("ENG".to_string()),
+            title: None,
+            content: None,
+            parent_id: None,
+            format: None,
+        };
+        let err = run_confluence_create(&params).await.unwrap_err();
+        assert!(err.to_string().contains("`title` is required"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_confluence_create_requires_content() {
+        let params = ConfluenceCreateParams {
+            document: None,
+            space_key: Some("ENG".to_string()),
+            title: Some("T".to_string()),
+            content: None,
+            parent_id: None,
+            format: None,
+        };
+        let err = run_confluence_create(&params).await.unwrap_err();
+        assert!(err.to_string().contains("`content` is required"));
     }
 
     // ── run_confluence_write ───────────────────────────────────────
@@ -3276,9 +3482,10 @@ mod tests {
         let server = make_server();
         let result = server
             .confluence_create(Parameters(ConfluenceCreateParams {
-                space_key: "ENG".to_string(),
-                title: "T".to_string(),
-                content: "body".to_string(),
+                document: None,
+                space_key: Some("ENG".to_string()),
+                title: Some("T".to_string()),
+                content: Some("body".to_string()),
                 parent_id: None,
                 format: Some("xml".to_string()),
             }))
@@ -3294,9 +3501,10 @@ mod tests {
         let server = make_server();
         let result = server
             .confluence_create(Parameters(ConfluenceCreateParams {
-                space_key: "ENG".to_string(),
-                title: "T".to_string(),
-                content: "body".to_string(),
+                document: None,
+                space_key: Some("ENG".to_string()),
+                title: Some("T".to_string()),
+                content: Some("body".to_string()),
                 parent_id: None,
                 format: None,
             }))
@@ -3329,9 +3537,10 @@ mod tests {
         let server = make_server();
         let result = server
             .confluence_create(Parameters(ConfluenceCreateParams {
-                space_key: "ENG".to_string(),
-                title: "T".to_string(),
-                content: "Body".to_string(),
+                document: None,
+                space_key: Some("ENG".to_string()),
+                title: Some("T".to_string()),
+                content: Some("Body".to_string()),
                 parent_id: None,
                 format: None,
             }))
