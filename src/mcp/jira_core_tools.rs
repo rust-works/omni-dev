@@ -12,12 +12,12 @@ use rmcp::{
     model::{CallToolResult, Content},
     schemars, tool, tool_router, ErrorData as McpError,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::atlassian::adf::AdfDocument;
 use crate::atlassian::adf_validated::ValidatedAdfDocument;
 use crate::atlassian::client::{
-    AtlassianClient, JiraTransition, JiraVisibility, JiraVisibilityType,
+    AtlassianClient, JiraCreatedIssue, JiraTransition, JiraVisibility, JiraVisibilityType,
 };
 use crate::atlassian::convert::markdown_to_adf;
 use crate::atlassian::create::{create_resolved_jira_issue, prepend_warnings, resolve_jira_create};
@@ -110,6 +110,104 @@ pub struct JiraCreateParams {
     /// time — without them JIRA rejects the create with HTTP 400.
     #[serde(default)]
     pub custom_fields: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+}
+
+/// One issue spec within a [`JiraBulkCreateParams`] batch.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BulkIssueSpec {
+    /// Optional local alias used to reference this issue from `links` before
+    /// its real key exists (e.g. `story-a`). Resolved alias-first, then as a
+    /// literal key — so don't reuse a real issue key as an alias.
+    #[serde(default)]
+    pub alias: Option<String>,
+    /// Project key (e.g., `PROJ`).
+    pub project: String,
+    /// Issue summary / title.
+    pub summary: String,
+    /// Optional description in JFM markdown — see resource
+    /// `omni-dev://specs/jfm` for syntax. JFM is GitHub-style markdown, NOT
+    /// JIRA wiki markup (use `##` not `h2.`, triple-backtick fences not
+    /// `{code}`, backtick inline code not `{{...}}`).
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Issue type (defaults to `Task`).
+    #[serde(default)]
+    pub issue_type: Option<String>,
+}
+
+/// One dependency link within a [`JiraBulkCreateParams`] batch. `inward` and
+/// `outward` may each be a local alias minted earlier in the batch or an
+/// existing JIRA key.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BulkLinkSpec {
+    /// Link type name (e.g., `Blocks`).
+    pub link_type: String,
+    /// Source (inward) issue — a batch alias or an existing key.
+    pub inward: String,
+    /// Target (outward) issue — a batch alias or an existing key.
+    pub outward: String,
+}
+
+/// Parameters for the `jira_bulk_create` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct JiraBulkCreateParams {
+    /// Issues to create, in order. May be empty to only create `links` between
+    /// existing issues.
+    pub issues: Vec<BulkIssueSpec>,
+    /// Dependency links to create after the issues. Each endpoint is resolved
+    /// alias-first (to the freshly-minted key), else treated as an existing
+    /// issue key.
+    #[serde(default)]
+    pub links: Option<Vec<BulkLinkSpec>>,
+    /// When true, stop at the first failed create or link instead of
+    /// continuing. The partial report is still returned. Defaults to false
+    /// (continue-on-error).
+    #[serde(default)]
+    pub fail_fast: Option<bool>,
+}
+
+/// Per-issue outcome in a [`run_jira_bulk_create`] report.
+#[derive(Debug, Serialize)]
+struct BulkIssueResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    alias: Option<String>,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    self_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// Per-link outcome in a [`run_jira_bulk_create`] report. `inward`/`outward`
+/// echo the request (alias or key), not the resolved key.
+#[derive(Debug, Serialize)]
+struct BulkLinkResult {
+    link_type: String,
+    inward: String,
+    outward: String,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// Tallies for a [`run_jira_bulk_create`] report.
+#[derive(Debug, Serialize)]
+struct BulkSummary {
+    issues_created: usize,
+    issues_failed: usize,
+    links_created: usize,
+    links_failed: usize,
+    stopped_early: bool,
+}
+
+/// Structured result of a [`run_jira_bulk_create`] batch.
+#[derive(Debug, Serialize)]
+struct BulkCreateReport {
+    issues: Vec<BulkIssueResult>,
+    links: Vec<BulkLinkResult>,
+    summary: BulkSummary,
 }
 
 /// Parameters for the `jira_write` tool.
@@ -416,6 +514,153 @@ async fn run_jira_create(client: &AtlassianClient, params: &JiraCreateParams) ->
         .create_issue_with_custom_fields(project, issue_type, summary, adf.as_ref(), &[], &resolved)
         .await?;
     yaml_result(&created)
+}
+
+/// Creates a single issue from a [`BulkIssueSpec`], mirroring
+/// [`run_jira_create`]'s JFM→ADF handling but returning the created issue
+/// rather than YAML.
+async fn create_one_issue(
+    client: &AtlassianClient,
+    spec: &BulkIssueSpec,
+) -> Result<JiraCreatedIssue> {
+    let issue_type = spec.issue_type.as_deref().unwrap_or("Task");
+    let adf = match spec.description.as_deref() {
+        Some(md) if !md.is_empty() => Some(ValidatedAdfDocument::try_new(markdown_to_adf(md)?)?),
+        _ => None,
+    };
+    client
+        .create_issue(&spec.project, issue_type, &spec.summary, adf.as_ref(), &[])
+        .await
+}
+
+/// Creates a batch of JIRA issues and (optionally) dependency links between
+/// them in a single call, returning a structured YAML report.
+///
+/// Sequential and continue-on-error by default: each issue then each link is
+/// attempted in turn and its outcome recorded. An individual failure never
+/// aborts the batch and is never propagated as `Err`, so already-minted keys
+/// are never lost. When `fail_fast` is set, the first failed create or link
+/// stops all further calls and the partial report is returned with
+/// `stopped_early: true`.
+///
+/// Link endpoints (`inward`/`outward`) are resolved alias-first, then as a
+/// literal key: a string matching an `alias` minted in this batch uses that
+/// issue's new key; otherwise it is sent unchanged (an existing key). An
+/// endpoint that names an alias whose create failed records the link as a
+/// skipped error without an HTTP call.
+async fn run_jira_bulk_create(
+    client: &AtlassianClient,
+    issues: &[BulkIssueSpec],
+    links: &[BulkLinkSpec],
+    fail_fast: bool,
+) -> Result<String> {
+    use std::collections::{HashMap, HashSet};
+
+    let mut issue_results: Vec<BulkIssueResult> = Vec::with_capacity(issues.len());
+    let mut link_results: Vec<BulkLinkResult> = Vec::with_capacity(links.len());
+    let mut alias_to_key: HashMap<&str, String> = HashMap::new();
+    let mut failed_aliases: HashSet<&str> = HashSet::new();
+    let mut summary = BulkSummary {
+        issues_created: 0,
+        issues_failed: 0,
+        links_created: 0,
+        links_failed: 0,
+        stopped_early: false,
+    };
+
+    for spec in issues {
+        match create_one_issue(client, spec).await {
+            Ok(created) => {
+                summary.issues_created += 1;
+                if let Some(alias) = spec.alias.as_deref() {
+                    alias_to_key.insert(alias, created.key.clone());
+                }
+                issue_results.push(BulkIssueResult {
+                    alias: spec.alias.clone(),
+                    ok: true,
+                    key: Some(created.key),
+                    self_url: Some(created.self_url),
+                    error: None,
+                });
+            }
+            Err(e) => {
+                summary.issues_failed += 1;
+                if let Some(alias) = spec.alias.as_deref() {
+                    failed_aliases.insert(alias);
+                }
+                issue_results.push(BulkIssueResult {
+                    alias: spec.alias.clone(),
+                    ok: false,
+                    key: None,
+                    self_url: None,
+                    error: Some(format!("{e:#}")),
+                });
+                if fail_fast {
+                    summary.stopped_early = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if !summary.stopped_early {
+        // Resolve an endpoint alias-first, then as a literal key. `Err` means
+        // the endpoint named an alias whose create failed (or never ran).
+        let resolve = |endpoint: &str| -> std::result::Result<String, String> {
+            if let Some(key) = alias_to_key.get(endpoint) {
+                Ok(key.clone())
+            } else if failed_aliases.contains(endpoint) {
+                Err(format!("skipped: alias {endpoint:?} was not created"))
+            } else {
+                Ok(endpoint.to_string())
+            }
+        };
+
+        for link in links {
+            let resolved = resolve(&link.inward)
+                .and_then(|inward| resolve(&link.outward).map(|outward| (inward, outward)));
+            let outcome = match resolved {
+                Ok((inward, outward)) => client
+                    .create_issue_link(&link.link_type, &inward, &outward)
+                    .await
+                    .map_err(|e| format!("{e:#}")),
+                Err(reason) => Err(reason),
+            };
+            match outcome {
+                Ok(()) => {
+                    summary.links_created += 1;
+                    link_results.push(BulkLinkResult {
+                        link_type: link.link_type.clone(),
+                        inward: link.inward.clone(),
+                        outward: link.outward.clone(),
+                        ok: true,
+                        error: None,
+                    });
+                }
+                Err(error) => {
+                    summary.links_failed += 1;
+                    link_results.push(BulkLinkResult {
+                        link_type: link.link_type.clone(),
+                        inward: link.inward.clone(),
+                        outward: link.outward.clone(),
+                        ok: false,
+                        error: Some(error),
+                    });
+                    if fail_fast {
+                        summary.stopped_early = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let report = BulkCreateReport {
+        issues: issue_results,
+        links: link_results,
+        summary,
+    };
+    yaml_result(&report)
 }
 
 /// Updates a JIRA issue. Any combination of description (`content`),
@@ -731,6 +976,39 @@ impl OmniDevServer {
         let text = run_jira_create(&client, &params)
             .await
             .map_err(tool_error)?;
+        ok_text(text)
+    }
+
+    /// Tool: create a batch of JIRA issues and (optionally) link them in one
+    /// call — built for epic decomposition.
+    #[tool(
+        description = "Bulk-create JIRA issues and (optionally) wire dependency links between \
+                       them in one call — built for epic decomposition. `issues` are created in \
+                       order and each may carry a local `alias`. `links` are created afterward; \
+                       each `inward`/`outward` is resolved alias-first (to the freshly-minted \
+                       key) else treated as an existing issue key, so you can link issues this \
+                       same call just created. Default is continue-on-error: every record is \
+                       attempted and a YAML report lists per-issue {alias, ok, key, self_url | \
+                       error}, per-link {ok | error}, and a summary. Set `fail_fast` to stop at \
+                       the first failure. NOTE: JIRA has no transaction — nothing is rolled \
+                       back; the report always shows exactly what succeeded so you can retry \
+                       only the remainder. To link existing issues only, pass an empty `issues` \
+                       array and reference real keys in `links`."
+    )]
+    pub async fn jira_bulk_create(
+        &self,
+        Parameters(params): Parameters<JiraBulkCreateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _instance_url) = create_client().map_err(tool_error)?;
+        let links = params.links.unwrap_or_default();
+        let text = run_jira_bulk_create(
+            &client,
+            &params.issues,
+            &links,
+            params.fail_fast.unwrap_or(false),
+        )
+        .await
+        .map_err(tool_error)?;
         ok_text(text)
     }
 
@@ -2965,6 +3243,270 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(v.ty, JiraVisibilityType::Role));
+    }
+
+    // ── run_jira_bulk_create ───────────────────────────────────────────────
+
+    fn issue_spec(alias: Option<&str>, summary: &str) -> BulkIssueSpec {
+        BulkIssueSpec {
+            alias: alias.map(str::to_string),
+            project: "PROJ".to_string(),
+            summary: summary.to_string(),
+            description: None,
+            issue_type: None,
+        }
+    }
+
+    fn link_spec(inward: &str, outward: &str) -> BulkLinkSpec {
+        BulkLinkSpec {
+            link_type: "Blocks".to_string(),
+            inward: inward.to_string(),
+            outward: outward.to_string(),
+        }
+    }
+
+    /// Mounts a create-issue mock matched on the exact summary, returning
+    /// the given key. `expect` lets callers assert call counts (e.g. `0` to
+    /// prove an issue was never attempted under `fail_fast`).
+    async fn mount_create(server: &MockServer, summary: &str, key: &str, id: &str, expect: u64) {
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue"))
+            .and(body_json(serde_json::json!({
+                "fields": {
+                    "project": {"key": "PROJ"},
+                    "issuetype": {"name": "Task"},
+                    "summary": summary,
+                }
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": id,
+                "key": key,
+                "self": format!("https://example.atlassian.net/rest/api/3/issue/{id}"),
+            })))
+            .expect(expect)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn run_jira_bulk_create_all_succeed_and_links_use_minted_keys() {
+        let server = MockServer::start().await;
+        mount_create(&server, "Story A", "PROJ-101", "101", 1).await;
+        mount_create(&server, "Story B", "PROJ-102", "102", 1).await;
+        // The link must carry the freshly-minted keys, not the aliases.
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issueLink"))
+            .and(body_json(serde_json::json!({
+                "type": {"name": "Blocks"},
+                "inwardIssue": {"key": "PROJ-101"},
+                "outwardIssue": {"key": "PROJ-102"},
+            })))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let issues = vec![
+            issue_spec(Some("a"), "Story A"),
+            issue_spec(Some("b"), "Story B"),
+        ];
+        let links = vec![link_spec("a", "b")];
+        let yaml = run_jira_bulk_create(&client, &issues, &links, false)
+            .await
+            .unwrap();
+        assert!(yaml.contains("PROJ-101"), "{yaml}");
+        assert!(yaml.contains("PROJ-102"), "{yaml}");
+        assert!(yaml.contains("issues_created: 2"), "{yaml}");
+        assert!(yaml.contains("links_created: 1"), "{yaml}");
+        assert!(yaml.contains("stopped_early: false"), "{yaml}");
+    }
+
+    #[tokio::test]
+    async fn run_jira_bulk_create_partial_failure_skips_dependent_link() {
+        let server = MockServer::start().await;
+        mount_create(&server, "Story A", "PROJ-101", "101", 1).await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue"))
+            .and(body_json(serde_json::json!({
+                "fields": {
+                    "project": {"key": "PROJ"},
+                    "issuetype": {"name": "Task"},
+                    "summary": "Story B",
+                }
+            })))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad summary"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // The link references alias `b`, whose create failed → never attempted.
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issueLink"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let issues = vec![
+            issue_spec(Some("a"), "Story A"),
+            issue_spec(Some("b"), "Story B"),
+        ];
+        let links = vec![link_spec("a", "b")];
+        let yaml = run_jira_bulk_create(&client, &issues, &links, false)
+            .await
+            .unwrap();
+        assert!(yaml.contains("issues_created: 1"), "{yaml}");
+        assert!(yaml.contains("issues_failed: 1"), "{yaml}");
+        assert!(yaml.contains("links_failed: 1"), "{yaml}");
+        assert!(yaml.contains("was not created"), "{yaml}");
+        assert!(yaml.contains("stopped_early: false"), "{yaml}");
+    }
+
+    #[tokio::test]
+    async fn run_jira_bulk_create_links_existing_keys_with_empty_issues() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issueLink"))
+            .and(body_json(serde_json::json!({
+                "type": {"name": "Blocks"},
+                "inwardIssue": {"key": "PROJ-1"},
+                "outwardIssue": {"key": "PROJ-2"},
+            })))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let links = vec![link_spec("PROJ-1", "PROJ-2")];
+        let yaml = run_jira_bulk_create(&client, &[], &links, false)
+            .await
+            .unwrap();
+        assert!(yaml.contains("issues_created: 0"), "{yaml}");
+        assert!(yaml.contains("links_created: 1"), "{yaml}");
+    }
+
+    #[tokio::test]
+    async fn run_jira_bulk_create_fail_fast_stops_after_first_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue"))
+            .and(body_json(serde_json::json!({
+                "fields": {
+                    "project": {"key": "PROJ"},
+                    "issuetype": {"name": "Task"},
+                    "summary": "Story A",
+                }
+            })))
+            .respond_with(ResponseTemplate::new(400).set_body_string("nope"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Second issue must never be attempted once the first fails.
+        mount_create(&server, "Story B", "PROJ-102", "102", 0).await;
+
+        let client = mock_client(&server.uri());
+        let issues = vec![issue_spec(None, "Story A"), issue_spec(None, "Story B")];
+        let yaml = run_jira_bulk_create(&client, &issues, &[], true)
+            .await
+            .unwrap();
+        assert!(yaml.contains("issues_created: 0"), "{yaml}");
+        assert!(yaml.contains("issues_failed: 1"), "{yaml}");
+        assert!(yaml.contains("stopped_early: true"), "{yaml}");
+    }
+
+    #[tokio::test]
+    async fn run_jira_bulk_create_reports_link_api_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issueLink"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("no such link type"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let links = vec![BulkLinkSpec {
+            link_type: "Nope".to_string(),
+            inward: "PROJ-1".to_string(),
+            outward: "PROJ-2".to_string(),
+        }];
+        let yaml = run_jira_bulk_create(&client, &[], &links, false)
+            .await
+            .unwrap();
+        assert!(yaml.contains("links_failed: 1"), "{yaml}");
+        assert!(yaml.contains("ok: false"), "{yaml}");
+        assert!(yaml.contains("400"), "{yaml}");
+    }
+
+    #[tokio::test]
+    async fn run_jira_bulk_create_converts_jfm_description() {
+        let server = MockServer::start().await;
+        // Match on method+path only; we just need the description→ADF branch
+        // in `create_one_issue` to run (the body carries the converted ADF).
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": "101",
+                "key": "PROJ-101",
+                "self": "https://example.atlassian.net/rest/api/3/issue/101",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let issues = vec![BulkIssueSpec {
+            alias: None,
+            project: "PROJ".to_string(),
+            summary: "With body".to_string(),
+            description: Some("Hello **world**".to_string()),
+            issue_type: None,
+        }];
+        let yaml = run_jira_bulk_create(&client, &issues, &[], false)
+            .await
+            .unwrap();
+        assert!(yaml.contains("issues_created: 1"), "{yaml}");
+        assert!(yaml.contains("PROJ-101"), "{yaml}");
+    }
+
+    #[tokio::test]
+    async fn run_jira_bulk_create_fail_fast_stops_after_link_failure() {
+        let server = MockServer::start().await;
+        // First link fails …
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issueLink"))
+            .and(body_json(serde_json::json!({
+                "type": {"name": "Blocks"},
+                "inwardIssue": {"key": "PROJ-1"},
+                "outwardIssue": {"key": "PROJ-2"},
+            })))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // … so the second link must never be attempted under fail_fast.
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issueLink"))
+            .and(body_json(serde_json::json!({
+                "type": {"name": "Blocks"},
+                "inwardIssue": {"key": "PROJ-3"},
+                "outwardIssue": {"key": "PROJ-4"},
+            })))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let links = vec![link_spec("PROJ-1", "PROJ-2"), link_spec("PROJ-3", "PROJ-4")];
+        let yaml = run_jira_bulk_create(&client, &[], &links, true)
+            .await
+            .unwrap();
+        assert!(yaml.contains("links_created: 0"), "{yaml}");
+        assert!(yaml.contains("links_failed: 1"), "{yaml}");
+        assert!(yaml.contains("stopped_early: true"), "{yaml}");
     }
 
     // ── run_jira_dev ───────────────────────────────────────────────────────
