@@ -89,6 +89,29 @@ Page body content here.
 > frontmatter field — `instance` included — as optional, filling any gaps from
 > CLI flags, and even accepts a body with no frontmatter block at all.
 
+### Creating from Frontmatter
+
+The create surfaces resolve their target from the document frontmatter, so the
+*read → edit → create* round-trip works: read an existing issue/page, edit the
+body and/or frontmatter, and send the whole document back as a create.
+
+- **CLI:** `omni-dev atlassian {jira,confluence} create <file>` reads the
+  frontmatter directly. For JIRA the project is taken from `project:`, or
+  derived from the prefix of `key:` (e.g. `PROJ` from `PROJ-123`).
+- **MCP:** the `jira_create` / `confluence_create` tools take an optional
+  **`document`** parameter holding the full JFM document (the output of
+  `jira_read` / `confluence_read`). Its body becomes the description/page body;
+  `project`/`summary`/`issue_type`/`labels`/`custom_fields` (JIRA) or
+  `space_key`/`title`/`parent_id` (Confluence) come from its frontmatter. Passing
+  both `document` and `description`/`content` is an error.
+
+**Precedence:** an explicit flag (`--project`, `--space`, …) or MCP parameter
+(`project`, `space_key`, …) **overrides** the matching frontmatter field. When an
+override shadows a value that was present in the frontmatter, a `warning:` is
+emitted — on **stderr** for the CLI, and **prepended in-band** to the tool result
+for the MCP tools (whose callers cannot see stderr) — so the agent knows its
+frontmatter value was ignored.
+
 ### Issue Key Validation
 
 Issue keys must match the pattern `^[A-Z][A-Z0-9]+-\d+$`:

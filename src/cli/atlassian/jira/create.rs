@@ -8,13 +8,9 @@ use clap::Parser;
 use crate::atlassian::adf::AdfDocument;
 use crate::atlassian::adf_validated::ValidatedAdfDocument;
 use crate::atlassian::client::AtlassianClient;
-use crate::atlassian::convert::markdown_to_adf;
-use crate::atlassian::custom_fields::{
-    merge_set_field_overrides, parse_set_field, resolve_custom_fields,
-};
-use crate::atlassian::document::{
-    split_custom_sections, split_frontmatter, CustomFieldSection, JiraCreateFrontmatter,
-};
+use crate::atlassian::create::{create_resolved_jira_issue, resolve_jira_create};
+use crate::atlassian::custom_fields::parse_set_field;
+use crate::atlassian::document::CustomFieldSection;
 use crate::cli::atlassian::format::ContentFormat;
 use crate::cli::atlassian::helpers::{
     create_client_with_instance, print_create_dry_run, read_input,
@@ -164,59 +160,25 @@ impl CreateCommand {
         overrides: Vec<(String, serde_yaml::Value)>,
     ) -> Result<CreateParams> {
         let input = read_input(self.file.as_deref())?;
-        let (fm_yaml, raw_body) = split_frontmatter(&input)?;
-
-        let fm: JiraCreateFrontmatter = match fm_yaml {
-            Some(yaml) => {
-                serde_yaml::from_str(yaml).context("Failed to parse JFM frontmatter YAML")?
-            }
-            None => JiraCreateFrontmatter::default(),
-        };
-
-        if fm.r#type.as_deref() == Some("confluence") {
-            anyhow::bail!("Cannot create a JIRA issue from Confluence frontmatter");
+        let resolved = resolve_jira_create(
+            &input,
+            self.project.as_deref(),
+            self.summary.as_deref(),
+            self.r#type.as_deref(),
+            overrides,
+        )?;
+        for shadowed in &resolved.shadowed {
+            eprintln!("{}", shadowed.warning_line());
         }
 
-        let (body_md, custom_sections) = split_custom_sections(&raw_body);
-        let adf = ValidatedAdfDocument::try_new(markdown_to_adf(&body_md)?)?;
-
-        // Derive project from key when no explicit project field is present.
-        let fm_project = fm.project.clone().or_else(|| {
-            if fm.key.is_empty() {
-                None
-            } else {
-                fm.key.split('-').next().map(String::from)
-            }
-        });
-
-        let project = self.project.clone().or(fm_project).ok_or_else(|| {
-            anyhow::anyhow!("Project key is required (use --project or set in frontmatter)")
-        })?;
-
-        let issue_type = self
-            .r#type
-            .clone()
-            .or(fm.issue_type)
-            .unwrap_or_else(|| "Task".to_string());
-
-        let summary = self
-            .summary
-            .clone()
-            .or_else(|| fm.summary.filter(|s| !s.is_empty()))
-            .ok_or_else(|| {
-                anyhow::anyhow!("Summary is required (use --summary or set in frontmatter)")
-            })?;
-
-        let custom_scalars = merge_set_field_overrides(fm.custom_fields, overrides);
-
         Ok(CreateParams {
-            project,
-            issue_type,
-            summary,
-            labels: fm.labels,
-            adf,
-            custom_scalars,
-            custom_sections,
+            project: resolved.project,
+            issue_type: resolved.issue_type,
+            summary: resolved.summary,
+            labels: resolved.labels,
+            adf: resolved.adf,
+            custom_scalars: resolved.custom_scalars,
+            custom_sections: resolved.custom_sections,
         })
     }
 
@@ -251,31 +213,21 @@ impl CreateCommand {
     }
 }
 
-/// Creates a JIRA issue from resolved parameters.
-///
-/// Fast path when no custom fields are requested: one POST to
-/// `/rest/api/3/issue`. With custom fields, fetches `createmeta` to resolve
-/// human names to IDs and dispatch values by schema before sending.
+/// Creates a JIRA issue from resolved parameters via the shared
+/// [`create_resolved_jira_issue`] helper (which handles the `createmeta`
+/// custom-field resolution path).
 async fn run_create(client: &AtlassianClient, params: &CreateParams) -> Result<()> {
-    let custom_fields = if params.custom_scalars.is_empty() && params.custom_sections.is_empty() {
-        BTreeMap::new()
-    } else {
-        let createmeta = client
-            .get_createmeta(&params.project, &params.issue_type)
-            .await?;
-        resolve_custom_fields(&params.custom_scalars, &params.custom_sections, &createmeta)?
-    };
-
-    let result = client
-        .create_issue_with_custom_fields(
-            &params.project,
-            &params.issue_type,
-            &params.summary,
-            Some(&params.adf),
-            &params.labels,
-            &custom_fields,
-        )
-        .await?;
+    let result = create_resolved_jira_issue(
+        client,
+        &params.project,
+        &params.issue_type,
+        &params.summary,
+        &params.adf,
+        &params.labels,
+        &params.custom_scalars,
+        &params.custom_sections,
+    )
+    .await?;
 
     println!("{}", result.key);
     Ok(())

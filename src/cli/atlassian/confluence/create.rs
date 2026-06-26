@@ -6,8 +6,7 @@ use clap::Parser;
 use crate::atlassian::adf::AdfDocument;
 use crate::atlassian::adf_validated::ValidatedAdfDocument;
 use crate::atlassian::confluence_api::ConfluenceApi;
-use crate::atlassian::convert::markdown_to_adf;
-use crate::atlassian::document::{JfmDocument, JfmFrontmatter};
+use crate::atlassian::create::resolve_confluence_create;
 use crate::cli::atlassian::format::ContentFormat;
 use crate::cli::atlassian::helpers::{create_client, read_input};
 
@@ -72,35 +71,21 @@ impl CreateCommand {
     /// Resolves parameters from JFM input, with CLI flags as overrides.
     fn resolve_from_jfm(&self) -> Result<CreateParams> {
         let input = read_input(self.file.as_deref())?;
-        let doc = JfmDocument::parse(&input)?;
-        let adf = ValidatedAdfDocument::try_new(markdown_to_adf(&doc.body)?)?;
-
-        let (fm_space, fm_title, fm_parent) = match &doc.frontmatter {
-            JfmFrontmatter::Confluence(fm) => (
-                Some(fm.space_key.clone()),
-                Some(fm.title.clone()),
-                fm.parent_id.clone(),
-            ),
-            JfmFrontmatter::Jira(_) => {
-                anyhow::bail!("Cannot create a Confluence page from JIRA frontmatter");
-            }
-        };
-
-        let space = self.space.clone().or(fm_space).ok_or_else(|| {
-            anyhow::anyhow!("Space key is required (use --space or set in frontmatter)")
-        })?;
-
-        let title = self.title.clone().or(fm_title).ok_or_else(|| {
-            anyhow::anyhow!("Title is required (use --title or set in frontmatter)")
-        })?;
-
-        let parent_id = self.parent.clone().or(fm_parent);
+        let resolved = resolve_confluence_create(
+            &input,
+            self.space.as_deref(),
+            self.title.as_deref(),
+            self.parent.as_deref(),
+        )?;
+        for shadowed in &resolved.shadowed {
+            eprintln!("{}", shadowed.warning_line());
+        }
 
         Ok(CreateParams {
-            space,
-            title,
-            parent_id,
-            adf,
+            space: resolved.space_key,
+            title: resolved.title,
+            parent_id: resolved.parent_id,
+            adf: resolved.adf,
         })
     }
 
