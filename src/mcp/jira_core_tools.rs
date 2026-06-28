@@ -20,6 +20,7 @@ use crate::atlassian::client::{
     AtlassianClient, JiraTransition, JiraVisibility, JiraVisibilityType,
 };
 use crate::atlassian::convert::markdown_to_adf;
+use crate::atlassian::create::{create_resolved_jira_issue, prepend_warnings, resolve_jira_create};
 use crate::atlassian::custom_fields::{
     apply_user_field_overrides, convert_textarea_string_values, resolve_custom_fields,
 };
@@ -67,17 +68,35 @@ pub struct JiraSearchParams {
 /// Parameters for the `jira_create` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct JiraCreateParams {
-    /// Project key (e.g., `PROJ`).
-    pub project: String,
-    /// Issue summary / title.
-    pub summary: String,
+    /// Full JFM document (YAML frontmatter + markdown body), e.g. the output
+    /// of `jira_read` with the frontmatter edited. When provided, `project`,
+    /// `summary`, `issue_type`, labels and custom fields are taken from the
+    /// frontmatter (the project derives from `key:` when no `project:` is set)
+    /// and the body becomes the description — so the read → edit → create
+    /// round-trip works without re-specifying fields. The `project`/`summary`/
+    /// `issue_type` parameters below still override their frontmatter
+    /// counterparts (a warning is returned when they do); passing `description`
+    /// or `custom_fields` together with `document` is an error (put custom fields
+    /// in the document's `custom_fields:` frontmatter). See resource
+    /// `omni-dev://specs/jfm`.
+    #[serde(default)]
+    pub document: Option<String>,
+    /// Project key (e.g., `PROJ`). Required unless `document` carries a
+    /// `project:` (or a `key:` it can be derived from). Overrides frontmatter.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Issue summary / title. Required unless `document` carries one.
+    /// Overrides frontmatter.
+    #[serde(default)]
+    pub summary: Option<String>,
     /// Optional description in JFM markdown — see resource
     /// `omni-dev://specs/jfm` for syntax. JFM is GitHub-style markdown,
     /// NOT JIRA wiki markup (use `##` not `h2.`, triple-backtick fences not
-    /// `{code}`, backtick inline code not `{{...}}`).
+    /// `{code}`, backtick inline code not `{{...}}`). Rejected when `document`
+    /// is provided (the document body is the description).
     #[serde(default)]
     pub description: Option<String>,
-    /// Issue type (defaults to `Task`).
+    /// Issue type (defaults to `Task`). Overrides frontmatter.
     #[serde(default)]
     pub issue_type: Option<String>,
     /// Custom fields to set at create time, as a map of field name *or*
@@ -303,26 +322,74 @@ async fn run_jira_search(client: &AtlassianClient, jql: &str, limit: u32) -> Res
     yaml_result(&result)
 }
 
-/// Creates a JIRA issue and returns the new issue key.
+/// Creates a JIRA issue and returns the new issue key as YAML.
 ///
-/// Fast path when no custom fields are requested: a single POST to
-/// `/rest/api/3/issue`. With custom fields, `createmeta` is fetched first to
-/// resolve human names to ids and dispatch values by schema (mirroring the
-/// CLI `--set-field` flow).
-async fn run_jira_create(
-    client: &AtlassianClient,
-    project: &str,
-    summary: &str,
-    description: Option<&str>,
-    issue_type: &str,
-    custom_fields: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
-) -> Result<String> {
-    let adf = match description {
+/// Two modes: from a full JFM `document` (frontmatter resolved like the CLI,
+/// with full label/custom-field parity via the shared create path), or from
+/// explicit `project`/`summary` fields plus an optional `custom_fields` map.
+/// When the document path shadows a frontmatter value with an explicit
+/// parameter, a `warning:` line is prepended to the returned text (and logged)
+/// so the assistant has a signal.
+async fn run_jira_create(client: &AtlassianClient, params: &JiraCreateParams) -> Result<String> {
+    if let Some(document) = params.document.as_deref() {
+        if params.description.is_some() {
+            anyhow::bail!(
+                "Provide either `document` or `description`, not both — the document body \
+                 becomes the description"
+            );
+        }
+        if params.custom_fields.is_some() {
+            anyhow::bail!(
+                "Provide either `document` or `custom_fields`, not both — put custom fields in \
+                 the document's `custom_fields:` frontmatter"
+            );
+        }
+
+        let resolved = resolve_jira_create(
+            document,
+            params.project.as_deref(),
+            params.summary.as_deref(),
+            params.issue_type.as_deref(),
+            vec![],
+        )?;
+        for shadowed in &resolved.shadowed {
+            tracing::warn!("{}", shadowed.warning_line());
+        }
+
+        let created = create_resolved_jira_issue(
+            client,
+            &resolved.project,
+            &resolved.issue_type,
+            &resolved.summary,
+            &resolved.adf,
+            &resolved.labels,
+            &resolved.custom_scalars,
+            &resolved.custom_sections,
+        )
+        .await?;
+
+        return Ok(prepend_warnings(&resolved.shadowed, yaml_result(&created)?));
+    }
+
+    let project = params.project.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "`project` is required (or provide a `document` whose frontmatter carries \
+             `project:`/`key:`)"
+        )
+    })?;
+    let summary = params.summary.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "`summary` is required (or provide a `document` whose frontmatter carries `summary:`)"
+        )
+    })?;
+    let issue_type = params.issue_type.as_deref().unwrap_or("Task");
+
+    let adf = match params.description.as_deref() {
         Some(md) if !md.is_empty() => Some(ValidatedAdfDocument::try_new(markdown_to_adf(md)?)?),
         _ => None,
     };
 
-    let resolved = match custom_fields {
+    let resolved = match params.custom_fields.as_ref() {
         Some(fields) if !fields.is_empty() => {
             // The CLI's resolver works on YAML scalars (numbers/bools/strings)
             // so it can coerce inline `NAME=VALUE` flags; bridge the JSON
@@ -643,29 +710,27 @@ impl OmniDevServer {
 
     /// Tool: create a new JIRA issue.
     #[tool(
-        description = "Create a new JIRA issue. Returns the new issue key and self URL as YAML. \
-                       `custom_fields` is an optional map of field name or canonical id (e.g. \
-                       `{\"Story Points\": 8}` or `{\"Planned / Unplanned Work\": \"Unplanned\"}`) \
-                       to value, resolved against the create screen and shaped for the API — use \
-                       it to satisfy fields a project requires at create time (otherwise JIRA \
-                       returns HTTP 400)."
+        description = "Create a new JIRA issue, from explicit fields or from a full JFM `document` \
+                       (frontmatter + body, e.g. the output of `jira_read`). With a `document`, \
+                       `project`/`summary`/`issue_type`, labels and custom fields come from the \
+                       frontmatter (project is derived from `key:` when no `project:` is set) and \
+                       the body becomes the description — enabling the read → edit → create \
+                       round-trip. Explicit `project`/`summary`/`issue_type` override frontmatter \
+                       and a warning is returned when they do. Without a `document`, `custom_fields` \
+                       is an optional map of field name or canonical id (e.g. `{\"Story Points\": 8}` \
+                       or `{\"Planned / Unplanned Work\": \"Unplanned\"}`) to value, resolved against \
+                       the create screen and shaped for the API — use it to satisfy fields a project \
+                       requires at create time (otherwise JIRA returns HTTP 400). Returns the new \
+                       issue key and self URL as YAML."
     )]
     pub async fn jira_create(
         &self,
         Parameters(params): Parameters<JiraCreateParams>,
     ) -> Result<CallToolResult, McpError> {
-        let issue_type = params.issue_type.as_deref().unwrap_or("Task");
         let (client, _instance_url) = create_client().map_err(tool_error)?;
-        let text = run_jira_create(
-            &client,
-            &params.project,
-            &params.summary,
-            params.description.as_deref(),
-            issue_type,
-            params.custom_fields.as_ref(),
-        )
-        .await
-        .map_err(tool_error)?;
+        let text = run_jira_create(&client, &params)
+            .await
+            .map_err(tool_error)?;
         ok_text(text)
     }
 
@@ -1172,9 +1237,36 @@ mod tests {
 
     // ── run_jira_create ────────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn run_jira_create_returns_new_key() {
-        let server = MockServer::start().await;
+    /// Builds `JiraCreateParams` for the explicit-fields (non-document) path.
+    fn jira_create_params(
+        project: Option<&str>,
+        summary: Option<&str>,
+        description: Option<&str>,
+        issue_type: Option<&str>,
+    ) -> JiraCreateParams {
+        JiraCreateParams {
+            document: None,
+            project: project.map(String::from),
+            summary: summary.map(String::from),
+            description: description.map(String::from),
+            issue_type: issue_type.map(String::from),
+            custom_fields: None,
+        }
+    }
+
+    /// Builds `JiraCreateParams` for the document path with an optional project override.
+    fn jira_create_doc_params(document: &str, project: Option<&str>) -> JiraCreateParams {
+        JiraCreateParams {
+            document: Some(document.to_string()),
+            project: project.map(String::from),
+            summary: None,
+            description: None,
+            issue_type: None,
+            custom_fields: None,
+        }
+    }
+
+    async fn mount_create_ok(server: &MockServer) {
         Mock::given(method("POST"))
             .and(path("/rest/api/3/issue"))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
@@ -1182,33 +1274,42 @@ mod tests {
                 "key": "PROJ-100",
                 "self": "https://example.atlassian.net/rest/api/3/issue/100"
             })))
-            .mount(&server)
+            .mount(server)
             .await;
+    }
+
+    #[tokio::test]
+    async fn run_jira_create_returns_new_key() {
+        let server = MockServer::start().await;
+        mount_create_ok(&server).await;
 
         let client = mock_client(&server.uri());
-        let yaml = run_jira_create(&client, "PROJ", "A task", Some("Body text"), "Task", None)
-            .await
-            .unwrap();
+        let yaml = run_jira_create(
+            &client,
+            &jira_create_params(
+                Some("PROJ"),
+                Some("A task"),
+                Some("Body text"),
+                Some("Task"),
+            ),
+        )
+        .await
+        .unwrap();
         assert!(yaml.contains("PROJ-100"));
     }
 
     #[tokio::test]
     async fn run_jira_create_without_description_omits_body() {
         let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/rest/api/3/issue"))
-            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
-                "id": "100",
-                "key": "PROJ-100",
-                "self": "https://example.atlassian.net/rest/api/3/issue/100"
-            })))
-            .mount(&server)
-            .await;
+        mount_create_ok(&server).await;
 
         let client = mock_client(&server.uri());
-        run_jira_create(&client, "PROJ", "Terse", None, "Task", None)
-            .await
-            .unwrap();
+        run_jira_create(
+            &client,
+            &jira_create_params(Some("PROJ"), Some("Terse"), None, Some("Task")),
+        )
+        .await
+        .unwrap();
     }
 
     /// Issue #714: a body whose ADF would violate Confluence's content
@@ -1219,9 +1320,12 @@ mod tests {
     #[tokio::test]
     async fn run_jira_create_rejects_invalid_adf_nesting() {
         let client = mock_client("http://127.0.0.1:1");
-        let err = run_jira_create(&client, "PROJ", "Title", Some(BAD_ADF_JFM), "Task", None)
-            .await
-            .unwrap_err();
+        let err = run_jira_create(
+            &client,
+            &jira_create_params(Some("PROJ"), Some("Title"), Some(BAD_ADF_JFM), Some("Task")),
+        )
+        .await
+        .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("invalid ADF nesting"));
         assert!(msg.contains("`expand` cannot be a child of `panel`"));
@@ -1236,10 +1340,197 @@ mod tests {
             .mount(&server)
             .await;
         let client = mock_client(&server.uri());
-        let err = run_jira_create(&client, "PROJ", "Title", None, "Task", None)
+        let err = run_jira_create(
+            &client,
+            &jira_create_params(Some("PROJ"), Some("Title"), None, Some("Task")),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("400"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_create_requires_project_without_document() {
+        let client = mock_client("http://127.0.0.1:1");
+        let err = run_jira_create(
+            &client,
+            &jira_create_params(None, Some("Title"), None, Some("Task")),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("`project` is required"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_create_requires_summary_without_document() {
+        let client = mock_client("http://127.0.0.1:1");
+        let err = run_jira_create(
+            &client,
+            &jira_create_params(Some("PROJ"), None, None, Some("Task")),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("`summary` is required"));
+    }
+
+    // ── run_jira_create: #1058 document (frontmatter) round-trip ─────────────
+
+    #[tokio::test]
+    async fn run_jira_create_from_document_derives_project_from_key() {
+        let server = MockServer::start().await;
+        mount_create_ok(&server).await;
+
+        let doc = "---\ntype: jira\ninstance: https://org.atlassian.net\nkey: PROJ-7\nsummary: Round-tripped\n---\n\nBody from document\n";
+        let client = mock_client(&server.uri());
+        let yaml = run_jira_create(&client, &jira_create_doc_params(doc, None))
+            .await
+            .unwrap();
+        assert!(yaml.contains("PROJ-100"));
+        // No override → no warning line.
+        assert!(!yaml.contains("warning:"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_create_from_document_with_labels() {
+        let server = MockServer::start().await;
+        // Labels add no createmeta round-trip (single POST); assert the labels
+        // reach the wire via a partial-body match.
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({ "fields": { "labels": ["backend"] } }),
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": "100", "key": "PROJ-100",
+                "self": "https://example.atlassian.net/rest/api/3/issue/100"
+            })))
+            .mount(&server)
+            .await;
+
+        let doc = "---\ntype: jira\ninstance: https://org.atlassian.net\nproject: PROJ\nsummary: Labelled\nlabels:\n  - backend\n---\n\nBody\n";
+        let client = mock_client(&server.uri());
+        let yaml = run_jira_create(&client, &jira_create_doc_params(doc, None))
+            .await
+            .unwrap();
+        assert!(yaml.contains("PROJ-100"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_create_from_document_custom_fields_use_createmeta() {
+        // Full parity: a `custom_fields:` map drives a createmeta GET to
+        // resolve the human field name to an ID, then the create POST carries
+        // the resolved `customfield_*`.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/createmeta"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "projects": [{
+                    "key": "PROJ",
+                    "issuetypes": [{
+                        "name": "Task",
+                        "fields": {
+                            "customfield_10010": {
+                                "name": "Story Points",
+                                "schema": { "type": "number" }
+                            }
+                        }
+                    }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({ "fields": { "customfield_10010": 5 } }),
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": "100", "key": "PROJ-100",
+                "self": "https://example.atlassian.net/rest/api/3/issue/100"
+            })))
+            .mount(&server)
+            .await;
+
+        let doc = "---\ntype: jira\ninstance: https://org.atlassian.net\nproject: PROJ\nsummary: With CF\ncustom_fields:\n  Story Points: 5\n---\n\nBody\n";
+        let client = mock_client(&server.uri());
+        let yaml = run_jira_create(&client, &jira_create_doc_params(doc, None))
+            .await
+            .unwrap();
+        assert!(yaml.contains("PROJ-100"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_create_document_param_override_warns_in_text() {
+        let server = MockServer::start().await;
+        mount_create_ok(&server).await;
+
+        let doc = "---\ntype: jira\ninstance: https://org.atlassian.net\nproject: OLD\nsummary: T\n---\n\nBody\n";
+        let client = mock_client(&server.uri());
+        let yaml = run_jira_create(&client, &jira_create_doc_params(doc, Some("NEW")))
+            .await
+            .unwrap();
+        assert!(yaml.contains("warning:"));
+        assert!(yaml.contains("OLD"));
+        assert!(yaml.contains("NEW"));
+        assert!(yaml.contains("PROJ-100"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_create_document_without_project_or_key_errors() {
+        let doc = "---\ntype: jira\ninstance: https://org.atlassian.net\nsummary: No project\n---\n\nBody\n";
+        let client = mock_client("http://127.0.0.1:1");
+        let err = run_jira_create(&client, &jira_create_doc_params(doc, None))
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("400"));
+        assert!(err.to_string().contains("Project key is required"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_create_document_and_description_errors() {
+        let doc = "---\ntype: jira\ninstance: https://org.atlassian.net\nproject: PROJ\nsummary: T\n---\n\nBody\n";
+        let client = mock_client("http://127.0.0.1:1");
+        let params = JiraCreateParams {
+            document: Some(doc.to_string()),
+            project: None,
+            summary: None,
+            description: Some("conflicting body".to_string()),
+            issue_type: None,
+            custom_fields: None,
+        };
+        let err = run_jira_create(&client, &params).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Provide either `document` or `description`"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_create_document_and_custom_fields_errors() {
+        let doc = "---\ntype: jira\ninstance: https://org.atlassian.net\nproject: PROJ\nsummary: T\n---\n\nBody\n";
+        let client = mock_client("http://127.0.0.1:1");
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert("Story Points".to_string(), serde_json::json!(5));
+        let params = JiraCreateParams {
+            document: Some(doc.to_string()),
+            project: None,
+            summary: None,
+            description: None,
+            issue_type: None,
+            custom_fields: Some(fields),
+        };
+        let err = run_jira_create(&client, &params).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Provide either `document` or `custom_fields`"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_create_document_rejects_confluence_frontmatter() {
+        let doc = "---\ntype: confluence\ninstance: https://org.atlassian.net\ntitle: P\nspace_key: ENG\n---\n\nBody\n";
+        let client = mock_client("http://127.0.0.1:1");
+        let err = run_jira_create(&client, &jira_create_doc_params(doc, None))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Confluence"));
     }
 
     #[tokio::test]
@@ -1297,9 +1588,15 @@ mod tests {
             "Planned / Unplanned Work".to_string(),
             serde_json::Value::String("Unplanned".to_string()),
         );
-        let yaml = run_jira_create(&client, "PROJ", "An epic", None, "Epic", Some(&fields))
-            .await
-            .unwrap();
+        let params = JiraCreateParams {
+            document: None,
+            project: Some("PROJ".to_string()),
+            summary: Some("An epic".to_string()),
+            description: None,
+            issue_type: Some("Epic".to_string()),
+            custom_fields: Some(fields),
+        };
+        let yaml = run_jira_create(&client, &params).await.unwrap();
         assert!(yaml.contains("PROJ-100"));
     }
 
@@ -1322,10 +1619,15 @@ mod tests {
         // wiremock unmatched-request panic and fails the test.
 
         let client = mock_client(&server.uri());
-        let empty = std::collections::BTreeMap::new();
-        run_jira_create(&client, "PROJ", "Terse", None, "Task", Some(&empty))
-            .await
-            .unwrap();
+        let params = JiraCreateParams {
+            document: None,
+            project: Some("PROJ".to_string()),
+            summary: Some("Terse".to_string()),
+            description: None,
+            issue_type: Some("Task".to_string()),
+            custom_fields: Some(std::collections::BTreeMap::new()),
+        };
+        run_jira_create(&client, &params).await.unwrap();
     }
 
     // ── run_jira_write ─────────────────────────────────────────────────────
