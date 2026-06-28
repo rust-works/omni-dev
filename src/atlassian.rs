@@ -16,6 +16,7 @@ pub mod auth;
 pub mod client;
 pub mod confluence_api;
 pub mod convert;
+pub mod create;
 pub mod custom_fields;
 pub mod diff;
 pub mod diff_format;
