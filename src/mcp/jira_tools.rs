@@ -22,6 +22,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 
 use super::catalogue_cache::CatalogueCache;
+use super::dry_run::dry_run_request_yaml;
 use super::error::tool_error;
 use super::server::OmniDevServer;
 use crate::atlassian::client::{AgileBoard, AtlassianClient, JiraAttachment, JiraProject};
@@ -555,6 +556,11 @@ pub struct LinkRemoveParams {
     pub link_id: String,
     /// Must be set to `true` — destructive guard.
     pub confirm: bool,
+    /// When true, validate and return the would-be request (method, path)
+    /// without removing the link (and without requiring `confirm`). Defaults
+    /// to `false`.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 pub(crate) async fn link_list_yaml(client: &AtlassianClient, key: &str) -> Result<String> {
@@ -574,7 +580,13 @@ pub(crate) async fn link_remove_yaml(
     client: &AtlassianClient,
     link_id: &str,
     confirm: bool,
+    dry_run: bool,
 ) -> Result<String> {
+    if dry_run {
+        // A dry-run only previews the request, so it neither mutates nor
+        // requires the destructive `confirm` guard.
+        return dry_run_request_yaml("DELETE", format!("/rest/api/3/issueLink/{link_id}"), None);
+    }
     if !confirm {
         return Err(anyhow!(
             "Refusing to remove link {link_id}: pass `confirm: true` to authorise this destructive operation."
@@ -605,6 +617,10 @@ pub struct LinkCreateParams {
     pub inward: String,
     /// Target (outward) issue key — e.g. for `Blocks`, the issue being blocked.
     pub outward: String,
+    /// When true, validate and return the would-be request (method, path,
+    /// body) without creating the link. Defaults to `false`.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 pub(crate) async fn link_create_yaml(
@@ -612,7 +628,19 @@ pub(crate) async fn link_create_yaml(
     link_type: &str,
     inward: &str,
     outward: &str,
+    dry_run: bool,
 ) -> Result<String> {
+    if dry_run {
+        return dry_run_request_yaml(
+            "POST",
+            "/rest/api/3/issueLink".to_string(),
+            Some(serde_json::json!({
+                "type": { "name": link_type },
+                "inwardIssue": { "key": inward },
+                "outwardIssue": { "key": outward },
+            })),
+        );
+    }
     client.create_issue_link(link_type, inward, outward).await?;
     serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
@@ -624,13 +652,25 @@ pub struct LinkParentParams {
     pub parent: String,
     /// Child issue key to place under the parent.
     pub child: String,
+    /// When true, validate and return the would-be request (method, path,
+    /// body) without setting the parent. Defaults to `false`.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 pub(crate) async fn link_parent_yaml(
     client: &AtlassianClient,
     parent: &str,
     child: &str,
+    dry_run: bool,
 ) -> Result<String> {
+    if dry_run {
+        return dry_run_request_yaml(
+            "PUT",
+            format!("/rest/api/3/issue/{child}"),
+            Some(serde_json::json!({ "fields": { "parent": { "key": parent } } })),
+        );
+    }
     client.set_issue_parent(child, parent).await?;
     serde_yaml::to_string(&STATUS_OK).context("Failed to serialize status as YAML")
 }
@@ -1239,7 +1279,9 @@ impl OmniDevServer {
                        `jira_read` to discover IDs). Destructive operation: callers \
                        must explicitly pass `confirm: true` for the removal to proceed; \
                        otherwise the tool refuses with an error. Returns YAML \
-                       `{status: ok}`. Mirrors `omni-dev atlassian jira link remove`."
+                       `{status: ok}`. Set `dry_run: true` to preview the request that would be \
+                       sent (method, path) without removing the link — no `confirm` needed for a \
+                       dry-run. Mirrors `omni-dev atlassian jira link remove`."
     )]
     pub async fn jira_link_remove(
         &self,
@@ -1247,7 +1289,7 @@ impl OmniDevServer {
     ) -> Result<CallToolResult, McpError> {
         let yaml = (async {
             let (client, _) = create_client()?;
-            link_remove_yaml(&client, &params.link_id, params.confirm).await
+            link_remove_yaml(&client, &params.link_id, params.confirm, params.dry_run).await
         })
         .await
         .map_err(tool_error)?;
@@ -1282,6 +1324,8 @@ impl OmniDevServer {
                        `jira_link_types`); `inward` is the source issue and `outward` \
                        the target. To set hierarchy (Epic → Story / Story → Sub-task) \
                        use `jira_link_parent` instead. Returns YAML `{status: ok}`. \
+                       Set `dry_run: true` to preview the request that would be sent (method, \
+                       path, body) without creating the link. \
                        Mirrors `omni-dev atlassian jira link create`."
     )]
     pub async fn jira_link_create(
@@ -1290,7 +1334,14 @@ impl OmniDevServer {
     ) -> Result<CallToolResult, McpError> {
         let yaml = (async {
             let (client, _) = create_client()?;
-            link_create_yaml(&client, &params.link_type, &params.inward, &params.outward).await
+            link_create_yaml(
+                &client,
+                &params.link_type,
+                &params.inward,
+                &params.outward,
+                params.dry_run,
+            )
+            .await
         })
         .await
         .map_err(tool_error)?;
@@ -1303,8 +1354,9 @@ impl OmniDevServer {
                        Epic → Story / Story → Sub-task hierarchy, distinct from the \
                        relationship links created by `jira_link_create`. `parent` is \
                        the parent issue key (e.g. the epic); `child` is the issue placed \
-                       under it. Returns YAML `{status: ok}`. Mirrors `omni-dev \
-                       atlassian jira link parent`."
+                       under it. Returns YAML `{status: ok}`. Set `dry_run: true` to preview \
+                       the request that would be sent (method, path, body) without setting the \
+                       parent. Mirrors `omni-dev atlassian jira link parent`."
     )]
     pub async fn jira_link_parent(
         &self,
@@ -1312,7 +1364,7 @@ impl OmniDevServer {
     ) -> Result<CallToolResult, McpError> {
         let yaml = (async {
             let (client, _) = create_client()?;
-            link_parent_yaml(&client, &params.parent, &params.child).await
+            link_parent_yaml(&client, &params.parent, &params.child, params.dry_run).await
         })
         .await
         .map_err(tool_error)?;
@@ -2312,7 +2364,9 @@ mod tests {
     async fn link_remove_yaml_requires_confirm_true() {
         let server = MockServer::start().await;
         let client = mock_client(&server.uri());
-        let err = link_remove_yaml(&client, "12345", false).await.unwrap_err();
+        let err = link_remove_yaml(&client, "12345", false, false)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("confirm: true"));
     }
 
@@ -2325,7 +2379,9 @@ mod tests {
             .mount(&server)
             .await;
         let client = mock_client(&server.uri());
-        let yaml = link_remove_yaml(&client, "12345", true).await.unwrap();
+        let yaml = link_remove_yaml(&client, "12345", true, false)
+            .await
+            .unwrap();
         assert!(yaml.contains("ok"));
     }
 
@@ -2338,7 +2394,9 @@ mod tests {
             .mount(&server)
             .await;
         let client = mock_client(&server.uri());
-        let err = link_remove_yaml(&client, "99", true).await.unwrap_err();
+        let err = link_remove_yaml(&client, "99", true, false)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("404"));
     }
 
@@ -2351,7 +2409,7 @@ mod tests {
             .mount(&server)
             .await;
         let client = mock_client(&server.uri());
-        let yaml = link_create_yaml(&client, "Blocks", "PROJ-1", "PROJ-2")
+        let yaml = link_create_yaml(&client, "Blocks", "PROJ-1", "PROJ-2", false)
             .await
             .unwrap();
         assert!(yaml.contains("ok"));
@@ -2366,7 +2424,7 @@ mod tests {
             .mount(&server)
             .await;
         let client = mock_client(&server.uri());
-        let err = link_create_yaml(&client, "Bad", "PROJ-1", "PROJ-2")
+        let err = link_create_yaml(&client, "Bad", "PROJ-1", "PROJ-2", false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("400"));
@@ -2382,7 +2440,9 @@ mod tests {
             .mount(&server)
             .await;
         let client = mock_client(&server.uri());
-        let yaml = link_parent_yaml(&client, "EPIC-1", "PROJ-2").await.unwrap();
+        let yaml = link_parent_yaml(&client, "EPIC-1", "PROJ-2", false)
+            .await
+            .unwrap();
         assert!(yaml.contains("ok"));
     }
 
@@ -2395,10 +2455,55 @@ mod tests {
             .mount(&server)
             .await;
         let client = mock_client(&server.uri());
-        let err = link_parent_yaml(&client, "EPIC-1", "PROJ-2")
+        let err = link_parent_yaml(&client, "EPIC-1", "PROJ-2", false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("403"));
+    }
+
+    // ── link dry_run (issue #1048) ──────────────────────────────────
+    //
+    // The unreachable `http://127.0.0.1:1` client is the short-circuit proof:
+    // a dry-run returns the would-be request instead of making a network call.
+
+    #[tokio::test]
+    async fn link_remove_yaml_dry_run_previews_without_confirm_or_api() {
+        let client = mock_client("http://127.0.0.1:1");
+        // `confirm = false`: a dry-run neither requires the destructive guard
+        // nor performs the DELETE.
+        let yaml = link_remove_yaml(&client, "12345", false, true)
+            .await
+            .unwrap();
+        assert!(yaml.contains("dry_run: true"));
+        assert!(yaml.contains("method: DELETE"));
+        assert!(yaml.contains("path: /rest/api/3/issueLink/12345"));
+    }
+
+    #[tokio::test]
+    async fn link_create_yaml_dry_run_previews_without_api() {
+        let client = mock_client("http://127.0.0.1:1");
+        let yaml = link_create_yaml(&client, "Blocks", "PROJ-1", "PROJ-2", true)
+            .await
+            .unwrap();
+        assert!(yaml.contains("dry_run: true"));
+        assert!(yaml.contains("method: POST"));
+        assert!(yaml.contains("path: /rest/api/3/issueLink"));
+        assert!(yaml.contains("Blocks"));
+        assert!(yaml.contains("PROJ-1"));
+        assert!(yaml.contains("PROJ-2"));
+    }
+
+    #[tokio::test]
+    async fn link_parent_yaml_dry_run_previews_without_api() {
+        let client = mock_client("http://127.0.0.1:1");
+        let yaml = link_parent_yaml(&client, "EPIC-1", "PROJ-2", true)
+            .await
+            .unwrap();
+        assert!(yaml.contains("dry_run: true"));
+        assert!(yaml.contains("method: PUT"));
+        // The child issue (`PROJ-2`) is the one PUT-updated with the parent field.
+        assert!(yaml.contains("path: /rest/api/3/issue/PROJ-2"));
+        assert!(yaml.contains("EPIC-1"));
     }
 
     // ── worklogs ───────────────────────────────────────────────────

@@ -35,6 +35,7 @@ use crate::cli::atlassian::format::ContentFormat;
 use crate::cli::atlassian::helpers::create_client;
 use crate::data::yaml::to_yaml;
 
+use super::dry_run::dry_run_request_yaml;
 use super::error::tool_error;
 use super::output_file::write_to_file_yaml;
 use super::server::OmniDevServer;
@@ -105,6 +106,10 @@ pub struct ConfluenceCreateParams {
     /// Ignored for the `document` path (a document is always JFM).
     #[serde(default)]
     pub format: Option<String>,
+    /// When true, validate and return the would-be request (method, path,
+    /// body) without creating the page. Defaults to `false`.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 /// Parameters for the `confluence_write` tool.
@@ -122,6 +127,10 @@ pub struct ConfluenceWriteParams {
     /// Format of `content`: `"jfm"` (default markdown) or `"adf"` (raw ADF JSON).
     #[serde(default)]
     pub format: Option<String>,
+    /// When true, validate and return the would-be request (method, path,
+    /// body) without updating the page. Defaults to `false`.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 /// Parameters for the `confluence_delete` tool.
@@ -1191,8 +1200,11 @@ impl OmniDevServer {
                        read → edit → create round-trip. Explicit `space_key`/`title`/`parent_id` \
                        override frontmatter and a warning is returned when they do. JFM is \
                        GitHub-style markdown, NOT Confluence wiki markup — see resource \
-                       `omni-dev://specs/jfm`. Returns the new page's ID. \
-                       Mirrors `omni-dev atlassian confluence create`."
+                       `omni-dev://specs/jfm`. Set `dry_run: true` first when uncertain about \
+                       required fields or formatting — validates the input and returns the request \
+                       that would be sent (method, path, body) without creating the page. \
+                       Returns the new page's ID. \
+                       Mirrors `omni-dev atlassian confluence create` (and its `--dry-run`)."
     )]
     pub async fn confluence_create(
         &self,
@@ -1207,20 +1219,20 @@ impl OmniDevServer {
         description = "Overwrite a Confluence page's body from JFM markdown (default) or raw ADF JSON. \
                        JFM is GitHub-style markdown, NOT Confluence wiki markup — see resource \
                        `omni-dev://specs/jfm` for syntax. \
-                       Mirrors `omni-dev atlassian confluence write --force`."
+                       Set `dry_run: true` first when uncertain about required fields or \
+                       formatting — validates the input and returns the request that would be \
+                       sent (method, path, body) without updating the page. \
+                       Mirrors `omni-dev atlassian confluence write --force` (and `--dry-run`)."
     )]
     pub async fn confluence_write(
         &self,
         Parameters(params): Parameters<ConfluenceWriteParams>,
     ) -> Result<CallToolResult, McpError> {
         let format = parse_format(params.format.as_deref()).map_err(tool_error)?;
-        run_confluence_write(&params.id, &params.content, format)
+        let text = run_confluence_write(&params.id, &params.content, format, params.dry_run)
             .await
             .map_err(tool_error)?;
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Updated {}",
-            params.id
-        ))]))
+        Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
     /// Tool: delete a Confluence page. Destructive — requires `confirm: true`.
@@ -1746,6 +1758,16 @@ async fn run_confluence_create(params: &ConfluenceCreateParams) -> Result<String
             tracing::warn!("{}", shadowed.warning_line());
         }
 
+        if params.dry_run {
+            let preview = confluence_create_dry_run_preview(
+                &resolved.space_key,
+                &resolved.title,
+                resolved.parent_id.as_deref(),
+                &resolved.adf,
+            )?;
+            return Ok(prepend_warnings(&resolved.shadowed, preview));
+        }
+
         let (client, _instance_url) = create_client()?;
         let api = ConfluenceApi::new(client);
         let id = api
@@ -1782,6 +1804,15 @@ async fn run_confluence_create(params: &ConfluenceCreateParams) -> Result<String
     };
     let adf = ValidatedAdfDocument::try_new(adf)?;
 
+    if params.dry_run {
+        return confluence_create_dry_run_preview(
+            space_key,
+            title,
+            params.parent_id.as_deref(),
+            &adf,
+        );
+    }
+
     let (client, _instance_url) = create_client()?;
     let api = ConfluenceApi::new(client);
     let id = api
@@ -1790,8 +1821,93 @@ async fn run_confluence_create(params: &ConfluenceCreateParams) -> Result<String
     Ok(id)
 }
 
-async fn run_confluence_write(id: &str, content: &str, format: ContentFormat) -> Result<()> {
+/// Builds the would-be `POST /wiki/api/v2/pages` request for a create dry-run.
+/// `space_key` is resolved to a numeric `spaceId` at send time (a read), so it
+/// is shown here as `spaceKey` rather than reproducing that lookup. On the wire
+/// the ADF is embedded as a JSON string under `body.value`; it is shown here as
+/// a nested value for readability.
+fn confluence_create_dry_run_preview(
+    space_key: &str,
+    title: &str,
+    parent_id: Option<&str>,
+    adf: &ValidatedAdfDocument,
+) -> Result<String> {
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "spaceKey".to_string(),
+        serde_json::Value::String(space_key.to_string()),
+    );
+    body.insert(
+        "title".to_string(),
+        serde_json::Value::String(title.to_string()),
+    );
+    if let Some(parent_id) = parent_id {
+        body.insert(
+            "parentId".to_string(),
+            serde_json::Value::String(parent_id.to_string()),
+        );
+    }
+    body.insert(
+        "status".to_string(),
+        serde_json::Value::String("current".to_string()),
+    );
+    body.insert(
+        "body".to_string(),
+        serde_json::json!({
+            "representation": "atlas_doc_format",
+            "value": serde_json::to_value(adf).context("Failed to serialize ADF document")?,
+        }),
+    );
+    dry_run_request_yaml(
+        "POST",
+        "/wiki/api/v2/pages".to_string(),
+        Some(serde_json::Value::Object(body)),
+    )
+}
+
+async fn run_confluence_write(
+    id: &str,
+    content: &str,
+    format: ContentFormat,
+    dry_run: bool,
+) -> Result<String> {
     let (adf, title) = parse_write_content(content, format)?;
+
+    if dry_run {
+        // Mirror the `ConfluenceUpdateRequest` wire body. The current version
+        // number and (when no new title is supplied) the current title are
+        // fetched at send time, so `version.number` is omitted here. On the
+        // wire the ADF is embedded as a JSON string under `body.value`; it is
+        // shown here as a nested value for readability.
+        let mut body = serde_json::Map::new();
+        body.insert("id".to_string(), serde_json::Value::String(id.to_string()));
+        body.insert(
+            "status".to_string(),
+            serde_json::Value::String("current".to_string()),
+        );
+        if title.is_empty() {
+            body.insert(
+                "title".to_string(),
+                serde_json::Value::String("<current title kept at send time>".to_string()),
+            );
+        } else {
+            body.insert("title".to_string(), serde_json::Value::String(title));
+        }
+        body.insert(
+            "body".to_string(),
+            serde_json::json!({
+                "representation": "atlas_doc_format",
+                "value": serde_json::to_value(&adf)
+                    .context("Failed to serialize ADF document")?,
+            }),
+        );
+        return dry_run_request_yaml(
+            "PUT",
+            format!("/wiki/api/v2/pages/{id}"),
+            Some(serde_json::Value::Object(body)),
+        );
+    }
+
     let (client, _instance_url) = create_client()?;
     let api = ConfluenceApi::new(client);
     let title_ref = if title.is_empty() {
@@ -1799,7 +1915,8 @@ async fn run_confluence_write(id: &str, content: &str, format: ContentFormat) ->
     } else {
         Some(title.as_str())
     };
-    api.update_content(id, &adf, title_ref).await
+    api.update_content(id, &adf, title_ref).await?;
+    Ok(format!("Updated {id}"))
 }
 
 async fn run_confluence_delete(params: &ConfluenceDeleteParams) -> Result<()> {
@@ -2439,6 +2556,7 @@ mod tests {
             content: Some("Body".to_string()),
             parent_id: None,
             format: None,
+            dry_run: false,
         };
         let id = run_confluence_create(&params).await.unwrap();
         assert_eq!(id, "54321");
@@ -2473,6 +2591,7 @@ mod tests {
             content: Some(r#"{"version":1,"type":"doc","content":[]}"#.to_string()),
             parent_id: Some("11111".to_string()),
             format: Some("adf".to_string()),
+            dry_run: false,
         };
         let id = run_confluence_create(&params).await.unwrap();
         assert_eq!(id, "999");
@@ -2491,6 +2610,7 @@ mod tests {
             ),
             parent_id: None,
             format: Some("jfm".to_string()),
+            dry_run: false,
         };
         let err = run_confluence_create(&params).await.unwrap_err();
         let msg = err.to_string();
@@ -2502,7 +2622,7 @@ mod tests {
     async fn run_confluence_write_rejects_invalid_adf_nesting() {
         // Issue #714: validation runs before any HTTP call.
         let bad_jfm = ":::panel{type=info}\n:::expand{title=\"x\"}\nbody\n:::\n:::";
-        let err = run_confluence_write("12345", bad_jfm, ContentFormat::Jfm)
+        let err = run_confluence_write("12345", bad_jfm, ContentFormat::Jfm, false)
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -2523,6 +2643,7 @@ mod tests {
             content: Some("not json".to_string()),
             parent_id: None,
             format: Some("adf".to_string()),
+            dry_run: false,
         };
         assert!(run_confluence_create(&params).await.is_err());
     }
@@ -2541,6 +2662,7 @@ mod tests {
             content: None,
             parent_id: None,
             format: None,
+            dry_run: false,
         }
     }
 
@@ -2607,6 +2729,7 @@ mod tests {
             content: Some("conflicting".to_string()),
             parent_id: None,
             format: None,
+                    dry_run: false,
         };
         let err = run_confluence_create(&params).await.unwrap_err();
         assert!(err
@@ -2635,6 +2758,7 @@ mod tests {
             content: None,
             parent_id: None,
             format: None,
+            dry_run: false,
         };
         let err = run_confluence_create(&params).await.unwrap_err();
         assert!(err.to_string().contains("`space_key` is required"));
@@ -2649,6 +2773,7 @@ mod tests {
             content: None,
             parent_id: None,
             format: None,
+            dry_run: false,
         };
         let err = run_confluence_create(&params).await.unwrap_err();
         assert!(err.to_string().contains("`title` is required"));
@@ -2663,6 +2788,7 @@ mod tests {
             content: None,
             parent_id: None,
             format: None,
+            dry_run: false,
         };
         let err = run_confluence_create(&params).await.unwrap_err();
         assert!(err.to_string().contains("`content` is required"));
@@ -2695,7 +2821,7 @@ mod tests {
             .await;
         let _env = EnvGuard::set(&server.uri());
 
-        let result = run_confluence_write("12345", "New body", ContentFormat::Jfm).await;
+        let result = run_confluence_write("12345", "New body", ContentFormat::Jfm, false).await;
         assert!(result.is_ok(), "got: {result:?}");
     }
 
@@ -2723,7 +2849,7 @@ mod tests {
         let _env = EnvGuard::set(&server.uri());
 
         let adf_json = r#"{"version":1,"type":"doc","content":[]}"#;
-        let result = run_confluence_write("12345", adf_json, ContentFormat::Adf).await;
+        let result = run_confluence_write("12345", adf_json, ContentFormat::Adf, false).await;
         assert!(result.is_ok(), "got: {result:?}");
     }
 
@@ -2879,7 +3005,7 @@ mod tests {
         let _env = EnvGuard::set(&server.uri());
 
         let content = "---\ntype: confluence\ninstance: https://org.atlassian.net\npage_id: '12345'\ntitle: New Title\nspace_key: ENG\n---\n\nBody\n";
-        let result = run_confluence_write("12345", content, ContentFormat::Jfm).await;
+        let result = run_confluence_write("12345", content, ContentFormat::Jfm, false).await;
         assert!(result.is_ok(), "got: {result:?}");
     }
 
@@ -3488,6 +3614,7 @@ mod tests {
                 content: Some("body".to_string()),
                 parent_id: None,
                 format: Some("xml".to_string()),
+                dry_run: false,
             }))
             .await;
         let err = result.unwrap_err();
@@ -3507,6 +3634,7 @@ mod tests {
                 content: Some("body".to_string()),
                 parent_id: None,
                 format: None,
+                dry_run: false,
             }))
             .await;
         assert!(result.is_err());
@@ -3543,6 +3671,7 @@ mod tests {
                 content: Some("Body".to_string()),
                 parent_id: None,
                 format: None,
+                dry_run: false,
             }))
             .await
             .unwrap();
@@ -3575,6 +3704,7 @@ mod tests {
         let server = make_server();
         let result = server
             .confluence_write(Parameters(ConfluenceWriteParams {
+                dry_run: false,
                 id: "12345".to_string(),
                 content: "New body".to_string(),
                 format: None,
@@ -3589,6 +3719,7 @@ mod tests {
         let server = make_server();
         let result = server
             .confluence_write(Parameters(ConfluenceWriteParams {
+                dry_run: false,
                 id: "12345".to_string(),
                 content: "body".to_string(),
                 format: Some("xml".to_string()),
@@ -3605,6 +3736,7 @@ mod tests {
         let server = make_server();
         let result = server
             .confluence_write(Parameters(ConfluenceWriteParams {
+                dry_run: false,
                 id: "12345".to_string(),
                 content: "body".to_string(),
                 format: None,
@@ -5129,5 +5261,100 @@ mod tests {
             }))
             .await;
         assert!(result.is_err());
+    }
+
+    // ── dry_run (issue #1048) ───────────────────────────────────────────────
+    //
+    // The dry-run branch returns before `create_client()`, so no credentials or
+    // network are needed. Validation runs first, so malformed ADF still errors.
+
+    #[tokio::test]
+    async fn run_confluence_create_dry_run_returns_request_without_calling_api() {
+        let params = ConfluenceCreateParams {
+            document: None,
+            space_key: Some("ENG".to_string()),
+            title: Some("My Page".to_string()),
+            content: Some("# Hello".to_string()),
+            parent_id: Some("123".to_string()),
+            format: None,
+            dry_run: true,
+        };
+        let yaml = run_confluence_create(&params).await.unwrap();
+        assert!(yaml.contains("dry_run: true"));
+        assert!(yaml.contains("method: POST"));
+        assert!(yaml.contains("path: /wiki/api/v2/pages"));
+        assert!(yaml.contains("spaceKey: ENG"));
+        assert!(yaml.contains("My Page"));
+        assert!(yaml.contains("parentId: '123'"));
+        assert!(yaml.contains("atlas_doc_format"));
+    }
+
+    #[tokio::test]
+    async fn run_confluence_create_dry_run_still_validates_adf() {
+        let params = ConfluenceCreateParams {
+            document: None,
+            space_key: Some("ENG".to_string()),
+            title: Some("Bad".to_string()),
+            content: Some(
+                ":::panel{type=info}\n:::expand{title=\"x\"}\nbody\n:::\n:::".to_string(),
+            ),
+            parent_id: None,
+            format: None,
+            dry_run: true,
+        };
+        let err = run_confluence_create(&params).await.unwrap_err();
+        assert!(err.to_string().contains("invalid ADF nesting"));
+    }
+
+    #[tokio::test]
+    async fn run_confluence_create_dry_run_from_document_previews_without_api() {
+        // Document-mode dry-run resolves the JFM frontmatter and previews the
+        // create without contacting the API (the function returns before
+        // `create_client()`).
+        let doc = "---\ntype: confluence\ninstance: https://org.atlassian.net\npage_id: '12345'\ntitle: Doc Title\nspace_key: ENG\n---\n\nBody\n";
+        let params = ConfluenceCreateParams {
+            dry_run: true,
+            ..confluence_create_doc_params(doc, None)
+        };
+        let yaml = run_confluence_create(&params).await.unwrap();
+        assert!(yaml.contains("dry_run: true"));
+        assert!(yaml.contains("method: POST"));
+        assert!(yaml.contains("path: /wiki/api/v2/pages"));
+        assert!(yaml.contains("spaceKey: ENG"));
+        assert!(yaml.contains("Doc Title"));
+    }
+
+    #[tokio::test]
+    async fn run_confluence_write_dry_run_returns_request_without_calling_api() {
+        let yaml = run_confluence_write("12345", "# Hello", ContentFormat::Jfm, true)
+            .await
+            .unwrap();
+        assert!(yaml.contains("dry_run: true"));
+        assert!(yaml.contains("method: PUT"));
+        assert!(yaml.contains("path: /wiki/api/v2/pages/12345"));
+        assert!(yaml.contains("atlas_doc_format"));
+    }
+
+    #[tokio::test]
+    async fn run_confluence_write_dry_run_still_validates_adf() {
+        let bad_jfm = ":::panel{type=info}\n:::expand{title=\"x\"}\nbody\n:::\n:::";
+        let err = run_confluence_write("12345", bad_jfm, ContentFormat::Jfm, true)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid ADF nesting"));
+    }
+
+    #[tokio::test]
+    async fn run_confluence_write_dry_run_with_frontmatter_title_includes_it() {
+        // JFM frontmatter carries a title, exercising the non-empty-title
+        // branch of the write dry-run preview (the empty-title branch is
+        // covered by the no-frontmatter test above).
+        let content = "---\ntype: confluence\ninstance: https://org.atlassian.net\npage_id: '12345'\ntitle: New Title\nspace_key: ENG\n---\n\nBody\n";
+        let yaml = run_confluence_write("12345", content, ContentFormat::Jfm, true)
+            .await
+            .unwrap();
+        assert!(yaml.contains("dry_run: true"));
+        assert!(yaml.contains("method: PUT"));
+        assert!(yaml.contains("title: New Title"));
     }
 }
