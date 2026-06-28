@@ -167,6 +167,7 @@ async fn list_tools_includes_all_jira_tools() -> Result<()> {
         "jira_read",
         "jira_search",
         "jira_create",
+        "jira_bulk_create",
         "jira_write",
         "jira_transition",
         "jira_comment",
@@ -673,12 +674,24 @@ async fn jira_tool_handlers_round_trip_through_wiremock() -> Result<()> {
     let _env = AtlassianEnvGuard::new(&server.uri(), "test@test.com", "token")?;
     let (client, server_handle) = spawn_server().await;
 
-    let calls: [(&str, serde_json::Value); 11] = [
+    let calls: [(&str, serde_json::Value); 12] = [
         ("jira_read", serde_json::json!({"key": "PROJ-1"})),
         ("jira_search", serde_json::json!({"jql": "project = PROJ"})),
         (
             "jira_create",
             serde_json::json!({"project": "PROJ", "summary": "T", "description": "Body"}),
+        ),
+        (
+            "jira_bulk_create",
+            serde_json::json!({
+                "issues": [
+                    {"alias": "a", "project": "PROJ", "summary": "A"},
+                    {"alias": "b", "project": "PROJ", "summary": "B"}
+                ],
+                "links": [
+                    {"link_type": "Blocks", "inward": "a", "outward": "b"}
+                ]
+            }),
         ),
         (
             "jira_write",
