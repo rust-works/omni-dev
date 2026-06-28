@@ -82,13 +82,14 @@ explicit `confirm: true`.
 | `git_twiddle_commits` | AI-powered commit message improvement | `omni-dev git commit message twiddle` |
 | `git_create_pr` | AI-drafted PR title + body, optionally pushed | `omni-dev git branch create pr` |
 
-### JIRA — core (9 tools)
+### JIRA — core (10 tools)
 
 | Tool | Purpose |
 |------|---------|
 | `jira_read` | Fetch a single issue (JFM markdown or ADF JSON). Supports `output_file`, `--fields`, `--all-fields` |
 | `jira_search` | JQL search; returns matching issues as YAML |
 | `jira_create` | Create a new issue. Supports `custom_fields` (a `{name-or-id: value}` map resolved against the create screen) for fields a project requires at create time |
+| `jira_bulk_create` | Create many issues and (optionally) wire dependency links between them in one call — for epic decomposition. See [Bulk create + link](#bulk-create--link-jira_bulk_create) |
 | `jira_write` | Update an issue body, `assignee`, `reporter`, or arbitrary `fields`. At least one of `content` or another field is required. (Set the parent for hierarchy via the `jira_link_parent` tool.) |
 | `jira_transition` | Apply or list workflow transitions (call with `list = true` first to discover names) |
 | `jira_comment` | Add a comment to an issue |
@@ -201,6 +202,36 @@ This prevents large pages from blowing past the assistant's context window —
 the assistant can then page through the file with offset/limit using its
 filesystem read tool. The same pattern is built into `confluence_download`
 and `jira_attachment_download` by default.
+
+### Bulk create + link (`jira_bulk_create`)
+
+`jira_bulk_create` collapses an epic-decomposition workflow — create N child
+issues, then wire N dependency links between them — into a single tool call,
+saving the per-call model round-trips an N-step loop would cost.
+
+- **`issues`**: an array of specs (`project`, `summary`, optional `description`
+  in JFM, `issue_type` defaulting to `Task`, and an optional local `alias`).
+  Created in order. May be empty to only link existing issues.
+- **`links`**: an optional array of `{ link_type, inward, outward }`. Each
+  endpoint is resolved **alias-first, then as a literal key**: a string
+  matching an `alias` minted in this batch uses that issue's new key; otherwise
+  it is treated as an existing issue key. (So don't reuse a real key as an
+  alias.) Links are created after all issues.
+- **`fail_fast`** (default `false`): when `false`, every record is attempted
+  (continue-on-error); when `true`, the first failed create or link stops all
+  further calls.
+
+The tool returns a YAML report — `issues[]` (`alias`, `ok`, `key`, `self_url`
+or `error`), `links[]` (`ok` or `error`, including
+`skipped: alias "…" was not created` when an endpoint's create failed), and a
+`summary` (`issues_created`, `issues_failed`, `links_created`, `links_failed`,
+`stopped_early`).
+
+**No rollback.** JIRA has no cross-call transaction, so nothing is undone on
+failure — `fail_fast` only stops issuing *further* calls. The report always
+lists exactly which issues/links succeeded, so a retry can re-send only the
+remainder (referencing already-created issues by their returned keys) without
+creating duplicates.
 
 ### `confirm: true` on destructive tools
 
