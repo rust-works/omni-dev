@@ -10,6 +10,13 @@
       "Bash(target/release/deps/omni_dev:*)",
       "Bash(git diff *)",
       "Bash(ls -la /Users/jky/.claude/plans/ 2>/dev/null | head -5)",
+      "Bash(pdftotext *)",
+      "Bash(cargo test *)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo build *)",
+      "Bash(cargo fmt *)",
+      "Bash(cargo insta *)",
+      "mcp__omni-dev__git_check_commits",
       "Read(//Users/jky/.claude/plans/**)"
     ]
   },
