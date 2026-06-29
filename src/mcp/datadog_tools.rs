@@ -47,7 +47,8 @@ pub struct DatadogAuthStatusParams {}
 /// Parameters for the `datadog_metrics_query` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DatadogMetricsQueryParams {
-    /// Datadog query string (e.g. `avg:system.cpu.user{*}`).
+    /// Datadog metrics query string, e.g. `avg:system.cpu.user{*}` or
+    /// `sum:trace.http.request.hits{service:api}.as_rate()`. Required.
     pub query: String,
     /// Start of the query window. Accepts relative shorthand (`15m`,
     /// `1h`, `7d`), the literal `now`, an RFC 3339 timestamp with
@@ -61,13 +62,17 @@ pub struct DatadogMetricsQueryParams {
 /// Parameters for the `datadog_monitor_list` tool.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct DatadogMonitorListParams {
-    /// Substring match on the monitor name.
+    /// Substring match on the monitor name, e.g. `cpu`. Optional; omit to
+    /// match all names.
     #[serde(default)]
     pub name: Option<String>,
-    /// Comma-separated `key:value` tags applied to the monitor.
+    /// Comma-separated `key:value` tags on the monitored *scope* (the
+    /// `tags` API filter), e.g. `env:prod,team:sre`. Optional.
     #[serde(default)]
     pub tags: Option<String>,
-    /// Comma-separated `key:value` tags applied via `monitor_tags`.
+    /// Comma-separated `key:value` tags on the *monitor object itself* (the
+    /// `monitor_tags` API filter), e.g. `service:api`. Distinct from `tags`
+    /// above. Optional.
     #[serde(default)]
     pub monitor_tags: Option<String>,
     /// Maximum monitors to return. `0` (or omitted) means "fetch every
@@ -79,14 +84,15 @@ pub struct DatadogMonitorListParams {
 /// Parameters for the `datadog_monitor_get` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DatadogMonitorGetParams {
-    /// Datadog monitor identifier.
+    /// Datadog monitor identifier (numeric, e.g. `12345`). Required.
     pub monitor_id: i64,
 }
 
 /// Parameters for the `datadog_monitor_search` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DatadogMonitorSearchParams {
-    /// Free-text / faceted search query (e.g. `status:alert`).
+    /// Free-text / faceted search query, e.g. `status:alert`,
+    /// `type:metric tag:team:sre`. Required.
     pub query: String,
     /// Maximum monitors to return. `0` (or omitted) means "fetch every
     /// match", capped at 10000.
@@ -97,8 +103,8 @@ pub struct DatadogMonitorSearchParams {
 /// Parameters for the `datadog_dashboard_list` tool.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct DatadogDashboardListParams {
-    /// When set, restricts the response to shared (or non-shared)
-    /// dashboards depending on the boolean.
+    /// `true` returns only shared dashboards; `false` returns only
+    /// non-shared ones; omit (the default) to return all. Optional.
     #[serde(default)]
     pub filter_shared: Option<bool>,
 }
@@ -113,11 +119,11 @@ pub struct DatadogDashboardGetParams {
 /// Parameters for the `datadog_metrics_catalog_list` tool.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct DatadogMetricsCatalogListParams {
-    /// Filter by host (e.g. `web-01`).
+    /// Filter by host (e.g. `web-01`). Optional; omit for all hosts.
     #[serde(default)]
     pub host: Option<String>,
-    /// Cutoff in Unix epoch seconds; only metrics ingested since this
-    /// timestamp are returned.
+    /// Cutoff in Unix epoch seconds (e.g. `1700000000`); only metrics
+    /// ingested since this timestamp are returned. Optional.
     #[serde(default)]
     pub from: Option<i64>,
 }
@@ -125,7 +131,9 @@ pub struct DatadogMetricsCatalogListParams {
 /// Parameters for the `datadog_downtime_list` tool.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct DatadogDowntimeListParams {
-    /// When true, restricts results to currently-active downtimes.
+    /// When `true`, restricts results to currently-active downtimes.
+    /// Defaults to `false` (include past and future downtimes too).
+    /// Optional.
     #[serde(default)]
     pub active_only: Option<bool>,
 }
@@ -133,11 +141,11 @@ pub struct DatadogDowntimeListParams {
 /// Parameters for the `datadog_hosts_list` tool.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct DatadogHostsListParams {
-    /// Datadog hosts filter (e.g. `env:prod`).
+    /// Datadog hosts filter (e.g. `env:prod`). Optional; omit for all hosts.
     #[serde(default)]
     pub filter: Option<String>,
-    /// Cutoff in Unix epoch seconds; hosts last reporting before this
-    /// are excluded.
+    /// Cutoff in Unix epoch seconds (e.g. `1700000000`); hosts last
+    /// reporting before this are excluded. Optional.
     #[serde(default)]
     pub from: Option<i64>,
     /// Maximum hosts to return. `0` (or omitted) auto-paginates up to 10000.
@@ -148,16 +156,19 @@ pub struct DatadogHostsListParams {
 /// Parameters for the `datadog_slo_list` tool.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct DatadogSloListParams {
-    /// Comma-separated `key:value` tags applied to the SLO.
+    /// Comma-separated `key:value` tags applied to the SLO, e.g.
+    /// `team:sre,env:prod`. Optional.
     #[serde(default)]
     pub tags: Option<String>,
-    /// Free-text query.
+    /// Free-text query matched against SLO name/description, e.g.
+    /// `checkout latency`. Optional.
     #[serde(default)]
     pub query: Option<String>,
-    /// Comma-separated list of SLO ids.
+    /// Comma-separated list of SLO ids, e.g. `abc123,def456`. Optional.
     #[serde(default)]
     pub ids: Option<String>,
-    /// Comma-separated list of metric names referenced by the SLO.
+    /// Comma-separated list of metric names referenced by the SLO, e.g.
+    /// `aws.elb.healthy_host_count`. Optional.
     #[serde(default)]
     pub metrics_query: Option<String>,
     /// Maximum SLOs to return. `0` (or omitted) means "fetch every match",
@@ -169,26 +180,30 @@ pub struct DatadogSloListParams {
 /// Parameters for the `datadog_slo_get` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DatadogSloGetParams {
-    /// Datadog SLO identifier (string).
+    /// Datadog SLO identifier (string, e.g. `abc123def456`). Required.
     pub slo_id: String,
 }
 
 /// Parameters for the `datadog_events_list` tool.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct DatadogEventsListParams {
-    /// Datadog events query (e.g. `service:api`).
+    /// Datadog events query (e.g. `service:api`). Optional; omit to match
+    /// all events in the window.
     #[serde(default)]
     pub filter: Option<String>,
-    /// Start of the time range. Defaults to `1h`.
+    /// Start of the time range. Accepts relative shorthand (`15m`, `1h`),
+    /// `now`, RFC 3339, or Unix epoch seconds. Defaults to `1h`.
     #[serde(default)]
     pub from: Option<String>,
-    /// End of the time range. Defaults to `now`.
+    /// End of the time range, same formats as `from`. Defaults to `now`.
     #[serde(default)]
     pub to: Option<String>,
-    /// Comma-separated list of source names.
+    /// Comma-separated list of source names, e.g. `github,nagios`.
+    /// Optional.
     #[serde(default)]
     pub sources: Option<String>,
-    /// Comma-separated list of `key:value` tags.
+    /// Comma-separated list of `key:value` tags, e.g. `env:prod,team:sre`.
+    /// Optional.
     #[serde(default)]
     pub tags: Option<String>,
     /// Maximum events to return. `0` means "fetch every match across
@@ -201,7 +216,8 @@ pub struct DatadogEventsListParams {
 /// Parameters for the `datadog_logs_search` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DatadogLogsSearchParams {
-    /// Datadog logs query (e.g. `service:api status:error`).
+    /// Datadog logs query, e.g. `service:api status:error`. Required; use
+    /// `*` to match all logs.
     pub filter: String,
     /// Start of the time range. Accepts relative shorthand (`15m`,
     /// `1h`), `now`, RFC 3339, or Unix epoch seconds. Defaults to
@@ -234,7 +250,10 @@ impl OmniDevServer {
         description = "Report which Datadog credential scopes have credentials configured. \
                        Returns boolean presence flags only — NEVER includes the API key, \
                        application key, or any other secret. The site (non-secret) is \
-                       returned verbatim. Read-only. Output is YAML."
+                       returned verbatim. Read-only; takes no parameters. Unlike the CLI \
+                       `omni-dev datadog auth status`, this tool only inspects local config \
+                       presence and does NOT call Datadog's `/api/v1/validate` endpoint, so \
+                       it cannot confirm the keys are actually accepted. Output is YAML."
     )]
     pub async fn datadog_auth_status(
         &self,
@@ -246,7 +265,10 @@ impl OmniDevServer {
 
     /// Tool: execute a point-in-time Datadog metrics timeseries query.
     #[tool(
-        description = "Execute a point-in-time Datadog metrics timeseries query. \
+        description = "Execute a point-in-time Datadog metrics timeseries query \
+                       (e.g. `avg:system.cpu.user{*}` over the last `1h`). Returns the actual \
+                       data points; use `datadog_metrics_catalog_list` instead when you only \
+                       need to discover metric *names*. Read-only. \
                        Mirrors `omni-dev datadog metrics query`. Returns YAML matching \
                        the CLI `-o yaml` output (status, from_date, to_date, series)."
     )]
@@ -260,8 +282,12 @@ impl OmniDevServer {
 
     /// Tool: list Datadog monitors with optional filters.
     #[tool(
-        description = "List Datadog monitors with optional name / tags filters. \
-                       `limit` of 0 (or omitted) auto-paginates up to 10000. \
+        description = "List Datadog monitors with optional name / tags filters \
+                       (e.g. `name = \"cpu\"`, `tags = \"team:sre\"`). Returns full monitor \
+                       objects. Use `datadog_monitor_search` for free-text / faceted queries \
+                       like `status:alert`; use `datadog_monitor_get` when you already know \
+                       the numeric monitor id. `limit` of 0 (or omitted) auto-paginates up to \
+                       10000. Read-only. \
                        Mirrors `omni-dev datadog monitor list`. Output is YAML."
     )]
     pub async fn datadog_monitor_list(
@@ -273,8 +299,12 @@ impl OmniDevServer {
     }
 
     /// Tool: fetch a single Datadog monitor by id.
-    #[tool(description = "Fetch a single Datadog monitor by numeric id. \
-                       Mirrors `omni-dev datadog monitor get`. Output is YAML.")]
+    #[tool(
+        description = "Fetch a single Datadog monitor by numeric id (e.g. `12345`). \
+                       Use `datadog_monitor_list` / `datadog_monitor_search` to discover ids \
+                       first. Read-only. \
+                       Mirrors `omni-dev datadog monitor get`. Output is YAML."
+    )]
     pub async fn datadog_monitor_get(
         &self,
         Parameters(params): Parameters<DatadogMonitorGetParams>,
@@ -286,8 +316,12 @@ impl OmniDevServer {
     }
 
     /// Tool: free-text / faceted search across Datadog monitors.
-    #[tool(description = "Free-text / faceted search across Datadog monitors. \
-                       `limit` of 0 (or omitted) auto-paginates up to 10000. \
+    #[tool(description = "Free-text / faceted search across Datadog monitors \
+                       (e.g. `status:alert`, `type:metric tag:team:sre`). Prefer this over \
+                       `datadog_monitor_list` when filtering by status/facets rather than just \
+                       name/tags; the response is a search envelope (monitors + paging \
+                       metadata) rather than a plain array. `limit` of 0 (or omitted) \
+                       auto-paginates up to 10000. Read-only. \
                        Mirrors `omni-dev datadog monitor search`. Output is YAML.")]
     pub async fn datadog_monitor_search(
         &self,
@@ -299,8 +333,10 @@ impl OmniDevServer {
 
     /// Tool: list Datadog dashboards.
     #[tool(
-        description = "List Datadog dashboards. `filter_shared` (boolean, optional) \
-                       restricts to shared / non-shared dashboards. \
+        description = "List Datadog dashboards (id, title, author). `filter_shared` (boolean, \
+                       optional) restricts to shared (`true`) or non-shared (`false`) \
+                       dashboards; omit it for all. Use `datadog_dashboard_get` to fetch one \
+                       dashboard's full widget definition by id. Read-only. \
                        Mirrors `omni-dev datadog dashboard list`. Output is YAML."
     )]
     pub async fn datadog_dashboard_list(
@@ -312,9 +348,12 @@ impl OmniDevServer {
     }
 
     /// Tool: fetch a single Datadog dashboard definition by id.
-    #[tool(description = "Fetch a single Datadog dashboard by id (string). \
-                       Returns the full definition including widgets. \
-                       Mirrors `omni-dev datadog dashboard get`. Output is YAML.")]
+    #[tool(
+        description = "Fetch a single Datadog dashboard by id (string, e.g. `abc-def-ghi`). \
+                       Returns the full definition including widgets. Use \
+                       `datadog_dashboard_list` to discover ids first. Read-only. \
+                       Mirrors `omni-dev datadog dashboard get`. Output is YAML."
+    )]
     pub async fn datadog_dashboard_get(
         &self,
         Parameters(params): Parameters<DatadogDashboardGetParams>,
@@ -326,12 +365,14 @@ impl OmniDevServer {
     }
 
     /// Tool: search Datadog log events.
-    #[tool(
-        description = "Search Datadog log events. `limit` of 0 (or omitted) auto-paginates \
+    #[tool(description = "Search Datadog log events with a logs query (e.g. \
+                       `service:api status:error`) over a time range (default last `15m`). \
+                       For the event/alert stream rather than logs, use \
+                       `datadog_events_list`. `limit` of 0 (or omitted) auto-paginates \
                        across cursor pages up to 10000; any non-zero value caps the total at \
-                       that count. `sort` is `timestamp-asc` or `timestamp-desc` (default). \
-                       Mirrors `omni-dev datadog logs search`. Output is YAML."
-    )]
+                       that count (default 100). `sort` is `timestamp-asc` or `timestamp-desc` \
+                       (default). Read-only. \
+                       Mirrors `omni-dev datadog logs search`. Output is YAML.")]
     pub async fn datadog_logs_search(
         &self,
         Parameters(params): Parameters<DatadogLogsSearchParams>,
@@ -342,11 +383,14 @@ impl OmniDevServer {
 
     /// Tool: list Datadog events.
     #[tool(
-        description = "List Datadog events. `limit` of 0 (or omitted) auto-paginates across \
-                       cursor pages up to 10000; any non-zero value caps the total at that \
-                       count. `from` / `to` accept relative shorthand (`15m`, `1h`), `now`, \
-                       RFC 3339, or Unix epoch seconds. Mirrors \
-                       `omni-dev datadog events list`. Output is YAML."
+        description = "List Datadog events from the event/alert stream (e.g. deploys, \
+                       monitor alerts), optionally filtered (e.g. `service:api`) over a time \
+                       range (default last `1h`). For application log lines use \
+                       `datadog_logs_search` instead. `limit` of 0 (or omitted) auto-paginates \
+                       across cursor pages up to 10000; any non-zero value caps the total at \
+                       that count (default 100). `from` / `to` accept relative shorthand \
+                       (`15m`, `1h`), `now`, RFC 3339, or Unix epoch seconds. Read-only. \
+                       Mirrors `omni-dev datadog events list`. Output is YAML."
     )]
     pub async fn datadog_events_list(
         &self,
@@ -358,9 +402,11 @@ impl OmniDevServer {
 
     /// Tool: list Datadog SLOs.
     #[tool(
-        description = "List Datadog Service Level Objectives. `limit` of 0 (or omitted) \
-                       auto-paginates up to 10000. Mirrors `omni-dev datadog slo list`. \
-                       Output is YAML."
+        description = "List Datadog Service Level Objectives, optionally filtered by tags, \
+                       free-text `query`, explicit `ids`, or referenced `metrics_query`. Use \
+                       `datadog_slo_get` to fetch one SLO's full definition by id. `limit` of \
+                       0 (or omitted) auto-paginates up to 10000. Read-only. \
+                       Mirrors `omni-dev datadog slo list`. Output is YAML."
     )]
     pub async fn datadog_slo_list(
         &self,
@@ -371,8 +417,11 @@ impl OmniDevServer {
     }
 
     /// Tool: fetch a single SLO by id.
-    #[tool(description = "Fetch a single Datadog SLO by id (string). \
-                       Mirrors `omni-dev datadog slo get`. Output is YAML.")]
+    #[tool(
+        description = "Fetch a single Datadog SLO by id (string, e.g. `abc123def456`). \
+                       Use `datadog_slo_list` to discover ids first. Read-only. \
+                       Mirrors `omni-dev datadog slo get`. Output is YAML."
+    )]
     pub async fn datadog_slo_get(
         &self,
         Parameters(params): Parameters<DatadogSloGetParams>,
@@ -383,9 +432,10 @@ impl OmniDevServer {
 
     /// Tool: list Datadog reporting hosts.
     #[tool(
-        description = "List Datadog reporting hosts. `limit` of 0 (or omitted) \
-                       auto-paginates up to 10000. Mirrors `omni-dev datadog hosts list`. \
-                       Output is YAML."
+        description = "List Datadog reporting hosts, optionally narrowed by a hosts `filter` \
+                       (e.g. `env:prod`) and a `from` cutoff (Unix epoch seconds). `limit` of \
+                       0 (or omitted) auto-paginates up to 10000. Read-only. \
+                       Mirrors `omni-dev datadog hosts list`. Output is YAML."
     )]
     pub async fn datadog_hosts_list(
         &self,
@@ -397,9 +447,11 @@ impl OmniDevServer {
 
     /// Tool: list Datadog scheduled downtimes.
     #[tool(
-        description = "List Datadog scheduled downtimes. `active_only` (boolean, optional) \
-                       restricts to currently-active downtimes. Mirrors \
-                       `omni-dev datadog downtime list`. Output is YAML."
+        description = "List Datadog scheduled downtimes (monitor muting windows). \
+                       `active_only` (boolean, optional, default `false`) restricts to \
+                       currently-active downtimes; omit or set `false` to include past and \
+                       future ones. Read-only. \
+                       Mirrors `omni-dev datadog downtime list`. Output is YAML."
     )]
     pub async fn datadog_downtime_list(
         &self,
@@ -412,9 +464,11 @@ impl OmniDevServer {
     /// Tool: list metrics in the Datadog catalog.
     #[tool(
         description = "List metrics in the Datadog catalog (`/api/v1/metrics`). Distinct \
-                       from `datadog_metrics_query`: returns metric *names* ingested since \
-                       `from`, optionally filtered by `host`. Mirrors \
-                       `omni-dev datadog metrics catalog list`. Output is YAML."
+                       from `datadog_metrics_query`: returns metric *names* (e.g. \
+                       `system.cpu.user`) ingested since `from`, optionally filtered by \
+                       `host` — use this to discover what to query, then \
+                       `datadog_metrics_query` to fetch the actual timeseries. Read-only. \
+                       Mirrors `omni-dev datadog metrics catalog list`. Output is YAML."
     )]
     pub async fn datadog_metrics_catalog_list(
         &self,

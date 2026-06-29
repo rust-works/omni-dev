@@ -23,9 +23,13 @@ pub struct AtlassianAuthStatusParams {}
 impl OmniDevServer {
     /// Returns the embedded `models.yaml` describing every AI model the CLI knows about.
     #[tool(
-        description = "Return the embedded `models.yaml` listing every AI model the CLI knows \
-                       about (identifiers, token budgets, provider). Output is YAML. Mirrors \
-                       `omni-dev config models show`."
+        description = "Return the embedded `models.yaml` listing every supported AI model the CLI \
+                       knows about, with each model's identifier, token limits (input context and \
+                       max output tokens), and provider. Use this to discover the valid `model` \
+                       values accepted by `ai_chat` and the git tools. Takes no arguments. \
+                       Read-only. Output is YAML. Mirrors `omni-dev config models show \
+                       --embedded-only` (the plain `show` additionally merges user/project \
+                       overrides; this tool returns the embedded catalog only)."
     )]
     pub async fn config_models_show(
         &self,
@@ -42,7 +46,10 @@ impl OmniDevServer {
         description = "Report which Atlassian credential scopes have credentials configured. \
                        Returns boolean presence flags only — NEVER includes the email, API \
                        token, or any other secret. The instance URL (non-secret) is returned \
-                       verbatim. Read-only. Output is YAML."
+                       verbatim. Checks local configuration only; it does NOT call the Atlassian \
+                       API to validate the credentials (unlike `omni-dev atlassian auth status`, \
+                       which signs in and prints the authenticated user). Takes no arguments. \
+                       Read-only. Output is YAML."
     )]
     pub async fn atlassian_auth_status(
         &self,
