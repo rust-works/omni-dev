@@ -10,8 +10,9 @@ use crate::daemon::server;
 
 /// Stops the running daemon, gracefully draining its services.
 ///
-/// On macOS it also boots out the launchd agent so the daemon stays stopped
-/// rather than auto-restarting at the next login.
+/// On macOS it also boots out the launchd agent — removing the demand socket — so
+/// the daemon stays stopped rather than being re-activated on the next client
+/// connect or at the next login. Re-run `daemon start` to re-enable it.
 #[derive(Parser)]
 pub struct StopCommand {
     /// Control-socket path. Defaults to the per-user runtime location.

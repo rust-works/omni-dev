@@ -11,6 +11,11 @@ use crate::daemon::protocol::StatusReport;
 use crate::daemon::server;
 
 /// Reports whether the daemon is running and the status of each hosted service.
+///
+/// Under launchd socket activation, "running" means a daemon process is currently
+/// spawned. The agent demand-spawns the daemon on the next client connect, so
+/// "not running" means "no process is resident right now", not "unavailable" —
+/// unless the agent was booted out via `daemon stop`.
 #[derive(Parser)]
 pub struct StatusCommand {
     /// Control-socket path. Defaults to the per-user runtime location.
