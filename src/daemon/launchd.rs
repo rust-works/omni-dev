@@ -4,7 +4,11 @@
 //! execs `omni-dev daemon run`. `KeepAlive` is set to restart only on
 //! *abnormal* exit (`SuccessfulExit = false`), so a clean `daemon stop` (which
 //! drives the daemon to a zero exit) stays down rather than being respawned.
-//! `RunAtLoad` makes it start at login. See ADR-0039.
+//! `RunAtLoad` covers the start-at-login case, but it is best-effort and launchd
+//! can silently downgrade it to on-demand activation, so `start` does not rely on
+//! it to spawn the process *now*: after bootstrapping it issues an explicit
+//! `launchctl kickstart -p` (idempotent) to make the immediate start
+//! deterministic. See ADR-0039 and issue #1078.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -81,6 +85,12 @@ fn gui_domain() -> String {
     format!("gui/{}", nix::unistd::getuid())
 }
 
+/// The fully-qualified launchd service target (`<domain>/<label>`) passed to
+/// `launchctl print` / `bootout` / `kickstart`.
+fn service_target(domain: &str) -> String {
+    format!("{domain}/{LAUNCHD_LABEL}")
+}
+
 /// Writes the plist and bootstraps the agent so the daemon runs now and at
 /// login.
 pub fn install_and_load(socket: &Path) -> Result<()> {
@@ -117,6 +127,10 @@ pub fn install_and_load(socket: &Path) -> Result<()> {
             .output()
             .context("failed to run `launchctl bootstrap`")?;
         if output.status.success() {
+            // Don't trust `RunAtLoad` to have spawned the process: launchd can
+            // silently downgrade it, parking the job at `state = not running`
+            // until the readiness poll times out. Force the spawn now. See #1078.
+            kickstart(&domain);
             return Ok(());
         }
         last_err = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -130,7 +144,7 @@ pub fn install_and_load(socket: &Path) -> Result<()> {
 /// This closes the window opened by the asynchronous `launchctl bootout`: a
 /// `bootstrap` issued while the prior job is still tearing down fails with EIO.
 fn wait_until_unloaded(domain: &str) {
-    let target = format!("{domain}/{LAUNCHD_LABEL}");
+    let target = service_target(domain);
     for _ in 0..50 {
         let still_loaded = Command::new("launchctl")
             .args(["print", &target])
@@ -160,12 +174,43 @@ pub fn unload() -> Result<()> {
 /// than discarded — otherwise `stop`/`restart` would claim to have disabled
 /// auto-start when they had not. See issue #996.
 fn bootout(domain: &str) {
-    let target = format!("{domain}/{LAUNCHD_LABEL}");
+    let target = service_target(domain);
     if let Err(e) = Command::new("launchctl")
         .args(["bootout", &target])
         .output()
     {
         tracing::warn!("failed to run `launchctl bootout {target}`: {e}");
+    }
+}
+
+/// Forces launchd to spawn the agent now via `launchctl kickstart -p
+/// <domain>/<label>`.
+///
+/// `RunAtLoad` is best-effort: launchd can silently downgrade it to on-demand
+/// activation, leaving a freshly-bootstrapped job parked at `state = not running`
+/// indefinitely so the readiness poll times out (issue #1078). `kickstart`
+/// removes that dependency. `-p` is idempotent — it returns the existing pid if
+/// the job already spawned (the happy path where `RunAtLoad` did fire), so this
+/// is a safe no-op there.
+///
+/// Best-effort, like `bootout`: the socket-ping readiness poll in
+/// `cli/daemon/control.rs` is the authoritative gate on whether the daemon came
+/// up, so a kickstart hiccup is logged rather than turned into a hard error.
+fn kickstart(domain: &str) {
+    let target = service_target(domain);
+    match Command::new("launchctl")
+        .args(["kickstart", "-p", &target])
+        .output()
+    {
+        Ok(out) if !out.status.success() => {
+            tracing::warn!(
+                "`launchctl kickstart -p {target}` exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("failed to run `launchctl kickstart -p {target}`: {e}"),
     }
 }
 
@@ -232,6 +277,16 @@ mod tests {
             "{plist}"
         );
         assert_well_formed(&plist);
+    }
+
+    #[test]
+    fn service_target_joins_domain_and_label() {
+        // The launchctl service target is `<domain>/<label>` — the form passed to
+        // `print` / `bootout` / `kickstart`.
+        assert_eq!(
+            service_target("gui/501"),
+            format!("gui/501/{LAUNCHD_LABEL}")
+        );
     }
 
     #[test]
