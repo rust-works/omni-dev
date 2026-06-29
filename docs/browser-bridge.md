@@ -87,11 +87,11 @@ use is invisible to the `request` / `harvest` thin clients.
 
 | Command | What it does |
 |---|---|
-| `omni-dev daemon run` | **Becomes** the daemon in the foreground: binds the control socket (which doubles as the single-instance lock), starts the bridge on its planes, and blocks until `SIGTERM`/`SIGINT` or `daemon stop`. This is what a launcher execs. |
-| `omni-dev daemon start` | Launches the daemon in the background and returns once it is ready. On macOS it installs + loads a launchd LaunchAgent (auto-starts at login); elsewhere it spawns `daemon run` detached. |
-| `omni-dev daemon stop` | Stops the daemon (and, on macOS, unloads the LaunchAgent so it does not auto-restart). |
-| `omni-dev daemon restart` | `stop` then `start`. |
-| `omni-dev daemon status` | Reports the daemon and each hosted service (`--json` for machines). |
+| `omni-dev daemon run` | **Becomes** the daemon in the foreground: acquires the control socket (the launchd-activated fd when socket-activated, otherwise a self-bound socket that doubles as the single-instance lock), starts the bridge on its planes, and blocks until `SIGTERM`/`SIGINT` or `daemon stop`. This is what launchd demand-spawns (or a launcher execs). |
+| `omni-dev daemon start` | Installs the daemon in the background and returns once it is ready. On macOS it bootstraps a launchd LaunchAgent that **owns** the control socket and spawns the daemon on the first client connect (so it also activates at login); `start` warms it with one ping. Elsewhere it spawns `daemon run` detached. You normally run this once — after that any CLI call re-activates the daemon on demand. |
+| `omni-dev daemon stop` | Stops the daemon and, on macOS, boots out the LaunchAgent — removing the demand socket — so it is not re-activated until the next `daemon start` or login. |
+| `omni-dev daemon restart` | `stop` then `start`. On macOS, the only step needed after upgrading from an older `RunAtLoad` daemon to pick up the socket-activated agent. |
+| `omni-dev daemon status` | Reports the daemon and each hosted service (`--json` for machines). Under socket activation, "running" means a process is currently spawned; "not running" means none is resident right now, not that the daemon is unavailable (it re-activates on the next connect) — unless it was `stop`ped. |
 
 `daemon run` accepts the bridge's port/scope flags as `--bridge-ws-port`,
 `--bridge-control-port`, `--bridge-allow-origin`, and `--bridge-token-file`

@@ -1,20 +1,27 @@
-//! macOS launchd integration for `omni-dev daemon start` / `stop`.
+//! macOS launchd integration for `omni-dev daemon start` / `stop` and socket
+//! activation.
 //!
-//! `start` writes a per-user LaunchAgent plist and bootstraps it; the agent
-//! execs `omni-dev daemon run`. `KeepAlive` is set to restart only on
-//! *abnormal* exit (`SuccessfulExit = false`), so a clean `daemon stop` (which
-//! drives the daemon to a zero exit) stays down rather than being respawned.
-//! `RunAtLoad` covers the start-at-login case, but it is best-effort and launchd
-//! can silently downgrade it to on-demand activation, so `start` does not rely on
-//! it to spawn the process *now*: after bootstrapping it issues an explicit
-//! `launchctl kickstart -p` (idempotent) to make the immediate start
-//! deterministic. See ADR-0039 and issue #1078.
+//! `start` writes a per-user LaunchAgent plist and bootstraps it. The agent is
+//! **socket-activated**: launchd owns the control socket (declared in the plist's
+//! `Sockets` dict) and spawns `omni-dev daemon run` the first time a client
+//! connects, handing it the listening file descriptor via `launchd_listener`.
+//! There is no `RunAtLoad`/`KeepAlive` — on-demand activation *is* the model, so
+//! the parking bug `RunAtLoad` suffered in on-demand-only GUI sessions (the
+//! `launchctl kickstart` workaround from #1078) cannot occur, and a crashed
+//! daemon is re-activated on the next connect for free. A clean `daemon stop`
+//! boots the agent out, removing the demand socket so the daemon stays down. See
+//! ADR-0039 and issues #1078 / #1081.
 
+use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use tokio::net::UnixListener;
+
+use super::paths;
 
 /// Reverse-DNS LaunchAgent label, derived from the project repository
 /// (`github.com/rust-works/omni-dev`).
@@ -30,7 +37,18 @@ pub fn plist_path() -> Result<PathBuf> {
         .join(format!("{LAUNCHD_LABEL}.plist")))
 }
 
-/// Renders a LaunchAgent plist that execs `omni-dev daemon run --socket <socket>`.
+/// Renders a socket-activated LaunchAgent plist that execs
+/// `omni-dev daemon run --socket <socket>`.
+///
+/// The `Sockets` → `Listener` dict makes launchd create and own the control
+/// socket and demand-spawn the daemon on first connect; the daemon adopts the
+/// inherited fd via [`launchd_listener`]. The socket path appears twice — as
+/// launchd's `SockPathName` and on the daemon's own `--socket` argument — kept in
+/// lock-step so the daemon resolves the same path for its co-located bridge token
+/// file even though it binds the inherited fd rather than `SockPathName` itself.
+/// `SockPathMode` `384` is decimal `0o600`: launchd creates the socket inode
+/// owner-private from birth, the privacy `bind_private` enforced via umask on the
+/// self-bound fallback path.
 ///
 /// Paths are XML-escaped before interpolation: `&`, `<`, `>` are all legal in
 /// filenames (a home or `--socket` dir named `A&B`), and unescaped they would
@@ -60,12 +78,19 @@ fn render_plist(exe: &Path, socket: &Path) -> Result<String> {
         <string>--socket</string>
         <string>{socket}</string>
     </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
+    <key>Sockets</key>
     <dict>
-        <key>SuccessfulExit</key>
-        <false/>
+        <key>Listener</key>
+        <dict>
+            <key>SockPathName</key>
+            <string>{socket}</string>
+            <key>SockPathMode</key>
+            <integer>384</integer>
+            <key>SockFamily</key>
+            <string>Unix</string>
+            <key>SockType</key>
+            <string>stream</string>
+        </dict>
     </dict>
     <key>ProcessType</key>
     <string>Interactive</string>
@@ -86,13 +111,13 @@ fn gui_domain() -> String {
 }
 
 /// The fully-qualified launchd service target (`<domain>/<label>`) passed to
-/// `launchctl print` / `bootout` / `kickstart`.
+/// `launchctl print` / `bootout`.
 fn service_target(domain: &str) -> String {
     format!("{domain}/{LAUNCHD_LABEL}")
 }
 
-/// Writes the plist and bootstraps the agent so the daemon runs now and at
-/// login.
+/// Writes the plist and bootstraps the agent so launchd listens on the demand
+/// socket and spawns the daemon on the first client connect (and at login).
 pub fn install_and_load(socket: &Path) -> Result<()> {
     let exe = std::env::current_exe().context("could not resolve the current executable")?;
     let plist = plist_path()?;
@@ -102,6 +127,14 @@ pub fn install_and_load(socket: &Path) -> Result<()> {
     }
     std::fs::write(&plist, render_plist(&exe, socket)?)
         .with_context(|| format!("failed to write {}", plist.display()))?;
+
+    // launchd creates the demand socket at `SockPathName` when it bootstraps the
+    // job — *before* our process runs — and does not create missing parent
+    // directories. Ensure the owner-only (`0700`) runtime directory exists now so
+    // that socket creation succeeds. See #1081.
+    if let Some(parent) = socket.parent() {
+        paths::ensure_dir_0700(parent)?;
+    }
 
     let domain = gui_domain();
     // Bootout any prior instance first so bootstrap does not fail as already loaded.
@@ -127,10 +160,9 @@ pub fn install_and_load(socket: &Path) -> Result<()> {
             .output()
             .context("failed to run `launchctl bootstrap`")?;
         if output.status.success() {
-            // Don't trust `RunAtLoad` to have spawned the process: launchd can
-            // silently downgrade it, parking the job at `state = not running`
-            // until the readiness poll times out. Force the spawn now. See #1078.
-            kickstart(&domain);
+            // launchd now owns the demand socket and spawns the daemon on the
+            // first client connect (`start`'s readiness ping triggers it). No
+            // `kickstart` is needed — there is no `RunAtLoad` to fail. See #1081.
             return Ok(());
         }
         last_err = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -183,35 +215,73 @@ fn bootout(domain: &str) {
     }
 }
 
-/// Forces launchd to spawn the agent now via `launchctl kickstart -p
-/// <domain>/<label>`.
+/// Adopts the listening socket launchd created for us when the daemon was
+/// **socket-activated** (the plist's `Sockets` → `<name>` entry, `name =
+/// "Listener"`).
 ///
-/// `RunAtLoad` is best-effort: launchd can silently downgrade it to on-demand
-/// activation, leaving a freshly-bootstrapped job parked at `state = not running`
-/// indefinitely so the readiness poll times out (issue #1078). `kickstart`
-/// removes that dependency. `-p` is idempotent — it returns the existing pid if
-/// the job already spawned (the happy path where `RunAtLoad` did fire), so this
-/// is a safe no-op there.
+/// Returns `Ok(None)` when the process was *not* launched by launchd with that
+/// activation socket — the manual / dev / CI case (`omni-dev daemon run` from a
+/// shell), where the caller falls back to binding the socket itself
+/// ([`single_instance::bind_or_reclaim`](super::single_instance::bind_or_reclaim)).
 ///
-/// Best-effort, like `bootout`: the socket-ping readiness poll in
-/// `cli/daemon/control.rs` is the authoritative gate on whether the daemon came
-/// up, so a kickstart hiccup is logged rather than turned into a hard error.
-fn kickstart(domain: &str) {
-    let target = service_target(domain);
-    match Command::new("launchctl")
-        .args(["kickstart", "-p", &target])
-        .output()
-    {
-        Ok(out) if !out.status.success() => {
-            tracing::warn!(
-                "`launchctl kickstart -p {target}` exited {}: {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        Ok(_) => {}
-        Err(e) => tracing::warn!("failed to run `launchctl kickstart -p {target}`: {e}"),
+/// launchd hands us a `malloc`-ed array of inherited fds; we take ownership of
+/// the first (the plist declares exactly one), set it non-blocking, adopt it as a
+/// Tokio listener, and free the array. The symbol lives in libSystem, so no
+/// `#[link]` attribute is required.
+#[allow(unsafe_code)]
+pub(crate) fn launchd_listener(name: &str) -> Result<Option<UnixListener>> {
+    use nix::libc::{self, c_char, c_int, size_t};
+
+    extern "C" {
+        fn launch_activate_socket(
+            name: *const c_char,
+            fds: *mut *mut RawFd,
+            cnt: *mut size_t,
+        ) -> c_int;
     }
+
+    let c_name = std::ffi::CString::new(name).context("launchd socket name had an interior NUL")?;
+    let mut fds: *mut RawFd = std::ptr::null_mut();
+    let mut cnt: size_t = 0;
+
+    // SAFETY: we pass a valid C string and two valid out-pointers.
+    // `launch_activate_socket` either writes a freshly `malloc`-ed array of `cnt`
+    // ints into `*fds` and returns 0, or returns a non-zero errno and allocates
+    // nothing. We never read past `cnt` and free the array exactly once below.
+    let rc = unsafe { launch_activate_socket(c_name.as_ptr(), &mut fds, &mut cnt) };
+    if rc != 0 {
+        // ENOENT/ESRCH ⇒ no activation socket under this name (not launchd-spawned,
+        // or the name does not match the plist): fall back to a self-bound socket.
+        // Other errno values are equally non-fatal here. Nothing was allocated.
+        tracing::debug!("launch_activate_socket({name}) returned {rc}; not socket-activated");
+        return Ok(None);
+    }
+
+    // Defensive: a success with no descriptors. Free any allocation and fall back.
+    if fds.is_null() || cnt == 0 {
+        if !fds.is_null() {
+            // SAFETY: non-null `fds` is the array launchd allocated; free it once.
+            unsafe { libc::free(fds.cast()) };
+        }
+        return Ok(None);
+    }
+
+    // SAFETY: on success `fds` points at `cnt >= 1` ints; read the first, then
+    // free the array exactly once. The fd stays valid after the array is freed.
+    let raw = unsafe { *fds };
+    unsafe { libc::free(fds.cast()) };
+
+    // SAFETY: `raw` is a listening Unix-domain socket fd handed off by launchd and
+    // now owned solely by us; adopting it into a std listener transfers ownership
+    // (closed on drop). It is converted to a Tokio listener after being set
+    // non-blocking, as the runtime requires.
+    let std_listener = unsafe { StdUnixListener::from_raw_fd(raw) };
+    std_listener
+        .set_nonblocking(true)
+        .context("failed to set the launchd socket non-blocking")?;
+    let listener = UnixListener::from_std(std_listener)
+        .context("failed to adopt the launchd socket into the Tokio runtime")?;
+    Ok(Some(listener))
 }
 
 #[cfg(test)]
@@ -280,9 +350,56 @@ mod tests {
     }
 
     #[test]
+    fn renders_a_socket_activated_agent() {
+        let plist = render_plist(
+            Path::new("/usr/local/bin/omni-dev"),
+            Path::new("/tmp/omni-dev/daemon.sock"),
+        )
+        .expect("ASCII paths render");
+
+        // launchd owns a demand-activating `Listener` socket at the socket path,
+        // created `0o600` (decimal 384) as a Unix stream.
+        assert!(plist.contains("<key>Sockets</key>"), "{plist}");
+        assert!(plist.contains("<key>Listener</key>"), "{plist}");
+        assert!(
+            plist.contains(
+                "<key>SockPathName</key>\n            <string>/tmp/omni-dev/daemon.sock</string>"
+            ),
+            "{plist}"
+        );
+        assert!(
+            plist.contains("<key>SockPathMode</key>\n            <integer>384</integer>"),
+            "{plist}"
+        );
+        assert!(plist.contains("<string>Unix</string>"), "{plist}");
+        assert!(plist.contains("<string>stream</string>"), "{plist}");
+
+        // The pre-#1081 run-at-load model is gone: there is nothing for launchd to
+        // park, and a clean stop (bootout) is what keeps the daemon down.
+        assert!(!plist.contains("RunAtLoad"), "{plist}");
+        assert!(!plist.contains("KeepAlive"), "{plist}");
+
+        assert_well_formed(&plist);
+    }
+
+    /// Run outside launchd (the unit-test binary is not socket-activated), so the
+    /// activation lookup must report "no inherited socket" rather than error,
+    /// letting the daemon fall back to self-binding. This exercises the real FFI;
+    /// it returns `Ok(None)` before touching the Tokio reactor, so no runtime is
+    /// needed here.
+    #[test]
+    fn launchd_listener_is_none_when_not_activated() {
+        let result = launchd_listener("Listener");
+        assert!(
+            matches!(result, Ok(None)),
+            "expected Ok(None) outside launchd, got {result:?}"
+        );
+    }
+
+    #[test]
     fn service_target_joins_domain_and_label() {
         // The launchctl service target is `<domain>/<label>` — the form passed to
-        // `print` / `bootout` / `kickstart`.
+        // `print` / `bootout`.
         assert_eq!(
             service_target("gui/501"),
             format!("gui/501/{LAUNCHD_LABEL}")
