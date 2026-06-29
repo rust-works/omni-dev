@@ -14,12 +14,17 @@ use crate::cli::ai::{self, SkillsFormat};
 /// Parameters for `ai_chat`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct AiChatParams {
-    /// User message to send to the AI.
+    /// User message to send to the AI, e.g. `"Summarise this diff in one
+    /// sentence."`. Sent as a single turn; there is no conversation history.
     pub message: String,
-    /// Optional model identifier (e.g., `claude-sonnet-4-6`).
+    /// Optional model identifier (e.g., `claude-sonnet-4-6`). When omitted,
+    /// the backend's environment-configured default model is used; call
+    /// `config_models_show` to see the identifiers the CLI recognises.
     #[serde(default)]
     pub model: Option<String>,
     /// Optional system prompt; defaults to `"You are a helpful assistant."`.
+    /// MCP-only: the interactive `omni-dev ai chat` CLI has no equivalent flag,
+    /// so this override is reachable only through the tool.
     #[serde(default)]
     pub system_prompt: Option<String>,
 }
@@ -72,9 +77,12 @@ impl OmniDevServer {
     /// Single-turn AI chat. Returns the assistant's response as text.
     #[tool(
         description = "Send a single message to the configured AI (Claude/OpenAI/Ollama/Bedrock) \
-                       and return its response. Non-streaming, single-turn. On missing credentials, \
-                       returns a tool error containing the same diagnostic the CLI would print. \
-                       Mirrors `omni-dev ai chat` in one-shot form."
+                       and return its response. Non-streaming, single-turn. Optionally override the \
+                       model (`model`) and the system prompt (`system_prompt`). On missing \
+                       credentials, returns a tool error containing the same diagnostic the CLI \
+                       would print. Mirrors `omni-dev ai chat` in one-shot form — that CLI command \
+                       is interactive and has no `system_prompt` flag, so this tool is the only way \
+                       to set a custom system prompt."
     )]
     pub async fn ai_chat(
         &self,
@@ -90,9 +98,12 @@ impl OmniDevServer {
     #[tool(
         description = "Sync Claude Code skills from the current repository (the MCP server's \
                        current working directory) into target worktrees. MUTATES THE FILESYSTEM: \
-                       creates symlinks inside `.claude/skills/` and upserts a managed block in \
-                       `.git/info/exclude`. Operates relative to the server process's cwd — not \
-                       cross-project. Mirrors `omni-dev ai claude skills sync`."
+                       creates symlinks inside `.claude/skills/` (e.g. \
+                       `.claude/skills/my-skill -> ../../../.claude/skills/my-skill`) and upserts a \
+                       managed block in `.git/info/exclude`. Operates relative to the server \
+                       process's cwd — not cross-project. Use `claude_skills_clean` to reverse this \
+                       and `claude_skills_status` to inspect the result without changing anything. \
+                       Mirrors `omni-dev ai claude skills sync`."
     )]
     pub async fn claude_skills_sync(
         &self,
@@ -109,9 +120,12 @@ impl OmniDevServer {
 
     /// Cleans Claude skill residue (symlinks and managed exclude block).
     #[tool(
-        description = "Remove skill symlinks and the managed exclude block created by a prior \
-                       `claude_skills_sync`. MUTATES THE FILESYSTEM. Operates relative to the \
-                       server process's cwd. Mirrors `omni-dev ai claude skills clean`."
+        description = "Remove the skill symlinks under `.claude/skills/` and the managed exclude \
+                       block created by a prior `claude_skills_sync` — the inverse of that tool. \
+                       MUTATES THE FILESYSTEM. Real files (non-symlinks) are preserved, never \
+                       deleted. Operates relative to the server process's cwd. Use \
+                       `claude_skills_status` first if you want to see what would be removed. \
+                       Mirrors `omni-dev ai claude skills clean`."
     )]
     pub async fn claude_skills_clean(
         &self,
@@ -128,9 +142,11 @@ impl OmniDevServer {
 
     /// Reports Claude skill residue (symlinks and managed exclude block) — read-only.
     #[tool(
-        description = "Report symlinks and managed exclude-block entries left by prior \
-                       `claude_skills_sync` runs. Read-only. Operates relative to the server \
-                       process's cwd. Mirrors `omni-dev ai claude skills status`."
+        description = "Report the skill symlinks under `.claude/skills/` and the managed \
+                       exclude-block entries left by prior `claude_skills_sync` runs. READ-ONLY — \
+                       changes nothing, so it is the safe way to preview before calling \
+                       `claude_skills_sync` or `claude_skills_clean`. Operates relative to the \
+                       server process's cwd. Mirrors `omni-dev ai claude skills status`."
     )]
     pub async fn claude_skills_status(
         &self,
