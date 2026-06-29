@@ -18,9 +18,9 @@ pub struct ProjectCommand {
 /// Project subcommands.
 #[derive(Subcommand)]
 pub enum ProjectSubcommands {
-    /// Lists all accessible JIRA projects.
+    /// Lists all accessible JIRA projects (mirrors the `jira_project_list` MCP tool).
     List(ListCommand),
-    /// Shows the create-screen fields for a project + issue type.
+    /// Shows the create-screen fields for a project + issue type (mirrors the `jira_project_create_meta` MCP tool).
     CreateMeta(CreateMetaCommand),
 }
 

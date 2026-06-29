@@ -132,9 +132,9 @@ pub struct CompareCommandGroup {
 /// Subcommands inside the compare group.
 #[derive(Subcommand)]
 pub enum CompareSubcommands {
-    /// Diff two versions of a Confluence page.
+    /// Diff two versions of a Confluence page (mirrors the `confluence_compare` MCP tool).
     Run(CompareCommand),
-    /// Drill in to a section diff using a cursor from a prior `run`.
+    /// Drill in to a section diff using a cursor from a prior `run` (mirrors the `confluence_compare_section` MCP tool).
     Section(CompareSectionCommand),
 }
 

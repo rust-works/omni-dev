@@ -21,10 +21,10 @@ pub struct ConvertCommand {
 /// Conversion subcommands.
 #[derive(Subcommand)]
 pub enum ConvertSubcommands {
-    /// Converts JFM markdown to ADF JSON.
+    /// Converts JFM markdown to ADF JSON (mirrors the `atlassian_convert` MCP tool).
     #[command(name = "to-adf")]
     ToAdf(ToAdfCommand),
-    /// Converts ADF JSON to JFM markdown.
+    /// Converts ADF JSON to JFM markdown (mirrors the `atlassian_convert` MCP tool).
     #[command(name = "from-adf")]
     FromAdf(FromAdfCommand),
 }

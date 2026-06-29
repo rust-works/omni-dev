@@ -23,13 +23,13 @@ pub struct AttachmentCommand {
 /// Attachment subcommands.
 #[derive(Subcommand)]
 pub enum AttachmentSubcommands {
-    /// Uploads a file as an attachment to a Confluence page.
+    /// Uploads a file as an attachment to a Confluence page (mirrors the `confluence_attachment_upload` MCP tool).
     Upload(UploadCommand),
-    /// Lists attachments on a Confluence page.
+    /// Lists attachments on a Confluence page (mirrors the `confluence_attachment_list` MCP tool).
     List(ListCommand),
-    /// Downloads an attachment binary by ID.
+    /// Downloads an attachment binary by ID (mirrors the `confluence_attachment_download` MCP tool).
     Download(DownloadCommand),
-    /// Deletes an attachment by ID.
+    /// Deletes an attachment by ID (mirrors the `confluence_attachment_delete` MCP tool).
     Delete(DeleteCommand),
 }
 

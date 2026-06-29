@@ -22,11 +22,11 @@ pub struct CommentCommand {
 /// Comment subcommands.
 #[derive(Subcommand)]
 pub enum CommentSubcommands {
-    /// Lists comments on a JIRA issue.
+    /// Lists comments on a JIRA issue (mirrors the `jira_comment` MCP tool with `action: list`).
     List(ListCommand),
-    /// Adds a comment to a JIRA issue.
+    /// Adds a comment to a JIRA issue (mirrors the `jira_comment` MCP tool with `action: add`).
     Add(AddCommand),
-    /// Edits an existing comment on a JIRA issue.
+    /// Edits an existing comment on a JIRA issue (mirrors the `jira_comment_edit` MCP tool).
     Edit(EditCommand),
 }
 

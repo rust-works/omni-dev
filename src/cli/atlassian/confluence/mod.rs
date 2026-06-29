@@ -33,29 +33,29 @@ pub struct ConfluenceCommand {
 pub enum ConfluenceSubcommands {
     /// Manages comments on a Confluence page.
     Comment(comment::CommentCommand),
-    /// Fetches a Confluence page and outputs it as JFM markdown or ADF JSON.
+    /// Fetches a Confluence page and outputs it as JFM markdown or ADF JSON (mirrors the `confluence_read` MCP tool).
     Read(read::ReadCommand),
-    /// Pushes content to a Confluence page.
+    /// Pushes content to a Confluence page (mirrors the `confluence_write` MCP tool).
     Write(write::WriteCommand),
     /// Interactive fetch-edit-push cycle for a Confluence page.
     Edit(edit::EditCommand),
-    /// Searches Confluence pages using CQL.
+    /// Searches Confluence pages using CQL (mirrors the `confluence_search` MCP tool).
     Search(search::SearchCommand),
-    /// Creates a new Confluence page.
+    /// Creates a new Confluence page (mirrors the `confluence_create` MCP tool).
     Create(create::CreateCommand),
-    /// Deletes a Confluence page.
+    /// Deletes a Confluence page (mirrors the `confluence_delete` MCP tool).
     Delete(delete::DeleteCommand),
-    /// Moves or reparents a Confluence page (same-space only).
+    /// Moves or reparents a Confluence page (same-space only) (mirrors the `confluence_move` MCP tool).
     Move(move_page::MoveCommand),
     /// Manages labels on Confluence pages.
     Label(label::LabelCommand),
     /// Manages attachments on Confluence pages.
     Attachment(attachment::AttachmentCommand),
-    /// Recursively downloads a Confluence page tree.
+    /// Recursively downloads a Confluence page tree (mirrors the `confluence_download` MCP tool).
     Download(download::DownloadCommand),
-    /// Lists child pages of a Confluence page or top-level pages in a space.
+    /// Lists child pages of a Confluence page or top-level pages in a space (mirrors the `confluence_children` MCP tool).
     Children(children::ChildrenCommand),
-    /// Lists version history (metadata) for a Confluence page.
+    /// Lists version history (metadata) for a Confluence page (mirrors the `confluence_history` MCP tool).
     History(history::HistoryCommand),
     /// Compares two versions of a Confluence page (structural diff).
     Compare(compare::CompareCommandGroup),

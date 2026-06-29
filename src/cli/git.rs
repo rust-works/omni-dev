@@ -90,15 +90,15 @@ pub struct MessageCommand {
 /// Message subcommands.
 #[derive(Subcommand)]
 pub enum MessageSubcommands {
-    /// Analyzes commits and outputs repository information in YAML format.
+    /// Analyzes commits and outputs repository information in YAML format (mirrors the `git_view_commits` MCP tool).
     View(ViewCommand),
     /// Amends commit messages based on a YAML configuration file.
     Amend(AmendCommand),
-    /// AI-powered commit message improvement using Claude.
+    /// AI-powered commit message improvement using Claude (mirrors the `git_twiddle_commits` MCP tool).
     Twiddle(TwiddleCommand),
-    /// Checks commit messages against guidelines without modifying them.
+    /// Checks commit messages against guidelines without modifying them (mirrors the `git_check_commits` MCP tool).
     Check(CheckCommand),
-    /// Generates a commit message from staged changes and commits them.
+    /// Generates a commit message from staged changes and commits them (mirrors the `git_staged_commit` MCP tool).
     Staged(StagedCommand),
 }
 
@@ -113,7 +113,7 @@ pub struct BranchCommand {
 /// Branch subcommands.
 #[derive(Subcommand)]
 pub enum BranchSubcommands {
-    /// Analyzes branch commits and outputs repository information in YAML format.
+    /// Analyzes branch commits and outputs repository information in YAML format (mirrors the `git_branch_info` MCP tool).
     Info(InfoCommand),
     /// Create operations.
     Create(CreateCommand),
@@ -130,7 +130,7 @@ pub struct CreateCommand {
 /// Create subcommands.
 #[derive(Subcommand)]
 pub enum CreateSubcommands {
-    /// Creates a pull request with AI-generated description.
+    /// Creates a pull request with AI-generated description (mirrors the `git_create_pr` MCP tool).
     Pr(CreatePrCommand),
 }
 

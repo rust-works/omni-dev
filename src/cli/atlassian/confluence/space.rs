@@ -18,9 +18,9 @@ pub struct SpaceCommand {
 /// Space subcommands.
 #[derive(Subcommand)]
 pub enum SpaceSubcommands {
-    /// Lists Confluence spaces.
+    /// Lists Confluence spaces (mirrors the `confluence_space_list` MCP tool).
     List(ListCommand),
-    /// Enumerates pages within a Confluence space.
+    /// Enumerates pages within a Confluence space (mirrors the `confluence_space_pages` MCP tool).
     Pages(PagesCommand),
 }
 

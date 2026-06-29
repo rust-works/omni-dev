@@ -32,7 +32,8 @@ pub struct ModelsCommand {
 #[derive(Subcommand)]
 pub enum ModelsSubcommands {
     /// Shows the model catalog (merged user/project layers over the
-    /// embedded `models.yaml`), annotating each entry with its source layer.
+    /// embedded `models.yaml`), annotating each entry with its source layer
+    /// (mirrors the `config_models_show` MCP tool).
     Show(ShowCommand),
 }
 
