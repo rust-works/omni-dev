@@ -24,7 +24,7 @@ pub enum AuthSubcommands {
     Login(LoginCommand),
     /// Removes Datadog API credentials from settings.json.
     Logout(LogoutCommand),
-    /// Shows the current authentication status.
+    /// Shows the current authentication status (mirrors the `datadog_auth_status` MCP tool).
     Status(StatusCommand),
 }
 

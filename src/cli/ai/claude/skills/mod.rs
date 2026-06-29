@@ -28,11 +28,11 @@ pub struct SkillsCommand {
 /// Skills subcommands.
 #[derive(Subcommand)]
 pub enum SkillsSubcommands {
-    /// Syncs skills from a source repository into one or more targets.
+    /// Syncs skills from a source repository into one or more targets (mirrors the `claude_skills_sync` MCP tool).
     Sync(sync::SyncCommand),
-    /// Removes skill symlinks and managed exclude block previously created by `sync`.
+    /// Removes skill symlinks and managed exclude block previously created by `sync` (mirrors the `claude_skills_clean` MCP tool).
     Clean(clean::CleanCommand),
-    /// Reports residue left by `sync` — symlinks and managed exclude-block entries.
+    /// Reports residue left by `sync` — symlinks and managed exclude-block entries (mirrors the `claude_skills_status` MCP tool).
     Status(status::StatusCommand),
 }
 

@@ -18,9 +18,9 @@ pub struct FieldCommand {
 /// Field subcommands.
 #[derive(Subcommand)]
 pub enum FieldSubcommands {
-    /// Lists all field definitions.
+    /// Lists all field definitions (mirrors the `jira_field_list` MCP tool).
     List(ListCommand),
-    /// Shows options for a custom field.
+    /// Shows options for a custom field (mirrors the `jira_field_options` MCP tool).
     Options(OptionsCommand),
 }
 

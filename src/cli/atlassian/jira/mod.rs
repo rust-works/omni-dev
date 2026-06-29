@@ -35,23 +35,23 @@ pub struct JiraCommand {
 /// JIRA subcommands.
 #[derive(Subcommand)]
 pub enum JiraSubcommands {
-    /// Fetches a JIRA issue and outputs it as JFM markdown or ADF JSON.
+    /// Fetches a JIRA issue and outputs it as JFM markdown or ADF JSON (mirrors the `jira_read` MCP tool).
     Read(read::ReadCommand),
-    /// Pushes content to a JIRA issue.
+    /// Pushes content to a JIRA issue (mirrors the `jira_write` MCP tool).
     Write(write::WriteCommand),
     /// Interactive fetch-edit-push cycle for a JIRA issue.
     Edit(edit::EditCommand),
-    /// Searches JIRA issues using JQL.
+    /// Searches JIRA issues using JQL (mirrors the `jira_search` MCP tool).
     Search(search::SearchCommand),
-    /// Creates a new JIRA issue.
+    /// Creates a new JIRA issue (mirrors the `jira_create` MCP tool).
     Create(create::CreateCommand),
     /// Lists or executes workflow transitions on a JIRA issue.
     Transition(transition::TransitionCommand),
     /// Manages comments on a JIRA issue.
     Comment(comment::CommentCommand),
-    /// Deletes a JIRA issue.
+    /// Deletes a JIRA issue (mirrors the `jira_delete` MCP tool).
     Delete(delete::DeleteCommand),
-    /// Shows development status (linked PRs, branches, repositories) for a JIRA issue.
+    /// Shows development status (linked PRs, branches, repositories) for a JIRA issue (mirrors the `jira_dev` MCP tool).
     Dev(dev::DevCommand),
     /// Lists JIRA projects.
     Project(project::ProjectCommand),
@@ -63,7 +63,7 @@ pub enum JiraSubcommands {
     Sprint(sprint::SprintCommand),
     /// Manages JIRA issue links.
     Link(link::LinkCommand),
-    /// Shows change history for JIRA issues.
+    /// Shows change history for JIRA issues (mirrors the `jira_changelog` MCP tool).
     Changelog(changelog::ChangelogCommand),
     /// Downloads JIRA issue attachments.
     Attachment(attachment::AttachmentCommand),

@@ -21,9 +21,9 @@ pub struct SloCommand {
 /// SLO subcommands.
 #[derive(Subcommand)]
 pub enum SloSubcommands {
-    /// Lists SLOs with optional tag filter.
+    /// Lists SLOs with optional tag filter (mirrors the `datadog_slo_list` MCP tool).
     List(list::ListCommand),
-    /// Fetches a single SLO definition by id.
+    /// Fetches a single SLO definition by id (mirrors the `datadog_slo_get` MCP tool).
     Get(get::GetCommand),
 }
 

@@ -18,9 +18,9 @@ pub struct BoardCommand {
 /// Board subcommands.
 #[derive(Subcommand)]
 pub enum BoardSubcommands {
-    /// Lists agile boards.
+    /// Lists agile boards (mirrors the `jira_board_list` MCP tool).
     List(ListCommand),
-    /// Lists issues on a board.
+    /// Lists issues on a board (mirrors the `jira_board_issues` MCP tool).
     Issues(IssuesCommand),
 }
 

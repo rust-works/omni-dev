@@ -20,7 +20,7 @@ pub struct LogsCommand {
 /// Logs subcommands.
 #[derive(Subcommand)]
 pub enum LogsSubcommands {
-    /// Searches log events via `POST /api/v2/logs/events/search`.
+    /// Searches log events via `POST /api/v2/logs/events/search` (mirrors the `datadog_logs_search` MCP tool).
     Search(search::SearchCommand),
 }
 

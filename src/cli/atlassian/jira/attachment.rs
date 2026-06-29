@@ -29,9 +29,9 @@ pub struct AttachmentCommand {
 /// Attachment subcommands.
 #[derive(Subcommand)]
 pub enum AttachmentSubcommands {
-    /// Downloads all attachments (or filtered by pattern).
+    /// Downloads all attachments (or filtered by pattern) (mirrors the `jira_attachment_download` MCP tool).
     Download(DownloadCommand),
-    /// Downloads only image attachments.
+    /// Downloads only image attachments (mirrors the `jira_attachment_images` MCP tool).
     Images(ImagesCommand),
 }
 
