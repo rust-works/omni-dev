@@ -26,7 +26,7 @@ which tags apply to the changes and search this file for those tags. Each rule h
 | After creating commits (before push / PR)        | `commits`                                |
 | Suppressing a lint or considering `unsafe`       | `code-style`, `unsafe`                   |
 | Writing or updating an ADR                       | `adrs`                                   |
-| Adding an MCP tool, resource, or param struct    | `api-design`, `module-organization`, `testing` |
+| Adding an MCP tool, resource, or param struct    | `api-design`, `module-organization`, `testing`, `documentation` |
 | Adding or modifying a docs/plan/ file            | `documentation`, `adrs`                  |
 | Reading env vars, or testing env-dependent code  | `testing`, `module-organization`         |
 | Reviewing code for style compliance              | All tags relevant to the changed code    |
@@ -43,7 +43,7 @@ A new convention needs to be added to this style guide.
 
 ### Guidance
 
-Assign the next sequential ID (currently next is `STYLE-0028`) and include:
+Assign the next sequential ID (currently next is `STYLE-0030`) and include:
 
 1. A **Tags** line immediately after the heading — a comma-separated list of category labels
    from the tag vocabulary below.
@@ -1470,3 +1470,76 @@ and `set_var`/`remove_var` are `unsafe` in Rust 2024. Injecting the resolved
 value removes the shared hazard entirely: env-dependent tests become pure,
 order-independent, lock-free, and fully parallel. A fresh bespoke env lock
 added *after* #821 (`datadog/*`) is exactly the regression this rule prevents.
+
+## STYLE-0029: MCP tool & parameter description checklist
+
+**Tags:** `documentation`, `api-design`
+
+### Situation
+
+Writing or revising any `#[tool(description = "…")]` text or any doc comment on
+a `*Params` struct field under `src/mcp/`. These strings are the **only** thing
+an AI agent reads to decide how to call a tool: field doc comments flow through
+`schemars::JsonSchema` into each field's JSON-schema `description`, and
+`description = "…"` sets the tool-level text. [STYLE-0026](#style-0026-mcp-tool-and-resource-authoring-conventions)
+covers the *wiring* (struct shape, router, tests); this rule covers the *prose
+quality* the agent actually reads.
+
+### Guidance
+
+Every tool description and parameter doc comment must satisfy this checklist.
+The reference exemplars are [`LinkCreateParams`](../src/mcp/jira_tools.rs)
+(`inward`/`outward` with the concrete `Blocks` example) and the
+[`git_*` tool descriptions](../src/mcp/git_tools.rs).
+
+**Tool-level `description`:**
+
+1. **One-line "what it does"** as the first sentence — a single, skimmable
+   summary an agent reads before the params.
+2. **CLI cross-reference, both directions.** The tool description names its
+   equivalent subcommand: ``Mirrors `omni-dev <subcommand>`.`` The clap
+   subcommand's doc comment carries the reverse, ending with
+   ``(mirrors the `<tool_name>` MCP tool)`` (see
+   [src/cli/atlassian/jira/link.rs](../src/cli/atlassian/jira/link.rs)). The
+   two must stay in lock-step. A tool with no CLI equivalent (e.g.
+   `atlassian_convert`'s `system_prompt` override) says so explicitly.
+3. **"When to use vs `<sibling>`"** wherever two tools overlap or could be
+   confused (e.g. updating a body via `jira_write` vs setting hierarchy via
+   `jira_link_parent`; `jira_link_create` vs `jira_link_parent`). One sentence
+   pointing at the sibling and when to prefer it.
+4. **A concrete example in the tool text**, not only on fields — a real key
+   (`PROJ-123`), a real enum value, or a one-line call shape. Surface the
+   single most error-prone value at the tool level the agent skims first.
+5. **Mutating/destructive affordances.** State any `dry_run`, `confirm`, or
+   preflight behaviour and its default (e.g. "Set `dry_run = true` to return
+   the would-be request without sending it"; "Requires `confirm: true`").
+
+**Per-parameter doc comment:**
+
+6. **A concrete example value** — ``e.g. `PROJ-123` ``, ``e.g. `2025-01-31` ``,
+   ``e.g. `Blocks` ``.
+7. **Allowed values for enums / closed sets** spelled out
+   (``one of `future`, `active`, `closed` ``) — don't make the agent guess.
+8. **Expected wire format** — JFM markdown vs ADF JSON, `YYYY-MM-DD`, JIRA
+   duration (`2h 30m`), Atlassian `accountId` vs display name, JQL/CQL.
+9. **Directional / order-dependent semantics spelled out** — never "source" /
+   "target" alone. Name which end is which, with an example: *"Source (inward)
+   issue — for `Blocks`, the issue doing the blocking."* This is the #1054
+   regression this rule exists to prevent.
+10. **Required vs optional.** Optional fields use `#[serde(default)]` +
+    `Option<T>` (per STYLE-0026) and the doc comment states the default
+    behaviour when the field is omitted.
+
+Keep [docs/mcp.md](mcp.md)'s tool catalog in sync when a tool's purpose or CLI
+mapping changes, and run the [`update-snapshots`](../.claude/skills/update-snapshots/SKILL.md)
+skill whenever the reverse-reference edits change CLI `--help` text.
+
+### Motivation
+
+An agent's success rate is bounded by how unambiguous these strings are. A
+vague description produces wrong-but-silent calls — an inverted `Blocks`
+dependency (#1054), a display name where an `accountId` was required, a body
+update where a parent link was meant — each costing a recovery round-trip or
+quietly corrupting data. #1049 fixed one tool (`jira_link_create`) to this bar;
+this checklist generalises it so the whole `src/mcp/` surface meets the same
+standard rather than drifting tool-by-tool.
