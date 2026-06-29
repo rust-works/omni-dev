@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use serde_json::json;
-use tokio::net::UnixStream;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 use tokio_util::sync::CancellationToken;
@@ -56,7 +56,7 @@ pub async fn run_with_shutdown(
     }
     paths::check_socket_path_len(&opts.socket_path)?;
 
-    let listener = single_instance::bind_or_reclaim(&opts.socket_path).await?;
+    let (listener, launchd_owned) = acquire_listener(&opts.socket_path).await?;
     tracing::info!("daemon listening on {}", opts.socket_path.display());
 
     lifecycle::install_signal_handlers(shutdown.clone());
@@ -91,16 +91,24 @@ pub async fn run_with_shutdown(
         }
     }
 
-    // Close and unlink the control socket *before* draining (see #993). The
-    // accept loop has already exited, so any `connect`+`ping` arriving during the
-    // drain below would otherwise sit unaccepted in the backlog and block the
-    // caller until process exit. Dropping the listener makes those connects fail
-    // fast (ECONNREFUSED). Removing the path here too — rather than after the
-    // drain — avoids a restart race: a replacement daemon could reclaim the stale
-    // socket and rebind its *own* listener mid-drain, and a late unlink would then
-    // delete that fresh socket out from under it.
+    // Close the control socket *before* draining (see #993). The accept loop has
+    // already exited, so any `connect`+`ping` arriving during the drain below
+    // would otherwise sit unaccepted in the backlog and block the caller until
+    // process exit. Dropping the listener makes those connects fail fast
+    // (ECONNREFUSED) on the self-bound path.
+    //
+    // Unlinking the path is conditional. On the self-bound path we remove it here
+    // — rather than after the drain — to avoid a restart race: a replacement
+    // daemon could reclaim the stale socket and rebind its *own* listener
+    // mid-drain, and a late unlink would then delete that fresh socket out from
+    // under it. On the launchd-activated path the socket inode belongs to launchd,
+    // not us: unlinking it would make the next `connect(path)` hit ENOENT and
+    // never re-activate the daemon — so we leave it in place for launchd to reuse
+    // on the next demand spawn (#1081).
     drop(listener);
-    remove_socket(&opts.socket_path);
+    if !launchd_owned {
+        remove_socket(&opts.socket_path);
+    }
 
     // Drain in-flight connection handlers before stopping services (#992).
     drain_connections(&mut conns, DRAIN_TIMEOUT).await;
@@ -108,6 +116,29 @@ pub async fn run_with_shutdown(
     tracing::info!("daemon shutting down; draining services");
     registry.shutdown_all().await;
     Ok(())
+}
+
+/// Acquires the control-socket listener, returning it alongside whether launchd
+/// owns the socket inode.
+///
+/// On macOS the daemon is normally **socket-activated**: launchd creates and owns
+/// the listening socket and hands us the inherited fd (`launchd::launchd_listener`
+/// — a plain code span, not an intra-doc link, since the `launchd` module is
+/// macOS-gated and absent from the cross-platform docs build), so there is
+/// no bind and no single-instance handling — launchd guarantees at most one spawn
+/// per socket. When that lookup reports no inherited socket (a manual
+/// `daemon run` from a shell, CI, or any non-macOS platform) the daemon binds the
+/// socket itself via [`single_instance::bind_or_reclaim`], which doubles as the
+/// single-instance lock. The returned bool gates whether shutdown unlinks the
+/// path: launchd's inode must be left in place to re-activate (#1081).
+async fn acquire_listener(socket_path: &Path) -> Result<(UnixListener, bool)> {
+    #[cfg(target_os = "macos")]
+    if let Some(listener) = super::launchd::launchd_listener("Listener")? {
+        tracing::info!("daemon adopting launchd-activated control socket");
+        return Ok((listener, true));
+    }
+    let listener = single_instance::bind_or_reclaim(socket_path).await?;
+    Ok((listener, false))
 }
 
 /// Removes the control-socket file, tolerating its absence (a replacement
