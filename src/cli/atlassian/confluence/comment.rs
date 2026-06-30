@@ -24,13 +24,13 @@ pub struct CommentCommand {
 /// Comment subcommands.
 #[derive(Subcommand)]
 pub enum CommentSubcommands {
-    /// Lists comments on a Confluence page.
+    /// Lists comments on a Confluence page (mirrors the `confluence_comment_list` MCP tool).
     List(ListCommand),
-    /// Adds a footer comment to a Confluence page.
+    /// Adds a footer comment to a Confluence page (mirrors the `confluence_comment_add` MCP tool).
     Add(AddCommand),
-    /// Adds an inline (anchored) comment to a Confluence page.
+    /// Adds an inline (anchored) comment to a Confluence page (mirrors the `confluence_comment_add_inline` MCP tool).
     AddInline(AddInlineCommand),
-    /// Lists the replies of a comment.
+    /// Lists the replies of a comment (mirrors the `confluence_comment_replies` MCP tool).
     Replies(RepliesCommand),
 }
 

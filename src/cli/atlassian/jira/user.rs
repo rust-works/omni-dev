@@ -18,7 +18,7 @@ pub struct UserCommand {
 /// JIRA user subcommands.
 #[derive(Subcommand)]
 pub enum UserSubcommands {
-    /// Searches JIRA users by display name or email substring.
+    /// Searches JIRA users by display name or email substring (mirrors the `jira_user_search` MCP tool).
     Search(UserSearchCommand),
 }
 

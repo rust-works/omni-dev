@@ -1160,7 +1160,10 @@ pub async fn delete_attachment_result(
 impl OmniDevServer {
     /// Tool: fetch a Confluence page as JFM markdown (default) or ADF JSON.
     #[tool(
-        description = "Fetch a Confluence page by ID. Returns JFM markdown by default, or raw ADF JSON when format=\"adf\". \
+        description = "Fetch a Confluence page by numeric ID (e.g. \"12345678\"). Returns JFM markdown by \
+                       default — AI-friendly GitHub-style markdown, the form to read/edit then feed back to \
+                       `confluence_write`/`confluence_create`. Pass format=\"adf\" for the raw ADF JSON \
+                       (the on-the-wire document model) only when you need exact node structure. \
                        When `output_file` is set, the content is written to that path and the tool returns \
                        a short YAML summary (path/bytes/format) — useful for large pages. \
                        Mirrors `omni-dev atlassian confluence read`."
@@ -1178,7 +1181,11 @@ impl OmniDevServer {
 
     /// Tool: search Confluence pages by CQL.
     #[tool(
-        description = "Search Confluence pages using CQL. Returns YAML with matching page IDs, titles, and space keys. \
+        description = "Search Confluence pages using CQL (Confluence Query Language), e.g. \
+                       `space = ENG AND title ~ \"architecture\"`. Returns YAML with matching page IDs, \
+                       titles, and space keys — feed an ID into `confluence_read` for the body. \
+                       Use `confluence_children`/`confluence_space_pages` instead when you want to \
+                       enumerate a known page tree or space rather than query by text. \
                        Mirrors `omni-dev atlassian confluence search --cql`."
     )]
     pub async fn confluence_search(
@@ -1193,7 +1200,8 @@ impl OmniDevServer {
 
     /// Tool: create a new Confluence page.
     #[tool(
-        description = "Create a new Confluence page, from explicit fields or from a full JFM \
+        description = "Create a NEW Confluence page (use `confluence_write` to overwrite an existing \
+                       page identified by its ID). Builds from explicit fields or from a full JFM \
                        `document` (frontmatter + body, e.g. the output of `confluence_read`). \
                        With a `document`, `space_key`/`title`/`parent_id` come from the \
                        frontmatter and the body becomes the page body — enabling the \
@@ -1216,7 +1224,9 @@ impl OmniDevServer {
 
     /// Tool: update a Confluence page's body (and optionally title).
     #[tool(
-        description = "Overwrite a Confluence page's body from JFM markdown (default) or raw ADF JSON. \
+        description = "Overwrite an EXISTING Confluence page's body (identified by `id`) from JFM \
+                       markdown (default) or raw ADF JSON. This fully replaces the body — to create a \
+                       brand-new page instead, use `confluence_create`. \
                        JFM is GitHub-style markdown, NOT Confluence wiki markup — see resource \
                        `omni-dev://specs/jfm` for syntax. \
                        Set `dry_run: true` first when uncertain about required fields or \
@@ -1289,8 +1299,11 @@ impl OmniDevServer {
     /// Lists children of a Confluence page, or top-level pages in a space,
     /// with optional recursion.
     #[tool(
-        description = "List children of a Confluence page, or top-level pages in a space. \
-                       Supports optional recursion with a max depth. Mirrors \
+        description = "List children of a Confluence page (pass `id`, e.g. \"12345678\"), or top-level \
+                       pages in a space (pass `space`, e.g. \"ENG\") — `id` and `space` are mutually \
+                       exclusive. Supports optional recursion with a max depth, so this is the tool for \
+                       walking a page hierarchy. To enumerate EVERY page in a space (flat, with status/sort \
+                       filters and cursor pagination) use `confluence_space_pages` instead. Mirrors \
                        `omni-dev atlassian confluence children`."
     )]
     pub async fn confluence_children(
@@ -1381,7 +1394,9 @@ impl OmniDevServer {
     /// Posts an inline (anchored) comment to a Confluence page.
     #[tool(
         description = "Post a markdown comment anchored to a text selection on a \
-                       Confluence page. `anchor_text` must match the on-page text \
+                       Confluence page (an inline comment). For a page-level comment not tied \
+                       to any text, use `confluence_comment_add` instead. \
+                       `anchor_text` must match the on-page text \
                        exactly; if it appears multiple times, pass `match_index` \
                        (1-based) to pick which occurrence. Errors if the anchor \
                        does not match or `match_index` is out of range. Mirrors \
@@ -1605,7 +1620,9 @@ impl OmniDevServer {
 
     /// Enumerates pages within a Confluence space (paginated).
     #[tool(
-        description = "Enumerate pages within a Confluence space (one page per call). \
+        description = "Enumerate ALL pages within a Confluence space (flat list, one response page per \
+                       call), e.g. space \"ENG\". To walk a page hierarchy parent-by-parent instead, use \
+                       `confluence_children`. \
                        Returns summary records: `id`, `title`, `status`, `parentId`, \
                        `authorId`, `createdAt` — no page bodies. \
                        Optional filters: `status` (common values: `current`, \

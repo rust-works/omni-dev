@@ -18,9 +18,9 @@ pub struct WorklogCommand {
 /// Worklog subcommands.
 #[derive(Subcommand)]
 pub enum WorklogSubcommands {
-    /// Lists worklogs on a JIRA issue.
+    /// Lists worklogs on a JIRA issue (mirrors the `jira_worklog_list` MCP tool).
     List(ListCommand),
-    /// Adds a worklog entry to a JIRA issue.
+    /// Adds a worklog entry to a JIRA issue (mirrors the `jira_worklog_add` MCP tool).
     Add(AddCommand),
 }
 

@@ -20,7 +20,7 @@ pub struct DowntimeCommand {
 /// Downtime subcommands.
 #[derive(Subcommand)]
 pub enum DowntimeSubcommands {
-    /// Lists scheduled downtimes via `GET /api/v1/downtime`.
+    /// Lists scheduled downtimes via `GET /api/v1/downtime` (mirrors the `datadog_downtime_list` MCP tool).
     List(list::ListCommand),
 }
 

@@ -20,7 +20,7 @@ pub struct HostsCommand {
 /// Hosts subcommands.
 #[derive(Subcommand)]
 pub enum HostsSubcommands {
-    /// Lists hosts via `GET /api/v1/hosts`.
+    /// Lists hosts via `GET /api/v1/hosts` (mirrors the `datadog_hosts_list` MCP tool).
     List(list::ListCommand),
 }
 

@@ -18,7 +18,7 @@ pub struct UserCommand {
 /// Confluence user subcommands.
 #[derive(Subcommand)]
 pub enum UserSubcommands {
-    /// Searches Confluence users by display name or email.
+    /// Searches Confluence users by display name or email (mirrors the `confluence_user_search` MCP tool).
     Search(UserSearchCommand),
 }
 

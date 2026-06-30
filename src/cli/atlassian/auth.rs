@@ -21,7 +21,7 @@ pub struct AuthCommand {
 pub enum AuthSubcommands {
     /// Configures Atlassian Cloud credentials interactively.
     Login(LoginCommand),
-    /// Shows the current authentication status.
+    /// Shows the current authentication status (mirrors the `atlassian_auth_status` MCP tool).
     Status(StatusCommand),
 }
 

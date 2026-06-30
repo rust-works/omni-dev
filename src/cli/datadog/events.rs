@@ -20,7 +20,7 @@ pub struct EventsCommand {
 /// Events subcommands.
 #[derive(Subcommand)]
 pub enum EventsSubcommands {
-    /// Lists events via `GET /api/v2/events`.
+    /// Lists events via `GET /api/v2/events` (mirrors the `datadog_events_list` MCP tool).
     List(list::ListCommand),
 }
 

@@ -18,15 +18,15 @@ pub struct SprintCommand {
 /// Sprint subcommands.
 #[derive(Subcommand)]
 pub enum SprintSubcommands {
-    /// Lists sprints for a board.
+    /// Lists sprints for a board (mirrors the `jira_sprint_list` MCP tool).
     List(ListCommand),
-    /// Lists issues in a sprint.
+    /// Lists issues in a sprint (mirrors the `jira_sprint_issues` MCP tool).
     Issues(IssuesCommand),
-    /// Adds issues to a sprint.
+    /// Adds issues to a sprint (mirrors the `jira_sprint_add` MCP tool).
     Add(AddCommand),
-    /// Creates a new sprint.
+    /// Creates a new sprint (mirrors the `jira_sprint_create` MCP tool).
     Create(CreateCommand),
-    /// Updates an existing sprint.
+    /// Updates an existing sprint (mirrors the `jira_sprint_update` MCP tool).
     Update(UpdateCommand),
 }
 

@@ -19,9 +19,9 @@ pub struct MetricsCommand {
 /// Metrics subcommands.
 #[derive(Subcommand)]
 pub enum MetricsSubcommands {
-    /// Executes a point-in-time metrics timeseries query.
+    /// Executes a point-in-time metrics timeseries query (mirrors the `datadog_metrics_query` MCP tool).
     Query(query::QueryCommand),
-    /// Inspects the metric catalog (`/api/v1/metrics`).
+    /// Inspects the metric catalog (`/api/v1/metrics`) (mirrors the `datadog_metrics_catalog_list` MCP tool).
     Catalog(catalog::CatalogCommand),
 }
 

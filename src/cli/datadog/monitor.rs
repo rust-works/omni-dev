@@ -22,11 +22,11 @@ pub struct MonitorCommand {
 /// Monitor subcommands.
 #[derive(Subcommand)]
 pub enum MonitorSubcommands {
-    /// Lists monitors with optional name / tag filters.
+    /// Lists monitors with optional name / tag filters (mirrors the `datadog_monitor_list` MCP tool).
     List(list::ListCommand),
-    /// Fetches a single monitor by id.
+    /// Fetches a single monitor by id (mirrors the `datadog_monitor_get` MCP tool).
     Get(get::GetCommand),
-    /// Searches monitors by free-text / faceted query.
+    /// Searches monitors by free-text / faceted query (mirrors the `datadog_monitor_search` MCP tool).
     Search(search::SearchCommand),
 }
 

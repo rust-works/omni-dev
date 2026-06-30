@@ -18,9 +18,9 @@ pub struct VersionCommand {
 /// Version subcommands.
 #[derive(Subcommand)]
 pub enum VersionSubcommands {
-    /// Lists versions for a project.
+    /// Lists versions for a project (mirrors the `jira_version_list` MCP tool).
     List(ListCommand),
-    /// Creates a new project version.
+    /// Creates a new project version (mirrors the `jira_version_create` MCP tool).
     Create(CreateCommand),
 }
 

@@ -145,11 +145,13 @@ pub struct BulkIssueSpec {
 /// existing JIRA key.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BulkLinkSpec {
-    /// Link type name (e.g., `Blocks`).
+    /// Link type name (e.g., `Blocks`; list options with `jira_link_types`).
     pub link_type: String,
-    /// Source (inward) issue — a batch alias or an existing key.
+    /// Source (inward) issue — e.g. for `Blocks`, the issue doing the blocking.
+    /// May be a batch alias minted earlier in this call or an existing key.
     pub inward: String,
-    /// Target (outward) issue — a batch alias or an existing key.
+    /// Target (outward) issue — e.g. for `Blocks`, the issue being blocked.
+    /// May be a batch alias minted earlier in this call or an existing key.
     pub outward: String,
 }
 
@@ -1023,10 +1025,12 @@ async fn run_jira_user_search(client: &AtlassianClient, query: &str, limit: u32)
 impl OmniDevServer {
     /// Tool: fetch a JIRA issue as JFM markdown or raw ADF JSON.
     #[tool(
-        description = "Fetch a JIRA issue. Returns JFM markdown (default, AI-friendly) \
-                       or raw ADF JSON when `format = \"adf\"`. When `output_file` is set, \
-                       the content is written to that path and the tool returns a short \
-                       YAML summary (path/bytes/format) — useful for large issues."
+        description = "Fetch a JIRA issue by key (e.g. `PROJ-123`). Returns JFM markdown \
+                       (default, AI-friendly GitHub-style markdown — see resource \
+                       `omni-dev://specs/jfm`) or the raw ADF description JSON when \
+                       `format = \"adf\"`. When `output_file` is set, the content is written \
+                       to that path and the tool returns a short YAML summary \
+                       (path/bytes/format) — useful for large issues."
     )]
     pub async fn jira_read(
         &self,
@@ -1047,7 +1051,11 @@ impl OmniDevServer {
     }
 
     /// Tool: search JIRA issues by JQL.
-    #[tool(description = "Search JIRA issues using a JQL query. Returns matching issues as YAML.")]
+    #[tool(description = "Search JIRA issues using a JQL query (e.g. \
+                       `project = PROJ AND status = Open ORDER BY created DESC`; dates are \
+                       `YYYY-MM-DD`). Returns matching issues as YAML. `limit` defaults to 20; \
+                       pass `0` for unlimited. To list issues on a board or sprint instead, use \
+                       `jira_board_issues` / `jira_sprint_issues`.")]
     pub async fn jira_search(
         &self,
         Parameters(params): Parameters<JiraSearchParams>,
@@ -1081,7 +1089,8 @@ impl OmniDevServer {
                        resolves the input and returns the request that would be sent (method, path, \
                        body) without creating the issue (mirrors the CLI's \
                        `omni-dev atlassian jira create --dry-run`). Returns the new issue key and \
-                       self URL as YAML."
+                       self URL as YAML. Creates a single issue; to create several issues at once \
+                       (and optionally link them, e.g. epic decomposition) use `jira_bulk_create`."
     )]
     pub async fn jira_create(
         &self,
@@ -1130,7 +1139,8 @@ impl OmniDevServer {
     /// Tool: update a JIRA issue's description, assignee, reporter, or
     /// arbitrary fields.
     #[tool(
-        description = "Update a JIRA issue. `content` updates the description (JFM markdown by \
+        description = "Update a JIRA issue by key (e.g. `PROJ-123`). `content` updates the \
+                       description (JFM markdown by \
                        default, or raw ADF JSON when `format = \"adf\"`); omit it to leave the \
                        description unchanged. JFM is GitHub-style markdown — see resource \
                        `omni-dev://specs/jfm` for syntax. To set the parent for hierarchy \
@@ -1221,8 +1231,11 @@ impl OmniDevServer {
 
     /// Tool: list or add comments on a JIRA issue.
     #[tool(
-        description = "Manage JIRA issue comments. `action = \"list\"` returns comments as YAML; \
-                       `action = \"add\"` posts the given `body` (JFM markdown)."
+        description = "Manage JIRA issue comments on `key` (e.g. `PROJ-123`). \
+                       `action = \"list\"` returns comments as YAML; `action = \"add\"` posts the \
+                       given `body` (JFM markdown — GitHub-style, see resource \
+                       `omni-dev://specs/jfm`). To change the text of an existing comment use \
+                       `jira_comment_edit` (it needs the comment id from the `list` output)."
     )]
     pub async fn jira_comment(
         &self,
@@ -1244,8 +1257,11 @@ impl OmniDevServer {
 
     /// Tool: edit an existing JIRA comment.
     #[tool(
-        description = "Edit an existing JIRA comment. `body` is JFM markdown (see resource \
-                       `omni-dev://specs/jfm`) and replaces the current comment text. Optional \
+        description = "Edit an existing JIRA comment (identified by `key` + `comment_id`; get \
+                       the id from `jira_comment` with `action = \"list\"`). To add a new comment \
+                       or list comments use `jira_comment` instead. `body` is JFM markdown (see \
+                       resource `omni-dev://specs/jfm`) and replaces the current comment text. \
+                       Optional \
                        `visibility = {type: \"group\"|\"role\", value: <name>}` updates the \
                        restriction. JIRA enforces stricter permissions on edit than on add (often \
                        only the original author can edit) — when JIRA refuses, its error message \
@@ -1270,8 +1286,8 @@ impl OmniDevServer {
 
     /// Tool: fetch development status (PRs, branches, repositories) for an issue.
     #[tool(
-        description = "Fetch development status for a JIRA issue: linked pull requests, \
-                       branches, and repositories as YAML."
+        description = "Fetch development status for a JIRA issue by key (e.g. `PROJ-123`): \
+                       linked pull requests, branches, and repositories as YAML. Read-only."
     )]
     pub async fn jira_dev(
         &self,
