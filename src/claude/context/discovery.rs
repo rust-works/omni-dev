@@ -12,25 +12,30 @@ use crate::data::context::{
     Ecosystem, FeatureContext, ProjectContext, ProjectConventions, ScopeDefinition,
     ScopeRequirements,
 };
+use crate::utils::env::{EnvSource, SystemEnv};
 
 /// Returns the XDG-compliant config directory for omni-dev.
 ///
 /// Uses `$XDG_CONFIG_HOME/omni-dev/` if the variable is set, otherwise
-/// defaults to `$HOME/.config/omni-dev/` per the XDG Base Directory
+/// defaults to `{home}/.config/omni-dev/` per the XDG Base Directory
 /// Specification. Returns `None` if neither can be determined.
 ///
-/// Uses `std::env::var` directly rather than `dirs::config_dir()`, which
-/// returns `~/Library/Application Support/` on macOS — not the expected
-/// location for a CLI tool.
-fn xdg_config_dir() -> Option<PathBuf> {
-    if let Ok(xdg_home) = std::env::var("XDG_CONFIG_HOME") {
+/// Reads `XDG_CONFIG_HOME` from the injected `env` rather than via
+/// `dirs::config_dir()`, which returns `~/Library/Application Support/` on
+/// macOS — not the expected location for a CLI tool. Taking `env`/`home` as
+/// parameters keeps this resolver pure: production callers pass `&SystemEnv`
+/// and `dirs::home_dir()`, while tests pass a `MapEnv` (the `#[cfg(test)]`
+/// `crate::test_support::env::MapEnv`) and a temp `home` without mutating the
+/// environment (STYLE-0028, issue #821).
+fn xdg_config_dir_with(env: &impl EnvSource, home: Option<&Path>) -> Option<PathBuf> {
+    if let Some(xdg_home) = env.var("XDG_CONFIG_HOME") {
         if !xdg_home.is_empty() {
             return Some(PathBuf::from(xdg_home).join("omni-dev"));
         }
     }
 
     // Default: $HOME/.config/omni-dev/
-    dirs::home_dir().map(|home| home.join(".config").join("omni-dev"))
+    home.map(|home| home.join(".config").join("omni-dev"))
 }
 
 /// Resolves configuration file path with local override support and global fallback.
@@ -41,6 +46,19 @@ fn xdg_config_dir() -> Option<PathBuf> {
 /// 3. `$XDG_CONFIG_HOME/omni-dev/{filename}` (XDG global config)
 /// 4. `$HOME/.omni-dev/{filename}` (legacy global fallback)
 pub fn resolve_config_file(dir: &Path, filename: &str) -> PathBuf {
+    resolve_config_file_with(dir, filename, &SystemEnv, dirs::home_dir().as_deref())
+}
+
+/// Inner seam for [`resolve_config_file`]: the XDG and legacy-home tiers read
+/// from an injected `env`/`home` rather than process-global state, so tests
+/// drive the full priority chain without mutating the environment
+/// (STYLE-0028, issue #821).
+fn resolve_config_file_with(
+    dir: &Path,
+    filename: &str,
+    env: &impl EnvSource,
+    home: Option<&Path>,
+) -> PathBuf {
     let local_path = dir.join("local").join(filename);
     if local_path.exists() {
         return local_path;
@@ -52,7 +70,7 @@ pub fn resolve_config_file(dir: &Path, filename: &str) -> PathBuf {
     }
 
     // Check XDG config directory
-    if let Some(xdg_dir) = xdg_config_dir() {
+    if let Some(xdg_dir) = xdg_config_dir_with(env, home) {
         let xdg_path = xdg_dir.join(filename);
         if xdg_path.exists() {
             return xdg_path;
@@ -60,7 +78,7 @@ pub fn resolve_config_file(dir: &Path, filename: &str) -> PathBuf {
     }
 
     // Check legacy home directory fallback
-    if let Ok(home_dir) = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("No home directory")) {
+    if let Some(home_dir) = home {
         let home_path = home_dir.join(".omni-dev").join(filename);
         if home_path.exists() {
             return home_path;
@@ -126,11 +144,22 @@ impl fmt::Display for ConfigDirSource {
 /// 3. Walk-up: nearest `.omni-dev/` from CWD to repo root
 /// 4. `.omni-dev` default
 pub fn resolve_context_dir_with_source(override_dir: Option<&Path>) -> (PathBuf, ConfigDirSource) {
+    resolve_context_dir_with_source_env(override_dir, &SystemEnv)
+}
+
+/// Inner seam for [`resolve_context_dir_with_source`]: reads `OMNI_DEV_CONFIG_DIR`
+/// from an injected `env` rather than process-global state, so tests cover the
+/// env-var tier without mutating the environment (STYLE-0028, issue #821). The
+/// CWD walk-up tier still consults the (read-only) process working directory.
+fn resolve_context_dir_with_source_env(
+    override_dir: Option<&Path>,
+    env: &impl EnvSource,
+) -> (PathBuf, ConfigDirSource) {
     if let Some(dir) = override_dir {
         return (dir.to_path_buf(), ConfigDirSource::CliFlag);
     }
 
-    if let Ok(env_dir) = std::env::var("OMNI_DEV_CONFIG_DIR") {
+    if let Some(env_dir) = env.var("OMNI_DEV_CONFIG_DIR") {
         if !env_dir.is_empty() {
             return (PathBuf::from(env_dir), ConfigDirSource::EnvVar);
         }
@@ -164,11 +193,23 @@ pub fn resolve_context_dir_with_source_at(
     override_dir: Option<&Path>,
     repo_root: &Path,
 ) -> (PathBuf, ConfigDirSource) {
+    resolve_context_dir_with_source_at_env(override_dir, repo_root, &SystemEnv)
+}
+
+/// Inner seam for [`resolve_context_dir_with_source_at`]: reads
+/// `OMNI_DEV_CONFIG_DIR` from an injected `env` rather than process-global
+/// state. With `repo_root` already a parameter, this seam is fully pure — tests
+/// cover every tier without mutating the environment (STYLE-0028, issue #821).
+fn resolve_context_dir_with_source_at_env(
+    override_dir: Option<&Path>,
+    repo_root: &Path,
+    env: &impl EnvSource,
+) -> (PathBuf, ConfigDirSource) {
     if let Some(dir) = override_dir {
         return (dir.to_path_buf(), ConfigDirSource::CliFlag);
     }
 
-    if let Ok(env_dir) = std::env::var("OMNI_DEV_CONFIG_DIR") {
+    if let Some(env_dir) = env.var("OMNI_DEV_CONFIG_DIR") {
         if !env_dir.is_empty() {
             return (PathBuf::from(env_dir), ConfigDirSource::EnvVar);
         }
@@ -234,6 +275,18 @@ impl fmt::Display for ConfigSourceLabel {
 /// Checks each tier in priority order and returns the first match.
 /// Does not read file content — only checks existence.
 pub fn config_source_label(dir: &Path, filename: &str) -> ConfigSourceLabel {
+    config_source_label_with(dir, filename, &SystemEnv, dirs::home_dir().as_deref())
+}
+
+/// Inner seam for [`config_source_label`]: the XDG and global-home tiers read
+/// from an injected `env`/`home` rather than process-global state, so tests
+/// exercise every tier without mutating the environment (STYLE-0028, issue #821).
+fn config_source_label_with(
+    dir: &Path,
+    filename: &str,
+    env: &impl EnvSource,
+    home: Option<&Path>,
+) -> ConfigSourceLabel {
     let local_path = dir.join("local").join(filename);
     if local_path.exists() {
         return ConfigSourceLabel::LocalOverride(local_path);
@@ -244,14 +297,14 @@ pub fn config_source_label(dir: &Path, filename: &str) -> ConfigSourceLabel {
         return ConfigSourceLabel::Project(project_path);
     }
 
-    if let Some(xdg_dir) = xdg_config_dir() {
+    if let Some(xdg_dir) = xdg_config_dir_with(env, home) {
         let xdg_path = xdg_dir.join(filename);
         if xdg_path.exists() {
             return ConfigSourceLabel::Xdg(xdg_path);
         }
     }
 
-    if let Some(home_dir) = dirs::home_dir() {
+    if let Some(home_dir) = home {
         let home_path = home_dir.join(".omni-dev").join(filename);
         if home_path.exists() {
             return ConfigSourceLabel::Global(home_path);
@@ -807,6 +860,7 @@ fn extract_scopes_from_examples(line: &str) -> Vec<String> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::test_support::env::MapEnv;
     use tempfile::TempDir;
 
     // ── resolve_config_file ──────────────────────────────────────────
@@ -1031,14 +1085,13 @@ scopes:
 
     // ── resolve_context_dir ────────────────────────────────────────────
 
-    // Use a mutex to serialize tests that modify OMNI_DEV_CONFIG_DIR.
-    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // These tests inject a `MapEnv` into the `*_env` seam instead of mutating
+    // `OMNI_DEV_CONFIG_DIR`, so they need no lock and run fully in parallel
+    // (STYLE-0028, issue #821).
 
     #[test]
     fn context_dir_defaults_to_omni_dev() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        std::env::remove_var("OMNI_DEV_CONFIG_DIR");
-        let result = resolve_context_dir(None);
+        let result = resolve_context_dir_with_source_env(None, &MapEnv::new()).0;
         // Walk-up may find .omni-dev in the real repo, or fall back to ".omni-dev"
         assert!(
             result.ends_with(".omni-dev"),
@@ -1048,37 +1101,30 @@ scopes:
 
     #[test]
     fn context_dir_uses_override() {
-        let _lock = ENV_MUTEX.lock().unwrap();
         let custom = PathBuf::from("custom-config");
-        let result = resolve_context_dir(Some(&custom));
+        let result = resolve_context_dir_with_source_env(Some(&custom), &MapEnv::new()).0;
         assert_eq!(result, custom);
     }
 
     #[test]
     fn context_dir_env_var() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        std::env::set_var("OMNI_DEV_CONFIG_DIR", "/tmp/my-config");
-        let result = resolve_context_dir(None);
-        std::env::remove_var("OMNI_DEV_CONFIG_DIR");
+        let env = MapEnv::new().with("OMNI_DEV_CONFIG_DIR", "/tmp/my-config");
+        let result = resolve_context_dir_with_source_env(None, &env).0;
         assert_eq!(result, PathBuf::from("/tmp/my-config"));
     }
 
     #[test]
     fn context_dir_cli_flag_beats_env_var() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        std::env::set_var("OMNI_DEV_CONFIG_DIR", "/tmp/env-config");
+        let env = MapEnv::new().with("OMNI_DEV_CONFIG_DIR", "/tmp/env-config");
         let cli = PathBuf::from("cli-config");
-        let result = resolve_context_dir(Some(&cli));
-        std::env::remove_var("OMNI_DEV_CONFIG_DIR");
+        let result = resolve_context_dir_with_source_env(Some(&cli), &env).0;
         assert_eq!(result, cli);
     }
 
     #[test]
     fn context_dir_ignores_empty_env_var() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        std::env::set_var("OMNI_DEV_CONFIG_DIR", "");
-        let result = resolve_context_dir(None);
-        std::env::remove_var("OMNI_DEV_CONFIG_DIR");
+        let env = MapEnv::new().with("OMNI_DEV_CONFIG_DIR", "");
+        let result = resolve_context_dir_with_source_env(None, &env).0;
         // Walk-up may find .omni-dev in the real repo, or fall back to ".omni-dev"
         assert!(
             result.ends_with(".omni-dev"),
@@ -1090,39 +1136,32 @@ scopes:
 
     #[test]
     fn with_source_cli_flag() {
-        let _lock = ENV_MUTEX.lock().unwrap();
         let custom = PathBuf::from("custom-config");
-        let (path, source) = resolve_context_dir_with_source(Some(&custom));
+        let (path, source) = resolve_context_dir_with_source_env(Some(&custom), &MapEnv::new());
         assert_eq!(path, custom);
         assert_eq!(source, ConfigDirSource::CliFlag);
     }
 
     #[test]
     fn with_source_env_var() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        std::env::set_var("OMNI_DEV_CONFIG_DIR", "/tmp/env-config");
-        let (path, source) = resolve_context_dir_with_source(None);
-        std::env::remove_var("OMNI_DEV_CONFIG_DIR");
+        let env = MapEnv::new().with("OMNI_DEV_CONFIG_DIR", "/tmp/env-config");
+        let (path, source) = resolve_context_dir_with_source_env(None, &env);
         assert_eq!(path, PathBuf::from("/tmp/env-config"));
         assert_eq!(source, ConfigDirSource::EnvVar);
     }
 
     #[test]
     fn with_source_cli_beats_env() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        std::env::set_var("OMNI_DEV_CONFIG_DIR", "/tmp/env-config");
+        let env = MapEnv::new().with("OMNI_DEV_CONFIG_DIR", "/tmp/env-config");
         let custom = PathBuf::from("cli-config");
-        let (path, source) = resolve_context_dir_with_source(Some(&custom));
-        std::env::remove_var("OMNI_DEV_CONFIG_DIR");
+        let (path, source) = resolve_context_dir_with_source_env(Some(&custom), &env);
         assert_eq!(path, custom);
         assert_eq!(source, ConfigDirSource::CliFlag);
     }
 
     #[test]
     fn with_source_walk_up_or_default() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        std::env::remove_var("OMNI_DEV_CONFIG_DIR");
-        let (path, source) = resolve_context_dir_with_source(None);
+        let (path, source) = resolve_context_dir_with_source_env(None, &MapEnv::new());
         // Inside this repo, walk-up finds .omni-dev; outside, falls back to default
         assert!(
             path.ends_with(".omni-dev"),
@@ -1138,39 +1177,40 @@ scopes:
 
     #[test]
     fn with_source_at_cli_flag() {
-        let _lock = ENV_MUTEX.lock().unwrap();
         let custom = PathBuf::from("custom-config");
-        let (path, source) =
-            resolve_context_dir_with_source_at(Some(&custom), std::path::Path::new("/unused"));
+        let (path, source) = resolve_context_dir_with_source_at_env(
+            Some(&custom),
+            std::path::Path::new("/unused"),
+            &MapEnv::new(),
+        );
         assert_eq!(path, custom);
         assert_eq!(source, ConfigDirSource::CliFlag);
     }
 
     #[test]
     fn with_source_at_env_var() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        std::env::set_var("OMNI_DEV_CONFIG_DIR", "/tmp/env-config");
+        let env = MapEnv::new().with("OMNI_DEV_CONFIG_DIR", "/tmp/env-config");
         let (path, source) =
-            resolve_context_dir_with_source_at(None, std::path::Path::new("/unused"));
-        std::env::remove_var("OMNI_DEV_CONFIG_DIR");
+            resolve_context_dir_with_source_at_env(None, std::path::Path::new("/unused"), &env);
         assert_eq!(path, PathBuf::from("/tmp/env-config"));
         assert_eq!(source, ConfigDirSource::EnvVar);
     }
 
     #[test]
     fn with_source_at_default_anchors_to_repo_root() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        std::env::remove_var("OMNI_DEV_CONFIG_DIR");
         // A repo root with a `.git` boundary but no `.omni-dev`: walk-up stops at
         // the boundary without escaping, so the default anchors to
         // `repo_root/.omni-dev` (NOT the CWD-relative `.omni-dev`). This is the
         // distinguishing behavior of the `_at` variant vs. its CWD sibling.
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir(tmp.path().join(".git")).unwrap();
-        let (path, source) = resolve_context_dir_with_source_at(None, tmp.path());
+        let (path, source) =
+            resolve_context_dir_with_source_at_env(None, tmp.path(), &MapEnv::new());
         assert_eq!(path, tmp.path().join(".omni-dev"));
         assert_eq!(source, ConfigDirSource::Default);
-        // The thin wrapper returns the same path, discarding the source.
+        // The thin `resolve_context_dir_at` wrapper discards the source. It reads
+        // the real env, but no test mutates `OMNI_DEV_CONFIG_DIR` any more, so it
+        // is race-free and returns the same default path.
         assert_eq!(
             resolve_context_dir_at(None, tmp.path()),
             tmp.path().join(".omni-dev")
@@ -1342,41 +1382,41 @@ scopes:
 
     #[test]
     fn xdg_config_dir_uses_env_var() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", "/tmp/xdg-test");
-        let result = xdg_config_dir();
-        std::env::remove_var("XDG_CONFIG_HOME");
+        let env = MapEnv::new().with("XDG_CONFIG_HOME", "/tmp/xdg-test");
+        let result = xdg_config_dir_with(&env, None);
         assert_eq!(result, Some(PathBuf::from("/tmp/xdg-test/omni-dev")));
     }
 
     #[test]
     fn xdg_config_dir_ignores_empty_env_var() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", "");
-        let result = xdg_config_dir();
-        std::env::remove_var("XDG_CONFIG_HOME");
-        // Falls back to $HOME/.config/omni-dev
-        if let Some(home) = dirs::home_dir() {
-            assert_eq!(result, Some(home.join(".config").join("omni-dev")));
-        }
+        // An empty `XDG_CONFIG_HOME` falls back to `$HOME/.config/omni-dev`.
+        let env = MapEnv::new().with("XDG_CONFIG_HOME", "");
+        let home = Path::new("/test-home");
+        let result = xdg_config_dir_with(&env, Some(home));
+        assert_eq!(result, Some(home.join(".config").join("omni-dev")));
     }
 
     #[test]
     fn xdg_config_dir_defaults_to_home_config() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        std::env::remove_var("XDG_CONFIG_HOME");
-        let result = xdg_config_dir();
-        if let Some(home) = dirs::home_dir() {
-            assert_eq!(result, Some(home.join(".config").join("omni-dev")));
-        }
+        // With `XDG_CONFIG_HOME` unset, the injected home base is used.
+        let home = Path::new("/test-home");
+        let result = xdg_config_dir_with(&MapEnv::new(), Some(home));
+        assert_eq!(result, Some(home.join(".config").join("omni-dev")));
     }
 
     // ── resolve_config_file XDG integration ─────────────────────────────
 
+    /// Builds a `MapEnv` pointing `XDG_CONFIG_HOME` at `path`, for the
+    /// `resolve_config_file_with` / `config_source_label_with` seams.
+    fn xdg_env(path: &Path) -> MapEnv {
+        MapEnv::new().with(
+            "XDG_CONFIG_HOME",
+            path.to_str().expect("temp path is valid UTF-8"),
+        )
+    }
+
     #[test]
     fn resolve_config_file_finds_xdg() -> anyhow::Result<()> {
-        let _lock = ENV_MUTEX.lock().unwrap();
-
         let xdg_dir = {
             std::fs::create_dir_all("tmp")?;
             TempDir::new_in("tmp")?
@@ -1385,13 +1425,16 @@ scopes:
         std::fs::create_dir_all(&xdg_omni)?;
         std::fs::write(xdg_omni.join("commit-guidelines.md"), "xdg content")?;
 
-        std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
         let project_dir = {
             std::fs::create_dir_all("tmp")?;
             TempDir::new_in("tmp")?
         };
-        let resolved = resolve_config_file(project_dir.path(), "commit-guidelines.md");
-        std::env::remove_var("XDG_CONFIG_HOME");
+        let resolved = resolve_config_file_with(
+            project_dir.path(),
+            "commit-guidelines.md",
+            &xdg_env(xdg_dir.path()),
+            None,
+        );
 
         assert_eq!(resolved, xdg_omni.join("commit-guidelines.md"));
         Ok(())
@@ -1399,8 +1442,6 @@ scopes:
 
     #[test]
     fn resolve_config_file_xdg_beats_home() -> anyhow::Result<()> {
-        let _lock = ENV_MUTEX.lock().unwrap();
-
         // Set up XDG config
         let xdg_dir = {
             std::fs::create_dir_all("tmp")?;
@@ -1410,16 +1451,18 @@ scopes:
         std::fs::create_dir_all(&xdg_omni)?;
         std::fs::write(xdg_omni.join("scopes.yaml"), "xdg")?;
 
-        std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
-
         // Project dir with no local config
         let project_dir = {
             std::fs::create_dir_all("tmp")?;
             TempDir::new_in("tmp")?
         };
 
-        let resolved = resolve_config_file(project_dir.path(), "scopes.yaml");
-        std::env::remove_var("XDG_CONFIG_HOME");
+        let resolved = resolve_config_file_with(
+            project_dir.path(),
+            "scopes.yaml",
+            &xdg_env(xdg_dir.path()),
+            None,
+        );
 
         // XDG path should win (home path only wins if XDG doesn't have the file)
         assert_eq!(resolved, xdg_omni.join("scopes.yaml"));
@@ -1428,8 +1471,6 @@ scopes:
 
     #[test]
     fn resolve_config_file_project_beats_xdg() -> anyhow::Result<()> {
-        let _lock = ENV_MUTEX.lock().unwrap();
-
         // Set up XDG config
         let xdg_dir = {
             std::fs::create_dir_all("tmp")?;
@@ -1439,8 +1480,6 @@ scopes:
         std::fs::create_dir_all(&xdg_omni)?;
         std::fs::write(xdg_omni.join("scopes.yaml"), "xdg")?;
 
-        std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
-
         // Project dir with project-level config
         let project_dir = {
             std::fs::create_dir_all("tmp")?;
@@ -1448,8 +1487,12 @@ scopes:
         };
         std::fs::write(project_dir.path().join("scopes.yaml"), "project")?;
 
-        let resolved = resolve_config_file(project_dir.path(), "scopes.yaml");
-        std::env::remove_var("XDG_CONFIG_HOME");
+        let resolved = resolve_config_file_with(
+            project_dir.path(),
+            "scopes.yaml",
+            &xdg_env(xdg_dir.path()),
+            None,
+        );
 
         // Project path should win over XDG
         assert_eq!(resolved, project_dir.path().join("scopes.yaml"));
@@ -1460,8 +1503,6 @@ scopes:
 
     #[test]
     fn source_label_xdg() -> anyhow::Result<()> {
-        let _lock = ENV_MUTEX.lock().unwrap();
-
         let xdg_dir = {
             std::fs::create_dir_all("tmp")?;
             TempDir::new_in("tmp")?
@@ -1470,14 +1511,16 @@ scopes:
         std::fs::create_dir_all(&xdg_omni)?;
         std::fs::write(xdg_omni.join("scopes.yaml"), "xdg")?;
 
-        std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
-
         let project_dir = {
             std::fs::create_dir_all("tmp")?;
             TempDir::new_in("tmp")?
         };
-        let label = config_source_label(project_dir.path(), "scopes.yaml");
-        std::env::remove_var("XDG_CONFIG_HOME");
+        let label = config_source_label_with(
+            project_dir.path(),
+            "scopes.yaml",
+            &xdg_env(xdg_dir.path()),
+            None,
+        );
 
         assert_eq!(label, ConfigSourceLabel::Xdg(xdg_omni.join("scopes.yaml")));
         Ok(())
