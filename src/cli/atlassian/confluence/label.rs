@@ -21,11 +21,11 @@ pub struct LabelCommand {
 /// Label subcommands.
 #[derive(Subcommand)]
 pub enum LabelSubcommands {
-    /// Lists labels on a Confluence page.
+    /// Lists labels on a Confluence page (mirrors the `confluence_label_list` MCP tool).
     List(ListCommand),
-    /// Adds labels to a Confluence page.
+    /// Adds labels to a Confluence page (mirrors the `confluence_label_add` MCP tool).
     Add(AddCommand),
-    /// Removes labels from a Confluence page.
+    /// Removes labels from a Confluence page (mirrors the `confluence_label_remove` MCP tool).
     Remove(RemoveCommand),
 }
 

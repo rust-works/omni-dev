@@ -21,11 +21,11 @@ pub struct WatcherCommand {
 /// Watcher subcommands.
 #[derive(Subcommand)]
 pub enum WatcherSubcommands {
-    /// Lists current watchers on an issue.
+    /// Lists current watchers on an issue (mirrors the `jira_watcher_list` MCP tool).
     List(ListCommand),
-    /// Adds a user as a watcher on an issue.
+    /// Adds a user as a watcher on an issue (mirrors the `jira_watcher_add` MCP tool).
     Add(AddCommand),
-    /// Removes a user from watchers on an issue.
+    /// Removes a user from watchers on an issue (mirrors the `jira_watcher_remove` MCP tool).
     Remove(RemoveCommand),
 }
 

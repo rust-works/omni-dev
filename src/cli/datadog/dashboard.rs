@@ -21,9 +21,9 @@ pub struct DashboardCommand {
 /// Dashboard subcommands.
 #[derive(Subcommand)]
 pub enum DashboardSubcommands {
-    /// Lists dashboards, optionally filtered to shared dashboards.
+    /// Lists dashboards, optionally filtered to shared dashboards (mirrors the `datadog_dashboard_list` MCP tool).
     List(list::ListCommand),
-    /// Fetches a single dashboard definition by id.
+    /// Fetches a single dashboard definition by id (mirrors the `datadog_dashboard_get` MCP tool).
     Get(get::GetCommand),
 }
 

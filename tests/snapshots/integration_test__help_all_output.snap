@@ -193,9 +193,9 @@ Manages Claude Code skills across repositories and worktrees
 Usage: skills <COMMAND>
 
 Commands:
-  sync    Syncs skills from a source repository into one or more targets
-  clean   Removes skill symlinks and managed exclude block previously created by `sync`
-  status  Reports residue left by `sync` — symlinks and managed exclude-block entries
+  sync    Syncs skills from a source repository into one or more targets (mirrors the `claude_skills_sync` MCP tool)
+  clean   Removes skill symlinks and managed exclude block previously created by `sync` (mirrors the `claude_skills_clean` MCP tool)
+  status  Reports residue left by `sync` — symlinks and managed exclude-block entries (mirrors the `claude_skills_status` MCP tool)
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -204,9 +204,9 @@ Options:
 
 ================================================================================
 
-omni-dev ai claude skills clean - Removes skill symlinks and managed exclude block previously created by `sync`
+omni-dev ai claude skills clean - Removes skill symlinks and managed exclude block previously created by `sync` (mirrors the `claude_skills_clean` MCP tool)
 
-Removes skill symlinks and managed exclude block previously created by `sync`
+Removes skill symlinks and managed exclude block previously created by `sync` (mirrors the `claude_skills_clean` MCP tool)
 
 Usage: clean [OPTIONS]
 
@@ -220,9 +220,9 @@ Options:
 
 ================================================================================
 
-omni-dev ai claude skills status - Reports residue left by `sync` — symlinks and managed exclude-block entries
+omni-dev ai claude skills status - Reports residue left by `sync` — symlinks and managed exclude-block entries (mirrors the `claude_skills_status` MCP tool)
 
-Reports residue left by `sync` — symlinks and managed exclude-block entries
+Reports residue left by `sync` — symlinks and managed exclude-block entries (mirrors the `claude_skills_status` MCP tool)
 
 Usage: status [OPTIONS]
 
@@ -235,9 +235,9 @@ Options:
 
 ================================================================================
 
-omni-dev ai claude skills sync - Syncs skills from a source repository into one or more targets
+omni-dev ai claude skills sync - Syncs skills from a source repository into one or more targets (mirrors the `claude_skills_sync` MCP tool)
 
-Syncs skills from a source repository into one or more targets
+Syncs skills from a source repository into one or more targets (mirrors the `claude_skills_sync` MCP tool)
 
 Usage: sync [OPTIONS]
 
@@ -279,7 +279,7 @@ Usage: auth <COMMAND>
 
 Commands:
   login   Configures Atlassian Cloud credentials interactively
-  status  Shows the current authentication status
+  status  Shows the current authentication status (mirrors the `atlassian_auth_status` MCP tool)
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -300,9 +300,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian auth status - Shows the current authentication status
+omni-dev atlassian auth status - Shows the current authentication status (mirrors the `atlassian_auth_status` MCP tool)
 
-Shows the current authentication status
+Shows the current authentication status (mirrors the `atlassian_auth_status` MCP tool)
 
 Usage: status
 
@@ -320,18 +320,18 @@ Usage: confluence <COMMAND>
 
 Commands:
   comment     Manages comments on a Confluence page
-  read        Fetches a Confluence page and outputs it as JFM markdown or ADF JSON
-  write       Pushes content to a Confluence page
+  read        Fetches a Confluence page and outputs it as JFM markdown or ADF JSON (mirrors the `confluence_read` MCP tool)
+  write       Pushes content to a Confluence page (mirrors the `confluence_write` MCP tool)
   edit        Interactive fetch-edit-push cycle for a Confluence page
-  search      Searches Confluence pages using CQL
-  create      Creates a new Confluence page
-  delete      Deletes a Confluence page
-  move        Moves or reparents a Confluence page (same-space only)
+  search      Searches Confluence pages using CQL (mirrors the `confluence_search` MCP tool)
+  create      Creates a new Confluence page (mirrors the `confluence_create` MCP tool)
+  delete      Deletes a Confluence page (mirrors the `confluence_delete` MCP tool)
+  move        Moves or reparents a Confluence page (same-space only) (mirrors the `confluence_move` MCP tool)
   label       Manages labels on Confluence pages
   attachment  Manages attachments on Confluence pages
-  download    Recursively downloads a Confluence page tree
-  children    Lists child pages of a Confluence page or top-level pages in a space
-  history     Lists version history (metadata) for a Confluence page
+  download    Recursively downloads a Confluence page tree (mirrors the `confluence_download` MCP tool)
+  children    Lists child pages of a Confluence page or top-level pages in a space (mirrors the `confluence_children` MCP tool)
+  history     Lists version history (metadata) for a Confluence page (mirrors the `confluence_history` MCP tool)
   compare     Compares two versions of a Confluence page (structural diff)
   user        Confluence user operations
   space       Confluence space operations
@@ -350,10 +350,10 @@ Manages attachments on Confluence pages
 Usage: attachment <COMMAND>
 
 Commands:
-  upload    Uploads a file as an attachment to a Confluence page
-  list      Lists attachments on a Confluence page
-  download  Downloads an attachment binary by ID
-  delete    Deletes an attachment by ID
+  upload    Uploads a file as an attachment to a Confluence page (mirrors the `confluence_attachment_upload` MCP tool)
+  list      Lists attachments on a Confluence page (mirrors the `confluence_attachment_list` MCP tool)
+  download  Downloads an attachment binary by ID (mirrors the `confluence_attachment_download` MCP tool)
+  delete    Deletes an attachment by ID (mirrors the `confluence_attachment_delete` MCP tool)
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -362,9 +362,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian confluence attachment delete - Deletes an attachment by ID
+omni-dev atlassian confluence attachment delete - Deletes an attachment by ID (mirrors the `confluence_attachment_delete` MCP tool)
 
-Deletes an attachment by ID
+Deletes an attachment by ID (mirrors the `confluence_attachment_delete` MCP tool)
 
 Usage: delete [OPTIONS] <ATTACHMENT_ID>
 
@@ -379,9 +379,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian confluence attachment download - Downloads an attachment binary by ID
+omni-dev atlassian confluence attachment download - Downloads an attachment binary by ID (mirrors the `confluence_attachment_download` MCP tool)
 
-Downloads an attachment binary by ID
+Downloads an attachment binary by ID (mirrors the `confluence_attachment_download` MCP tool)
 
 Usage: download [OPTIONS] <ATTACHMENT_ID>
 
@@ -395,9 +395,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian confluence attachment list - Lists attachments on a Confluence page
+omni-dev atlassian confluence attachment list - Lists attachments on a Confluence page (mirrors the `confluence_attachment_list` MCP tool)
 
-Lists attachments on a Confluence page
+Lists attachments on a Confluence page (mirrors the `confluence_attachment_list` MCP tool)
 
 Usage: list [OPTIONS] <PAGE_ID>
 
@@ -413,9 +413,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian confluence attachment upload - Uploads a file as an attachment to a Confluence page
+omni-dev atlassian confluence attachment upload - Uploads a file as an attachment to a Confluence page (mirrors the `confluence_attachment_upload` MCP tool)
 
-Uploads a file as an attachment to a Confluence page
+Uploads a file as an attachment to a Confluence page (mirrors the `confluence_attachment_upload` MCP tool)
 
 Usage: upload [OPTIONS] <PAGE_ID> <FILE>
 
@@ -432,9 +432,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian confluence children - Lists child pages of a Confluence page or top-level pages in a space
+omni-dev atlassian confluence children - Lists child pages of a Confluence page or top-level pages in a space (mirrors the `confluence_children` MCP tool)
 
-Lists child pages of a Confluence page or top-level pages in a space
+Lists child pages of a Confluence page or top-level pages in a space (mirrors the `confluence_children` MCP tool)
 
 Usage: children [OPTIONS] [ID]
 
@@ -458,10 +458,10 @@ Manages comments on a Confluence page
 Usage: comment <COMMAND>
 
 Commands:
-  list        Lists comments on a Confluence page
-  add         Adds a footer comment to a Confluence page
-  add-inline  Adds an inline (anchored) comment to a Confluence page
-  replies     Lists the replies of a comment
+  list        Lists comments on a Confluence page (mirrors the `confluence_comment_list` MCP tool)
+  add         Adds a footer comment to a Confluence page (mirrors the `confluence_comment_add` MCP tool)
+  add-inline  Adds an inline (anchored) comment to a Confluence page (mirrors the `confluence_comment_add_inline` MCP tool)
+  replies     Lists the replies of a comment (mirrors the `confluence_comment_replies` MCP tool)
   help        Print this message or the help of the given subcommand(s)
 
 Options:
@@ -470,9 +470,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian confluence comment add - Adds a footer comment to a Confluence page
+omni-dev atlassian confluence comment add - Adds a footer comment to a Confluence page (mirrors the `confluence_comment_add` MCP tool)
 
-Adds a footer comment to a Confluence page
+Adds a footer comment to a Confluence page (mirrors the `confluence_comment_add` MCP tool)
 
 Usage: add [OPTIONS] <ID> [FILE]
 
@@ -487,9 +487,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian confluence comment add-inline - Adds an inline (anchored) comment to a Confluence page
+omni-dev atlassian confluence comment add-inline - Adds an inline (anchored) comment to a Confluence page (mirrors the `confluence_comment_add_inline` MCP tool)
 
-Adds an inline (anchored) comment to a Confluence page
+Adds an inline (anchored) comment to a Confluence page (mirrors the `confluence_comment_add_inline` MCP tool)
 
 Usage: add-inline [OPTIONS] --anchor-text <ANCHOR_TEXT> <ID> [FILE]
 
@@ -506,9 +506,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian confluence comment list - Lists comments on a Confluence page
+omni-dev atlassian confluence comment list - Lists comments on a Confluence page (mirrors the `confluence_comment_list` MCP tool)
 
-Lists comments on a Confluence page
+Lists comments on a Confluence page (mirrors the `confluence_comment_list` MCP tool)
 
 Usage: list [OPTIONS] <ID>
 
@@ -524,9 +524,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian confluence comment replies - Lists the replies of a comment
+omni-dev atlassian confluence comment replies - Lists the replies of a comment (mirrors the `confluence_comment_replies` MCP tool)
 
-Lists the replies of a comment
+Lists the replies of a comment (mirrors the `confluence_comment_replies` MCP tool)
 
 Usage: replies [OPTIONS] --kind <KIND> <ID>
 
@@ -549,8 +549,8 @@ Compares two versions of a Confluence page (structural diff)
 Usage: compare <COMMAND>
 
 Commands:
-  run      Diff two versions of a Confluence page
-  section  Drill in to a section diff using a cursor from a prior `run`
+  run      Diff two versions of a Confluence page (mirrors the `confluence_compare` MCP tool)
+  section  Drill in to a section diff using a cursor from a prior `run` (mirrors the `confluence_compare_section` MCP tool)
   help     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -559,9 +559,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian confluence compare run - Diff two versions of a Confluence page
+omni-dev atlassian confluence compare run - Diff two versions of a Confluence page (mirrors the `confluence_compare` MCP tool)
 
-Diff two versions of a Confluence page
+Diff two versions of a Confluence page (mirrors the `confluence_compare` MCP tool)
 
 Usage: run [OPTIONS] <ID>
 
@@ -593,9 +593,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian confluence compare section - Drill in to a section diff using a cursor from a prior `run`
+omni-dev atlassian confluence compare section - Drill in to a section diff using a cursor from a prior `run` (mirrors the `confluence_compare_section` MCP tool)
 
-Drill in to a section diff using a cursor from a prior `run`
+Drill in to a section diff using a cursor from a prior `run` (mirrors the `confluence_compare_section` MCP tool)
 
 Usage: section [OPTIONS] --cursor <CURSOR>
 
@@ -607,9 +607,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian confluence create - Creates a new Confluence page
+omni-dev atlassian confluence create - Creates a new Confluence page (mirrors the `confluence_create` MCP tool)
 
-Creates a new Confluence page
+Creates a new Confluence page (mirrors the `confluence_create` MCP tool)
 
 Usage: create [OPTIONS] [FILE]
 
@@ -627,9 +627,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian confluence delete - Deletes a Confluence page
+omni-dev atlassian confluence delete - Deletes a Confluence page (mirrors the `confluence_delete` MCP tool)
 
-Deletes a Confluence page
+Deletes a Confluence page (mirrors the `confluence_delete` MCP tool)
 
 Usage: delete [OPTIONS] <ID>
 
@@ -645,9 +645,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian confluence download - Recursively downloads a Confluence page tree
+omni-dev atlassian confluence download - Recursively downloads a Confluence page tree (mirrors the `confluence_download` MCP tool)
 
-Recursively downloads a Confluence page tree
+Recursively downloads a Confluence page tree (mirrors the `confluence_download` MCP tool)
 
 Usage: download [OPTIONS] <ID|--space <SPACE>>
 
@@ -684,9 +684,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian confluence history - Lists version history (metadata) for a Confluence page
+omni-dev atlassian confluence history - Lists version history (metadata) for a Confluence page (mirrors the `confluence_history` MCP tool)
 
-Lists version history (metadata) for a Confluence page
+Lists version history (metadata) for a Confluence page (mirrors the `confluence_history` MCP tool)
 
 Usage: history [OPTIONS] <ID>
 
@@ -709,9 +709,9 @@ Manages labels on Confluence pages
 Usage: label <COMMAND>
 
 Commands:
-  list    Lists labels on a Confluence page
-  add     Adds labels to a Confluence page
-  remove  Removes labels from a Confluence page
+  list    Lists labels on a Confluence page (mirrors the `confluence_label_list` MCP tool)
+  add     Adds labels to a Confluence page (mirrors the `confluence_label_add` MCP tool)
+  remove  Removes labels from a Confluence page (mirrors the `confluence_label_remove` MCP tool)
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -720,9 +720,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian confluence label add - Adds labels to a Confluence page
+omni-dev atlassian confluence label add - Adds labels to a Confluence page (mirrors the `confluence_label_add` MCP tool)
 
-Adds labels to a Confluence page
+Adds labels to a Confluence page (mirrors the `confluence_label_add` MCP tool)
 
 Usage: add --labels <LABELS> <ID>
 
@@ -736,9 +736,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian confluence label list - Lists labels on a Confluence page
+omni-dev atlassian confluence label list - Lists labels on a Confluence page (mirrors the `confluence_label_list` MCP tool)
 
-Lists labels on a Confluence page
+Lists labels on a Confluence page (mirrors the `confluence_label_list` MCP tool)
 
 Usage: list [OPTIONS] <ID>
 
@@ -752,9 +752,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian confluence label remove - Removes labels from a Confluence page
+omni-dev atlassian confluence label remove - Removes labels from a Confluence page (mirrors the `confluence_label_remove` MCP tool)
 
-Removes labels from a Confluence page
+Removes labels from a Confluence page (mirrors the `confluence_label_remove` MCP tool)
 
 Usage: remove [OPTIONS] --labels <LABELS> <ID>
 
@@ -770,9 +770,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian confluence move - Moves or reparents a Confluence page (same-space only)
+omni-dev atlassian confluence move - Moves or reparents a Confluence page (same-space only) (mirrors the `confluence_move` MCP tool)
 
-Moves or reparents a Confluence page (same-space only)
+Moves or reparents a Confluence page (same-space only) (mirrors the `confluence_move` MCP tool)
 
 Usage: move [OPTIONS] --target <TARGET> <ID>
 
@@ -787,9 +787,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian confluence read - Fetches a Confluence page and outputs it as JFM markdown or ADF JSON
+omni-dev atlassian confluence read - Fetches a Confluence page and outputs it as JFM markdown or ADF JSON (mirrors the `confluence_read` MCP tool)
 
-Fetches a Confluence page and outputs it as JFM markdown or ADF JSON
+Fetches a Confluence page and outputs it as JFM markdown or ADF JSON (mirrors the `confluence_read` MCP tool)
 
 Usage: read [OPTIONS] <ID>
 
@@ -804,9 +804,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian confluence search - Searches Confluence pages using CQL
+omni-dev atlassian confluence search - Searches Confluence pages using CQL (mirrors the `confluence_search` MCP tool)
 
-Searches Confluence pages using CQL
+Searches Confluence pages using CQL (mirrors the `confluence_search` MCP tool)
 
 Usage: search [OPTIONS]
 
@@ -828,8 +828,8 @@ Confluence space operations
 Usage: space <COMMAND>
 
 Commands:
-  list   Lists Confluence spaces
-  pages  Enumerates pages within a Confluence space
+  list   Lists Confluence spaces (mirrors the `confluence_space_list` MCP tool)
+  pages  Enumerates pages within a Confluence space (mirrors the `confluence_space_pages` MCP tool)
   help   Print this message or the help of the given subcommand(s)
 
 Options:
@@ -838,9 +838,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian confluence space list - Lists Confluence spaces
+omni-dev atlassian confluence space list - Lists Confluence spaces (mirrors the `confluence_space_list` MCP tool)
 
-Lists Confluence spaces
+Lists Confluence spaces (mirrors the `confluence_space_list` MCP tool)
 
 Usage: list [OPTIONS]
 
@@ -856,9 +856,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian confluence space pages - Enumerates pages within a Confluence space
+omni-dev atlassian confluence space pages - Enumerates pages within a Confluence space (mirrors the `confluence_space_pages` MCP tool)
 
-Enumerates pages within a Confluence space
+Enumerates pages within a Confluence space (mirrors the `confluence_space_pages` MCP tool)
 
 Usage: pages [OPTIONS] <KEY>
 
@@ -883,7 +883,7 @@ Confluence user operations
 Usage: user <COMMAND>
 
 Commands:
-  search  Searches Confluence users by display name or email
+  search  Searches Confluence users by display name or email (mirrors the `confluence_user_search` MCP tool)
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -892,9 +892,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian confluence user search - Searches Confluence users by display name or email
+omni-dev atlassian confluence user search - Searches Confluence users by display name or email (mirrors the `confluence_user_search` MCP tool)
 
-Searches Confluence users by display name or email
+Searches Confluence users by display name or email (mirrors the `confluence_user_search` MCP tool)
 
 Usage: search [OPTIONS] --query <QUERY>
 
@@ -907,9 +907,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian confluence write - Pushes content to a Confluence page
+omni-dev atlassian confluence write - Pushes content to a Confluence page (mirrors the `confluence_write` MCP tool)
 
-Pushes content to a Confluence page
+Pushes content to a Confluence page (mirrors the `confluence_write` MCP tool)
 
 Usage: write [OPTIONS] <ID> [FILE]
 
@@ -933,8 +933,8 @@ Converts between JFM markdown and ADF JSON
 Usage: convert <COMMAND>
 
 Commands:
-  to-adf    Converts JFM markdown to ADF JSON
-  from-adf  Converts ADF JSON to JFM markdown
+  to-adf    Converts JFM markdown to ADF JSON (mirrors the `atlassian_convert` MCP tool)
+  from-adf  Converts ADF JSON to JFM markdown (mirrors the `atlassian_convert` MCP tool)
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -943,9 +943,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian convert from-adf - Converts ADF JSON to JFM markdown
+omni-dev atlassian convert from-adf - Converts ADF JSON to JFM markdown (mirrors the `atlassian_convert` MCP tool)
 
-Converts ADF JSON to JFM markdown
+Converts ADF JSON to JFM markdown (mirrors the `atlassian_convert` MCP tool)
 
 Usage: from-adf [OPTIONS] [FILE]
 
@@ -959,9 +959,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian convert to-adf - Converts JFM markdown to ADF JSON
+omni-dev atlassian convert to-adf - Converts JFM markdown to ADF JSON (mirrors the `atlassian_convert` MCP tool)
 
-Converts JFM markdown to ADF JSON
+Converts JFM markdown to ADF JSON (mirrors the `atlassian_convert` MCP tool)
 
 Usage: to-adf [OPTIONS] [FILE]
 
@@ -983,21 +983,21 @@ JIRA issue management, search, agile boards, and more
 Usage: jira <COMMAND>
 
 Commands:
-  read        Fetches a JIRA issue and outputs it as JFM markdown or ADF JSON
-  write       Pushes content to a JIRA issue
+  read        Fetches a JIRA issue and outputs it as JFM markdown or ADF JSON (mirrors the `jira_read` MCP tool)
+  write       Pushes content to a JIRA issue (mirrors the `jira_write` MCP tool)
   edit        Interactive fetch-edit-push cycle for a JIRA issue
-  search      Searches JIRA issues using JQL
-  create      Creates a new JIRA issue
+  search      Searches JIRA issues using JQL (mirrors the `jira_search` MCP tool)
+  create      Creates a new JIRA issue (mirrors the `jira_create` MCP tool)
   transition  Lists or executes workflow transitions on a JIRA issue
   comment     Manages comments on a JIRA issue
-  delete      Deletes a JIRA issue
-  dev         Shows development status (linked PRs, branches, repositories) for a JIRA issue
+  delete      Deletes a JIRA issue (mirrors the `jira_delete` MCP tool)
+  dev         Shows development status (linked PRs, branches, repositories) for a JIRA issue (mirrors the `jira_dev` MCP tool)
   project     Lists JIRA projects
   field       Manages JIRA field definitions and options
   board       Manages JIRA agile boards
   sprint      Manages JIRA agile sprints
   link        Manages JIRA issue links
-  changelog   Shows change history for JIRA issues
+  changelog   Shows change history for JIRA issues (mirrors the `jira_changelog` MCP tool)
   attachment  Downloads JIRA issue attachments
   watcher     Manages watchers on a JIRA issue
   worklog     Manages worklogs (time tracking) on a JIRA issue
@@ -1018,8 +1018,8 @@ Downloads JIRA issue attachments
 Usage: attachment <COMMAND>
 
 Commands:
-  download  Downloads all attachments (or filtered by pattern)
-  images    Downloads only image attachments
+  download  Downloads all attachments (or filtered by pattern) (mirrors the `jira_attachment_download` MCP tool)
+  images    Downloads only image attachments (mirrors the `jira_attachment_images` MCP tool)
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1028,9 +1028,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira attachment download - Downloads all attachments (or filtered by pattern)
+omni-dev atlassian jira attachment download - Downloads all attachments (or filtered by pattern) (mirrors the `jira_attachment_download` MCP tool)
 
-Downloads all attachments (or filtered by pattern)
+Downloads all attachments (or filtered by pattern) (mirrors the `jira_attachment_download` MCP tool)
 
 Usage: download [OPTIONS] <KEY>
 
@@ -1045,9 +1045,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira attachment images - Downloads only image attachments
+omni-dev atlassian jira attachment images - Downloads only image attachments (mirrors the `jira_attachment_images` MCP tool)
 
-Downloads only image attachments
+Downloads only image attachments (mirrors the `jira_attachment_images` MCP tool)
 
 Usage: images [OPTIONS] <KEY>
 
@@ -1068,8 +1068,8 @@ Manages JIRA agile boards
 Usage: board <COMMAND>
 
 Commands:
-  list    Lists agile boards
-  issues  Lists issues on a board
+  list    Lists agile boards (mirrors the `jira_board_list` MCP tool)
+  issues  Lists issues on a board (mirrors the `jira_board_issues` MCP tool)
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1078,9 +1078,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira board issues - Lists issues on a board
+omni-dev atlassian jira board issues - Lists issues on a board (mirrors the `jira_board_issues` MCP tool)
 
-Lists issues on a board
+Lists issues on a board (mirrors the `jira_board_issues` MCP tool)
 
 Usage: issues [OPTIONS] --board-id <BOARD_ID>
 
@@ -1094,9 +1094,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira board list - Lists agile boards
+omni-dev atlassian jira board list - Lists agile boards (mirrors the `jira_board_list` MCP tool)
 
-Lists agile boards
+Lists agile boards (mirrors the `jira_board_list` MCP tool)
 
 Usage: list [OPTIONS]
 
@@ -1110,9 +1110,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira changelog - Shows change history for JIRA issues
+omni-dev atlassian jira changelog - Shows change history for JIRA issues (mirrors the `jira_changelog` MCP tool)
 
-Shows change history for JIRA issues
+Shows change history for JIRA issues (mirrors the `jira_changelog` MCP tool)
 
 Usage: changelog [OPTIONS] <KEYS>
 
@@ -1134,9 +1134,9 @@ Manages comments on a JIRA issue
 Usage: comment <COMMAND>
 
 Commands:
-  list  Lists comments on a JIRA issue
-  add   Adds a comment to a JIRA issue
-  edit  Edits an existing comment on a JIRA issue
+  list  Lists comments on a JIRA issue (mirrors the `jira_comment` MCP tool with `action: list`)
+  add   Adds a comment to a JIRA issue (mirrors the `jira_comment` MCP tool with `action: add`)
+  edit  Edits an existing comment on a JIRA issue (mirrors the `jira_comment_edit` MCP tool)
   help  Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1145,9 +1145,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira comment add - Adds a comment to a JIRA issue
+omni-dev atlassian jira comment add - Adds a comment to a JIRA issue (mirrors the `jira_comment` MCP tool with `action: add`)
 
-Adds a comment to a JIRA issue
+Adds a comment to a JIRA issue (mirrors the `jira_comment` MCP tool with `action: add`)
 
 Usage: add [OPTIONS] <KEY> [FILE]
 
@@ -1162,9 +1162,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira comment edit - Edits an existing comment on a JIRA issue
+omni-dev atlassian jira comment edit - Edits an existing comment on a JIRA issue (mirrors the `jira_comment_edit` MCP tool)
 
-Edits an existing comment on a JIRA issue
+Edits an existing comment on a JIRA issue (mirrors the `jira_comment_edit` MCP tool)
 
 Usage: edit [OPTIONS] <KEY> <COMMENT_ID> [FILE]
 
@@ -1186,9 +1186,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira comment list - Lists comments on a JIRA issue
+omni-dev atlassian jira comment list - Lists comments on a JIRA issue (mirrors the `jira_comment` MCP tool with `action: list`)
 
-Lists comments on a JIRA issue
+Lists comments on a JIRA issue (mirrors the `jira_comment` MCP tool with `action: list`)
 
 Usage: list [OPTIONS] <KEY>
 
@@ -1203,9 +1203,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira create - Creates a new JIRA issue
+omni-dev atlassian jira create - Creates a new JIRA issue (mirrors the `jira_create` MCP tool)
 
-Creates a new JIRA issue
+Creates a new JIRA issue (mirrors the `jira_create` MCP tool)
 
 Usage: create [OPTIONS] [FILE]
 
@@ -1240,9 +1240,9 @@ ADF INPUT (--format adf):
 
 ================================================================================
 
-omni-dev atlassian jira delete - Deletes a JIRA issue
+omni-dev atlassian jira delete - Deletes a JIRA issue (mirrors the `jira_delete` MCP tool)
 
-Deletes a JIRA issue
+Deletes a JIRA issue (mirrors the `jira_delete` MCP tool)
 
 Usage: delete [OPTIONS] <KEY>
 
@@ -1257,9 +1257,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira dev - Shows development status (linked PRs, branches, repositories) for a JIRA issue
+omni-dev atlassian jira dev - Shows development status (linked PRs, branches, repositories) for a JIRA issue (mirrors the `jira_dev` MCP tool)
 
-Shows development status (linked PRs, branches, repositories) for a JIRA issue
+Shows development status (linked PRs, branches, repositories) for a JIRA issue (mirrors the `jira_dev` MCP tool)
 
 Usage: dev [OPTIONS] <KEY>
 
@@ -1298,8 +1298,8 @@ Manages JIRA field definitions and options
 Usage: field <COMMAND>
 
 Commands:
-  list     Lists all field definitions
-  options  Shows options for a custom field
+  list     Lists all field definitions (mirrors the `jira_field_list` MCP tool)
+  options  Shows options for a custom field (mirrors the `jira_field_options` MCP tool)
   help     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1308,9 +1308,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira field list - Lists all field definitions
+omni-dev atlassian jira field list - Lists all field definitions (mirrors the `jira_field_list` MCP tool)
 
-Lists all field definitions
+Lists all field definitions (mirrors the `jira_field_list` MCP tool)
 
 Usage: list [OPTIONS]
 
@@ -1322,9 +1322,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira field options - Shows options for a custom field
+omni-dev atlassian jira field options - Shows options for a custom field (mirrors the `jira_field_options` MCP tool)
 
-Shows options for a custom field
+Shows options for a custom field (mirrors the `jira_field_options` MCP tool)
 
 Usage: options [OPTIONS] --field-id <FIELD_ID>
 
@@ -1470,8 +1470,8 @@ Lists JIRA projects
 Usage: project <COMMAND>
 
 Commands:
-  list         Lists all accessible JIRA projects
-  create-meta  Shows the create-screen fields for a project + issue type
+  list         Lists all accessible JIRA projects (mirrors the `jira_project_list` MCP tool)
+  create-meta  Shows the create-screen fields for a project + issue type (mirrors the `jira_project_create_meta` MCP tool)
   help         Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1480,9 +1480,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira project create-meta - Shows the create-screen fields for a project + issue type
+omni-dev atlassian jira project create-meta - Shows the create-screen fields for a project + issue type (mirrors the `jira_project_create_meta` MCP tool)
 
-Shows the create-screen fields for a project + issue type
+Shows the create-screen fields for a project + issue type (mirrors the `jira_project_create_meta` MCP tool)
 
 Usage: create-meta [OPTIONS] --project <PROJECT> --issue-type <ISSUE_TYPE>
 
@@ -1495,9 +1495,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira project list - Lists all accessible JIRA projects
+omni-dev atlassian jira project list - Lists all accessible JIRA projects (mirrors the `jira_project_list` MCP tool)
 
-Lists all accessible JIRA projects
+Lists all accessible JIRA projects (mirrors the `jira_project_list` MCP tool)
 
 Usage: list [OPTIONS]
 
@@ -1509,9 +1509,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira read - Fetches a JIRA issue and outputs it as JFM markdown or ADF JSON
+omni-dev atlassian jira read - Fetches a JIRA issue and outputs it as JFM markdown or ADF JSON (mirrors the `jira_read` MCP tool)
 
-Fetches a JIRA issue and outputs it as JFM markdown or ADF JSON
+Fetches a JIRA issue and outputs it as JFM markdown or ADF JSON (mirrors the `jira_read` MCP tool)
 
 Usage: read [OPTIONS] <KEY>
 
@@ -1528,9 +1528,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira search - Searches JIRA issues using JQL
+omni-dev atlassian jira search - Searches JIRA issues using JQL (mirrors the `jira_search` MCP tool)
 
-Searches JIRA issues using JQL
+Searches JIRA issues using JQL (mirrors the `jira_search` MCP tool)
 
 Usage: search [OPTIONS]
 
@@ -1553,11 +1553,11 @@ Manages JIRA agile sprints
 Usage: sprint <COMMAND>
 
 Commands:
-  list    Lists sprints for a board
-  issues  Lists issues in a sprint
-  add     Adds issues to a sprint
-  create  Creates a new sprint
-  update  Updates an existing sprint
+  list    Lists sprints for a board (mirrors the `jira_sprint_list` MCP tool)
+  issues  Lists issues in a sprint (mirrors the `jira_sprint_issues` MCP tool)
+  add     Adds issues to a sprint (mirrors the `jira_sprint_add` MCP tool)
+  create  Creates a new sprint (mirrors the `jira_sprint_create` MCP tool)
+  update  Updates an existing sprint (mirrors the `jira_sprint_update` MCP tool)
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1566,9 +1566,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira sprint add - Adds issues to a sprint
+omni-dev atlassian jira sprint add - Adds issues to a sprint (mirrors the `jira_sprint_add` MCP tool)
 
-Adds issues to a sprint
+Adds issues to a sprint (mirrors the `jira_sprint_add` MCP tool)
 
 Usage: add --sprint-id <SPRINT_ID> --issues <ISSUES>
 
@@ -1580,9 +1580,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira sprint create - Creates a new sprint
+omni-dev atlassian jira sprint create - Creates a new sprint (mirrors the `jira_sprint_create` MCP tool)
 
-Creates a new sprint
+Creates a new sprint (mirrors the `jira_sprint_create` MCP tool)
 
 Usage: create [OPTIONS] --board-id <BOARD_ID> --name <NAME>
 
@@ -1597,9 +1597,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira sprint issues - Lists issues in a sprint
+omni-dev atlassian jira sprint issues - Lists issues in a sprint (mirrors the `jira_sprint_issues` MCP tool)
 
-Lists issues in a sprint
+Lists issues in a sprint (mirrors the `jira_sprint_issues` MCP tool)
 
 Usage: issues [OPTIONS] --sprint-id <SPRINT_ID>
 
@@ -1613,9 +1613,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira sprint list - Lists sprints for a board
+omni-dev atlassian jira sprint list - Lists sprints for a board (mirrors the `jira_sprint_list` MCP tool)
 
-Lists sprints for a board
+Lists sprints for a board (mirrors the `jira_sprint_list` MCP tool)
 
 Usage: list [OPTIONS] --board-id <BOARD_ID>
 
@@ -1629,9 +1629,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira sprint update - Updates an existing sprint
+omni-dev atlassian jira sprint update - Updates an existing sprint (mirrors the `jira_sprint_update` MCP tool)
 
-Updates an existing sprint
+Updates an existing sprint (mirrors the `jira_sprint_update` MCP tool)
 
 Usage: update [OPTIONS] --sprint-id <SPRINT_ID>
 
@@ -1654,8 +1654,8 @@ Lists or executes workflow transitions on a JIRA issue
 Usage: transition <COMMAND>
 
 Commands:
-  list     Lists workflow transitions available from the issue's current status
-  execute  Executes a workflow transition on a JIRA issue
+  list     Lists workflow transitions available from the issue's current status (mirrors the `jira_transition_list` MCP tool)
+  execute  Executes a workflow transition on a JIRA issue (mirrors the `jira_transition` MCP tool)
   help     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1664,9 +1664,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira transition execute - Executes a workflow transition on a JIRA issue
+omni-dev atlassian jira transition execute - Executes a workflow transition on a JIRA issue (mirrors the `jira_transition` MCP tool)
 
-Executes a workflow transition on a JIRA issue
+Executes a workflow transition on a JIRA issue (mirrors the `jira_transition` MCP tool)
 
 Usage: execute <KEY> <TRANSITION>
 
@@ -1680,9 +1680,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira transition list - Lists workflow transitions available from the issue's current status
+omni-dev atlassian jira transition list - Lists workflow transitions available from the issue's current status (mirrors the `jira_transition_list` MCP tool)
 
-Lists workflow transitions available from the issue's current status
+Lists workflow transitions available from the issue's current status (mirrors the `jira_transition_list` MCP tool)
 
 Usage: list [OPTIONS] <KEY>
 
@@ -1703,7 +1703,7 @@ JIRA user operations (search by name or email)
 Usage: user <COMMAND>
 
 Commands:
-  search  Searches JIRA users by display name or email substring
+  search  Searches JIRA users by display name or email substring (mirrors the `jira_user_search` MCP tool)
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1712,9 +1712,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira user search - Searches JIRA users by display name or email substring
+omni-dev atlassian jira user search - Searches JIRA users by display name or email substring (mirrors the `jira_user_search` MCP tool)
 
-Searches JIRA users by display name or email substring
+Searches JIRA users by display name or email substring (mirrors the `jira_user_search` MCP tool)
 
 Usage: search [OPTIONS] --query <QUERY>
 
@@ -1734,8 +1734,8 @@ Manages JIRA project versions (release versions)
 Usage: version <COMMAND>
 
 Commands:
-  list    Lists versions for a project
-  create  Creates a new project version
+  list    Lists versions for a project (mirrors the `jira_version_list` MCP tool)
+  create  Creates a new project version (mirrors the `jira_version_create` MCP tool)
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1744,9 +1744,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira version create - Creates a new project version
+omni-dev atlassian jira version create - Creates a new project version (mirrors the `jira_version_create` MCP tool)
 
-Creates a new project version
+Creates a new project version (mirrors the `jira_version_create` MCP tool)
 
 Usage: create [OPTIONS] --project <PROJECT> --name <NAME>
 
@@ -1763,9 +1763,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira version list - Lists versions for a project
+omni-dev atlassian jira version list - Lists versions for a project (mirrors the `jira_version_list` MCP tool)
 
-Lists versions for a project
+Lists versions for a project (mirrors the `jira_version_list` MCP tool)
 
 Usage: list [OPTIONS] --project <PROJECT>
 
@@ -1788,9 +1788,9 @@ Manages watchers on a JIRA issue
 Usage: watcher <COMMAND>
 
 Commands:
-  list    Lists current watchers on an issue
-  add     Adds a user as a watcher on an issue
-  remove  Removes a user from watchers on an issue
+  list    Lists current watchers on an issue (mirrors the `jira_watcher_list` MCP tool)
+  add     Adds a user as a watcher on an issue (mirrors the `jira_watcher_add` MCP tool)
+  remove  Removes a user from watchers on an issue (mirrors the `jira_watcher_remove` MCP tool)
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1799,9 +1799,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira watcher add - Adds a user as a watcher on an issue
+omni-dev atlassian jira watcher add - Adds a user as a watcher on an issue (mirrors the `jira_watcher_add` MCP tool)
 
-Adds a user as a watcher on an issue
+Adds a user as a watcher on an issue (mirrors the `jira_watcher_add` MCP tool)
 
 Usage: add --user <USER> <KEY>
 
@@ -1815,9 +1815,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira watcher list - Lists current watchers on an issue
+omni-dev atlassian jira watcher list - Lists current watchers on an issue (mirrors the `jira_watcher_list` MCP tool)
 
-Lists current watchers on an issue
+Lists current watchers on an issue (mirrors the `jira_watcher_list` MCP tool)
 
 Usage: list [OPTIONS] <KEY>
 
@@ -1831,9 +1831,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira watcher remove - Removes a user from watchers on an issue
+omni-dev atlassian jira watcher remove - Removes a user from watchers on an issue (mirrors the `jira_watcher_remove` MCP tool)
 
-Removes a user from watchers on an issue
+Removes a user from watchers on an issue (mirrors the `jira_watcher_remove` MCP tool)
 
 Usage: remove [OPTIONS] --user <USER> <KEY>
 
@@ -1856,8 +1856,8 @@ Manages worklogs (time tracking) on a JIRA issue
 Usage: worklog <COMMAND>
 
 Commands:
-  list  Lists worklogs on a JIRA issue
-  add   Adds a worklog entry to a JIRA issue
+  list  Lists worklogs on a JIRA issue (mirrors the `jira_worklog_list` MCP tool)
+  add   Adds a worklog entry to a JIRA issue (mirrors the `jira_worklog_add` MCP tool)
   help  Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1866,9 +1866,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira worklog add - Adds a worklog entry to a JIRA issue
+omni-dev atlassian jira worklog add - Adds a worklog entry to a JIRA issue (mirrors the `jira_worklog_add` MCP tool)
 
-Adds a worklog entry to a JIRA issue
+Adds a worklog entry to a JIRA issue (mirrors the `jira_worklog_add` MCP tool)
 
 Usage: add [OPTIONS] --time-spent <TIME_SPENT> <KEY>
 
@@ -1884,9 +1884,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira worklog list - Lists worklogs on a JIRA issue
+omni-dev atlassian jira worklog list - Lists worklogs on a JIRA issue (mirrors the `jira_worklog_list` MCP tool)
 
-Lists worklogs on a JIRA issue
+Lists worklogs on a JIRA issue (mirrors the `jira_worklog_list` MCP tool)
 
 Usage: list [OPTIONS] <KEY>
 
@@ -1901,9 +1901,9 @@ Options:
 
 ================================================================================
 
-omni-dev atlassian jira write - Pushes content to a JIRA issue
+omni-dev atlassian jira write - Pushes content to a JIRA issue (mirrors the `jira_write` MCP tool)
 
-Pushes content to a JIRA issue
+Pushes content to a JIRA issue (mirrors the `jira_write` MCP tool)
 
 Usage: write [OPTIONS] <KEY> [FILE]
 
@@ -2180,7 +2180,7 @@ AI model configuration and information
 Usage: models <COMMAND>
 
 Commands:
-  show  Shows the model catalog (merged user/project layers over the embedded `models.yaml`), annotating each entry with its source layer
+  show  Shows the model catalog (merged user/project layers over the embedded `models.yaml`), annotating each entry with its source layer (mirrors the `config_models_show` MCP tool)
   help  Print this message or the help of the given subcommand(s)
 
 Options:
@@ -2189,9 +2189,9 @@ Options:
 
 ================================================================================
 
-omni-dev config models show - Shows the model catalog (merged user/project layers over the embedded `models.yaml`), annotating each entry with its source layer
+omni-dev config models show - Shows the model catalog (merged user/project layers over the embedded `models.yaml`), annotating each entry with its source layer (mirrors the `config_models_show` MCP tool)
 
-Shows the model catalog (merged user/project layers over the embedded `models.yaml`), annotating each entry with its source layer
+Shows the model catalog (merged user/project layers over the embedded `models.yaml`), annotating each entry with its source layer (mirrors the `config_models_show` MCP tool)
 
 Usage: show [OPTIONS]
 
@@ -2394,7 +2394,7 @@ Usage: auth <COMMAND>
 Commands:
   login   Configures Datadog API credentials interactively
   logout  Removes Datadog API credentials from settings.json
-  status  Shows the current authentication status
+  status  Shows the current authentication status (mirrors the `datadog_auth_status` MCP tool)
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -2427,9 +2427,9 @@ Options:
 
 ================================================================================
 
-omni-dev datadog auth status - Shows the current authentication status
+omni-dev datadog auth status - Shows the current authentication status (mirrors the `datadog_auth_status` MCP tool)
 
-Shows the current authentication status
+Shows the current authentication status (mirrors the `datadog_auth_status` MCP tool)
 
 Usage: status
 
@@ -2446,8 +2446,8 @@ Inspects Datadog dashboards
 Usage: dashboard <COMMAND>
 
 Commands:
-  list  Lists dashboards, optionally filtered to shared dashboards
-  get   Fetches a single dashboard definition by id
+  list  Lists dashboards, optionally filtered to shared dashboards (mirrors the `datadog_dashboard_list` MCP tool)
+  get   Fetches a single dashboard definition by id (mirrors the `datadog_dashboard_get` MCP tool)
   help  Print this message or the help of the given subcommand(s)
 
 Options:
@@ -2456,9 +2456,9 @@ Options:
 
 ================================================================================
 
-omni-dev datadog dashboard get - Fetches a single dashboard definition by id
+omni-dev datadog dashboard get - Fetches a single dashboard definition by id (mirrors the `datadog_dashboard_get` MCP tool)
 
-Fetches a single dashboard definition by id
+Fetches a single dashboard definition by id (mirrors the `datadog_dashboard_get` MCP tool)
 
 Usage: get [OPTIONS] <ID>
 
@@ -2472,9 +2472,9 @@ Options:
 
 ================================================================================
 
-omni-dev datadog dashboard list - Lists dashboards, optionally filtered to shared dashboards
+omni-dev datadog dashboard list - Lists dashboards, optionally filtered to shared dashboards (mirrors the `datadog_dashboard_list` MCP tool)
 
-Lists dashboards, optionally filtered to shared dashboards
+Lists dashboards, optionally filtered to shared dashboards (mirrors the `datadog_dashboard_list` MCP tool)
 
 Usage: list [OPTIONS]
 
@@ -2493,7 +2493,7 @@ Inspects Datadog scheduled downtimes
 Usage: downtime <COMMAND>
 
 Commands:
-  list  Lists scheduled downtimes via `GET /api/v1/downtime`
+  list  Lists scheduled downtimes via `GET /api/v1/downtime` (mirrors the `datadog_downtime_list` MCP tool)
   help  Print this message or the help of the given subcommand(s)
 
 Options:
@@ -2502,9 +2502,9 @@ Options:
 
 ================================================================================
 
-omni-dev datadog downtime list - Lists scheduled downtimes via `GET /api/v1/downtime`
+omni-dev datadog downtime list - Lists scheduled downtimes via `GET /api/v1/downtime` (mirrors the `datadog_downtime_list` MCP tool)
 
-Lists scheduled downtimes via `GET /api/v1/downtime`
+Lists scheduled downtimes via `GET /api/v1/downtime` (mirrors the `datadog_downtime_list` MCP tool)
 
 Usage: list [OPTIONS]
 
@@ -2523,7 +2523,7 @@ Inspects the Datadog events stream
 Usage: events <COMMAND>
 
 Commands:
-  list  Lists events via `GET /api/v2/events`
+  list  Lists events via `GET /api/v2/events` (mirrors the `datadog_events_list` MCP tool)
   help  Print this message or the help of the given subcommand(s)
 
 Options:
@@ -2532,9 +2532,9 @@ Options:
 
 ================================================================================
 
-omni-dev datadog events list - Lists events via `GET /api/v2/events`
+omni-dev datadog events list - Lists events via `GET /api/v2/events` (mirrors the `datadog_events_list` MCP tool)
 
-Lists events via `GET /api/v2/events`
+Lists events via `GET /api/v2/events` (mirrors the `datadog_events_list` MCP tool)
 
 Usage: list [OPTIONS]
 
@@ -2558,7 +2558,7 @@ Inspects Datadog reporting hosts
 Usage: hosts <COMMAND>
 
 Commands:
-  list  Lists hosts via `GET /api/v1/hosts`
+  list  Lists hosts via `GET /api/v1/hosts` (mirrors the `datadog_hosts_list` MCP tool)
   help  Print this message or the help of the given subcommand(s)
 
 Options:
@@ -2567,9 +2567,9 @@ Options:
 
 ================================================================================
 
-omni-dev datadog hosts list - Lists hosts via `GET /api/v1/hosts`
+omni-dev datadog hosts list - Lists hosts via `GET /api/v1/hosts` (mirrors the `datadog_hosts_list` MCP tool)
 
-Lists hosts via `GET /api/v1/hosts`
+Lists hosts via `GET /api/v1/hosts` (mirrors the `datadog_hosts_list` MCP tool)
 
 Usage: list [OPTIONS]
 
@@ -2590,7 +2590,7 @@ Searches Datadog logs
 Usage: logs <COMMAND>
 
 Commands:
-  search  Searches log events via `POST /api/v2/logs/events/search`
+  search  Searches log events via `POST /api/v2/logs/events/search` (mirrors the `datadog_logs_search` MCP tool)
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -2599,9 +2599,9 @@ Options:
 
 ================================================================================
 
-omni-dev datadog logs search - Searches log events via `POST /api/v2/logs/events/search`
+omni-dev datadog logs search - Searches log events via `POST /api/v2/logs/events/search` (mirrors the `datadog_logs_search` MCP tool)
 
-Searches log events via `POST /api/v2/logs/events/search`
+Searches log events via `POST /api/v2/logs/events/search` (mirrors the `datadog_logs_search` MCP tool)
 
 Usage: search [OPTIONS] --filter <FILTER>
 
@@ -2624,8 +2624,8 @@ Queries Datadog metrics
 Usage: metrics <COMMAND>
 
 Commands:
-  query    Executes a point-in-time metrics timeseries query
-  catalog  Inspects the metric catalog (`/api/v1/metrics`)
+  query    Executes a point-in-time metrics timeseries query (mirrors the `datadog_metrics_query` MCP tool)
+  catalog  Inspects the metric catalog (`/api/v1/metrics`) (mirrors the `datadog_metrics_catalog_list` MCP tool)
   help     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -2634,9 +2634,9 @@ Options:
 
 ================================================================================
 
-omni-dev datadog metrics catalog - Inspects the metric catalog (`/api/v1/metrics`)
+omni-dev datadog metrics catalog - Inspects the metric catalog (`/api/v1/metrics`) (mirrors the `datadog_metrics_catalog_list` MCP tool)
 
-Inspects the metric catalog (`/api/v1/metrics`)
+Inspects the metric catalog (`/api/v1/metrics`) (mirrors the `datadog_metrics_catalog_list` MCP tool)
 
 Usage: catalog <COMMAND>
 
@@ -2665,9 +2665,9 @@ Options:
 
 ================================================================================
 
-omni-dev datadog metrics query - Executes a point-in-time metrics timeseries query
+omni-dev datadog metrics query - Executes a point-in-time metrics timeseries query (mirrors the `datadog_metrics_query` MCP tool)
 
-Executes a point-in-time metrics timeseries query
+Executes a point-in-time metrics timeseries query (mirrors the `datadog_metrics_query` MCP tool)
 
 Usage: query [OPTIONS] --query <QUERY> --from <FROM>
 
@@ -2688,9 +2688,9 @@ Inspects Datadog monitors
 Usage: monitor <COMMAND>
 
 Commands:
-  list    Lists monitors with optional name / tag filters
-  get     Fetches a single monitor by id
-  search  Searches monitors by free-text / faceted query
+  list    Lists monitors with optional name / tag filters (mirrors the `datadog_monitor_list` MCP tool)
+  get     Fetches a single monitor by id (mirrors the `datadog_monitor_get` MCP tool)
+  search  Searches monitors by free-text / faceted query (mirrors the `datadog_monitor_search` MCP tool)
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -2699,9 +2699,9 @@ Options:
 
 ================================================================================
 
-omni-dev datadog monitor get - Fetches a single monitor by id
+omni-dev datadog monitor get - Fetches a single monitor by id (mirrors the `datadog_monitor_get` MCP tool)
 
-Fetches a single monitor by id
+Fetches a single monitor by id (mirrors the `datadog_monitor_get` MCP tool)
 
 Usage: get [OPTIONS] <ID>
 
@@ -2715,9 +2715,9 @@ Options:
 
 ================================================================================
 
-omni-dev datadog monitor list - Lists monitors with optional name / tag filters
+omni-dev datadog monitor list - Lists monitors with optional name / tag filters (mirrors the `datadog_monitor_list` MCP tool)
 
-Lists monitors with optional name / tag filters
+Lists monitors with optional name / tag filters (mirrors the `datadog_monitor_list` MCP tool)
 
 Usage: list [OPTIONS]
 
@@ -2732,9 +2732,9 @@ Options:
 
 ================================================================================
 
-omni-dev datadog monitor search - Searches monitors by free-text / faceted query
+omni-dev datadog monitor search - Searches monitors by free-text / faceted query (mirrors the `datadog_monitor_search` MCP tool)
 
-Searches monitors by free-text / faceted query
+Searches monitors by free-text / faceted query (mirrors the `datadog_monitor_search` MCP tool)
 
 Usage: search [OPTIONS] --query <QUERY>
 
@@ -2754,8 +2754,8 @@ Inspects Datadog Service Level Objectives
 Usage: slo <COMMAND>
 
 Commands:
-  list  Lists SLOs with optional tag filter
-  get   Fetches a single SLO definition by id
+  list  Lists SLOs with optional tag filter (mirrors the `datadog_slo_list` MCP tool)
+  get   Fetches a single SLO definition by id (mirrors the `datadog_slo_get` MCP tool)
   help  Print this message or the help of the given subcommand(s)
 
 Options:
@@ -2764,9 +2764,9 @@ Options:
 
 ================================================================================
 
-omni-dev datadog slo get - Fetches a single SLO definition by id
+omni-dev datadog slo get - Fetches a single SLO definition by id (mirrors the `datadog_slo_get` MCP tool)
 
-Fetches a single SLO definition by id
+Fetches a single SLO definition by id (mirrors the `datadog_slo_get` MCP tool)
 
 Usage: get [OPTIONS] <ID>
 
@@ -2780,9 +2780,9 @@ Options:
 
 ================================================================================
 
-omni-dev datadog slo list - Lists SLOs with optional tag filter
+omni-dev datadog slo list - Lists SLOs with optional tag filter (mirrors the `datadog_slo_list` MCP tool)
 
-Lists SLOs with optional tag filter
+Lists SLOs with optional tag filter (mirrors the `datadog_slo_list` MCP tool)
 
 Usage: list [OPTIONS]
 
@@ -2822,7 +2822,7 @@ Branch-related operations
 Usage: branch <COMMAND>
 
 Commands:
-  info    Analyzes branch commits and outputs repository information in YAML format
+  info    Analyzes branch commits and outputs repository information in YAML format (mirrors the `git_branch_info` MCP tool)
   create  Create operations
   help    Print this message or the help of the given subcommand(s)
 
@@ -2839,7 +2839,7 @@ Create operations
 Usage: create <COMMAND>
 
 Commands:
-  pr    Creates a pull request with AI-generated description
+  pr    Creates a pull request with AI-generated description (mirrors the `git_create_pr` MCP tool)
   help  Print this message or the help of the given subcommand(s)
 
 Options:
@@ -2848,9 +2848,9 @@ Options:
 
 ================================================================================
 
-omni-dev git branch create pr - Creates a pull request with AI-generated description
+omni-dev git branch create pr - Creates a pull request with AI-generated description (mirrors the `git_create_pr` MCP tool)
 
-Creates a pull request with AI-generated description
+Creates a pull request with AI-generated description (mirrors the `git_create_pr` MCP tool)
 
 Usage: pr [OPTIONS]
 
@@ -2869,9 +2869,9 @@ Options:
 
 ================================================================================
 
-omni-dev git branch info - Analyzes branch commits and outputs repository information in YAML format
+omni-dev git branch info - Analyzes branch commits and outputs repository information in YAML format (mirrors the `git_branch_info` MCP tool)
 
-Analyzes branch commits and outputs repository information in YAML format
+Analyzes branch commits and outputs repository information in YAML format (mirrors the `git_branch_info` MCP tool)
 
 Usage: info [BASE_BRANCH]
 
@@ -2907,11 +2907,11 @@ Commit message operations
 Usage: message <COMMAND>
 
 Commands:
-  view     Analyzes commits and outputs repository information in YAML format
+  view     Analyzes commits and outputs repository information in YAML format (mirrors the `git_view_commits` MCP tool)
   amend    Amends commit messages based on a YAML configuration file
-  twiddle  AI-powered commit message improvement using Claude
-  check    Checks commit messages against guidelines without modifying them
-  staged   Generates a commit message from staged changes and commits them
+  twiddle  AI-powered commit message improvement using Claude (mirrors the `git_twiddle_commits` MCP tool)
+  check    Checks commit messages against guidelines without modifying them (mirrors the `git_check_commits` MCP tool)
+  staged   Generates a commit message from staged changes and commits them (mirrors the `git_staged_commit` MCP tool)
   help     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -2935,9 +2935,9 @@ Options:
 
 ================================================================================
 
-omni-dev git commit message check - Checks commit messages against guidelines without modifying them
+omni-dev git commit message check - Checks commit messages against guidelines without modifying them (mirrors the `git_check_commits` MCP tool)
 
-Checks commit messages against guidelines without modifying them
+Checks commit messages against guidelines without modifying them (mirrors the `git_check_commits` MCP tool)
 
 Usage: check [OPTIONS] [COMMIT_RANGE]
 
@@ -2963,9 +2963,9 @@ Options:
 
 ================================================================================
 
-omni-dev git commit message staged - Generates a commit message from staged changes and commits them
+omni-dev git commit message staged - Generates a commit message from staged changes and commits them (mirrors the `git_staged_commit` MCP tool)
 
-Generates a commit message from staged changes and commits them
+Generates a commit message from staged changes and commits them (mirrors the `git_staged_commit` MCP tool)
 
 Usage: staged [OPTIONS]
 
@@ -2979,9 +2979,9 @@ Options:
 
 ================================================================================
 
-omni-dev git commit message twiddle - AI-powered commit message improvement using Claude
+omni-dev git commit message twiddle - AI-powered commit message improvement using Claude (mirrors the `git_twiddle_commits` MCP tool)
 
-AI-powered commit message improvement using Claude
+AI-powered commit message improvement using Claude (mirrors the `git_twiddle_commits` MCP tool)
 
 Usage: twiddle [OPTIONS] [COMMIT_RANGE]
 
@@ -3027,9 +3027,9 @@ Options:
 
 ================================================================================
 
-omni-dev git commit message view - Analyzes commits and outputs repository information in YAML format
+omni-dev git commit message view - Analyzes commits and outputs repository information in YAML format (mirrors the `git_view_commits` MCP tool)
 
-Analyzes commits and outputs repository information in YAML format
+Analyzes commits and outputs repository information in YAML format (mirrors the `git_view_commits` MCP tool)
 
 Usage: view [COMMIT_RANGE]
 

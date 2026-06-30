@@ -482,7 +482,8 @@ pub struct WatcherListParams {
 pub struct WatcherMutateParams {
     /// JIRA issue key (e.g., `PROJ-123`).
     pub key: String,
-    /// Atlassian account ID of the user.
+    /// Atlassian `accountId` of the user (not a display name or email). Use
+    /// `jira_user_search` to resolve a name or email to an `accountId`.
     pub account_id: String,
 }
 
@@ -495,7 +496,8 @@ pub struct WatcherMutateParams {
 pub struct WatcherRemoveParams {
     /// JIRA issue key (e.g., `PROJ-123`).
     pub key: String,
-    /// Atlassian account ID of the user.
+    /// Atlassian `accountId` of the user (not a display name or email). Use
+    /// `jira_user_search` to resolve a name or email to an `accountId`.
     pub account_id: String,
     /// Must be set to `true` — destructive guard.
     pub confirm: bool,
@@ -1194,7 +1196,8 @@ impl OmniDevServer {
 
     /// Tool: add a watcher to an issue.
     #[tool(
-        description = "Add a user (by Atlassian account ID) as a watcher on a JIRA issue. \
+        description = "Add a user (by Atlassian `accountId`, not a name or email — resolve one \
+                       with `jira_user_search`) as a watcher on a JIRA issue. \
                        Returns YAML `{status: ok}`. Mirrors `omni-dev atlassian jira watcher add`."
     )]
     pub async fn jira_watcher_add(
@@ -1212,7 +1215,8 @@ impl OmniDevServer {
 
     /// Tool: remove a watcher from an issue.
     #[tool(
-        description = "Remove a user (by Atlassian account ID) from the watchers of a JIRA \
+        description = "Remove a user (by Atlassian `accountId`, not a name or email — resolve \
+                       one with `jira_user_search`) from the watchers of a JIRA \
                        issue. Destructive operation: callers must explicitly pass \
                        `confirm: true` for the removal to proceed; otherwise the tool \
                        refuses with an error. Returns YAML `{status: ok}`. Mirrors \

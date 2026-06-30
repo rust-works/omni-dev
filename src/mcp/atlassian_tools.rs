@@ -41,9 +41,17 @@ pub struct AtlassianConvertParams {
 #[tool_router(router = atlassian_tool_router, vis = "pub")]
 impl OmniDevServer {
     /// Tool: convert between JFM markdown and ADF JSON without touching the API.
-    #[tool(description = "Convert between JFM markdown and ADF JSON. \
-                       Mirrors `omni-dev atlassian convert to-adf` / `from-adf`. \
-                       `direction` must be either \"to-adf\" or \"from-adf\".")]
+    #[tool(
+        description = "Convert between JFM (JIRA-Flavoured Markdown) and ADF (Atlassian \
+                       Document Format) JSON. Bidirectional and fully offline — performs no network \
+                       I/O and needs no Atlassian credentials. Set `direction` to \"to-adf\" to \
+                       convert JFM markdown into an ADF JSON document (e.g. `# Title` becomes \
+                       `{\"version\":1,\"type\":\"doc\",\"content\":[...]}`), or \"from-adf\" to \
+                       render an ADF JSON document back into JFM markdown. Use it to preview or \
+                       inspect the ADF a JIRA/Confluence write tool would send. Output is the \
+                       converted document (JSON for to-adf, markdown for from-adf). Mirrors \
+                       `omni-dev atlassian convert to-adf` / `from-adf`."
+    )]
     pub async fn atlassian_convert(
         &self,
         Parameters(params): Parameters<AtlassianConvertParams>,

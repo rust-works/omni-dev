@@ -36,7 +36,8 @@ pub struct GitViewCommitsParams {
 /// Parameters for the `git_branch_info` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GitBranchInfoParams {
-    /// Base branch to compare against. Defaults to `main` or `master`.
+    /// Base branch to compare against, e.g. `main` or `develop`.
+    /// Defaults to `main` or `master` (whichever exists) when omitted.
     #[serde(default)]
     pub branch: Option<String>,
     /// Path to the git repository. Defaults to the current working directory.
@@ -48,6 +49,8 @@ pub struct GitBranchInfoParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GitCheckCommitsParams {
     /// Commit range to check (e.g., `HEAD~3..HEAD`, `abc123..def456`).
+    /// Required — unlike the CLI, this tool does not default to "commits ahead
+    /// of the base branch".
     pub range: String,
     /// Optional explicit path to the guidelines file. When omitted the tool
     /// falls back to `.omni-dev/commit-guidelines.md` via the standard
@@ -58,9 +61,11 @@ pub struct GitCheckCommitsParams {
     #[serde(default)]
     pub repo_path: Option<String>,
     /// When true, warnings are treated as non-zero exit conditions.
+    /// Defaults to `false` (only errors fail).
     #[serde(default)]
     pub strict: bool,
-    /// Claude model override.
+    /// Claude model override (e.g. `claude-sonnet-4-6`). Defaults to the model
+    /// from settings, then the built-in default, when omitted.
     #[serde(default)]
     pub model: Option<String>,
 }
@@ -68,10 +73,12 @@ pub struct GitCheckCommitsParams {
 /// Parameters for the `git_twiddle_commits` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GitTwiddleCommitsParams {
-    /// Commit range to twiddle. Defaults to `HEAD~5..HEAD` when omitted.
+    /// Commit range to twiddle (e.g., `HEAD~3..HEAD`, `abc123..def456`).
+    /// Defaults to `HEAD~5..HEAD` when omitted.
     #[serde(default)]
     pub range: Option<String>,
-    /// Claude model override.
+    /// Claude model override (e.g. `claude-sonnet-4-6`). Defaults to the model
+    /// from settings, then the built-in default, when omitted.
     #[serde(default)]
     pub model: Option<String>,
     /// When true, proposed amendments are returned without being applied.
@@ -92,7 +99,8 @@ pub struct GitStagedCommitParams {
     /// committed to the repository. Defaults to `false` (commit applied).
     #[serde(default)]
     pub print_only: bool,
-    /// Claude model override.
+    /// Claude model override (e.g. `claude-sonnet-4-6`). Defaults to the model
+    /// from settings, then the built-in default, when omitted.
     #[serde(default)]
     pub model: Option<String>,
     /// Path to the git repository. Defaults to the current working directory.
@@ -103,10 +111,12 @@ pub struct GitStagedCommitParams {
 /// Parameters for the `git_create_pr` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GitCreatePrParams {
-    /// Claude model override.
+    /// Claude model override (e.g. `claude-sonnet-4-6`). Defaults to the model
+    /// from settings, then the built-in default, when omitted.
     #[serde(default)]
     pub model: Option<String>,
-    /// Base branch for the PR. Defaults to the primary remote's main branch.
+    /// Base branch the PR would merge into, e.g. `main` or `develop`.
+    /// Defaults to the primary remote's main branch when omitted.
     #[serde(default)]
     pub base_branch: Option<String>,
     /// Path to the git repository. Defaults to the current working directory.
@@ -120,6 +130,9 @@ impl OmniDevServer {
     /// Tool: analyse commits in a range and return repository information as YAML.
     #[tool(
         description = "Analyze commits in a range and return repository information as YAML. \
+                       Use this when you have an explicit commit range (e.g. `HEAD~3..HEAD`); \
+                       use `git_branch_info` instead to analyze the current branch against a base \
+                       branch without computing the range yourself. \
                        Mirrors `omni-dev git commit message view`."
     )]
     pub async fn git_view_commits(
@@ -150,8 +163,11 @@ impl OmniDevServer {
 
     /// Tool: analyse branch commits and return repository info as YAML.
     #[tool(
-        description = "Analyze branch commits against a base and return repository information \
-                       as YAML. Mirrors `omni-dev git branch info`."
+        description = "Analyze the current branch's commits against a base branch and return \
+                       repository information as YAML. Use this when you want the diff against \
+                       `main`/`master` (or another base) without computing an explicit range; \
+                       use `git_view_commits` instead when you already have a range. \
+                       Mirrors `omni-dev git branch info`."
     )]
     pub async fn git_branch_info(
         &self,
@@ -172,10 +188,12 @@ impl OmniDevServer {
 
     /// Tool: validate commit messages against guidelines.
     #[tool(
-        description = "Validate commit messages in a range against commit guidelines. \
-                       Mirrors `omni-dev git commit message check`. Returns a YAML payload with \
-                       the full CheckReport, a pass/fail summary, and the exit code the CLI \
-                       would use (honouring `strict`)."
+        description = "Validate commit messages in a range against commit guidelines \
+                       (read-only — never modifies commits). Use this to report problems; use \
+                       `git_twiddle_commits` instead to rewrite the messages. `range` is required \
+                       (e.g. `HEAD~3..HEAD`). Mirrors `omni-dev git commit message check`. Returns \
+                       a YAML payload with the full CheckReport, a pass/fail summary, and the exit \
+                       code the CLI would use (honouring `strict`)."
     )]
     pub async fn git_check_commits(
         &self,
@@ -198,10 +216,13 @@ impl OmniDevServer {
 
     /// Tool: AI-powered commit message improvement.
     #[tool(
-        description = "Generate improved commit messages for a range and (by default) apply \
-                       them. Mirrors `omni-dev git commit message twiddle --auto-apply`. Set \
-                       `dry_run = true` to return the proposed amendments as YAML without \
-                       applying them. The editor is never started from this tool."
+        description = "Generate improved commit messages for a range (e.g. `HEAD~3..HEAD`) and \
+                       (by default) apply them. Mutating: rewrites commit messages unless \
+                       `dry_run = true`. Use this to fix messages; use `git_check_commits` instead \
+                       to only report problems without modifying anything. Mirrors \
+                       `omni-dev git commit message twiddle --auto-apply`. Set `dry_run = true` to \
+                       return the proposed amendments as YAML without applying them. The editor is \
+                       never started from this tool."
     )]
     pub async fn git_twiddle_commits(
         &self,

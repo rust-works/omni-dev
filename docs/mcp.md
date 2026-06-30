@@ -72,6 +72,14 @@ Read tools accept an optional `output_file` parameter (see [Cross-cutting
 parameters](#cross-cutting-parameters)). Destructive tools require an
 explicit `confirm: true`.
 
+Every tool's `description` and parameter doc comments follow the checklist in
+[STYLE-0029](STYLE_GUIDE.md#style-0029-mcp-tool--parameter-description-checklist):
+a one-line summary, concrete example values, allowed enum values, the expected
+wire format, directional semantics where order matters, and a `Mirrors
+\`omni-dev <subcommand>\`` cross-reference. Each equivalent CLI subcommand
+carries the reverse reference (`mirrors the \`<tool>\` MCP tool`) in its
+`--help`, so the two surfaces stay discoverable from each other.
+
 ### Git (5 tools)
 
 | Tool | Purpose | CLI equivalent |
@@ -132,7 +140,7 @@ project listing and create-screen introspection, and changelog history.
 | `confluence_label_remove` | Remove a label from a page. Requires `confirm: true` |
 | `confluence_user_search` | Resolve a display name or email to an Atlassian `accountId` |
 | `confluence_compare` | Structural diff between two versions of a page. `detail`: `summary`, `outline` (default), or `full`. Returns drill-in cursors. See [user guide](user-guide.md#confluence-comparing-pages) |
-| `confluence_compare_section` | Drill into a single section delta via a cursor returned from `confluence_compare`. `format`: `unified`, `side-by-side`, `markdown-inline` |
+| `confluence_compare_section` | Drill into a single section delta via a cursor returned from `confluence_compare`. `format`: `unified`, `side_by_side`, `markdown_inline` |
 
 ### Atlassian — shared (2 tools)
 

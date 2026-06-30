@@ -18,9 +18,9 @@ pub struct TransitionCommand {
 /// Transition subcommands.
 #[derive(Subcommand)]
 pub enum TransitionSubcommands {
-    /// Lists workflow transitions available from the issue's current status.
+    /// Lists workflow transitions available from the issue's current status (mirrors the `jira_transition_list` MCP tool).
     List(ListCommand),
-    /// Executes a workflow transition on a JIRA issue.
+    /// Executes a workflow transition on a JIRA issue (mirrors the `jira_transition` MCP tool).
     Execute(ExecuteCommand),
 }
 
