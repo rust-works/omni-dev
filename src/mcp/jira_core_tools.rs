@@ -14,7 +14,6 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::atlassian::adf::AdfDocument;
 use crate::atlassian::adf_validated::{markdown_to_validated_adf, ValidatedAdfDocument};
 use crate::atlassian::client::{
     AtlassianClient, JiraCreatedIssue, JiraTransition, JiraVisibility, JiraVisibilityType,
