@@ -229,13 +229,13 @@ mod tests {
 
     #[test]
     fn invalid_adf_nesting_display_includes_violations() {
-        let err = AtlassianError::InvalidAdfNesting(AdfValidationError {
-            violations: vec![AdfSchemaViolation::DisallowedChild {
+        let err = AtlassianError::InvalidAdfNesting(AdfValidationError::new(vec![
+            AdfSchemaViolation::DisallowedChild {
                 parent_type: "panel".to_string(),
                 child_type: "expand".to_string(),
                 path: vec![0, 0],
-            }],
-        });
+            },
+        ]));
         let msg = err.to_string();
         assert!(msg.contains("invalid ADF nesting"));
         assert!(msg.contains("`expand` cannot be a child of `panel`"));

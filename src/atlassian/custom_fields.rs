@@ -12,9 +12,8 @@ use std::collections::BTreeMap;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::atlassian::adf_validated::ValidatedAdfDocument;
+use crate::atlassian::adf_validated::markdown_to_validated_adf;
 use crate::atlassian::client::{EditMeta, EditMetaField};
-use crate::atlassian::convert::markdown_to_adf;
 use crate::atlassian::document::CustomFieldSection;
 
 #[cfg(test)]
@@ -27,7 +26,7 @@ use crate::atlassian::client::TEXTAREA_CUSTOM_TYPE as CUSTOM_TEXTAREA;
 ///   `{"value": "..."}`, textfield/number/date pass through, rich-text
 ///   fields are rejected (must use a body section instead).
 /// - **Sections** must reference rich-text fields; their markdown is
-///   converted to ADF via [`markdown_to_adf`].
+///   converted to validated ADF via [`markdown_to_validated_adf`].
 ///
 /// Field names are looked up in [`EditMeta`]; entries already formatted as
 /// `customfield_<digits>` bypass the lookup. An unknown or ambiguous name
@@ -63,13 +62,7 @@ pub fn resolve_custom_fields(
                 field.name, id
             );
         }
-        let adf = markdown_to_adf(&section.body).with_context(|| {
-            format!(
-                "Failed to convert body for custom field '{}' ({}) to ADF",
-                field.name, id
-            )
-        })?;
-        let validated = ValidatedAdfDocument::try_new(adf).with_context(|| {
+        let validated = markdown_to_validated_adf(&section.body).with_context(|| {
             format!(
                 "Custom field '{}' ({}) failed ADF nesting validation",
                 field.name, id
@@ -175,8 +168,7 @@ fn string_to_rich_text_api_value(s: &str, field_name: &str, id: &str) -> Result<
     if s.is_empty() {
         return Ok(serde_json::Value::Null);
     }
-    let adf = markdown_to_adf(s)?;
-    let validated = ValidatedAdfDocument::try_new(adf).with_context(|| {
+    let validated = markdown_to_validated_adf(s).with_context(|| {
         format!("Custom field '{field_name}' ({id}) failed ADF nesting validation")
     })?;
     serde_json::to_value(&validated).context("Failed to serialize custom field ADF document")
