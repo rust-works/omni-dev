@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **JFM→ADF validation failures now point at the source line, column, and offending text** ([#1087](https://github.com/rust-works/omni-dev/issues/1087)): when a JFM body converts to ADF that violates the content model — most commonly bold-wrapping-inline-code (`` **`/api/v1/example`** ``, which maps to a text node carrying both `strong` and `code`, a combination ADF forbids) — the write was aborted with only an opaque ADF index path (e.g. `at /38/4/0/1`), leaving the author to count siblings under an unrendered tree to find the culprit in a large document. The [`AdfValidationError`](src/atlassian/adf_validated.rs) is now enriched: it resolves the index path against the produced ADF tree to name the **offending run's text** (`in text: "/api/v1/example"`) and, when the JFM source is available, reports the **1-based `line:column`** of that run in the original markdown (columns counted in characters, so multi-byte text lines up with an editor cursor). Every validation error gains the text excerpt via [`ValidatedAdfDocument::try_new`](src/atlassian/adf_validated.rs); the JFM-sourced paths additionally gain `line:column` through a new shared [`markdown_to_validated_adf`](src/atlassian/adf_validated.rs) helper (and `try_new_with_source` / `validate_with_source` variants) now used by the MCP `jira`/`confluence` create/write/comment tools, the matching CLI commands and their `--dry-run` / `convert to-adf` preflights, and custom-field rich-text sections. This is the diagnostics improvement from #1087 option 2; silently splitting the `strong`+`code` marks (option 1) remains a separate follow-up.
+
 ## [0.31.0] - 2026-06-30
 
 ### Added

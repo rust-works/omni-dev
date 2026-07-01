@@ -4,11 +4,11 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::atlassian::adf::AdfDocument;
-use crate::atlassian::adf_validated::ValidatedAdfDocument;
+use crate::atlassian::adf_validated::{markdown_to_validated_adf, ValidatedAdfDocument};
 use crate::atlassian::confluence_api::{
     CommentKind, ConfluenceApi, ConfluenceComment, InlineAnchor,
 };
-use crate::atlassian::convert::{adf_to_markdown, markdown_to_adf};
+use crate::atlassian::convert::adf_to_markdown;
 use crate::atlassian::document::JfmDocument;
 use crate::cli::atlassian::format::{output_as, ContentFormat, OutputFormat};
 use crate::cli::atlassian::helpers::{create_client, read_input};
@@ -208,20 +208,22 @@ impl RepliesCommand {
 fn parse_comment_input(file: Option<&str>, format: ContentFormat) -> Result<ValidatedAdfDocument> {
     let input = read_input(file)?;
 
-    let adf: AdfDocument = match format {
+    let validated: ValidatedAdfDocument = match format {
         ContentFormat::Jfm => {
             if input.starts_with("---\n") {
                 let doc = JfmDocument::parse(&input)?;
-                markdown_to_adf(&doc.body)?
+                markdown_to_validated_adf(&doc.body)?
             } else {
-                markdown_to_adf(&input)?
+                markdown_to_validated_adf(&input)?
             }
         }
         ContentFormat::Adf => {
-            serde_json::from_str(&input).context("Failed to parse ADF JSON input")?
+            let adf: AdfDocument =
+                serde_json::from_str(&input).context("Failed to parse ADF JSON input")?;
+            ValidatedAdfDocument::try_new(adf)?
         }
     };
-    Ok(ValidatedAdfDocument::try_new(adf)?)
+    Ok(validated)
 }
 
 /// Fetches and displays comments for a page.

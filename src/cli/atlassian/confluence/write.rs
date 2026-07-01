@@ -33,13 +33,18 @@ pub struct WriteCommand {
 impl WriteCommand {
     /// Reads input and pushes to the Confluence page.
     pub async fn execute(self) -> Result<()> {
-        let (adf, title) = prepare_write(self.file.as_deref(), &self.format)?;
+        let (adf, title, source) = prepare_write(self.file.as_deref(), &self.format)?;
 
         if self.dry_run {
-            return crate::cli::atlassian::helpers::print_dry_run(&self.id, &adf, &title);
+            return crate::cli::atlassian::helpers::print_dry_run(
+                &self.id,
+                &adf,
+                &title,
+                source.as_deref(),
+            );
         }
 
-        let validated = ValidatedAdfDocument::try_new(adf)?;
+        let validated = ValidatedAdfDocument::try_new_with_source(adf, source.as_deref())?;
         let (client, _instance_url) = create_client()?;
         let api = ConfluenceApi::new(client);
 

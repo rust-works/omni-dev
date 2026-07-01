@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::atlassian::adf::AdfDocument;
-use crate::atlassian::adf_validated::validate;
+use crate::atlassian::adf_validated::validate_with_source;
 use crate::atlassian::convert::markdown_to_adf;
 
 /// Converts between JFM markdown and ADF JSON.
@@ -64,7 +64,7 @@ impl ToAdfCommand {
         let doc = markdown_to_adf(&input)?;
 
         if !self.no_validate {
-            validate(&doc)?;
+            validate_with_source(&doc, Some(&input))?;
         }
 
         let json = if self.compact {
