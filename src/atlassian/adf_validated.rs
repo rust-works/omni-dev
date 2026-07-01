@@ -825,6 +825,38 @@ mod tests {
         let loc = locate_in_source("hello\nworld foo", "foo").unwrap();
         assert_eq!(loc, SourceLocation { line: 2, column: 7 });
         assert!(locate_in_source("no match here", "absent").is_none());
+        // A needle that is only whitespace trims to empty and locates nothing.
+        assert!(locate_in_source("some text", "   ").is_none());
+    }
+
+    #[test]
+    fn collect_text_stops_at_the_excerpt_budget() {
+        // A block node whose *own* text already fills the budget, plus a child:
+        // gathering the child enters `gather_text` with a full buffer (the
+        // entry guard), and the post-child loop guard also fires — so the
+        // trailing child text is never appended.
+        let long = "a".repeat(EXCERPT_MAX_CHARS + 5);
+        let mut node = AdfNode::paragraph(vec![AdfNode::text("SHOULD_NOT_APPEAR")]);
+        node.text = Some(long);
+        let gathered = collect_text(&node);
+        assert!(gathered.chars().count() >= EXCERPT_MAX_CHARS);
+        assert!(!gathered.contains("SHOULD_NOT_APPEAR"), "got: {gathered}");
+    }
+
+    #[test]
+    fn resolve_context_returns_empty_for_off_tree_path() {
+        // A violation whose path runs off the tree resolves to no node, so no
+        // excerpt or location is attached.
+        let d = doc(vec![AdfNode::paragraph(vec![AdfNode::text("hi")])]);
+        let violation = AdfSchemaViolation::DisallowedChild {
+            child_type: "x".to_string(),
+            parent_type: "y".to_string(),
+            path: vec![9, 9],
+        };
+        assert_eq!(
+            resolve_context(&violation, &d, Some("hi")),
+            ViolationContext::default()
+        );
     }
 
     #[test]
