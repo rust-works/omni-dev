@@ -6,8 +6,7 @@ use std::io::{self, Read, Write};
 use anyhow::{anyhow, Context, Result};
 
 use crate::atlassian::adf::AdfDocument;
-use crate::atlassian::adf_schema::validate_document;
-use crate::atlassian::adf_validated::ValidatedAdfDocument;
+use crate::atlassian::adf_validated::{validate_with_source, ValidatedAdfDocument};
 use crate::atlassian::api::AtlassianApi;
 use crate::atlassian::auth;
 use crate::atlassian::client::{AtlassianClient, FieldSelection};
@@ -95,7 +94,13 @@ pub async fn run_read_jira_with_fields(
 /// callers must wrap the result in [`ValidatedAdfDocument::try_new`] before
 /// sending. The dry-run path bypasses that wrapping so it can show the
 /// converted ADF *and* a violation diagnosis from [`print_dry_run`].
-pub fn prepare_write(file: Option<&str>, format: &ContentFormat) -> Result<(AdfDocument, String)> {
+/// The third tuple element is the JFM markdown body the ADF was converted from
+/// (`Some` for JFM input, `None` for ADF input), so callers can report a
+/// validation failure's 1-based `line:column` in that source (issue #1087).
+pub fn prepare_write(
+    file: Option<&str>,
+    format: &ContentFormat,
+) -> Result<(AdfDocument, String, Option<String>)> {
     let input = read_input(file)?;
 
     match format {
@@ -103,11 +108,11 @@ pub fn prepare_write(file: Option<&str>, format: &ContentFormat) -> Result<(AdfD
             let doc = JfmDocument::parse(&input)?;
             let adf = markdown_to_adf(&doc.body)?;
             let title = doc.frontmatter.title().to_string();
-            Ok((adf, title))
+            Ok((adf, title, Some(doc.body)))
         }
         ContentFormat::Adf => {
             let adf = AdfDocument::from_json_str(&input)?;
-            Ok((adf, String::new()))
+            Ok((adf, String::new(), None))
         }
     }
 }
@@ -121,7 +126,7 @@ pub fn prepare_write(file: Option<&str>, format: &ContentFormat) -> Result<(AdfD
 /// Takes a raw [`AdfDocument`] (not [`ValidatedAdfDocument`]) so callers on
 /// the dry-run path can show the ADF *and* the violation diagnosis even when
 /// the document would otherwise be rejected by [`ValidatedAdfDocument::try_new`].
-pub fn print_dry_run(id: &str, adf: &AdfDocument, title: &str) -> Result<()> {
+pub fn print_dry_run(id: &str, adf: &AdfDocument, title: &str, source: Option<&str>) -> Result<()> {
     println!("Dry run for {id}:");
     if !title.is_empty() {
         println!("  Title: {title}");
@@ -131,22 +136,25 @@ pub fn print_dry_run(id: &str, adf: &AdfDocument, title: &str) -> Result<()> {
         serde_json::to_string_pretty(adf).context("Failed to serialize ADF")?
     );
 
-    let violations = validate_document(adf);
-    if violations.is_empty() {
-        println!("\nValidation: OK");
-        Ok(())
-    } else {
-        let count = violations.len();
-        let noun = if count == 1 {
-            "violation"
-        } else {
-            "violations"
-        };
-        println!("\nValidation: {count} {noun}");
-        for v in &violations {
-            println!("  ✗ {v}");
+    match validate_with_source(adf, source) {
+        Ok(()) => {
+            println!("\nValidation: OK");
+            Ok(())
         }
-        Err(anyhow!("ADF validation failed: {count} {noun}"))
+        Err(err) => {
+            let count = err.violations.len();
+            let noun = if count == 1 {
+                "violation"
+            } else {
+                "violations"
+            };
+            println!("\nValidation: {count} {noun}");
+            // The enriched error carries per-violation ADF path, hint, and —
+            // when `source` is `Some` — the offending run's line:column and a
+            // text excerpt (issue #1087).
+            println!("{err}");
+            Err(anyhow!("ADF validation failed: {count} {noun}"))
+        }
     }
 }
 
@@ -362,7 +370,8 @@ pub async fn run_edit(id: &str, api: &dyn AtlassianApi, instance_url: &str) -> R
                         .unwrap_or_else(|e| format!("<serialization error: {e}>"));
                     tracing::trace!("ADF payload:\n{adf_json}");
                 }
-                let validated = ValidatedAdfDocument::try_new(adf)?;
+                let validated =
+                    ValidatedAdfDocument::try_new_with_source(adf, Some(&final_doc.body))?;
 
                 let title_changed = final_doc.frontmatter.title() != original_title;
                 let title_update = if title_changed {
@@ -730,11 +739,13 @@ mod tests {
         let content = "---\ntype: jira\ninstance: https://org.atlassian.net\nkey: PROJ-1\nsummary: My Title\n---\n\nHello world\n";
         fs::write(&file_path, content).unwrap();
 
-        let (adf, title) =
+        let (adf, title, source) =
             prepare_write(Some(file_path.to_str().unwrap()), &ContentFormat::Jfm).unwrap();
 
         assert_eq!(title, "My Title");
         assert!(!adf.content.is_empty());
+        // JFM input carries its body forward for line:column reporting.
+        assert!(source.is_some_and(|s| s.contains("Hello world")));
     }
 
     #[test]
@@ -744,11 +755,13 @@ mod tests {
         let adf_json = r#"{"version":1,"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"Hello"}]}]}"#;
         fs::write(&file_path, adf_json).unwrap();
 
-        let (adf, title) =
+        let (adf, title, source) =
             prepare_write(Some(file_path.to_str().unwrap()), &ContentFormat::Adf).unwrap();
 
         assert!(title.is_empty());
         assert_eq!(adf.content.len(), 1);
+        // ADF input has no JFM source, so there is no line:column to report.
+        assert!(source.is_none());
     }
 
     #[test]
@@ -767,11 +780,12 @@ mod tests {
         let file_path = temp_dir.path().join("null.json");
         fs::write(&file_path, "null").unwrap();
 
-        let (adf, title) =
+        let (adf, title, source) =
             prepare_write(Some(file_path.to_str().unwrap()), &ContentFormat::Adf).unwrap();
 
         assert_eq!(adf, AdfDocument::default());
         assert!(title.is_empty());
+        assert!(source.is_none());
     }
 
     #[test]
@@ -794,7 +808,7 @@ mod tests {
     #[test]
     fn print_dry_run_with_title() {
         let adf = AdfDocument::default();
-        let result = print_dry_run("PROJ-1", &adf, "My Title");
+        let result = print_dry_run("PROJ-1", &adf, "My Title", None);
         assert!(result.is_ok());
     }
 
@@ -828,7 +842,7 @@ mod tests {
         }"#;
         let adf = AdfDocument::from_json_str(adf_json).unwrap();
 
-        let result = print_dry_run("12345", &adf, "Title");
+        let result = print_dry_run("12345", &adf, "Title", None);
         assert!(result.is_err());
         let err = format!("{}", result.unwrap_err());
         // Two `expand` children inside a `panel` produce three violations:
@@ -860,7 +874,7 @@ mod tests {
         }"#;
         let adf = AdfDocument::from_json_str(adf_json).unwrap();
 
-        let result = print_dry_run("12345", &adf, "Title");
+        let result = print_dry_run("12345", &adf, "Title", None);
         assert!(result.is_err());
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("ADF validation failed"), "got: {err}");
@@ -869,7 +883,7 @@ mod tests {
     #[test]
     fn print_dry_run_without_title() {
         let adf = AdfDocument::default();
-        let result = print_dry_run("PROJ-1", &adf, "");
+        let result = print_dry_run("PROJ-1", &adf, "", None);
         assert!(result.is_ok());
     }
 
@@ -888,7 +902,7 @@ mod tests {
             }]
         }"#;
         let adf = AdfDocument::from_json_str(adf_json).unwrap();
-        let result = print_dry_run("12345", &adf, "Title");
+        let result = print_dry_run("12345", &adf, "Title", None);
         assert!(result.is_err());
         let err = format!("{}", result.unwrap_err());
         assert!(
@@ -913,7 +927,7 @@ mod tests {
             }]
         }"#;
         let adf = AdfDocument::from_json_str(adf_json).unwrap();
-        let result = print_dry_run("12345", &adf, "Title");
+        let result = print_dry_run("12345", &adf, "Title", None);
         assert!(result.is_err());
         let err = format!("{}", result.unwrap_err());
         assert!(

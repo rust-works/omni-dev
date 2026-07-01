@@ -18,14 +18,13 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 
 use crate::atlassian::adf::AdfDocument;
-use crate::atlassian::adf_validated::ValidatedAdfDocument;
+use crate::atlassian::adf_validated::{markdown_to_validated_adf, ValidatedAdfDocument};
 use crate::atlassian::api::{AtlassianApi, ContentItem};
 use crate::atlassian::client::AtlassianClient;
 use crate::atlassian::confluence_api::{
     ChildPage, CommentKind, ConfluenceApi, ConfluenceAttachmentPage, ConfluenceSpacePage,
     MovePosition, PageSummaryPage,
 };
-use crate::atlassian::convert::markdown_to_adf;
 use crate::atlassian::create::{prepend_warnings, resolve_confluence_create};
 use crate::atlassian::document::{content_item_to_document, JfmDocument, JfmFrontmatter};
 use crate::cli::atlassian::confluence::download::{
@@ -578,7 +577,7 @@ fn parse_write_content(
     content: &str,
     format: ContentFormat,
 ) -> Result<(ValidatedAdfDocument, String)> {
-    let (adf, title): (AdfDocument, String) = match format {
+    let (adf, title): (ValidatedAdfDocument, String) = match format {
         ContentFormat::Jfm => {
             // JFM inputs with frontmatter are passed as-is; inputs without
             // frontmatter are treated as raw markdown. The CLI requires
@@ -586,23 +585,21 @@ fn parse_write_content(
             // separately, so we don't force it here.
             if content.starts_with("---\n") {
                 let doc = JfmDocument::parse(content)?;
-                let adf = markdown_to_adf(&doc.body)?;
                 let title = match &doc.frontmatter {
                     JfmFrontmatter::Confluence(fm) => fm.title.clone(),
                     JfmFrontmatter::Jira(fm) => fm.summary.clone(),
                 };
-                (adf, title)
+                (markdown_to_validated_adf(&doc.body)?, title)
             } else {
-                let adf = markdown_to_adf(content)?;
-                (adf, String::new())
+                (markdown_to_validated_adf(content)?, String::new())
             }
         }
-        ContentFormat::Adf => {
-            let adf = AdfDocument::from_json_str(content)?;
-            (adf, String::new())
-        }
+        ContentFormat::Adf => (
+            ValidatedAdfDocument::try_new(AdfDocument::from_json_str(content)?)?,
+            String::new(),
+        ),
     };
-    Ok((ValidatedAdfDocument::try_new(adf)?, title))
+    Ok((adf, title))
 }
 
 /// Serializes search results as YAML for the tool response body.
@@ -899,8 +896,7 @@ pub async fn list_comment_replies_yaml(
 ///
 /// The markdown `content` is converted to ADF before posting.
 pub async fn add_comment_result(api: &ConfluenceApi, id: &str, content: &str) -> Result<String> {
-    let adf: AdfDocument = markdown_to_adf(content).context("Failed to convert markdown to ADF")?;
-    let adf = ValidatedAdfDocument::try_new(adf)?;
+    let adf = markdown_to_validated_adf(content)?;
     api.add_page_comment(id, &adf).await?;
 
     let result = MutationResult {
@@ -923,8 +919,7 @@ pub async fn add_inline_comment_result(
     anchor_text: &str,
     match_index_1based: Option<usize>,
 ) -> Result<String> {
-    let adf: AdfDocument = markdown_to_adf(content).context("Failed to convert markdown to ADF")?;
-    let adf = ValidatedAdfDocument::try_new(adf)?;
+    let adf = markdown_to_validated_adf(content)?;
     let anchor = api
         .resolve_anchor(id, anchor_text, match_index_1based)
         .await?;
@@ -1816,10 +1811,9 @@ async fn run_confluence_create(params: &ConfluenceCreateParams) -> Result<String
 
     let format = parse_format(params.format.as_deref())?;
     let adf = match format {
-        ContentFormat::Jfm => markdown_to_adf(content)?,
-        ContentFormat::Adf => AdfDocument::from_json_str(content)?,
+        ContentFormat::Jfm => markdown_to_validated_adf(content)?,
+        ContentFormat::Adf => ValidatedAdfDocument::try_new(AdfDocument::from_json_str(content)?)?,
     };
-    let adf = ValidatedAdfDocument::try_new(adf)?;
 
     if params.dry_run {
         return confluence_create_dry_run_preview(

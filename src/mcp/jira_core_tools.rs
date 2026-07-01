@@ -14,12 +14,10 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::atlassian::adf::AdfDocument;
-use crate::atlassian::adf_validated::ValidatedAdfDocument;
+use crate::atlassian::adf_validated::{markdown_to_validated_adf, ValidatedAdfDocument};
 use crate::atlassian::client::{
     AtlassianClient, JiraCreatedIssue, JiraTransition, JiraVisibility, JiraVisibilityType,
 };
-use crate::atlassian::convert::markdown_to_adf;
 use crate::atlassian::create::{create_resolved_jira_issue, prepend_warnings, resolve_jira_create};
 use crate::atlassian::custom_fields::{
     apply_user_field_overrides, convert_textarea_string_values, resolve_custom_fields,
@@ -511,7 +509,7 @@ async fn run_jira_create(client: &AtlassianClient, params: &JiraCreateParams) ->
     let issue_type = params.issue_type.as_deref().unwrap_or("Task");
 
     let adf = match params.description.as_deref() {
-        Some(md) if !md.is_empty() => Some(ValidatedAdfDocument::try_new(markdown_to_adf(md)?)?),
+        Some(md) if !md.is_empty() => Some(markdown_to_validated_adf(md)?),
         _ => None,
     };
 
@@ -566,7 +564,7 @@ async fn create_one_issue(
 ) -> Result<JiraCreatedIssue> {
     let issue_type = spec.issue_type.as_deref().unwrap_or("Task");
     let adf = match spec.description.as_deref() {
-        Some(md) if !md.is_empty() => Some(ValidatedAdfDocument::try_new(markdown_to_adf(md)?)?),
+        Some(md) if !md.is_empty() => Some(markdown_to_validated_adf(md)?),
         _ => None,
     };
     client
@@ -774,18 +772,20 @@ async fn run_jira_write(
 ) -> Result<String> {
     let adf: Option<ValidatedAdfDocument> = match content {
         Some(c) => {
-            let raw: AdfDocument = match format {
+            let validated: ValidatedAdfDocument = match format {
                 ReadFormat::Jfm => {
                     if c.starts_with("---\n") {
                         let doc = JfmDocument::parse(c)?;
-                        markdown_to_adf(&doc.body)?
+                        markdown_to_validated_adf(&doc.body)?
                     } else {
-                        markdown_to_adf(c)?
+                        markdown_to_validated_adf(c)?
                     }
                 }
-                ReadFormat::Adf => serde_json::from_str(c).context("Failed to parse ADF JSON")?,
+                ReadFormat::Adf => ValidatedAdfDocument::try_new(
+                    serde_json::from_str(c).context("Failed to parse ADF JSON")?,
+                )?,
             };
-            Some(ValidatedAdfDocument::try_new(raw)?)
+            Some(validated)
         }
         None => None,
     };
@@ -887,7 +887,7 @@ async fn run_jira_transition(
         })?;
 
     if let Some(body) = comment.filter(|s| !s.is_empty()) {
-        let adf = ValidatedAdfDocument::try_new(markdown_to_adf(body)?)?;
+        let adf = markdown_to_validated_adf(body)?;
         client.add_comment(key, &adf).await?;
     }
 
@@ -965,7 +965,7 @@ async fn run_jira_comment(
         "add" => {
             let text =
                 body.ok_or_else(|| anyhow::anyhow!("`body` is required when action is \"add\""))?;
-            let adf = ValidatedAdfDocument::try_new(markdown_to_adf(text)?)?;
+            let adf = markdown_to_validated_adf(text)?;
             client.add_comment(key, &adf).await?;
             Ok(format!("Comment added to {key}.\n"))
         }
@@ -983,7 +983,7 @@ async fn run_jira_comment_edit(
     body: &str,
     visibility: Option<&JiraVisibilityParam>,
 ) -> Result<String> {
-    let adf = ValidatedAdfDocument::try_new(markdown_to_adf(body)?)?;
+    let adf = markdown_to_validated_adf(body)?;
     let visibility = visibility.map(parse_visibility).transpose()?;
     let updated = client
         .update_comment(key, comment_id, &adf, visibility.as_ref())

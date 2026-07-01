@@ -11,9 +11,8 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
 
-use crate::atlassian::adf_validated::ValidatedAdfDocument;
+use crate::atlassian::adf_validated::{markdown_to_validated_adf, ValidatedAdfDocument};
 use crate::atlassian::client::{AtlassianClient, JiraCreatedIssue};
-use crate::atlassian::convert::markdown_to_adf;
 use crate::atlassian::custom_fields::{merge_set_field_overrides, resolve_custom_fields};
 use crate::atlassian::document::{
     split_custom_sections, split_frontmatter, CustomFieldSection, JfmDocument, JfmFrontmatter,
@@ -134,7 +133,7 @@ pub fn resolve_jira_create(
     }
 
     let (body_md, custom_sections) = split_custom_sections(&raw_body);
-    let adf = ValidatedAdfDocument::try_new(markdown_to_adf(&body_md)?)?;
+    let adf = markdown_to_validated_adf(&body_md)?;
 
     let mut shadowed = Vec::new();
 
@@ -253,7 +252,7 @@ pub fn resolve_confluence_create(
         }
     };
 
-    let adf = ValidatedAdfDocument::try_new(markdown_to_adf(&doc.body)?)?;
+    let adf = markdown_to_validated_adf(&doc.body)?;
 
     let mut shadowed = Vec::new();
 
