@@ -953,7 +953,7 @@ Arguments:
   [FILE]  Input file (reads from stdin if omitted or "-")
 
 Options:
-      --strip-local-ids  Omit localId attributes from output for readability
+      --strip-local-ids  Omit localId attributes from output. For reading only — do NOT write stripped output back to Confluence, as localIds anchor inline comments and dropping them makes Confluence lose those comments
   -h, --help             Print help
 
 
