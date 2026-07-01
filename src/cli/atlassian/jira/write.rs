@@ -18,6 +18,19 @@ use crate::cli::atlassian::helpers::{
     run_write_jira_with_resolved_fields,
 };
 
+/// The resolved write body: `(adf, title, custom-field scalars, custom-field
+/// sections, JFM source)`. The last element is the JFM markdown body the ADF
+/// was converted from, carried so a validation failure can be reported with
+/// its 1-based line:column (issue #1087). `None` for ADF-format or
+/// body-skipped paths.
+type ResolvedWriteBody = (
+    Option<AdfDocument>,
+    String,
+    std::collections::BTreeMap<String, serde_yaml::Value>,
+    Vec<CustomFieldSection>,
+    Option<String>,
+);
+
 /// Pushes content to a JIRA issue.
 #[derive(Parser)]
 pub struct WriteCommand {
@@ -112,34 +125,47 @@ impl WriteCommand {
         // (assignee/reporter/--set-field) — that combination signals a
         // "fields-only" update and should not block on stdin.
         let skip_body = self.no_content || (self.file.is_none() && other_fields_present);
-        let (body_adf, title, frontmatter_scalars, sections): (
-            Option<AdfDocument>,
-            String,
-            std::collections::BTreeMap<String, serde_yaml::Value>,
-            Vec<CustomFieldSection>,
-        ) = if skip_body {
-            (
-                None,
-                String::new(),
-                std::collections::BTreeMap::new(),
-                vec![],
-            )
-        } else if matches!(self.format, ContentFormat::Adf) {
-            let (adf, title) = prepare_write(self.file.as_deref(), &self.format)?;
-            (Some(adf), title, std::collections::BTreeMap::new(), vec![])
-        } else {
-            let input = read_input(self.file.as_deref())?;
-            let doc = JfmDocument::parse(&input)?;
-            let (body_md, sections) = doc.split_custom_sections();
-            let frontmatter_scalars = doc
-                .frontmatter
-                .jira_custom_fields()
-                .cloned()
-                .unwrap_or_default();
-            let body_adf = markdown_to_adf(&body_md)?;
-            let title = doc.frontmatter.title().to_string();
-            (Some(body_adf), title, frontmatter_scalars, sections)
-        };
+        // `body_source` is the JFM markdown body the ADF was converted from,
+        // carried alongside so a validation failure reports its 1-based
+        // line:column (issue #1087). `None` for ADF-format or body-skipped
+        // paths.
+        let (body_adf, title, frontmatter_scalars, sections, body_source): ResolvedWriteBody =
+            if skip_body {
+                (
+                    None,
+                    String::new(),
+                    std::collections::BTreeMap::new(),
+                    vec![],
+                    None,
+                )
+            } else if matches!(self.format, ContentFormat::Adf) {
+                let (adf, title, _source) = prepare_write(self.file.as_deref(), &self.format)?;
+                (
+                    Some(adf),
+                    title,
+                    std::collections::BTreeMap::new(),
+                    vec![],
+                    None,
+                )
+            } else {
+                let input = read_input(self.file.as_deref())?;
+                let doc = JfmDocument::parse(&input)?;
+                let (body_md, sections) = doc.split_custom_sections();
+                let frontmatter_scalars = doc
+                    .frontmatter
+                    .jira_custom_fields()
+                    .cloned()
+                    .unwrap_or_default();
+                let body_adf = markdown_to_adf(&body_md)?;
+                let title = doc.frontmatter.title().to_string();
+                (
+                    Some(body_adf),
+                    title,
+                    frontmatter_scalars,
+                    sections,
+                    Some(body_md),
+                )
+            };
 
         let scalars = merge_set_field_overrides(frontmatter_scalars, overrides);
 
@@ -164,7 +190,8 @@ impl WriteCommand {
             let Some(body_adf) = body_adf else {
                 unreachable!("skip_body without other fields was rejected above");
             };
-            let validated = ValidatedAdfDocument::try_new(body_adf)?;
+            let validated =
+                ValidatedAdfDocument::try_new_with_source(body_adf, body_source.as_deref())?;
             let api = JiraApi::new(client);
             return run_write(&self.key, &validated, &title, self.force, &api).await;
         }
@@ -186,7 +213,9 @@ impl WriteCommand {
             "`--set-field` of the same name",
         )?;
 
-        let validated_body = body_adf.map(ValidatedAdfDocument::try_new).transpose()?;
+        let validated_body = body_adf
+            .map(|adf| ValidatedAdfDocument::try_new_with_source(adf, body_source.as_deref()))
+            .transpose()?;
         run_write_jira_with_resolved_fields(
             &self.key,
             validated_body.as_ref(),
