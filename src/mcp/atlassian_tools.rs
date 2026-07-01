@@ -32,7 +32,9 @@ pub struct AtlassianConvertParams {
     #[serde(default)]
     pub compact: Option<bool>,
     /// When `direction = from-adf`, strip `localId` attributes from output
-    /// for better readability.
+    /// for better readability. For reading only — do NOT write stripped output
+    /// back to Confluence, as `localId`s anchor inline comments and dropping
+    /// them makes Confluence lose those comments.
     #[serde(default)]
     pub strip_local_ids: Option<bool>,
 }
