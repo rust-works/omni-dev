@@ -34,8 +34,21 @@ pub enum ConfluenceSubcommands {
     /// Manages comments on a Confluence page.
     Comment(comment::CommentCommand),
     /// Fetches a Confluence page and outputs it as JFM markdown or ADF JSON (mirrors the `confluence_read` MCP tool).
+    ///
+    /// The output carries `localId` attributes (and inline-comment anchor
+    /// spans) that anchor inline comments and other stateful nodes. Preserve
+    /// them verbatim when editing so a later `write` does not drop those
+    /// comments.
     Read(read::ReadCommand),
     /// Pushes content to a Confluence page (mirrors the `confluence_write` MCP tool).
+    ///
+    /// This fully replaces the page body, so it can silently lose data. Inline
+    /// comments (and task-item state) are anchored to the page through the
+    /// `localId` attributes that `read` emits; if the body you push omits them,
+    /// Confluence drops the inline comments tied to those anchors. Edit the JFM
+    /// produced by `read` and keep its `localId`s intact — do not hand-author a
+    /// fresh body or push content produced with local IDs stripped (see
+    /// `atlassian convert from-adf --strip-local-ids`).
     Write(write::WriteCommand),
     /// Interactive fetch-edit-push cycle for a Confluence page.
     Edit(edit::EditCommand),

@@ -122,6 +122,10 @@ pub struct ConfluenceWriteParams {
     /// NOT Confluence wiki markup. Use `##` not `h2.`, triple-backtick fences
     /// not `{code}`, backtick inline code not `{{...}}`. Full reference:
     /// MCP resource `omni-dev://specs/jfm`.
+    ///
+    /// Preserve the `localId` attributes (and inline-comment anchor spans) from
+    /// the original `confluence_read` output: they anchor inline comments and
+    /// stateful nodes, and dropping them makes Confluence lose those comments.
     pub content: String,
     /// Format of `content`: `"jfm"` (default markdown) or `"adf"` (raw ADF JSON).
     #[serde(default)]
@@ -1157,7 +1161,10 @@ impl OmniDevServer {
     #[tool(
         description = "Fetch a Confluence page by numeric ID (e.g. \"12345678\"). Returns JFM markdown by \
                        default — AI-friendly GitHub-style markdown, the form to read/edit then feed back to \
-                       `confluence_write`/`confluence_create`. Pass format=\"adf\" for the raw ADF JSON \
+                       `confluence_write`/`confluence_create`. That output carries `localId` attributes \
+                       (and inline-comment anchor spans) that anchor inline comments and other stateful \
+                       nodes — preserve them verbatim when editing so a later `confluence_write` does not \
+                       drop those comments. Pass format=\"adf\" for the raw ADF JSON \
                        (the on-the-wire document model) only when you need exact node structure. \
                        When `output_file` is set, the content is written to that path and the tool returns \
                        a short YAML summary (path/bytes/format) — useful for large pages. \
@@ -1222,6 +1229,12 @@ impl OmniDevServer {
         description = "Overwrite an EXISTING Confluence page's body (identified by `id`) from JFM \
                        markdown (default) or raw ADF JSON. This fully replaces the body — to create a \
                        brand-new page instead, use `confluence_create`. \
+                       DATA LOSS: inline comments (and task-item state) are anchored to the page through \
+                       the `localId` attributes that `confluence_read` emits; if the body you send omits \
+                       them, Confluence drops the inline comments tied to those anchors. Edit the JFM \
+                       returned by `confluence_read` and keep its `localId`s intact — do not hand-author a \
+                       fresh body or send content produced with local IDs stripped (`atlassian_convert` \
+                       with `strip_local_ids`). \
                        JFM is GitHub-style markdown, NOT Confluence wiki markup — see resource \
                        `omni-dev://specs/jfm` for syntax. \
                        Set `dry_run: true` first when uncertain about required fields or \
