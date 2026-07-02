@@ -1534,6 +1534,14 @@ Keep [docs/mcp.md](mcp.md)'s tool catalog in sync when a tool's purpose or CLI
 mapping changes, and run the [`update-snapshots`](../.claude/skills/update-snapshots/SKILL.md)
 skill whenever the reverse-reference edits change CLI `--help` text.
 
+The `present and non-empty` floor of this checklist (items 1 and 6) is enforced
+mechanically by `all_tools_advertise_descriptions_and_param_schemas` in
+[tests/mcp_integration_test.rs](../tests/mcp_integration_test.rs): it fails if
+*any* advertised tool or top-level parameter ships without a description, so a
+new tool cannot silently regress the surface. The prose-quality items (2–5,
+7–10) still need review — the test guarantees the strings exist, not that they
+are good.
+
 ### Motivation
 
 An agent's success rate is bounded by how unambiguous these strings are. A
