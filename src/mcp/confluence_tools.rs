@@ -34,6 +34,7 @@ use crate::cli::atlassian::format::ContentFormat;
 use crate::cli::atlassian::helpers::create_client;
 use crate::data::yaml::to_yaml;
 
+use super::content_input::{require_content_input, resolve_content_input};
 use super::dry_run::dry_run_request_yaml;
 use super::error::tool_error;
 use super::output_file::write_to_file_yaml;
@@ -81,6 +82,11 @@ pub struct ConfluenceCreateParams {
     /// `omni-dev://specs/jfm`.
     #[serde(default)]
     pub document: Option<String>,
+    /// Filesystem path the server reads the JFM `document` from, instead of
+    /// `document`. Prefer this when the document is already on disk — it avoids
+    /// re-emitting the whole document inline. Mutually exclusive with `document`.
+    #[serde(default)]
+    pub document_path: Option<String>,
     /// Target Confluence space key (e.g., `"ENG"`). Required unless `document`
     /// carries a `space_key:`. Overrides frontmatter.
     #[serde(default)]
@@ -97,6 +103,12 @@ pub struct ConfluenceCreateParams {
     /// MCP resource `omni-dev://specs/jfm`.
     #[serde(default)]
     pub content: Option<String>,
+    /// Filesystem path the server reads the page body from, instead of
+    /// `content`. Prefer this when the body is already on disk — it avoids
+    /// re-emitting the whole body inline. Mutually exclusive with `content`
+    /// (and, like `content`, rejected when `document`/`document_path` is given).
+    #[serde(default)]
+    pub content_path: Option<String>,
     /// Optional parent page ID for nesting under an existing page. Overrides
     /// frontmatter `parent_id:`.
     #[serde(default)]
@@ -116,7 +128,8 @@ pub struct ConfluenceCreateParams {
 pub struct ConfluenceWriteParams {
     /// Confluence page ID.
     pub id: String,
-    /// New page body.
+    /// New page body, supplied inline. Mutually exclusive with `content_path`;
+    /// exactly one of the two is required.
     ///
     /// For `format = "jfm"` (the default), this is GitHub-style markdown,
     /// NOT Confluence wiki markup. Use `##` not `h2.`, triple-backtick fences
@@ -126,7 +139,15 @@ pub struct ConfluenceWriteParams {
     /// Preserve the `localId` attributes (and inline-comment anchor spans) from
     /// the original `confluence_read` output: they anchor inline comments and
     /// stateful nodes, and dropping them makes Confluence lose those comments.
-    pub content: String,
+    #[serde(default)]
+    pub content: Option<String>,
+    /// Filesystem path the server reads the body from, instead of `content`.
+    /// Prefer this when the body is already on disk (e.g. edited via
+    /// `confluence_read`'s `output_file`): the assistant avoids re-emitting the
+    /// whole page inline, which for large pages is slow. Mutually exclusive with
+    /// `content`.
+    #[serde(default)]
+    pub content_path: Option<String>,
     /// Format of `content`: `"jfm"` (default markdown) or `"adf"` (raw ADF JSON).
     #[serde(default)]
     pub format: Option<String>,
@@ -248,7 +269,14 @@ pub struct ConfluenceCommentAddParams {
     /// Confluence page ID.
     pub id: String,
     /// Markdown content of the comment body. Converted to ADF before posting.
-    pub content: String,
+    /// Mutually exclusive with `content_path`; exactly one is required.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// Filesystem path the server reads the comment body from, instead of
+    /// `content`. Prefer this when the body is already on disk. Mutually
+    /// exclusive with `content`.
+    #[serde(default)]
+    pub content_path: Option<String>,
 }
 
 /// Parameters for the `confluence_comment_add_inline` tool.
@@ -257,7 +285,14 @@ pub struct ConfluenceCommentAddInlineParams {
     /// Confluence page ID.
     pub id: String,
     /// Markdown content of the comment body. Converted to ADF before posting.
-    pub content: String,
+    /// Mutually exclusive with `content_path`; exactly one is required.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// Filesystem path the server reads the comment body from, instead of
+    /// `content`. Prefer this when the body is already on disk. Mutually
+    /// exclusive with `content`.
+    #[serde(default)]
+    pub content_path: Option<String>,
     /// Exact text on the page that the comment should anchor to.
     pub anchor_text: String,
     /// 1-based occurrence to anchor to when `anchor_text` appears more than
@@ -1212,7 +1247,10 @@ impl OmniDevServer {
                        read → edit → create round-trip. Explicit `space_key`/`title`/`parent_id` \
                        override frontmatter and a warning is returned when they do. JFM is \
                        GitHub-style markdown, NOT Confluence wiki markup — see resource \
-                       `omni-dev://specs/jfm`. Set `dry_run: true` first when uncertain about \
+                       `omni-dev://specs/jfm`. The `document`/`content` bodies each also accept a \
+                       filesystem-path form (`document_path`/`content_path`) the server reads from \
+                       disk — prefer it when the body is already on disk, to avoid emitting a large \
+                       body inline. Set `dry_run: true` first when uncertain about \
                        required fields or formatting — validates the input and returns the request \
                        that would be sent (method, path, body) without creating the page. \
                        Returns the new page's ID. \
@@ -1239,6 +1277,10 @@ impl OmniDevServer {
                        with `strip_local_ids`). \
                        JFM is GitHub-style markdown, NOT Confluence wiki markup — see resource \
                        `omni-dev://specs/jfm` for syntax. \
+                       Provide the body as `content` (inline) OR `content_path` (a filesystem \
+                       path the server reads) — not both. Prefer `content_path` when the body is \
+                       already on disk: emitting a large body inline is slow, and pages routinely \
+                       exceed that threshold; the inline form is fine for short bodies. \
                        Set `dry_run: true` first when uncertain about required fields or \
                        formatting — validates the input and returns the request that would be \
                        sent (method, path, body) without updating the page. \
@@ -1249,7 +1291,13 @@ impl OmniDevServer {
         Parameters(params): Parameters<ConfluenceWriteParams>,
     ) -> Result<CallToolResult, McpError> {
         let format = parse_format(params.format.as_deref()).map_err(tool_error)?;
-        let text = run_confluence_write(&params.id, &params.content, format, params.dry_run)
+        let content = require_content_input(
+            params.content.as_deref(),
+            params.content_path.as_deref(),
+            "content",
+        )
+        .map_err(tool_error)?;
+        let text = run_confluence_write(&params.id, &content, format, params.dry_run)
             .await
             .map_err(tool_error)?;
         Ok(CallToolResult::success(vec![Content::text(text)]))
@@ -1386,6 +1434,8 @@ impl OmniDevServer {
     #[tool(
         description = "Post a markdown comment to a Confluence page as a page-level \
                        footer comment. The content is converted to ADF before posting. \
+                       Supply the body as `content` (inline) OR `content_path` (a filesystem \
+                       path the server reads) — not both. \
                        For inline (anchored) comments, use \
                        `confluence_comment_add_inline`. Mirrors \
                        `omni-dev atlassian confluence comment add`."
@@ -1394,9 +1444,15 @@ impl OmniDevServer {
         &self,
         Parameters(params): Parameters<ConfluenceCommentAddParams>,
     ) -> Result<CallToolResult, McpError> {
+        let content = require_content_input(
+            params.content.as_deref(),
+            params.content_path.as_deref(),
+            "content",
+        )
+        .map_err(tool_error)?;
         let (client, _url) = create_client().map_err(tool_error)?;
         let api = ConfluenceApi::new(client);
-        let yaml = add_comment_result(&api, &params.id, &params.content)
+        let yaml = add_comment_result(&api, &params.id, &content)
             .await
             .map_err(tool_error)?;
         Ok(CallToolResult::success(vec![Content::text(yaml)]))
@@ -1407,6 +1463,8 @@ impl OmniDevServer {
         description = "Post a markdown comment anchored to a text selection on a \
                        Confluence page (an inline comment). For a page-level comment not tied \
                        to any text, use `confluence_comment_add` instead. \
+                       Supply the body as `content` (inline) OR `content_path` (a filesystem \
+                       path the server reads) — not both. \
                        `anchor_text` must match the on-page text \
                        exactly; if it appears multiple times, pass `match_index` \
                        (1-based) to pick which occurrence. Errors if the anchor \
@@ -1417,12 +1475,18 @@ impl OmniDevServer {
         &self,
         Parameters(params): Parameters<ConfluenceCommentAddInlineParams>,
     ) -> Result<CallToolResult, McpError> {
+        let content = require_content_input(
+            params.content.as_deref(),
+            params.content_path.as_deref(),
+            "content",
+        )
+        .map_err(tool_error)?;
         let (client, _url) = create_client().map_err(tool_error)?;
         let api = ConfluenceApi::new(client);
         let yaml = add_inline_comment_result(
             &api,
             &params.id,
-            &params.content,
+            &content,
             &params.anchor_text,
             params.match_index,
         )
@@ -1768,8 +1832,22 @@ async fn run_confluence_search(cql: &str, limit: u32) -> Result<String> {
 /// line is prepended to the returned text (and logged). Validation runs before
 /// any client construction so input errors short-circuit before the wire.
 async fn run_confluence_create(params: &ConfluenceCreateParams) -> Result<String> {
-    if let Some(document) = params.document.as_deref() {
-        if params.content.is_some() {
+    // Resolve the inline-or-path pairs before any mode branching so a bad path
+    // fails fast and the `document` vs `content` exclusivity check sees the
+    // effective values.
+    let document = resolve_content_input(
+        params.document.as_deref(),
+        params.document_path.as_deref(),
+        "document",
+    )?;
+    let content = resolve_content_input(
+        params.content.as_deref(),
+        params.content_path.as_deref(),
+        "content",
+    )?;
+
+    if let Some(document) = document.as_deref() {
+        if content.is_some() {
             anyhow::bail!(
                 "Provide either `document` or `content`, not both — the document body becomes \
                  the page body"
@@ -1820,8 +1898,7 @@ async fn run_confluence_create(params: &ConfluenceCreateParams) -> Result<String
             "`title` is required (or provide a `document` whose frontmatter carries `title:`)"
         )
     })?;
-    let content = params
-        .content
+    let content = content
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("`content` is required (or provide a `document`)"))?;
 
@@ -2577,6 +2654,8 @@ mod tests {
         let _env = EnvGuard::set(&server.uri());
 
         let params = ConfluenceCreateParams {
+            content_path: None,
+            document_path: None,
             document: None,
             space_key: Some("ENG".to_string()),
             title: Some("New Page".to_string()),
@@ -2612,6 +2691,8 @@ mod tests {
         let _env = EnvGuard::set(&server.uri());
 
         let params = ConfluenceCreateParams {
+            content_path: None,
+            document_path: None,
             document: None,
             space_key: Some("ENG".to_string()),
             title: Some("ADF Page".to_string()),
@@ -2629,6 +2710,8 @@ mod tests {
         // Issue #714: validation runs before any HTTP call. No EnvGuard
         // needed because the function returns before reaching create_client().
         let params = ConfluenceCreateParams {
+            content_path: None,
+            document_path: None,
             document: None,
             space_key: Some("ENG".to_string()),
             title: Some("Bad".to_string()),
@@ -2664,6 +2747,8 @@ mod tests {
         let _env = EnvGuard::set(&server.uri());
 
         let params = ConfluenceCreateParams {
+            content_path: None,
+            document_path: None,
             document: None,
             space_key: Some("ENG".to_string()),
             title: Some("Bad".to_string()),
@@ -2683,6 +2768,8 @@ mod tests {
         space_key: Option<&str>,
     ) -> ConfluenceCreateParams {
         ConfluenceCreateParams {
+            content_path: None,
+            document_path: None,
             document: Some(document.to_string()),
             space_key: space_key.map(String::from),
             title: None,
@@ -2728,6 +2815,84 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn run_confluence_create_reads_content_from_path() {
+        // Issue #1093: the page body may come from `content_path` on disk.
+        let _lock = env_lock();
+        let server = wiremock::MockServer::start().await;
+        mount_space_and_page(&server, "54321").await;
+        let _env = EnvGuard::set(&server.uri());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("body.md");
+        std::fs::write(&path, "Body from disk").unwrap();
+
+        let params = ConfluenceCreateParams {
+            document: None,
+            document_path: None,
+            space_key: Some("ENG".to_string()),
+            title: Some("New Page".to_string()),
+            content: None,
+            content_path: Some(path.to_str().unwrap().to_string()),
+            parent_id: None,
+            format: None,
+            dry_run: false,
+        };
+        let id = run_confluence_create(&params).await.unwrap();
+        assert_eq!(id, "54321");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_confluence_create_reads_document_from_path() {
+        // The full JFM `document` may also come from disk via `document_path`.
+        let _lock = env_lock();
+        let server = wiremock::MockServer::start().await;
+        mount_space_and_page(&server, "54321").await;
+        let _env = EnvGuard::set(&server.uri());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("doc.md");
+        std::fs::write(
+            &path,
+            "---\ntype: confluence\ninstance: https://org.atlassian.net\ntitle: From Disk\nspace_key: ENG\n---\n\nBody\n",
+        )
+        .unwrap();
+
+        let params = ConfluenceCreateParams {
+            document: None,
+            document_path: Some(path.to_str().unwrap().to_string()),
+            space_key: None,
+            title: None,
+            content: None,
+            content_path: None,
+            parent_id: None,
+            format: None,
+            dry_run: false,
+        };
+        let id = run_confluence_create(&params).await.unwrap();
+        assert_eq!(id, "54321");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_confluence_create_content_and_content_path_conflict_errors() {
+        // Both inline and path supplied → error before any client/HTTP.
+        let params = ConfluenceCreateParams {
+            document: None,
+            document_path: None,
+            space_key: Some("ENG".to_string()),
+            title: Some("T".to_string()),
+            content: Some("inline".to_string()),
+            content_path: Some("/tmp/whatever.md".to_string()),
+            parent_id: None,
+            format: None,
+            dry_run: false,
+        };
+        let err = run_confluence_create(&params).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Provide either `content` or `content_path`, not both"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn run_confluence_create_document_param_override_warns_in_text() {
         let _lock = env_lock();
         let server = wiremock::MockServer::start().await;
@@ -2747,6 +2912,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn run_confluence_create_document_and_content_errors() {
         let params = ConfluenceCreateParams {
+            content_path: None,
+            document_path: None,
             document: Some(
                 "---\ntype: confluence\ninstance: https://o.net\ntitle: T\nspace_key: ENG\n---\n\nB\n"
                     .to_string(),
@@ -2779,6 +2946,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn run_confluence_create_requires_space_key() {
         let params = ConfluenceCreateParams {
+            content_path: None,
+            document_path: None,
             document: None,
             space_key: None,
             title: None,
@@ -2794,6 +2963,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn run_confluence_create_requires_title() {
         let params = ConfluenceCreateParams {
+            content_path: None,
+            document_path: None,
             document: None,
             space_key: Some("ENG".to_string()),
             title: None,
@@ -2809,6 +2980,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn run_confluence_create_requires_content() {
         let params = ConfluenceCreateParams {
+            content_path: None,
+            document_path: None,
             document: None,
             space_key: Some("ENG".to_string()),
             title: Some("T".to_string()),
@@ -3635,6 +3808,8 @@ mod tests {
         let server = make_server();
         let result = server
             .confluence_create(Parameters(ConfluenceCreateParams {
+                content_path: None,
+                document_path: None,
                 document: None,
                 space_key: Some("ENG".to_string()),
                 title: Some("T".to_string()),
@@ -3655,6 +3830,8 @@ mod tests {
         let server = make_server();
         let result = server
             .confluence_create(Parameters(ConfluenceCreateParams {
+                content_path: None,
+                document_path: None,
                 document: None,
                 space_key: Some("ENG".to_string()),
                 title: Some("T".to_string()),
@@ -3692,6 +3869,8 @@ mod tests {
         let server = make_server();
         let result = server
             .confluence_create(Parameters(ConfluenceCreateParams {
+                content_path: None,
+                document_path: None,
                 document: None,
                 space_key: Some("ENG".to_string()),
                 title: Some("T".to_string()),
@@ -3733,12 +3912,94 @@ mod tests {
             .confluence_write(Parameters(ConfluenceWriteParams {
                 dry_run: false,
                 id: "12345".to_string(),
-                content: "New body".to_string(),
+                content: Some("New body".to_string()),
+                content_path: None,
                 format: None,
             }))
             .await
             .unwrap();
         assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_write_handler_reads_content_from_path() {
+        // Issue #1093: the body may be supplied via `content_path` (read from
+        // disk by the server) instead of inline `content`.
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12345"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "12345",
+                "title": "Old",
+                "status": "current",
+                "spaceId": "98765",
+                "version": {"number": 3},
+                "body": {"atlas_doc_format": {"value": "{\"version\":1,\"type\":\"doc\",\"content\":[]}"}}
+            })))
+            .mount(&srv)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12345"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&srv)
+            .await;
+        let _env = EnvGuard::set(&srv.uri());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("body.md");
+        std::fs::write(&path, "New body from disk").unwrap();
+
+        let server = make_server();
+        let result = server
+            .confluence_write(Parameters(ConfluenceWriteParams {
+                dry_run: false,
+                id: "12345".to_string(),
+                content: None,
+                content_path: Some(path.to_str().unwrap().to_string()),
+                format: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_write_handler_content_and_path_conflict_errors() {
+        // Both sources supplied → mutually-exclusive error, before any HTTP.
+        let server = make_server();
+        let err = server
+            .confluence_write(Parameters(ConfluenceWriteParams {
+                dry_run: false,
+                id: "12345".to_string(),
+                content: Some("inline".to_string()),
+                content_path: Some("/tmp/whatever.md".to_string()),
+                format: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err
+            .message
+            .contains("Provide either `content` or `content_path`, not both"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_write_handler_requires_content_or_path() {
+        // Neither source supplied → required-body error, before any HTTP.
+        let server = make_server();
+        let err = server
+            .confluence_write(Parameters(ConfluenceWriteParams {
+                dry_run: false,
+                id: "12345".to_string(),
+                content: None,
+                content_path: None,
+                format: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err
+            .message
+            .contains("Provide either `content` or `content_path`."));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3748,7 +4009,8 @@ mod tests {
             .confluence_write(Parameters(ConfluenceWriteParams {
                 dry_run: false,
                 id: "12345".to_string(),
-                content: "body".to_string(),
+                content: Some("body".to_string()),
+                content_path: None,
                 format: Some("xml".to_string()),
             }))
             .await;
@@ -3765,7 +4027,8 @@ mod tests {
             .confluence_write(Parameters(ConfluenceWriteParams {
                 dry_run: false,
                 id: "12345".to_string(),
-                content: "body".to_string(),
+                content: Some("body".to_string()),
+                content_path: None,
                 format: None,
             }))
             .await;
@@ -5298,6 +5561,8 @@ mod tests {
     #[tokio::test]
     async fn run_confluence_create_dry_run_returns_request_without_calling_api() {
         let params = ConfluenceCreateParams {
+            content_path: None,
+            document_path: None,
             document: None,
             space_key: Some("ENG".to_string()),
             title: Some("My Page".to_string()),
@@ -5319,6 +5584,8 @@ mod tests {
     #[tokio::test]
     async fn run_confluence_create_dry_run_still_validates_adf() {
         let params = ConfluenceCreateParams {
+            content_path: None,
+            document_path: None,
             document: None,
             space_key: Some("ENG".to_string()),
             title: Some("Bad".to_string()),

@@ -7,6 +7,7 @@ use rmcp::{
 };
 use serde::Deserialize;
 
+use super::content_input::require_content_input;
 use super::error::tool_error;
 use super::server::OmniDevServer;
 use crate::cli::ai::{self, SkillsFormat};
@@ -16,7 +17,15 @@ use crate::cli::ai::{self, SkillsFormat};
 pub struct AiChatParams {
     /// User message to send to the AI, e.g. `"Summarise this diff in one
     /// sentence."`. Sent as a single turn; there is no conversation history.
-    pub message: String,
+    /// Mutually exclusive with `message_path`; exactly one is required.
+    #[serde(default)]
+    pub message: Option<String>,
+    /// Filesystem path the server reads the message from, instead of `message`.
+    /// Prefer this when the message is already on disk (e.g. a large prompt or
+    /// document) — it avoids re-emitting it inline. Mutually exclusive with
+    /// `message`.
+    #[serde(default)]
+    pub message_path: Option<String>,
     /// Optional model identifier (e.g., `claude-sonnet-4-6`). When omitted,
     /// the backend's environment-configured default model is used; call
     /// `config_models_show` to see the identifiers the CLI recognises.
@@ -82,13 +91,21 @@ impl OmniDevServer {
                        credentials, returns a tool error containing the same diagnostic the CLI \
                        would print. Mirrors `omni-dev ai chat` in one-shot form — that CLI command \
                        is interactive and has no `system_prompt` flag, so this tool is the only way \
-                       to set a custom system prompt."
+                       to set a custom system prompt. Supply the message as `message` (inline) OR \
+                       `message_path` (a filesystem path the server reads) — not both; prefer the \
+                       path form when the message is already on disk."
     )]
     pub async fn ai_chat(
         &self,
         Parameters(params): Parameters<AiChatParams>,
     ) -> Result<CallToolResult, McpError> {
-        let response = ai::run_chat(&params.message, params.model, params.system_prompt)
+        let message = require_content_input(
+            params.message.as_deref(),
+            params.message_path.as_deref(),
+            "message",
+        )
+        .map_err(tool_error)?;
+        let response = ai::run_chat(&message, params.model, params.system_prompt)
             .await
             .map_err(tool_error)?;
         Ok(CallToolResult::success(vec![Content::text(response)]))
@@ -192,7 +209,8 @@ mod tests {
     #[test]
     fn ai_chat_params_deserializes_with_minimal_fields() {
         let params: AiChatParams = serde_json::from_str(r#"{"message":"hi"}"#).unwrap();
-        assert_eq!(params.message, "hi");
+        assert_eq!(params.message.as_deref(), Some("hi"));
+        assert!(params.message_path.is_none());
         assert!(params.model.is_none());
         assert!(params.system_prompt.is_none());
     }
@@ -203,7 +221,7 @@ mod tests {
             r#"{"message":"hi","model":"claude-sonnet-4-6","system_prompt":"be helpful"}"#,
         )
         .unwrap();
-        assert_eq!(params.message, "hi");
+        assert_eq!(params.message.as_deref(), Some("hi"));
         assert_eq!(params.model.as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(params.system_prompt.as_deref(), Some("be helpful"));
     }
@@ -321,7 +339,8 @@ mod tests {
         let server = OmniDevServer::new();
         let result = server
             .ai_chat(Parameters(AiChatParams {
-                message: "hi".to_string(),
+                message: Some("hi".to_string()),
+                message_path: None,
                 model: None,
                 system_prompt: Some("be terse".to_string()),
             }))
@@ -349,7 +368,8 @@ mod tests {
         let server = OmniDevServer::new();
         let err = server
             .ai_chat(Parameters(AiChatParams {
-                message: "hi".to_string(),
+                message: Some("hi".to_string()),
+                message_path: None,
                 model: None,
                 system_prompt: None,
             }))
