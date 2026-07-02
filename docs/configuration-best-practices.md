@@ -6,12 +6,13 @@ real lessons learned from the project's own development.
 ## Table of Contents
 
 1. [Config Resolution Priority](#config-resolution-priority)
-2. [Ecosystem Defaults](#ecosystem-defaults)
-3. [Writing Effective Scope Definitions](#writing-effective-scope-definitions)
-4. [Writing Effective Commit Guidelines](#writing-effective-commit-guidelines)
-5. [Scope Validity vs Appropriateness](#scope-validity-vs-appropriateness)
-6. [Common Pitfalls](#common-pitfalls)
-7. [Quality Checklist](#quality-checklist)
+2. [Credential Profiles](#credential-profiles)
+3. [Ecosystem Defaults](#ecosystem-defaults)
+4. [Writing Effective Scope Definitions](#writing-effective-scope-definitions)
+5. [Writing Effective Commit Guidelines](#writing-effective-commit-guidelines)
+6. [Scope Validity vs Appropriateness](#scope-validity-vs-appropriateness)
+7. [Common Pitfalls](#common-pitfalls)
+8. [Quality Checklist](#quality-checklist)
 
 ## Config Resolution Priority
 
@@ -76,6 +77,86 @@ ecosystem defaults are still applied (see below).
   command-line arguments.
 - **Walk-up**: Automatic monorepo support — place `.omni-dev/` directories
   at package boundaries and run from within the package.
+
+## Credential Profiles
+
+Backend credentials (Atlassian, Datadog, Snowflake, Claude/AI, and the
+`claude-cli` knobs) are read as environment variables, with a fallback to the
+`env` map in `~/.omni-dev/settings.json`:
+
+```json
+{
+  "env": {
+    "CLAUDE_API_KEY": "sk-...",
+    "DATADOG_SITE": "datadoghq.com"
+  }
+}
+```
+
+The lookup order for every such variable is **process environment first, then
+the `settings.json` `env` map** — so exported shell / CI variables always win
+and secret injection is unaffected.
+
+### Selecting a profile
+
+A **profile** is a named `env` bundle, letting one machine hold several
+credential sets (e.g. a `work` vs a `personal` Atlassian tenant) and pick one
+per invocation — the same model as the AWS CLI's `--profile`. Profiles live in a
+`profiles` map alongside the base `env`:
+
+```json
+{
+  "env": {
+    "CLAUDE_API_KEY": "sk-...",
+    "DATADOG_SITE": "datadoghq.com"
+  },
+  "profiles": {
+    "work": {
+      "env": {
+        "ATLASSIAN_INSTANCE_URL": "https://work.atlassian.net",
+        "ATLASSIAN_EMAIL": "me@work.com",
+        "ATLASSIAN_API_TOKEN": "..."
+      }
+    },
+    "personal": {
+      "env": {
+        "ATLASSIAN_INSTANCE_URL": "https://me.atlassian.net",
+        "ATLASSIAN_EMAIL": "me@personal.com",
+        "ATLASSIAN_API_TOKEN": "..."
+      }
+    }
+  }
+}
+```
+
+Select a profile two ways (the flag wins over the env var, mirroring
+`--profile` / `AWS_PROFILE`):
+
+```bash
+omni-dev --profile work atlassian jira read PROJ-1   # global --profile flag
+OMNI_DEV_PROFILE=work omni-dev datadog monitor list  # OMNI_DEV_PROFILE env var
+```
+
+### Resolution rules
+
+| Situation                                     | Lookup order for each variable               |
+|-----------------------------------------------|----------------------------------------------|
+| No profile active                             | process env, then base `env` map             |
+| `--profile work` (or `OMNI_DEV_PROFILE=work`) | process env, then the `work` profile's `env` |
+
+The layering is **isolated**: when a profile is active the base `env` map is
+**not** consulted. A key missing from the selected profile therefore fails loud
+rather than silently reusing a base credential against the wrong tenant — put
+values that every profile needs (e.g. `CLAUDE_API_KEY`) into each profile that
+needs them, not only in the base map. Process environment variables still
+override both, exactly as without a profile.
+
+- **Backward compatible.** With no `profiles` and no profile selected, behaviour
+  is byte-for-byte identical to a plain `env`-only `settings.json`.
+- **Unknown profile is a hard error.** A typo (`--profile wrok`) fails before any
+  backend call: `error: unknown profile 'wrok'; known profiles: personal, work`.
+- **Not profile-scoped:** the browser-bridge token (`OMNI_BRIDGE_TOKEN`) reads
+  the raw process environment only and ignores both the `env` map and profiles.
 
 ## Ecosystem Defaults
 

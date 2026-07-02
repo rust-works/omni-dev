@@ -109,6 +109,16 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub models_yaml: Option<std::path::PathBuf>,
 
+    /// Selects a named credential/config profile from
+    /// `~/.omni-dev/settings.json` (AWS-CLI style).
+    ///
+    /// When set, the profile's `env` bundle replaces the base `env` map in the
+    /// settings-fallback chain (process env still wins); the base map is not
+    /// consulted. Overrides `OMNI_DEV_PROFILE`. An unknown name is a hard error
+    /// listing the known profiles.
+    #[arg(long, global = true, value_name = "NAME")]
+    pub profile: Option<String>,
+
     /// Run as if omni-dev was started in `<PATH>` instead of the current
     /// working directory.
     ///
@@ -198,11 +208,53 @@ impl Cli {
         if let Some(path) = &self.models_yaml {
             std::env::set_var("OMNI_DEV_MODELS_YAML", path);
         }
+
+        // The flag beats the env var: setting OMNI_DEV_PROFILE here means the
+        // settings readers (which discover the active profile from that env
+        // var) pick up the flag. When the flag is absent we leave any existing
+        // OMNI_DEV_PROFILE untouched, so the env-var path still works.
+        if let Some(profile) = &self.profile {
+            std::env::set_var(crate::utils::settings::PROFILE_ENV_VAR, profile);
+        }
+    }
+
+    /// Validates the active profile (resolved from `env`) against the settings
+    /// produced by `load_settings`. The loader is invoked only when a profile is
+    /// actually active, so a no-profile invocation reads no disk. Pure over its
+    /// inputs — unit-tested with a `MapEnv` and a constructed `Settings` rather
+    /// than the process environment and `~/.omni-dev/settings.json`.
+    fn validate_active_profile<E, F>(env: &E, load_settings: F) -> Result<()>
+    where
+        E: crate::utils::env::EnvSource,
+        F: FnOnce() -> crate::utils::settings::Settings,
+    {
+        match crate::utils::settings::active_profile_from(env) {
+            Some(name) => load_settings().validate_profile(&name),
+            None => Ok(()),
+        }
+    }
+
+    /// Thin disk boundary for [`Self::validate_active_profile`]: loads
+    /// `~/.omni-dev/settings.json`, degrading to defaults when it is absent or
+    /// unreadable rather than failing (an unreadable settings file must not block
+    /// commands that use no profile). A named function so it can be unit-tested
+    /// directly instead of as an inline closure.
+    fn load_settings_or_default() -> crate::utils::settings::Settings {
+        crate::utils::settings::Settings::load().unwrap_or_default()
     }
 
     /// Executes the CLI command.
     pub async fn execute(self) -> Result<()> {
         self.propagate_global_flags();
+
+        // Validate the selected profile once, before dispatch, so a typo fails
+        // fast rather than silently falling back to base credentials. The loader
+        // runs only when a profile is active, so a no-profile invocation pays no
+        // extra disk I/O.
+        Self::validate_active_profile(
+            &crate::utils::env::SystemEnv,
+            Self::load_settings_or_default,
+        )?;
 
         // Resolve the repo location exactly once at this boundary, then thread
         // it explicitly into each command. Nothing deeper reads the ambient CWD.
@@ -371,12 +423,13 @@ mod tests {
     const ALLOW_MCP_VAR: &str = "OMNI_DEV_CLAUDE_CLI_ALLOW_MCP";
     const MAX_BUDGET_VAR: &str = "OMNI_DEV_CLAUDE_CLI_MAX_BUDGET_USD";
     const MODELS_YAML_VAR: &str = "OMNI_DEV_MODELS_YAML";
+    const PROFILE_VAR: &str = "OMNI_DEV_PROFILE";
 
     /// Locks the shared mutex and snapshots/restores every env var
     /// `propagate_global_flags` may touch.
     struct GlobalFlagsEnvGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
-        saved: [(&'static str, Option<String>); 5],
+        saved: [(&'static str, Option<String>); 6],
     }
 
     impl GlobalFlagsEnvGuard {
@@ -390,6 +443,7 @@ mod tests {
                 ALLOW_MCP_VAR,
                 MAX_BUDGET_VAR,
                 MODELS_YAML_VAR,
+                PROFILE_VAR,
             ];
             let saved = names.map(|n| (n, std::env::var(n).ok()));
             for (n, _) in &saved {
@@ -423,6 +477,7 @@ mod tests {
         assert!(std::env::var(ALLOW_MCP_VAR).is_err());
         assert!(std::env::var(MAX_BUDGET_VAR).is_err());
         assert!(std::env::var(MODELS_YAML_VAR).is_err());
+        assert!(std::env::var(PROFILE_VAR).is_err());
     }
 
     #[test]
@@ -531,6 +586,87 @@ mod tests {
             std::env::var(MODELS_YAML_VAR).ok().as_deref(),
             Some("/tmp/custom-models.yaml")
         );
+    }
+
+    #[test]
+    fn parses_profile_flag() {
+        let cli = Cli::try_parse_from(["omni-dev", "--profile", "work", "help-all"]).unwrap();
+        assert_eq!(cli.profile.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn profile_absent_is_none() {
+        let cli = Cli::try_parse_from(["omni-dev", "help-all"]).unwrap();
+        assert!(cli.profile.is_none());
+    }
+
+    #[test]
+    fn propagate_global_flags_sets_profile() {
+        let _g = GlobalFlagsEnvGuard::new();
+        let mut cli = cli_with_defaults();
+        cli.profile = Some("work".to_string());
+        cli.propagate_global_flags();
+        assert_eq!(std::env::var(PROFILE_VAR).ok().as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn propagate_global_flags_profile_flag_beats_env_var() {
+        let _g = GlobalFlagsEnvGuard::new();
+        std::env::set_var(PROFILE_VAR, "personal");
+        let mut cli = cli_with_defaults();
+        cli.profile = Some("work".to_string());
+        cli.propagate_global_flags();
+        assert_eq!(std::env::var(PROFILE_VAR).ok().as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn propagate_global_flags_absent_profile_leaves_env_var() {
+        let _g = GlobalFlagsEnvGuard::new();
+        std::env::set_var(PROFILE_VAR, "personal");
+        cli_with_defaults().propagate_global_flags();
+        assert_eq!(std::env::var(PROFILE_VAR).ok().as_deref(), Some("personal"));
+    }
+
+    // ── validate_active_profile() seam (pure: MapEnv + injected settings loader,
+    // no process env, no disk) ──
+
+    #[test]
+    fn validate_active_profile_ok_and_skips_load_when_no_profile() {
+        use crate::test_support::env::MapEnv;
+        let env = MapEnv::new();
+        let result = Cli::validate_active_profile(&env, || panic!("must not load settings"));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_active_profile_ok_for_known_profile() {
+        use crate::test_support::env::MapEnv;
+        use crate::utils::settings::{Profile, Settings};
+        let env = MapEnv::new().with(PROFILE_VAR, "work");
+        let settings = Settings {
+            profiles: std::iter::once(("work".to_string(), Profile::default())).collect(),
+            ..Default::default()
+        };
+        assert!(Cli::validate_active_profile(&env, || settings).is_ok());
+    }
+
+    #[test]
+    fn validate_active_profile_errors_for_unknown_profile() {
+        use crate::test_support::env::MapEnv;
+        use crate::utils::settings::Settings;
+        let env = MapEnv::new().with(PROFILE_VAR, "wrok");
+        let err = Cli::validate_active_profile(&env, Settings::default)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown profile 'wrok'"));
+    }
+
+    #[test]
+    fn load_settings_or_default_never_panics() {
+        // The disk boundary must degrade to defaults rather than panic when
+        // `~/.omni-dev/settings.json` is absent or unreadable. Exercises the
+        // production loader directly, no process env or fixture required.
+        let _settings = Cli::load_settings_or_default();
     }
 
     #[test]

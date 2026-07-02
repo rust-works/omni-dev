@@ -37,6 +37,8 @@ Options:
           Per-invocation spending cap in USD for the `claude-cli` backend
       --models-yaml <PATH>
           Path to a single user-side `models.yaml` that short-circuits the standard `./.omni-dev/models.yaml` and `~/.omni-dev/models.yaml` lookup. The file is still merged over the embedded catalog. Equivalent to setting `OMNI_DEV_MODELS_YAML`
+      --profile <NAME>
+          Selects a named credential/config profile from `~/.omni-dev/settings.json` (AWS-CLI style)
   -C, --repo <PATH>
           Run as if omni-dev was started in `<PATH>` instead of the current working directory
   -h, --help
