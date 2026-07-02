@@ -713,6 +713,11 @@ $ omni-dev datadog auth login
 This persists credentials to `~/.omni-dev/settings.json`, which is read by
 every invocation regardless of how the process was started.
 
+To keep several Datadog orgs on one machine and switch per invocation, put each
+org's variables in a named **profile** and select it with `--profile` /
+`OMNI_DEV_PROFILE`. See
+[Credential Profiles](configuration-best-practices.md#credential-profiles).
+
 ## See also
 
 - [User Guide](user-guide.md#datadog-integration) — short reference;

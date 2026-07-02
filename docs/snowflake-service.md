@@ -143,6 +143,13 @@ rather than by the per-request timeout.
 { "env": { "SNOWFLAKE_ACCOUNT": "MYACCT", "SNOWFLAKE_USER": "me" } }
 ```
 
+To hold several accounts on one machine, put each account's `SNOWFLAKE_*`
+variables in a named **profile** and select it with `--profile` /
+`OMNI_DEV_PROFILE` (see
+[Credential Profiles](configuration-best-practices.md#credential-profiles)).
+Because the service pools sessions by `(account, user)`, distinct profiles
+produce distinct pools automatically.
+
 The service is **account-agnostic**: there is no hardcoded account list. Defaults
 are applied at session creation; the per-query flags issue `USE WAREHOUSE/ROLE/
 DATABASE/SCHEMA` on the reused session, so one session serves varied query
