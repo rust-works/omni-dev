@@ -3,7 +3,6 @@
 //! Loads and saves Atlassian Cloud API credentials from/to the
 //! `~/.omni-dev/settings.json` file using the existing `env` map.
 
-use std::collections::HashMap;
 use std::fs;
 
 use anyhow::{Context, Result};
@@ -52,9 +51,7 @@ pub fn load_credentials() -> Result<AtlassianCredentials> {
 pub fn load_credentials_with_instance(
     instance_override: Option<&str>,
 ) -> Result<AtlassianCredentials> {
-    let settings = Settings::load().unwrap_or(Settings {
-        env: HashMap::new(),
-    });
+    let settings = Settings::load().unwrap_or_default();
 
     let instance_url = match instance_override {
         Some(url) => url.to_string(),
@@ -115,9 +112,7 @@ pub struct AuthStatus {
 /// only. Safe to call with no credentials configured (returns a scope with
 /// every flag `false`).
 pub fn status() -> AuthStatus {
-    let settings = Settings::load().unwrap_or(Settings {
-        env: HashMap::new(),
-    });
+    let settings = Settings::load().unwrap_or_default();
 
     let instance_url = settings
         .get_env_var(ATLASSIAN_INSTANCE_URL)
