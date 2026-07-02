@@ -81,6 +81,9 @@ impl From<CommentKindArg> for CommentKind {
 }
 
 /// Lists comments on a Confluence page.
+///
+/// Comment authors are returned as Atlassian account IDs — resolve them to
+/// display names with `omni-dev atlassian confluence user get`.
 #[derive(Parser)]
 pub struct ListCommand {
     /// Confluence page ID.

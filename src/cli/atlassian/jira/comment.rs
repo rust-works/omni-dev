@@ -42,6 +42,9 @@ impl CommentCommand {
 }
 
 /// Lists comments on a JIRA issue.
+///
+/// Comment authors are returned as Atlassian account IDs — resolve them to
+/// display names with `omni-dev atlassian jira user get`.
 #[derive(Parser)]
 pub struct ListCommand {
     /// JIRA issue key (e.g., PROJ-123).
