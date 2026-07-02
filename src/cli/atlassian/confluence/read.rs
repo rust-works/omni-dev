@@ -8,6 +8,9 @@ use crate::cli::atlassian::format::ContentFormat;
 use crate::cli::atlassian::helpers::{create_client, run_read};
 
 /// Fetches a Confluence page and outputs it as JFM markdown or ADF JSON.
+///
+/// Any author/version metadata is returned as Atlassian account IDs — resolve
+/// them to display names with `omni-dev atlassian confluence user get`.
 #[derive(Parser)]
 pub struct ReadCommand {
     /// Confluence page ID (e.g., 12345678).

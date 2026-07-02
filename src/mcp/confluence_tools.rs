@@ -359,6 +359,14 @@ pub struct ConfluenceUserSearchParams {
     pub limit: Option<u32>,
 }
 
+/// Parameters for the `confluence_user_get` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceUserGetParams {
+    /// One or more Atlassian account IDs to resolve
+    /// (e.g. `557058:00ce7e71-9edc-47da-a0c6-f796533ae2cd`).
+    pub account_ids: Vec<String>,
+}
+
 /// Parameters for the `confluence_attachment_upload` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ConfluenceAttachmentUploadParams {
@@ -1045,6 +1053,13 @@ pub async fn search_users_yaml(
     to_yaml(&results)
 }
 
+/// Builds the YAML output for the `confluence_user_get` tool — resolves the
+/// given account IDs to user records.
+pub async fn get_users_yaml(client: &AtlassianClient, account_ids: &[String]) -> Result<String> {
+    let results = client.get_confluence_users(account_ids).await?;
+    to_yaml(&results)
+}
+
 /// Uploads a file as an attachment and returns YAML for the resulting attachment.
 pub async fn upload_attachment_result(
     api: &ConfluenceApi,
@@ -1205,6 +1220,8 @@ impl OmniDevServer {
                        a short YAML summary (path/bytes/format) — useful for large pages. This reads a \
                        single page; to fetch a whole page tree or an entire space to disk, use \
                        `confluence_download` instead. \
+                       Any author/version metadata is returned as Atlassian account IDs — resolve them to \
+                       display names with `confluence_user_get`. \
                        Mirrors `omni-dev atlassian confluence read`."
     )]
     pub async fn confluence_read(
@@ -1388,11 +1405,12 @@ impl OmniDevServer {
         description = "List version history (metadata only) for a Confluence page. \
                        Returns version number, timestamp, author account ID, edit \
                        message, and minor-edit flag for each version, newest-first. \
-                       Does NOT fetch version bodies — use `confluence_read` for \
-                       content. `since` filters to versions at or after a numeric \
-                       version (\"5\") or ISO 8601 date (\"2026-01-01T00:00:00Z\"). \
-                       `limit` defaults to 20; `0` means unlimited. Mirrors \
-                       `omni-dev atlassian confluence history`."
+                       Resolve those author account IDs to display names with \
+                       `confluence_user_get`. Does NOT fetch version bodies — use \
+                       `confluence_read` for content. `since` filters to versions at or \
+                       after a numeric version (\"5\") or ISO 8601 date \
+                       (\"2026-01-01T00:00:00Z\"). `limit` defaults to 20; `0` means \
+                       unlimited. Mirrors `omni-dev atlassian confluence history`."
     )]
     pub async fn confluence_history(
         &self,
@@ -1415,8 +1433,10 @@ impl OmniDevServer {
     #[tool(description = "List comments on a Confluence page (auto-paginated). \
                        `kind` selects \"footer\", \"inline\", or \"all\" (default — \
                        both kinds merged and sorted by creation time). `limit` of 0 \
-                       returns every comment. Mirrors \
-                       `omni-dev atlassian confluence comment list`.")]
+                       returns every comment. Comment authors are returned as Atlassian \
+                       account IDs (e.g. `557058:...`) — resolve them to display names \
+                       with `confluence_user_get` (pass every distinct author ID in one \
+                       call). Mirrors `omni-dev atlassian confluence comment list`.")]
     pub async fn confluence_comment_list(
         &self,
         Parameters(params): Parameters<ConfluenceCommentListParams>,
@@ -1579,6 +1599,29 @@ impl OmniDevServer {
     ) -> Result<CallToolResult, McpError> {
         let (client, _url) = create_client().map_err(tool_error)?;
         let yaml = search_users_yaml(&client, &params.query, params.limit.unwrap_or(25))
+            .await
+            .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Resolves Confluence account IDs to user records.
+    #[tool(
+        description = "Resolve one or more Atlassian `account_id`s (as emitted by author \
+                       fields in `confluence_comment_list`, `confluence_history`, \
+                       `confluence_read`, etc.) to user records — the reverse of \
+                       `confluence_user_search`. Returns YAML with one entry per requested ID: \
+                       `account_id`, `display_name`, `email` (when accessible), and \
+                       `account_type`. Pass every distinct author ID from a batch in one call. \
+                       Unknown, anonymised, or permission-denied IDs come back as a stub record \
+                       with an `error` field (the batch never fails). Mirrors \
+                       `omni-dev atlassian confluence user get`."
+    )]
+    pub async fn confluence_user_get(
+        &self,
+        Parameters(params): Parameters<ConfluenceUserGetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _url) = create_client().map_err(tool_error)?;
+        let yaml = get_users_yaml(&client, &params.account_ids)
             .await
             .map_err(tool_error)?;
         Ok(CallToolResult::success(vec![Content::text(yaml)]))
@@ -4294,6 +4337,7 @@ mod tests {
             "confluence_label_add",
             "confluence_label_remove",
             "confluence_user_search",
+            "confluence_user_get",
             "confluence_attachment_upload",
             "confluence_attachment_list",
             "confluence_attachment_download",

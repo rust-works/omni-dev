@@ -1517,8 +1517,9 @@ impl OmniDevServer {
     /// Tool: get the change history for an issue.
     #[tool(
         description = "Get the change history for a JIRA issue. Returns YAML with one entry \
-                       per change (author, timestamp, items). Mirrors `omni-dev atlassian jira \
-                       changelog`."
+                       per change (author, timestamp, items). The author is an Atlassian \
+                       account ID — resolve it to a display name with `jira_user_get`. \
+                       Mirrors `omni-dev atlassian jira changelog`."
     )]
     pub async fn jira_changelog(
         &self,

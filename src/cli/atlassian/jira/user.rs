@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::atlassian::client::{AtlassianClient, JiraUserSearchResults};
+use crate::atlassian::client::{AtlassianClient, JiraUserGetResults, JiraUserSearchResults};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -20,6 +20,8 @@ pub struct UserCommand {
 pub enum UserSubcommands {
     /// Searches JIRA users by display name or email substring (mirrors the `jira_user_search` MCP tool).
     Search(UserSearchCommand),
+    /// Resolves account IDs to user records — the reverse of `search` (mirrors the `jira_user_get` MCP tool).
+    Get(UserGetCommand),
 }
 
 impl UserCommand {
@@ -27,6 +29,7 @@ impl UserCommand {
     pub async fn execute(self) -> Result<()> {
         match self.command {
             UserSubcommands::Search(cmd) => cmd.execute().await,
+            UserSubcommands::Get(cmd) => cmd.execute().await,
         }
     }
 }
@@ -112,6 +115,94 @@ fn print_user_results(result: &JiraUserSearchResults) {
     }
 }
 
+/// Resolves JIRA account IDs to user records (the reverse of `search`).
+#[derive(Parser)]
+pub struct UserGetCommand {
+    /// Account ID to resolve (repeat for a bulk lookup). Unknown or deactivated
+    /// IDs are returned as a stub record with an `error` field rather than
+    /// failing the whole batch.
+    #[arg(long = "account-id", required = true)]
+    pub account_id: Vec<String>,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
+impl UserGetCommand {
+    /// Executes the user lookup and prints results.
+    pub async fn execute(self) -> Result<()> {
+        let (client, _instance_url) = create_client()?;
+        run_get(&client, &self.account_id, &self.output).await
+    }
+}
+
+async fn run_get(
+    client: &AtlassianClient,
+    account_ids: &[String],
+    output: &OutputFormat,
+) -> Result<()> {
+    let result = client.get_jira_users(account_ids).await?;
+    if output_as(&result, output)? {
+        return Ok(());
+    }
+    print_user_get_results(&result);
+    Ok(())
+}
+
+/// Prints resolved JIRA user records as a formatted table.
+fn print_user_get_results(result: &JiraUserGetResults) {
+    if result.users.is_empty() {
+        println!("No users resolved.");
+        return;
+    }
+
+    let id_width = result
+        .users
+        .iter()
+        .map(|u| u.account_id.len())
+        .max()
+        .unwrap_or(10)
+        .max(10);
+    let name_width = result
+        .users
+        .iter()
+        .map(|u| u.display_name.as_deref().unwrap_or("-").len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+
+    println!(
+        "{:<id_width$}  {:<name_width$}  ACTIVE  EMAIL",
+        "ACCOUNT_ID", "NAME"
+    );
+    println!(
+        "{:<id_width$}  {:<name_width$}  ------  -----",
+        "-".repeat(id_width),
+        "-".repeat(name_width),
+    );
+
+    for user in &result.users {
+        // A failed lookup carries only account_id + error; surface the reason
+        // in the NAME column so a table reader still sees what went wrong.
+        let name = match (&user.display_name, &user.error) {
+            (Some(name), _) => name.clone(),
+            (None, Some(err)) => format!("({err})"),
+            (None, None) => "-".to_string(),
+        };
+        let active = match user.active {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "-",
+        };
+        let email = user.email_address.as_deref().unwrap_or("-");
+        println!(
+            "{:<id_width$}  {:<name_width$}  {active:<6}  {email}",
+            user.account_id, name,
+        );
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -121,7 +212,7 @@ fn print_user_results(result: &JiraUserSearchResults) {
 mod tests {
     use super::*;
     use crate::atlassian::auth::{ATLASSIAN_API_TOKEN, ATLASSIAN_EMAIL, ATLASSIAN_INSTANCE_URL};
-    use crate::atlassian::client::JiraUserSearchResult;
+    use crate::atlassian::client::{JiraUserRecord, JiraUserSearchResult};
 
     fn mock_client(base_url: &str) -> AtlassianClient {
         AtlassianClient::new(base_url, "user@test.com", "token").unwrap()
@@ -313,6 +404,145 @@ mod tests {
             command: UserSubcommands::Search(UserSearchCommand {
                 query: "nobody".to_string(),
                 limit: 25,
+                output: OutputFormat::Yaml,
+            }),
+        };
+        cmd.execute().await.unwrap();
+    }
+
+    // ── user get (account ID → record) ────────────────────────────
+
+    fn sample_record(
+        account_id: &str,
+        display_name: Option<&str>,
+        active: Option<bool>,
+        error: Option<&str>,
+    ) -> JiraUserRecord {
+        JiraUserRecord {
+            account_id: account_id.to_string(),
+            display_name: display_name.map(String::from),
+            email_address: None,
+            active,
+            account_type: Some("atlassian".to_string()),
+            error: error.map(String::from),
+        }
+    }
+
+    #[test]
+    fn print_get_results_empty() {
+        print_user_get_results(&JiraUserGetResults { users: vec![] });
+    }
+
+    #[test]
+    fn print_get_results_with_users_and_error() {
+        let result = JiraUserGetResults {
+            users: vec![
+                sample_record("abc123", Some("Alice"), Some(true), None),
+                sample_record("gone1", None, Some(false), None),
+                sample_record("bad", None, None, Some("HTTP 404")),
+            ],
+        };
+        print_user_get_results(&result);
+    }
+
+    #[tokio::test]
+    async fn run_get_table_output() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/user"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "accountId": "abc123",
+                    "displayName": "Alice Smith",
+                    "active": true,
+                    "accountType": "atlassian"
+                })),
+            )
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let ids = vec!["abc123".to_string()];
+        assert!(run_get(&client, &ids, &OutputFormat::Table).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_get_json_output() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/user"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not found"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let ids = vec!["missing".to_string()];
+        assert!(run_get(&client, &ids, &OutputFormat::Json).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_get_batch_survives_bad_id() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/user"))
+            .and(wiremock::matchers::query_param("accountId", "good"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "accountId": "good",
+                    "displayName": "Good User",
+                    "active": true
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/user"))
+            .and(wiremock::matchers::query_param("accountId", "bad"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not found"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let ids = vec!["good".to_string(), "bad".to_string()];
+        assert!(run_get(&client, &ids, &OutputFormat::Yaml).await.is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_get_command_execute_round_trip() {
+        let _lock = env_lock();
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/user"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "accountId": "abc123",
+                    "displayName": "Alice",
+                    "active": true,
+                    "accountType": "atlassian"
+                })),
+            )
+            .mount(&server)
+            .await;
+        let _env = EnvGuard::set(&server.uri());
+
+        let cmd = UserGetCommand {
+            account_id: vec!["abc123".to_string()],
+            output: OutputFormat::Json,
+        };
+        cmd.execute().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_command_dispatches_to_get() {
+        let _lock = env_lock();
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/user"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not found"))
+            .mount(&server)
+            .await;
+        let _env = EnvGuard::set(&server.uri());
+
+        let cmd = UserCommand {
+            command: UserSubcommands::Get(UserGetCommand {
+                account_id: vec!["missing".to_string()],
                 output: OutputFormat::Yaml,
             }),
         };
