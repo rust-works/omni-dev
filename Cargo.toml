@@ -58,7 +58,7 @@ flate2 = "1"
 tar = "0.4"
 sha2 = "0.11"
 ureq = "3"
-quick-xml = "0.40.1"
+quick-xml = "0.41"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["fs", "hostname", "signal", "user"] }
