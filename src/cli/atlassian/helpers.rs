@@ -7,7 +7,7 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::atlassian::adf::AdfDocument;
 use crate::atlassian::adf_validated::{validate_with_source, ValidatedAdfDocument};
-use crate::atlassian::api::AtlassianApi;
+use crate::atlassian::api::{AtlassianApi, ContentItem};
 use crate::atlassian::auth;
 use crate::atlassian::client::{AtlassianClient, FieldSelection};
 use crate::atlassian::convert::markdown_to_adf;
@@ -24,16 +24,31 @@ pub async fn run_read(
     instance_url: &str,
 ) -> Result<()> {
     let item = api.get_content(id).await?;
+    render_content_item(&item, output, format, instance_url)
+}
 
+/// Renders an already-fetched [`ContentItem`] to the requested format and writes
+/// it to `output` (or stdout).
+///
+/// Split out of [`run_read`] so callers that fetch through a Confluence-specific
+/// path (e.g. a versioned read via `get_page_at_version`, which is not on the
+/// shared [`AtlassianApi`] trait) can reuse identical rendering.
+pub fn render_content_item(
+    item: &ContentItem,
+    output: Option<&str>,
+    format: &ContentFormat,
+    instance_url: &str,
+) -> Result<()> {
     match format {
         ContentFormat::Adf => {
-            let json =
-                serde_json::to_string_pretty(&item.body_adf.unwrap_or(serde_json::Value::Null))
-                    .context("Failed to serialize ADF JSON")?;
+            let json = serde_json::to_string_pretty(
+                item.body_adf.as_ref().unwrap_or(&serde_json::Value::Null),
+            )
+            .context("Failed to serialize ADF JSON")?;
             output_text(&json, output)?;
         }
         ContentFormat::Jfm => {
-            let doc = content_item_to_document(&item, instance_url)?;
+            let doc = content_item_to_document(item, instance_url)?;
             let rendered = doc.render()?;
             output_text(&rendered, output)?;
 

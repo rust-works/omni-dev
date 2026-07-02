@@ -27,6 +27,7 @@ use crate::atlassian::confluence_api::{
 };
 use crate::atlassian::create::{prepend_warnings, resolve_confluence_create};
 use crate::atlassian::document::{content_item_to_document, JfmDocument, JfmFrontmatter};
+use crate::atlassian::inline_comment::{audit_inline_comments, reanchor_inline_comment};
 use crate::cli::atlassian::confluence::download::{
     run_download, DownloadParams, ManifestEntry, OnConflict,
 };
@@ -57,6 +58,12 @@ pub struct ConfluenceReadParams {
     /// window — the assistant can then read the file with offset/limit.
     #[serde(default)]
     pub output_file: Option<String>,
+    /// Read a specific historical version instead of the current head (e.g.
+    /// `3`). Confluence stores each version as an immutable snapshot; omit for
+    /// the latest. Useful for seeing what a reviewer was reading when they
+    /// posted a comment.
+    #[serde(default)]
+    pub version: Option<u32>,
 }
 
 /// Parameters for the `confluence_search` tool.
@@ -313,6 +320,33 @@ pub struct ConfluenceCommentRepliesParams {
     /// Maximum number of replies to return (0 = unlimited).
     #[serde(default)]
     pub limit: Option<usize>,
+}
+
+/// Parameters for the `confluence_comment_audit` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceCommentAuditParams {
+    /// Confluence page ID.
+    pub id: String,
+}
+
+/// Parameters for the `confluence_comment_reanchor` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfluenceCommentReanchorParams {
+    /// Confluence page ID.
+    pub id: String,
+    /// The inline comment ID to re-anchor.
+    pub comment_id: String,
+    /// Exact text on the current page to move the comment's anchor to.
+    pub anchor_text: String,
+    /// 1-based occurrence to anchor to when `anchor_text` appears more than
+    /// once on the page. Required for ambiguous anchors; rejected if out of
+    /// range.
+    #[serde(default)]
+    pub match_index: Option<usize>,
+    /// When true, validate and return what would change without writing the
+    /// page. Defaults to `false`.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 /// Parameters for the `confluence_label_list` tool.
@@ -986,6 +1020,29 @@ pub async fn add_inline_comment_result(
     to_yaml(&result)
 }
 
+/// Builds the YAML output for the `confluence_comment_audit` tool.
+pub async fn audit_comments_yaml(api: &ConfluenceApi, id: &str) -> Result<String> {
+    let drifts = audit_inline_comments(api, id).await?;
+    to_yaml(&drifts)
+}
+
+/// Moves an inline comment's anchor and returns the outcome as YAML.
+///
+/// With `dry_run`, the move is computed and validated but the page is not
+/// written.
+pub async fn reanchor_comment_result(
+    api: &ConfluenceApi,
+    id: &str,
+    comment_id: &str,
+    anchor_text: &str,
+    match_index: Option<usize>,
+    dry_run: bool,
+) -> Result<String> {
+    let outcome =
+        reanchor_inline_comment(api, id, comment_id, anchor_text, match_index, dry_run).await?;
+    to_yaml(&outcome)
+}
+
 /// Builds the YAML output for the `confluence_label_list` tool.
 pub async fn list_labels_yaml(api: &ConfluenceApi, id: &str, limit: usize) -> Result<String> {
     let mut labels = api.get_labels(id).await?;
@@ -1216,10 +1273,14 @@ impl OmniDevServer {
                        nodes — preserve them verbatim when editing so a later `confluence_write` does not \
                        drop those comments. Pass format=\"adf\" for the raw ADF JSON \
                        (the on-the-wire document model) only when you need exact node structure. \
-                       When `output_file` is set, the content is written to that path and the tool returns \
-                       a short YAML summary (path/bytes/format) — useful for large pages. This reads a \
-                       single page; to fetch a whole page tree or an entire space to disk, use \
+                       Pass `version` to read a specific historical version (an immutable snapshot) instead \
+                       of the current head — useful for seeing what a reviewer was reading when they \
+                       commented. When `output_file` is set, the content is written to that path and the \
+                       tool returns a short YAML summary (path/bytes/format) — useful for large pages. This \
+                       reads a single page; to fetch a whole page tree or an entire space to disk, use \
                        `confluence_download` instead. \
+                       NOTE: inline-comment anchors do NOT follow text edits — to detect/repair drifted \
+                       comments use `confluence_comment_audit` / `confluence_comment_reanchor`. \
                        Any author/version metadata is returned as Atlassian account IDs — resolve them to \
                        display names with `confluence_user_get`. \
                        Mirrors `omni-dev atlassian confluence read`."
@@ -1229,9 +1290,14 @@ impl OmniDevServer {
         Parameters(params): Parameters<ConfluenceReadParams>,
     ) -> Result<CallToolResult, McpError> {
         let format = parse_format(params.format.as_deref()).map_err(tool_error)?;
-        let rendered = run_confluence_read(&params.id, format, params.output_file.as_deref())
-            .await
-            .map_err(tool_error)?;
+        let rendered = run_confluence_read(
+            &params.id,
+            format,
+            params.output_file.as_deref(),
+            params.version,
+        )
+        .await
+        .map_err(tool_error)?;
         Ok(CallToolResult::success(vec![Content::text(rendered)]))
     }
 
@@ -1433,9 +1499,14 @@ impl OmniDevServer {
     #[tool(description = "List comments on a Confluence page (auto-paginated). \
                        `kind` selects \"footer\", \"inline\", or \"all\" (default — \
                        both kinds merged and sorted by creation time). `limit` of 0 \
-                       returns every comment. Comment authors are returned as Atlassian \
-                       account IDs (e.g. `557058:...`) — resolve them to display names \
-                       with `confluence_user_get` (pass every distinct author ID in one \
+                       returns every comment. Inline comments include their \
+                       `inline_marker_ref` and durable `inline_original_selection` \
+                       (the reviewer's original highlight); note that inline-comment \
+                       anchors do NOT follow text edits — use `confluence_comment_audit` \
+                       to detect drift and `confluence_comment_reanchor` to fix it. \
+                       Comment authors are returned as Atlassian account IDs \
+                       (e.g. `557058:...`) — resolve them to display names with \
+                       `confluence_user_get` (pass every distinct author ID in one \
                        call). Mirrors `omni-dev atlassian confluence comment list`.")]
     pub async fn confluence_comment_list(
         &self,
@@ -1534,6 +1605,63 @@ impl OmniDevServer {
             list_comment_replies_yaml(&api, &params.comment_id, kind, params.limit.unwrap_or(25))
                 .await
                 .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Audits inline comments on a page for anchor drift.
+    #[tool(
+        description = "Audit every inline comment on a Confluence page for anchor drift. \
+                       Inline-comment anchors do NOT follow text edits: when the annotated text \
+                       is rewritten, Confluence leaves the mark on whatever original characters \
+                       survive, so comments end up torn across fragments, slid onto unrelated \
+                       text, or dropped. This compares each comment's currently-anchored text \
+                       against the reviewer's durable original highlight and returns YAML with a \
+                       per-comment `status` (`ok`/`torn`/`mark_lost`/`drifted`), the original vs. \
+                       current anchored text, and a `suggested_new_anchor` for drifted comments. \
+                       Read-only — fix drift with `confluence_comment_reanchor`. Mirrors \
+                       `omni-dev atlassian confluence comment audit`."
+    )]
+    pub async fn confluence_comment_audit(
+        &self,
+        Parameters(params): Parameters<ConfluenceCommentAuditParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _url) = create_client().map_err(tool_error)?;
+        let api = ConfluenceApi::new(client);
+        let yaml = audit_comments_yaml(&api, &params.id)
+            .await
+            .map_err(tool_error)?;
+        Ok(CallToolResult::success(vec![Content::text(yaml)]))
+    }
+
+    /// Moves an inline comment's anchor to a new text run.
+    #[tool(
+        description = "Move an inline comment's anchor to a new run of text in a Confluence page's \
+                       current ADF, then write the page back in one update — the fix for a comment \
+                       flagged as `drifted`/`mark_lost` by `confluence_comment_audit`. Pass the \
+                       inline `comment_id` and the exact `anchor_text` to move it to; \
+                       `match_index` (1-based) disambiguates when the text occurs more than once. \
+                       The anchor may span multiple runs (e.g. a phrase split by bold) but not a \
+                       block boundary. Operates entirely on ADF — it never round-trips through JFM, \
+                       which would discard the annotation marks. Set `dry_run: true` to validate \
+                       and preview the move without writing. Mirrors \
+                       `omni-dev atlassian confluence comment reanchor`."
+    )]
+    pub async fn confluence_comment_reanchor(
+        &self,
+        Parameters(params): Parameters<ConfluenceCommentReanchorParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _url) = create_client().map_err(tool_error)?;
+        let api = ConfluenceApi::new(client);
+        let yaml = reanchor_comment_result(
+            &api,
+            &params.id,
+            &params.comment_id,
+            &params.anchor_text,
+            params.match_index,
+            params.dry_run,
+        )
+        .await
+        .map_err(tool_error)?;
         Ok(CallToolResult::success(vec![Content::text(yaml)]))
     }
 
@@ -1841,10 +1969,14 @@ async fn run_confluence_read(
     id: &str,
     format: ContentFormat,
     output_file: Option<&str>,
+    version: Option<u32>,
 ) -> Result<String> {
     let (client, instance_url) = create_client()?;
     let api = ConfluenceApi::new(client);
-    let item = api.get_content(id).await?;
+    let item = match version {
+        Some(v) => api.get_page_at_version(id, v).await?,
+        None => api.get_content(id).await?,
+    };
     let label = format_label(&format);
     let rendered = render_content_item(&item, format, &instance_url)?;
     match output_file {
@@ -2475,7 +2607,7 @@ mod tests {
         mock_page(&server, "12345").await;
         let _env = EnvGuard::set(&server.uri());
 
-        let out = run_confluence_read("12345", ContentFormat::Jfm, None)
+        let out = run_confluence_read("12345", ContentFormat::Jfm, None, None)
             .await
             .unwrap();
         assert!(out.contains("Mocked"));
@@ -2489,7 +2621,7 @@ mod tests {
         mock_page(&server, "12345").await;
         let _env = EnvGuard::set(&server.uri());
 
-        let out = run_confluence_read("12345", ContentFormat::Adf, None)
+        let out = run_confluence_read("12345", ContentFormat::Adf, None, None)
             .await
             .unwrap();
         assert!(out.contains("\"doc\""));
@@ -2506,7 +2638,7 @@ mod tests {
             .await;
         let _env = EnvGuard::set(&server.uri());
 
-        let err = run_confluence_read("99", ContentFormat::Jfm, None)
+        let err = run_confluence_read("99", ContentFormat::Jfm, None, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("404"));
@@ -2523,7 +2655,7 @@ mod tests {
         let out_path = tmp.path().join("page.md");
         let path_str = out_path.to_str().unwrap();
 
-        let summary = run_confluence_read("12345", ContentFormat::Jfm, Some(path_str))
+        let summary = run_confluence_read("12345", ContentFormat::Jfm, Some(path_str), None)
             .await
             .unwrap();
 
@@ -2549,7 +2681,7 @@ mod tests {
         let out_path = tmp.path().join("page.json");
         let path_str = out_path.to_str().unwrap();
 
-        let summary = run_confluence_read("12345", ContentFormat::Adf, Some(path_str))
+        let summary = run_confluence_read("12345", ContentFormat::Adf, Some(path_str), None)
             .await
             .unwrap();
 
@@ -2569,6 +2701,7 @@ mod tests {
             "12345",
             ContentFormat::Jfm,
             Some("/nonexistent_dir_zxq/out.md"),
+            None,
         )
         .await
         .unwrap_err();
@@ -2621,7 +2754,7 @@ mod tests {
         mock_page_with_bad_adf(&server, "12345").await;
         let _env = EnvGuard::set(&server.uri());
 
-        let err = run_confluence_read("12345", ContentFormat::Jfm, None)
+        let err = run_confluence_read("12345", ContentFormat::Jfm, None, None)
             .await
             .unwrap_err();
         assert!(
@@ -3296,6 +3429,7 @@ mod tests {
             id: "12345".to_string(),
             format: Some("xml".to_string()),
             output_file: None,
+            version: None,
         };
         let result = server.confluence_read(Parameters(params)).await;
         let err = result.unwrap_err();
@@ -3319,6 +3453,7 @@ mod tests {
                 id: "12345".to_string(),
                 format: Some("jfm".to_string()),
                 output_file: None,
+                version: None,
             }))
             .await
             .unwrap();

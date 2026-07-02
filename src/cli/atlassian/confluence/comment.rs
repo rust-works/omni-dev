@@ -1,5 +1,7 @@
 //! CLI commands for Confluence page comments.
 
+use std::io::{self, BufRead, Write};
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -10,6 +12,10 @@ use crate::atlassian::confluence_api::{
 };
 use crate::atlassian::convert::adf_to_markdown;
 use crate::atlassian::document::JfmDocument;
+use crate::atlassian::inline_comment::{
+    audit_inline_comments, reanchor_inline_comment, CommentDrift, DriftStatus,
+};
+use crate::cli::atlassian::confirm::{guard_destructive_with_io, GuardOptions, GuardOutcome};
 use crate::cli::atlassian::format::{output_as, ContentFormat, OutputFormat};
 use crate::cli::atlassian::helpers::{create_client, read_input};
 
@@ -32,6 +38,10 @@ pub enum CommentSubcommands {
     AddInline(AddInlineCommand),
     /// Lists the replies of a comment (mirrors the `confluence_comment_replies` MCP tool).
     Replies(RepliesCommand),
+    /// Audits inline comments for anchor drift (mirrors the `confluence_comment_audit` MCP tool).
+    Audit(AuditCommand),
+    /// Moves an inline comment's anchor to a new text run (mirrors the `confluence_comment_reanchor` MCP tool).
+    Reanchor(ReanchorCommand),
 }
 
 impl CommentCommand {
@@ -42,6 +52,8 @@ impl CommentCommand {
             CommentSubcommands::Add(cmd) => cmd.execute().await,
             CommentSubcommands::AddInline(cmd) => cmd.execute().await,
             CommentSubcommands::Replies(cmd) => cmd.execute().await,
+            CommentSubcommands::Audit(cmd) => cmd.execute().await,
+            CommentSubcommands::Reanchor(cmd) => cmd.execute().await,
         }
     }
 }
@@ -200,6 +212,157 @@ impl RepliesCommand {
         let (client, _instance_url) = create_client()?;
         let api = ConfluenceApi::new(client);
         run_list_replies(&api, &self.id, self.kind.into(), self.limit, &self.output).await
+    }
+}
+
+/// Audits every inline comment on a page for anchor drift.
+///
+/// Inline-comment anchors do NOT follow text edits: when the annotated text is
+/// rewritten, Confluence keeps the mark on whatever original characters survive.
+/// This compares each comment's currently-anchored text against the reviewer's
+/// original highlight and reports the drift. Read-only.
+#[derive(Parser)]
+pub struct AuditCommand {
+    /// Confluence page ID.
+    pub id: String,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
+impl AuditCommand {
+    /// Fetches inline comments and the page ADF, then reports drift.
+    pub async fn execute(self) -> Result<()> {
+        let (client, _instance_url) = create_client()?;
+        let api = ConfluenceApi::new(client);
+        let drifts = audit_inline_comments(&api, &self.id).await?;
+        if output_as(&drifts, &self.output)? {
+            return Ok(());
+        }
+        print_drifts(&drifts);
+        Ok(())
+    }
+}
+
+/// Moves an inline comment's anchor to a new run of text in the current-version
+/// ADF and writes the page back.
+///
+/// Operates entirely on ADF (it never round-trips through JFM, which would
+/// discard the annotation marks the anchor depends on). Destructive — the page
+/// is updated — so it prompts for confirmation unless `--force`.
+#[derive(Parser)]
+pub struct ReanchorCommand {
+    /// Confluence page ID.
+    pub id: String,
+
+    /// The inline comment ID to re-anchor.
+    #[arg(long)]
+    pub comment: String,
+
+    /// Exact text on the current page to move the comment's anchor to.
+    #[arg(long)]
+    pub anchor_text: String,
+
+    /// 1-based occurrence to anchor to when `--anchor-text` appears more than
+    /// once on the page. Required for ambiguous anchors; rejected if out of range.
+    #[arg(long)]
+    pub match_index: Option<usize>,
+
+    /// Skips the confirmation prompt.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Prints what would change without writing the page.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+impl ReanchorCommand {
+    /// Executes the re-anchor command.
+    pub async fn execute(self) -> Result<()> {
+        let (client, _instance_url) = create_client()?;
+        let api = ConfluenceApi::new(client);
+        let mut reader = io::BufReader::new(io::stdin());
+        let mut writer = io::stdout();
+        self.execute_with_io(&api, &mut reader, &mut writer).await
+    }
+
+    /// Inner form taking explicit API and IO handles, for unit tests.
+    async fn execute_with_io(
+        self,
+        api: &ConfluenceApi,
+        reader: &mut (dyn BufRead + Send),
+        writer: &mut (dyn Write + Send),
+    ) -> Result<()> {
+        let prompt = format!(
+            "Re-anchor inline comment {} on page {} to {:?}? [y/N] ",
+            self.comment, self.id, self.anchor_text
+        );
+        let dry_run_message = format!(
+            "Would re-anchor inline comment {} on page {} to {:?}.",
+            self.comment, self.id, self.anchor_text
+        );
+        let outcome = guard_destructive_with_io(
+            &GuardOptions {
+                prompt: &prompt,
+                dry_run_message: &dry_run_message,
+                force: self.force,
+                dry_run: self.dry_run,
+            },
+            reader,
+            writer,
+        )?;
+        match outcome {
+            GuardOutcome::Cancelled | GuardOutcome::DryRun => return Ok(()),
+            GuardOutcome::Proceed => {}
+        }
+
+        let outcome = reanchor_inline_comment(
+            api,
+            &self.id,
+            &self.comment,
+            &self.anchor_text,
+            self.match_index,
+            false,
+        )
+        .await?;
+        writeln!(
+            writer,
+            "Re-anchored inline comment {} to {:?}.",
+            outcome.comment_id, outcome.new_anchor_text
+        )?;
+        Ok(())
+    }
+}
+
+/// Prints inline-comment drift reports in a readable format.
+fn print_drifts(drifts: &[CommentDrift]) {
+    if drifts.is_empty() {
+        println!("No inline comments.");
+        return;
+    }
+
+    for (i, drift) in drifts.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        let status = match drift.status {
+            DriftStatus::Ok => "OK",
+            DriftStatus::Torn => "TORN",
+            DriftStatus::MarkLost => "MARK LOST",
+            DriftStatus::Drifted => "DRIFTED",
+        };
+        println!("--- {} | {} ---", drift.comment_id, status);
+        println!("  original:  {:?}", drift.original_selection);
+        match &drift.current_anchored_text {
+            Some(text) => println!("  current:   {text:?}"),
+            None => println!("  current:   (mark not present)"),
+        }
+        if let Some(suggestion) = &drift.suggested_new_anchor {
+            let count = drift.suggested_match_count.unwrap_or(0);
+            println!("  suggested: {suggestion:?} (appears {count}x on the current page)");
+        }
     }
 }
 
@@ -364,6 +527,8 @@ mod tests {
             kind: CommentKind::Footer,
             body_adf,
             created: "2026-04-01T10:30:00.000Z".to_string(),
+            inline_marker_ref: None,
+            inline_original_selection: None,
         }
     }
 
@@ -378,6 +543,8 @@ mod tests {
             kind: CommentKind::Inline,
             body_adf,
             created: "2026-04-02T10:30:00.000Z".to_string(),
+            inline_marker_ref: Some("marker-1".to_string()),
+            inline_original_selection: Some("original highlighted text".to_string()),
         }
     }
 

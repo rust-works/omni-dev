@@ -5,7 +5,7 @@ use clap::Parser;
 
 use crate::atlassian::confluence_api::ConfluenceApi;
 use crate::cli::atlassian::format::ContentFormat;
-use crate::cli::atlassian::helpers::{create_client, run_read};
+use crate::cli::atlassian::helpers::{create_client, render_content_item, run_read};
 
 /// Fetches a Confluence page and outputs it as JFM markdown or ADF JSON.
 ///
@@ -23,6 +23,12 @@ pub struct ReadCommand {
     /// Output format.
     #[arg(long, value_enum, default_value_t = ContentFormat::Jfm)]
     pub format: ContentFormat,
+
+    /// Read a specific historical version instead of the current head
+    /// (e.g. `--version 3`). Confluence stores each version as an immutable
+    /// snapshot; omit for the latest.
+    #[arg(long)]
+    pub version: Option<u32>,
 }
 
 impl ReadCommand {
@@ -31,14 +37,24 @@ impl ReadCommand {
         let (client, instance_url) = create_client()?;
         let api = ConfluenceApi::new(client);
 
-        run_read(
-            &self.id,
-            self.output.as_deref(),
-            &self.format,
-            &api,
-            &instance_url,
-        )
-        .await
+        match self.version {
+            Some(version) => {
+                // `get_page_at_version` is Confluence-specific (not on the shared
+                // `AtlassianApi` trait), so fetch here and reuse the shared renderer.
+                let item = api.get_page_at_version(&self.id, version).await?;
+                render_content_item(&item, self.output.as_deref(), &self.format, &instance_url)
+            }
+            None => {
+                run_read(
+                    &self.id,
+                    self.output.as_deref(),
+                    &self.format,
+                    &api,
+                    &instance_url,
+                )
+                .await
+            }
+        }
     }
 }
 
@@ -53,10 +69,12 @@ mod tests {
             id: "12345".to_string(),
             output: Some("page.md".to_string()),
             format: ContentFormat::Jfm,
+            version: None,
         };
         assert_eq!(cmd.id, "12345");
         assert_eq!(cmd.output.as_deref(), Some("page.md"));
         assert!(matches!(cmd.format, ContentFormat::Jfm));
+        assert!(cmd.version.is_none());
     }
 
     #[test]
@@ -65,9 +83,11 @@ mod tests {
             id: "99999".to_string(),
             output: None,
             format: ContentFormat::Adf,
+            version: Some(3),
         };
         assert_eq!(cmd.id, "99999");
         assert!(cmd.output.is_none());
         assert!(matches!(cmd.format, ContentFormat::Adf));
+        assert_eq!(cmd.version, Some(3));
     }
 }
