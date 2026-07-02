@@ -206,6 +206,58 @@ async fn jira_tools_advertise_schemas() -> Result<()> {
     Ok(())
 }
 
+/// Backstop for STYLE-0029: EVERY advertised tool must carry a non-empty
+/// description, and every top-level parameter in its input schema must carry a
+/// non-empty `description` (schemars renders `///` field doc comments here).
+/// Prevents the #1072 audit from silently rotting as tools are added.
+#[tokio::test]
+async fn all_tools_advertise_descriptions_and_param_schemas() -> Result<()> {
+    let (client, server_handle) = spawn_server().await;
+    let tools = client.list_tools(Option::default()).await?;
+    assert!(
+        tools.tools.len() >= 90,
+        "unexpectedly few tools ({}) — did a tool_router get dropped from OmniDevServer::new()?",
+        tools.tools.len()
+    );
+
+    let mut problems = Vec::new();
+    for tool in &tools.tools {
+        let name = tool.name.as_ref();
+        if !tool
+            .description
+            .as_ref()
+            .is_some_and(|d| !d.trim().is_empty())
+        {
+            problems.push(format!("{name}: missing tool description"));
+        }
+        // input_schema is Arc<serde_json::Map<String, Value>> (rmcp 1.7).
+        if let Some(props) = tool
+            .input_schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+        {
+            for (param, schema) in props {
+                let has_desc = schema
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|d| !d.trim().is_empty());
+                if !has_desc {
+                    problems.push(format!("{name}.{param}: missing param description"));
+                }
+            }
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "STYLE-0029 violations (every MCP tool & param needs a description):\n{}",
+        problems.join("\n")
+    );
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn list_tools_includes_confluence_and_atlassian_tools() -> Result<()> {
     let (client, server_handle) = spawn_server().await;

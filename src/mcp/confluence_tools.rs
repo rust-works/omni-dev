@@ -1167,7 +1167,9 @@ impl OmniDevServer {
                        drop those comments. Pass format=\"adf\" for the raw ADF JSON \
                        (the on-the-wire document model) only when you need exact node structure. \
                        When `output_file` is set, the content is written to that path and the tool returns \
-                       a short YAML summary (path/bytes/format) — useful for large pages. \
+                       a short YAML summary (path/bytes/format) — useful for large pages. This reads a \
+                       single page; to fetch a whole page tree or an entire space to disk, use \
+                       `confluence_download` instead. \
                        Mirrors `omni-dev atlassian confluence read`."
     )]
     pub async fn confluence_read(
@@ -1293,7 +1295,8 @@ impl OmniDevServer {
                        Either `id` (root page) or `space` (space key) must be provided. \
                        Set `include_attachments: true` to also fetch each page's attachment \
                        binaries into an `attachments/` subdirectory beside its content file. \
-                       Returns a YAML manifest summary of downloaded pages. \
+                       Returns a YAML manifest summary of downloaded pages. To read a single \
+                       page's body instead (no files written), use `confluence_read`. \
                        Mirrors `omni-dev atlassian confluence download`."
     )]
     pub async fn confluence_download(
