@@ -375,6 +375,14 @@ pub struct JiraUserSearchParams {
     pub limit: Option<u32>,
 }
 
+/// Parameters for the `jira_user_get` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct JiraUserGetParams {
+    /// One or more Atlassian account IDs to resolve
+    /// (e.g. `557058:00ce7e71-9edc-47da-a0c6-f796533ae2cd`).
+    pub account_ids: Vec<String>,
+}
+
 // ── format helpers ─────────────────────────────────────────────────────────
 
 /// Output format for JIRA read/write operations.
@@ -1062,6 +1070,12 @@ async fn run_jira_user_search(client: &AtlassianClient, query: &str, limit: u32)
     yaml_result(&result)
 }
 
+/// Resolves JIRA account IDs to user records and returns the result as YAML.
+async fn run_jira_user_get(client: &AtlassianClient, account_ids: &[String]) -> Result<String> {
+    let result = client.get_jira_users(account_ids).await?;
+    yaml_result(&result)
+}
+
 // ── tool router ────────────────────────────────────────────────────────────
 
 #[allow(missing_docs)] // #[tool_router] generates a pub `jira_core_tool_router` fn.
@@ -1074,7 +1088,9 @@ impl OmniDevServer {
                        `omni-dev://specs/jfm`) or the raw ADF description JSON when \
                        `format = \"adf\"`. When `output_file` is set, the content is written \
                        to that path and the tool returns a short YAML summary \
-                       (path/bytes/format) — useful for large issues."
+                       (path/bytes/format) — useful for large issues. Assignee/reporter and \
+                       other people fields are Atlassian account IDs — resolve them to \
+                       display names with `jira_user_get`."
     )]
     pub async fn jira_read(
         &self,
@@ -1291,9 +1307,10 @@ impl OmniDevServer {
                        `action = \"list\"` returns comments as YAML; `action = \"add\"` posts the \
                        given `body` (JFM markdown — GitHub-style, see resource \
                        `omni-dev://specs/jfm`). Supply the body as `body` (inline) OR `body_path` \
-                       (a filesystem path the server reads) — not both. To change the text of an \
-                       existing comment use `jira_comment_edit` (it needs the comment id from the \
-                       `list` output)."
+                       (a filesystem path the server reads) — not both. Listed comment authors \
+                       are Atlassian account IDs — resolve them to display names with \
+                       `jira_user_get`. To change the text of an existing comment use \
+                       `jira_comment_edit` (it needs the comment id from the `list` output)."
     )]
     pub async fn jira_comment(
         &self,
@@ -1377,6 +1394,29 @@ impl OmniDevServer {
         let limit = params.limit.unwrap_or(25);
         let (client, _instance_url) = create_client().map_err(tool_error)?;
         let text = run_jira_user_search(&client, &params.query, limit)
+            .await
+            .map_err(tool_error)?;
+        ok_text(text)
+    }
+
+    /// Tool: resolve JIRA account IDs to user records.
+    #[tool(
+        description = "Resolve one or more Atlassian `account_id`s (as emitted by author \
+                       fields in `jira_comment`, `jira_read`, `jira_changelog`, etc.) to user \
+                       records — the reverse of `jira_user_search`. Returns YAML with one entry \
+                       per requested ID: `account_id`, `display_name`, `email_address` (often \
+                       redacted by GDPR), `active`, and `account_type`. Pass every distinct \
+                       author ID from a batch in one call. Unknown, anonymised, or \
+                       permission-denied IDs come back as a stub record with an `error` field \
+                       (the batch never fails); deactivated accounts resolve normally with \
+                       `active: false`. Mirrors `omni-dev atlassian jira user get`."
+    )]
+    pub async fn jira_user_get(
+        &self,
+        Parameters(params): Parameters<JiraUserGetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _instance_url) = create_client().map_err(tool_error)?;
+        let text = run_jira_user_get(&client, &params.account_ids)
             .await
             .map_err(tool_error)?;
         ok_text(text)

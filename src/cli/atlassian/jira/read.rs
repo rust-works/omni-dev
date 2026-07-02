@@ -9,6 +9,9 @@ use crate::cli::atlassian::format::ContentFormat;
 use crate::cli::atlassian::helpers::{create_client, run_read, run_read_jira_with_fields};
 
 /// Fetches a JIRA issue and outputs it as JFM markdown or ADF JSON.
+///
+/// Assignee/reporter and other people fields are Atlassian account IDs —
+/// resolve them to display names with `omni-dev atlassian jira user get`.
 #[derive(Parser)]
 pub struct ReadCommand {
     /// JIRA issue key (e.g., PROJ-123).

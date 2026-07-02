@@ -886,10 +886,25 @@ Usage: user <COMMAND>
 
 Commands:
   search  Searches Confluence users by display name or email (mirrors the `confluence_user_search` MCP tool)
+  get     Resolves account IDs to user records — the reverse of `search` (mirrors the `confluence_user_get` MCP tool)
   help    Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian confluence user get - Resolves account IDs to user records — the reverse of `search` (mirrors the `confluence_user_get` MCP tool)
+
+Resolves account IDs to user records — the reverse of `search` (mirrors the `confluence_user_get` MCP tool)
+
+Usage: get [OPTIONS] --account-id <ACCOUNT_ID>
+
+Options:
+      --account-id <ACCOUNT_ID>  Account ID to resolve (repeat for a bulk lookup). Unknown or deactivated IDs are returned as a stub record with an `error` field rather than failing the whole batch
+  -o, --output <OUTPUT>          Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                     Print help (see more with '--help')
 
 
 ================================================================================
@@ -1706,10 +1721,25 @@ Usage: user <COMMAND>
 
 Commands:
   search  Searches JIRA users by display name or email substring (mirrors the `jira_user_search` MCP tool)
+  get     Resolves account IDs to user records — the reverse of `search` (mirrors the `jira_user_get` MCP tool)
   help    Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev atlassian jira user get - Resolves account IDs to user records — the reverse of `search` (mirrors the `jira_user_get` MCP tool)
+
+Resolves account IDs to user records — the reverse of `search` (mirrors the `jira_user_get` MCP tool)
+
+Usage: get [OPTIONS] --account-id <ACCOUNT_ID>
+
+Options:
+      --account-id <ACCOUNT_ID>  Account ID to resolve (repeat for a bulk lookup). Unknown or deactivated IDs are returned as a stub record with an `error` field rather than failing the whole batch
+  -o, --output <OUTPUT>          Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help                     Print help (see more with '--help')
 
 
 ================================================================================

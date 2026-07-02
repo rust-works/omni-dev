@@ -7,9 +7,10 @@ use clap::ValueEnum;
 use serde::Serialize;
 
 use crate::atlassian::client::{
-    AgileBoardList, AgileSprintList, ConfluenceSearchResults, ConfluenceUserSearchResults,
-    CreateMeta, JiraDevStatus, JiraDevStatusSummary, JiraProjectList, JiraProjectVersionList,
-    JiraSearchResult, JiraUserSearchResults, JiraWatcherList, JiraWorklogList,
+    AgileBoardList, AgileSprintList, ConfluenceSearchResults, ConfluenceUserGetResults,
+    ConfluenceUserSearchResults, CreateMeta, JiraDevStatus, JiraDevStatusSummary, JiraProjectList,
+    JiraProjectVersionList, JiraSearchResult, JiraUserGetResults, JiraUserSearchResults,
+    JiraWatcherList, JiraWorklogList,
 };
 use crate::atlassian::confluence_api::{
     ConfluenceAttachmentPage, ConfluenceSpacePage, PageSummaryPage,
@@ -156,6 +157,18 @@ impl JsonlSerialize for PageSummaryPage {
 }
 
 impl JsonlSerialize for JiraUserSearchResults {
+    fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
+        write_items_jsonl(self.users.iter(), out)
+    }
+}
+
+impl JsonlSerialize for JiraUserGetResults {
+    fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
+        write_items_jsonl(self.users.iter(), out)
+    }
+}
+
+impl JsonlSerialize for ConfluenceUserGetResults {
     fn write_jsonl(&self, out: &mut dyn Write) -> Result<()> {
         write_items_jsonl(self.users.iter(), out)
     }

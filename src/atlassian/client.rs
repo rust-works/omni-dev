@@ -430,6 +430,81 @@ pub struct JiraUserSearchResults {
     pub count: u32,
 }
 
+/// A single user resolved by account ID via `GET /rest/api/3/user?accountId=`.
+///
+/// Unlike the search result, this is the *reverse* direction (ID → record) and
+/// is failure-tolerant: on a per-ID lookup failure (unknown / anonymised
+/// account, or a non-auth error) all fields except `account_id` are `None` and
+/// `error` carries the reason, so a batch lookup never aborts for one bad ID.
+/// Deactivated accounts still come back as a real record with `active: false`.
+///
+/// See [`JiraUserGetResults`] for the batch wrapper.
+#[derive(Debug, Clone, Serialize)]
+pub struct JiraUserRecord {
+    /// Account ID (always present — echoed back even when the lookup failed).
+    pub account_id: String,
+    /// Display name. Absent on GDPR-redacted tenants or failed lookups.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Email address. Often absent due to GDPR / privacy settings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email_address: Option<String>,
+    /// Whether the account is currently active. `None` when the lookup failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active: Option<bool>,
+    /// Account type, e.g. `"atlassian"`, `"app"`, `"customer"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_type: Option<String>,
+    /// Reason this ID could not be resolved (e.g. `"HTTP 404"`). Absent on
+    /// success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Batch wrapper around [`JiraUserRecord`] from resolving one or more account
+/// IDs via `GET /rest/api/3/user?accountId=`.
+#[derive(Debug, Clone, Serialize)]
+pub struct JiraUserGetResults {
+    /// Resolved users, one per requested account ID (in request order).
+    pub users: Vec<JiraUserRecord>,
+}
+
+/// A single user resolved by account ID via `GET /wiki/rest/api/user?accountId=`.
+///
+/// The Confluence v1 user object does not report an `active` flag, so `active`
+/// is always `None` here. Failure-tolerant in the same way as
+/// [`JiraUserRecord`]. See [`ConfluenceUserGetResults`] for the batch wrapper.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfluenceUserRecord {
+    /// Account ID (always present — echoed back even when the lookup failed).
+    pub account_id: String,
+    /// Display name (falls back to `publicName` when `displayName` is absent).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Email address. Absent unless the caller has permission to see it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// Account type, e.g. `"atlassian"`, `"app"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_type: Option<String>,
+    /// Always `None` — the Confluence v1 user endpoint does not return an
+    /// active flag. Present for parity with [`JiraUserRecord`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active: Option<bool>,
+    /// Reason this ID could not be resolved (e.g. `"HTTP 404"`). Absent on
+    /// success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Batch wrapper around [`ConfluenceUserRecord`] from resolving one or more
+/// account IDs via `GET /wiki/rest/api/user?accountId=`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfluenceUserGetResults {
+    /// Resolved users, one per requested account ID (in request order).
+    pub users: Vec<ConfluenceUserRecord>,
+}
+
 /// A JIRA issue comment returned by `GET /rest/api/3/issue/{key}/comment`.
 #[derive(Debug, Clone, Serialize)]
 pub struct JiraComment {
@@ -1371,6 +1446,38 @@ struct ConfluenceSearchUser {
     public_name: Option<String>,
 }
 
+// ── Confluence user-get API response struct ───────────────────────
+
+/// Deserialization helper for `GET /wiki/rest/api/user?accountId=` — a bare
+/// user object (not wrapped in `results`). `publicName` is the fallback when
+/// `displayName` is unavailable; the v1 endpoint has no `active` flag.
+#[derive(Deserialize)]
+struct ConfluenceUserGetEntry {
+    #[serde(rename = "accountId", default)]
+    account_id: Option<String>,
+    #[serde(rename = "accountType", default)]
+    account_type: Option<String>,
+    #[serde(rename = "displayName", default)]
+    display_name: Option<String>,
+    #[serde(rename = "publicName", default)]
+    public_name: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+}
+
+/// Builds the `error` string stored on a stub user record when a single
+/// account-ID lookup fails. Includes a short body snippet when the API
+/// returned one so callers can distinguish "not found" from "no permission".
+fn user_lookup_error(status: u16, body: &str) -> String {
+    let snippet = body.trim();
+    if snippet.is_empty() {
+        format!("HTTP {status}")
+    } else {
+        let snippet: String = snippet.chars().take(200).collect();
+        format!("HTTP {status}: {snippet}")
+    }
+}
+
 // ── Agile API response structs ─────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -1964,6 +2071,230 @@ mod tests {
             .unwrap();
         // After max retries, returns the 429 response to the caller
         assert_eq!(resp.status().as_u16(), 429);
+    }
+
+    // ── user-get (account ID → record) ────────────────────────────
+
+    #[test]
+    fn user_lookup_error_formats() {
+        assert_eq!(user_lookup_error(404, ""), "HTTP 404");
+        assert_eq!(user_lookup_error(404, "   "), "HTTP 404");
+        assert_eq!(
+            user_lookup_error(403, "no permission"),
+            "HTTP 403: no permission"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_jira_user_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/user"))
+            .and(wiremock::matchers::query_param("accountId", "abc123"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "accountId": "abc123",
+                    "displayName": "Alice Smith",
+                    "emailAddress": "alice@example.com",
+                    "active": true,
+                    "accountType": "atlassian"
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let record = client.get_jira_user("abc123").await.unwrap();
+        assert_eq!(record.account_id, "abc123");
+        assert_eq!(record.display_name.as_deref(), Some("Alice Smith"));
+        assert_eq!(record.email_address.as_deref(), Some("alice@example.com"));
+        assert_eq!(record.active, Some(true));
+        assert_eq!(record.account_type.as_deref(), Some("atlassian"));
+        assert!(record.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_jira_user_deactivated_is_a_record_not_an_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/user"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "accountId": "gone1",
+                    "active": false,
+                    "accountType": "atlassian"
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let record = client.get_jira_user("gone1").await.unwrap();
+        assert_eq!(record.account_id, "gone1");
+        assert_eq!(record.active, Some(false));
+        assert!(record.display_name.is_none());
+        assert!(record.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_jira_user_not_found_yields_stub() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/user"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not found"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let record = client.get_jira_user("missing").await.unwrap();
+        assert_eq!(record.account_id, "missing");
+        assert!(record.display_name.is_none());
+        assert!(record.error.as_deref().unwrap().starts_with("HTTP 404"));
+    }
+
+    #[tokio::test]
+    async fn get_jira_user_unauthorized_is_hard_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/user"))
+            .respond_with(wiremock::ResponseTemplate::new(401).set_body_string("Unauthorized"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        assert!(client.get_jira_user("whoever").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_jira_users_batch_survives_one_bad_id() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/user"))
+            .and(wiremock::matchers::query_param("accountId", "good"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "accountId": "good",
+                    "displayName": "Good User",
+                    "active": true
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/user"))
+            .and(wiremock::matchers::query_param("accountId", "bad"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not found"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let ids = vec!["good".to_string(), "bad".to_string()];
+        let results = client.get_jira_users(&ids).await.unwrap();
+        assert_eq!(results.users.len(), 2);
+        assert_eq!(results.users[0].account_id, "good");
+        assert_eq!(results.users[0].display_name.as_deref(), Some("Good User"));
+        assert!(results.users[0].error.is_none());
+        assert_eq!(results.users[1].account_id, "bad");
+        assert!(results.users[1].error.is_some());
+    }
+
+    #[tokio::test]
+    async fn get_jira_users_empty_input_makes_no_requests() {
+        let client = AtlassianClient::new("https://org.atlassian.net", "u@t.com", "tok").unwrap();
+        let results = client.get_jira_users(&[]).await.unwrap();
+        assert!(results.users.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_confluence_user_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/user"))
+            .and(wiremock::matchers::query_param("accountId", "abc123"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "accountId": "abc123",
+                    "accountType": "atlassian",
+                    "displayName": "Alice Smith",
+                    "email": "alice@example.com"
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let record = client.get_confluence_user("abc123").await.unwrap();
+        assert_eq!(record.account_id, "abc123");
+        assert_eq!(record.display_name.as_deref(), Some("Alice Smith"));
+        assert_eq!(record.email.as_deref(), Some("alice@example.com"));
+        assert_eq!(record.account_type.as_deref(), Some("atlassian"));
+        assert!(record.active.is_none());
+        assert!(record.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_confluence_user_falls_back_to_public_name() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/user"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "accountId": "app1",
+                    "accountType": "app",
+                    "publicName": "Automation App"
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let record = client.get_confluence_user("app1").await.unwrap();
+        assert_eq!(record.display_name.as_deref(), Some("Automation App"));
+    }
+
+    #[tokio::test]
+    async fn get_confluence_user_not_found_yields_stub() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/user"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not found"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let record = client.get_confluence_user("missing").await.unwrap();
+        assert_eq!(record.account_id, "missing");
+        assert!(record.error.as_deref().unwrap().starts_with("HTTP 404"));
+    }
+
+    #[tokio::test]
+    async fn get_confluence_users_batch_survives_one_bad_id() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/user"))
+            .and(wiremock::matchers::query_param("accountId", "good"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "accountId": "good",
+                    "displayName": "Good User"
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/user"))
+            .and(wiremock::matchers::query_param("accountId", "bad"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not found"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        let ids = vec!["good".to_string(), "bad".to_string()];
+        let results = client.get_confluence_users(&ids).await.unwrap();
+        assert_eq!(results.users.len(), 2);
+        assert_eq!(results.users[0].display_name.as_deref(), Some("Good User"));
+        assert!(results.users[0].error.is_none());
+        assert!(results.users[1].error.is_some());
     }
 
     #[tokio::test]
@@ -8293,6 +8624,130 @@ impl AtlassianClient {
             users: all_results,
             total,
         })
+    }
+
+    /// Resolves a single JIRA user by account ID
+    /// (`GET /rest/api/3/user?accountId=`).
+    ///
+    /// Failure-tolerant: an unknown / anonymised account (HTTP 404) or any
+    /// other non-auth failure resolves to a stub record with `error` set rather
+    /// than an `Err`, so a batch lookup never aborts for one bad ID. A `401`
+    /// (bad credentials) is a hard error worth surfacing. Deactivated accounts
+    /// come back from Atlassian as a real `200` record with `active: false`.
+    pub async fn get_jira_user(&self, account_id: &str) -> Result<JiraUserRecord> {
+        let base = format!("{}/rest/api/3/user", self.instance_url);
+        let url = reqwest::Url::parse_with_params(&base, &[("accountId", account_id)])
+            .context("Failed to build JIRA user get URL")?;
+
+        let response = self.get_json(url.as_str()).await?;
+        let status = response.status();
+
+        if status.is_success() {
+            let entry: JiraUserSearchEntry = response
+                .json()
+                .await
+                .context("Failed to parse JIRA user get response")?;
+            return Ok(JiraUserRecord {
+                account_id: entry.account_id,
+                display_name: entry.display_name,
+                email_address: entry.email_address,
+                active: Some(entry.active),
+                account_type: entry.account_type,
+                error: None,
+            });
+        }
+
+        if status.as_u16() == 401 {
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status: 401, body }.into());
+        }
+
+        let code = status.as_u16();
+        let body = response.text().await.unwrap_or_default();
+        Ok(JiraUserRecord {
+            account_id: account_id.to_string(),
+            display_name: None,
+            email_address: None,
+            active: None,
+            account_type: None,
+            error: Some(user_lookup_error(code, &body)),
+        })
+    }
+
+    /// Resolves multiple JIRA users by account ID, concurrently.
+    ///
+    /// Each ID is fetched independently via [`Self::get_jira_user`]; per-ID
+    /// failures become stub records, so the batch only errors on a genuine auth
+    /// failure (or transport error). Results preserve request order.
+    pub async fn get_jira_users(&self, account_ids: &[String]) -> Result<JiraUserGetResults> {
+        let lookups = account_ids.iter().map(|id| self.get_jira_user(id));
+        let users = futures::future::join_all(lookups)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(JiraUserGetResults { users })
+    }
+
+    /// Resolves a single Confluence user by account ID
+    /// (`GET /wiki/rest/api/user?accountId=`).
+    ///
+    /// Failure-tolerant in the same way as [`Self::get_jira_user`]. The v1 user
+    /// object has no `active` flag, so [`ConfluenceUserRecord::active`] is
+    /// always `None`; `displayName` falls back to `publicName`.
+    pub async fn get_confluence_user(&self, account_id: &str) -> Result<ConfluenceUserRecord> {
+        let base = format!("{}/wiki/rest/api/user", self.instance_url);
+        let url = reqwest::Url::parse_with_params(&base, &[("accountId", account_id)])
+            .context("Failed to build Confluence user get URL")?;
+
+        let response = self.get_json(url.as_str()).await?;
+        let status = response.status();
+
+        if status.is_success() {
+            let entry: ConfluenceUserGetEntry = response
+                .json()
+                .await
+                .context("Failed to parse Confluence user get response")?;
+            return Ok(ConfluenceUserRecord {
+                account_id: entry.account_id.unwrap_or_else(|| account_id.to_string()),
+                display_name: entry.display_name.or(entry.public_name),
+                email: entry.email,
+                account_type: entry.account_type,
+                active: None,
+                error: None,
+            });
+        }
+
+        if status.as_u16() == 401 {
+            let body = response.text().await.unwrap_or_default();
+            return Err(AtlassianError::ApiRequestFailed { status: 401, body }.into());
+        }
+
+        let code = status.as_u16();
+        let body = response.text().await.unwrap_or_default();
+        Ok(ConfluenceUserRecord {
+            account_id: account_id.to_string(),
+            display_name: None,
+            email: None,
+            account_type: None,
+            active: None,
+            error: Some(user_lookup_error(code, &body)),
+        })
+    }
+
+    /// Resolves multiple Confluence users by account ID, concurrently.
+    ///
+    /// Behaves like [`Self::get_jira_users`]: per-ID failures become stub
+    /// records; the batch only errors on a genuine auth / transport failure.
+    pub async fn get_confluence_users(
+        &self,
+        account_ids: &[String],
+    ) -> Result<ConfluenceUserGetResults> {
+        let lookups = account_ids.iter().map(|id| self.get_confluence_user(id));
+        let users = futures::future::join_all(lookups)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ConfluenceUserGetResults { users })
     }
 
     /// Lists agile boards with auto-pagination.
