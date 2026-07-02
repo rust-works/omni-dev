@@ -111,9 +111,7 @@ impl SnowflakeEngineConfig {
     /// Currently infallible, but returns `Result` so the daemon registry wiring
     /// can `?` it and future validation can surface errors.
     pub fn from_env_and_settings() -> Result<Self> {
-        let settings = Settings::load().unwrap_or_else(|_| Settings {
-            env: std::collections::HashMap::new(),
-        });
+        let settings = Settings::load().unwrap_or_default();
         let pool_size = settings
             .get_env_var(ENV_POOL_SIZE)
             .and_then(|s| s.trim().parse::<usize>().ok())

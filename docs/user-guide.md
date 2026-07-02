@@ -588,6 +588,11 @@ export ATLASSIAN_API_TOKEN=your-token
 
 Environment variables take precedence over the settings file.
 
+To keep multiple Atlassian tenants (e.g. `work` and `personal`) on one machine
+and pick one per command, store each tenant's variables in a named **profile**
+and select it with `--profile <name>` (or `OMNI_DEV_PROFILE`). See
+[Credential Profiles](configuration-best-practices.md#credential-profiles).
+
 #### Destructive Commands
 
 > **⚠️ Destructive commands require confirmation.**
