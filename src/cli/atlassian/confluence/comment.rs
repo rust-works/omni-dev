@@ -1269,4 +1269,240 @@ mod tests {
         clear_atlassian_env();
         assert!(result.is_ok(), "{result:?}");
     }
+
+    // ── print_drifts ───────────────────────────────────────────────
+
+    fn sample_drift(id: &str, status: DriftStatus) -> CommentDrift {
+        CommentDrift {
+            comment_id: id.to_string(),
+            author: "alice".to_string(),
+            created: "2026-04-01T10:00:00.000Z".to_string(),
+            marker_ref: "marker-1".to_string(),
+            status,
+            original_selection: "original text".to_string(),
+            current_anchored_text: Some("current text".to_string()),
+            suggested_new_anchor: None,
+            suggested_match_count: None,
+        }
+    }
+
+    #[test]
+    fn print_drifts_empty() {
+        print_drifts(&[]);
+    }
+
+    #[test]
+    fn print_drifts_all_statuses() {
+        let mut lost = sample_drift("c3", DriftStatus::MarkLost);
+        lost.current_anchored_text = None;
+        lost.suggested_new_anchor = Some("original text".to_string());
+        lost.suggested_match_count = Some(2);
+        let mut drifted = sample_drift("c4", DriftStatus::Drifted);
+        // Suggestion without a count exercises the `unwrap_or(0)` fallback.
+        drifted.suggested_new_anchor = Some("original text".to_string());
+        let drifts = vec![
+            sample_drift("c1", DriftStatus::Ok),
+            sample_drift("c2", DriftStatus::Torn),
+            lost,
+            drifted,
+        ];
+        print_drifts(&drifts);
+    }
+
+    // ── audit / reanchor command execution ──────────────────────────
+
+    /// Mounts the endpoints a reanchor (and audit) needs: the page (whose ADF
+    /// contains "the anchor"), its space, one inline comment `ic1` bearing
+    /// marker `aaa`, and the page-update PUT.
+    async fn mount_reanchor_fixture(server: &wiremock::MockServer) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12345"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "12345",
+                    "title": "Mock",
+                    "status": "current",
+                    "spaceId": "98",
+                    "version": {"number": 1},
+                    "body": {"atlas_doc_format": {
+                        "value": "{\"version\":1,\"type\":\"doc\",\"content\":[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"the anchor\"}]}]}"
+                    }}
+                })),
+            )
+            .mount(server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/98"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"key": "ENG"})),
+            )
+            .mount(server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/inline-comments",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {"id": "ic1", "version": {"authorId": "a", "createdAt": "t"},
+                         "properties": {"inlineMarkerRef": "aaa", "inlineOriginalSelection": "old"}}
+                    ]
+                })),
+            )
+            .mount(server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12345"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn audit_command_execute_propagates_create_client_error() {
+        let guard = crate::atlassian::auth::test_util::EnvGuard::take();
+        let _home = guard.clear_credentials();
+
+        let cmd = AuditCommand {
+            id: "12345".to_string(),
+            output: OutputFormat::Yaml,
+        };
+        assert!(cmd.execute().await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn audit_command_execute_runs_through_dispatch() {
+        let _lock = crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let server = wiremock::MockServer::start().await;
+        mount_reanchor_fixture(&server).await;
+
+        set_atlassian_env(&server.uri());
+        let cmd = CommentCommand {
+            command: CommentSubcommands::Audit(AuditCommand {
+                id: "12345".to_string(),
+                output: OutputFormat::Json,
+            }),
+        };
+        let result = cmd.execute().await;
+        clear_atlassian_env();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn audit_command_execute_table_output_prints_drifts() {
+        let _lock = crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let server = wiremock::MockServer::start().await;
+        mount_reanchor_fixture(&server).await;
+
+        set_atlassian_env(&server.uri());
+        let cmd = AuditCommand {
+            id: "12345".to_string(),
+            output: OutputFormat::Table,
+        };
+        let result = cmd.execute().await;
+        clear_atlassian_env();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    fn reanchor_command(force: bool, dry_run: bool) -> ReanchorCommand {
+        ReanchorCommand {
+            id: "12345".to_string(),
+            comment: "ic1".to_string(),
+            anchor_text: "the anchor".to_string(),
+            match_index: None,
+            force,
+            dry_run,
+        }
+    }
+
+    #[tokio::test]
+    async fn reanchor_command_execute_propagates_create_client_error() {
+        let guard = crate::atlassian::auth::test_util::EnvGuard::take();
+        let _home = guard.clear_credentials();
+
+        let cmd = reanchor_command(true, false);
+        assert!(cmd.execute().await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reanchor_command_execute_runs_through_dispatch() {
+        let _lock = crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let server = wiremock::MockServer::start().await;
+        mount_reanchor_fixture(&server).await;
+
+        set_atlassian_env(&server.uri());
+        let cmd = CommentCommand {
+            command: CommentSubcommands::Reanchor(reanchor_command(true, false)),
+        };
+        let result = cmd.execute().await;
+        clear_atlassian_env();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn reanchor_execute_with_io_cancelled_makes_no_api_calls() {
+        let server = wiremock::MockServer::start().await;
+        let api = mock_api(&server);
+
+        let cmd = reanchor_command(false, false);
+        let mut reader = io::Cursor::new(b"n\n".to_vec());
+        let mut writer: Vec<u8> = Vec::new();
+        cmd.execute_with_io(&api, &mut reader, &mut writer)
+            .await
+            .unwrap();
+
+        let out = String::from_utf8(writer).unwrap();
+        assert!(out.contains("Re-anchor inline comment ic1"));
+        assert!(out.contains("Cancelled."));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reanchor_execute_with_io_dry_run_makes_no_api_calls() {
+        let server = wiremock::MockServer::start().await;
+        let api = mock_api(&server);
+
+        let cmd = reanchor_command(false, true);
+        let mut reader = io::Cursor::new(Vec::new());
+        let mut writer: Vec<u8> = Vec::new();
+        cmd.execute_with_io(&api, &mut reader, &mut writer)
+            .await
+            .unwrap();
+
+        let out = String::from_utf8(writer).unwrap();
+        assert!(out.contains("Would re-anchor inline comment ic1"));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reanchor_execute_with_io_confirmed_proceeds() {
+        let server = wiremock::MockServer::start().await;
+        mount_reanchor_fixture(&server).await;
+        let api = mock_api(&server);
+
+        let cmd = reanchor_command(false, false);
+        let mut reader = io::Cursor::new(b"y\n".to_vec());
+        let mut writer: Vec<u8> = Vec::new();
+        cmd.execute_with_io(&api, &mut reader, &mut writer)
+            .await
+            .unwrap();
+
+        let out = String::from_utf8(writer).unwrap();
+        assert!(out.contains("Re-anchored inline comment ic1"));
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests
+            .iter()
+            .any(|r| r.method == wiremock::http::Method::PUT));
+    }
 }
