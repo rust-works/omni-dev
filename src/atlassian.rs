@@ -23,4 +23,5 @@ pub mod diff_format;
 pub mod directive;
 pub mod document;
 pub mod error;
+pub mod inline_comment;
 pub mod jira_api;
