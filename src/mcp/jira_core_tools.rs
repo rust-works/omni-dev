@@ -375,6 +375,14 @@ pub struct JiraUserSearchParams {
     pub limit: Option<u32>,
 }
 
+/// Parameters for the `jira_user_get` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct JiraUserGetParams {
+    /// One or more Atlassian account IDs to resolve
+    /// (e.g. `557058:00ce7e71-9edc-47da-a0c6-f796533ae2cd`).
+    pub account_ids: Vec<String>,
+}
+
 // ── format helpers ─────────────────────────────────────────────────────────
 
 /// Output format for JIRA read/write operations.
@@ -1062,6 +1070,12 @@ async fn run_jira_user_search(client: &AtlassianClient, query: &str, limit: u32)
     yaml_result(&result)
 }
 
+/// Resolves JIRA account IDs to user records and returns the result as YAML.
+async fn run_jira_user_get(client: &AtlassianClient, account_ids: &[String]) -> Result<String> {
+    let result = client.get_jira_users(account_ids).await?;
+    yaml_result(&result)
+}
+
 // ── tool router ────────────────────────────────────────────────────────────
 
 #[allow(missing_docs)] // #[tool_router] generates a pub `jira_core_tool_router` fn.
@@ -1074,7 +1088,9 @@ impl OmniDevServer {
                        `omni-dev://specs/jfm`) or the raw ADF description JSON when \
                        `format = \"adf\"`. When `output_file` is set, the content is written \
                        to that path and the tool returns a short YAML summary \
-                       (path/bytes/format) — useful for large issues."
+                       (path/bytes/format) — useful for large issues. Assignee/reporter and \
+                       other people fields are Atlassian account IDs — resolve them to \
+                       display names with `jira_user_get`."
     )]
     pub async fn jira_read(
         &self,
@@ -1291,9 +1307,10 @@ impl OmniDevServer {
                        `action = \"list\"` returns comments as YAML; `action = \"add\"` posts the \
                        given `body` (JFM markdown — GitHub-style, see resource \
                        `omni-dev://specs/jfm`). Supply the body as `body` (inline) OR `body_path` \
-                       (a filesystem path the server reads) — not both. To change the text of an \
-                       existing comment use `jira_comment_edit` (it needs the comment id from the \
-                       `list` output)."
+                       (a filesystem path the server reads) — not both. Listed comment authors \
+                       are Atlassian account IDs — resolve them to display names with \
+                       `jira_user_get`. To change the text of an existing comment use \
+                       `jira_comment_edit` (it needs the comment id from the `list` output)."
     )]
     pub async fn jira_comment(
         &self,
@@ -1381,6 +1398,29 @@ impl OmniDevServer {
             .map_err(tool_error)?;
         ok_text(text)
     }
+
+    /// Tool: resolve JIRA account IDs to user records.
+    #[tool(
+        description = "Resolve one or more Atlassian `account_id`s (as emitted by author \
+                       fields in `jira_comment`, `jira_read`, `jira_changelog`, etc.) to user \
+                       records — the reverse of `jira_user_search`. Returns YAML with one entry \
+                       per requested ID: `account_id`, `display_name`, `email_address` (often \
+                       redacted by GDPR), `active`, and `account_type`. Pass every distinct \
+                       author ID from a batch in one call. Unknown, anonymised, or \
+                       permission-denied IDs come back as a stub record with an `error` field \
+                       (the batch never fails); deactivated accounts resolve normally with \
+                       `active: false`. Mirrors `omni-dev atlassian jira user get`."
+    )]
+    pub async fn jira_user_get(
+        &self,
+        Parameters(params): Parameters<JiraUserGetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _instance_url) = create_client().map_err(tool_error)?;
+        let text = run_jira_user_get(&client, &params.account_ids)
+            .await
+            .map_err(tool_error)?;
+        ok_text(text)
+    }
 }
 
 #[cfg(test)]
@@ -1391,6 +1431,7 @@ impl OmniDevServer {
 )]
 mod tests {
     use super::*;
+    use crate::atlassian::auth::{ATLASSIAN_API_TOKEN, ATLASSIAN_EMAIL, ATLASSIAN_INSTANCE_URL};
     use wiremock::matchers::{body_json, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1406,25 +1447,22 @@ mod tests {
         CatalogueCache::new(std::time::Duration::from_secs(60))
     }
 
-    /// Serialize env-backed handler tests — the tool handlers build their
-    /// client via `create_client()`, which reads process-wide environment
-    /// variables. Routes through the crate-wide `AUTH_ENV_MUTEX` so we don't
-    /// race env-mutating tests in other Atlassian-touching modules.
+    fn make_server() -> OmniDevServer {
+        OmniDevServer::new()
+    }
+
+    /// Serialize env-backed tests — `create_client()` reads process-wide env
+    /// vars, so concurrent tests would race without the crate-wide lock.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Points the ATLASSIAN_* credentials at a mock server for the duration of
-    /// a handler test, restoring the prior (empty) state on drop.
     struct EnvGuard;
 
     impl EnvGuard {
         fn set(instance_url: &str) -> Self {
-            use crate::atlassian::auth::{
-                ATLASSIAN_API_TOKEN, ATLASSIAN_EMAIL, ATLASSIAN_INSTANCE_URL,
-            };
             std::env::set_var(ATLASSIAN_INSTANCE_URL, instance_url);
             std::env::set_var(ATLASSIAN_EMAIL, "user@test.com");
             std::env::set_var(ATLASSIAN_API_TOKEN, "fake-token");
@@ -1434,9 +1472,6 @@ mod tests {
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            use crate::atlassian::auth::{
-                ATLASSIAN_API_TOKEN, ATLASSIAN_EMAIL, ATLASSIAN_INSTANCE_URL,
-            };
             std::env::remove_var(ATLASSIAN_INSTANCE_URL);
             std::env::remove_var(ATLASSIAN_EMAIL);
             std::env::remove_var(ATLASSIAN_API_TOKEN);
@@ -4094,6 +4129,71 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("403"));
+    }
+
+    // ── run_jira_user_get ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_jira_user_get_resolves_record() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/user"))
+            .and(query_param("accountId", "abc123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "accountId": "abc123",
+                "displayName": "Alice Smith",
+                "active": true,
+                "accountType": "atlassian"
+            })))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let ids = vec!["abc123".to_string()];
+        let yaml = run_jira_user_get(&client, &ids).await.unwrap();
+        assert!(yaml.contains("account_id: abc123"));
+        assert!(yaml.contains("display_name: Alice Smith"));
+        assert!(yaml.contains("active: true"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_user_get_stubs_unknown_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/user"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("Not found"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let ids = vec!["missing".to_string()];
+        let yaml = run_jira_user_get(&client, &ids).await.unwrap();
+        assert!(yaml.contains("account_id: missing"));
+        assert!(yaml.contains("error:"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_user_get_handler_success_path_via_mock() {
+        let _lock = env_lock();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/user"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "accountId": "abc123",
+                "displayName": "Alice",
+                "active": true,
+                "accountType": "atlassian"
+            })))
+            .mount(&server)
+            .await;
+        let _env = EnvGuard::set(&server.uri());
+
+        let srv = make_server();
+        let result = srv
+            .jira_user_get(Parameters(JiraUserGetParams {
+                account_ids: vec!["abc123".to_string()],
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
     }
 
     // ── ok_text / yaml_result helpers ──────────────────────────────────────

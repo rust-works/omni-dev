@@ -12,6 +12,9 @@ use crate::cli::atlassian::format::{output_as, JsonlSerialize, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
 /// Lists version history (metadata only) for a Confluence page.
+///
+/// Authors are returned as Atlassian account IDs — resolve them to display
+/// names with `omni-dev atlassian confluence user get`.
 #[derive(Parser)]
 pub struct HistoryCommand {
     /// Confluence page ID.

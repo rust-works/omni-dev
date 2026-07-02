@@ -10,6 +10,9 @@ use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
 /// Shows change history for one or more JIRA issues.
+///
+/// Change authors are returned as Atlassian account IDs — resolve them to
+/// display names with `omni-dev atlassian jira user get`.
 #[derive(Parser)]
 pub struct ChangelogCommand {
     /// Issue keys, comma-separated (e.g., PROJ-1 or PROJ-1,PROJ-2).
