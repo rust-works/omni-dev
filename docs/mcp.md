@@ -68,7 +68,8 @@ any tool interactively, and fetch resources against the working directory.
 ## Tool catalog
 
 All tools serialise responses as YAML to match the CLI's `-o yaml` output.
-Read tools accept an optional `output_file` parameter (see [Cross-cutting
+Read tools accept an optional `output_file` parameter, and write tools accept
+a `*_path` alternative to their inline body (see [Cross-cutting
 parameters](#cross-cutting-parameters)). Destructive tools require an
 explicit `confirm: true`.
 
@@ -210,6 +211,34 @@ This prevents large pages from blowing past the assistant's context window —
 the assistant can then page through the file with offset/limit using its
 filesystem read tool. The same pattern is built into `confluence_download`
 and `jira_attachment_download` by default.
+
+### `content_path` on write tools
+
+The write-side mirror of `output_file`. Every text body a write tool takes
+inline can instead be read from a filesystem path, so the assistant doesn't
+have to emit a large body byte-for-byte through its output stream (an O(size)
+generation cost — a 70 KB page can take minutes to emit inline versus seconds
+from disk). Each body parameter `X` has an optional sibling `X_path`; the two
+are **mutually exclusive** (supplying both is an error), and where the body is
+required exactly one must be given:
+
+| Tool | Inline | Path alternative |
+| --- | --- | --- |
+| `confluence_write` | `content` | `content_path` |
+| `confluence_create` | `content` / `document` | `content_path` / `document_path` |
+| `confluence_comment_add` | `content` | `content_path` |
+| `confluence_comment_add_inline` | `content` | `content_path` |
+| `jira_write` | `content` | `content_path` |
+| `jira_create` | `description` / `document` | `description_path` / `document_path` |
+| `jira_comment` (add) | `body` | `body_path` |
+| `jira_comment_edit` | `body` | `body_path` |
+| `ai_chat` | `message` | `message_path` |
+
+Prefer the path form when the body is already on disk (e.g. edited in place
+after a `confluence_read`/`jira_read` wrote it there via `output_file`); the
+inline form stays fine for short bodies. Binary attachment uploads
+(`confluence_attachment_upload`) already read from disk via `file_path` — there
+is no inline-bytes path to fall back from.
 
 ### Bulk create + link (`jira_bulk_create`)
 
