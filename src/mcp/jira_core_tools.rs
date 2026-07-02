@@ -26,6 +26,7 @@ use crate::atlassian::document::{issue_to_jfm_document, CustomFieldSection, JfmD
 use crate::cli::atlassian::helpers::create_client;
 
 use super::catalogue_cache::CatalogueCache;
+use super::content_input::{require_content_input, resolve_content_input};
 use super::dry_run::dry_run_request_yaml;
 use super::error::tool_error;
 use super::output_file::write_to_file_yaml;
@@ -80,6 +81,11 @@ pub struct JiraCreateParams {
     /// `omni-dev://specs/jfm`.
     #[serde(default)]
     pub document: Option<String>,
+    /// Filesystem path the server reads the JFM `document` from, instead of
+    /// `document`. Prefer this when the document is already on disk — it avoids
+    /// re-emitting the whole document inline. Mutually exclusive with `document`.
+    #[serde(default)]
+    pub document_path: Option<String>,
     /// Project key (e.g., `PROJ`). Required unless `document` carries a
     /// `project:` (or a `key:` it can be derived from). Overrides frontmatter.
     #[serde(default)]
@@ -95,6 +101,13 @@ pub struct JiraCreateParams {
     /// is provided (the document body is the description).
     #[serde(default)]
     pub description: Option<String>,
+    /// Filesystem path the server reads the description from, instead of
+    /// `description`. Prefer this when the description is already on disk — it
+    /// avoids re-emitting a large body inline. Mutually exclusive with
+    /// `description` (and, like `description`, rejected when
+    /// `document`/`document_path` is given).
+    #[serde(default)]
+    pub description_path: Option<String>,
     /// Issue type (defaults to `Task`). Overrides frontmatter.
     #[serde(default)]
     pub issue_type: Option<String>,
@@ -230,6 +243,11 @@ pub struct JiraWriteParams {
     /// MCP resource `omni-dev://specs/jfm`.
     #[serde(default)]
     pub content: Option<String>,
+    /// Filesystem path the server reads the description body from, instead of
+    /// `content`. Prefer this when the body is already on disk — it avoids
+    /// re-emitting a large body inline. Mutually exclusive with `content`.
+    #[serde(default)]
+    pub content_path: Option<String>,
     /// Content format — `jfm` (default) parses Markdown/JFM; `adf` accepts
     /// a raw ADF JSON document.
     #[serde(default)]
@@ -294,9 +312,14 @@ pub struct JiraCommentParams {
     /// `list` to fetch comments; `add` to post a new one.
     pub action: String,
     /// Comment body (JFM markdown — see resource `omni-dev://specs/jfm`).
-    /// Required for `action = "add"`.
+    /// Required for `action = "add"`. Mutually exclusive with `body_path`.
     #[serde(default)]
     pub body: Option<String>,
+    /// Filesystem path the server reads the comment body from, instead of
+    /// `body`. Prefer this when the body is already on disk. Mutually exclusive
+    /// with `body`.
+    #[serde(default)]
+    pub body_path: Option<String>,
     /// Maximum number of comments to return. `0` means unlimited.
     #[serde(default)]
     pub limit: Option<u32>,
@@ -320,7 +343,14 @@ pub struct JiraCommentEditParams {
     /// Comment ID to update.
     pub comment_id: String,
     /// New comment body (JFM markdown — see resource `omni-dev://specs/jfm`).
-    pub body: String,
+    /// Mutually exclusive with `body_path`; exactly one is required.
+    #[serde(default)]
+    pub body: Option<String>,
+    /// Filesystem path the server reads the comment body from, instead of
+    /// `body`. Prefer this when the body is already on disk. Mutually exclusive
+    /// with `body`.
+    #[serde(default)]
+    pub body_path: Option<String>,
     /// Optional visibility restriction. Many JIRA configurations only allow
     /// the comment author to change visibility — JIRA's response is surfaced
     /// as-is when permission is denied.
@@ -440,8 +470,22 @@ async fn run_jira_search(client: &AtlassianClient, jql: &str, limit: u32) -> Res
 /// resolved (custom fields included — a `createmeta` read) and the would-be
 /// request is returned without creating anything.
 async fn run_jira_create(client: &AtlassianClient, params: &JiraCreateParams) -> Result<String> {
-    if let Some(document) = params.document.as_deref() {
-        if params.description.is_some() {
+    // Resolve the inline-or-path pairs before any mode branching so a bad path
+    // fails fast and the `document` vs `description` exclusivity check sees the
+    // effective values.
+    let document = resolve_content_input(
+        params.document.as_deref(),
+        params.document_path.as_deref(),
+        "document",
+    )?;
+    let description = resolve_content_input(
+        params.description.as_deref(),
+        params.description_path.as_deref(),
+        "description",
+    )?;
+
+    if let Some(document) = document.as_deref() {
+        if description.is_some() {
             anyhow::bail!(
                 "Provide either `document` or `description`, not both — the document body \
                  becomes the description"
@@ -508,7 +552,7 @@ async fn run_jira_create(client: &AtlassianClient, params: &JiraCreateParams) ->
     })?;
     let issue_type = params.issue_type.as_deref().unwrap_or("Task");
 
-    let adf = match params.description.as_deref() {
+    let adf = match description.as_deref() {
         Some(md) if !md.is_empty() => Some(markdown_to_validated_adf(md)?),
         _ => None,
     };
@@ -1084,7 +1128,11 @@ impl OmniDevServer {
                        is an optional map of field name or canonical id (e.g. `{\"Story Points\": 8}` \
                        or `{\"Planned / Unplanned Work\": \"Unplanned\"}`) to value, resolved against \
                        the create screen and shaped for the API — use it to satisfy fields a project \
-                       requires at create time (otherwise JIRA returns HTTP 400). Set `dry_run: true` \
+                       requires at create time (otherwise JIRA returns HTTP 400). The \
+                       `document`/`description` bodies each also accept a filesystem-path form \
+                       (`document_path`/`description_path`) the server reads from disk — prefer it \
+                       when the body is already on disk, to avoid emitting a large body inline. \
+                       Set `dry_run: true` \
                        first when uncertain about required fields or formatting — validates and \
                        resolves the input and returns the request that would be sent (method, path, \
                        body) without creating the issue (mirrors the CLI's \
@@ -1142,8 +1190,10 @@ impl OmniDevServer {
         description = "Update a JIRA issue by key (e.g. `PROJ-123`). `content` updates the \
                        description (JFM markdown by \
                        default, or raw ADF JSON when `format = \"adf\"`); omit it to leave the \
-                       description unchanged. JFM is GitHub-style markdown — see resource \
-                       `omni-dev://specs/jfm` for syntax. To set the parent for hierarchy \
+                       description unchanged. Supply the description as `content` (inline) OR \
+                       `content_path` (a filesystem path the server reads) — not both; prefer the \
+                       path form when the body is already on disk. JFM is GitHub-style markdown — \
+                       see resource `omni-dev://specs/jfm` for syntax. To set the parent for hierarchy \
                        (Epic → Story, Story → Sub-task) use the `jira_link_parent` tool — \
                        the canonical hierarchy surface. `assignee`/`reporter` \
                        accept an `accountId` (use the empty string `\"\"` to clear, `\"-1\"` for \
@@ -1165,12 +1215,18 @@ impl OmniDevServer {
         Parameters(params): Parameters<JiraWriteParams>,
     ) -> Result<CallToolResult, McpError> {
         let format = ReadFormat::parse(params.format.as_deref()).map_err(tool_error)?;
+        let content = resolve_content_input(
+            params.content.as_deref(),
+            params.content_path.as_deref(),
+            "content",
+        )
+        .map_err(tool_error)?;
         let (client, _instance_url) = create_client().map_err(tool_error)?;
         let text = run_jira_write(
             &client,
             &self.catalogue_cache,
             &params.key,
-            params.content.as_deref(),
+            content.as_deref(),
             format,
             params.assignee.as_deref(),
             params.reporter.as_deref(),
@@ -1234,24 +1290,23 @@ impl OmniDevServer {
         description = "Manage JIRA issue comments on `key` (e.g. `PROJ-123`). \
                        `action = \"list\"` returns comments as YAML; `action = \"add\"` posts the \
                        given `body` (JFM markdown — GitHub-style, see resource \
-                       `omni-dev://specs/jfm`). To change the text of an existing comment use \
-                       `jira_comment_edit` (it needs the comment id from the `list` output)."
+                       `omni-dev://specs/jfm`). Supply the body as `body` (inline) OR `body_path` \
+                       (a filesystem path the server reads) — not both. To change the text of an \
+                       existing comment use `jira_comment_edit` (it needs the comment id from the \
+                       `list` output)."
     )]
     pub async fn jira_comment(
         &self,
         Parameters(params): Parameters<JiraCommentParams>,
     ) -> Result<CallToolResult, McpError> {
         let limit = params.limit.unwrap_or(0);
+        let body =
+            resolve_content_input(params.body.as_deref(), params.body_path.as_deref(), "body")
+                .map_err(tool_error)?;
         let (client, _instance_url) = create_client().map_err(tool_error)?;
-        let text = run_jira_comment(
-            &client,
-            &params.key,
-            &params.action,
-            params.body.as_deref(),
-            limit,
-        )
-        .await
-        .map_err(tool_error)?;
+        let text = run_jira_comment(&client, &params.key, &params.action, body.as_deref(), limit)
+            .await
+            .map_err(tool_error)?;
         ok_text(text)
     }
 
@@ -1260,7 +1315,9 @@ impl OmniDevServer {
         description = "Edit an existing JIRA comment (identified by `key` + `comment_id`; get \
                        the id from `jira_comment` with `action = \"list\"`). To add a new comment \
                        or list comments use `jira_comment` instead. `body` is JFM markdown (see \
-                       resource `omni-dev://specs/jfm`) and replaces the current comment text. \
+                       resource `omni-dev://specs/jfm`) and replaces the current comment text; \
+                       supply it as `body` (inline) OR `body_path` (a filesystem path the server \
+                       reads) — not both. \
                        Optional \
                        `visibility = {type: \"group\"|\"role\", value: <name>}` updates the \
                        restriction. JIRA enforces stricter permissions on edit than on add (often \
@@ -1271,12 +1328,15 @@ impl OmniDevServer {
         &self,
         Parameters(params): Parameters<JiraCommentEditParams>,
     ) -> Result<CallToolResult, McpError> {
+        let body =
+            require_content_input(params.body.as_deref(), params.body_path.as_deref(), "body")
+                .map_err(tool_error)?;
         let (client, _instance_url) = create_client().map_err(tool_error)?;
         let text = run_jira_comment_edit(
             &client,
             &params.key,
             &params.comment_id,
-            &params.body,
+            &body,
             params.visibility.as_ref(),
         )
         .await
@@ -1658,6 +1718,8 @@ mod tests {
         issue_type: Option<&str>,
     ) -> JiraCreateParams {
         JiraCreateParams {
+            description_path: None,
+            document_path: None,
             document: None,
             project: project.map(String::from),
             summary: summary.map(String::from),
@@ -1671,6 +1733,8 @@ mod tests {
     /// Builds `JiraCreateParams` for the document path with an optional project override.
     fn jira_create_doc_params(document: &str, project: Option<&str>) -> JiraCreateParams {
         JiraCreateParams {
+            description_path: None,
+            document_path: None,
             document: Some(document.to_string()),
             project: project.map(String::from),
             summary: None,
@@ -1711,6 +1775,53 @@ mod tests {
         .await
         .unwrap();
         assert!(yaml.contains("PROJ-100"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_create_reads_description_from_path() {
+        // Issue #1093: the description may come from `description_path` on disk.
+        let server = MockServer::start().await;
+        mount_create_ok(&server).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("desc.md");
+        std::fs::write(&path, "Body from disk").unwrap();
+
+        let client = mock_client(&server.uri());
+        let params = JiraCreateParams {
+            document: None,
+            document_path: None,
+            project: Some("PROJ".to_string()),
+            summary: Some("A task".to_string()),
+            description: None,
+            description_path: Some(path.to_str().unwrap().to_string()),
+            issue_type: Some("Task".to_string()),
+            custom_fields: None,
+            dry_run: false,
+        };
+        let yaml = run_jira_create(&client, &params).await.unwrap();
+        assert!(yaml.contains("PROJ-100"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_create_description_and_path_conflict_errors() {
+        // Both inline and path supplied → error before any HTTP.
+        let client = mock_client("http://127.0.0.1:1");
+        let params = JiraCreateParams {
+            document: None,
+            document_path: None,
+            project: Some("PROJ".to_string()),
+            summary: Some("A task".to_string()),
+            description: Some("inline".to_string()),
+            description_path: Some("/tmp/whatever.md".to_string()),
+            issue_type: Some("Task".to_string()),
+            custom_fields: None,
+            dry_run: false,
+        };
+        let err = run_jira_create(&client, &params).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Provide either `description` or `description_path`, not both"));
     }
 
     #[tokio::test]
@@ -1905,6 +2016,8 @@ mod tests {
         let doc = "---\ntype: jira\ninstance: https://org.atlassian.net\nproject: PROJ\nsummary: T\n---\n\nBody\n";
         let client = mock_client("http://127.0.0.1:1");
         let params = JiraCreateParams {
+            description_path: None,
+            document_path: None,
             document: Some(doc.to_string()),
             project: None,
             summary: None,
@@ -1926,6 +2039,8 @@ mod tests {
         let mut fields = std::collections::BTreeMap::new();
         fields.insert("Story Points".to_string(), serde_json::json!(5));
         let params = JiraCreateParams {
+            description_path: None,
+            document_path: None,
             document: Some(doc.to_string()),
             project: None,
             summary: None,
@@ -2006,6 +2121,8 @@ mod tests {
             serde_json::Value::String("Unplanned".to_string()),
         );
         let params = JiraCreateParams {
+            description_path: None,
+            document_path: None,
             document: None,
             project: Some("PROJ".to_string()),
             summary: Some("An epic".to_string()),
@@ -2038,6 +2155,8 @@ mod tests {
 
         let client = mock_client(&server.uri());
         let params = JiraCreateParams {
+            description_path: None,
+            document_path: None,
             document: None,
             project: Some("PROJ".to_string()),
             summary: Some("Terse".to_string()),
@@ -3885,6 +4004,8 @@ mod tests {
     async fn run_jira_create_dry_run_returns_request_without_calling_api() {
         let client = mock_client("http://127.0.0.1:1");
         let params = JiraCreateParams {
+            description_path: None,
+            document_path: None,
             document: None,
             project: Some("PROJ".to_string()),
             summary: Some("A task".to_string()),
@@ -3905,6 +4026,8 @@ mod tests {
     async fn run_jira_create_dry_run_still_validates_adf() {
         let client = mock_client("http://127.0.0.1:1");
         let params = JiraCreateParams {
+            description_path: None,
+            document_path: None,
             document: None,
             project: Some("PROJ".to_string()),
             summary: Some("Title".to_string()),
@@ -3954,6 +4077,8 @@ mod tests {
             serde_json::Value::String("Unplanned".to_string()),
         );
         let params = JiraCreateParams {
+            description_path: None,
+            document_path: None,
             document: None,
             project: Some("PROJ".to_string()),
             summary: Some("An epic".to_string()),
@@ -4023,6 +4148,8 @@ mod tests {
         // (no `description` key in the previewed payload).
         let client = mock_client("http://127.0.0.1:1");
         let params = JiraCreateParams {
+            description_path: None,
+            document_path: None,
             document: None,
             project: Some("PROJ".to_string()),
             summary: Some("Terse".to_string()),
