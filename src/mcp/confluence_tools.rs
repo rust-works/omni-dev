@@ -3351,6 +3351,33 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn confluence_user_get_handler_success_path_via_mock() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/user"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "accountId": "abc",
+                    "accountType": "atlassian",
+                    "displayName": "Alice"
+                })),
+            )
+            .mount(&srv)
+            .await;
+        let _env = EnvGuard::set(&srv.uri());
+
+        let server = make_server();
+        let result = server
+            .confluence_user_get(Parameters(ConfluenceUserGetParams {
+                account_ids: vec!["abc".to_string()],
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn confluence_search_handler_error_path() {
         let _lock = env_lock();
         clear_env();
@@ -5375,6 +5402,47 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("403"));
+    }
+
+    // ── get_users_yaml ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_users_yaml_resolves_record() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/user"))
+            .and(wiremock::matchers::query_param("accountId", "abc"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "accountId": "abc",
+                    "accountType": "atlassian",
+                    "displayName": "Alice"
+                })),
+            )
+            .mount(&server)
+            .await;
+        let ids = vec!["abc".to_string()];
+        let yaml = get_users_yaml(&phase2d_mock_client(&server.uri()), &ids)
+            .await
+            .unwrap();
+        assert!(yaml.contains("Alice"));
+        assert!(yaml.contains("abc"));
+    }
+
+    #[tokio::test]
+    async fn get_users_yaml_stubs_unknown_id() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/user"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not found"))
+            .mount(&server)
+            .await;
+        let ids = vec!["missing".to_string()];
+        let yaml = get_users_yaml(&phase2d_mock_client(&server.uri()), &ids)
+            .await
+            .unwrap();
+        assert!(yaml.contains("account_id: missing"));
+        assert!(yaml.contains("error:"));
     }
 
     // ── confluence_compare / confluence_compare_section ────────────
