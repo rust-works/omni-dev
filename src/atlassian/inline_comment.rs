@@ -1002,4 +1002,197 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
+
+    #[tokio::test]
+    async fn reanchor_comment_without_marker_ref_errors() {
+        let server = wiremock::MockServer::start().await;
+        mount_inline_comments(
+            &server,
+            "12345",
+            serde_json::json!({
+                "results": [
+                    {"id": "ic1", "version": {"authorId": "a", "createdAt": "t"}}
+                ]
+            }),
+        )
+        .await;
+        let api = mock_api(&server);
+        let err = reanchor_inline_comment(&api, "12345", "ic1", "x", None, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no inline marker reference"));
+    }
+
+    #[tokio::test]
+    async fn reanchor_lost_mark_reports_no_previous_text() {
+        let server = wiremock::MockServer::start().await;
+        // The page no longer bears marker "aaa" anywhere — the mark was lost.
+        let page = doc(vec![vec![AdfNode::text("Plain text with 200ms here.")]]);
+        mount_page(&server, "12345", &page).await;
+        mount_inline_comments(
+            &server,
+            "12345",
+            serde_json::json!({
+                "results": [
+                    {"id": "ic1", "version": {"authorId": "a", "createdAt": "t"},
+                     "properties": {"inlineMarkerRef": "aaa", "inlineOriginalSelection": "old"}}
+                ]
+            }),
+        )
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12345"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let api = mock_api(&server);
+        let outcome = reanchor_inline_comment(&api, "12345", "ic1", "200ms", None, false)
+            .await
+            .unwrap();
+        assert!(outcome.previous_anchored_text.is_none());
+        assert_eq!(outcome.new_anchor_text, "200ms");
+    }
+
+    #[tokio::test]
+    async fn audit_skips_comments_without_marker_ref() {
+        let server = wiremock::MockServer::start().await;
+        let page = doc(vec![vec![annotated("200ms", "aaa")]]);
+        mount_page(&server, "12345", &page).await;
+        mount_inline_comments(
+            &server,
+            "12345",
+            serde_json::json!({
+                "results": [
+                    {"id": "ic1", "version": {"authorId": "a", "createdAt": "t"}},
+                    {"id": "ic2", "version": {"authorId": "b", "createdAt": "t"},
+                     "properties": {"inlineMarkerRef": "aaa", "inlineOriginalSelection": "200ms"}}
+                ]
+            }),
+        )
+        .await;
+
+        let api = mock_api(&server);
+        let drifts = audit_inline_comments(&api, "12345").await.unwrap();
+        // ic1 has no marker reference and is skipped.
+        assert_eq!(drifts.len(), 1);
+        assert_eq!(drifts[0].comment_id, "ic2");
+    }
+
+    #[tokio::test]
+    async fn audit_page_without_adf_body_reports_mark_lost() {
+        let server = wiremock::MockServer::start().await;
+        // Page response carries no `body` — `fetch_page_adf` yields an empty doc.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12345"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "12345",
+                    "title": "Mock",
+                    "status": "current",
+                    "spaceId": "98",
+                    "version": {"number": 1}
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/98"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"key": "ENG"})),
+            )
+            .mount(&server)
+            .await;
+        mount_inline_comments(
+            &server,
+            "12345",
+            serde_json::json!({
+                "results": [
+                    {"id": "ic1", "version": {"authorId": "a", "createdAt": "t"},
+                     "properties": {"inlineMarkerRef": "aaa", "inlineOriginalSelection": "200ms"}}
+                ]
+            }),
+        )
+        .await;
+
+        let api = mock_api(&server);
+        let drifts = audit_inline_comments(&api, "12345").await.unwrap();
+        assert_eq!(drifts.len(), 1);
+        assert_eq!(drifts[0].status, DriftStatus::MarkLost);
+        // The empty page contains no occurrence of the original selection.
+        assert!(drifts[0].suggested_new_anchor.is_none());
+    }
+
+    // ── edge branches in the anchor-application walk ────────────────
+
+    #[test]
+    fn apply_annotation_empty_anchor_errors() {
+        let mut d = doc(vec![vec![AdfNode::text("hello")]]);
+        let err = apply_annotation(&mut d, "", None, "aaa").unwrap_err();
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn apply_annotation_match_in_first_block_leaves_later_blocks_untouched() {
+        let mut d = doc(vec![
+            vec![AdfNode::text("alpha here")],
+            vec![AdfNode::text("beta there")],
+        ]);
+        apply_annotation(&mut d, "alpha", None, "aaa").unwrap();
+        assert_eq!(collect_annotation_runs(&d, "aaa"), vec!["alpha"]);
+        // The second paragraph is untouched (a single unsplit run).
+        let second = d.content[1].content.as_ref().unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].text.as_deref(), Some("beta there"));
+    }
+
+    fn hard_break() -> AdfNode {
+        AdfNode {
+            node_type: "hardBreak".to_string(),
+            attrs: None,
+            content: None,
+            text: None,
+            marks: None,
+            local_id: None,
+            parameters: None,
+        }
+    }
+
+    #[test]
+    fn apply_annotation_spans_reset_at_inline_non_text_nodes() {
+        // "foo" appears once before and once after a hard break: two separate
+        // spans, so the anchor is ambiguous and match_index selects the first.
+        let mut d = doc(vec![vec![
+            AdfNode::text("see foo here"),
+            hard_break(),
+            AdfNode::text("and foo there"),
+        ]]);
+        apply_annotation(&mut d, "foo", Some(1), "aaa").unwrap();
+        assert_eq!(collect_annotation_runs(&d, "aaa"), vec!["foo"]);
+        // The annotated occurrence is the one before the break.
+        let runs = first_para_runs(&d);
+        let pos = runs.iter().position(|n| has_annotation(n, "aaa")).unwrap();
+        let break_pos = runs
+            .iter()
+            .position(|n| n.node_type == "hardBreak")
+            .unwrap();
+        assert!(pos < break_pos);
+    }
+
+    #[test]
+    fn apply_annotation_preserves_empty_text_runs() {
+        let mut d = doc(vec![vec![AdfNode::text(""), AdfNode::text("foo bar")]]);
+        apply_annotation(&mut d, "foo", None, "aaa").unwrap();
+        assert_eq!(collect_annotation_runs(&d, "aaa"), vec!["foo"]);
+        // The empty run survives the split untouched.
+        let runs = first_para_runs(&d);
+        assert_eq!(runs[0].text.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn count_non_overlapping_empty_needle_is_zero() {
+        assert_eq!(count_non_overlapping("abc", ""), 0);
+    }
 }

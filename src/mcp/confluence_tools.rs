@@ -5919,4 +5919,194 @@ mod tests {
         assert!(yaml.contains("method: PUT"));
         assert!(yaml.contains("title: New Title"));
     }
+
+    // ── comment audit / reanchor (issue #1092) ──────────────────────
+
+    /// Mounts the inline-comments listing for page `id` with one comment
+    /// `ic1` bearing marker `aaa` and original selection "old".
+    async fn mock_inline_comment_ic1(server: &wiremock::MockServer, id: &str) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!(
+                "/wiki/api/v2/pages/{id}/inline-comments"
+            )))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {"id": "ic1", "version": {"authorId": "a", "createdAt": "t"},
+                         "properties": {"inlineMarkerRef": "aaa", "inlineOriginalSelection": "old"}}
+                    ]
+                })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn audit_comments_yaml_reports_drift() {
+        let server = wiremock::MockServer::start().await;
+        // The page body does not bear marker "aaa" → the mark was lost.
+        mock_page_with_anchor(&server, "12345", "some page text").await;
+        mock_inline_comment_ic1(&server, "12345").await;
+
+        let yaml = audit_comments_yaml(&phase2d_mock_api(&server), "12345")
+            .await
+            .unwrap();
+        assert!(yaml.contains("ic1"), "got: {yaml}");
+        assert!(yaml.contains("mark_lost"), "got: {yaml}");
+    }
+
+    #[tokio::test]
+    async fn reanchor_comment_result_dry_run_returns_yaml_without_put() {
+        let server = wiremock::MockServer::start().await;
+        mock_page_with_anchor(&server, "12345", "fresh anchor").await;
+        mock_inline_comment_ic1(&server, "12345").await;
+        // No PUT mounted: a write attempt would fail the test with a 404.
+
+        let yaml = reanchor_comment_result(
+            &phase2d_mock_api(&server),
+            "12345",
+            "ic1",
+            "fresh anchor",
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(yaml.contains("dry_run: true"), "got: {yaml}");
+        assert!(yaml.contains("fresh anchor"), "got: {yaml}");
+    }
+
+    #[tokio::test]
+    async fn reanchor_comment_result_writes_page() {
+        let server = wiremock::MockServer::start().await;
+        mock_page_with_anchor(&server, "12345", "fresh anchor").await;
+        mock_inline_comment_ic1(&server, "12345").await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12345"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let yaml = reanchor_comment_result(
+            &phase2d_mock_api(&server),
+            "12345",
+            "ic1",
+            "fresh anchor",
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(yaml.contains("dry_run: false"), "got: {yaml}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_comment_audit_handler_success_via_mock() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        mock_page_with_anchor(&srv, "12345", "some page text").await;
+        mock_inline_comment_ic1(&srv, "12345").await;
+        let _env = EnvGuard::set(&srv.uri());
+
+        let server = make_server();
+        let result = server
+            .confluence_comment_audit(Parameters(ConfluenceCommentAuditParams {
+                id: "12345".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_comment_audit_handler_error_path_without_credentials() {
+        let _lock = env_lock();
+        clear_env();
+        let server = make_server();
+        let result = server
+            .confluence_comment_audit(Parameters(ConfluenceCommentAuditParams {
+                id: "12345".to_string(),
+            }))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_comment_reanchor_handler_success_via_mock() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        mock_page_with_anchor(&srv, "12345", "fresh anchor").await;
+        mock_inline_comment_ic1(&srv, "12345").await;
+        let _env = EnvGuard::set(&srv.uri());
+
+        let server = make_server();
+        let result = server
+            .confluence_comment_reanchor(Parameters(ConfluenceCommentReanchorParams {
+                id: "12345".to_string(),
+                comment_id: "ic1".to_string(),
+                anchor_text: "fresh anchor".to_string(),
+                match_index: None,
+                dry_run: true,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confluence_comment_reanchor_handler_error_path_without_credentials() {
+        let _lock = env_lock();
+        clear_env();
+        let server = make_server();
+        let result = server
+            .confluence_comment_reanchor(Parameters(ConfluenceCommentReanchorParams {
+                id: "12345".to_string(),
+                comment_id: "ic1".to_string(),
+                anchor_text: "fresh anchor".to_string(),
+                match_index: None,
+                dry_run: true,
+            }))
+            .await;
+        assert!(result.is_err());
+    }
+
+    // ── run_confluence_read at a pinned version ─────────────────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_confluence_read_at_specific_version() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12345"))
+            .and(wiremock::matchers::query_param("version", "2"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "12345",
+                    "title": "Mock Page v2",
+                    "status": "current",
+                    "spaceId": "98765",
+                    "version": {"number": 2},
+                    "body": {"atlas_doc_format": {
+                        "value": "{\"version\":1,\"type\":\"doc\",\"content\":[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"Version two body\"}]}]}"
+                    }}
+                })),
+            )
+            .mount(&srv)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/98765"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"key": "ENG"})),
+            )
+            .mount(&srv)
+            .await;
+        let _env = EnvGuard::set(&srv.uri());
+
+        let out = run_confluence_read("12345", ContentFormat::Jfm, None, Some(2))
+            .await
+            .unwrap();
+        assert!(out.contains("Version two body"), "got: {out}");
+    }
 }
