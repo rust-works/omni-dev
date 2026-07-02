@@ -2893,6 +2893,27 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn run_confluence_create_document_and_document_path_conflict_errors() {
+        // Both document sources supplied → error from the `document` resolution
+        // before any client/HTTP (covers the document-side path branch).
+        let params = ConfluenceCreateParams {
+            document: Some("---\ntype: confluence\n---\n\nB\n".to_string()),
+            document_path: Some("/tmp/whatever.md".to_string()),
+            space_key: None,
+            title: None,
+            content: None,
+            content_path: None,
+            parent_id: None,
+            format: None,
+            dry_run: false,
+        };
+        let err = run_confluence_create(&params).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Provide either `document` or `document_path`, not both"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn run_confluence_create_document_param_override_warns_in_text() {
         let _lock = env_lock();
         let server = wiremock::MockServer::start().await;

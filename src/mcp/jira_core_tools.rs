@@ -1384,7 +1384,11 @@ impl OmniDevServer {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::await_holding_lock // env lock intentionally held across await on a single-thread runtime
+)]
 mod tests {
     use super::*;
     use wiremock::matchers::{body_json, method, path, query_param};
@@ -1400,6 +1404,43 @@ mod tests {
     /// avoids cross-test bleed.
     fn mock_cache() -> CatalogueCache {
         CatalogueCache::new(std::time::Duration::from_secs(60))
+    }
+
+    /// Serialize env-backed handler tests — the tool handlers build their
+    /// client via `create_client()`, which reads process-wide environment
+    /// variables. Routes through the crate-wide `AUTH_ENV_MUTEX` so we don't
+    /// race env-mutating tests in other Atlassian-touching modules.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Points the ATLASSIAN_* credentials at a mock server for the duration of
+    /// a handler test, restoring the prior (empty) state on drop.
+    struct EnvGuard;
+
+    impl EnvGuard {
+        fn set(instance_url: &str) -> Self {
+            use crate::atlassian::auth::{
+                ATLASSIAN_API_TOKEN, ATLASSIAN_EMAIL, ATLASSIAN_INSTANCE_URL,
+            };
+            std::env::set_var(ATLASSIAN_INSTANCE_URL, instance_url);
+            std::env::set_var(ATLASSIAN_EMAIL, "user@test.com");
+            std::env::set_var(ATLASSIAN_API_TOKEN, "fake-token");
+            Self
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            use crate::atlassian::auth::{
+                ATLASSIAN_API_TOKEN, ATLASSIAN_EMAIL, ATLASSIAN_INSTANCE_URL,
+            };
+            std::env::remove_var(ATLASSIAN_INSTANCE_URL);
+            std::env::remove_var(ATLASSIAN_EMAIL);
+            std::env::remove_var(ATLASSIAN_API_TOKEN);
+        }
     }
 
     // ── ReadFormat::parse ──────────────────────────────────────────────────
@@ -1822,6 +1863,28 @@ mod tests {
         assert!(err
             .to_string()
             .contains("Provide either `description` or `description_path`, not both"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_create_document_and_document_path_conflict_errors() {
+        // Both document sources supplied → error from the `document` resolution
+        // before any HTTP (covers the document-side path branch).
+        let client = mock_client("http://127.0.0.1:1");
+        let params = JiraCreateParams {
+            document: Some("---\ntype: jira\n---\n\nB\n".to_string()),
+            document_path: Some("/tmp/whatever.md".to_string()),
+            project: None,
+            summary: None,
+            description: None,
+            description_path: None,
+            issue_type: None,
+            custom_fields: None,
+            dry_run: false,
+        };
+        let err = run_jira_create(&client, &params).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Provide either `document` or `document_path`, not both"));
     }
 
     #[tokio::test]
@@ -3412,6 +3475,62 @@ mod tests {
             .unwrap();
         assert!(yaml.contains("id: '100'") || yaml.contains("id: \"100\""));
         assert!(yaml.contains("2026-05-10T12:00:00"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_comment_edit_handler_reads_body_from_path() {
+        // Issue #1093: exercise the `jira_comment_edit` handler end-to-end with
+        // the body supplied via `body_path` (read from disk), covering the
+        // handler's `require_content_input` + `run_jira_comment_edit` call.
+        let _lock = env_lock();
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1/comment/100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "100",
+                "author": {"displayName": "Me"},
+                "created": "2026-04-01T10:00:00.000+0000",
+                "updated": "2026-05-10T12:00:00.000+0000",
+                "body": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let _env = EnvGuard::set(&server.uri());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("comment.md");
+        std::fs::write(&path, "edited from disk").unwrap();
+
+        let result = OmniDevServer::new()
+            .jira_comment_edit(Parameters(JiraCommentEditParams {
+                key: "PROJ-1".to_string(),
+                comment_id: "100".to_string(),
+                body: None,
+                body_path: Some(path.to_str().unwrap().to_string()),
+                visibility: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_comment_edit_handler_requires_body_or_path() {
+        // Neither body source supplied → tool error before any client/HTTP.
+        let err = OmniDevServer::new()
+            .jira_comment_edit(Parameters(JiraCommentEditParams {
+                key: "PROJ-1".to_string(),
+                comment_id: "100".to_string(),
+                body: None,
+                body_path: None,
+                visibility: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err
+            .message
+            .contains("Provide either `body` or `body_path`."));
     }
 
     #[tokio::test]
