@@ -979,8 +979,10 @@ impl OmniDevServer {
 
     /// Tool: list issues on an agile board.
     #[tool(
-        description = "List issues on a JIRA agile board. Accepts an optional JQL filter. \
-                       Returns YAML. Mirrors `omni-dev atlassian jira board issues`."
+        description = "List issues on a JIRA agile board (every issue on the board, across its \
+                       backlog and all its sprints). Accepts an optional JQL filter. Returns YAML. \
+                       To scope to a single sprint's issues instead, use `jira_sprint_issues`. \
+                       Mirrors `omni-dev atlassian jira board issues`."
     )]
     pub async fn jira_board_issues(
         &self,
@@ -1030,8 +1032,10 @@ impl OmniDevServer {
 
     /// Tool: list issues in a sprint.
     #[tool(
-        description = "List issues in a JIRA sprint. Accepts an optional JQL filter. Returns \
-                       YAML. Mirrors `omni-dev atlassian jira sprint issues`."
+        description = "List issues in one JIRA sprint (get sprint IDs from `jira_sprint_list`). \
+                       Accepts an optional JQL filter. Returns YAML. For every issue on a board \
+                       regardless of sprint, use `jira_board_issues` instead. \
+                       Mirrors `omni-dev atlassian jira sprint issues`."
     )]
     pub async fn jira_sprint_issues(
         &self,
