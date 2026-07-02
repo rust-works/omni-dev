@@ -216,9 +216,14 @@ fn print_user_get_results(result: &ConfluenceUserGetResults) {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::await_holding_lock // env lock intentionally held across await on a single-thread runtime
+)]
 mod tests {
     use super::*;
+    use crate::atlassian::auth::{ATLASSIAN_API_TOKEN, ATLASSIAN_EMAIL, ATLASSIAN_INSTANCE_URL};
     use crate::atlassian::client::{ConfluenceUserRecord, ConfluenceUserSearchResult};
 
     fn mock_client(base_url: &str) -> AtlassianClient {
@@ -424,6 +429,8 @@ mod tests {
             users: vec![
                 sample_record("abc123", Some("Alice Smith"), None),
                 sample_record("bad", None, Some("HTTP 404")),
+                // No display name and no error — exercises the "-" fallback arm.
+                sample_record("noinfo", None, None),
             ],
         };
         print_user_get_results(&result);
@@ -485,5 +492,76 @@ mod tests {
         let client = mock_client(&server.uri());
         let ids = vec!["good".to_string(), "bad".to_string()];
         assert!(run_get(&client, &ids, &OutputFormat::Yaml).await.is_ok());
+    }
+
+    // ── execute() with env-backed credentials ─────────────────────
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    struct EnvGuard;
+
+    impl EnvGuard {
+        fn set(instance_url: &str) -> Self {
+            std::env::set_var(ATLASSIAN_INSTANCE_URL, instance_url);
+            std::env::set_var(ATLASSIAN_EMAIL, "user@test.com");
+            std::env::set_var(ATLASSIAN_API_TOKEN, "fake-token");
+            Self
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(ATLASSIAN_INSTANCE_URL);
+            std::env::remove_var(ATLASSIAN_EMAIL);
+            std::env::remove_var(ATLASSIAN_API_TOKEN);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_get_command_execute_round_trip() {
+        let _lock = env_lock();
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/user"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "accountId": "abc123",
+                    "accountType": "atlassian",
+                    "displayName": "Alice"
+                })),
+            )
+            .mount(&server)
+            .await;
+        let _env = EnvGuard::set(&server.uri());
+
+        let cmd = UserGetCommand {
+            account_id: vec!["abc123".to_string()],
+            output: OutputFormat::Json,
+        };
+        cmd.execute().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_command_dispatches_to_get() {
+        let _lock = env_lock();
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/user"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("Not found"))
+            .mount(&server)
+            .await;
+        let _env = EnvGuard::set(&server.uri());
+
+        let cmd = UserCommand {
+            command: UserSubcommands::Get(UserGetCommand {
+                account_id: vec!["missing".to_string()],
+                output: OutputFormat::Yaml,
+            }),
+        };
+        cmd.execute().await.unwrap();
     }
 }

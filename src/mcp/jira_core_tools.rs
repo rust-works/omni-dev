@@ -1431,6 +1431,7 @@ impl OmniDevServer {
 )]
 mod tests {
     use super::*;
+    use crate::atlassian::auth::{ATLASSIAN_API_TOKEN, ATLASSIAN_EMAIL, ATLASSIAN_INSTANCE_URL};
     use wiremock::matchers::{body_json, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1446,25 +1447,22 @@ mod tests {
         CatalogueCache::new(std::time::Duration::from_secs(60))
     }
 
-    /// Serialize env-backed handler tests — the tool handlers build their
-    /// client via `create_client()`, which reads process-wide environment
-    /// variables. Routes through the crate-wide `AUTH_ENV_MUTEX` so we don't
-    /// race env-mutating tests in other Atlassian-touching modules.
+    fn make_server() -> OmniDevServer {
+        OmniDevServer::new()
+    }
+
+    /// Serialize env-backed tests — `create_client()` reads process-wide env
+    /// vars, so concurrent tests would race without the crate-wide lock.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Points the ATLASSIAN_* credentials at a mock server for the duration of
-    /// a handler test, restoring the prior (empty) state on drop.
     struct EnvGuard;
 
     impl EnvGuard {
         fn set(instance_url: &str) -> Self {
-            use crate::atlassian::auth::{
-                ATLASSIAN_API_TOKEN, ATLASSIAN_EMAIL, ATLASSIAN_INSTANCE_URL,
-            };
             std::env::set_var(ATLASSIAN_INSTANCE_URL, instance_url);
             std::env::set_var(ATLASSIAN_EMAIL, "user@test.com");
             std::env::set_var(ATLASSIAN_API_TOKEN, "fake-token");
@@ -1474,9 +1472,6 @@ mod tests {
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            use crate::atlassian::auth::{
-                ATLASSIAN_API_TOKEN, ATLASSIAN_EMAIL, ATLASSIAN_INSTANCE_URL,
-            };
             std::env::remove_var(ATLASSIAN_INSTANCE_URL);
             std::env::remove_var(ATLASSIAN_EMAIL);
             std::env::remove_var(ATLASSIAN_API_TOKEN);
@@ -4134,6 +4129,71 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("403"));
+    }
+
+    // ── run_jira_user_get ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_jira_user_get_resolves_record() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/user"))
+            .and(query_param("accountId", "abc123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "accountId": "abc123",
+                "displayName": "Alice Smith",
+                "active": true,
+                "accountType": "atlassian"
+            })))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let ids = vec!["abc123".to_string()];
+        let yaml = run_jira_user_get(&client, &ids).await.unwrap();
+        assert!(yaml.contains("account_id: abc123"));
+        assert!(yaml.contains("display_name: Alice Smith"));
+        assert!(yaml.contains("active: true"));
+    }
+
+    #[tokio::test]
+    async fn run_jira_user_get_stubs_unknown_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/user"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("Not found"))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let ids = vec!["missing".to_string()];
+        let yaml = run_jira_user_get(&client, &ids).await.unwrap();
+        assert!(yaml.contains("account_id: missing"));
+        assert!(yaml.contains("error:"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jira_user_get_handler_success_path_via_mock() {
+        let _lock = env_lock();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/user"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "accountId": "abc123",
+                "displayName": "Alice",
+                "active": true,
+                "accountType": "atlassian"
+            })))
+            .mount(&server)
+            .await;
+        let _env = EnvGuard::set(&server.uri());
+
+        let srv = make_server();
+        let result = srv
+            .jira_user_get(Parameters(JiraUserGetParams {
+                account_ids: vec!["abc123".to_string()],
+            }))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
     }
 
     // ── ok_text / yaml_result helpers ──────────────────────────────────────

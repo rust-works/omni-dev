@@ -766,6 +766,53 @@ mod tests {
     }
 
     #[test]
+    fn jira_user_get_results_jsonl() {
+        use crate::atlassian::client::{JiraUserGetResults, JiraUserRecord};
+        let list = JiraUserGetResults {
+            users: vec![
+                JiraUserRecord {
+                    account_id: "u1".to_string(),
+                    display_name: Some("Alice".to_string()),
+                    email_address: Some("alice@example.com".to_string()),
+                    active: Some(true),
+                    account_type: Some("atlassian".to_string()),
+                    error: None,
+                },
+                JiraUserRecord {
+                    account_id: "bad".to_string(),
+                    display_name: None,
+                    email_address: None,
+                    active: None,
+                    account_type: None,
+                    error: Some("HTTP 404".to_string()),
+                },
+            ],
+        };
+        let out = jsonl_string(&list);
+        assert_eq!(out.lines().count(), 2);
+        assert!(out.contains("\"account_id\":\"u1\""));
+        assert!(out.contains("\"error\":\"HTTP 404\""));
+    }
+
+    #[test]
+    fn confluence_user_get_results_jsonl() {
+        use crate::atlassian::client::{ConfluenceUserGetResults, ConfluenceUserRecord};
+        let list = ConfluenceUserGetResults {
+            users: vec![ConfluenceUserRecord {
+                account_id: "abc".to_string(),
+                display_name: Some("Alice".to_string()),
+                email: Some("a@x.com".to_string()),
+                account_type: Some("atlassian".to_string()),
+                active: None,
+                error: None,
+            }],
+        };
+        let out = jsonl_string(&list);
+        assert_eq!(out.lines().count(), 1);
+        assert!(out.contains("\"account_id\":\"abc\""));
+    }
+
+    #[test]
     fn jira_dev_status_jsonl_single_line() {
         let status = JiraDevStatus {
             pull_requests: vec![],

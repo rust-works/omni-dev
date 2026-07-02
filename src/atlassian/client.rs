@@ -2268,6 +2268,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_confluence_user_unauthorized_is_hard_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/rest/api/user"))
+            .respond_with(wiremock::ResponseTemplate::new(401).set_body_string("Unauthorized"))
+            .mount(&server)
+            .await;
+
+        let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
+        assert!(client.get_confluence_user("whoever").await.is_err());
+    }
+
+    #[tokio::test]
     async fn get_confluence_users_batch_survives_one_bad_id() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
