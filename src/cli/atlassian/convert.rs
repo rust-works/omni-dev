@@ -84,7 +84,9 @@ pub struct FromAdfCommand {
     /// Input file (reads from stdin if omitted or "-").
     pub file: Option<String>,
 
-    /// Omit localId attributes from output for readability.
+    /// Omit localId attributes from output. For reading only — do NOT write
+    /// stripped output back to Confluence, as localIds anchor inline comments
+    /// and dropping them makes Confluence lose those comments.
     #[arg(long)]
     pub strip_local_ids: bool,
 }
