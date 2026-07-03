@@ -207,6 +207,10 @@ omni-dev git commit message view 'HEAD~3..HEAD'
 
 # Analyze current branch vs main
 omni-dev git branch info main
+
+# Without an argument, the base branch is resolved remote-first:
+# origin/main, then origin/master, then local main/master
+omni-dev git branch info
 ```
 
 The output includes:
@@ -247,7 +251,9 @@ Validate commit messages against guidelines without modifying anything.
 Useful in CI, pre-push hooks, and as a non-destructive sibling to `twiddle`.
 
 ```bash
-# Default range: commits ahead of main
+# Default range: commits ahead of the default base branch, resolved
+# remote-first (origin/main, then origin/master, then local main/master);
+# errors if none of these exist — pass an explicit range in that case
 omni-dev git commit message check
 
 # Explicit range

@@ -47,6 +47,19 @@ pub(crate) fn parse_beta_header(s: &str) -> Result<(String, String)> {
     Ok((k.to_string(), v.to_string()))
 }
 
+/// Computes the default commit range when the user gave none:
+/// `<base>..HEAD` with the base resolved remote-first (see
+/// [`crate::git::GitRepository::resolve_default_base_branch`]).
+pub(crate) fn default_commit_range(repo: &crate::git::GitRepository) -> Result<String> {
+    match repo.resolve_default_base_branch() {
+        Some(base) => Ok(format!("{base}..HEAD")),
+        None => anyhow::bail!(
+            "No default base branch found (checked origin/main, origin/master, main, master). \
+             Pass an explicit commit range (e.g. 'origin/develop..HEAD') or base branch."
+        ),
+    }
+}
+
 /// Git operations.
 #[derive(Parser)]
 pub struct GitCommand {
@@ -393,6 +406,57 @@ mod tests {
         let mut reader = std::io::Cursor::new(b"\n" as &[u8]);
         let result = read_interactive_line(&mut reader).unwrap();
         assert_eq!(result, Some("\n".to_string()));
+    }
+
+    /// Creates a temp repo with one commit on `branch`, anchored at
+    /// `$CARGO_MANIFEST_DIR/tmp` like the other git test fixtures.
+    fn repo_on_branch(branch: &str) -> (tempfile::TempDir, crate::git::GitRepository) {
+        let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
+        std::fs::create_dir_all(&tmp_root).unwrap();
+        let temp_dir = tempfile::tempdir_in(&tmp_root).unwrap();
+        let p = temp_dir.path();
+        for args in [
+            vec!["init"],
+            vec!["checkout", "-b", branch],
+            vec!["commit", "--allow-empty", "-m", "init"],
+        ] {
+            let output = std::process::Command::new("git")
+                .current_dir(p)
+                .args([
+                    "-c",
+                    "user.email=test@example.com",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(&args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let repo = crate::git::GitRepository::open_at(p).unwrap();
+        (temp_dir, repo)
+    }
+
+    #[test]
+    fn default_commit_range_uses_resolved_base() {
+        let (_tmp, repo) = repo_on_branch("main");
+        assert_eq!(default_commit_range(&repo).unwrap(), "main..HEAD");
+    }
+
+    #[test]
+    fn default_commit_range_errors_without_mainline() {
+        let (_tmp, repo) = repo_on_branch("dev");
+        let err = default_commit_range(&repo).unwrap_err().to_string();
+        assert!(
+            err.contains("No default base branch found") && err.contains("origin/main"),
+            "unexpected error: {err}"
+        );
     }
 
     /// All `git` message and branch commands now honor `--repo` by threading

@@ -473,7 +473,13 @@ Error: Invalid commit range: HEAD~100..HEAD
 
 ### Error: Remote branch not found
 
-**Symptom**: Can't find origin/main or base branch.
+**Symptom**: Can't find origin/main or base branch, or commands report
+`No default base branch found (checked origin/main, origin/master, main, master)`.
+
+When no commit range or base branch is given, `git commit message check` and
+`git branch info` resolve the default base remote-first: `origin/main`, then
+`origin/master`, then local `main`, then local `master`. If none of these
+refs exist, they error rather than guessing a range.
 
 **Solutions**:
 

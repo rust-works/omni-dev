@@ -8,7 +8,8 @@ use clap::Parser;
 /// Info command options.
 #[derive(Parser)]
 pub struct InfoCommand {
-    /// Base branch to compare against (defaults to main/master).
+    /// Base branch to compare against (defaults to origin/main,
+    /// origin/master, main, or master).
     #[arg(value_name = "BASE_BRANCH")]
     pub base_branch: Option<String>,
 }
@@ -146,25 +147,15 @@ pub fn run_info<P: AsRef<Path>>(base_branch: Option<&str>, repo_path: Option<P>)
         .get_current_branch()
         .context("Failed to get current branch. Make sure you're not in detached HEAD state.")?;
 
-    let resolved_base = match base_branch {
+    let commit_range = match base_branch {
         Some(branch) => {
             if !repo.branch_exists(branch)? {
                 anyhow::bail!("Base branch '{branch}' does not exist");
             }
-            branch.to_string()
+            format!("{branch}..HEAD")
         }
-        None => {
-            if repo.branch_exists("main")? {
-                "main".to_string()
-            } else if repo.branch_exists("master")? {
-                "master".to_string()
-            } else {
-                anyhow::bail!("No default base branch found (main or master)");
-            }
-        }
+        None => super::default_commit_range(&repo)?,
     };
-
-    let commit_range = format!("{resolved_base}..HEAD");
 
     let wd_status = repo.get_working_directory_status()?;
     let working_directory = WorkingDirectoryInfo {
@@ -332,7 +323,35 @@ mod tests {
 
         let err = run_info(None, Some(temp_dir.path())).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("main or master"), "got: {msg}");
+        assert!(msg.contains("No default base branch found"), "got: {msg}");
+    }
+
+    /// The core regression test for issue #1106: when both a stale local
+    /// `main` and an up-to-date `origin/main` exist, the default range must
+    /// bind to the remote-tracking ref, excluding commits already merged
+    /// into the remote mainline.
+    #[test]
+    fn run_info_prefers_origin_main_over_stale_local_main() {
+        let (temp_dir, commits) = init_repo_with_commits();
+        let repo = Repository::open(temp_dir.path()).unwrap();
+
+        // Move to a work branch at the tip, rewind local `main` to the first
+        // commit (stale), and mark the tip as the remote's view of main.
+        repo.reference("refs/heads/work", commits[1], true, "test")
+            .unwrap();
+        repo.set_head("refs/heads/work").unwrap();
+        repo.reference("refs/heads/main", commits[0], true, "test")
+            .unwrap();
+        repo.reference("refs/remotes/origin/main", commits[1], true, "test")
+            .unwrap();
+
+        let yaml = run_info(None, Some(temp_dir.path())).unwrap();
+        // origin/main..HEAD is empty; the stale local main..HEAD would have
+        // included the "feat: work" commit.
+        assert!(
+            !yaml.contains("feat: work"),
+            "range bound to stale local main: {yaml}"
+        );
     }
 
     #[test]

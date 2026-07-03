@@ -2947,7 +2947,7 @@ Analyzes branch commits and outputs repository information in YAML format (mirro
 Usage: info [BASE_BRANCH]
 
 Arguments:
-  [BASE_BRANCH]  Base branch to compare against (defaults to main/master)
+  [BASE_BRANCH]  Base branch to compare against (defaults to origin/main, origin/master, main, or master)
 
 Options:
   -h, --help  Print help
@@ -3013,7 +3013,7 @@ Checks commit messages against guidelines without modifying them (mirrors the `g
 Usage: check [OPTIONS] [COMMIT_RANGE]
 
 Arguments:
-  [COMMIT_RANGE]  Commit range to check (e.g., HEAD~3..HEAD, abc123..def456). Defaults to commits ahead of main branch
+  [COMMIT_RANGE]  Commit range to check (e.g., HEAD~3..HEAD, abc123..def456). Defaults to commits ahead of the default base branch (origin/main, origin/master, main, or master)
 
 Options:
       --model <MODEL>              Claude API model to use (if not specified, uses settings or default)
