@@ -13,8 +13,9 @@
 //!   code. Honors `OMNI_DEV_LOG_DISABLE=1` for an absolute opt-out.
 //! - **No secrets.** Auth headers/tokens are never written; only a non-secret
 //!   `auth_principal` identity is kept. Headers are redacted centrally
-//!   ([`redact_headers`]) and request/response bodies are opt-in via
-//!   `OMNI_DEV_LOG_BODIES=1`.
+//!   ([`redact_headers`]), secret-bearing URL query/fragment parameter values
+//!   are redacted (`redact_url`) before writing, and request/response bodies
+//!   are opt-in via `OMNI_DEV_LOG_BODIES=1`.
 //! - **Forward compatible.** A single [`LogRecord`] is used for both writing
 //!   and reading: every field is `#[serde(default)]`, and every optional field
 //!   is `skip_serializing_if`, so a newer reader never chokes on an older line
@@ -445,9 +446,10 @@ pub fn record_http(
 
 /// Appends one `kind: "http"` record with extra, non-secret fields.
 ///
-/// Headers and bodies are dropped unless their opt-in env var is set, and
-/// headers are always redacted — so no secret can be written here under any
-/// caller.
+/// Headers and bodies are dropped unless their opt-in env var is set, headers
+/// are always redacted, and URL query/fragment values under secret-looking
+/// keys are replaced with `REDACTED` (`redact_url`) — so no secret can be
+/// written here under any caller.
 #[allow(clippy::too_many_arguments)]
 pub fn record_http_with(
     service: &str,
@@ -467,7 +469,7 @@ pub fn record_http_with(
     rec.mcp_tool = ctx.mcp_tool;
     rec.service = Some(service.to_string());
     rec.method = Some(method.to_string());
-    rec.url = Some(url.to_string());
+    rec.url = Some(redact_url(url));
     rec.status_code = status;
     rec.elapsed_ms = Some(started.elapsed().as_millis() as u64);
     rec.error = error.map(str::to_string);
@@ -615,6 +617,87 @@ fn scrub_argv(argv: &[String]) -> Vec<String> {
                 }
             }
         }
+    }
+    out
+}
+
+/// Query/fragment keys that are secrets outright (compared decoded + lowercased).
+const SENSITIVE_QUERY_KEYS: &[&str] = &["sig", "sas", "jwt", "auth"];
+
+/// Key suffixes marking the open-ended secret families (`access_token`,
+/// `client_secret`, `api_key`, …).
+const SENSITIVE_QUERY_KEY_SUFFIXES: &[&str] = &[
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "signature",
+    "apikey",
+    "api_key",
+    "api-key",
+];
+
+/// Key prefixes for cloud-storage signed-URL parameter families.
+const SENSITIVE_QUERY_KEY_PREFIXES: &[&str] = &["x-amz-", "x-goog-"];
+
+/// Returns whether a decoded query/fragment key looks secret-bearing.
+fn sensitive_query_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    SENSITIVE_QUERY_KEYS.contains(&key.as_str())
+        || SENSITIVE_QUERY_KEY_SUFFIXES
+            .iter()
+            .any(|suffix| key.ends_with(suffix))
+        || SENSITIVE_QUERY_KEY_PREFIXES
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+}
+
+/// Rewrites one `&`-separated pair list, replacing the values of
+/// secret-bearing keys with `REDACTED` and passing every other segment
+/// through byte-verbatim.
+fn redact_pairs(pairs: &str) -> String {
+    pairs
+        .split('&')
+        .map(|segment| match segment.split_once('=') {
+            Some((raw_key, _)) => {
+                // Decode only the key (handles `access%5Ftoken` and `+`); the
+                // raw key text is preserved in the output.
+                let sensitive = url::form_urlencoded::parse(raw_key.as_bytes())
+                    .next()
+                    .is_some_and(|(key, _)| sensitive_query_key(&key));
+                if sensitive {
+                    format!("{raw_key}=REDACTED")
+                } else {
+                    segment.to_string()
+                }
+            }
+            // A bare key (no `=`) carries no value to leak.
+            None => segment.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Redacts secret-bearing query and fragment parameter values in a URL,
+/// preserving scheme, host, path, and all parameter keys so `--url` substring
+/// filtering stays useful. Handles relative URLs (the browser bridge logs
+/// page-origin targets like `/api/foo?sig=…`), so this never requires the
+/// input to parse as an absolute [`url::Url`].
+fn redact_url(url: &str) -> String {
+    let (rest, fragment) = url
+        .split_once('#')
+        .map_or((url, None), |(rest, fragment)| (rest, Some(fragment)));
+    let (prefix, query) = rest
+        .split_once('?')
+        .map_or((rest, None), |(prefix, query)| (prefix, Some(query)));
+    let mut out = prefix.to_string();
+    if let Some(query) = query {
+        out.push('?');
+        out.push_str(&redact_pairs(query));
+    }
+    if let Some(fragment) = fragment {
+        out.push('#');
+        out.push_str(&redact_pairs(fragment));
     }
     out
 }
@@ -872,6 +955,110 @@ mod tests {
         assert_eq!(out["User-Agent"], "plain-value");
         assert_eq!(out["x-request-id"], "plain-value");
         assert_eq!(out["traceparent"], "plain-value");
+    }
+
+    #[test]
+    fn url_without_query_is_unchanged() {
+        assert_eq!(redact_url("https://h/p"), "https://h/p");
+        assert_eq!(redact_url("/relative/p"), "/relative/p");
+    }
+
+    #[test]
+    fn benign_query_is_byte_identical() {
+        let url = "https://h/p?q=a%20b&page=2&&x=y+z&keyword=k&sort_key=s&token_type=bearer";
+        assert_eq!(redact_url(url), url);
+    }
+
+    #[test]
+    fn sensitive_query_values_are_redacted() {
+        let url = "https://h/p?token=a&access_token=b&client_secret=c&api_key=d&x=1";
+        assert_eq!(
+            redact_url(url),
+            "https://h/p?token=REDACTED&access_token=REDACTED&client_secret=REDACTED\
+             &api_key=REDACTED&x=1"
+        );
+    }
+
+    #[test]
+    fn presigned_s3_query_is_redacted() {
+        let url = "https://bucket.s3.amazonaws.com/key?X-Amz-Algorithm=AWS4-HMAC-SHA256\
+                   &X-Amz-Credential=AKIA%2F20260703%2Fus-east-1%2Fs3%2Faws4_request\
+                   &X-Amz-Date=20260703T000000Z&X-Amz-Expires=3600\
+                   &X-Amz-SignedHeaders=host&X-Amz-Signature=deadbeef";
+        assert_eq!(
+            redact_url(url),
+            "https://bucket.s3.amazonaws.com/key?X-Amz-Algorithm=REDACTED\
+             &X-Amz-Credential=REDACTED&X-Amz-Date=REDACTED&X-Amz-Expires=REDACTED\
+             &X-Amz-SignedHeaders=REDACTED&X-Amz-Signature=REDACTED"
+        );
+    }
+
+    #[test]
+    fn key_matching_is_case_insensitive() {
+        assert_eq!(
+            redact_url("/p?TOKEN=x&Api_Key=y&X-Amz-Signature=z"),
+            "/p?TOKEN=REDACTED&Api_Key=REDACTED&X-Amz-Signature=REDACTED"
+        );
+    }
+
+    #[test]
+    fn repeated_sensitive_keys_are_each_redacted() {
+        assert_eq!(redact_url("/p?sig=a&sig=b"), "/p?sig=REDACTED&sig=REDACTED");
+    }
+
+    #[test]
+    fn valueless_key_is_left_alone() {
+        assert_eq!(redact_url("/p?token"), "/p?token");
+        assert_eq!(redact_url("/p?token="), "/p?token=REDACTED");
+    }
+
+    #[test]
+    fn relative_url_query_is_redacted() {
+        assert_eq!(
+            redact_url("/api/foo?sig=abc&x=y"),
+            "/api/foo?sig=REDACTED&x=y"
+        );
+    }
+
+    #[test]
+    fn fragment_credentials_are_redacted() {
+        assert_eq!(
+            redact_url("https://h/cb#access_token=xyz&token_type=bearer"),
+            "https://h/cb#access_token=REDACTED&token_type=bearer"
+        );
+    }
+
+    #[test]
+    fn query_and_fragment_are_scrubbed_independently() {
+        assert_eq!(
+            redact_url("/p?sig=a#id_token=b"),
+            "/p?sig=REDACTED#id_token=REDACTED"
+        );
+    }
+
+    #[test]
+    fn question_mark_in_fragment_is_not_parsed_as_query() {
+        // The fragment is split off before the query, so `?` inside it never
+        // starts a query; the pseudo-key `frag?token` still redacts via the
+        // suffix rule (over-redaction in the safe direction).
+        assert_eq!(
+            redact_url("https://h/p#frag?token=x"),
+            "https://h/p#frag?token=REDACTED"
+        );
+    }
+
+    #[test]
+    fn encoded_sensitive_key_is_decoded_before_matching() {
+        assert_eq!(
+            redact_url("/p?access%5Ftoken=v"),
+            "/p?access%5Ftoken=REDACTED"
+        );
+    }
+
+    #[test]
+    fn empty_query_is_unchanged() {
+        assert_eq!(redact_url("https://h/p?"), "https://h/p?");
+        assert_eq!(redact_url("https://h/p?#f"), "https://h/p?#f");
     }
 
     #[test]
