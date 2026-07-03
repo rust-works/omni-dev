@@ -89,8 +89,8 @@ fn run_login_to(
     };
 
     let credentials = DatadogCredentials {
-        api_key: api_key.to_string(),
-        app_key: app_key.to_string(),
+        api_key: api_key.into(),
+        app_key: app_key.into(),
         site: site.clone(),
     };
 

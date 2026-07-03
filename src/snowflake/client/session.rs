@@ -8,6 +8,8 @@ use std::time::Duration;
 use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::{json, Value};
 
+use crate::utils::secret::Secret;
+
 use super::error::{Error, Result};
 use super::row::{Column, Row};
 use super::transport::{request_id, Transport};
@@ -17,10 +19,10 @@ const POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Tokens returned by login, consumed by [`SnowflakeSession::new`].
 pub(crate) struct LoginTokens {
-    /// Session token (authorizes queries; short-lived).
-    pub session_token: String,
-    /// Master token (authorizes renewal; longer-lived).
-    pub master_token: String,
+    /// Session token (authorizes queries; short-lived; redacted in `Debug` output).
+    pub session_token: Secret,
+    /// Master token (authorizes renewal; longer-lived; redacted in `Debug` output).
+    pub master_token: Secret,
     /// Session-token validity in seconds.
     pub session_validity_secs: i64,
     /// Master-token validity in seconds.
@@ -30,8 +32,8 @@ pub(crate) struct LoginTokens {
 /// The mutable token state, refreshed by `renew`/`heartbeat`.
 #[derive(Clone, Debug)]
 struct Tokens {
-    session_token: String,
-    master_token: String,
+    session_token: Secret,
+    master_token: Secret,
     session_expires_at: DateTime<Utc>,
     master_expires_at: DateTime<Utc>,
 }
@@ -100,7 +102,7 @@ impl SnowflakeSession {
             .post_statement(
                 &[("requestId", rid.as_str())],
                 &body,
-                &token,
+                token.expose_secret(),
                 self.query_timeout,
                 POLL_INTERVAL,
             )
@@ -133,14 +135,15 @@ impl SnowflakeSession {
             (tokens.session_token.clone(), tokens.master_token.clone())
         };
         let rid = request_id();
-        let body = json!({ "oldSessionToken": old_session, "requestType": "RENEW" });
+        let body =
+            json!({ "oldSessionToken": old_session.expose_secret(), "requestType": "RENEW" });
         let data = self
             .transport
             .post(
                 "session/token-request",
                 &[("requestId", rid.as_str())],
                 &body,
-                Some(&master),
+                Some(master.expose_secret()),
             )
             .await?;
 
@@ -157,10 +160,10 @@ impl SnowflakeSession {
             .unwrap_or(3600);
 
         let mut tokens = self.lock();
-        tokens.session_token = new_session;
+        tokens.session_token = new_session.into();
         tokens.session_expires_at = Utc::now() + TimeDelta::seconds(st_validity);
         if let Some(master_token) = data.get("masterToken").and_then(Value::as_str) {
-            tokens.master_token = master_token.to_string();
+            tokens.master_token = master_token.into();
         }
         if let Some(mt_validity) = data.get("validityInSecondsMT").and_then(Value::as_i64) {
             tokens.master_expires_at = Utc::now() + TimeDelta::seconds(mt_validity);
@@ -182,7 +185,7 @@ impl SnowflakeSession {
                 "session/heartbeat",
                 &[("requestId", rid.as_str())],
                 &json!({}),
-                Some(&token),
+                Some(token.expose_secret()),
             )
             .await?;
         // The server resets the master token's validity; the precise value
@@ -203,7 +206,7 @@ impl SnowflakeSession {
                 "session",
                 &[("delete", "true"), ("requestId", rid.as_str())],
                 &json!({}),
-                Some(&token),
+                Some(token.expose_secret()),
             )
             .await?;
         Ok(())
@@ -363,8 +366,8 @@ mod tests {
         SnowflakeSession::new(
             transport,
             LoginTokens {
-                session_token: "sess".to_string(),
-                master_token: "mast".to_string(),
+                session_token: "sess".into(),
+                master_token: "mast".into(),
                 session_validity_secs,
                 master_validity_secs: 14_400,
             },
@@ -380,8 +383,8 @@ mod tests {
         let session = SnowflakeSession::new(
             transport,
             LoginTokens {
-                session_token: "s".to_string(),
-                master_token: "m".to_string(),
+                session_token: "s".into(),
+                master_token: "m".into(),
                 session_validity_secs: 3600,
                 master_validity_secs: 14_400,
             },
@@ -390,6 +393,28 @@ mod tests {
         assert!(session.master_expires_at() > Utc::now());
         assert!(!session.session_expiring_within(TimeDelta::seconds(60)));
         assert!(session.session_expiring_within(TimeDelta::seconds(7200)));
+    }
+
+    #[test]
+    fn tokens_debug_redacts_secrets() {
+        let tokens = Tokens {
+            session_token: "sekret-session-token".into(),
+            master_token: "sekret-master-token".into(),
+            session_expires_at: Utc::now(),
+            master_expires_at: Utc::now(),
+        };
+        // Debug must never print the token values (#1131).
+        let debug = format!("{tokens:?}");
+        assert!(
+            !debug.contains("sekret-session-token"),
+            "leaked session token: {debug}"
+        );
+        assert!(
+            !debug.contains("sekret-master-token"),
+            "leaked master token: {debug}"
+        );
+        assert!(debug.contains("session_token: <redacted>"));
+        assert!(debug.contains("master_token: <redacted>"));
     }
 
     #[tokio::test]

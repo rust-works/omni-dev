@@ -12,6 +12,7 @@ use reqwest::Client;
 use crate::datadog::auth::{base_url_for_site, DatadogCredentials};
 use crate::datadog::error::DatadogError;
 use crate::request_log;
+use crate::utils::secret::Secret;
 
 /// HTTP request timeout for Datadog API calls.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -28,8 +29,8 @@ const DEFAULT_RETRY_DELAY_SECS: u64 = 2;
 pub struct DatadogClient {
     client: Client,
     base_url: String,
-    api_key: String,
-    app_key: String,
+    api_key: Secret,
+    app_key: Secret,
 }
 
 impl DatadogClient {
@@ -47,8 +48,8 @@ impl DatadogClient {
         Ok(Self {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
-            api_key: api_key.to_string(),
-            app_key: app_key.to_string(),
+            api_key: api_key.into(),
+            app_key: app_key.into(),
         })
     }
 
@@ -74,7 +75,11 @@ impl DatadogClient {
             .var(crate::datadog::auth::DATADOG_API_URL)
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| base_url_for_site(&creds.site));
-        Self::new(&base_url, &creds.api_key, &creds.app_key)
+        Self::new(
+            &base_url,
+            creds.api_key.expose_secret(),
+            creds.app_key.expose_secret(),
+        )
     }
 
     /// Returns the API base URL (without trailing slash).
@@ -117,8 +122,8 @@ impl DatadogClient {
             let result = self
                 .client
                 .get(url)
-                .header("DD-API-KEY", &self.api_key)
-                .header("DD-APPLICATION-KEY", &self.app_key)
+                .header("DD-API-KEY", self.api_key.expose_secret())
+                .header("DD-APPLICATION-KEY", self.app_key.expose_secret())
                 .header("Accept", "application/json")
                 .send()
                 .await;
@@ -144,8 +149,8 @@ impl DatadogClient {
             let result = self
                 .client
                 .post(url)
-                .header("DD-API-KEY", &self.api_key)
-                .header("DD-APPLICATION-KEY", &self.app_key)
+                .header("DD-API-KEY", self.api_key.expose_secret())
+                .header("DD-APPLICATION-KEY", self.app_key.expose_secret())
                 .header("Content-Type", "application/json")
                 .header("Accept", "application/json")
                 .json(body)
@@ -253,11 +258,27 @@ mod tests {
     }
 
     #[test]
+    fn client_debug_redacts_keys() {
+        let client = DatadogClient::new(
+            "https://api.datadoghq.com",
+            "sekret-api-key",
+            "sekret-app-key",
+        )
+        .unwrap();
+        // Debug must never print the key values (#1131).
+        let debug = format!("{client:?}");
+        assert!(!debug.contains("sekret-api-key"), "leaked api_key: {debug}");
+        assert!(!debug.contains("sekret-app-key"), "leaked app_key: {debug}");
+        assert!(debug.contains("api_key: <redacted>"));
+        assert!(debug.contains("app_key: <redacted>"));
+    }
+
+    #[test]
     fn from_credentials_builds_base_url_from_site() {
         let env = crate::test_support::env::MapEnv::new();
         let creds = DatadogCredentials {
-            api_key: "api".to_string(),
-            app_key: "app".to_string(),
+            api_key: "api".into(),
+            app_key: "app".into(),
             site: "us5.datadoghq.com".to_string(),
         };
         let client = DatadogClient::from_credentials_with(&env, &creds).unwrap();
@@ -271,8 +292,8 @@ mod tests {
             "http://proxy.example:8080",
         );
         let creds = DatadogCredentials {
-            api_key: "api".to_string(),
-            app_key: "app".to_string(),
+            api_key: "api".into(),
+            app_key: "app".into(),
             site: "us5.datadoghq.com".to_string(),
         };
         let client = DatadogClient::from_credentials_with(&env, &creds).unwrap();
@@ -284,8 +305,8 @@ mod tests {
         let env =
             crate::test_support::env::MapEnv::new().with(crate::datadog::auth::DATADOG_API_URL, "");
         let creds = DatadogCredentials {
-            api_key: "api".to_string(),
-            app_key: "app".to_string(),
+            api_key: "api".into(),
+            app_key: "app".into(),
             site: "datadoghq.com".to_string(),
         };
         let client = DatadogClient::from_credentials_with(&env, &creds).unwrap();
