@@ -1506,13 +1506,20 @@ mod tests {
             .any(|r| r.method == wiremock::http::Method::PUT));
     }
 
-    /// A writer whose every operation fails, for exercising IO-error
-    /// propagation through `execute_with_io`.
-    struct FailingWriter;
+    /// A writer that fails at a chosen point (`write` or, when writes are
+    /// allowed through, `flush`), for exercising IO-error propagation through
+    /// `execute_with_io`.
+    struct FailingWriter {
+        fail_write: bool,
+    }
 
     impl Write for FailingWriter {
-        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
-            Err(io::Error::other("writer failed"))
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.fail_write {
+                Err(io::Error::other("writer failed"))
+            } else {
+                Ok(buf.len())
+            }
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -1529,7 +1536,23 @@ mod tests {
         // writer surfaces that IO error before any API call.
         let cmd = reanchor_command(false, false);
         let mut reader = io::Cursor::new(b"y\n".to_vec());
-        let mut writer = FailingWriter;
+        let mut writer = FailingWriter { fail_write: true };
+        assert!(cmd
+            .execute_with_io(&api, &mut reader, &mut writer)
+            .await
+            .is_err());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reanchor_execute_with_io_propagates_prompt_flush_error() {
+        let server = wiremock::MockServer::start().await;
+        let api = mock_api(&server);
+
+        // Writes go through but the guard's flush after the prompt fails.
+        let cmd = reanchor_command(false, false);
+        let mut reader = io::Cursor::new(b"y\n".to_vec());
+        let mut writer = FailingWriter { fail_write: false };
         assert!(cmd
             .execute_with_io(&api, &mut reader, &mut writer)
             .await
@@ -1547,7 +1570,7 @@ mod tests {
         // the failure comes from writing the success message.
         let cmd = reanchor_command(true, false);
         let mut reader = io::Cursor::new(Vec::new());
-        let mut writer = FailingWriter;
+        let mut writer = FailingWriter { fail_write: true };
         assert!(cmd
             .execute_with_io(&api, &mut reader, &mut writer)
             .await
