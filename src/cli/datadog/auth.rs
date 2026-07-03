@@ -8,6 +8,8 @@ use serde::Deserialize;
 
 use crate::datadog::auth::{self, DatadogCredentials, DEFAULT_SITE};
 use crate::datadog::client::DatadogClient;
+use crate::utils::env::SystemEnv;
+use crate::utils::settings::{active_profile_from, profile_suffix, Settings};
 
 /// Manages Datadog API credentials.
 #[derive(Parser)]
@@ -54,24 +56,29 @@ impl LoginCommand {
     }
 }
 
-/// Validates credentials and persists them to `~/.omni-dev/settings.json`.
+/// Validates credentials and persists them to `~/.omni-dev/settings.json`,
+/// targeting the active profile's `env` map when a profile is selected
+/// (issue #1116).
 ///
 /// Extracted from [`LoginCommand::execute`] so the input-validation and
 /// site-normalisation branches are reachable from tests without mocking
 /// stdin.
 fn run_login(api_key: &str, app_key: &str, site_raw: &str) -> Result<()> {
     run_login_to(
-        &crate::utils::settings::Settings::get_settings_path()?,
+        &Settings::get_settings_path()?,
+        active_profile_from(&SystemEnv).as_deref(),
         api_key,
         app_key,
         site_raw,
     )
 }
 
-/// [`run_login`], persisting to an explicit settings-file path so tests inject
-/// a tempdir instead of redirecting `HOME` (issue #1030).
+/// [`run_login`], persisting to an explicit settings-file path and profile so
+/// tests inject both instead of mutating `HOME` / `OMNI_DEV_PROFILE`
+/// (issue #1030).
 fn run_login_to(
     settings_path: &std::path::Path,
+    profile: Option<&str>,
     api_key: &str,
     app_key: &str,
     site_raw: &str,
@@ -94,8 +101,11 @@ fn run_login_to(
         site: site.clone(),
     };
 
-    auth::save_credentials_to(settings_path, &credentials)?;
-    println!("\nCredentials saved to ~/.omni-dev/settings.json");
+    auth::save_credentials_to(settings_path, profile, &credentials)?;
+    println!(
+        "\nCredentials saved to ~/.omni-dev/settings.json{}",
+        profile_suffix(profile)
+    );
     println!("  Site: {site}");
     println!("\nRun `omni-dev datadog auth status` to verify.");
 
@@ -107,18 +117,26 @@ fn run_login_to(
 pub struct LogoutCommand;
 
 impl LogoutCommand {
-    /// Removes Datadog credential keys from settings.json.
+    /// Removes Datadog credential keys from settings.json — from the active
+    /// profile's `env` map when a profile is selected (issue #1116).
     pub fn execute(self) -> Result<()> {
-        run_logout(&crate::utils::settings::Settings::get_settings_path()?)
+        run_logout(
+            &Settings::get_settings_path()?,
+            active_profile_from(&SystemEnv).as_deref(),
+        )
     }
 }
 
-/// Removes Datadog credential keys from an explicit settings-file path so
-/// tests inject a tempdir instead of redirecting `HOME` (issue #1030).
-fn run_logout(settings_path: &std::path::Path) -> Result<()> {
-    let removed = auth::remove_credentials_at(settings_path)?;
+/// Removes Datadog credential keys from an explicit settings-file path and
+/// profile so tests inject both instead of mutating `HOME` /
+/// `OMNI_DEV_PROFILE` (issue #1030).
+fn run_logout(settings_path: &std::path::Path, profile: Option<&str>) -> Result<()> {
+    let removed = auth::remove_credentials_at(settings_path, profile)?;
     if removed {
-        println!("Datadog credentials removed from ~/.omni-dev/settings.json");
+        println!(
+            "Datadog credentials removed from ~/.omni-dev/settings.json{}",
+            profile_suffix(profile)
+        );
     } else {
         println!("No Datadog credentials were configured.");
     }
@@ -250,7 +268,7 @@ mod tests {
     fn run_login_defaults_site_when_blank_and_persists() {
         let (_dir, settings_path) = temp_settings();
 
-        run_login_to(&settings_path, "api-1", "app-1", "").unwrap();
+        run_login_to(&settings_path, None, "api-1", "app-1", "").unwrap();
 
         let content = fs::read_to_string(&settings_path).unwrap();
         let val: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -265,6 +283,7 @@ mod tests {
 
         run_login_to(
             &settings_path,
+            None,
             "api",
             "app",
             "https://api.us5.datadoghq.com/",
@@ -293,7 +312,7 @@ mod tests {
         )
         .unwrap();
 
-        run_logout(&settings_path).unwrap();
+        run_logout(&settings_path, None).unwrap();
 
         let val: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
@@ -306,7 +325,65 @@ mod tests {
     #[test]
     fn run_logout_is_idempotent_when_no_credentials() {
         let (_dir, settings_path) = temp_settings();
-        run_logout(&settings_path).unwrap();
+        run_logout(&settings_path, None).unwrap();
+    }
+
+    /// `LogoutCommand::execute` resolves the settings path from `HOME` and
+    /// the profile from `OMNI_DEV_PROFILE`, so this one test redirects both
+    /// under the shared [`crate::atlassian::auth::test_util::EnvGuard`];
+    /// every other logout test injects them into `run_logout` (issue #1030).
+    #[test]
+    fn logout_command_execute_resolves_default_settings_path() {
+        let guard = crate::atlassian::auth::test_util::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let omni_dir = dir.path().join(".omni-dev");
+        fs::create_dir_all(&omni_dir).unwrap();
+        let settings_path = omni_dir.join("settings.json");
+        fs::write(&settings_path, r#"{"env": {"DATADOG_API_KEY": "a"}}"#).unwrap();
+
+        LogoutCommand.execute().unwrap();
+
+        let val: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(val["env"].get(DATADOG_API_KEY).is_none());
+    }
+
+    // ── profile-targeted login/logout (issue #1116) ───────────────
+
+    #[test]
+    fn run_login_to_with_profile_persists_under_profile() {
+        let (_dir, settings_path) = temp_settings();
+
+        run_login_to(&settings_path, Some("work"), "api-p", "app-p", "").unwrap();
+
+        let val: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(val["profiles"]["work"]["env"]["DATADOG_API_KEY"], "api-p");
+        assert_eq!(val["profiles"]["work"]["env"]["DATADOG_SITE"], DEFAULT_SITE);
+        assert!(val["env"].get("DATADOG_API_KEY").is_none());
+    }
+
+    #[test]
+    fn run_logout_with_profile_removes_profile_credentials_and_keeps_base() {
+        let (dir, settings_path) = temp_settings();
+        fs::create_dir_all(dir.path().join(".omni-dev")).unwrap();
+        fs::write(
+            &settings_path,
+            r#"{
+                "env": {"DATADOG_API_KEY": "base"},
+                "profiles": {"work": {"env": {"DATADOG_API_KEY": "work"}}}
+            }"#,
+        )
+        .unwrap();
+
+        run_logout(&settings_path, Some("work")).unwrap();
+
+        let val: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(val["profiles"]["work"]["env"]
+            .get(DATADOG_API_KEY)
+            .is_none());
+        assert_eq!(val["env"]["DATADOG_API_KEY"], "base");
     }
 
     #[tokio::test]
