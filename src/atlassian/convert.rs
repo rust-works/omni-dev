@@ -4,7 +4,7 @@
 //! marks (bold, italic, code, strikethrough, links), images, lists, code
 //! blocks, blockquotes, horizontal rules, and tables.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use chrono::NaiveDate;
 use tracing::{debug, warn};
 
@@ -16,6 +16,18 @@ use crate::atlassian::directive::{
 };
 
 // ── Markdown → ADF ──────────────────────────────────────────────────
+
+/// Maximum nesting depth for markdown → ADF conversion.
+///
+/// The parser recurses once per nesting level (blockquotes, lists, container
+/// directives, directive-table cells, inline marks), so unbounded input would
+/// overflow the stack — an uncatchable abort that would kill the long-lived
+/// MCP server (issue #1130).  The ADF → markdown direction is already bounded
+/// at 128 by serde_json's recursion limit; this cap is lower because the
+/// nested-list frame chain is heavy enough in debug builds that at-cap
+/// parsing must still fit within a 2 MiB thread stack.  Realistic documents
+/// nest well under 20 levels.
+const MAX_NESTING_DEPTH: usize = 64;
 
 /// Converts a markdown string to an ADF document.
 pub fn markdown_to_adf(markdown: &str) -> Result<AdfDocument> {
@@ -38,13 +50,24 @@ pub fn markdown_to_adf(markdown: &str) -> Result<AdfDocument> {
 struct MarkdownParser<'a> {
     lines: Vec<&'a str>,
     pos: usize,
+    /// Nesting depth of this parser: 0 at the document root, +1 for each
+    /// nested parser spawned for container content (blockquote, list item,
+    /// panel, layout column, table cell, …).  Checked against
+    /// [`MAX_NESTING_DEPTH`] in [`Self::parse_blocks`].
+    depth: usize,
 }
 
 impl<'a> MarkdownParser<'a> {
     fn new(input: &'a str) -> Self {
+        Self::with_depth(input, 0)
+    }
+
+    /// Creates a nested parser for container content at the given depth.
+    fn with_depth(input: &'a str, depth: usize) -> Self {
         Self {
             lines: input.lines().collect(),
             pos: 0,
+            depth,
         }
     }
 
@@ -103,6 +126,14 @@ impl<'a> MarkdownParser<'a> {
     }
 
     fn parse_blocks(&mut self) -> Result<Vec<AdfNode>> {
+        if self.depth > MAX_NESTING_DEPTH {
+            bail!(
+                "Markdown nesting exceeds the maximum depth of {MAX_NESTING_DEPTH} \
+                 (nested blockquotes, lists, panels, expands, layouts, or table \
+                 cells); flatten the document structure"
+            );
+        }
+
         let mut blocks = Vec::new();
 
         while !self.at_end() {
@@ -253,7 +284,7 @@ impl<'a> MarkdownParser<'a> {
         }
 
         let quote_text = quote_lines.join("\n");
-        let mut inner_parser = MarkdownParser::new(&quote_text);
+        let mut inner_parser = MarkdownParser::with_depth(&quote_text, self.depth + 1);
         let inner_blocks = inner_parser.parse_blocks()?;
 
         Ok(Some(AdfNode::blockquote(inner_blocks)))
@@ -337,7 +368,8 @@ impl<'a> MarkdownParser<'a> {
                 }
                 if !sub_lines.is_empty() {
                     let sub_text = sub_lines.join("\n");
-                    let mut nested = MarkdownParser::new(&sub_text).parse_blocks()?;
+                    let mut nested =
+                        MarkdownParser::with_depth(&sub_text, self.depth + 1).parse_blocks()?;
                     // When the task item has no inline text and its
                     // sub-content is a single taskList, this is a
                     // container taskItem from malformed ADF (issue #489).
@@ -402,8 +434,13 @@ impl<'a> MarkdownParser<'a> {
                     }
                     break;
                 }
-                let item_content =
-                    parse_list_item_first_line(item_text, sub_lines, local_id, para_local_id)?;
+                let item_content = parse_list_item_first_line(
+                    item_text,
+                    sub_lines,
+                    local_id,
+                    para_local_id,
+                    self.depth + 1,
+                )?;
                 items.push(item_content);
             }
         }
@@ -441,8 +478,13 @@ impl<'a> MarkdownParser<'a> {
                     }
                     break;
                 }
-                let item_content =
-                    parse_list_item_first_line(item_text, sub_lines, local_id, para_local_id)?;
+                let item_content = parse_list_item_first_line(
+                    item_text,
+                    sub_lines,
+                    local_id,
+                    para_local_id,
+                    self.depth + 1,
+                )?;
                 items.push(item_content);
             } else {
                 break;
@@ -546,7 +588,8 @@ impl<'a> MarkdownParser<'a> {
                     .as_ref()
                     .and_then(|a| a.get("type"))
                     .unwrap_or("info");
-                let inner_blocks = MarkdownParser::new(&inner_text).parse_blocks()?;
+                let inner_blocks =
+                    MarkdownParser::with_depth(&inner_text, self.depth + 1).parse_blocks()?;
                 let mut node = AdfNode::panel(panel_type, inner_blocks);
                 // Pass through custom panel attrs (icon, color)
                 if let Some(ref attrs) = d.attrs {
@@ -563,14 +606,16 @@ impl<'a> MarkdownParser<'a> {
             }
             "expand" => {
                 let title = d.attrs.as_ref().and_then(|a| a.get("title"));
-                let inner_blocks = MarkdownParser::new(&inner_text).parse_blocks()?;
+                let inner_blocks =
+                    MarkdownParser::with_depth(&inner_text, self.depth + 1).parse_blocks()?;
                 let mut node = AdfNode::expand(title, inner_blocks);
                 pass_through_expand_params(&d.attrs, &mut node);
                 node
             }
             "nested-expand" => {
                 let title = d.attrs.as_ref().and_then(|a| a.get("title"));
-                let inner_blocks = MarkdownParser::new(&inner_text).parse_blocks()?;
+                let inner_blocks =
+                    MarkdownParser::with_depth(&inner_text, self.depth + 1).parse_blocks()?;
                 let mut node = AdfNode::nested_expand(title, inner_blocks);
                 pass_through_expand_params(&d.attrs, &mut node);
                 node
@@ -614,7 +659,8 @@ impl<'a> MarkdownParser<'a> {
             "extension" => {
                 let ext_type = d.attrs.as_ref().and_then(|a| a.get("type")).unwrap_or("");
                 let ext_key = d.attrs.as_ref().and_then(|a| a.get("key")).unwrap_or("");
-                let inner_blocks = MarkdownParser::new(&inner_text).parse_blocks()?;
+                let inner_blocks =
+                    MarkdownParser::with_depth(&inner_text, self.depth + 1).parse_blocks()?;
                 let mut node = AdfNode::bodied_extension(ext_type, ext_key, inner_blocks);
                 if let (Some(ref dir_attrs), Some(ref mut node_attrs)) = (&d.attrs, &mut node.attrs)
                 {
@@ -658,7 +704,8 @@ impl<'a> MarkdownParser<'a> {
                     // Flush previous column
                     if in_column && !current_column_lines.is_empty() {
                         let col_text = current_column_lines.join("\n");
-                        let blocks = MarkdownParser::new(&col_text).parse_blocks()?;
+                        let blocks =
+                            MarkdownParser::with_depth(&col_text, self.depth + 1).parse_blocks()?;
                         let mut col = AdfNode::layout_column(current_width.clone(), blocks);
                         pass_through_local_id(&current_dir_attrs, &mut col);
                         columns.push(col);
@@ -688,7 +735,8 @@ impl<'a> MarkdownParser<'a> {
                 }
                 // End of column
                 let col_text = current_column_lines.join("\n");
-                let blocks = MarkdownParser::new(&col_text).parse_blocks()?;
+                let blocks =
+                    MarkdownParser::with_depth(&col_text, self.depth + 1).parse_blocks()?;
                 let mut col = AdfNode::layout_column(current_width.clone(), blocks);
                 pass_through_local_id(&current_dir_attrs, &mut col);
                 columns.push(col);
@@ -707,7 +755,7 @@ impl<'a> MarkdownParser<'a> {
         // Flush last column if no closing fence
         if in_column && !current_column_lines.is_empty() {
             let col_text = current_column_lines.join("\n");
-            let blocks = MarkdownParser::new(&col_text).parse_blocks()?;
+            let blocks = MarkdownParser::with_depth(&col_text, self.depth + 1).parse_blocks()?;
             let mut col = AdfNode::layout_column(current_width, blocks);
             pass_through_local_id(&current_dir_attrs, &mut col);
             columns.push(col);
@@ -844,7 +892,7 @@ impl<'a> MarkdownParser<'a> {
         }
 
         let cell_text = cell_lines.join("\n");
-        let blocks = MarkdownParser::new(&cell_text).parse_blocks()?;
+        let blocks = MarkdownParser::with_depth(&cell_text, self.depth + 1).parse_blocks()?;
 
         let adf_attrs = cell_attrs.as_ref().map(build_cell_attrs);
         let cell_marks = cell_attrs
@@ -1896,24 +1944,32 @@ fn parse_image_syntax(line: &str) -> Option<(&str, &str)> {
 /// `inlineCard` nodes. Call this at the top level (paragraph, heading, cell,
 /// list item) where a bare URL represents a smart link.
 fn parse_inline(text: &str) -> Vec<AdfNode> {
-    parse_inline_impl(text, true)
+    parse_inline_impl(text, true, 0)
 }
 
-/// Parses inline markdown content without promoting bare URLs to `inlineCard`.
-///
-/// Used when recursing into mark-wrapping constructs such as emphasis, strike,
-/// bracketed spans, or links.  In those contexts, the enclosing syntax already
-/// declares the semantic role of the content — a URL inside `[url]{underline}`
-/// or `**url**` is the user's text, not a smart link (issue #553).
-fn parse_inline_no_auto_cards(text: &str) -> Vec<AdfNode> {
-    parse_inline_impl(text, false)
-}
-
-/// Implementation backing [`parse_inline`] and [`parse_inline_no_auto_cards`].
+/// Implementation backing [`parse_inline`] and the inline recursion sites.
 ///
 /// When `auto_inline_card` is `false`, bare `http://`/`https://` URLs are
 /// treated as plain text instead of being promoted to `inlineCard` nodes.
-fn parse_inline_impl(text: &str, auto_inline_card: bool) -> Vec<AdfNode> {
+/// Recursion into mark-wrapping constructs (emphasis, strike, bracketed
+/// spans, links, inline directives) passes `false`: the enclosing syntax
+/// already declares the semantic role of the content — a URL inside
+/// `[url]{underline}` or `**url**` is the user's text, not a smart link
+/// (issue #553).
+///
+/// `depth` counts those recursion levels.  Past [`MAX_NESTING_DEPTH`] the
+/// remaining text is emitted as a plain text node instead of recursing
+/// further — inline parsing is infallible, so unlike the block parser it
+/// degrades gracefully rather than erroring (issue #1130).
+fn parse_inline_impl(text: &str, auto_inline_card: bool, depth: usize) -> Vec<AdfNode> {
+    if depth > MAX_NESTING_DEPTH {
+        return if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![AdfNode::text(text)]
+        };
+    }
+
     let mut nodes = Vec::new();
     let mut chars = text.char_indices().peekable();
     let mut plain_start = 0;
@@ -1928,7 +1984,7 @@ fn parse_inline_impl(text: &str, auto_inline_card: bool) -> Vec<AdfNode> {
                     } else {
                         AdfMark::em()
                     };
-                    let inner = parse_inline_no_auto_cards(content);
+                    let inner = parse_inline_impl(content, false, depth + 1);
                     for mut node in inner {
                         prepend_mark(&mut node, mark.clone());
                         nodes.push(node);
@@ -1955,7 +2011,7 @@ fn parse_inline_impl(text: &str, auto_inline_card: bool) -> Vec<AdfNode> {
             '~' => {
                 if let Some((end, content)) = try_parse_strikethrough(text, i) {
                     flush_plain(text, plain_start, i, &mut nodes);
-                    let inner = parse_inline_no_auto_cards(content);
+                    let inner = parse_inline_impl(content, false, depth + 1);
                     for mut node in inner {
                         prepend_mark(&mut node, AdfMark::strike());
                         nodes.push(node);
@@ -1997,7 +2053,7 @@ fn parse_inline_impl(text: &str, auto_inline_card: bool) -> Vec<AdfNode> {
                             vec![AdfMark::link(href)],
                         ));
                     } else {
-                        let inner = parse_inline_no_auto_cards(link_text);
+                        let inner = parse_inline_impl(link_text, false, depth + 1);
                         for mut node in inner {
                             prepend_mark(&mut node, AdfMark::link(href));
                             nodes.push(node);
@@ -2010,7 +2066,7 @@ fn parse_inline_impl(text: &str, auto_inline_card: bool) -> Vec<AdfNode> {
                     continue;
                 }
                 // Try bracketed span with attributes: [text]{underline}
-                if let Some((end, span_nodes)) = try_parse_bracketed_span(text, i) {
+                if let Some((end, span_nodes)) = try_parse_bracketed_span(text, i, depth) {
                     flush_plain(text, plain_start, i, &mut nodes);
                     nodes.extend(span_nodes);
                     while chars.peek().is_some_and(|&(idx, _)| idx < end) {
@@ -2023,7 +2079,7 @@ fn parse_inline_impl(text: &str, auto_inline_card: bool) -> Vec<AdfNode> {
             }
             ':' => {
                 // Try generic inline directive (:card[url], :status[text]{attrs}, etc.)
-                if let Some(node) = try_dispatch_inline_directive(text, i) {
+                if let Some(node) = try_dispatch_inline_directive(text, i, depth) {
                     flush_plain(text, plain_start, i, &mut nodes);
                     let end = node.1;
                     nodes.push(node.0);
@@ -2427,8 +2483,9 @@ fn strip_code_span_padding(content: &str) -> &str {
 }
 
 /// Tries to parse a bracketed span `[text]{attrs}` starting at position `i`.
-/// Used for `[text]{underline}` and similar constructs.
-fn try_parse_bracketed_span(text: &str, i: usize) -> Option<(usize, Vec<AdfNode>)> {
+/// Used for `[text]{underline}` and similar constructs.  `depth` is the
+/// caller's inline recursion depth (see [`parse_inline_impl`]).
+fn try_parse_bracketed_span(text: &str, i: usize, depth: usize) -> Option<(usize, Vec<AdfNode>)> {
     let rest = &text[i..];
     if !rest.starts_with('[') {
         return None;
@@ -2437,17 +2494,17 @@ fn try_parse_bracketed_span(text: &str, i: usize) -> Option<(usize, Vec<AdfNode>
     // Find the matching ] by counting bracket depth (supports nested brackets
     // such as [[text](url)]{underline} for underline-before-link ordering).
     // Backslash-escaped brackets are skipped (issue #493).
-    let mut depth: usize = 0;
+    let mut bracket_depth: usize = 0;
     let mut bracket_close = None;
     let bs_bytes = rest.as_bytes();
     for (j, ch) in rest.char_indices() {
         match ch {
             '\\' if j + 1 < bs_bytes.len()
                 && (bs_bytes[j + 1] == b'[' || bs_bytes[j + 1] == b']') => {}
-            '[' if j == 0 || bs_bytes[j - 1] != b'\\' => depth += 1,
+            '[' if j == 0 || bs_bytes[j - 1] != b'\\' => bracket_depth += 1,
             ']' if j == 0 || bs_bytes[j - 1] != b'\\' => {
-                depth -= 1;
-                if depth == 0 {
+                bracket_depth -= 1;
+                if bracket_depth == 0 {
                     bracket_close = Some(j);
                     break;
                 }
@@ -2481,7 +2538,7 @@ fn try_parse_bracketed_span(text: &str, i: usize) -> Option<(usize, Vec<AdfNode>
         return None; // no recognized marks
     }
 
-    let inner = parse_inline_no_auto_cards(span_text);
+    let inner = parse_inline_impl(span_text, false, depth + 1);
     let result: Vec<AdfNode> = inner
         .into_iter()
         .map(|mut node| {
@@ -2500,8 +2557,9 @@ fn try_parse_bracketed_span(text: &str, i: usize) -> Option<(usize, Vec<AdfNode>
 }
 
 /// Dispatches an inline directive to the appropriate ADF node constructor.
-/// Returns `(AdfNode, end_pos)` on success.
-fn try_dispatch_inline_directive(text: &str, pos: usize) -> Option<(AdfNode, usize)> {
+/// Returns `(AdfNode, end_pos)` on success.  `depth` is the caller's inline
+/// recursion depth (see [`parse_inline_impl`]).
+fn try_dispatch_inline_directive(text: &str, pos: usize, depth: usize) -> Option<(AdfNode, usize)> {
     let d = try_parse_inline_directive(text, pos)?;
     let content = d.content.as_deref().unwrap_or("");
 
@@ -2591,7 +2649,7 @@ fn try_dispatch_inline_directive(text: &str, pos: usize) -> Option<(AdfNode, usi
             } else {
                 // Parse inner content to handle nested syntax (e.g., links).
                 // Prepend span marks before inner marks to preserve ordering.
-                let inner = parse_inline_no_auto_cards(content);
+                let inner = parse_inline_impl(content, false, depth + 1);
                 let mut nodes: Vec<AdfNode> = inner
                     .into_iter()
                     .map(|mut node| {
@@ -2941,18 +2999,22 @@ fn extract_trailing_local_id(text: &str) -> (&str, Option<String>, Option<String
 /// an `AdfNode::list_item`.  When the first line is a code fence opener
 /// (`` ``` ``), the line is folded into the sub-content so the block-level
 /// code fence parser handles it correctly (issue #511).
+///
+/// `depth` is the nesting depth for parsers spawned on the sub-content —
+/// callers pass their own depth plus one.
 fn parse_list_item_first_line(
     item_text: &str,
     sub_lines: Vec<String>,
     local_id: Option<String>,
     para_local_id: Option<String>,
+    depth: usize,
 ) -> Result<AdfNode> {
     if item_text.starts_with("```") {
         // Treat the code fence opener + indented body as block content.
         let mut all_lines = vec![item_text.to_string()];
         all_lines.extend(sub_lines);
         let combined = all_lines.join("\n");
-        let nested = MarkdownParser::new(&combined).parse_blocks()?;
+        let nested = MarkdownParser::with_depth(&combined, depth).parse_blocks()?;
         Ok(list_item_with_local_id(nested, local_id, para_local_id))
     } else if let Some(media) = try_parse_media_single_from_line(item_text) {
         // Block-level image (issue #430).
@@ -2964,7 +3026,7 @@ fn parse_list_item_first_line(
             ))
         } else {
             let sub_text = sub_lines.join("\n");
-            let mut nested = MarkdownParser::new(&sub_text).parse_blocks()?;
+            let mut nested = MarkdownParser::with_depth(&sub_text, depth).parse_blocks()?;
             let mut content = vec![media];
             content.append(&mut nested);
             Ok(list_item_with_local_id(content, local_id, para_local_id))
@@ -2979,7 +3041,7 @@ fn parse_list_item_first_line(
             ))
         } else {
             let sub_text = sub_lines.join("\n");
-            let mut nested = MarkdownParser::new(&sub_text).parse_blocks()?;
+            let mut nested = MarkdownParser::with_depth(&sub_text, depth).parse_blocks()?;
             let mut content = vec![first_node];
             content.append(&mut nested);
             Ok(list_item_with_local_id(content, local_id, para_local_id))
@@ -22067,5 +22129,136 @@ C
                 assert!(!ms.iter().any(|m| m.mark_type == "em"));
             }
         }
+    }
+
+    // ── Nesting depth limit (issue #1130) ──────────────────────────────
+    //
+    // Without MAX_NESTING_DEPTH each of these inputs recurses one stack
+    // frame per nesting level, overflowing the stack — an uncatchable
+    // abort.  The block-path tests assert a clean error; the inline-path
+    // tests assert graceful degradation (no abort, valid document).
+
+    #[test]
+    fn blockquote_nesting_beyond_cap_errors() {
+        let md = format!("{}x", "> ".repeat(200));
+        let err = markdown_to_adf(&md).unwrap_err();
+        assert!(err.to_string().contains("maximum depth"));
+    }
+
+    #[test]
+    fn list_nesting_beyond_cap_errors() {
+        let mut md = String::new();
+        for i in 0..200 {
+            md.push_str(&"  ".repeat(i));
+            md.push_str("- x\n");
+        }
+        let err = markdown_to_adf(&md).unwrap_err();
+        assert!(err.to_string().contains("maximum depth"));
+    }
+
+    #[test]
+    fn container_directive_nesting_beyond_cap_errors() {
+        let mut md = String::new();
+        for _ in 0..200 {
+            md.push_str(":::panel{type=info}\n");
+        }
+        md.push_str("body\n");
+        for _ in 0..200 {
+            md.push_str(":::\n");
+        }
+        let err = markdown_to_adf(&md).unwrap_err();
+        assert!(err.to_string().contains("maximum depth"));
+    }
+
+    #[test]
+    fn directive_table_cell_nesting_beyond_cap_errors() {
+        let mut md = String::new();
+        for _ in 0..200 {
+            md.push_str("::::table\n:::tr\n:::td\n");
+        }
+        md.push_str("cell\n");
+        for _ in 0..200 {
+            md.push_str(":::\n:::\n::::\n");
+        }
+        let err = markdown_to_adf(&md).unwrap_err();
+        assert!(err.to_string().contains("maximum depth"));
+    }
+
+    #[test]
+    fn layout_column_nesting_beyond_cap_errors() {
+        let mut md = String::new();
+        for _ in 0..200 {
+            md.push_str("::::layout\n:::column{width=100}\n");
+        }
+        md.push_str("x\n");
+        for _ in 0..200 {
+            md.push_str(":::\n::::\n");
+        }
+        let err = markdown_to_adf(&md).unwrap_err();
+        assert!(err.to_string().contains("maximum depth"));
+    }
+
+    #[test]
+    fn blockquote_nesting_at_cap_boundary() {
+        // A parser at depth d handles the (d+1)-th `>` level, so exactly
+        // MAX_NESTING_DEPTH levels succeed and one more errors.
+        let at_cap = format!("{}x", "> ".repeat(MAX_NESTING_DEPTH));
+        assert!(markdown_to_adf(&at_cap).is_ok());
+        let past_cap = format!("{}x", "> ".repeat(MAX_NESTING_DEPTH + 1));
+        let err = markdown_to_adf(&past_cap).unwrap_err();
+        assert!(err.to_string().contains("maximum depth"));
+    }
+
+    #[test]
+    fn list_nesting_at_cap_succeeds() {
+        // The nested-list path has the largest debug-build stack frames, so
+        // an at-cap success here proves the cap leaves stack headroom on a
+        // default 2 MiB test thread (the canary for MAX_NESTING_DEPTH).
+        let mut md = String::new();
+        for i in 0..MAX_NESTING_DEPTH {
+            md.push_str(&"  ".repeat(i));
+            md.push_str("- x\n");
+        }
+        assert!(markdown_to_adf(&md).is_ok());
+    }
+
+    #[test]
+    fn deep_but_reasonable_nesting_succeeds() {
+        let md = format!("{}deep", "> ".repeat(20));
+        let doc = markdown_to_adf(&md).unwrap();
+        // Walk down the 20 blockquote levels to the paragraph.
+        let mut node = &doc.content[0];
+        for _ in 0..20 {
+            assert_eq!(node.node_type, "blockquote");
+            node = &node.content.as_ref().unwrap()[0];
+        }
+        assert_eq!(node.node_type, "paragraph");
+    }
+
+    #[test]
+    fn deeply_nested_emphasis_degrades_without_overflow() {
+        let md = format!("{}x{}", "*_".repeat(400), "_*".repeat(400));
+        let doc = markdown_to_adf(&md).unwrap();
+        assert_eq!(doc.content[0].node_type, "paragraph");
+    }
+
+    #[test]
+    fn deeply_nested_links_degrade_without_overflow() {
+        let mut md = String::from("x");
+        for _ in 0..400 {
+            md = format!("[{md}](https://example.com)");
+        }
+        let doc = markdown_to_adf(&md).unwrap();
+        assert_eq!(doc.content[0].node_type, "paragraph");
+    }
+
+    #[test]
+    fn deeply_nested_bracketed_spans_degrade_without_overflow() {
+        let mut md = String::from("x");
+        for _ in 0..400 {
+            md = format!("[{md}]{{underline}}");
+        }
+        let doc = markdown_to_adf(&md).unwrap();
+        assert_eq!(doc.content[0].node_type, "paragraph");
     }
 }
