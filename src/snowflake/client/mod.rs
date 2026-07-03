@@ -11,8 +11,10 @@
 //! Verification status: the offline-decodable paths (result parsing, row→JSON,
 //! request shaping, callback parsing) are unit-tested; the live
 //! SSO/login/query/renew paths follow the documented protocol but need a real
-//! account to verify. The Arrow result format and result sets that span external
-//! chunks are not yet supported (a clear [`Error::Unsupported`] is returned).
+//! account to verify. Result sets that span external chunks are downloaded and
+//! appended transparently (gzip JSON chunks after the inline rows); only the
+//! Arrow result format is not yet supported (a clear [`Error::Unsupported`] is
+//! returned).
 
 pub mod config;
 pub mod error;

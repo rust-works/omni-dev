@@ -181,8 +181,8 @@ pub trait TranscriptSource: Send + Sync {
 ```
 
 `matches` is `where Self: Sized` so it stays out of the `dyn` vtable —
-sources can be used through `Box<dyn TranscriptSource>` (planned for a
-future `omni-dev transcript fetch <url>` auto-detect path).
+sources can be used through `Box<dyn TranscriptSource>` (a future
+`omni-dev transcript fetch <url>` auto-detect path, tracked in #1187).
 
 Format converters take `&[Cue]` and never reach back into a source, so
 they are reused as-is by every implementation.

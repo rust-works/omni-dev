@@ -181,6 +181,6 @@ Example exchange:
   reporter that speaks the contract above.
 - Git enrichment lives in Rust: the companion reports raw folder paths; richer
   per-worktree data (branch, ahead/behind) is a follow-up the daemon can compute
-  with `git2`.
+  with `git2`, tracked in #1186.
 - The service and CLI are Unix-only (`#[cfg(unix)]`), like the rest of the daemon;
   Windows support is tracked with the broader daemon work (#1041).

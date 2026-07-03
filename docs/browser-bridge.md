@@ -265,7 +265,7 @@ Resolution rules:
 
 > Requests are routed to **exactly one** tab; there is no fan-out to multiple
 > tabs. `--allow-origin` remains a single global value applied to every
-> connection (a per-origin allowlist is possible future work).
+> connection (a per-origin allowlist is future work, tracked in #1185).
 
 ## Security model
 
