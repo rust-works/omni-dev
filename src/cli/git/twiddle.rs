@@ -28,6 +28,10 @@ pub struct TwiddleCommand {
     #[arg(long)]
     pub auto_apply: bool,
 
+    /// Allows amending commits that already exist in remote main branches (rewrites published history).
+    #[arg(long)]
+    pub allow_pushed: bool,
+
     /// Saves generated amendments to file without applying.
     #[arg(long, value_name = "FILE")]
     pub save_only: Option<String>,
@@ -818,8 +822,9 @@ impl TwiddleCommand {
 
         // Use AmendmentHandler to apply amendments directly from file, anchored
         // to the injected repo root.
-        let handler =
-            AmendmentHandler::new(repo_root).context("Failed to initialize amendment handler")?;
+        let handler = AmendmentHandler::new(repo_root)
+            .context("Failed to initialize amendment handler")?
+            .with_allow_pushed(self.allow_pushed);
         handler
             .apply_amendments(&amendments_file.to_string_lossy())
             .context("Failed to apply amendments")?;
@@ -2239,6 +2244,7 @@ mod execute_tests {
             model: None,
             beta_header: None,
             auto_apply: false,
+            allow_pushed: false,
             save_only: Some(save_path.to_string_lossy().into_owned()),
             use_context: false,
             context_dir: None,
@@ -2395,6 +2401,7 @@ mod execute_tests {
             model: None,
             beta_header: None,
             auto_apply: false,
+            allow_pushed: false,
             save_only: Some(save_path.to_string_lossy().into_owned()),
             use_context: false,
             context_dir: None,
@@ -2779,6 +2786,7 @@ mod tests {
             model: None,
             beta_header: None,
             auto_apply: false,
+            allow_pushed: false,
             save_only: None,
             use_context: false,
             context_dir: None,
