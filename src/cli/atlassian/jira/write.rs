@@ -65,8 +65,10 @@ pub struct WriteCommand {
 
     /// Set a custom field inline: `--set-field "NAME=VALUE"`. Can be used
     /// multiple times. Values are parsed as YAML scalars (numbers, bools)
-    /// when possible, falling back to strings. Overrides values from the
-    /// frontmatter `custom_fields:` map for the same name.
+    /// when possible, falling back to strings. Array fields (labels,
+    /// components, versions) accept comma-separated values
+    /// (`Labels=a,b,c`) or a YAML list (`Labels=[a, b]`). Overrides values
+    /// from the frontmatter `custom_fields:` map for the same name.
     #[arg(long = "set-field", value_name = "NAME=VALUE")]
     pub set_fields: Vec<String>,
 
@@ -690,6 +692,49 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("rich-text field"), "got: {msg}");
         assert!(msg.contains("JFM markdown"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn execute_set_field_comma_separated_labels_splits_into_array() {
+        // Issue #1172: `--set-field Labels=a,b,c` on an array-typed field
+        // must produce the same wire payload as `Labels=[a, b, c]`.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/rest/api/3/issue/PROJ-1/editmeta",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "fields": {
+                        "labels": {
+                            "name": "Labels",
+                            "schema": {
+                                "type": "array",
+                                "items": "string",
+                                "system": "labels"
+                            }
+                        }
+                    }
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "fields": {"labels": ["a", "b", "c"]}
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut c = cmd("PROJ-1");
+        c.no_content = true;
+        c.set_fields = vec!["Labels=a,b,c".to_string()];
+        c.execute_with_client(mock_client(&server.uri()))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
