@@ -1967,7 +1967,7 @@ mod tests {
         let creds = crate::atlassian::auth::AtlassianCredentials {
             instance_url: "https://org.atlassian.net".to_string(),
             email: "user@test.com".to_string(),
-            api_token: "token123".to_string(),
+            api_token: "token123".into(),
         };
         let client = AtlassianClient::from_credentials(&creds).unwrap();
         assert_eq!(client.instance_url(), "https://org.atlassian.net");
@@ -7452,7 +7452,11 @@ impl AtlassianClient {
 
     /// Creates a client from stored credentials.
     pub fn from_credentials(creds: &crate::atlassian::auth::AtlassianCredentials) -> Result<Self> {
-        Self::new(&creds.instance_url, &creds.email, &creds.api_token)
+        Self::new(
+            &creds.instance_url,
+            &creds.email,
+            creds.api_token.expose_secret(),
+        )
     }
 
     /// Returns the instance URL.

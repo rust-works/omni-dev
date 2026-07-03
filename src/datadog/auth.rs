@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::datadog::error::DatadogError;
+use crate::utils::secret::Secret;
 use crate::utils::settings::Settings;
 
 /// Environment variable / settings key for the Datadog API key.
@@ -48,11 +49,11 @@ pub const KNOWN_SITES: &[&str] = &[
 /// Datadog API credentials.
 #[derive(Debug, Clone)]
 pub struct DatadogCredentials {
-    /// API key (organisation-scoped secret; required for every call).
-    pub api_key: String,
+    /// API key (organisation-scoped secret; redacted in `Debug` output).
+    pub api_key: Secret,
 
-    /// Application key (user-scoped secret; required for every call).
-    pub app_key: String,
+    /// Application key (user-scoped secret; redacted in `Debug` output).
+    pub app_key: Secret,
 
     /// Site identifier, e.g. `datadoghq.com`. Determines the base URL.
     pub site: String,
@@ -111,8 +112,8 @@ pub(crate) fn load_credentials_with(
     }
 
     Ok(DatadogCredentials {
-        api_key,
-        app_key,
+        api_key: api_key.into(),
+        app_key: app_key.into(),
         site,
     })
 }
@@ -196,11 +197,11 @@ pub(crate) fn save_credentials_to(
     };
     env.insert(
         DATADOG_API_KEY.to_string(),
-        serde_json::Value::String(credentials.api_key.clone()),
+        serde_json::Value::String(credentials.api_key.expose_secret().to_string()),
     );
     env.insert(
         DATADOG_APP_KEY.to_string(),
-        serde_json::Value::String(credentials.app_key.clone()),
+        serde_json::Value::String(credentials.app_key.expose_secret().to_string()),
     );
     env.insert(
         DATADOG_SITE.to_string(),
@@ -326,13 +327,25 @@ mod tests {
     #[test]
     fn credentials_struct_clone_and_debug() {
         let creds = DatadogCredentials {
-            api_key: "a".to_string(),
-            app_key: "b".to_string(),
+            api_key: "sekret-api-key-value".into(),
+            app_key: "sekret-app-key-value".into(),
             site: "datadoghq.com".to_string(),
         };
         let cloned = creds.clone();
         assert_eq!(cloned.api_key, creds.api_key);
-        assert!(format!("{creds:?}").contains("DatadogCredentials"));
+        // Debug must never print the key values (#1131).
+        let debug = format!("{creds:?}");
+        assert!(debug.contains("DatadogCredentials"));
+        assert!(
+            !debug.contains("sekret-api-key-value"),
+            "leaked api_key: {debug}"
+        );
+        assert!(
+            !debug.contains("sekret-app-key-value"),
+            "leaked app_key: {debug}"
+        );
+        assert!(debug.contains("api_key: <redacted>"));
+        assert!(debug.contains("app_key: <redacted>"));
     }
 
     #[test]
@@ -430,8 +443,8 @@ mod tests {
             let settings_path = temp_dir.path().join(".omni-dev").join("settings.json");
 
             let creds = DatadogCredentials {
-                api_key: "api-1".to_string(),
-                app_key: "app-1".to_string(),
+                api_key: "api-1".into(),
+                app_key: "app-1".into(),
                 site: "datadoghq.com".to_string(),
             };
             save_credentials_to(&settings_path, &creds).unwrap();
@@ -460,8 +473,8 @@ mod tests {
             .unwrap();
 
             let creds = DatadogCredentials {
-                api_key: "api-2".to_string(),
-                app_key: "app-2".to_string(),
+                api_key: "api-2".into(),
+                app_key: "app-2".into(),
                 site: "datadoghq.eu".to_string(),
             };
             save_credentials_to(&settings_path, &creds).unwrap();
