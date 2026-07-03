@@ -330,6 +330,14 @@ bridge runs.
   snippet cannot smuggle those — a relied-upon browser control.
 - No request URLs, queries, headers, or bodies are logged at the default level
   (they contain authenticated/sensitive data).
+- **Token in stdout / scrollback.** A foreground `serve` prints the session
+  token to stdout twice — the labeled `session token :` line and embedded in
+  the paste-ready snippet. This is required operator UX (the token must be
+  pasted into DevTools), but stdout can persist in terminal scrollback, tmux
+  logs (`capture-pane` / pane logging), or CI transcripts. The token is
+  loopback-only and dies with the process; if a transcript may be exposed,
+  restart `serve` to rotate it. Under the daemon nothing is printed — the token
+  lives only in the `0600` `bridge.token` file — **accepted** (#1148).
 
 ## Flags
 
