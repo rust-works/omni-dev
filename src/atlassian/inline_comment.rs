@@ -1195,4 +1195,23 @@ mod tests {
     fn count_non_overlapping_empty_needle_is_zero() {
         assert_eq!(count_non_overlapping("abc", ""), 0);
     }
+
+    #[test]
+    fn apply_in_children_is_noop_once_applied() {
+        // The short-circuit guard: once the target occurrence has been
+        // annotated, later subtree walks must leave nodes untouched even if
+        // they contain further matches.
+        let mut state = ApplyState {
+            anchor: "foo".to_string(),
+            marker_id: "aaa".to_string(),
+            target: 1,
+            current: 0,
+            applied: true,
+        };
+        let mut children = vec![AdfNode::text("foo bar")];
+        apply_in_children(&mut children, &mut state);
+        assert_eq!(children.len(), 1);
+        assert!(children[0].marks.is_none());
+        assert_eq!(children[0].text.as_deref(), Some("foo bar"));
+    }
 }
