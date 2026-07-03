@@ -396,6 +396,28 @@ mod tests {
         assert!(!scope.has_token);
     }
 
+    /// The production wrapper resolves `~/.omni-dev/settings.json` from
+    /// `HOME`, which `dirs::home_dir()` reads internally — so this one test
+    /// must redirect `HOME` (under the shared [`EnvGuard`]). Every other save
+    /// test injects a path into `save_credentials_to` instead (issue #1030).
+    #[test]
+    fn save_credentials_resolves_default_settings_path() {
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+
+        let creds = AtlassianCredentials {
+            instance_url: "https://wrapper.atlassian.net".to_string(),
+            email: "wrapper@example.com".to_string(),
+            api_token: "wrapper-token".into(),
+        };
+        save_credentials(&creds).unwrap();
+
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        let val: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(val["env"]["ATLASSIAN_EMAIL"], "wrapper@example.com");
+    }
+
     /// Save against injected settings-file paths — no `HOME` mutation, so the
     /// test needs no lock (issue #1030). Covers fresh-file creation and
     /// merge-with-existing.

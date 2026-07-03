@@ -181,9 +181,9 @@ impl Settings {
         }
 
         // Merge keys — safe because we just ensured "env" is an object above
-        let Some(env) = settings_value["env"].as_object_mut() else {
-            anyhow::bail!("Internal error: env key is not an object after initialization");
-        };
+        let env = settings_value["env"]
+            .as_object_mut()
+            .context("Internal error: env key is not an object after initialization")?;
         for (key, value) in vars {
             env.insert(
                 (*key).to_string(),
@@ -718,6 +718,33 @@ mod tests {
         let (_tmp, path) = temp_settings_path();
         assert!(!Settings::remove_env_vars(&path, &["A_KEY"]).unwrap());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn remove_env_vars_false_when_env_missing_or_not_an_object() {
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        // No "env" key at all.
+        fs::write(&path, r#"{"extra": true}"#).unwrap();
+        assert!(!Settings::remove_env_vars(&path, &["A_KEY"]).unwrap());
+
+        // "env" present but not an object.
+        fs::write(&path, r#"{"env": "not-an-object"}"#).unwrap();
+        assert!(!Settings::remove_env_vars(&path, &["A_KEY"]).unwrap());
+    }
+
+    #[test]
+    fn upsert_env_vars_bare_filename_skips_dir_creation() {
+        // A bare relative filename has an empty parent — the dir-creation
+        // branch must be skipped, not fail on `create_dir_all("")`.
+        let name = format!("tmp-upsert-bare-{}.json", std::process::id());
+        let path = Path::new(&name);
+
+        Settings::upsert_env_vars(path, &[("A_KEY", "a")]).unwrap();
+
+        assert_eq!(read_json(path)["env"]["A_KEY"], "a");
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
