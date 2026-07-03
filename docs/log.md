@@ -12,8 +12,9 @@ One JSON object per line (NDJSON). A `kind` field discriminates the two record
 types, so the log is a complete invocation history, not just an HTTP history:
 
 - **`kind: "invocation"`** — one per process run (and one per MCP tool call):
-  the resolved subcommand path, full argv, exit code, duration, any top-level
-  error, and a whitelisted `OMNI_DEV_*` env snapshot.
+  the resolved subcommand path, full argv (with secret-bearing flag values
+  redacted), exit code, duration, any top-level error, and a whitelisted
+  `OMNI_DEV_*` env snapshot.
 - **`kind: "http"`** — one per outbound request (recorded *inside* each client's
   retry loop, so retries and transport failures are captured too): service,
   method, URL, status, elapsed, and any error.
@@ -121,6 +122,12 @@ No secret material is ever written, under any code path:
 - Request/response bodies are **opt-in** via `OMNI_DEV_LOG_BODIES=1`.
 - The `OMNI_DEV_*` env snapshot redacts any name containing `TOKEN`, `SECRET`,
   `KEY`, `PASSWORD`, or `PASSWD`.
+- Argv in the invocation record is scrubbed before writing, in both
+  `--flag value` and `--flag=value` forms: `--header` values naming a sensitive
+  header are redacted keeping the name (`Authorization: REDACTED`), inline
+  `--body` values are redacted (`@file` references are kept), and any flag
+  whose name has a `token`/`secret`/`password`/`passwd`/`key` segment has its
+  value redacted (flags ending in `-file`/`-path` carry paths and are exempt).
 
 ## Daemon-served requests
 

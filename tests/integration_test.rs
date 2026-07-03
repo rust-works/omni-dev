@@ -675,6 +675,40 @@ fn omni_dev_log_reads_back_records_byte_identically() {
 }
 
 #[test]
+fn invocation_command_line_redacts_argv_secrets() {
+    // Secrets passed on argv must never reach the log file (#1129). The
+    // command fails fast (no bridge is running), but the invocation record
+    // is written on the error path too.
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("log.jsonl");
+
+    run_with_log(
+        &log,
+        &[
+            "browser",
+            "bridge",
+            "request",
+            "--url",
+            "/x",
+            "--header",
+            "Authorization: Bearer sekret123",
+            "--header",
+            "Content-Type: application/json",
+            "--body",
+            "supersecretbody",
+        ],
+    );
+
+    let contents = fs::read_to_string(&log).expect("log file should exist");
+    assert!(
+        !contents.contains("sekret123") && !contents.contains("supersecretbody"),
+        "argv secrets must not appear anywhere in the log:\n{contents}"
+    );
+    assert!(contents.contains("Authorization: REDACTED"));
+    assert!(contents.contains("Content-Type: application/json"));
+}
+
+#[test]
 fn log_disable_appends_nothing() {
     let dir = TempDir::new().unwrap();
     let log = dir.path().join("log.jsonl");

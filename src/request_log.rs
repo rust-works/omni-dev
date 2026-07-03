@@ -393,7 +393,7 @@ pub fn record_invocation(outcome: InvocationOutcome) {
     rec.source = Some(ctx.source);
     rec.mcp_tool = ctx.mcp_tool;
     rec.command = outcome.command;
-    rec.command_line = outcome.command_line;
+    rec.command_line = scrub_argv(&outcome.command_line);
     rec.exit_code = Some(outcome.exit_code);
     rec.error = outcome.error;
     rec.duration_ms = Some(outcome.duration.as_millis() as u64);
@@ -540,6 +540,83 @@ pub fn redact_headers(headers: &BTreeMap<String, String>) -> BTreeMap<String, St
             )
         })
         .collect()
+}
+
+/// Flag-name segments marking a long flag's value as secret-bearing — the argv
+/// counterpart of [`SECRETISH`]. Matched per `-`/`_`-separated segment of the
+/// flag name so `--api-key` is caught but a name like `--keyword` is not.
+const SECRETISH_FLAG_WORDS: &[&str] = &["token", "secret", "password", "passwd", "key"];
+
+/// True when the long flag `--<name>` takes a secret-bearing value. Flags whose
+/// last segment is `file` or `path` carry paths, not secrets, and are exempt
+/// (e.g. `--token-file`).
+fn is_secretish_flag(name: &str) -> bool {
+    let segments: Vec<String> = name
+        .split(['-', '_'])
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let takes_path = matches!(segments.last().map(String::as_str), Some("file" | "path"));
+    !takes_path
+        && segments
+            .iter()
+            .any(|segment| SECRETISH_FLAG_WORDS.contains(&segment.as_str()))
+}
+
+/// Scrubs one `--header` value (`Name: Value`): values of [`SENSITIVE_HEADERS`]
+/// are redacted keeping the name, other headers pass through (`None`), and a
+/// value with no colon is redacted wholesale.
+fn scrub_header_arg(value: &str) -> Option<String> {
+    let Some((name, _)) = value.split_once(':') else {
+        return Some("REDACTED".to_string());
+    };
+    SENSITIVE_HEADERS
+        .contains(&name.trim().to_ascii_lowercase().as_str())
+        .then(|| format!("{}: REDACTED", name.trim()))
+}
+
+/// Returns the scrubbed replacement for the value of flag `--<name>`, or
+/// `None` when the value is safe to log verbatim. `--body` keeps `@file`
+/// references (a path, not a secret).
+fn scrub_flag_value(name: &str, value: &str) -> Option<String> {
+    match name {
+        "header" => scrub_header_arg(value),
+        "body" => (!value.starts_with('@')).then(|| "REDACTED".to_string()),
+        _ if is_secretish_flag(name) => Some("REDACTED".to_string()),
+        _ => None,
+    }
+}
+
+/// Scrubs secret-bearing flag values out of a raw argv before it is logged
+/// (`--header`/`--body` plus any [`is_secretish_flag`] name, in both
+/// `--flag value` and `--flag=value` forms). Everything else passes through.
+fn scrub_argv(argv: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(argv.len());
+    let mut i = 0;
+    while i < argv.len() {
+        let arg = &argv[i];
+        i += 1;
+        let Some(flag_body) = arg.strip_prefix("--") else {
+            out.push(arg.clone());
+            continue;
+        };
+        if let Some((name, value)) = flag_body.split_once('=') {
+            match scrub_flag_value(name, value) {
+                Some(scrubbed) => out.push(format!("--{name}={scrubbed}")),
+                None => out.push(arg.clone()),
+            }
+        } else {
+            out.push(arg.clone());
+            let takes_secret_value =
+                matches!(flag_body, "header" | "body") || is_secretish_flag(flag_body);
+            if takes_secret_value {
+                if let Some(value) = argv.get(i) {
+                    i += 1;
+                    out.push(scrub_flag_value(flag_body, value).unwrap_or_else(|| value.clone()));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// A time-sortable id: 13-digit zero-padded epoch-millis, a dash, then 16 hex.
@@ -691,6 +768,74 @@ mod tests {
         assert_eq!(out["Authorization"], "REDACTED");
         assert_eq!(out["X-Api-Key"], "REDACTED");
         assert_eq!(out["Content-Type"], "application/json");
+    }
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().copied().map(String::from).collect()
+    }
+
+    #[test]
+    fn scrub_argv_redacts_sensitive_header_in_both_forms() {
+        let out = scrub_argv(&argv(&[
+            "omni-dev",
+            "--header",
+            "Authorization: Bearer sekret",
+            "--header=Cookie: session=abc",
+        ]));
+        assert_eq!(
+            out,
+            argv(&[
+                "omni-dev",
+                "--header",
+                "Authorization: REDACTED",
+                "--header=Cookie: REDACTED",
+            ])
+        );
+    }
+
+    #[test]
+    fn scrub_argv_keeps_non_sensitive_headers() {
+        let input = argv(&["omni-dev", "--header", "Content-Type: application/json"]);
+        assert_eq!(scrub_argv(&input), input);
+    }
+
+    #[test]
+    fn scrub_argv_redacts_colonless_header_wholesale() {
+        let out = scrub_argv(&argv(&["omni-dev", "--header", "sekret"]));
+        assert_eq!(out, argv(&["omni-dev", "--header", "REDACTED"]));
+    }
+
+    #[test]
+    fn scrub_argv_redacts_inline_body_but_keeps_at_file() {
+        let out = scrub_argv(&argv(&["omni-dev", "--body", r#"{"secret":1}"#]));
+        assert_eq!(out, argv(&["omni-dev", "--body", "REDACTED"]));
+
+        let file_form = argv(&["omni-dev", "--body", "@payload.json"]);
+        assert_eq!(scrub_argv(&file_form), file_form);
+
+        let out = scrub_argv(&argv(&["omni-dev", "--body=sekret"]));
+        assert_eq!(out, argv(&["omni-dev", "--body=REDACTED"]));
+    }
+
+    #[test]
+    fn scrub_argv_redacts_secretish_flag_values() {
+        let out = scrub_argv(&argv(&["omni-dev", "--api-key", "abc", "--auth-token=xyz"]));
+        assert_eq!(
+            out,
+            argv(&["omni-dev", "--api-key", "REDACTED", "--auth-token=REDACTED"])
+        );
+    }
+
+    #[test]
+    fn scrub_argv_exempts_path_flags_and_positionals() {
+        let input = argv(&["omni-dev", "--token-file", "/tmp/t", "PROJ-123"]);
+        assert_eq!(scrub_argv(&input), input);
+    }
+
+    #[test]
+    fn scrub_argv_handles_trailing_flag_without_value() {
+        let input = argv(&["omni-dev", "--body"]);
+        assert_eq!(scrub_argv(&input), input);
     }
 
     #[test]
