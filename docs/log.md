@@ -114,7 +114,10 @@ omni-dev log -f --service browser-bridge
 No secret material is ever written, under any code path:
 
 - Auth headers/tokens are **redacted centrally** before writing; only a
-  non-secret `auth_principal` identity is ever kept.
+  non-secret `auth_principal` identity is ever kept. Redaction matches both a
+  fixed list of known header names and any name containing `auth`, `token`,
+  `key`, `secret`, `cookie`, `password`, `session`, `signature`, or
+  `credential` (case-insensitive).
 - Request/response bodies are **opt-in** via `OMNI_DEV_LOG_BODIES=1`.
 - The `OMNI_DEV_*` env snapshot redacts any name containing `TOKEN`, `SECRET`,
   `KEY`, `PASSWORD`, or `PASSWD`.

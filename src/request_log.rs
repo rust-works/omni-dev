@@ -502,12 +502,34 @@ const SENSITIVE_HEADERS: &[&str] = &[
     "x-omni-bridge-target",
 ];
 
+/// Substrings that mark a header name as secret-bearing (compared lowercased),
+/// guarding against off-list auth headers (e.g. `x-auth-token`,
+/// `x-goog-api-key`). False positives redact harmlessly.
+const SENSITIVE_HEADER_MARKERS: &[&str] = &[
+    "auth",
+    "token",
+    "secret",
+    "key",
+    "cookie",
+    "password",
+    "session",
+    "signature",
+    "credential",
+];
+
 /// Replaces sensitive header values with `REDACTED`, passing others through.
+///
+/// A header is sensitive when its lowercased name is in [`SENSITIVE_HEADERS`]
+/// or contains any [`SENSITIVE_HEADER_MARKERS`] substring.
 pub fn redact_headers(headers: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     headers
         .iter()
         .map(|(name, value)| {
-            let redacted = SENSITIVE_HEADERS.contains(&name.to_ascii_lowercase().as_str());
+            let lower = name.to_ascii_lowercase();
+            let redacted = SENSITIVE_HEADERS.contains(&lower.as_str())
+                || SENSITIVE_HEADER_MARKERS
+                    .iter()
+                    .any(|marker| lower.contains(marker));
             (
                 name.clone(),
                 if redacted {
@@ -669,6 +691,42 @@ mod tests {
         assert_eq!(out["Authorization"], "REDACTED");
         assert_eq!(out["X-Api-Key"], "REDACTED");
         assert_eq!(out["Content-Type"], "application/json");
+    }
+
+    #[test]
+    fn off_list_secretish_headers_are_redacted() {
+        let mut headers = BTreeMap::new();
+        for name in [
+            "X-Auth-Token",
+            "x-amz-security-token",
+            "X-Goog-Api-Key",
+            "x-csrf-token",
+            "X-Vendor-Token",
+            "X-Omni-Bridge",
+        ] {
+            headers.insert(name.to_string(), "secret-value".to_string());
+        }
+        for name in [
+            "Content-Type",
+            "Accept",
+            "User-Agent",
+            "x-request-id",
+            "traceparent",
+        ] {
+            headers.insert(name.to_string(), "plain-value".to_string());
+        }
+        let out = redact_headers(&headers);
+        assert_eq!(out["X-Auth-Token"], "REDACTED");
+        assert_eq!(out["x-amz-security-token"], "REDACTED");
+        assert_eq!(out["X-Goog-Api-Key"], "REDACTED");
+        assert_eq!(out["x-csrf-token"], "REDACTED");
+        assert_eq!(out["X-Vendor-Token"], "REDACTED");
+        assert_eq!(out["X-Omni-Bridge"], "REDACTED");
+        assert_eq!(out["Content-Type"], "plain-value");
+        assert_eq!(out["Accept"], "plain-value");
+        assert_eq!(out["User-Agent"], "plain-value");
+        assert_eq!(out["x-request-id"], "plain-value");
+        assert_eq!(out["traceparent"], "plain-value");
     }
 
     #[test]
