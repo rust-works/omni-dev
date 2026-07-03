@@ -2,6 +2,12 @@
 //!
 //! This module provides functionality to read settings from $HOME/.omni-dev/settings.json
 //! and use them as a fallback for environment variables.
+//!
+//! It also owns the write side: [`Settings::upsert_env_vars`] and
+//! [`Settings::remove_env_vars`] are the only production paths that mutate the
+//! settings file. Because the `env` map holds credentials (Atlassian, Datadog),
+//! every write is hardened: parent directory `0700`, file `0600`, re-tightened
+//! on each write (issue #1128).
 
 use std::collections::HashMap;
 use std::fs;
@@ -156,6 +162,69 @@ impl Settings {
         }
     }
 
+    /// Merges the given key/value pairs into the `env` object of the settings
+    /// file at `path`, creating the file and its parent directory as needed.
+    ///
+    /// The file is read and written as a generic JSON value, so every other
+    /// field (profiles, unknown keys) is preserved verbatim. Because the `env`
+    /// map holds credentials, the write is hardened: parent directory `0700`,
+    /// file `0600` (see [`write_settings`]).
+    pub fn upsert_env_vars(path: &Path, vars: &[(&str, &str)]) -> Result<()> {
+        let mut settings_value = read_or_default_settings(path)?;
+
+        // Ensure the "env" key exists as an object
+        if !settings_value
+            .get("env")
+            .is_some_and(serde_json::Value::is_object)
+        {
+            settings_value["env"] = serde_json::json!({});
+        }
+
+        // Merge keys — safe because we just ensured "env" is an object above
+        let env = settings_value["env"]
+            .as_object_mut()
+            .context("Internal error: env key is not an object after initialization")?;
+        for (key, value) in vars {
+            env.insert(
+                (*key).to_string(),
+                serde_json::Value::String((*value).to_string()),
+            );
+        }
+
+        write_settings(path, &settings_value)
+    }
+
+    /// Removes the given keys from the `env` object of the settings file at
+    /// `path`, leaving all other settings intact.
+    ///
+    /// Returns `true` if any key was present and removed (the file is
+    /// rewritten, hardened as in [`Settings::upsert_env_vars`]), `false` when
+    /// the file did not exist or contained none of the keys (the file is left
+    /// untouched).
+    pub fn remove_env_vars(path: &Path, keys: &[&str]) -> Result<bool> {
+        if !path.exists() {
+            return Ok(false);
+        }
+        let mut settings_value = read_or_default_settings(path)?;
+
+        let mut removed = false;
+        if let Some(env) = settings_value
+            .get_mut("env")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            for key in keys {
+                if env.remove(*key).is_some() {
+                    removed = true;
+                }
+            }
+        }
+
+        if removed {
+            write_settings(path, &settings_value)?;
+        }
+        Ok(removed)
+    }
+
     /// Validates that `name` is a known profile, returning a hard error that
     /// lists the known profiles (sorted) otherwise. Called once at the CLI
     /// boundary so a typo never silently falls back to base credentials.
@@ -174,6 +243,59 @@ impl Settings {
             "unknown profile '{name}'; known profiles: {known}"
         ))
     }
+}
+
+/// Reads and parses the settings file at `path` as a generic JSON value
+/// (preserving unknown fields), or returns `{}` when the file does not exist.
+fn read_or_default_settings(path: &Path) -> Result<serde_json::Value> {
+    if path.exists() {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse {}", path.display()))
+    } else {
+        Ok(serde_json::json!({}))
+    }
+}
+
+/// The single hardened write site for the settings file: creates the parent
+/// directory `0700`, writes the pretty-printed JSON through a `0600` handle
+/// (no window where a fresh file is world-readable), and re-tightens a
+/// pre-existing looser-permission file on every write (issue #1128).
+fn write_settings(path: &Path, value: &serde_json::Value) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            crate::daemon::paths::ensure_dir_0700(parent)?;
+        }
+    }
+    let formatted =
+        serde_json::to_string_pretty(value).context("Failed to serialize settings JSON")?;
+    write_file_0600(path, &formatted)
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+    crate::daemon::paths::set_file_0600(path)?;
+    Ok(())
+}
+
+/// Creates/truncates `path` with owner-only (`0600`) permissions on Unix.
+#[cfg(unix)]
+fn write_file_0600(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents.as_bytes())
+}
+
+/// Non-Unix fallback: a plain write ([`set_file_0600`](crate::daemon::paths::set_file_0600)
+/// is a no-op there too).
+#[cfg(not(unix))]
+fn write_file_0600(path: &Path, contents: &str) -> std::io::Result<()> {
+    fs::write(path, contents)
 }
 
 /// Returns an environment variable with fallback to settings, honouring the
@@ -487,5 +609,154 @@ mod tests {
         assert_eq!(err.to_string(), "disk boom");
         let chain = format!("{err:#}");
         assert!(chain.contains("Environment variable not found: MISSING"));
+    }
+
+    // ── env-write helpers (injected paths, no HOME mutation — issue #1030) ──
+
+    /// Creates a tempdir under `tmp/` (avoids TMPDIR issues in tarpaulin) and
+    /// returns it with a `<dir>/.omni-dev/settings.json` path inside it.
+    fn temp_settings_path() -> (TempDir, std::path::PathBuf) {
+        let temp_dir = {
+            std::fs::create_dir_all("tmp").ok();
+            TempDir::new_in("tmp").unwrap()
+        };
+        let path = temp_dir.path().join(".omni-dev").join("settings.json");
+        (temp_dir, path)
+    }
+
+    fn read_json(path: &Path) -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn upsert_env_vars_creates_file_and_dir_with_secure_permissions() {
+        let (_tmp, path) = temp_settings_path();
+
+        Settings::upsert_env_vars(&path, &[("A_KEY", "a"), ("B_KEY", "b")]).unwrap();
+
+        let val = read_json(&path);
+        assert_eq!(val["env"]["A_KEY"], "a");
+        assert_eq!(val["env"]["B_KEY"], "b");
+
+        // Credential store hardening (issue #1128): dir 0700, file 0600.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(dir_mode & 0o777, 0o700);
+            let file_mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(file_mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn upsert_env_vars_merges_and_preserves_unknown_fields() {
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, r#"{"env": {"OTHER_KEY": "keep_me"}, "extra": true}"#).unwrap();
+
+        Settings::upsert_env_vars(&path, &[("A_KEY", "new")]).unwrap();
+
+        let val = read_json(&path);
+        assert_eq!(val["env"]["OTHER_KEY"], "keep_me");
+        assert_eq!(val["extra"], true);
+        assert_eq!(val["env"]["A_KEY"], "new");
+    }
+
+    #[test]
+    fn upsert_env_vars_replaces_non_object_env() {
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, r#"{"env": "not-an-object"}"#).unwrap();
+
+        Settings::upsert_env_vars(&path, &[("A_KEY", "a")]).unwrap();
+
+        assert_eq!(read_json(&path)["env"]["A_KEY"], "a");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upsert_env_vars_retightens_loose_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, r#"{"env": {}}"#).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        Settings::upsert_env_vars(&path, &[("A_KEY", "a")]).unwrap();
+
+        let file_mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(file_mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn remove_env_vars_removes_listed_keys_and_preserves_rest() {
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"env": {"A_KEY": "a", "B_KEY": "b", "OTHER_KEY": "keep"}, "extra": true}"#,
+        )
+        .unwrap();
+
+        let removed = Settings::remove_env_vars(&path, &["A_KEY", "B_KEY", "ABSENT"]).unwrap();
+        assert!(removed);
+
+        let val = read_json(&path);
+        assert!(val["env"].get("A_KEY").is_none());
+        assert!(val["env"].get("B_KEY").is_none());
+        assert_eq!(val["env"]["OTHER_KEY"], "keep");
+        assert_eq!(val["extra"], true);
+    }
+
+    #[test]
+    fn remove_env_vars_false_when_file_missing() {
+        let (_tmp, path) = temp_settings_path();
+        assert!(!Settings::remove_env_vars(&path, &["A_KEY"]).unwrap());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn remove_env_vars_false_when_env_missing_or_not_an_object() {
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        // No "env" key at all.
+        fs::write(&path, r#"{"extra": true}"#).unwrap();
+        assert!(!Settings::remove_env_vars(&path, &["A_KEY"]).unwrap());
+
+        // "env" present but not an object.
+        fs::write(&path, r#"{"env": "not-an-object"}"#).unwrap();
+        assert!(!Settings::remove_env_vars(&path, &["A_KEY"]).unwrap());
+    }
+
+    #[test]
+    fn upsert_env_vars_bare_filename_skips_dir_creation() {
+        // A bare relative filename has an empty parent — the dir-creation
+        // branch must be skipped, not fail on `create_dir_all("")`.
+        let name = format!("tmp-upsert-bare-{}.json", std::process::id());
+        let path = Path::new(&name);
+
+        Settings::upsert_env_vars(path, &[("A_KEY", "a")]).unwrap();
+
+        assert_eq!(read_json(path)["env"]["A_KEY"], "a");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn remove_env_vars_false_when_keys_absent_leaves_file_untouched() {
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"{"env": {"OTHER_KEY": "keep"}}"#;
+        fs::write(&path, original).unwrap();
+
+        let removed = Settings::remove_env_vars(&path, &["A_KEY"]).unwrap();
+        assert!(!removed);
+        // Not rewritten: the raw bytes are exactly as written.
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
 }
