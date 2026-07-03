@@ -37,7 +37,8 @@ pub struct GitViewCommitsParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GitBranchInfoParams {
     /// Base branch to compare against, e.g. `main` or `develop`.
-    /// Defaults to `main` or `master` (whichever exists) when omitted.
+    /// When omitted, resolved remote-first: `origin/main`, `origin/master`,
+    /// local `main`, then local `master`.
     #[serde(default)]
     pub branch: Option<String>,
     /// Path to the git repository. Defaults to the current working directory.

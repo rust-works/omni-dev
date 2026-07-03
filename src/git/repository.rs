@@ -134,6 +134,25 @@ impl GitRepository {
         Ok(false)
     }
 
+    /// Resolves the default base branch for commit-range defaults.
+    ///
+    /// Prefers remote-tracking refs so the default range binds to the remote's
+    /// view of the mainline rather than a possibly-stale local branch:
+    /// `origin/main` → `origin/master` → `main` → `master`.
+    /// Returns `None` when none of these refs exist.
+    pub fn resolve_default_base_branch(&self) -> Option<String> {
+        const CANDIDATES: [(&str, git2::BranchType); 4] = [
+            ("origin/main", git2::BranchType::Remote),
+            ("origin/master", git2::BranchType::Remote),
+            ("main", git2::BranchType::Local),
+            ("master", git2::BranchType::Local),
+        ];
+        CANDIDATES
+            .iter()
+            .find(|(name, kind)| self.repo.find_branch(name, *kind).is_ok())
+            .map(|(name, _)| (*name).to_string())
+    }
+
     /// Parses a commit range and returns the commits.
     pub fn get_commits_in_range(&self, range: &str) -> Result<Vec<CommitInfo>> {
         let mut commits = Vec::new();
@@ -574,5 +593,78 @@ mod tests {
         let (_work, _bare, repo) = repo_with_bare_remote();
         let result = repo.branch_exists_on_remote("feature-branch", "nonexistent");
         assert!(matches!(&result, Err(e) if e.to_string().contains("Failed to check remote")));
+    }
+
+    // ── resolve_default_base_branch (issue #1106) ──────────────────
+
+    #[test]
+    fn resolve_default_base_prefers_origin_main_over_local() -> Result<()> {
+        let (work, _bare, repo) = repo_with_bare_remote();
+        git_in(work.path(), &["branch", "main"]);
+        // Pushing creates `refs/remotes/origin/main` in the work repo, so both
+        // the local and the remote-tracking branch exist; the remote must win.
+        repo.push_branch("main", "origin")?;
+        assert_eq!(
+            repo.resolve_default_base_branch(),
+            Some("origin/main".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_default_base_prefers_origin_master_over_local_main() -> Result<()> {
+        // Interleaved order: a remote-tracking `origin/master` outranks a
+        // (possibly stale) local `main`.
+        let (work, _bare, repo) = repo_with_bare_remote();
+        git_in(work.path(), &["branch", "main"]);
+        git_in(work.path(), &["branch", "master"]);
+        repo.push_branch("master", "origin")?;
+        assert_eq!(
+            repo.resolve_default_base_branch(),
+            Some("origin/master".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_default_base_uses_local_main_without_remote() -> Result<()> {
+        let temp_dir = init_tmp_repo();
+        let p = temp_dir.path();
+        std::fs::write(p.join("f.txt"), "x")?;
+        git_in(p, &["checkout", "-b", "main"]);
+        git_in(p, &["add", "."]);
+        git_in(p, &["commit", "-m", "init"]);
+        let repo = GitRepository::open_at(p)?;
+        assert_eq!(repo.resolve_default_base_branch(), Some("main".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_default_base_falls_back_to_local_master() -> Result<()> {
+        let temp_dir = init_tmp_repo();
+        let p = temp_dir.path();
+        std::fs::write(p.join("f.txt"), "x")?;
+        git_in(p, &["checkout", "-b", "master"]);
+        git_in(p, &["add", "."]);
+        git_in(p, &["commit", "-m", "init"]);
+        let repo = GitRepository::open_at(p)?;
+        assert_eq!(
+            repo.resolve_default_base_branch(),
+            Some("master".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_default_base_none_without_mainline() -> Result<()> {
+        let temp_dir = init_tmp_repo();
+        let p = temp_dir.path();
+        std::fs::write(p.join("f.txt"), "x")?;
+        git_in(p, &["checkout", "-b", "dev"]);
+        git_in(p, &["add", "."]);
+        git_in(p, &["commit", "-m", "init"]);
+        let repo = GitRepository::open_at(p)?;
+        assert_eq!(repo.resolve_default_base_branch(), None);
+        Ok(())
     }
 }

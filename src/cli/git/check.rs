@@ -9,7 +9,8 @@ use super::parse_beta_header;
 #[derive(Parser)]
 pub struct CheckCommand {
     /// Commit range to check (e.g., HEAD~3..HEAD, abc123..def456).
-    /// Defaults to commits ahead of main branch.
+    /// Defaults to commits ahead of the default base branch
+    /// (origin/main, origin/master, main, or master).
     #[arg(value_name = "COMMIT_RANGE")]
     pub commit_range: Option<String>,
 
@@ -229,18 +230,9 @@ impl CheckCommand {
             .unwrap_or_else(|_| "HEAD".to_string());
 
         // Determine commit range
-        let commit_range = if let Some(range) = &self.commit_range {
-            range.clone()
-        } else {
-            // Default to commits ahead of main branch
-            let base = if repo.branch_exists("main")? {
-                "main"
-            } else if repo.branch_exists("master")? {
-                "master"
-            } else {
-                "HEAD~5"
-            };
-            format!("{base}..HEAD")
+        let commit_range = match &self.commit_range {
+            Some(range) => range.clone(),
+            None => super::default_commit_range(&repo)?,
         };
 
         // Get working directory status
