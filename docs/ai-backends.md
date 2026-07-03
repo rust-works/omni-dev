@@ -375,8 +375,18 @@ export OMNI_DEV_CLAUDE_CLI_MAX_BUDGET_USD=0.50
 
 The value is forwarded to `claude -p --max-budget-usd`. If the nested
 session exceeds the cap it aborts with an error rather than running away
-with cost. Non-positive, non-finite, or non-numeric values are silently
-treated as no cap. The cap is ignored on backends other than `claude-cli`.
+with cost. Non-positive, non-finite, or non-numeric values are ignored
+with a `WARN` and the invocation runs with **no** cap — a typo like
+`--claude-cli-max-budget-usd 0` does not silently disable spending
+altogether, but it does not cap it either. The cap is ignored on backends
+other than `claude-cli`.
+
+Two limitations to be aware of (#1135):
+
+- Enforcement is delegated to `claude -p` itself; omni-dev has no
+  independent kill switch if the subprocess mishandles the flag.
+- The cost of a model turn is only known after it completes, so a single
+  invocation can overshoot the cap by up to one turn before aborting.
 
 Regardless of whether a cap is set, every invocation's `total_cost_usd` is
 logged at `INFO` level — run with `RUST_LOG=omni_dev=info` to see it:
