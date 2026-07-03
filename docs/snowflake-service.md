@@ -126,6 +126,7 @@ overridable per request via flags:
 | HTTP timeout (s) | `SNOWFLAKE_HTTP_TIMEOUT` | — (config only) |
 | Sign-in deadline (s) | `SNOWFLAKE_AUTH_TIMEOUT` | — (config only) |
 | Query deadline (s) | `SNOWFLAKE_QUERY_TIMEOUT` | — (config only) |
+| Keep-alive interval (s) | `SNOWFLAKE_HEARTBEAT_INTERVAL` | — (config only) |
 
 `SNOWFLAKE_POOL_SIZE` (default 4) caps the concurrent sessions — and therefore the
 browser auths — per `(account, user)`. A burst of more than that many concurrent
@@ -136,6 +137,10 @@ query long-poll isn't cut short); `SNOWFLAKE_AUTH_TIMEOUT` (default 150s) bounds
 sign-in end-to-end; `SNOWFLAKE_QUERY_TIMEOUT` (default 3600s) bounds a whole query
 **including async-result polling**, so long-running queries are limited by it
 rather than by the per-request timeout.
+
+`SNOWFLAKE_HEARTBEAT_INTERVAL` (default 900s; `0` disables) sets how often the
+background keep-alive task heartbeats idle sessions (see
+[Reliability](#reliability)).
 
 `settings.json` fallback example:
 
@@ -184,6 +189,16 @@ the first auth from a foreground context (`omni-dev daemon start --foreground`).
   renewed before its next query, and a query that hits an expired token renews
   and retries once transparently — so routine expiry is invisible. Only a failed
   renew (master token also expired) falls back to evict + lazy re-auth.
+- **Keep-alive heartbeat (idle pools never re-prompt SSO).** Renewal is
+  authorized by the master token, which itself expires (~4h) unless the client
+  heartbeats — `CLIENT_SESSION_KEEP_ALIVE` only extends it server-side when
+  periodic `session/heartbeat` calls arrive. A background task heartbeats every
+  **idle** session each `SNOWFLAKE_HEARTBEAT_INTERVAL` (default 900s; `0`
+  disables), renewing a session token that would lapse before the next tick, so
+  a pool idle overnight still answers its next query without a browser popup.
+  Busy sessions are skipped (the query path keeps them alive); a session whose
+  master token has expired anyway is evicted so the next query lazily
+  re-authenticates. The task stops on daemon shutdown.
 - **Long-running queries.** The v1 endpoint long-polls and, for anything slower
   than its synchronous window, returns an "in progress" code with a result URL;
   the client **polls** that URL until the query completes. Heavy queries (e.g. a

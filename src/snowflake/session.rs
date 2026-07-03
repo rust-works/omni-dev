@@ -378,6 +378,45 @@ impl<S> SessionPool<S> {
         }
     }
 
+    /// Checks out every currently-idle session without waiting or creating.
+    ///
+    /// Used by the keep-alive heartbeat: each borrowed session holds a real
+    /// permit, so a concurrent [`checkout`](Self::checkout) briefly waits for
+    /// [`restore`](Self::restore) instead of authenticating a duplicate session
+    /// (a spurious browser SSO). Busy sessions are skipped — the query path
+    /// keeps them alive itself.
+    #[must_use]
+    pub fn checkout_all_idle(&self) -> Vec<Checkout<S>> {
+        let mut checkouts = Vec::new();
+        while let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() {
+            match self.take_idle() {
+                Some((id, base, current, session)) => {
+                    checkouts.push(self.make_checkout(permit, id, base, current, session));
+                }
+                // No idle session left; the unused permit drops (released).
+                None => break,
+            }
+        }
+        checkouts
+    }
+
+    /// Returns a borrowed session to its slot untouched — unlike
+    /// [`checkin`](Self::checkin) it preserves `last_used` and the recorded
+    /// context, because a keep-alive heartbeat is not a query.
+    pub fn restore(&self, mut checkout: Checkout<S>) {
+        checkout.done = true;
+        let session = checkout.session.take();
+        {
+            let mut slots = self.lock_slots();
+            if let Some(slot) = slots.iter_mut().find(|slot| slot.id == checkout.id) {
+                slot.session = session;
+            }
+        }
+        // Wake a waiter so it can reuse this session instead of authenticating.
+        self.idle_notify.notify_waiters();
+        // `_permit` drops with `checkout`, freeing a concurrency slot.
+    }
+
     /// Returns a session to its slot with the context now applied to it.
     pub fn checkin(&self, mut checkout: Checkout<S>, current: QueryContext) {
         checkout.done = true;
@@ -549,6 +588,15 @@ impl PoolRegistry {
     /// Drains and returns every pool.
     pub fn take_all(&self) -> Vec<Arc<SessionPool>> {
         self.lock().drain().map(|(_, pool)| pool).collect()
+    }
+
+    /// Live handles to every pool, ordered by id, without draining the
+    /// registry. Used by the keep-alive heartbeat to visit each pool.
+    #[must_use]
+    pub fn pools(&self) -> Vec<Arc<SessionPool>> {
+        let mut pools: Vec<Arc<SessionPool>> = self.lock().values().map(Arc::clone).collect();
+        pools.sort_by_key(|pool| pool.id());
+        pools
     }
 
     /// A snapshot of every pool, ordered by id. Sync; no awaits.
@@ -777,6 +825,137 @@ mod tests {
 
         drop(held);
         pool.checkin(c2, ctx());
+    }
+
+    #[tokio::test]
+    async fn checkout_all_idle_borrows_only_idle_sessions() {
+        let (pool, calls) = fake_pool(4);
+        let c1 = pool.checkout(|| fake_create(&calls)).await.unwrap();
+        let c2 = pool.checkout(|| fake_create(&calls)).await.unwrap();
+        let busy_id = c2.id();
+        pool.checkin(c1, ctx());
+
+        // One idle, one busy: only the idle session is borrowed.
+        let borrowed = pool.checkout_all_idle();
+        assert_eq!(borrowed.len(), 1);
+        assert_ne!(borrowed[0].id(), busy_id);
+        // Both slots stay visible; the borrowed one shows as busy.
+        assert_eq!(pool.live(), 2);
+        assert_eq!(pool.info().members.iter().filter(|m| m.busy).count(), 2);
+
+        for c in borrowed {
+            pool.restore(c);
+        }
+        pool.checkin(c2, ctx());
+        // Nothing was created or lost by the borrow cycle.
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(pool.live(), 2);
+    }
+
+    #[tokio::test]
+    async fn checkout_all_idle_is_empty_when_nothing_is_idle() {
+        let (pool, calls) = fake_pool(2);
+        assert!(pool.checkout_all_idle().is_empty(), "empty pool");
+        let c = pool.checkout(|| fake_create(&calls)).await.unwrap();
+        assert!(pool.checkout_all_idle().is_empty(), "all busy");
+        pool.checkin(c, ctx());
+    }
+
+    #[tokio::test]
+    async fn restore_preserves_last_used_and_context() {
+        let (pool, calls) = fake_pool(2);
+        let c = pool.checkout(|| fake_create(&calls)).await.unwrap();
+        let recorded = QueryContext {
+            warehouse: Some("WH".into()),
+            ..QueryContext::default()
+        };
+        pool.checkin(c, recorded.clone());
+        let before = pool.info().members[0].clone();
+
+        // Ensure a bookkeeping bump would produce a strictly later timestamp.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let borrowed = pool.checkout_all_idle();
+        assert_eq!(borrowed.len(), 1);
+        for c in borrowed {
+            pool.restore(c);
+        }
+
+        let after = pool.info().members[0].clone();
+        assert_eq!(after.last_used, before.last_used, "not a query");
+        assert_eq!(after.context, recorded, "recorded context untouched");
+        assert_eq!(after.query_count, before.query_count);
+    }
+
+    #[tokio::test]
+    async fn discarding_a_borrowed_idle_session_frees_capacity() {
+        let (pool, calls) = fake_pool(1);
+        let c = pool.checkout(|| fake_create(&calls)).await.unwrap();
+        pool.checkin(c, ctx());
+
+        let mut borrowed = pool.checkout_all_idle();
+        pool.discard(borrowed.pop().unwrap()); // dead beyond renewal
+        assert_eq!(pool.live(), 0);
+
+        // Capacity is freed, so the next checkout authenticates afresh.
+        let c = pool.checkout(|| fake_create(&calls)).await.unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        pool.checkin(c, ctx());
+    }
+
+    #[tokio::test]
+    async fn checkout_during_heartbeat_borrow_waits_and_reuses() {
+        let (pool, calls) = fake_pool(1);
+        let pool = Arc::new(pool);
+        let c = pool.checkout(|| fake_create(&calls)).await.unwrap();
+        let id = c.id();
+        pool.checkin(c, ctx());
+
+        // The heartbeat borrows the only session (and its only permit).
+        let mut borrowed = pool.checkout_all_idle();
+        assert_eq!(borrowed.len(), 1);
+
+        // A query arriving mid-heartbeat parks on the permit instead of
+        // authenticating a duplicate session (no spurious SSO).
+        let pool2 = Arc::clone(&pool);
+        let calls2 = Arc::clone(&calls);
+        let waiter = tokio::spawn(async move {
+            pool2
+                .checkout(move || async move {
+                    let id = calls2.fetch_add(1, Ordering::Relaxed);
+                    Ok::<(u32, QueryContext), std::convert::Infallible>((
+                        id,
+                        QueryContext::default(),
+                    ))
+                })
+                .await
+                .unwrap()
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "waiter blocks while borrowed");
+
+        pool.restore(borrowed.pop().unwrap());
+        let c = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("waiter must proceed once the session is restored")
+            .unwrap();
+        assert_eq!(c.id(), id, "reused the restored session");
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "no new auth");
+        pool.checkin(c, ctx());
+    }
+
+    #[test]
+    fn registry_pools_returns_handles_without_draining() {
+        let registry = PoolRegistry::new();
+        assert!(registry.pools().is_empty());
+        let p1 = registry.get_or_create(&SessionKey::new("A", "u"), 4);
+        let p2 = registry.get_or_create(&SessionKey::new("B", "u"), 4);
+        let pools = registry.pools();
+        assert_eq!(
+            pools.iter().map(|p| p.id()).collect::<Vec<_>>(),
+            vec![p1.id(), p2.id()],
+            "ordered by id"
+        );
+        assert_eq!(registry.len(), 2, "not drained");
     }
 
     #[test]
