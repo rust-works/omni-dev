@@ -23,11 +23,12 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use chrono::TimeDelta;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::utils::env::EnvSource;
 use crate::utils::settings::Settings;
 use client::{Error as ClientError, Row, SnowflakeClient, SnowflakeClientConfig, SnowflakeSession};
 use session::{PoolRegistry, QueryContext, SessionInfo, SessionKey};
@@ -176,27 +177,57 @@ fn heartbeat_interval_from(raw: Option<String>) -> Duration {
 /// A single arbitrary-SQL query request routed to the engine.
 ///
 /// `account`/`user` and the per-query context default to the engine config when
-/// omitted. Deserialized from the daemon `query` op payload.
-#[derive(Clone, Debug, Default, Deserialize)]
+/// omitted. Serialized by the CLI client (after [`fill_defaults_from`]
+/// resolution) and deserialized from the daemon `query` op payload.
+///
+/// [`fill_defaults_from`]: QueryRequest::fill_defaults_from
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct QueryRequest {
     /// Target account; falls back to `SNOWFLAKE_ACCOUNT`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
     /// Authenticating user; falls back to `SNOWFLAKE_USER`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
     /// Per-query `USE WAREHOUSE` override.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub warehouse: Option<String>,
     /// Per-query `USE ROLE` override.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     /// Per-query `USE DATABASE` override.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub database: Option<String>,
     /// Per-query `USE SCHEMA` override.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
     /// The SQL to execute.
     pub sql: String,
 }
 
 impl QueryRequest {
+    /// Fills each unset identity/context field from `env`.
+    ///
+    /// Called by the CLI client with a profile-aware source
+    /// ([`SettingsEnv`](crate::utils::settings::SettingsEnv)) so that
+    /// `--profile` / `OMNI_DEV_PROFILE` resolve in the invoking process —
+    /// the daemon's startup defaults then only back-fill requests that still
+    /// omit a field (e.g. bare socket clients). Explicit values are never
+    /// overwritten.
+    pub fn fill_defaults_from(&mut self, env: &impl EnvSource) {
+        let fill = |slot: &mut Option<String>, key: &str| {
+            if slot.is_none() {
+                *slot = env.var(key);
+            }
+        };
+        fill(&mut self.account, ENV_ACCOUNT);
+        fill(&mut self.user, ENV_USER);
+        fill(&mut self.warehouse, ENV_WAREHOUSE);
+        fill(&mut self.role, ENV_ROLE);
+        fill(&mut self.database, ENV_DATABASE);
+        fill(&mut self.schema, ENV_SCHEMA);
+    }
     /// The per-query context overrides (the `Some` fields override the session
     /// base context).
     fn overrides(&self) -> QueryContext {
@@ -676,6 +707,7 @@ fn validate_identifier(field: &str, value: &str) -> Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::test_support::env::MapEnv;
 
     #[test]
     fn default_config_has_a_nonzero_pool_size() {
@@ -755,6 +787,69 @@ mod tests {
         for value in ["", "wh; DROP TABLE t", "wh OR 1=1", "wh'", "a b"] {
             assert!(validate_identifier("warehouse", value).is_err(), "{value}");
         }
+    }
+
+    #[test]
+    fn fill_defaults_from_fills_unset_fields() {
+        let env = MapEnv::new()
+            .with(ENV_ACCOUNT, "ACCT")
+            .with(ENV_USER, "me")
+            .with(ENV_WAREHOUSE, "WH")
+            .with(ENV_ROLE, "R")
+            .with(ENV_DATABASE, "DB")
+            .with(ENV_SCHEMA, "S");
+        let mut req = QueryRequest {
+            sql: "SELECT 1".to_string(),
+            ..QueryRequest::default()
+        };
+        req.fill_defaults_from(&env);
+        assert_eq!(req.account.as_deref(), Some("ACCT"));
+        assert_eq!(req.user.as_deref(), Some("me"));
+        assert_eq!(req.warehouse.as_deref(), Some("WH"));
+        assert_eq!(req.role.as_deref(), Some("R"));
+        assert_eq!(req.database.as_deref(), Some("DB"));
+        assert_eq!(req.schema.as_deref(), Some("S"));
+    }
+
+    #[test]
+    fn fill_defaults_from_keeps_explicit_values() {
+        let env = MapEnv::new()
+            .with(ENV_ACCOUNT, "ENV_ACCT")
+            .with(ENV_USER, "env_user");
+        let mut req = QueryRequest {
+            account: Some("FLAG_ACCT".to_string()),
+            sql: "SELECT 1".to_string(),
+            ..QueryRequest::default()
+        };
+        req.fill_defaults_from(&env);
+        assert_eq!(req.account.as_deref(), Some("FLAG_ACCT"));
+        assert_eq!(req.user.as_deref(), Some("env_user"));
+    }
+
+    #[test]
+    fn fill_defaults_from_leaves_unresolved_fields_none() {
+        let mut req = QueryRequest {
+            sql: "SELECT 1".to_string(),
+            ..QueryRequest::default()
+        };
+        req.fill_defaults_from(&MapEnv::new());
+        assert!(req.account.is_none());
+        assert!(req.user.is_none());
+        assert!(req.warehouse.is_none());
+    }
+
+    #[test]
+    fn query_request_serializes_without_none_fields() {
+        let req = QueryRequest {
+            account: Some("ACCT".to_string()),
+            sql: "SELECT 1".to_string(),
+            ..QueryRequest::default()
+        };
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({ "account": "ACCT", "sql": "SELECT 1" })
+        );
     }
 
     #[test]

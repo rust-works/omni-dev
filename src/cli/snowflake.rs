@@ -16,6 +16,9 @@ use serde_json::{json, Value};
 use crate::daemon::client::DaemonClient;
 use crate::daemon::protocol::DaemonEnvelope;
 use crate::daemon::server;
+use crate::snowflake::QueryRequest;
+use crate::utils::env::EnvSource;
+use crate::utils::settings::SettingsEnv;
 
 /// The `snowflake` service routing key on the daemon control socket.
 const SERVICE: &str = "snowflake";
@@ -96,8 +99,8 @@ pub struct QueryCommand {
 
 impl QueryCommand {
     /// Executes the query command.
-    pub async fn execute(self) -> Result<()> {
-        let sql = match self.sql {
+    pub async fn execute(mut self) -> Result<()> {
+        let sql = match self.sql.take() {
             Some(sql) => sql,
             None => read_stdin()?,
         };
@@ -105,15 +108,7 @@ impl QueryCommand {
             bail!("no SQL provided (pass it as an argument or on stdin)");
         }
 
-        let payload = json!({
-            "account": self.account,
-            "user": self.user,
-            "warehouse": self.warehouse,
-            "role": self.role,
-            "database": self.database,
-            "schema": self.schema,
-            "sql": sql,
-        });
+        let payload = serde_json::to_value(self.request(sql, &SettingsEnv::load()))?;
 
         // First-time auth for an (account, user) opens a browser; warn on stderr
         // so it doesn't pollute the JSON/YAML on stdout.
@@ -122,6 +117,24 @@ impl QueryCommand {
         let socket = server::resolve_socket(self.socket)?;
         let result = call(&socket, "query", payload).await?;
         print_value(&result, self.format)
+    }
+
+    /// Builds the query request, filling each unset identity/context field from
+    /// `env` so `SNOWFLAKE_*` defaults — including profile-scoped ones selected
+    /// via `--profile` / `OMNI_DEV_PROFILE` — resolve in this client process
+    /// rather than against the daemon's startup environment (#1110).
+    fn request(&self, sql: String, env: &impl EnvSource) -> QueryRequest {
+        let mut req = QueryRequest {
+            account: self.account.clone(),
+            user: self.user.clone(),
+            warehouse: self.warehouse.clone(),
+            role: self.role.clone(),
+            database: self.database.clone(),
+            schema: self.schema.clone(),
+            sql,
+        };
+        req.fill_defaults_from(env);
+        req
     }
 }
 
@@ -330,6 +343,7 @@ fn print_value(value: &Value, format: OutputFormat) -> Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::test_support::env::MapEnv;
 
     /// Mirrors the `omni-dev snowflake` argv surface for parse tests.
     #[derive(Parser)]
@@ -375,6 +389,52 @@ mod tests {
         assert!(cmd.sql.is_none());
         assert_eq!(cmd.format, OutputFormat::Json);
         assert!(cmd.socket.is_none());
+    }
+
+    #[test]
+    fn query_request_resolves_defaults_from_env_source() {
+        let SnowflakeSubcommands::Query(cmd) = parse(&["query", "SELECT 1"]) else {
+            panic!("expected query");
+        };
+        let env = MapEnv::new()
+            .with("SNOWFLAKE_ACCOUNT", "PROFILE_ACCT")
+            .with("SNOWFLAKE_USER", "profile_user")
+            .with("SNOWFLAKE_ROLE", "PROFILE_ROLE");
+        let payload = serde_json::to_value(cmd.request("SELECT 1".to_string(), &env)).unwrap();
+        assert_eq!(
+            payload,
+            json!({
+                "account": "PROFILE_ACCT",
+                "user": "profile_user",
+                "role": "PROFILE_ROLE",
+                "sql": "SELECT 1",
+            })
+        );
+    }
+
+    #[test]
+    fn query_request_explicit_flags_beat_env_source() {
+        let SnowflakeSubcommands::Query(cmd) =
+            parse(&["query", "--account", "FLAG_ACCT", "SELECT 1"])
+        else {
+            panic!("expected query");
+        };
+        let env = MapEnv::new()
+            .with("SNOWFLAKE_ACCOUNT", "ENV_ACCT")
+            .with("SNOWFLAKE_USER", "env_user");
+        let req = cmd.request("SELECT 1".to_string(), &env);
+        assert_eq!(req.account.as_deref(), Some("FLAG_ACCT"));
+        assert_eq!(req.user.as_deref(), Some("env_user"));
+    }
+
+    #[test]
+    fn query_request_omits_unresolved_fields_from_payload() {
+        let SnowflakeSubcommands::Query(cmd) = parse(&["query", "SELECT 1"]) else {
+            panic!("expected query");
+        };
+        let payload =
+            serde_json::to_value(cmd.request("SELECT 1".to_string(), &MapEnv::new())).unwrap();
+        assert_eq!(payload, json!({ "sql": "SELECT 1" }));
     }
 
     #[test]
