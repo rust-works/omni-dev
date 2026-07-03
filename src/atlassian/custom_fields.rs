@@ -25,7 +25,9 @@ use crate::atlassian::client::TEXTAREA_CUSTOM_TYPE as CUSTOM_TEXTAREA;
 ///
 /// - **Scalars** are dispatched by schema: option/radiobutton fields become
 ///   `{"value": "..."}`, textfield/number/date pass through, rich-text
-///   fields are rejected (must use a body section instead).
+///   fields are rejected (must use a body section instead). Array fields
+///   take a YAML sequence or a comma-separated string (elements trimmed,
+///   empties dropped).
 /// - **Sections** must reference rich-text fields; their markdown is
 ///   converted to validated ADF via [`markdown_to_validated_adf`].
 ///
@@ -255,9 +257,6 @@ fn scalar_to_api_value(
             Ok(serde_json::json!({ "value": s }))
         }
         ("array", _) => {
-            let seq = value.as_sequence().ok_or_else(|| {
-                anyhow!("expected a sequence for array field '{}'", field.name)
-            })?;
             // Element shape depends on the array's item type: labels and
             // labels-like custom fields take bare strings, components and
             // versions take `{"name"}`, options (the historical default)
@@ -267,15 +266,39 @@ fn scalar_to_api_value(
                 Some("component" | "version") => |s| serde_json::json!({ "name": s }),
                 _ => |s| serde_json::json!({ "value": s }),
             };
-            let items: Vec<serde_json::Value> = seq
-                .iter()
-                .map(|v| {
-                    let s = yaml_as_string(v).with_context(|| {
-                        format!(
-                            "expected a string array element for field '{}'",
-                            field.name
-                        )
-                    })?;
+            // A scalar is accepted as comma-separated shorthand for a
+            // sequence (split on ',', trim, drop empties), so
+            // `Labels=a,b,c` works alongside `Labels=[a, b, c]`. Sequence
+            // elements are never split — `Labels=["a,b"]` is the escape
+            // hatch for a literal comma inside one element.
+            let elements: Vec<String> = match value {
+                serde_yaml::Value::Sequence(seq) => seq
+                    .iter()
+                    .map(|v| {
+                        yaml_as_string(v).with_context(|| {
+                            format!(
+                                "expected a string array element for field '{}'",
+                                field.name
+                            )
+                        })
+                    })
+                    .collect::<Result<_>>()?,
+                serde_yaml::Value::String(_)
+                | serde_yaml::Value::Number(_)
+                | serde_yaml::Value::Bool(_) => yaml_as_string(value)?
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|part| !part.is_empty())
+                    .map(String::from)
+                    .collect(),
+                _ => bail!(
+                    "expected a sequence (e.g. [a, b]) or comma-separated string (e.g. a,b) for array field '{}'",
+                    field.name
+                ),
+            };
+            let items: Vec<serde_json::Value> = elements
+                .into_iter()
+                .map(|s| {
                     validate_option_value(field, id, &s)?;
                     Ok(wrap(s))
                 })
@@ -708,6 +731,131 @@ mod tests {
         );
     }
 
+    fn labels_meta() -> EditMeta {
+        meta_with_schema(
+            "labels",
+            "Labels",
+            EditMetaSchema {
+                kind: "array".to_string(),
+                items: Some("string".to_string()),
+                system: Some("labels".to_string()),
+                ..EditMetaSchema::default()
+            },
+        )
+    }
+
+    #[test]
+    fn comma_separated_string_array_field_splits_elements() {
+        // Issue #1172: `Labels=a,b,c` splits into the same payload as
+        // `Labels=[a, b, c]`.
+        let mut scalars = BTreeMap::new();
+        scalars.insert(
+            "Labels".to_string(),
+            serde_yaml::Value::String("a,b,c".to_string()),
+        );
+        let out = resolve_custom_fields(&scalars, &[], &labels_meta()).unwrap();
+        assert_eq!(
+            out.get("labels").unwrap(),
+            &serde_json::json!(["a", "b", "c"])
+        );
+    }
+
+    #[test]
+    fn comma_separated_option_array_field_wraps_each_value() {
+        let editmeta = meta(&[("customfield_10004", "Components", "array", None)]);
+        let mut scalars = BTreeMap::new();
+        scalars.insert(
+            "Components".to_string(),
+            serde_yaml::Value::String("backend,auth".to_string()),
+        );
+        let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
+        assert_eq!(
+            out.get("customfield_10004").unwrap(),
+            &serde_json::json!([{"value": "backend"}, {"value": "auth"}])
+        );
+    }
+
+    #[test]
+    fn comma_separated_component_array_field_wraps_in_name_objects() {
+        let editmeta = meta_with_schema(
+            "components",
+            "Components",
+            EditMetaSchema {
+                kind: "array".to_string(),
+                items: Some("component".to_string()),
+                system: Some("components".to_string()),
+                ..EditMetaSchema::default()
+            },
+        );
+        let mut scalars = BTreeMap::new();
+        scalars.insert(
+            "Components".to_string(),
+            serde_yaml::Value::String("backend,auth".to_string()),
+        );
+        let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
+        assert_eq!(
+            out.get("components").unwrap(),
+            &serde_json::json!([{"name": "backend"}, {"name": "auth"}])
+        );
+    }
+
+    #[test]
+    fn comma_split_trims_whitespace_and_drops_empty_elements() {
+        let mut scalars = BTreeMap::new();
+        scalars.insert(
+            "Labels".to_string(),
+            serde_yaml::Value::String(" a , , b ,".to_string()),
+        );
+        let out = resolve_custom_fields(&scalars, &[], &labels_meta()).unwrap();
+        assert_eq!(out.get("labels").unwrap(), &serde_json::json!(["a", "b"]));
+    }
+
+    #[test]
+    fn comma_split_elements_validate_against_allowed_values() {
+        let editmeta = meta_with_allowed("customfield_10004", "Components", "array", &["x", "y"]);
+        let mut scalars = BTreeMap::new();
+        scalars.insert(
+            "Components".to_string(),
+            serde_yaml::Value::String("x,z".to_string()),
+        );
+        let err = resolve_custom_fields(&scalars, &[], &editmeta).unwrap_err();
+        assert!(format!("{err:#}").contains("not an allowed option"));
+    }
+
+    #[test]
+    fn array_field_number_scalar_becomes_single_element() {
+        let mut scalars = BTreeMap::new();
+        scalars.insert("Labels".to_string(), serde_yaml::Value::from(5));
+        let out = resolve_custom_fields(&scalars, &[], &labels_meta()).unwrap();
+        assert_eq!(out.get("labels").unwrap(), &serde_json::json!(["5"]));
+    }
+
+    #[test]
+    fn array_field_empty_string_sends_empty_array() {
+        // `Labels=""` (and all-comma inputs) drop every empty element and
+        // replace the field with an empty array — i.e. clear it.
+        let mut scalars = BTreeMap::new();
+        scalars.insert(
+            "Labels".to_string(),
+            serde_yaml::Value::String(String::new()),
+        );
+        let out = resolve_custom_fields(&scalars, &[], &labels_meta()).unwrap();
+        assert_eq!(out.get("labels").unwrap(), &serde_json::json!([]));
+    }
+
+    #[test]
+    fn sequence_element_containing_comma_is_not_split() {
+        // `Labels=["a,b"]` is the escape hatch for a literal comma inside
+        // one element; sequence elements must never be split.
+        let mut scalars = BTreeMap::new();
+        scalars.insert(
+            "Labels".to_string(),
+            serde_yaml::Value::Sequence(vec![serde_yaml::Value::String("a,b".to_string())]),
+        );
+        let out = resolve_custom_fields(&scalars, &[], &labels_meta()).unwrap();
+        assert_eq!(out.get("labels").unwrap(), &serde_json::json!(["a,b"]));
+    }
+
     #[test]
     fn scalar_issuelink_field_wraps_key() {
         // Issue #1157: Parent (schema type issuelink) accepts an issue key
@@ -1111,15 +1259,32 @@ content:
     }
 
     #[test]
-    fn array_field_requires_sequence_value() {
+    fn array_field_scalar_without_comma_becomes_single_element() {
         let editmeta = meta(&[("customfield_10004", "Components", "array", None)]);
         let mut scalars = BTreeMap::new();
         scalars.insert(
             "Components".to_string(),
-            serde_yaml::Value::String("not-a-sequence".to_string()),
+            serde_yaml::Value::String("solo".to_string()),
+        );
+        let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
+        assert_eq!(
+            out.get("customfield_10004").unwrap(),
+            &serde_json::json!([{"value": "solo"}])
+        );
+    }
+
+    #[test]
+    fn array_field_rejects_mapping_value() {
+        let editmeta = meta(&[("customfield_10004", "Components", "array", None)]);
+        let mut scalars = BTreeMap::new();
+        scalars.insert(
+            "Components".to_string(),
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
         );
         let err = resolve_custom_fields(&scalars, &[], &editmeta).unwrap_err();
-        assert!(format!("{err:#}").contains("expected a sequence"));
+        let msg = format!("{err:#}");
+        assert!(msg.contains("expected a sequence"));
+        assert!(msg.contains("comma-separated"));
     }
 
     #[test]
