@@ -62,7 +62,7 @@ impl LoginCommand {
         let credentials = AtlassianCredentials {
             instance_url: instance_url.clone(),
             email: email.clone(),
-            api_token,
+            api_token: api_token.into(),
         };
 
         auth::save_credentials(&credentials)?;

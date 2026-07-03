@@ -131,8 +131,8 @@ pub(crate) async fn external_browser_login(
         .unwrap_or(14400);
 
     Ok(LoginTokens {
-        session_token,
-        master_token,
+        session_token: session_token.into(),
+        master_token: master_token.into(),
         session_validity_secs,
         master_validity_secs,
     })

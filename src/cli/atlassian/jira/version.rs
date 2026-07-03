@@ -582,7 +582,7 @@ mod tests {
         AtlassianCredentials {
             instance_url: instance_url.to_string(),
             email: "test@example.com".to_string(),
-            api_token: "test-token".to_string(),
+            api_token: "test-token".into(),
         }
     }
 

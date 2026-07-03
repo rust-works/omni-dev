@@ -38,8 +38,8 @@ mod tests {
         // `load_credentials_with` tests; here we only verify the value-in seam
         // wires the site through. No env/HOME mutation, so no lock needed.
         let creds = DatadogCredentials {
-            api_key: "api".to_string(),
-            app_key: "app".to_string(),
+            api_key: "api".into(),
+            app_key: "app".into(),
             site: "us5.datadoghq.com".to_string(),
         };
         let (_client, site) = create_client_from(creds).unwrap();
