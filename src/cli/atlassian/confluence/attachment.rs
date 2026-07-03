@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 use crate::atlassian::confluence_api::{
     ConfluenceApi, ConfluenceAttachment, ConfluenceAttachmentPage,
 };
+use crate::cli::atlassian::confirm::{guard_destructive_with_io, GuardOptions, GuardOutcome};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 use crate::utils::path::attachment_filename;
@@ -289,40 +290,66 @@ pub struct DeleteCommand {
     #[arg(long)]
     pub force: bool,
 
+    /// Prints what would be deleted without making any API calls.
+    #[arg(long)]
+    pub dry_run: bool,
+
     /// Permanently purges the attachment instead of moving to trash (requires space admin).
     #[arg(long)]
     pub purge: bool,
 }
 
 impl DeleteCommand {
-    /// Executes the delete command using stdin for confirmation.
+    /// Executes the delete command.
     pub async fn execute(self) -> Result<()> {
-        let confirmed = self.force || self.prompt(&mut io::stdin().lock())?;
-        self.run_delete(confirmed).await
-    }
-
-    /// Reads the confirmation answer from `reader`. Synchronous so the
-    /// borrow ends before any `.await` in the async caller.
-    fn prompt(&self, reader: &mut dyn BufRead) -> Result<bool> {
-        let prompt = format_delete_prompt(&self.attachment_id, self.purge);
-        confirm_with_reader(&prompt, reader)
-    }
-
-    /// Performs the delete after the user has (or hasn't) confirmed.
-    async fn run_delete(self, confirmed: bool) -> Result<()> {
-        if !confirmed {
-            println!("Cancelled.");
-            return Ok(());
-        }
-
         let (client, instance_url) = create_client()?;
         let api = ConfluenceApi::new(client);
+        let mut reader = io::BufReader::new(io::stdin());
+        let mut writer = io::stdout();
+        self.execute_with_io(&api, &instance_url, &mut reader, &mut writer)
+            .await
+    }
+
+    /// Inner form taking explicit API, instance URL, and IO handles, for unit tests.
+    async fn execute_with_io(
+        self,
+        api: &ConfluenceApi,
+        instance_url: &str,
+        reader: &mut (dyn BufRead + Send),
+        writer: &mut (dyn Write + Send),
+    ) -> Result<()> {
+        if !self.force || self.dry_run {
+            let prompt = format_delete_prompt(&self.attachment_id, self.purge);
+            let dry_run_message = if self.purge {
+                format!("Would permanently purge attachment {}.", self.attachment_id)
+            } else {
+                format!("Would delete attachment {}.", self.attachment_id)
+            };
+
+            let outcome = guard_destructive_with_io(
+                &GuardOptions {
+                    prompt: &prompt,
+                    dry_run_message: &dry_run_message,
+                    force: self.force,
+                    dry_run: self.dry_run,
+                },
+                reader,
+                writer,
+            )?;
+
+            match outcome {
+                GuardOutcome::Cancelled | GuardOutcome::DryRun => return Ok(()),
+                GuardOutcome::Proceed => {}
+            }
+        }
+
         api.delete_attachment(&self.attachment_id, self.purge)
             .await?;
-        println!(
+        writeln!(
+            writer,
             "Deleted attachment {} from {}.",
             self.attachment_id, instance_url
-        );
+        )?;
 
         Ok(())
     }
@@ -335,16 +362,6 @@ fn format_delete_prompt(attachment_id: &str, purge: bool) -> String {
     } else {
         format!("Delete attachment {attachment_id}? [y/N] ")
     }
-}
-
-/// Prompts the user for confirmation using the given reader for input.
-fn confirm_with_reader(prompt: &str, reader: &mut dyn BufRead) -> Result<bool> {
-    print!("{prompt}");
-    io::stdout().flush()?;
-
-    let mut answer = String::new();
-    reader.read_line(&mut answer)?;
-    Ok(answer.trim().eq_ignore_ascii_case("y"))
 }
 
 #[cfg(test)]
@@ -422,6 +439,7 @@ mod tests {
             command: AttachmentSubcommands::Delete(DeleteCommand {
                 attachment_id: "att-1".to_string(),
                 force: true,
+                dry_run: false,
                 purge: false,
             }),
         };
@@ -476,26 +494,6 @@ mod tests {
             format_delete_prompt("att-1", true),
             "Permanently purge attachment att-1? [y/N] "
         );
-    }
-
-    // ── confirm_with_reader ────────────────────────────────────────
-
-    #[test]
-    fn confirm_yes_lowercase() {
-        let mut input = Cursor::new(b"y\n");
-        assert!(confirm_with_reader("Delete? ", &mut input).unwrap());
-    }
-
-    #[test]
-    fn confirm_no() {
-        let mut input = Cursor::new(b"n\n");
-        assert!(!confirm_with_reader("Delete? ", &mut input).unwrap());
-    }
-
-    #[test]
-    fn confirm_empty_is_no() {
-        let mut input = Cursor::new(b"\n");
-        assert!(!confirm_with_reader("Delete? ", &mut input).unwrap());
     }
 
     // ── run_upload (wiremock) ─────────────────────────────────
@@ -778,79 +776,146 @@ mod tests {
         assert_eq!(std::fs::read(&out).unwrap(), b"hi");
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn delete_command_execute_force_runs_through_dispatch() {
-        let _lock = ENV_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // ── DeleteCommand::execute_with_io (wiremock, injected IO) ────
 
-        let server = wiremock::MockServer::start().await;
+    fn delete_test_api(server: &wiremock::MockServer) -> ConfluenceApi {
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "u@t.com", "tok")
+                .unwrap();
+        ConfluenceApi::new(client)
+    }
+
+    async fn mount_delete_mock(server: &wiremock::MockServer, attachment_id: &str) {
         wiremock::Mock::given(wiremock::matchers::method("DELETE"))
-            .and(wiremock::matchers::path("/wiki/api/v2/attachments/att-1"))
+            .and(wiremock::matchers::path(format!(
+                "/wiki/api/v2/attachments/{attachment_id}"
+            )))
             .respond_with(wiremock::ResponseTemplate::new(204))
-            .mount(&server)
+            .expect(1)
+            .mount(server)
             .await;
-
-        set_atlassian_env(&server.uri());
-        let cmd = AttachmentCommand {
-            command: AttachmentSubcommands::Delete(DeleteCommand {
-                attachment_id: "att-1".to_string(),
-                force: true,
-                purge: true,
-            }),
-        };
-        let result = cmd.execute().await;
-        clear_atlassian_env();
-        assert!(result.is_ok(), "{result:?}");
     }
 
-    #[test]
-    fn delete_command_prompt_yes_returns_true() {
-        let cmd = DeleteCommand {
-            attachment_id: "att-1".to_string(),
-            force: false,
-            purge: false,
-        };
-        let mut input = Cursor::new(b"y\n");
-        assert!(cmd.prompt(&mut input).unwrap());
+    async fn run_delete_with_io(
+        cmd: DeleteCommand,
+        api: &ConfluenceApi,
+        input: &[u8],
+    ) -> (Result<()>, String) {
+        let mut reader = Cursor::new(input.to_vec());
+        let mut output = Vec::<u8>::new();
+        let result = cmd
+            .execute_with_io(
+                api,
+                "https://example.atlassian.net",
+                &mut reader,
+                &mut output,
+            )
+            .await;
+        (result, String::from_utf8(output).unwrap())
     }
 
-    #[test]
-    fn delete_command_prompt_no_returns_false() {
+    #[tokio::test]
+    async fn delete_execute_with_force_calls_delete() {
+        let server = wiremock::MockServer::start().await;
+        mount_delete_mock(&server, "att-1").await;
+
         let cmd = DeleteCommand {
             attachment_id: "att-1".to_string(),
-            force: false,
+            force: true,
+            dry_run: false,
             purge: true,
         };
-        let mut input = Cursor::new(b"n\n");
-        assert!(!cmd.prompt(&mut input).unwrap());
+        let (result, out) = run_delete_with_io(cmd, &delete_test_api(&server), b"").await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(out.contains("Deleted attachment att-1 from https://example.atlassian.net."));
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn delete_command_run_delete_unconfirmed_skips_api() {
-        let _lock = ENV_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        // No DELETE mock — confirms the API is *not* called when not confirmed.
+    #[tokio::test]
+    async fn delete_execute_with_dry_run_does_not_call_delete() {
+        // No DELETE mock — confirms the API is *not* called on dry-run.
         let server = wiremock::MockServer::start().await;
-        set_atlassian_env(&server.uri());
+
         let cmd = DeleteCommand {
             attachment_id: "att-1".to_string(),
             force: false,
+            dry_run: true,
             purge: false,
         };
-        let result = cmd.run_delete(false).await;
-        clear_atlassian_env();
+        let (result, out) = run_delete_with_io(cmd, &delete_test_api(&server), b"").await;
         assert!(result.is_ok(), "{result:?}");
+        assert!(out.contains("Would delete attachment att-1."));
+        assert!(!out.contains("Deleted attachment"));
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn delete_command_execute_propagates_api_error() {
-        let _lock = ENV_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    #[tokio::test]
+    async fn delete_execute_with_dry_run_and_purge_adjusts_wording() {
+        let server = wiremock::MockServer::start().await;
 
+        let cmd = DeleteCommand {
+            attachment_id: "att-1".to_string(),
+            force: false,
+            dry_run: true,
+            purge: true,
+        };
+        let (result, out) = run_delete_with_io(cmd, &delete_test_api(&server), b"").await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(out.contains("Would permanently purge attachment att-1."));
+    }
+
+    #[tokio::test]
+    async fn delete_execute_dry_run_wins_over_force() {
+        // No DELETE mock — dry-run takes precedence and skips the API.
+        let server = wiremock::MockServer::start().await;
+
+        let cmd = DeleteCommand {
+            attachment_id: "att-1".to_string(),
+            force: true,
+            dry_run: true,
+            purge: false,
+        };
+        let (result, out) = run_delete_with_io(cmd, &delete_test_api(&server), b"").await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(out.contains("Would delete attachment att-1."));
+        assert!(!out.contains("Deleted attachment"));
+    }
+
+    #[tokio::test]
+    async fn delete_execute_with_prompt_yes_calls_delete() {
+        let server = wiremock::MockServer::start().await;
+        mount_delete_mock(&server, "att-1").await;
+
+        let cmd = DeleteCommand {
+            attachment_id: "att-1".to_string(),
+            force: false,
+            dry_run: false,
+            purge: false,
+        };
+        let (result, out) = run_delete_with_io(cmd, &delete_test_api(&server), b"y\n").await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(out.contains("Delete attachment att-1? [y/N]"));
+        assert!(out.contains("Deleted attachment att-1"));
+    }
+
+    #[tokio::test]
+    async fn delete_execute_with_prompt_no_skips_api() {
+        // No DELETE mock — confirms the API is *not* called when declined.
+        let server = wiremock::MockServer::start().await;
+
+        let cmd = DeleteCommand {
+            attachment_id: "att-1".to_string(),
+            force: false,
+            dry_run: false,
+            purge: true,
+        };
+        let (result, out) = run_delete_with_io(cmd, &delete_test_api(&server), b"n\n").await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(out.contains("Permanently purge attachment att-1? [y/N]"));
+        assert!(out.contains("Cancelled."));
+        assert!(!out.contains("Deleted attachment"));
+    }
+
+    #[tokio::test]
+    async fn delete_execute_propagates_api_error() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("DELETE"))
             .and(wiremock::matchers::path("/wiki/api/v2/attachments/missing"))
@@ -858,31 +923,89 @@ mod tests {
             .mount(&server)
             .await;
 
-        set_atlassian_env(&server.uri());
         let cmd = DeleteCommand {
             attachment_id: "missing".to_string(),
             force: true,
+            dry_run: false,
             purge: false,
         };
-        let result = cmd.execute().await;
-        clear_atlassian_env();
+        let (result, _out) = run_delete_with_io(cmd, &delete_test_api(&server), b"").await;
         let err = result.unwrap_err();
         assert!(err.to_string().contains("404"));
     }
 
-    // ── extra coverage for confirm_with_reader & print_upload ─────
-
-    #[test]
-    fn confirm_yes_uppercase() {
-        let mut input = Cursor::new(b"Y\n");
-        assert!(confirm_with_reader("Delete? ", &mut input).unwrap());
+    /// Dry-run with a failing writer covers `?` on guard_destructive_with_io.
+    #[tokio::test]
+    async fn delete_execute_dry_run_propagates_guard_error() {
+        use crate::test_support::failing_io::FailingWriter;
+        let server = wiremock::MockServer::start().await;
+        let cmd = DeleteCommand {
+            attachment_id: "att-1".to_string(),
+            force: false,
+            dry_run: true,
+            purge: false,
+        };
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut writer = FailingWriter;
+        let err = cmd
+            .execute_with_io(
+                &delete_test_api(&server),
+                "https://example.atlassian.net",
+                &mut input,
+                &mut writer,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated write failure"));
     }
 
-    #[test]
-    fn confirm_random_text_is_no() {
-        let mut input = Cursor::new(b"maybe\n");
-        assert!(!confirm_with_reader("Delete? ", &mut input).unwrap());
+    /// Force-mode + failing writer covers `?` on the post-API writeln.
+    #[tokio::test]
+    async fn delete_execute_force_propagates_writeln_error() {
+        use crate::test_support::failing_io::FailingWriter;
+        let server = wiremock::MockServer::start().await;
+        mount_delete_mock(&server, "att-1").await;
+        let cmd = DeleteCommand {
+            attachment_id: "att-1".to_string(),
+            force: true,
+            dry_run: false,
+            purge: false,
+        };
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut writer = FailingWriter;
+        let err = cmd
+            .execute_with_io(
+                &delete_test_api(&server),
+                "https://example.atlassian.net",
+                &mut input,
+                &mut writer,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated write failure"));
     }
+
+    /// End-to-end exercise of the public `execute()` wrapper through the
+    /// `AttachmentCommand` dispatch arm.
+    #[tokio::test]
+    async fn delete_execute_with_force_drives_create_client_and_calls_delete() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        mount_delete_mock(&server, "att-1").await;
+
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        let cmd = AttachmentCommand {
+            command: AttachmentSubcommands::Delete(DeleteCommand {
+                attachment_id: "att-1".to_string(),
+                force: true,
+                dry_run: false,
+                purge: false,
+            }),
+        };
+        cmd.execute().await.unwrap();
+    }
+
+    // ── extra coverage for print_upload ────────────────────────────
 
     #[test]
     fn print_upload_confirmation_prints() {
