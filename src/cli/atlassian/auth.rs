@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use crate::atlassian::auth::{self, AtlassianCredentials};
 use crate::atlassian::client::AtlassianClient;
 use crate::utils::env::SystemEnv;
-use crate::utils::settings::active_profile_from;
+use crate::utils::settings::{active_profile_from, profile_suffix, Settings};
 
 /// Manages Atlassian Cloud credentials.
 #[derive(Parser)]
@@ -45,44 +45,65 @@ impl LoginCommand {
     /// Prompts the user for credentials and saves them.
     pub fn execute(self) -> Result<()> {
         println!("Configure Atlassian Cloud credentials\n");
-
         let instance_url = prompt("Instance URL (e.g., https://myorg.atlassian.net): ")?;
-        if instance_url.is_empty() {
-            anyhow::bail!("Instance URL is required");
-        }
-
         let email = prompt("Email: ")?;
-        if email.is_empty() {
-            anyhow::bail!("Email is required");
-        }
-
         let api_token = prompt("API token: ")?;
-        if api_token.is_empty() {
-            anyhow::bail!("API token is required");
-        }
-
-        let credentials = AtlassianCredentials {
-            instance_url: instance_url.clone(),
-            email: email.clone(),
-            api_token: api_token.into(),
-        };
-
-        // The wrapper re-resolves the profile internally; this copy only
-        // feeds the confirmation message.
-        let profile = active_profile_from(&SystemEnv);
-        auth::save_credentials(&credentials)?;
-        println!(
-            "\nCredentials saved to ~/.omni-dev/settings.json{}",
-            profile
-                .map(|name| format!(" (profile '{name}')"))
-                .unwrap_or_default()
-        );
-        println!("  Instance: {instance_url}");
-        println!("  Email: {email}");
-        println!("\nRun `omni-dev atlassian auth status` to verify.");
-
-        Ok(())
+        run_login(&instance_url, &email, &api_token)
     }
+}
+
+/// Validates credentials and persists them to `~/.omni-dev/settings.json`,
+/// targeting the active profile's `env` map when a profile is selected
+/// (issue #1116).
+///
+/// Extracted from [`LoginCommand::execute`] so the input-validation branches
+/// are reachable from tests without mocking stdin.
+fn run_login(instance_url: &str, email: &str, api_token: &str) -> Result<()> {
+    run_login_to(
+        &Settings::get_settings_path()?,
+        active_profile_from(&SystemEnv).as_deref(),
+        instance_url,
+        email,
+        api_token,
+    )
+}
+
+/// [`run_login`], persisting to an explicit settings-file path and profile so
+/// tests inject both instead of mutating `HOME` / `OMNI_DEV_PROFILE`
+/// (issue #1030).
+fn run_login_to(
+    settings_path: &std::path::Path,
+    profile: Option<&str>,
+    instance_url: &str,
+    email: &str,
+    api_token: &str,
+) -> Result<()> {
+    if instance_url.is_empty() {
+        anyhow::bail!("Instance URL is required");
+    }
+    if email.is_empty() {
+        anyhow::bail!("Email is required");
+    }
+    if api_token.is_empty() {
+        anyhow::bail!("API token is required");
+    }
+
+    let credentials = AtlassianCredentials {
+        instance_url: instance_url.to_string(),
+        email: email.to_string(),
+        api_token: api_token.into(),
+    };
+
+    auth::save_credentials_to(settings_path, profile, &credentials)?;
+    println!(
+        "\nCredentials saved to ~/.omni-dev/settings.json{}",
+        profile_suffix(profile)
+    );
+    println!("  Instance: {instance_url}");
+    println!("  Email: {email}");
+    println!("\nRun `omni-dev atlassian auth status` to verify.");
+
+    Ok(())
 }
 
 /// Shows the current authentication status.
@@ -146,6 +167,78 @@ mod tests {
             command: AuthSubcommands::Status(StatusCommand),
         };
         assert!(matches!(cmd.command, AuthSubcommands::Status(_)));
+    }
+
+    // ── run_login ──────────────────────────────────────────────────
+
+    fn temp_settings() -> (tempfile::TempDir, std::path::PathBuf) {
+        std::fs::create_dir_all("tmp").ok();
+        let dir = tempfile::TempDir::new_in("tmp").unwrap();
+        let path = dir.path().join(".omni-dev").join("settings.json");
+        (dir, path)
+    }
+
+    #[test]
+    fn run_login_rejects_empty_instance_url() {
+        let err = run_login("", "me@test.com", "tok").unwrap_err();
+        assert!(err.to_string().contains("Instance URL"));
+    }
+
+    #[test]
+    fn run_login_rejects_empty_email() {
+        let err = run_login("https://org.atlassian.net", "", "tok").unwrap_err();
+        assert!(err.to_string().contains("Email"));
+    }
+
+    #[test]
+    fn run_login_rejects_empty_api_token() {
+        let err = run_login("https://org.atlassian.net", "me@test.com", "").unwrap_err();
+        assert!(err.to_string().contains("API token"));
+    }
+
+    #[test]
+    fn run_login_to_persists_credentials() {
+        let (_dir, settings_path) = temp_settings();
+
+        run_login_to(
+            &settings_path,
+            None,
+            "https://org.atlassian.net",
+            "me@test.com",
+            "tok-1",
+        )
+        .unwrap();
+
+        let val: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(
+            val["env"]["ATLASSIAN_INSTANCE_URL"],
+            "https://org.atlassian.net"
+        );
+        assert_eq!(val["env"]["ATLASSIAN_EMAIL"], "me@test.com");
+        assert_eq!(val["env"]["ATLASSIAN_API_TOKEN"], "tok-1");
+    }
+
+    #[test]
+    fn run_login_to_with_profile_persists_under_profile() {
+        let (_dir, settings_path) = temp_settings();
+
+        run_login_to(
+            &settings_path,
+            Some("work"),
+            "https://work.atlassian.net",
+            "me@work.com",
+            "tok-w",
+        )
+        .unwrap();
+
+        let val: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(
+            val["profiles"]["work"]["env"]["ATLASSIAN_EMAIL"],
+            "me@work.com"
+        );
+        assert!(val["env"].get("ATLASSIAN_EMAIL").is_none());
     }
 
     // ── run_auth_status ────────────────────────────────────────────

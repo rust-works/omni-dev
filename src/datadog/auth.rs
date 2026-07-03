@@ -547,6 +547,35 @@ mod tests {
         assert!(!removed);
     }
 
+    /// The production wrappers resolve `~/.omni-dev/settings.json` from
+    /// `HOME` and the active profile from `OMNI_DEV_PROFILE`, so this one
+    /// test must redirect both (under the shared
+    /// [`crate::atlassian::auth::test_util::EnvGuard`], which serialises all
+    /// env-mutating auth tests). Every other save/remove test injects a path
+    /// and profile instead (issue #1030).
+    #[test]
+    fn save_and_remove_credentials_resolve_default_settings_path() {
+        let guard = crate::atlassian::auth::test_util::EnvGuard::take();
+        let dir = guard.clear_credentials();
+
+        let creds = DatadogCredentials {
+            api_key: "wrapper-api".into(),
+            app_key: "wrapper-app".into(),
+            site: "datadoghq.com".to_string(),
+        };
+        save_credentials(&creds).unwrap();
+
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        let val: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(val["env"]["DATADOG_API_KEY"], "wrapper-api");
+
+        assert!(remove_credentials().unwrap());
+        let val: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(val["env"].get("DATADOG_API_KEY").is_none());
+    }
+
     /// A profile-targeted logout must not clear base-`env` credentials
     /// belonging to the default bundle (issue #1116).
     #[test]
