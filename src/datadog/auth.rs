@@ -1,14 +1,16 @@
 //! Datadog credential management.
 //!
 //! Loads and saves Datadog API credentials from/to the
-//! `~/.omni-dev/settings.json` file using the existing `env` map.
+//! `~/.omni-dev/settings.json` file — the active profile's `env` map when a
+//! profile is selected, the base `env` map otherwise (issue #1116).
 
 use anyhow::Result;
 use serde::Serialize;
 
 use crate::datadog::error::DatadogError;
+use crate::utils::env::SystemEnv;
 use crate::utils::secret::Secret;
-use crate::utils::settings::Settings;
+use crate::utils::settings::{active_profile_from, Settings};
 
 /// Environment variable / settings key for the Datadog API key.
 pub const DATADOG_API_KEY: &str = "DATADOG_API_KEY";
@@ -175,20 +177,29 @@ pub(crate) fn status_with(env: &impl crate::utils::env::EnvSource) -> AuthStatus
 /// Saves Datadog credentials to `~/.omni-dev/settings.json`.
 ///
 /// Reads the existing settings file, merges the three credential keys into
-/// the `env` map, and writes back. Preserves all other settings.
+/// the active profile's `env` map (the base `env` when no profile is active
+/// — issue #1116), and writes back. Preserves all other settings.
 pub fn save_credentials(credentials: &DatadogCredentials) -> Result<()> {
-    save_credentials_to(&Settings::get_settings_path()?, credentials)
+    save_credentials_to(
+        &Settings::get_settings_path()?,
+        active_profile_from(&SystemEnv).as_deref(),
+        credentials,
+    )
 }
 
-/// [`save_credentials`], writing to an explicit settings-file path.
+/// [`save_credentials`], writing to an explicit settings-file path and env
+/// map (`profiles.<name>.env` when `profile` is `Some`, base `env` otherwise).
 ///
-/// Tests inject a tempdir path instead of redirecting `HOME` (issue #1030).
+/// Tests inject a tempdir path and an explicit profile instead of mutating
+/// `HOME` / `OMNI_DEV_PROFILE` (issue #1030).
 pub(crate) fn save_credentials_to(
     settings_path: &std::path::Path,
+    profile: Option<&str>,
     credentials: &DatadogCredentials,
 ) -> Result<()> {
-    Settings::upsert_env_vars(
+    Settings::upsert_env_vars_in(
         settings_path,
+        profile,
         &[
             (DATADOG_API_KEY, credentials.api_key.expose_secret()),
             (DATADOG_APP_KEY, credentials.app_key.expose_secret()),
@@ -197,21 +208,33 @@ pub(crate) fn save_credentials_to(
     )
 }
 
-/// Removes Datadog credential keys from `~/.omni-dev/settings.json`.
+/// Removes Datadog credential keys from `~/.omni-dev/settings.json` — from
+/// the active profile's `env` map when a profile is active, the base `env`
+/// otherwise (issue #1116).
 ///
 /// Leaves all other settings intact. Returns `true` if any Datadog key was
-/// present and removed, `false` when the file was already free of them (or
-/// did not exist).
+/// present and removed, `false` when the targeted map was already free of
+/// them (or the file did not exist).
 pub fn remove_credentials() -> Result<bool> {
-    remove_credentials_at(&Settings::get_settings_path()?)
+    remove_credentials_at(
+        &Settings::get_settings_path()?,
+        active_profile_from(&SystemEnv).as_deref(),
+    )
 }
 
-/// [`remove_credentials`], operating on an explicit settings-file path.
+/// [`remove_credentials`], operating on an explicit settings-file path and
+/// env map (`profiles.<name>.env` when `profile` is `Some`, base `env`
+/// otherwise).
 ///
-/// Tests inject a tempdir path instead of redirecting `HOME` (issue #1030).
-pub(crate) fn remove_credentials_at(settings_path: &std::path::Path) -> Result<bool> {
-    Settings::remove_env_vars(
+/// Tests inject a tempdir path and an explicit profile instead of mutating
+/// `HOME` / `OMNI_DEV_PROFILE` (issue #1030).
+pub(crate) fn remove_credentials_at(
+    settings_path: &std::path::Path,
+    profile: Option<&str>,
+) -> Result<bool> {
+    Settings::remove_env_vars_in(
         settings_path,
+        profile,
         &[DATADOG_API_KEY, DATADOG_APP_KEY, DATADOG_SITE],
     )
 }
@@ -390,7 +413,7 @@ mod tests {
                 app_key: "app-1".into(),
                 site: "datadoghq.com".to_string(),
             };
-            save_credentials_to(&settings_path, &creds).unwrap();
+            save_credentials_to(&settings_path, None, &creds).unwrap();
 
             assert!(settings_path.exists());
             let content = fs::read_to_string(&settings_path).unwrap();
@@ -428,7 +451,7 @@ mod tests {
                 app_key: "app-2".into(),
                 site: "datadoghq.eu".to_string(),
             };
-            save_credentials_to(&settings_path, &creds).unwrap();
+            save_credentials_to(&settings_path, None, &creds).unwrap();
 
             let val: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
@@ -457,7 +480,7 @@ mod tests {
             )
             .unwrap();
 
-            let removed = remove_credentials_at(&settings_path).unwrap();
+            let removed = remove_credentials_at(&settings_path, None).unwrap();
             assert!(removed);
 
             let val: serde_json::Value =
@@ -475,8 +498,78 @@ mod tests {
                 tempfile::TempDir::new_in("tmp").unwrap()
             };
             let settings_path = temp_dir.path().join(".omni-dev").join("settings.json");
-            let removed = remove_credentials_at(&settings_path).unwrap();
+            let removed = remove_credentials_at(&settings_path, None).unwrap();
             assert!(!removed);
         }
+    }
+
+    /// Save + remove round-trip against a profile-targeted env map — the
+    /// credentials land under `profiles.<name>.env` where the profile-aware
+    /// read side will find them, and the base `env` is untouched
+    /// (issue #1116).
+    #[test]
+    fn save_then_remove_round_trip_in_profile() {
+        let temp_dir = {
+            std::fs::create_dir_all("tmp").ok();
+            tempfile::TempDir::new_in("tmp").unwrap()
+        };
+        let omni_dir = temp_dir.path().join(".omni-dev");
+        fs::create_dir_all(&omni_dir).unwrap();
+        let settings_path = omni_dir.join("settings.json");
+        fs::write(&settings_path, r#"{"env": {"OTHER_KEY": "keep_me"}}"#).unwrap();
+
+        let creds = DatadogCredentials {
+            api_key: "api-p".into(),
+            app_key: "app-p".into(),
+            site: "datadoghq.eu".to_string(),
+        };
+        save_credentials_to(&settings_path, Some("work"), &creds).unwrap();
+
+        let val: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(val["profiles"]["work"]["env"]["DATADOG_API_KEY"], "api-p");
+        assert_eq!(
+            val["profiles"]["work"]["env"]["DATADOG_SITE"],
+            "datadoghq.eu"
+        );
+        assert!(val["env"].get("DATADOG_API_KEY").is_none());
+        assert_eq!(val["env"]["OTHER_KEY"], "keep_me");
+
+        let removed = remove_credentials_at(&settings_path, Some("work")).unwrap();
+        assert!(removed);
+        let val: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(val["profiles"]["work"]["env"]
+            .get("DATADOG_API_KEY")
+            .is_none());
+
+        let removed = remove_credentials_at(&settings_path, Some("work")).unwrap();
+        assert!(!removed);
+    }
+
+    /// A profile-targeted logout must not clear base-`env` credentials
+    /// belonging to the default bundle (issue #1116).
+    #[test]
+    fn remove_credentials_at_profile_ignores_base_keys() {
+        let temp_dir = {
+            std::fs::create_dir_all("tmp").ok();
+            tempfile::TempDir::new_in("tmp").unwrap()
+        };
+        let omni_dir = temp_dir.path().join(".omni-dev");
+        fs::create_dir_all(&omni_dir).unwrap();
+        let settings_path = omni_dir.join("settings.json");
+        fs::write(
+            &settings_path,
+            r#"{"env": {"DATADOG_API_KEY": "base-a", "DATADOG_APP_KEY": "base-b"}}"#,
+        )
+        .unwrap();
+
+        let removed = remove_credentials_at(&settings_path, Some("work")).unwrap();
+        assert!(!removed);
+
+        let val: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(val["env"]["DATADOG_API_KEY"], "base-a");
+        assert_eq!(val["env"]["DATADOG_APP_KEY"], "base-b");
     }
 }
