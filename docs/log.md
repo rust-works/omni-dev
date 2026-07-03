@@ -17,7 +17,8 @@ types, so the log is a complete invocation history, not just an HTTP history:
   `OMNI_DEV_*` env snapshot.
 - **`kind: "http"`** — one per outbound request (recorded *inside* each client's
   retry loop, so retries and transport failures are captured too): service,
-  method, URL, status, elapsed, and any error.
+  method, URL (secret-bearing query/fragment parameter **values** redacted —
+  see [Redaction posture](#redaction-posture)), status, elapsed, and any error.
 
 Every HTTP record shares an `invocation_id` with the invocation that issued it,
 so you can pull a run and all of its requests with a single `--id`.
@@ -119,6 +120,14 @@ No secret material is ever written, under any code path:
   fixed list of known header names and any name containing `auth`, `token`,
   `key`, `secret`, `cookie`, `password`, `session`, `signature`, or
   `credential` (case-insensitive).
+- URL query and fragment parameters whose keys look secret-bearing have their
+  **values** replaced with `REDACTED` before writing: keys suffixed `token`,
+  `secret`, `password`, `passwd`, `signature`, or `api_key`/`apikey`; the exact
+  keys `sig`, `sas`, `jwt`, and `auth`; and the `X-Amz-*` / `X-Goog-*`
+  signed-URL families. Host, path, and parameter keys are preserved, so
+  `--url` substring filtering keeps working. This matters mostly for the
+  browser bridge, which logs arbitrary operator-supplied target URLs
+  (presigned URLs, `?access_token=…`).
 - Request/response bodies are **opt-in** via `OMNI_DEV_LOG_BODIES=1`.
 - The `OMNI_DEV_*` env snapshot redacts any name containing `TOKEN`, `SECRET`,
   `KEY`, `PASSWORD`, or `PASSWD`.
