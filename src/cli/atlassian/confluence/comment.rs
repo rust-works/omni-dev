@@ -1505,4 +1505,56 @@ mod tests {
             .iter()
             .any(|r| r.method == wiremock::http::Method::PUT));
     }
+
+    /// A writer whose every operation fails, for exercising IO-error
+    /// propagation through `execute_with_io`.
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("writer failed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("writer failed"))
+        }
+    }
+
+    #[tokio::test]
+    async fn reanchor_execute_with_io_propagates_prompt_write_error() {
+        let server = wiremock::MockServer::start().await;
+        let api = mock_api(&server);
+
+        // Without --force the guard writes the prompt first; the failing
+        // writer surfaces that IO error before any API call.
+        let cmd = reanchor_command(false, false);
+        let mut reader = io::Cursor::new(b"y\n".to_vec());
+        let mut writer = FailingWriter;
+        assert!(cmd
+            .execute_with_io(&api, &mut reader, &mut writer)
+            .await
+            .is_err());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reanchor_execute_with_io_propagates_result_write_error() {
+        let server = wiremock::MockServer::start().await;
+        mount_reanchor_fixture(&server).await;
+        let api = mock_api(&server);
+
+        // With --force the guard writes nothing; the re-anchor succeeds and
+        // the failure comes from writing the success message.
+        let cmd = reanchor_command(true, false);
+        let mut reader = io::Cursor::new(Vec::new());
+        let mut writer = FailingWriter;
+        assert!(cmd
+            .execute_with_io(&api, &mut reader, &mut writer)
+            .await
+            .is_err());
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests
+            .iter()
+            .any(|r| r.method == wiremock::http::Method::PUT));
+    }
 }
