@@ -2,6 +2,7 @@
 
 pub mod ai_scratch;
 pub mod env;
+pub(crate) mod path;
 pub mod preflight;
 pub mod settings;
 
