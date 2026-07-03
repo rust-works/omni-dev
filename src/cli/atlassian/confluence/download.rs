@@ -17,6 +17,7 @@ use crate::atlassian::confluence_api::{ChildPage, ConfluenceApi, ConfluenceAttac
 use crate::atlassian::document::content_item_to_document;
 use crate::cli::atlassian::format::ContentFormat;
 use crate::cli::atlassian::helpers::create_client;
+use crate::utils::path::attachment_filename;
 
 /// Behavior when a file already exists at the download target.
 #[derive(Clone, Debug, Default, ValueEnum)]
@@ -796,20 +797,6 @@ async fn drain_attachments(
     Ok(all)
 }
 
-/// Returns a safe, single-component filename for an attachment.
-///
-/// Attachment titles are remote-controlled, so strip everything but the final
-/// path component to prevent a malicious title (e.g. `../../etc/passwd`) from
-/// escaping the `attachments/` directory. Falls back to the attachment ID when
-/// the title has no usable file name.
-fn attachment_filename(title: &str, id: &str) -> String {
-    Path::new(title)
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .filter(|s| !s.is_empty() && s != "." && s != "..")
-        .unwrap_or_else(|| format!("attachment-{id}"))
-}
-
 /// Backs up a file before overwriting it.
 async fn backup_file(source: &Path, backup_dir: &Path, relative_path: &str) -> Result<()> {
     let dest = backup_dir.join(relative_path);
@@ -977,24 +964,6 @@ mod tests {
     #[test]
     fn extension_adf() {
         assert_eq!(file_extension(&ContentFormat::Adf), "json");
-    }
-
-    // ── attachment_filename ────────────────────────────────────────
-
-    #[test]
-    fn attachment_filename_keeps_plain_name() {
-        assert_eq!(attachment_filename("diagram.png", "att-1"), "diagram.png");
-    }
-
-    #[test]
-    fn attachment_filename_strips_path_traversal() {
-        assert_eq!(attachment_filename("../../etc/passwd", "att-1"), "passwd");
-    }
-
-    #[test]
-    fn attachment_filename_falls_back_to_id() {
-        assert_eq!(attachment_filename("", "att-1"), "attachment-att-1");
-        assert_eq!(attachment_filename("..", "att-9"), "attachment-att-9");
     }
 
     // ── OnConflict ─────────────────────────────────────────────────
