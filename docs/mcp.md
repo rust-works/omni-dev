@@ -91,15 +91,16 @@ carries the reverse reference (`mirrors the \`<tool>\` MCP tool`) in its
 | `git_twiddle_commits` | AI-powered commit message improvement | `omni-dev git commit message twiddle` |
 | `git_create_pr` | AI-drafted PR title + body, optionally pushed | `omni-dev git branch create pr` |
 
-### JIRA — core (10 tools)
+### JIRA — core (11 tools)
 
 | Tool | Purpose |
 |------|---------|
 | `jira_read` | Fetch a single issue (JFM markdown or ADF JSON). Supports `output_file`, `--fields`, `--all-fields` |
 | `jira_search` | JQL search; returns matching issues as YAML |
-| `jira_create` | Create a new issue. Supports `custom_fields` (a `{name-or-id: value}` map resolved against the create screen) for fields a project requires at create time |
+| `jira_create` | Create a new issue. Supports `custom_fields` (a `{name-or-id: value}` map resolved against the create screen, including labels and issue-link fields such as `Parent`) for fields a project requires at create time |
 | `jira_bulk_create` | Create many issues and (optionally) wire dependency links between them in one call — for epic decomposition. See [Bulk create + link](#bulk-create--link-jira_bulk_create) |
-| `jira_write` | Update an issue body, `assignee`, `reporter`, or arbitrary `fields`. At least one of `content` or another field is required. (Set the parent for hierarchy via the `jira_link_parent` tool.) |
+| `jira_write` | Update an issue body, `assignee`, `reporter`, or arbitrary raw-id `fields`. At least one of `content` or another field is required. (Set the parent for hierarchy via the `jira_link_parent` tool; prefer `jira_edit` for name-resolved field updates.) |
+| `jira_edit` | Set arbitrary fields on an existing issue by display name or canonical id — labels, selects, story points, rich-text custom fields, parent. Values are coerced to the API shape; rich-text strings are JFM→ADF converted (or pass a raw ADF object). Mirrors `omni-dev atlassian jira write --set-field` |
 | `jira_transition` | Apply or list workflow transitions (call with `list = true` first to discover names) |
 | `jira_comment` | Add a comment to an issue |
 | `jira_dev` | Fetch development info (commits, branches, PRs) attached to an issue |
@@ -197,7 +198,7 @@ The server exposes URI-addressable content alongside tools.
 
 The currently shipped spec resource is `omni-dev://specs/jfm`, the
 JIRA-Flavoured Markdown reference. AI clients should fetch this before
-writing content for `jira_write`, `jira_create`, `jira_comment`,
+writing content for `jira_write`, `jira_edit`, `jira_create`, `jira_comment`,
 `confluence_write`, or `confluence_create`.
 
 ## Cross-cutting parameters
@@ -277,6 +278,7 @@ CLI's `--dry-run`:
 
 - `jira_create`
 - `jira_write`
+- `jira_edit`
 - `jira_link_create`
 - `jira_link_parent`
 - `jira_link_remove`

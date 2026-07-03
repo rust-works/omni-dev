@@ -650,6 +650,20 @@ async fn jira_tool_handlers_round_trip_through_wiremock() -> Result<()> {
         .mount(&server)
         .await;
 
+    // jira_edit (editmeta for name resolution; reuses the jira_write PUT mock)
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/issue/PROJ-1/editmeta"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "fields": {
+                "labels": {
+                    "name": "Labels",
+                    "schema": {"type": "array", "items": "string", "system": "labels"}
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+
     // jira_transition (list)
     Mock::given(method("GET"))
         .and(path("/rest/api/3/issue/PROJ-1/transitions"))
@@ -726,7 +740,7 @@ async fn jira_tool_handlers_round_trip_through_wiremock() -> Result<()> {
     let _env = AtlassianEnvGuard::new(&server.uri(), "test@test.com", "token")?;
     let (client, server_handle) = spawn_server().await;
 
-    let calls: [(&str, serde_json::Value); 12] = [
+    let calls: [(&str, serde_json::Value); 13] = [
         ("jira_read", serde_json::json!({"key": "PROJ-1"})),
         ("jira_search", serde_json::json!({"jql": "project = PROJ"})),
         (
@@ -748,6 +762,10 @@ async fn jira_tool_handlers_round_trip_through_wiremock() -> Result<()> {
         (
             "jira_write",
             serde_json::json!({"key": "PROJ-1", "content": "Body"}),
+        ),
+        (
+            "jira_edit",
+            serde_json::json!({"key": "PROJ-1", "fields": {"Labels": ["a", "b"]}}),
         ),
         (
             "jira_transition",
@@ -806,6 +824,7 @@ async fn jira_tool_handlers_surface_tool_error_without_credentials() -> Result<(
         "jira_search",
         "jira_create",
         "jira_write",
+        "jira_edit",
         "jira_transition",
         "jira_comment",
         "jira_link_create",
@@ -819,6 +838,7 @@ async fn jira_tool_handlers_surface_tool_error_without_credentials() -> Result<(
             "jira_search" => serde_json::json!({"jql": "x"}),
             "jira_create" => serde_json::json!({"project": "P", "summary": "s"}),
             "jira_write" => serde_json::json!({"key": "X-1", "content": "b"}),
+            "jira_edit" => serde_json::json!({"key": "X-1", "fields": {"labels": []}}),
             "jira_comment" => serde_json::json!({"key": "X-1", "action": "list"}),
             "jira_link_create" => {
                 serde_json::json!({"link_type": "Blocks", "inward": "X-1", "outward": "X-2"})
