@@ -240,12 +240,34 @@ impl ClaudeCliAiClient {
     }
 
     /// Reads [`MAX_BUDGET_ENV_VAR`] and returns the parsed spending cap.
-    /// Returns `None` when unset or unparseable.
+    /// Returns `None` silently when unset; a value that is set but unusable
+    /// also returns `None`, after logging a WARN (see
+    /// [`Self::max_budget_from_value`]).
     fn max_budget_from_env() -> Option<f64> {
-        crate::utils::settings::get_env_var(MAX_BUDGET_ENV_VAR)
+        let raw = crate::utils::settings::get_env_var(MAX_BUDGET_ENV_VAR).ok()?;
+        Self::max_budget_from_value(&raw)
+    }
+
+    /// Pure core of [`Self::max_budget_from_env`]: validates an explicitly
+    /// provided budget value. An unusable value — unparseable, non-finite,
+    /// or non-positive — yields `None` (no cap is applied), but logs a WARN
+    /// so a typo like `--claude-cli-max-budget-usd 0` cannot silently
+    /// disable the cap (issue #1135).
+    fn max_budget_from_value(raw: &str) -> Option<f64> {
+        let trimmed = raw.trim();
+        let parsed = trimmed
+            .parse::<f64>()
             .ok()
-            .and_then(|v| v.trim().parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v > 0.0)
+            .filter(|v| v.is_finite() && *v > 0.0);
+        if parsed.is_none() {
+            warn!(
+                value = trimmed,
+                env_var = MAX_BUDGET_ENV_VAR,
+                "invalid spending cap ignored (must be a positive, finite \
+                 USD amount); running with NO budget cap"
+            );
+        }
+        parsed
     }
 
     /// Builds the subprocess [`Command`] without spawning.
@@ -1357,6 +1379,86 @@ mod tests {
         assert!(ClaudeCliAiClient::max_budget_from_env().is_none());
         g.set("");
         assert!(ClaudeCliAiClient::max_budget_from_env().is_none());
+    }
+
+    /// Thread-scoped log capture for asserting on emitted `warn!` lines.
+    /// Installed via `tracing::subscriber::with_default`, so it never
+    /// touches the global subscriber other tests may have initialised.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Runs `f` under a thread-local WARN-level subscriber and returns
+    /// everything it logged.
+    fn capture_warnings(f: impl FnOnce()) -> String {
+        let writer = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let mut sink = writer.clone();
+        std::io::Write::flush(&mut sink).expect("flushing the capture buffer cannot fail");
+        let logs = String::from_utf8_lossy(&writer.0.lock().unwrap()).into_owned();
+        logs
+    }
+
+    #[test]
+    fn max_budget_from_value_warns_on_non_positive() {
+        let logs = capture_warnings(|| {
+            assert!(ClaudeCliAiClient::max_budget_from_value("0").is_none());
+        });
+        assert!(
+            logs.contains("invalid spending cap"),
+            "expected a WARN for a non-positive cap, got: {logs}"
+        );
+        assert!(
+            logs.contains(MAX_BUDGET_ENV_VAR),
+            "WARN should name the env var, got: {logs}"
+        );
+    }
+
+    #[test]
+    fn max_budget_from_value_warns_on_unusable_values() {
+        for raw in ["-1.0", "nan", "inf", "five dollars", ""] {
+            let logs = capture_warnings(|| {
+                assert!(
+                    ClaudeCliAiClient::max_budget_from_value(raw).is_none(),
+                    "{raw:?} should yield no cap"
+                );
+            });
+            assert!(
+                logs.contains("invalid spending cap"),
+                "expected a WARN for {raw:?}, got: {logs}"
+            );
+        }
+    }
+
+    #[test]
+    fn max_budget_from_value_valid_is_silent() {
+        let logs = capture_warnings(|| {
+            assert_eq!(ClaudeCliAiClient::max_budget_from_value("0.50"), Some(0.50));
+        });
+        assert!(logs.is_empty(), "no WARN expected for a valid cap: {logs}");
     }
 
     #[test]
