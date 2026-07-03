@@ -1,14 +1,16 @@
 //! Atlassian credential management.
 //!
 //! Loads and saves Atlassian Cloud API credentials from/to the
-//! `~/.omni-dev/settings.json` file using the existing `env` map.
+//! `~/.omni-dev/settings.json` file — the active profile's `env` map when a
+//! profile is selected, the base `env` map otherwise (issue #1116).
 
 use anyhow::Result;
 use serde::Serialize;
 
 use crate::atlassian::error::AtlassianError;
+use crate::utils::env::SystemEnv;
 use crate::utils::secret::Secret;
-use crate::utils::settings::Settings;
+use crate::utils::settings::{active_profile_from, Settings};
 
 /// Environment variable / settings key for the Atlassian instance URL.
 pub const ATLASSIAN_INSTANCE_URL: &str = "ATLASSIAN_INSTANCE_URL";
@@ -132,20 +134,29 @@ pub fn status() -> AuthStatus {
 /// Saves Atlassian credentials to `~/.omni-dev/settings.json`.
 ///
 /// Reads the existing settings file, merges the new credential keys into
-/// the `env` map, and writes back. Preserves all other settings.
+/// the active profile's `env` map (the base `env` when no profile is active
+/// — issue #1116), and writes back. Preserves all other settings.
 pub fn save_credentials(credentials: &AtlassianCredentials) -> Result<()> {
-    save_credentials_to(&Settings::get_settings_path()?, credentials)
+    save_credentials_to(
+        &Settings::get_settings_path()?,
+        active_profile_from(&SystemEnv).as_deref(),
+        credentials,
+    )
 }
 
-/// [`save_credentials`], writing to an explicit settings-file path.
+/// [`save_credentials`], writing to an explicit settings-file path and env
+/// map (`profiles.<name>.env` when `profile` is `Some`, base `env` otherwise).
 ///
-/// Tests inject a tempdir path instead of redirecting `HOME` (issue #1030).
+/// Tests inject a tempdir path and an explicit profile instead of mutating
+/// `HOME` / `OMNI_DEV_PROFILE` (issue #1030).
 pub(crate) fn save_credentials_to(
     settings_path: &std::path::Path,
+    profile: Option<&str>,
     credentials: &AtlassianCredentials,
 ) -> Result<()> {
-    Settings::upsert_env_vars(
+    Settings::upsert_env_vars_in(
         settings_path,
+        profile,
         &[
             (ATLASSIAN_INSTANCE_URL, credentials.instance_url.as_str()),
             (ATLASSIAN_EMAIL, credentials.email.as_str()),
@@ -163,16 +174,18 @@ pub(crate) fn save_credentials_to(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 pub(crate) mod test_util {
     use super::{ATLASSIAN_API_TOKEN, ATLASSIAN_EMAIL, ATLASSIAN_INSTANCE_URL};
+    use crate::utils::settings::PROFILE_ENV_VAR;
 
-    /// Mutex shared by every test that mutates `HOME` and the Atlassian
-    /// credential env vars. Serialises those tests against each other so
-    /// parallel execution doesn't race on process-wide env state.
+    /// Mutex shared by every test that mutates `HOME`, `OMNI_DEV_PROFILE`, or
+    /// the Atlassian credential env vars. Serialises those tests against each
+    /// other so parallel execution doesn't race on process-wide env state.
     pub(crate) static AUTH_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// RAII guard: snapshots `HOME` + every Atlassian credential env var on
-    /// construction and restores them on drop. Concentrating the save/restore
-    /// branches into one place (here) instead of inlining them in each test
-    /// keeps coverage high — every test exercises the same guard drop path.
+    /// RAII guard: snapshots `HOME`, `OMNI_DEV_PROFILE`, and every Atlassian
+    /// credential env var on construction and restores them on drop.
+    /// Concentrating the save/restore branches into one place (here) instead
+    /// of inlining them in each test keeps coverage high — every test
+    /// exercises the same guard drop path.
     pub(crate) struct EnvGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
         snapshot: Vec<(&'static str, Option<String>)>,
@@ -185,6 +198,7 @@ pub(crate) mod test_util {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let keys = [
                 "HOME",
+                PROFILE_ENV_VAR,
                 ATLASSIAN_INSTANCE_URL,
                 ATLASSIAN_EMAIL,
                 ATLASSIAN_API_TOKEN,
@@ -199,16 +213,19 @@ pub(crate) mod test_util {
             }
         }
 
-        /// Clears the three Atlassian credential env vars and points `HOME`
-        /// at a fresh empty tempdir so `load_credentials()` returns
-        /// `CredentialsNotFound`. Useful for testing the Err propagation
-        /// path of code that calls `create_client()`.
+        /// Clears the three Atlassian credential env vars plus
+        /// `OMNI_DEV_PROFILE` and points `HOME` at a fresh empty tempdir so
+        /// `load_credentials()` returns `CredentialsNotFound` and settings
+        /// writes target the base `env` map. Useful for testing the Err
+        /// propagation path of code that calls `create_client()` and the
+        /// `HOME`-resolving credential-write wrappers.
         pub(crate) fn clear_credentials(&self) -> tempfile::TempDir {
             let dir = {
                 std::fs::create_dir_all("tmp").ok();
                 tempfile::TempDir::new_in("tmp").unwrap()
             };
             std::env::set_var("HOME", dir.path());
+            std::env::remove_var(PROFILE_ENV_VAR);
             std::env::remove_var(ATLASSIAN_INSTANCE_URL);
             std::env::remove_var(ATLASSIAN_EMAIL);
             std::env::remove_var(ATLASSIAN_API_TOKEN);
@@ -329,6 +346,7 @@ mod tests {
             tempfile::TempDir::new_in("tmp").unwrap()
         };
         std::env::set_var("HOME", dir.path());
+        std::env::remove_var(crate::utils::settings::PROFILE_ENV_VAR);
         std::env::remove_var(ATLASSIAN_INSTANCE_URL);
         std::env::remove_var(ATLASSIAN_EMAIL);
         std::env::remove_var(ATLASSIAN_API_TOKEN);
@@ -436,7 +454,7 @@ mod tests {
                 email: "save@example.com".to_string(),
                 api_token: "save-token".into(),
             };
-            save_credentials_to(&settings_path, &creds).unwrap();
+            save_credentials_to(&settings_path, None, &creds).unwrap();
 
             assert!(settings_path.exists());
             let content = fs::read_to_string(&settings_path).unwrap();
@@ -477,7 +495,7 @@ mod tests {
                 email: "user@test.com".to_string(),
                 api_token: "token".into(),
             };
-            save_credentials_to(&settings_path, &creds).unwrap();
+            save_credentials_to(&settings_path, None, &creds).unwrap();
 
             let content = fs::read_to_string(&settings_path).unwrap();
             let val: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -488,6 +506,41 @@ mod tests {
                 "https://org.atlassian.net"
             );
         }
+    }
+
+    /// A profile-targeted save lands under `profiles.<name>.env` — where the
+    /// profile-aware read side will find it — and leaves the base `env`
+    /// untouched (issue #1116).
+    #[test]
+    fn save_credentials_to_profile_writes_into_profile_env() {
+        let temp_dir = {
+            std::fs::create_dir_all("tmp").ok();
+            tempfile::TempDir::new_in("tmp").unwrap()
+        };
+        let omni_dir = temp_dir.path().join(".omni-dev");
+        fs::create_dir_all(&omni_dir).unwrap();
+        let settings_path = omni_dir.join("settings.json");
+        fs::write(&settings_path, r#"{"env": {"OTHER_KEY": "keep_me"}}"#).unwrap();
+
+        let creds = AtlassianCredentials {
+            instance_url: "https://work.atlassian.net".to_string(),
+            email: "work@example.com".to_string(),
+            api_token: "work-token".into(),
+        };
+        save_credentials_to(&settings_path, Some("work"), &creds).unwrap();
+
+        let val: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(
+            val["profiles"]["work"]["env"]["ATLASSIAN_EMAIL"],
+            "work@example.com"
+        );
+        assert_eq!(
+            val["profiles"]["work"]["env"]["ATLASSIAN_INSTANCE_URL"],
+            "https://work.atlassian.net"
+        );
+        assert!(val["env"].get("ATLASSIAN_EMAIL").is_none());
+        assert_eq!(val["env"]["OTHER_KEY"], "keep_me");
     }
 
     #[test]

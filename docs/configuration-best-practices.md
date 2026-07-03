@@ -142,6 +142,16 @@ omni-dev --profile work atlassian jira read PROJ-1   # global --profile flag
 OMNI_DEV_PROFILE=work omni-dev datadog monitor list  # OMNI_DEV_PROFILE env var
 ```
 
+### Populating a profile
+
+The `auth login` flows write to the profile that is active when they run:
+`omni-dev --profile work atlassian auth login` (or `datadog auth login`)
+stores the credentials under `profiles.work.env` — exactly where a later
+`--profile work` invocation will look for them. `datadog auth logout` removes
+credentials from the active profile's `env` only, leaving the base map and
+other profiles untouched. With no profile active, both target the base `env`
+map as before (issue #1116).
+
 ### Resolution rules
 
 | Situation                                     | Lookup order for each variable               |
