@@ -34,6 +34,7 @@ use crate::cli::atlassian::confluence::download::{
 use crate::cli::atlassian::format::ContentFormat;
 use crate::cli::atlassian::helpers::create_client;
 use crate::data::yaml::to_yaml;
+use crate::utils::path::attachment_filename;
 
 use super::content_input::{require_content_input, resolve_content_input};
 use super::dry_run::dry_run_request_yaml;
@@ -1201,7 +1202,7 @@ pub async fn download_attachment_yaml(
     output_path: Option<&str>,
 ) -> Result<String> {
     let (attachment, bytes) = api.download_attachment(attachment_id).await?;
-    let path = resolve_attachment_path(output_path, &attachment.title)?;
+    let path = resolve_attachment_path(output_path, &attachment.title, &attachment.id)?;
     path.parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map(std::fs::create_dir_all)
@@ -1223,11 +1224,17 @@ pub async fn download_attachment_yaml(
 /// With no `output_path`, a fresh temp directory is created and the
 /// attachment's title is written inside it. An `output_path` that names an
 /// existing directory is joined with the title; otherwise it is used verbatim.
-fn resolve_attachment_path(output_path: Option<&str>, title: &str) -> Result<PathBuf> {
+/// The title is remote-controlled, so it is sanitized to its final path
+/// component (falling back to the attachment ID) before joining.
+fn resolve_attachment_path(
+    output_path: Option<&str>,
+    title: &str,
+    attachment_id: &str,
+) -> Result<PathBuf> {
     if let Some(p) = output_path {
         let path = PathBuf::from(p);
         if path.is_dir() {
-            Ok(path.join(title))
+            Ok(path.join(attachment_filename(title, attachment_id)))
         } else {
             Ok(path)
         }
@@ -1236,7 +1243,7 @@ fn resolve_attachment_path(output_path: Option<&str>, title: &str) -> Result<Pat
             .prefix("omni-dev-confluence-attachment-")
             .tempdir()
             .context("Failed to create temp dir for attachment download")?;
-        Ok(tmp.keep().join(title))
+        Ok(tmp.keep().join(attachment_filename(title, attachment_id)))
     }
 }
 
@@ -3771,6 +3778,51 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn download_attachment_yaml_sanitizes_traversal_title() {
+        let _lock = env_lock();
+        let srv = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/attachments/att-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "att-1",
+                    "title": "../../pwn.txt",
+                    "mediaType": "text/plain",
+                    "downloadLink": "/download/attachments/12345/pwn.txt"
+                })),
+            )
+            .mount(&srv)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/download/attachments/12345/pwn.txt",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"EVIL".to_vec()))
+            .mount(&srv)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let client = AtlassianClient::new(&srv.uri(), "u@t.com", "tok").unwrap();
+        let api = ConfluenceApi::new(client);
+        let yaml = download_attachment_yaml(&api, "att-1", Some(dir.path().to_str().unwrap()))
+            .await
+            .unwrap();
+
+        let sanitized = dir.path().join("pwn.txt");
+        assert_eq!(std::fs::read(&sanitized).unwrap(), b"EVIL");
+        assert!(yaml.contains(sanitized.to_str().unwrap()));
+        assert!(!dir
+            .path()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("pwn.txt")
+            .exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn confluence_attachment_download_handler_success_via_mock() {
         let _lock = env_lock();
         let srv = wiremock::MockServer::start().await;
@@ -3861,7 +3913,7 @@ mod tests {
 
     #[test]
     fn resolve_attachment_path_defaults_to_tempdir() {
-        let path = resolve_attachment_path(None, "x.txt").unwrap();
+        let path = resolve_attachment_path(None, "x.txt", "att-1").unwrap();
         assert_eq!(path.file_name().unwrap(), "x.txt");
         assert!(path.parent().unwrap().is_dir());
     }
@@ -3869,14 +3921,34 @@ mod tests {
     #[test]
     fn resolve_attachment_path_existing_dir_joins_title() {
         let dir = tempfile::tempdir().unwrap();
-        let path = resolve_attachment_path(Some(dir.path().to_str().unwrap()), "x.txt").unwrap();
+        let path =
+            resolve_attachment_path(Some(dir.path().to_str().unwrap()), "x.txt", "att-1").unwrap();
         assert_eq!(path, dir.path().join("x.txt"));
     }
 
     #[test]
     fn resolve_attachment_path_explicit_file_used_verbatim() {
-        let path = resolve_attachment_path(Some("/tmp/foo/bar.bin"), "x.txt").unwrap();
+        let path = resolve_attachment_path(Some("/tmp/foo/bar.bin"), "x.txt", "att-1").unwrap();
         assert_eq!(path, PathBuf::from("/tmp/foo/bar.bin"));
+    }
+
+    #[test]
+    fn resolve_attachment_path_sanitizes_traversal_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = resolve_attachment_path(
+            Some(dir.path().to_str().unwrap()),
+            "../../evil.txt",
+            "att-1",
+        )
+        .unwrap();
+        assert_eq!(path, dir.path().join("evil.txt"));
+    }
+
+    #[test]
+    fn resolve_attachment_path_tempdir_sanitizes_absolute_title() {
+        let path = resolve_attachment_path(None, "/etc/passwd", "att-1").unwrap();
+        assert_eq!(path.file_name().unwrap(), "passwd");
+        assert!(path.parent().unwrap().is_dir());
     }
 
     /// Covers the Err branch of `resolve_space_id` inside
