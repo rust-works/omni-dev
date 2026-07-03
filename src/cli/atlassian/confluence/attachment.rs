@@ -11,6 +11,7 @@ use crate::atlassian::confluence_api::{
 };
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
+use crate::utils::path::attachment_filename;
 
 /// Manages attachments on Confluence pages.
 #[derive(Parser)]
@@ -252,7 +253,7 @@ async fn run_download(
     output: Option<&Path>,
 ) -> Result<()> {
     let (attachment, bytes) = api.download_attachment(attachment_id).await?;
-    let path = resolve_output_path(output, &attachment.title);
+    let path = resolve_output_path(output, &attachment.title, &attachment.id);
     std::fs::write(&path, &bytes).with_context(|| format!("Failed to write {}", path.display()))?;
     println!(
         "Downloaded {} ({} bytes) to {}.",
@@ -268,11 +269,13 @@ async fn run_download(
 /// An explicit `--output` that points at an existing directory is joined
 /// with the attachment's title; otherwise it is used verbatim. With no
 /// `--output`, the attachment's title is written to the current directory.
-fn resolve_output_path(output: Option<&Path>, title: &str) -> PathBuf {
+/// The title is remote-controlled, so it is sanitized to its final path
+/// component (falling back to the attachment ID) before use.
+fn resolve_output_path(output: Option<&Path>, title: &str, attachment_id: &str) -> PathBuf {
     match output {
-        Some(p) if p.is_dir() => p.join(title),
+        Some(p) if p.is_dir() => p.join(attachment_filename(title, attachment_id)),
         Some(p) => p.to_path_buf(),
-        None => PathBuf::from(title),
+        None => PathBuf::from(attachment_filename(title, attachment_id)),
     }
 }
 
@@ -562,7 +565,7 @@ mod tests {
     #[test]
     fn resolve_output_path_defaults_to_title_in_cwd() {
         assert_eq!(
-            resolve_output_path(None, "diagram.png"),
+            resolve_output_path(None, "diagram.png", "att-1"),
             PathBuf::from("diagram.png")
         );
     }
@@ -570,7 +573,7 @@ mod tests {
     #[test]
     fn resolve_output_path_explicit_file() {
         assert_eq!(
-            resolve_output_path(Some(Path::new("/tmp/out.png")), "diagram.png"),
+            resolve_output_path(Some(Path::new("/tmp/out.png")), "diagram.png", "att-1"),
             PathBuf::from("/tmp/out.png")
         );
     }
@@ -579,8 +582,33 @@ mod tests {
     fn resolve_output_path_existing_dir_joins_title() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            resolve_output_path(Some(dir.path()), "diagram.png"),
+            resolve_output_path(Some(dir.path()), "diagram.png", "att-1"),
             dir.path().join("diagram.png")
+        );
+    }
+
+    #[test]
+    fn resolve_output_path_sanitizes_traversal_title_in_cwd() {
+        assert_eq!(
+            resolve_output_path(None, "../../evil.txt", "att-1"),
+            PathBuf::from("evil.txt")
+        );
+    }
+
+    #[test]
+    fn resolve_output_path_existing_dir_sanitizes_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_output_path(Some(dir.path()), "../x.png", "att-1"),
+            dir.path().join("x.png")
+        );
+    }
+
+    #[test]
+    fn resolve_output_path_dotdot_title_falls_back_to_id() {
+        assert_eq!(
+            resolve_output_path(None, "..", "att-1"),
+            PathBuf::from("attachment-att-1")
         );
     }
 

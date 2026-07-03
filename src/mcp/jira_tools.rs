@@ -27,6 +27,7 @@ use super::error::tool_error;
 use super::server::OmniDevServer;
 use crate::atlassian::client::{AgileBoard, AtlassianClient, JiraAttachment, JiraProject};
 use crate::cli::atlassian::helpers::create_client;
+use crate::utils::path::attachment_filename;
 
 // ─────────────────────────────────────────────────────────────────────────
 // Attachment tools
@@ -140,7 +141,7 @@ async fn download_to_yaml(
     let mut files = Vec::with_capacity(attachments.len());
     for a in attachments {
         let bytes = client.get_bytes(&a.content_url).await?;
-        let path = output_dir.join(&a.filename);
+        let path = output_dir.join(attachment_filename(&a.filename, &a.id));
         fs::write(&path, &bytes).with_context(|| format!("Failed to write {}", path.display()))?;
         files.push(DownloadedAttachment {
             id: a.id.clone(),
@@ -1609,6 +1610,68 @@ mod tests {
         assert!(yaml.contains("note.txt"));
         assert!(yaml.contains(dir.path().to_str().unwrap()));
         assert!(dir.path().join("note.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn attachment_download_yaml_sanitizes_traversal_filename() {
+        let server = MockServer::start().await;
+        let content_url = format!("{}/attachment/1", server.uri());
+
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "fields": {
+                    "attachment": [
+                        {"id": "1", "filename": "../../escape.txt", "mimeType": "text/plain", "size": 4, "content": content_url}
+                    ]
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/attachment/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"EVIL".as_slice()))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let dir = tempfile::tempdir().unwrap();
+        attachment_download_yaml(&client, "PROJ-1", dir.path(), None)
+            .await
+            .unwrap();
+        assert!(dir.path().join("escape.txt").exists());
+        let escaped = dir.path().parent().unwrap().parent().unwrap();
+        assert!(!escaped.join("escape.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn attachment_download_yaml_empty_filename_falls_back_to_id() {
+        let server = MockServer::start().await;
+        let content_url = format!("{}/attachment/1", server.uri());
+
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "fields": {
+                    "attachment": [
+                        {"id": "1", "filename": "", "mimeType": "text/plain", "size": 4, "content": content_url}
+                    ]
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/attachment/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"data".as_slice()))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let dir = tempfile::tempdir().unwrap();
+        attachment_download_yaml(&client, "PROJ-1", dir.path(), None)
+            .await
+            .unwrap();
+        assert!(dir.path().join("attachment-1").exists());
     }
 
     #[tokio::test]
