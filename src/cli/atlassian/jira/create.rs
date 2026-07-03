@@ -81,7 +81,9 @@ pub struct CreateCommand {
     ///
     /// VALUE is parsed as a YAML scalar (number, bool) when possible, else a
     /// string; the wire type then follows the field's schema — option fields
-    /// send `{"value": ...}`, number fields send a number, and so on.
+    /// send `{"value": ...}`, number fields send a number, and so on. Array
+    /// fields (labels, components, versions) accept comma-separated values
+    /// (`Labels=a,b,c`) or a YAML list (`Labels=[a, b]`).
     ///
     /// NAME resolves against the project + issue-type create screen: a
     /// `customfield_<digits>` id matches first, otherwise the display name.

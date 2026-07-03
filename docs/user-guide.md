@@ -660,6 +660,10 @@ omni-dev atlassian jira write PROJ-123 issue.md --dry-run
 omni-dev atlassian jira write PROJ-123 --no-content --assignee 5b10a2844c20165700ede21g
 omni-dev atlassian jira write PROJ-123 --no-content --reporter "" --set-field "Priority=High"
 
+# Array fields take comma-separated values or a YAML list (same payload)
+omni-dev atlassian jira write PROJ-123 --no-content --set-field "Labels=triage,backend"
+omni-dev atlassian jira write PROJ-123 --no-content --set-field "Labels=[triage, backend]"
+
 # Interactive edit: fetch -> $EDITOR -> push
 omni-dev atlassian jira edit PROJ-123
 ```
@@ -766,10 +770,18 @@ Prints the created issue key (e.g., `PROJ-124`) to stdout.
 - **Value typing.** `VALUE` is parsed as a YAML scalar (number, bool) when
   possible, otherwise a string. The shape actually sent then follows the
   field's schema: option/select fields send `{"value": "…"}`, number fields
-  send a JSON number, array-of-option fields take a YAML list, and rich-text
+  send a JSON number, array fields take a list, and rich-text
   (ADF) fields take JFM markdown. So `--set-field "Story Points=5"` sends the
   number `5` for a numeric field, whereas an option field receives the string
   `"5"` wrapped as `{"value": "5"}`.
+- **Array fields.** Fields whose schema is array-typed (labels, components,
+  fix versions, multi-selects) accept either a YAML flow list
+  (`Labels=[a, b, c]`) or a comma-separated string (`Labels=a,b,c`) — both
+  send the same payload. Comma-split elements are whitespace-trimmed and
+  empty elements are dropped, so `Labels=a , b ,` sends `["a", "b"]` and
+  `Labels=""` clears the field. A literal comma inside one element needs the
+  list form: `Labels=["a,b"]`. The value **replaces** the field's current
+  contents; appending requires read → merge → write.
 - **Field resolution.** `NAME` resolves against the create screen for the
   target project + issue type. A `customfield_<digits>` id is matched first;
   otherwise the **display name** is matched exactly. The field **must be on the

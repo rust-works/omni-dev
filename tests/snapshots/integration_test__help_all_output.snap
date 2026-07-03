@@ -1987,7 +1987,7 @@ Options:
       --no-content              Skips reading the description and leaves it untouched. Use with `--assignee`, `--reporter`, or `--set-field` to update other fields without rewriting the body
       --assignee <ACCOUNT_ID>   Sets the assignee `accountId`. The empty string `""` clears the assignee; `"-1"` triggers JIRA automatic assignment. Use `omni-dev atlassian jira user search` to resolve a name or email to an `accountId`
       --reporter <ACCOUNT_ID>   Sets the reporter `accountId`. Same conventions as `--assignee`
-      --set-field <NAME=VALUE>  Set a custom field inline: `--set-field "NAME=VALUE"`. Can be used multiple times. Values are parsed as YAML scalars (numbers, bools) when possible, falling back to strings. Overrides values from the frontmatter `custom_fields:` map for the same name
+      --set-field <NAME=VALUE>  Set a custom field inline: `--set-field "NAME=VALUE"`. Can be used multiple times. Values are parsed as YAML scalars (numbers, bools) when possible, falling back to strings. Array fields (labels, components, versions) accept comma-separated values (`Labels=a,b,c`) or a YAML list (`Labels=[a, b]`). Overrides values from the frontmatter `custom_fields:` map for the same name
       --force                   Skips the confirmation prompt
       --dry-run                 Shows what would change without writing
   -h, --help                    Print help (see more with '--help')
