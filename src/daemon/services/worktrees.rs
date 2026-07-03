@@ -37,6 +37,15 @@ pub const SERVICE_NAME: &str = "worktrees";
 /// liveness correct — a flat shared file could not reap stale entries.
 const DEFAULT_TTL: Duration = Duration::from_secs(30);
 
+/// Ceiling on live registry entries, so a misbehaving companion flooding
+/// `register` with distinct keys cannot grow daemon memory faster than the TTL
+/// reaps it (#1140). Far above any real window count; when a new key would
+/// exceed it, the longest-silent entry is evicted instead of rejecting the
+/// request — an evicted live window self-heals via the `heartbeat` →
+/// `{known: false}` → re-register path, so `register` stays infallible for the
+/// companion.
+const MAX_WINDOWS: usize = 256;
+
 /// Environment override for the VS Code launcher used by the "focus" tray
 /// action, for when the daemon runs under launchd with a minimal `PATH`.
 const VSCODE_BIN_ENV: &str = "OMNI_DEV_VSCODE_BIN";
@@ -140,6 +149,11 @@ impl DaemonService for WorktreesService {
                 }
                 let mut windows = self.lock();
                 reap(&mut windows, self.ttl, now);
+                // Upserts never evict; only a genuinely new key can grow the
+                // map, and never past MAX_WINDOWS.
+                if !windows.contains_key(&req.key) && windows.len() >= MAX_WINDOWS {
+                    evict_oldest(&mut windows);
+                }
                 windows.insert(
                     req.key.clone(),
                     WindowEntry {
@@ -240,6 +254,24 @@ fn require_key<'a>(payload: &'a Value, op: &str) -> Result<&'a str> {
 fn reap(windows: &mut HashMap<String, WindowEntry>, ttl: Duration, now: DateTime<Utc>) {
     let max_age = ttl.as_secs() as i64;
     windows.retain(|_, e| (now - e.last_seen).num_seconds() <= max_age);
+}
+
+/// Removes the entry with the oldest `last_seen` (ties broken by lowest key
+/// for determinism). Called when a `register` of a new key would grow the
+/// registry past [`MAX_WINDOWS`]. Pure CPU under the registry lock, like
+/// [`reap`].
+fn evict_oldest(windows: &mut HashMap<String, WindowEntry>) {
+    let oldest = windows
+        .values()
+        .min_by(|a, b| {
+            a.last_seen
+                .cmp(&b.last_seen)
+                .then_with(|| a.key.cmp(&b.key))
+        })
+        .map(|e| e.key.clone());
+    if let Some(key) = oldest {
+        windows.remove(&key);
+    }
 }
 
 /// Snapshots the registry into a stably-ordered vector (by repo, then key) so
@@ -529,6 +561,97 @@ mod tests {
         reap(&mut windows, DEFAULT_TTL, now);
         assert!(windows.contains_key("fresh"));
         assert!(!windows.contains_key("stale"));
+    }
+
+    /// A minimal entry for cap/eviction tests; only `key` and `last_seen`
+    /// participate in eviction order.
+    fn entry_at(key: &str, last_seen: DateTime<Utc>) -> WindowEntry {
+        WindowEntry {
+            key: key.to_string(),
+            folders: vec![],
+            repo: None,
+            title: None,
+            pid: None,
+            last_seen,
+        }
+    }
+
+    #[test]
+    fn evict_oldest_removes_oldest_with_key_tiebreak() {
+        let now = Utc::now();
+        let mut windows = HashMap::new();
+        windows.insert("young".to_string(), entry_at("young", now));
+        windows.insert(
+            "old-b".to_string(),
+            entry_at("old-b", now - chrono::Duration::seconds(10)),
+        );
+        windows.insert(
+            "old-a".to_string(),
+            entry_at("old-a", now - chrono::Duration::seconds(10)),
+        );
+        // Oldest `last_seen` is shared by two entries; the lowest key loses.
+        evict_oldest(&mut windows);
+        assert!(!windows.contains_key("old-a"));
+        assert!(windows.contains_key("old-b"));
+        assert!(windows.contains_key("young"));
+        // Empty map is a no-op rather than a panic.
+        let mut empty: HashMap<String, WindowEntry> = HashMap::new();
+        evict_oldest(&mut empty);
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn register_at_cap_evicts_only_the_oldest() {
+        let svc = WorktreesService::new();
+        // Seed a full registry directly (registering 256 times over the socket
+        // op would work too, but sub-second timestamps may tie; explicit
+        // timestamps make the highest-numbered key unambiguously the oldest).
+        {
+            let mut windows = svc.lock();
+            let base = Utc::now();
+            for i in 0..MAX_WINDOWS {
+                let key = format!("w{i:03}");
+                windows.insert(
+                    key.clone(),
+                    entry_at(&key, base - chrono::Duration::milliseconds(i as i64)),
+                );
+            }
+        }
+        // A new key at the cap displaces exactly the longest-silent entry.
+        svc.handle("register", register_payload("fresh", None, "/tmp/f"))
+            .await
+            .unwrap();
+        let windows = svc.lock();
+        assert_eq!(windows.len(), MAX_WINDOWS);
+        assert!(windows.contains_key("fresh"));
+        assert!(!windows.contains_key(&format!("w{:03}", MAX_WINDOWS - 1)));
+        assert!(windows.contains_key("w000"));
+    }
+
+    #[tokio::test]
+    async fn register_upsert_at_cap_does_not_evict() {
+        let svc = WorktreesService::new();
+        {
+            let mut windows = svc.lock();
+            let base = Utc::now();
+            for i in 0..MAX_WINDOWS {
+                let key = format!("w{i:03}");
+                windows.insert(
+                    key.clone(),
+                    entry_at(&key, base - chrono::Duration::milliseconds(i as i64)),
+                );
+            }
+        }
+        // Re-registering an existing key is an upsert: nothing is displaced,
+        // not even the oldest entry.
+        let oldest = format!("w{:03}", MAX_WINDOWS - 1);
+        svc.handle("register", register_payload(&oldest, Some("r"), "/tmp/a"))
+            .await
+            .unwrap();
+        let windows = svc.lock();
+        assert_eq!(windows.len(), MAX_WINDOWS);
+        assert!(windows.contains_key(&oldest));
+        assert!(windows.contains_key("w000"));
     }
 
     #[test]
