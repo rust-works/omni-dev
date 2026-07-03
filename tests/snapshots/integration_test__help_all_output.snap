@@ -464,6 +464,8 @@ Commands:
   add         Adds a footer comment to a Confluence page (mirrors the `confluence_comment_add` MCP tool)
   add-inline  Adds an inline (anchored) comment to a Confluence page (mirrors the `confluence_comment_add_inline` MCP tool)
   replies     Lists the replies of a comment (mirrors the `confluence_comment_replies` MCP tool)
+  audit       Audits inline comments for anchor drift (mirrors the `confluence_comment_audit` MCP tool)
+  reanchor    Moves an inline comment's anchor to a new text run (mirrors the `confluence_comment_reanchor` MCP tool)
   help        Print this message or the help of the given subcommand(s)
 
 Options:
@@ -508,6 +510,22 @@ Options:
 
 ================================================================================
 
+omni-dev atlassian confluence comment audit - Audits inline comments for anchor drift (mirrors the `confluence_comment_audit` MCP tool)
+
+Audits inline comments for anchor drift (mirrors the `confluence_comment_audit` MCP tool)
+
+Usage: audit [OPTIONS] <ID>
+
+Arguments:
+  <ID>  Confluence page ID
+
+Options:
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
+  -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
 omni-dev atlassian confluence comment list - Lists comments on a Confluence page (mirrors the `confluence_comment_list` MCP tool)
 
 Lists comments on a Confluence page (mirrors the `confluence_comment_list` MCP tool)
@@ -522,6 +540,26 @@ Options:
       --limit <LIMIT>    Maximum number of comments to display [default: 25]
   -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json, yaml, yamls, jsonl]
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev atlassian confluence comment reanchor - Moves an inline comment's anchor to a new text run (mirrors the `confluence_comment_reanchor` MCP tool)
+
+Moves an inline comment's anchor to a new text run (mirrors the `confluence_comment_reanchor` MCP tool)
+
+Usage: reanchor [OPTIONS] --comment <COMMENT> --anchor-text <ANCHOR_TEXT> <ID>
+
+Arguments:
+  <ID>  Confluence page ID
+
+Options:
+      --comment <COMMENT>          The inline comment ID to re-anchor
+      --anchor-text <ANCHOR_TEXT>  Exact text on the current page to move the comment's anchor to
+      --match-index <MATCH_INDEX>  1-based occurrence to anchor to when `--anchor-text` appears more than once on the page. Required for ambiguous anchors; rejected if out of range
+      --force                      Skips the confirmation prompt
+      --dry-run                    Prints what would change without writing the page
+  -h, --help                       Print help
 
 
 ================================================================================
@@ -799,9 +837,10 @@ Arguments:
   <ID>  Confluence page ID (e.g., 12345678)
 
 Options:
-  -o, --output <OUTPUT>  Output file (writes to stdout if omitted)
-      --format <FORMAT>  Output format [default: jfm] [possible values: jfm, adf]
-  -h, --help             Print help (see more with '--help')
+  -o, --output <OUTPUT>    Output file (writes to stdout if omitted)
+      --format <FORMAT>    Output format [default: jfm] [possible values: jfm, adf]
+      --version <VERSION>  Read a specific historical version instead of the current head (e.g. `--version 3`). Confluence stores each version as an immutable snapshot; omit for the latest
+  -h, --help               Print help (see more with '--help')
 
 
 ================================================================================

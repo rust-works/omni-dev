@@ -1,5 +1,7 @@
 //! CLI commands for Confluence page comments.
 
+use std::io::{self, BufRead, Write};
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -10,6 +12,10 @@ use crate::atlassian::confluence_api::{
 };
 use crate::atlassian::convert::adf_to_markdown;
 use crate::atlassian::document::JfmDocument;
+use crate::atlassian::inline_comment::{
+    audit_inline_comments, reanchor_inline_comment, CommentDrift, DriftStatus,
+};
+use crate::cli::atlassian::confirm::{guard_destructive_with_io, GuardOptions, GuardOutcome};
 use crate::cli::atlassian::format::{output_as, ContentFormat, OutputFormat};
 use crate::cli::atlassian::helpers::{create_client, read_input};
 
@@ -32,6 +38,10 @@ pub enum CommentSubcommands {
     AddInline(AddInlineCommand),
     /// Lists the replies of a comment (mirrors the `confluence_comment_replies` MCP tool).
     Replies(RepliesCommand),
+    /// Audits inline comments for anchor drift (mirrors the `confluence_comment_audit` MCP tool).
+    Audit(AuditCommand),
+    /// Moves an inline comment's anchor to a new text run (mirrors the `confluence_comment_reanchor` MCP tool).
+    Reanchor(ReanchorCommand),
 }
 
 impl CommentCommand {
@@ -42,6 +52,8 @@ impl CommentCommand {
             CommentSubcommands::Add(cmd) => cmd.execute().await,
             CommentSubcommands::AddInline(cmd) => cmd.execute().await,
             CommentSubcommands::Replies(cmd) => cmd.execute().await,
+            CommentSubcommands::Audit(cmd) => cmd.execute().await,
+            CommentSubcommands::Reanchor(cmd) => cmd.execute().await,
         }
     }
 }
@@ -200,6 +212,157 @@ impl RepliesCommand {
         let (client, _instance_url) = create_client()?;
         let api = ConfluenceApi::new(client);
         run_list_replies(&api, &self.id, self.kind.into(), self.limit, &self.output).await
+    }
+}
+
+/// Audits every inline comment on a page for anchor drift.
+///
+/// Inline-comment anchors do NOT follow text edits: when the annotated text is
+/// rewritten, Confluence keeps the mark on whatever original characters survive.
+/// This compares each comment's currently-anchored text against the reviewer's
+/// original highlight and reports the drift. Read-only.
+#[derive(Parser)]
+pub struct AuditCommand {
+    /// Confluence page ID.
+    pub id: String,
+
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+}
+
+impl AuditCommand {
+    /// Fetches inline comments and the page ADF, then reports drift.
+    pub async fn execute(self) -> Result<()> {
+        let (client, _instance_url) = create_client()?;
+        let api = ConfluenceApi::new(client);
+        let drifts = audit_inline_comments(&api, &self.id).await?;
+        if output_as(&drifts, &self.output)? {
+            return Ok(());
+        }
+        print_drifts(&drifts);
+        Ok(())
+    }
+}
+
+/// Moves an inline comment's anchor to a new run of text in the current-version
+/// ADF and writes the page back.
+///
+/// Operates entirely on ADF (it never round-trips through JFM, which would
+/// discard the annotation marks the anchor depends on). Destructive — the page
+/// is updated — so it prompts for confirmation unless `--force`.
+#[derive(Parser)]
+pub struct ReanchorCommand {
+    /// Confluence page ID.
+    pub id: String,
+
+    /// The inline comment ID to re-anchor.
+    #[arg(long)]
+    pub comment: String,
+
+    /// Exact text on the current page to move the comment's anchor to.
+    #[arg(long)]
+    pub anchor_text: String,
+
+    /// 1-based occurrence to anchor to when `--anchor-text` appears more than
+    /// once on the page. Required for ambiguous anchors; rejected if out of range.
+    #[arg(long)]
+    pub match_index: Option<usize>,
+
+    /// Skips the confirmation prompt.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Prints what would change without writing the page.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+impl ReanchorCommand {
+    /// Executes the re-anchor command.
+    pub async fn execute(self) -> Result<()> {
+        let (client, _instance_url) = create_client()?;
+        let api = ConfluenceApi::new(client);
+        let mut reader = io::BufReader::new(io::stdin());
+        let mut writer = io::stdout();
+        self.execute_with_io(&api, &mut reader, &mut writer).await
+    }
+
+    /// Inner form taking explicit API and IO handles, for unit tests.
+    async fn execute_with_io(
+        self,
+        api: &ConfluenceApi,
+        reader: &mut (dyn BufRead + Send),
+        writer: &mut (dyn Write + Send),
+    ) -> Result<()> {
+        let prompt = format!(
+            "Re-anchor inline comment {} on page {} to {:?}? [y/N] ",
+            self.comment, self.id, self.anchor_text
+        );
+        let dry_run_message = format!(
+            "Would re-anchor inline comment {} on page {} to {:?}.",
+            self.comment, self.id, self.anchor_text
+        );
+        let outcome = guard_destructive_with_io(
+            &GuardOptions {
+                prompt: &prompt,
+                dry_run_message: &dry_run_message,
+                force: self.force,
+                dry_run: self.dry_run,
+            },
+            reader,
+            writer,
+        )?;
+        match outcome {
+            GuardOutcome::Cancelled | GuardOutcome::DryRun => return Ok(()),
+            GuardOutcome::Proceed => {}
+        }
+
+        let outcome = reanchor_inline_comment(
+            api,
+            &self.id,
+            &self.comment,
+            &self.anchor_text,
+            self.match_index,
+            false,
+        )
+        .await?;
+        writeln!(
+            writer,
+            "Re-anchored inline comment {} to {:?}.",
+            outcome.comment_id, outcome.new_anchor_text
+        )?;
+        Ok(())
+    }
+}
+
+/// Prints inline-comment drift reports in a readable format.
+fn print_drifts(drifts: &[CommentDrift]) {
+    if drifts.is_empty() {
+        println!("No inline comments.");
+        return;
+    }
+
+    for (i, drift) in drifts.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        let status = match drift.status {
+            DriftStatus::Ok => "OK",
+            DriftStatus::Torn => "TORN",
+            DriftStatus::MarkLost => "MARK LOST",
+            DriftStatus::Drifted => "DRIFTED",
+        };
+        println!("--- {} | {} ---", drift.comment_id, status);
+        println!("  original:  {:?}", drift.original_selection);
+        match &drift.current_anchored_text {
+            Some(text) => println!("  current:   {text:?}"),
+            None => println!("  current:   (mark not present)"),
+        }
+        if let Some(suggestion) = &drift.suggested_new_anchor {
+            let count = drift.suggested_match_count.unwrap_or(0);
+            println!("  suggested: {suggestion:?} (appears {count}x on the current page)");
+        }
     }
 }
 
@@ -364,6 +527,8 @@ mod tests {
             kind: CommentKind::Footer,
             body_adf,
             created: "2026-04-01T10:30:00.000Z".to_string(),
+            inline_marker_ref: None,
+            inline_original_selection: None,
         }
     }
 
@@ -378,6 +543,8 @@ mod tests {
             kind: CommentKind::Inline,
             body_adf,
             created: "2026-04-02T10:30:00.000Z".to_string(),
+            inline_marker_ref: Some("marker-1".to_string()),
+            inline_original_selection: Some("original highlighted text".to_string()),
         }
     }
 
@@ -1101,5 +1268,316 @@ mod tests {
         let result = cmd.execute().await;
         clear_atlassian_env();
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    // ── print_drifts ───────────────────────────────────────────────
+
+    fn sample_drift(id: &str, status: DriftStatus) -> CommentDrift {
+        CommentDrift {
+            comment_id: id.to_string(),
+            author: "alice".to_string(),
+            created: "2026-04-01T10:00:00.000Z".to_string(),
+            marker_ref: "marker-1".to_string(),
+            status,
+            original_selection: "original text".to_string(),
+            current_anchored_text: Some("current text".to_string()),
+            suggested_new_anchor: None,
+            suggested_match_count: None,
+        }
+    }
+
+    #[test]
+    fn print_drifts_empty() {
+        print_drifts(&[]);
+    }
+
+    #[test]
+    fn print_drifts_all_statuses() {
+        let mut lost = sample_drift("c3", DriftStatus::MarkLost);
+        lost.current_anchored_text = None;
+        lost.suggested_new_anchor = Some("original text".to_string());
+        lost.suggested_match_count = Some(2);
+        let mut drifted = sample_drift("c4", DriftStatus::Drifted);
+        // Suggestion without a count exercises the `unwrap_or(0)` fallback.
+        drifted.suggested_new_anchor = Some("original text".to_string());
+        let drifts = vec![
+            sample_drift("c1", DriftStatus::Ok),
+            sample_drift("c2", DriftStatus::Torn),
+            lost,
+            drifted,
+        ];
+        print_drifts(&drifts);
+    }
+
+    // ── audit / reanchor command execution ──────────────────────────
+
+    /// Mounts the endpoints a reanchor (and audit) needs: the page (whose ADF
+    /// contains "the anchor"), its space, one inline comment `ic1` bearing
+    /// marker `aaa`, and the page-update PUT.
+    async fn mount_reanchor_fixture(server: &wiremock::MockServer) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12345"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "12345",
+                    "title": "Mock",
+                    "status": "current",
+                    "spaceId": "98",
+                    "version": {"number": 1},
+                    "body": {"atlas_doc_format": {
+                        "value": "{\"version\":1,\"type\":\"doc\",\"content\":[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"the anchor\"}]}]}"
+                    }}
+                })),
+            )
+            .mount(server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/wiki/api/v2/spaces/98"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"key": "ENG"})),
+            )
+            .mount(server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/inline-comments",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {"id": "ic1", "version": {"authorId": "a", "createdAt": "t"},
+                         "properties": {"inlineMarkerRef": "aaa", "inlineOriginalSelection": "old"}}
+                    ]
+                })),
+            )
+            .mount(server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/wiki/api/v2/pages/12345"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn audit_command_execute_propagates_create_client_error() {
+        let guard = crate::atlassian::auth::test_util::EnvGuard::take();
+        let _home = guard.clear_credentials();
+
+        let cmd = AuditCommand {
+            id: "12345".to_string(),
+            output: OutputFormat::Yaml,
+        };
+        assert!(cmd.execute().await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn audit_command_execute_runs_through_dispatch() {
+        let _lock = crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let server = wiremock::MockServer::start().await;
+        mount_reanchor_fixture(&server).await;
+
+        set_atlassian_env(&server.uri());
+        let cmd = CommentCommand {
+            command: CommentSubcommands::Audit(AuditCommand {
+                id: "12345".to_string(),
+                output: OutputFormat::Json,
+            }),
+        };
+        let result = cmd.execute().await;
+        clear_atlassian_env();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn audit_command_execute_table_output_prints_drifts() {
+        let _lock = crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let server = wiremock::MockServer::start().await;
+        mount_reanchor_fixture(&server).await;
+
+        set_atlassian_env(&server.uri());
+        let cmd = AuditCommand {
+            id: "12345".to_string(),
+            output: OutputFormat::Table,
+        };
+        let result = cmd.execute().await;
+        clear_atlassian_env();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    fn reanchor_command(force: bool, dry_run: bool) -> ReanchorCommand {
+        ReanchorCommand {
+            id: "12345".to_string(),
+            comment: "ic1".to_string(),
+            anchor_text: "the anchor".to_string(),
+            match_index: None,
+            force,
+            dry_run,
+        }
+    }
+
+    #[tokio::test]
+    async fn reanchor_command_execute_propagates_create_client_error() {
+        let guard = crate::atlassian::auth::test_util::EnvGuard::take();
+        let _home = guard.clear_credentials();
+
+        let cmd = reanchor_command(true, false);
+        assert!(cmd.execute().await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reanchor_command_execute_runs_through_dispatch() {
+        let _lock = crate::atlassian::auth::test_util::AUTH_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let server = wiremock::MockServer::start().await;
+        mount_reanchor_fixture(&server).await;
+
+        set_atlassian_env(&server.uri());
+        let cmd = CommentCommand {
+            command: CommentSubcommands::Reanchor(reanchor_command(true, false)),
+        };
+        let result = cmd.execute().await;
+        clear_atlassian_env();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn reanchor_execute_with_io_cancelled_makes_no_api_calls() {
+        let server = wiremock::MockServer::start().await;
+        let api = mock_api(&server);
+
+        let cmd = reanchor_command(false, false);
+        let mut reader = io::Cursor::new(b"n\n".to_vec());
+        let mut writer: Vec<u8> = Vec::new();
+        cmd.execute_with_io(&api, &mut reader, &mut writer)
+            .await
+            .unwrap();
+
+        let out = String::from_utf8(writer).unwrap();
+        assert!(out.contains("Re-anchor inline comment ic1"));
+        assert!(out.contains("Cancelled."));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reanchor_execute_with_io_dry_run_makes_no_api_calls() {
+        let server = wiremock::MockServer::start().await;
+        let api = mock_api(&server);
+
+        let cmd = reanchor_command(false, true);
+        let mut reader = io::Cursor::new(Vec::new());
+        let mut writer: Vec<u8> = Vec::new();
+        cmd.execute_with_io(&api, &mut reader, &mut writer)
+            .await
+            .unwrap();
+
+        let out = String::from_utf8(writer).unwrap();
+        assert!(out.contains("Would re-anchor inline comment ic1"));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reanchor_execute_with_io_confirmed_proceeds() {
+        let server = wiremock::MockServer::start().await;
+        mount_reanchor_fixture(&server).await;
+        let api = mock_api(&server);
+
+        let cmd = reanchor_command(false, false);
+        let mut reader = io::Cursor::new(b"y\n".to_vec());
+        let mut writer: Vec<u8> = Vec::new();
+        cmd.execute_with_io(&api, &mut reader, &mut writer)
+            .await
+            .unwrap();
+
+        let out = String::from_utf8(writer).unwrap();
+        assert!(out.contains("Re-anchored inline comment ic1"));
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests
+            .iter()
+            .any(|r| r.method == wiremock::http::Method::PUT));
+    }
+
+    /// A writer that fails at a chosen point (`write` or, when writes are
+    /// allowed through, `flush`), for exercising IO-error propagation through
+    /// `execute_with_io`.
+    struct FailingWriter {
+        fail_write: bool,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.fail_write {
+                Err(io::Error::other("writer failed"))
+            } else {
+                Ok(buf.len())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("writer failed"))
+        }
+    }
+
+    #[tokio::test]
+    async fn reanchor_execute_with_io_propagates_prompt_write_error() {
+        let server = wiremock::MockServer::start().await;
+        let api = mock_api(&server);
+
+        // Without --force the guard writes the prompt first; the failing
+        // writer surfaces that IO error before any API call.
+        let cmd = reanchor_command(false, false);
+        let mut reader = io::Cursor::new(b"y\n".to_vec());
+        let mut writer = FailingWriter { fail_write: true };
+        assert!(cmd
+            .execute_with_io(&api, &mut reader, &mut writer)
+            .await
+            .is_err());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reanchor_execute_with_io_propagates_prompt_flush_error() {
+        let server = wiremock::MockServer::start().await;
+        let api = mock_api(&server);
+
+        // Writes go through but the guard's flush after the prompt fails.
+        let cmd = reanchor_command(false, false);
+        let mut reader = io::Cursor::new(b"y\n".to_vec());
+        let mut writer = FailingWriter { fail_write: false };
+        assert!(cmd
+            .execute_with_io(&api, &mut reader, &mut writer)
+            .await
+            .is_err());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reanchor_execute_with_io_propagates_result_write_error() {
+        let server = wiremock::MockServer::start().await;
+        mount_reanchor_fixture(&server).await;
+        let api = mock_api(&server);
+
+        // With --force the guard writes nothing; the re-anchor succeeds and
+        // the failure comes from writing the success message.
+        let cmd = reanchor_command(true, false);
+        let mut reader = io::Cursor::new(Vec::new());
+        let mut writer = FailingWriter { fail_write: true };
+        assert!(cmd
+            .execute_with_io(&api, &mut reader, &mut writer)
+            .await
+            .is_err());
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests
+            .iter()
+            .any(|r| r.method == wiremock::http::Method::PUT));
     }
 }

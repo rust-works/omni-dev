@@ -359,6 +359,17 @@ pub struct ConfluenceComment {
     pub body_adf: Option<serde_json::Value>,
     /// ISO 8601 creation timestamp.
     pub created: String,
+    /// For inline comments: the `id` of the `annotation` mark this comment is
+    /// anchored to inside the page ADF (Confluence's `inlineMarkerRef`). `None`
+    /// for footer comments. Used to locate — and re-anchor — the highlighted run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inline_marker_ref: Option<String>,
+    /// For inline comments: the plaintext the reviewer originally highlighted
+    /// (Confluence's `inlineOriginalSelection`). This is durable — it does not
+    /// drift when the surrounding page text is edited — so it is the ground
+    /// truth for inline-comment drift auditing. `None` for footer comments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inline_original_selection: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -380,6 +391,23 @@ struct ConfluenceCommentEntry {
     version: Option<ConfluenceCommentVersion>,
     #[serde(default)]
     body: Option<ConfluenceCommentBody>,
+    /// Inline-comment anchor metadata. Present on the v2 `inline-comments`
+    /// endpoint regardless of `body-format`; absent for footer comments.
+    #[serde(default)]
+    properties: Option<ConfluenceInlineCommentProperties>,
+}
+
+/// The `properties` object on an inline-comment entry. Both fields are optional
+/// so we deserialize tolerantly across footer comments (no `properties`) and any
+/// future shape changes.
+#[derive(Deserialize)]
+struct ConfluenceInlineCommentProperties {
+    /// The `annotation`-mark `id` this comment is anchored to in the page ADF.
+    #[serde(rename = "inlineMarkerRef", default)]
+    inline_marker_ref: Option<String>,
+    /// The plaintext the reviewer highlighted when the comment was posted.
+    #[serde(rename = "inlineOriginalSelection", default)]
+    inline_original_selection: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1457,12 +1485,18 @@ impl ConfluenceApi {
                     .and_then(|v| v.author_id.clone())
                     .unwrap_or_default();
                 let created = c.version.and_then(|v| v.created_at).unwrap_or_default();
+                let (inline_marker_ref, inline_original_selection) = match c.properties {
+                    Some(p) => (p.inline_marker_ref, p.inline_original_selection),
+                    None => (None, None),
+                };
                 all_comments.push(ConfluenceComment {
                     id: c.id,
                     author,
                     kind,
                     body_adf,
                     created,
+                    inline_marker_ref,
+                    inline_original_selection,
                 });
             }
 
@@ -2612,6 +2646,65 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("500"));
+    }
+
+    // ── get_page_inline_comments (properties) ──────────────────────
+
+    #[tokio::test]
+    async fn get_page_inline_comments_captures_marker_and_original_selection() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/inline-comments",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{
+                        "id": "ic1",
+                        "version": {"authorId": "alice", "createdAt": "2026-01-01T00:00:00Z"},
+                        "properties": {
+                            "inlineMarkerRef": "marker-abc",
+                            "inlineOriginalSelection": "the original highlight"
+                        }
+                    }]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let api = mock_confluence_api(&server);
+        let comments = api.get_page_inline_comments("12345").await.unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].inline_marker_ref.as_deref(), Some("marker-abc"));
+        assert_eq!(
+            comments[0].inline_original_selection.as_deref(),
+            Some("the original highlight")
+        );
+    }
+
+    #[tokio::test]
+    async fn get_page_comments_footer_has_no_inline_properties() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/wiki/api/v2/pages/12345/footer-comments",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{
+                        "id": "fc1",
+                        "version": {"authorId": "bob", "createdAt": "2026-01-01T00:00:00Z"}
+                    }]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let api = mock_confluence_api(&server);
+        let comments = api.get_page_comments("12345").await.unwrap();
+        assert_eq!(comments.len(), 1);
+        assert!(comments[0].inline_marker_ref.is_none());
+        assert!(comments[0].inline_original_selection.is_none());
     }
 
     // ── get_comment_replies ────────────────────────────────────────

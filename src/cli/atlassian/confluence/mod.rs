@@ -129,6 +129,7 @@ mod tests {
                 id: "12345".to_string(),
                 output: None,
                 format: ContentFormat::Jfm,
+                version: None,
             }),
         };
         assert!(matches!(cmd.command, ConfluenceSubcommands::Read(_)));
@@ -319,6 +320,7 @@ mod tests {
                 id: "1".to_string(),
                 output: None,
                 format: ContentFormat::Jfm,
+                version: None,
             }),
         };
         // Single `matches!` site exercised against both a matching and
