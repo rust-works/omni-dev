@@ -48,7 +48,8 @@ omni-dev git branch create pr
 - 🎯 **Conventional Commits**: Automatic detection and formatting
 - 🌐 **Browser Bridge**: Drive HTTP requests through an authenticated browser
   tab without exfiltrating cookies or tokens
-- 🛡️ **Safety First**: Working directory validation and error recovery
+- 🛡️ **Safety First**: Working directory validation, protection against
+  amending commits already in remote main branches, and error recovery
 - ⚡ **Fast & Reliable**: Built with Rust for memory safety and performance
 
 ## 🚀 Quick Start

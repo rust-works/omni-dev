@@ -157,13 +157,18 @@ impl GitRepository {
     pub fn get_commits_in_range(&self, range: &str) -> Result<Vec<CommitInfo>> {
         let mut commits = Vec::new();
 
+        // Resolved once per invocation; containment is checked per commit.
+        let main_tips = crate::git::main_branches::detect_main_branch_tips(&self.repo)?;
+
         if range == "HEAD" {
             // Single HEAD commit
             let head = self.repo.head().context("Failed to get HEAD")?;
             let commit = head
                 .peel_to_commit()
                 .context("Failed to peel HEAD to commit")?;
-            commits.push(CommitInfo::from_git_commit(&self.repo, &commit)?);
+            commits.push(CommitInfo::from_git_commit(
+                &self.repo, &commit, &main_tips,
+            )?);
         } else if range.contains("..") {
             // Range format like HEAD~3..HEAD
             let parts: Vec<&str> = range.split("..").collect();
@@ -212,7 +217,9 @@ impl GitRepository {
                     continue;
                 }
 
-                commits.push(CommitInfo::from_git_commit(&self.repo, &commit)?);
+                commits.push(CommitInfo::from_git_commit(
+                    &self.repo, &commit, &main_tips,
+                )?);
             }
 
             // Reverse to get chronological order (oldest first)
@@ -226,7 +233,9 @@ impl GitRepository {
             let commit = obj
                 .peel_to_commit()
                 .context("Failed to peel object to commit")?;
-            commits.push(CommitInfo::from_git_commit(&self.repo, &commit)?);
+            commits.push(CommitInfo::from_git_commit(
+                &self.repo, &commit, &main_tips,
+            )?);
         }
 
         Ok(commits)
@@ -665,6 +674,60 @@ mod tests {
         git_in(p, &["commit", "-m", "init"]);
         let repo = GitRepository::open_at(p)?;
         assert_eq!(repo.resolve_default_base_branch(), None);
+        Ok(())
+    }
+
+    // ── in_main_branches population (issue #1105) ──────────────────
+
+    #[test]
+    fn commits_in_range_report_main_branch_containment() -> Result<()> {
+        // Work repo on `main` with one pushed commit and one unpushed commit
+        // on top of it.
+        let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
+        std::fs::create_dir_all(&tmp_root)?;
+        let bare = tempfile::tempdir_in(&tmp_root)?;
+        git_in(bare.path(), &["init", "--bare"]);
+
+        let work = init_tmp_repo();
+        let p = work.path();
+        git_in(p, &["checkout", "-b", "main"]);
+        std::fs::write(p.join("a.txt"), "pushed")?;
+        git_in(p, &["add", "."]);
+        git_in(p, &["commit", "-m", "pushed commit"]);
+        #[allow(clippy::unwrap_used)]
+        git_in(
+            p,
+            &["remote", "add", "origin", bare.path().to_str().unwrap()],
+        );
+        git_in(p, &["push", "origin", "main"]);
+        std::fs::write(p.join("b.txt"), "unpushed")?;
+        git_in(p, &["add", "."]);
+        git_in(p, &["commit", "-m", "unpushed commit"]);
+
+        let repo = GitRepository::open_at(p)?;
+        // Single-rev path: the pushed commit is contained in origin/main.
+        let pushed = repo.get_commits_in_range("HEAD~1")?;
+        assert_eq!(pushed.len(), 1);
+        assert_eq!(pushed[0].in_main_branches, vec!["origin/main".to_string()]);
+        // Range path: the unpushed commit on top is not contained.
+        let unpushed = repo.get_commits_in_range("HEAD~1..HEAD")?;
+        assert_eq!(unpushed.len(), 1);
+        assert!(unpushed[0].in_main_branches.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn commits_in_range_empty_containment_without_remotes() -> Result<()> {
+        let work = init_tmp_repo();
+        let p = work.path();
+        std::fs::write(p.join("a.txt"), "x")?;
+        git_in(p, &["add", "."]);
+        git_in(p, &["commit", "-m", "local only"]);
+
+        let repo = GitRepository::open_at(p)?;
+        let commits = repo.get_commits_in_range("HEAD")?;
+        assert_eq!(commits.len(), 1);
+        assert!(commits[0].in_main_branches.is_empty());
         Ok(())
     }
 }
