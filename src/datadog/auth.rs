@@ -3,9 +3,7 @@
 //! Loads and saves Datadog API credentials from/to the
 //! `~/.omni-dev/settings.json` file using the existing `env` map.
 
-use std::fs;
-
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Serialize;
 
 use crate::datadog::error::DatadogError;
@@ -189,26 +187,14 @@ pub(crate) fn save_credentials_to(
     settings_path: &std::path::Path,
     credentials: &DatadogCredentials,
 ) -> Result<()> {
-    let mut settings_value = read_or_default_settings(settings_path)?;
-    ensure_env_object(&mut settings_value);
-
-    let Some(env) = settings_value["env"].as_object_mut() else {
-        anyhow::bail!("Internal error: env key is not an object after initialization");
-    };
-    env.insert(
-        DATADOG_API_KEY.to_string(),
-        serde_json::Value::String(credentials.api_key.expose_secret().to_string()),
-    );
-    env.insert(
-        DATADOG_APP_KEY.to_string(),
-        serde_json::Value::String(credentials.app_key.expose_secret().to_string()),
-    );
-    env.insert(
-        DATADOG_SITE.to_string(),
-        serde_json::Value::String(credentials.site.clone()),
-    );
-
-    write_settings(settings_path, &settings_value)
+    Settings::upsert_env_vars(
+        settings_path,
+        &[
+            (DATADOG_API_KEY, credentials.api_key.expose_secret()),
+            (DATADOG_APP_KEY, credentials.app_key.expose_secret()),
+            (DATADOG_SITE, credentials.site.as_str()),
+        ],
+    )
 }
 
 /// Removes Datadog credential keys from `~/.omni-dev/settings.json`.
@@ -224,60 +210,17 @@ pub fn remove_credentials() -> Result<bool> {
 ///
 /// Tests inject a tempdir path instead of redirecting `HOME` (issue #1030).
 pub(crate) fn remove_credentials_at(settings_path: &std::path::Path) -> Result<bool> {
-    if !settings_path.exists() {
-        return Ok(false);
-    }
-    let mut settings_value = read_or_default_settings(settings_path)?;
-
-    let mut removed = false;
-    if let Some(env) = settings_value
-        .get_mut("env")
-        .and_then(serde_json::Value::as_object_mut)
-    {
-        for key in [DATADOG_API_KEY, DATADOG_APP_KEY, DATADOG_SITE] {
-            if env.remove(key).is_some() {
-                removed = true;
-            }
-        }
-    }
-
-    if removed {
-        write_settings(settings_path, &settings_value)?;
-    }
-    Ok(removed)
-}
-
-fn read_or_default_settings(path: &std::path::Path) -> Result<serde_json::Value> {
-    if path.exists() {
-        let content = fs::read_to_string(path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-        serde_json::from_str(&content)
-            .with_context(|| format!("Failed to parse {}", path.display()))
-    } else {
-        Ok(serde_json::json!({}))
-    }
-}
-
-fn ensure_env_object(value: &mut serde_json::Value) {
-    if !value.get("env").is_some_and(serde_json::Value::is_object) {
-        value["env"] = serde_json::json!({});
-    }
-}
-
-fn write_settings(path: &std::path::Path, value: &serde_json::Value) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create directory {}", parent.display()))?;
-    }
-    let formatted =
-        serde_json::to_string_pretty(value).context("Failed to serialize settings JSON")?;
-    fs::write(path, formatted).with_context(|| format!("Failed to write {}", path.display()))?;
-    Ok(())
+    Settings::remove_env_vars(
+        settings_path,
+        &[DATADOG_API_KEY, DATADOG_APP_KEY, DATADOG_SITE],
+    )
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     // ── Pure helpers (safe to run in parallel) ─────────────────────────
@@ -455,6 +398,14 @@ mod tests {
             assert_eq!(val["env"]["DATADOG_API_KEY"], "api-1");
             assert_eq!(val["env"]["DATADOG_APP_KEY"], "app-1");
             assert_eq!(val["env"]["DATADOG_SITE"], "datadoghq.com");
+
+            // The credential store is created owner-only (issue #1128).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = fs::metadata(&settings_path).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600);
+            }
         }
 
         // ── Part 2: merges into existing settings ──────────────────
