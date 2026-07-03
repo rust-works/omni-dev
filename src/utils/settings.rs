@@ -3,11 +3,14 @@
 //! This module provides functionality to read settings from $HOME/.omni-dev/settings.json
 //! and use them as a fallback for environment variables.
 //!
-//! It also owns the write side: [`Settings::upsert_env_vars`] and
-//! [`Settings::remove_env_vars`] are the only production paths that mutate the
-//! settings file. Because the `env` map holds credentials (Atlassian, Datadog),
-//! every write is hardened: parent directory `0700`, file `0600`, re-tightened
-//! on each write (issue #1128).
+//! It also owns the write side: [`Settings::upsert_env_vars_in`] and
+//! [`Settings::remove_env_vars_in`] (plus their base-`env` shorthands
+//! [`Settings::upsert_env_vars`] / [`Settings::remove_env_vars`]) are the only
+//! production paths that mutate the settings file. Writes target the active
+//! profile's `env` when a profile is given, mirroring the read-side isolation
+//! of [`Settings::resolve_with`] (issue #1116). Because the `env` maps hold
+//! credentials (Atlassian, Datadog), every write is hardened: parent directory
+//! `0700`, file `0600`, re-tightened on each write (issue #1128).
 
 use std::collections::HashMap;
 use std::fs;
@@ -162,28 +165,35 @@ impl Settings {
         }
     }
 
-    /// Merges the given key/value pairs into the `env` object of the settings
-    /// file at `path`, creating the file and its parent directory as needed.
+    /// Merges the given key/value pairs into the base `env` object of the
+    /// settings file at `path` — [`Settings::upsert_env_vars_in`] with no
+    /// profile.
+    pub fn upsert_env_vars(path: &Path, vars: &[(&str, &str)]) -> Result<()> {
+        Self::upsert_env_vars_in(path, None, vars)
+    }
+
+    /// Merges the given key/value pairs into the `env` object targeted by
+    /// `profile` — `profiles.<name>.env` when `Some`, the base `env` when
+    /// `None` — creating the file, its parent directory, and any missing
+    /// intermediate objects as needed. Writes therefore land where
+    /// [`Settings::resolve_with`] will look for them (issue #1116).
+    ///
+    /// A `profile` absent from the file is created rather than rejected; the
+    /// CLI validates the active profile before dispatch, so this only affects
+    /// library callers.
     ///
     /// The file is read and written as a generic JSON value, so every other
-    /// field (profiles, unknown keys) is preserved verbatim. Because the `env`
-    /// map holds credentials, the write is hardened: parent directory `0700`,
-    /// file `0600` (see [`write_settings`]).
-    pub fn upsert_env_vars(path: &Path, vars: &[(&str, &str)]) -> Result<()> {
+    /// field (other profiles, unknown keys) is preserved verbatim. Because the
+    /// `env` maps hold credentials, the write is hardened: parent directory
+    /// `0700`, file `0600` (see [`write_settings`]).
+    pub fn upsert_env_vars_in(
+        path: &Path,
+        profile: Option<&str>,
+        vars: &[(&str, &str)],
+    ) -> Result<()> {
         let mut settings_value = read_or_default_settings(path)?;
 
-        // Ensure the "env" key exists as an object
-        if !settings_value
-            .get("env")
-            .is_some_and(serde_json::Value::is_object)
-        {
-            settings_value["env"] = serde_json::json!({});
-        }
-
-        // Merge keys — safe because we just ensured "env" is an object above
-        let env = settings_value["env"]
-            .as_object_mut()
-            .context("Internal error: env key is not an object after initialization")?;
+        let env = ensure_env_object(&mut settings_value, profile)?;
         for (key, value) in vars {
             env.insert(
                 (*key).to_string(),
@@ -194,24 +204,30 @@ impl Settings {
         write_settings(path, &settings_value)
     }
 
-    /// Removes the given keys from the `env` object of the settings file at
-    /// `path`, leaving all other settings intact.
-    ///
-    /// Returns `true` if any key was present and removed (the file is
-    /// rewritten, hardened as in [`Settings::upsert_env_vars`]), `false` when
-    /// the file did not exist or contained none of the keys (the file is left
-    /// untouched).
+    /// Removes the given keys from the base `env` object of the settings file
+    /// at `path` — [`Settings::remove_env_vars_in`] with no profile.
     pub fn remove_env_vars(path: &Path, keys: &[&str]) -> Result<bool> {
+        Self::remove_env_vars_in(path, None, keys)
+    }
+
+    /// Removes the given keys from the `env` object targeted by `profile`
+    /// (`profiles.<name>.env` when `Some`, the base `env` when `None`),
+    /// leaving all other settings — including the same keys in other env
+    /// maps — intact.
+    ///
+    /// Returns `true` if any key was present in the targeted map and removed
+    /// (the file is rewritten, hardened as in
+    /// [`Settings::upsert_env_vars_in`]), `false` when the file did not
+    /// exist, the targeted map was absent, or it contained none of the keys
+    /// (the file is left untouched).
+    pub fn remove_env_vars_in(path: &Path, profile: Option<&str>, keys: &[&str]) -> Result<bool> {
         if !path.exists() {
             return Ok(false);
         }
         let mut settings_value = read_or_default_settings(path)?;
 
         let mut removed = false;
-        if let Some(env) = settings_value
-            .get_mut("env")
-            .and_then(serde_json::Value::as_object_mut)
-        {
+        if let Some(env) = env_object_mut(&mut settings_value, profile) {
             for key in keys {
                 if env.remove(*key).is_some() {
                     removed = true;
@@ -243,6 +259,55 @@ impl Settings {
             "unknown profile '{name}'; known profiles: {known}"
         ))
     }
+}
+
+/// Navigates `root` to the env object targeted by `profile` — the base `env`
+/// when `None`, `profiles.<name>.env` when `Some` — creating missing
+/// intermediate objects and replacing non-object nodes along the way.
+/// The creating counterpart of [`env_object_mut`], for upserts.
+fn ensure_env_object<'a>(
+    root: &'a mut serde_json::Value,
+    profile: Option<&str>,
+) -> Result<&'a mut serde_json::Map<String, serde_json::Value>> {
+    let parent = match profile {
+        Some(name) => {
+            if !root
+                .get("profiles")
+                .is_some_and(serde_json::Value::is_object)
+            {
+                root["profiles"] = serde_json::json!({});
+            }
+            let profiles = &mut root["profiles"];
+            if !profiles.get(name).is_some_and(serde_json::Value::is_object) {
+                profiles[name] = serde_json::json!({});
+            }
+            &mut profiles[name]
+        }
+        None => root,
+    };
+
+    if !parent.get("env").is_some_and(serde_json::Value::is_object) {
+        parent["env"] = serde_json::json!({});
+    }
+    parent["env"]
+        .as_object_mut()
+        .context("Internal error: env key is not an object after initialization")
+}
+
+/// Navigates `root` to the env object targeted by `profile`, or `None` when
+/// any node on the way is absent or not an object. The non-creating
+/// counterpart of [`ensure_env_object`], for removals.
+fn env_object_mut<'a>(
+    root: &'a mut serde_json::Value,
+    profile: Option<&str>,
+) -> Option<&'a mut serde_json::Map<String, serde_json::Value>> {
+    let parent = match profile {
+        Some(name) => root.get_mut("profiles")?.get_mut(name)?,
+        None => root,
+    };
+    parent
+        .get_mut("env")
+        .and_then(serde_json::Value::as_object_mut)
 }
 
 /// Reads and parses the settings file at `path` as a generic JSON value
@@ -758,5 +823,130 @@ mod tests {
         assert!(!removed);
         // Not rewritten: the raw bytes are exactly as written.
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    // ── profile-targeted env writes (issue #1116) ────────────────────
+
+    #[test]
+    fn upsert_env_vars_in_profile_creates_profile_env() {
+        let (_tmp, path) = temp_settings_path();
+
+        Settings::upsert_env_vars_in(&path, Some("work"), &[("A_KEY", "a")]).unwrap();
+
+        let val = read_json(&path);
+        assert_eq!(val["profiles"]["work"]["env"]["A_KEY"], "a");
+        // The base env map is not touched (read-side isolation mirrored).
+        assert!(val.get("env").is_none());
+
+        // Credential store hardening (issue #1128) applies to profile
+        // writes too: dir 0700, file 0600.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(dir_mode & 0o777, 0o700);
+            let file_mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(file_mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn upsert_env_vars_in_profile_preserves_base_and_other_profiles() {
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{
+                "env": {"SHARED": "base"},
+                "profiles": {
+                    "work": {"env": {"OLD": "keep"}},
+                    "home": {"env": {"SHARED": "home"}}
+                },
+                "extra": true
+            }"#,
+        )
+        .unwrap();
+
+        Settings::upsert_env_vars_in(&path, Some("work"), &[("A_KEY", "a")]).unwrap();
+
+        let val = read_json(&path);
+        assert_eq!(val["profiles"]["work"]["env"]["A_KEY"], "a");
+        assert_eq!(val["profiles"]["work"]["env"]["OLD"], "keep");
+        assert_eq!(val["profiles"]["home"]["env"]["SHARED"], "home");
+        assert_eq!(val["env"]["SHARED"], "base");
+        assert_eq!(val["extra"], true);
+    }
+
+    #[test]
+    fn upsert_env_vars_in_profile_replaces_non_object_nodes() {
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        // "profiles" itself is not an object.
+        fs::write(&path, r#"{"profiles": "bogus"}"#).unwrap();
+        Settings::upsert_env_vars_in(&path, Some("work"), &[("A_KEY", "a")]).unwrap();
+        assert_eq!(read_json(&path)["profiles"]["work"]["env"]["A_KEY"], "a");
+
+        // The profile node is not an object.
+        fs::write(&path, r#"{"profiles": {"work": []}}"#).unwrap();
+        Settings::upsert_env_vars_in(&path, Some("work"), &[("A_KEY", "a")]).unwrap();
+        assert_eq!(read_json(&path)["profiles"]["work"]["env"]["A_KEY"], "a");
+    }
+
+    #[test]
+    fn remove_env_vars_in_profile_removes_only_profile_keys() {
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{
+                "env": {"A_KEY": "base"},
+                "profiles": {"work": {"env": {"A_KEY": "work", "OTHER": "keep"}}}
+            }"#,
+        )
+        .unwrap();
+
+        let removed = Settings::remove_env_vars_in(&path, Some("work"), &["A_KEY"]).unwrap();
+        assert!(removed);
+
+        let val = read_json(&path);
+        assert!(val["profiles"]["work"]["env"].get("A_KEY").is_none());
+        assert_eq!(val["profiles"]["work"]["env"]["OTHER"], "keep");
+        // The base copy of the same key survives.
+        assert_eq!(val["env"]["A_KEY"], "base");
+    }
+
+    #[test]
+    fn remove_env_vars_in_profile_false_when_profile_missing() {
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"{"env": {"A_KEY": "base"}}"#;
+        fs::write(&path, original).unwrap();
+
+        let removed = Settings::remove_env_vars_in(&path, Some("work"), &["A_KEY"]).unwrap();
+        assert!(!removed);
+        // Not rewritten: the raw bytes are exactly as written.
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn remove_env_vars_in_none_targets_base_env() {
+        let (_tmp, path) = temp_settings_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"env": {"A_KEY": "base"}, "profiles": {"work": {"env": {"A_KEY": "work"}}}}"#,
+        )
+        .unwrap();
+
+        let removed = Settings::remove_env_vars_in(&path, None, &["A_KEY"]).unwrap();
+        assert!(removed);
+
+        let val = read_json(&path);
+        assert!(val["env"].get("A_KEY").is_none());
+        assert_eq!(val["profiles"]["work"]["env"]["A_KEY"], "work");
     }
 }

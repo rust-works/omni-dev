@@ -7,6 +7,8 @@ use clap::{Parser, Subcommand};
 
 use crate::atlassian::auth::{self, AtlassianCredentials};
 use crate::atlassian::client::AtlassianClient;
+use crate::utils::env::SystemEnv;
+use crate::utils::settings::active_profile_from;
 
 /// Manages Atlassian Cloud credentials.
 #[derive(Parser)]
@@ -65,8 +67,16 @@ impl LoginCommand {
             api_token: api_token.into(),
         };
 
+        // The wrapper re-resolves the profile internally; this copy only
+        // feeds the confirmation message.
+        let profile = active_profile_from(&SystemEnv);
         auth::save_credentials(&credentials)?;
-        println!("\nCredentials saved to ~/.omni-dev/settings.json");
+        println!(
+            "\nCredentials saved to ~/.omni-dev/settings.json{}",
+            profile
+                .map(|name| format!(" (profile '{name}')"))
+                .unwrap_or_default()
+        );
         println!("  Instance: {instance_url}");
         println!("  Email: {email}");
         println!("\nRun `omni-dev atlassian auth status` to verify.");
