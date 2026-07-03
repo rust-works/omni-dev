@@ -33,12 +33,17 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 
 ### Daemon
 
-- **[Running under the daemon](browser-bridge.md#running-under-the-daemon)** - Host long-lived services (the browser bridge, Snowflake) in one supervised process behind a per-user Unix-domain control socket; `daemon run/start/stop/restart/status` and the optional macOS menu-bar app
+- **[Running under the daemon](browser-bridge.md#running-under-the-daemon)** - Host long-lived services (the browser bridge, Snowflake, worktrees) in one supervised process behind a per-user Unix-domain control socket; `daemon run/start/stop/restart/status` and the optional macOS menu-bar app
 - **[ADR-0039](adrs/adr-0039.md)** - Daemon architecture: service abstraction, Unix-socket control plane, single-instance supervision, and lifecycle
 
 ### Snowflake Integration
 
 - **[Snowflake Service](snowflake-service.md)** - Authenticate once via external-browser SSO, then run concurrent SQL across any account through the daemon's multiplexed session pool; `omni-dev snowflake query/sessions/disconnect`
+
+### Worktrees
+
+- **[Worktrees Service](worktrees-service.md)** - One live registry of the repos and git worktrees open across every VS Code window, fed by a per-window companion extension; `omni-dev worktrees list` and the tray submenu
+- **[ADR-0040](adrs/adr-0040.md)** - Why a resident daemon service (a rendezvous point that ages out dead windows) beats per-window state or a shared file
 
 ### Request Log
 
@@ -72,7 +77,7 @@ Complete documentation for omni-dev - the intelligent Git commit message toolkit
 Each file in [`plan/`](plan/) carries a `**Status:**` header (`Built`, `In Progress`, `Aspirational`, or `Historical`) and may cross-link the ADRs that capture its current architecture. Use a plan to **explore** a design before high-level decisions stabilise; promote it to an [ADR](adrs/README.md) once the decisions firm up; document the *current* user-facing behaviour in [user-guide.md](user-guide.md). Once a plan's decisions are fully captured by ADRs, change its status to `Built` (with ADR cross-links) or `Historical` rather than deleting it — the prior reasoning stays discoverable. See [STYLE-0027](STYLE_GUIDE.md#style-0027-plan-file-status-header-and-adr-cross-links) for the full convention.
 
 - **[Project Plan](plan/project.md)** *(Historical)* - Initial CLI architecture predating Atlassian/MCP/AI providers
-- **[Twiddle Design](plan/twiddle.md)** *(In Progress)* - Phases 1 and 2 built; Phase 3 (contextual intelligence) aspirational
+- **[Twiddle Design](plan/twiddle.md)** *(In Progress)* - Phases 1–3 built, including contextual intelligence; later polish/edge-case phases aspirational
 - **[Help All Command](plan/help-all-command.md)** *(Built)* - Comprehensive help system design
 - **[Config Internals](plan/config-internals.md)** *(Built, canonical reference)* - How configuration resolution works · [ADR-0005](adrs/adr-0005.md) · [ADR-0018](adrs/adr-0018.md) · [ADR-0019](adrs/adr-0019.md)
 - **[AI Client](plan/AiClient.md)** *(Built)* - Multi-provider AI abstraction · [ADR-0002](adrs/adr-0002.md) · [ADR-0014](adrs/adr-0014.md)
@@ -138,6 +143,7 @@ Each file in [`plan/`](plan/) carries a `**Status:**` header (`Built`, `In Progr
 | **Atlassian Integration** | [User Guide - Atlassian](user-guide.md#atlassian---jira-and-confluence-integration) | [JFM Spec](specs/jfm.md) |
 | **Datadog Integration** | [Datadog Guide](datadog.md) | [User Guide - Datadog](user-guide.md#datadog-integration) · [README - Datadog](../README.md#-datadog-integration-read-only) |
 | **MCP Server** | [MCP Reference](mcp.md) | [README - MCP Server](../README.md#-mcp-server) |
+| **Worktrees View** | [Worktrees Service](worktrees-service.md) | [ADR-0040](adrs/adr-0040.md) · [README - Worktrees](../README.md#️-worktrees) |
 
 ## 🔗 External Resources
 

@@ -102,8 +102,9 @@ Types we use: feat, fix, docs, chore, refactor, test.
 That's enough for omni-dev to bias suggestions toward your project. For
 the full schema (multiple scopes, `file_patterns`, local overrides,
 monorepo setups) see the [Configuration Guide](configuration.md) and
-[Configuration Best Practices](configuration-best-practices.md).
-<!-- TODO: replace with link to .omni-dev contract doc once issue #765 lands -->
+[Configuration Best Practices](configuration-best-practices.md); the
+[`.omni-dev/` Directory Contract](omni-dev-directory.md) is the canonical
+reference for every recognised file, its format, and the precedence rules.
 
 ## 4. Improve your first commit
 
