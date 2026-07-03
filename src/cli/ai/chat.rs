@@ -10,24 +10,24 @@ use crossterm::{
 };
 
 /// Interactive AI chat session.
+///
+/// Model selection uses the global `--model` flag (propagated as
+/// `OMNI_DEV_MODEL`) and the per-backend env chain; there is no
+/// subcommand-local flag.
 #[derive(Parser)]
-pub struct ChatCommand {
-    /// AI model to use (overrides environment configuration).
-    #[arg(long)]
-    pub model: Option<String>,
-}
+pub struct ChatCommand {}
 
 impl ChatCommand {
     /// Executes the chat command.
     pub async fn execute(self) -> Result<()> {
-        let ai_info = crate::utils::preflight::check_ai_credentials(self.model.as_deref())?;
+        let ai_info = crate::utils::preflight::check_ai_credentials(None)?;
         eprintln!(
             "Connected to {} (model: {})",
             ai_info.provider, ai_info.model
         );
         eprintln!("Enter to send, Shift+Enter for newline, Ctrl+D to exit.\n");
 
-        let client = crate::claude::create_default_claude_client(self.model, None).await?;
+        let client = crate::claude::create_default_claude_client(None, None).await?;
 
         chat_loop(&client).await
     }
@@ -155,6 +155,9 @@ mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     const KEYS: &[&str] = &[
+        "OMNI_DEV_AI_BACKEND",
+        "OMNI_DEV_MODEL",
+        "OMNI_DEV_BETA_HEADER",
         "USE_OPENAI",
         "USE_OLLAMA",
         "CLAUDE_CODE_USE_BEDROCK",

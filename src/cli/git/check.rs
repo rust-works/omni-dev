@@ -3,8 +3,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use super::parse_beta_header;
-
 /// Check command options - validates commit messages against guidelines.
 #[derive(Parser)]
 pub struct CheckCommand {
@@ -13,15 +11,6 @@ pub struct CheckCommand {
     /// (origin/main, origin/master, main, or master).
     #[arg(value_name = "COMMIT_RANGE")]
     pub commit_range: Option<String>,
-
-    /// Claude API model to use (if not specified, uses settings or default).
-    #[arg(long)]
-    pub model: Option<String>,
-
-    /// Beta header to send with API requests (format: key:value).
-    /// Only sent if the model supports it in the registry.
-    #[arg(long, value_name = "KEY:VALUE")]
-    pub beta_header: Option<String>,
 
     /// Path to custom context directory (defaults to .omni-dev/).
     #[arg(long)]
@@ -93,9 +82,11 @@ impl CheckCommand {
         // Parse output format
         let output_format: OutputFormat = self.format.parse().unwrap_or(OutputFormat::Text);
 
-        // Preflight check: validate AI credentials before any processing
-        let ai_info =
-            crate::utils::check_ai_command_prerequisites(self.model.as_deref(), repo_root)?;
+        // Preflight check: validate AI credentials before any processing.
+        // Model/beta-header selection uses the global `--model`/`--beta-header`
+        // flags (propagated as OMNI_DEV_MODEL/OMNI_DEV_BETA_HEADER) and the
+        // per-backend env chain.
+        let ai_info = crate::utils::check_ai_command_prerequisites(None, repo_root)?;
         if !self.quiet && output_format == OutputFormat::Text {
             println!(
                 "✓ {} credentials verified (model: {})",
@@ -134,13 +125,7 @@ impl CheckCommand {
         }
 
         // 4. Initialize Claude client
-        let beta = self
-            .beta_header
-            .as_deref()
-            .map(parse_beta_header)
-            .transpose()?;
-        let claude_client =
-            crate::claude::create_default_claude_client(self.model.clone(), beta).await?;
+        let claude_client = crate::claude::create_default_claude_client(None, None).await?;
 
         if self.verbose && output_format == OutputFormat::Text {
             self.show_model_info(&claude_client)?;
@@ -1481,8 +1466,6 @@ mod tests {
     fn make_check_cmd(quiet: bool) -> CheckCommand {
         CheckCommand {
             commit_range: None,
-            model: None,
-            beta_header: None,
             context_dir: None,
             guidelines: None,
             format: "text".to_string(),

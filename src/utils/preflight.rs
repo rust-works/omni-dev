@@ -64,12 +64,15 @@ pub(crate) fn check_ai_credentials_with(
     env: &impl crate::utils::env::EnvSource,
     model_override: Option<&str>,
 ) -> Result<AiCredentialInfo> {
-    // The `claude -p` subprocess backend is checked first so it wins over
-    // the existing USE_* flags if multiple are set. Credentials for this
-    // backend live inside the `claude` binary's own auth state, so we just
-    // verify the binary is on PATH.
-    if let Some(val) = env.var("OMNI_DEV_AI_BACKEND") {
-        if matches!(val.as_str(), "claude-cli" | "claude_cli") {
+    use crate::claude::backend::{self, AiBackend};
+
+    let ai_backend = backend::resolve_backend(env)?;
+    let model = backend::resolve_model(ai_backend, model_override, env, get_model_registry());
+
+    match ai_backend {
+        // Credentials for the `claude -p` subprocess backend live inside the
+        // `claude` binary's own auth state, so we just verify the binary runs.
+        AiBackend::ClaudeCli => {
             let binary = env
                 .var("OMNI_DEV_CLAUDE_CLI_BIN")
                 .unwrap_or_else(|| "claude".to_string());
@@ -77,24 +80,10 @@ pub(crate) fn check_ai_credentials_with(
                 .arg("--version")
                 .output();
             match probe {
-                Ok(out) if out.status.success() => {
-                    let registry = get_model_registry();
-                    let model = model_override
-                        .map(String::from)
-                        .or_else(|| env.var("CLAUDE_MODEL"))
-                        .or_else(|| env.var("CLAUDE_CODE_MODEL"))
-                        .or_else(|| env.var("ANTHROPIC_MODEL"))
-                        .unwrap_or_else(|| {
-                            registry
-                                .get_default_model("claude")
-                                .unwrap_or("claude-sonnet-4-6")
-                                .to_string()
-                        });
-                    return Ok(AiCredentialInfo {
-                        provider: AiProvider::ClaudeCli,
-                        model,
-                    });
-                }
+                Ok(out) if out.status.success() => Ok(AiCredentialInfo {
+                    provider: AiProvider::ClaudeCli,
+                    model,
+                }),
                 _ => bail!(
                     "Claude Code CLI not available at '{binary}'.\n\
                      Install it from https://github.com/anthropics/claude-code \
@@ -102,126 +91,76 @@ pub(crate) fn check_ai_credentials_with(
                 ),
             }
         }
-    }
 
-    // Check provider selection flags
-    let use_openai = env.var("USE_OPENAI").is_some_and(|val| val == "true");
-
-    let use_ollama = env.var("USE_OLLAMA").is_some_and(|val| val == "true");
-
-    let use_bedrock = env
-        .var("CLAUDE_CODE_USE_BEDROCK")
-        .is_some_and(|val| val == "true");
-
-    // Check Ollama (no credentials required, just model)
-    if use_ollama {
-        let model = model_override
-            .map(String::from)
-            .or_else(|| env.var("OLLAMA_MODEL"))
-            .unwrap_or_else(|| "llama2".to_string());
-
-        return Ok(AiCredentialInfo {
+        // Ollama needs no credentials, just a model.
+        AiBackend::Ollama => Ok(AiCredentialInfo {
             provider: AiProvider::Ollama,
             model,
-        });
-    }
+        }),
 
-    // Check OpenAI
-    if use_openai {
-        let registry = get_model_registry();
-        let model = model_override
-            .map(String::from)
-            .or_else(|| env.var("OPENAI_MODEL"))
-            .unwrap_or_else(|| {
-                registry
-                    .get_default_model("openai")
-                    .unwrap_or("gpt-5")
-                    .to_string()
-            });
-
-        // Verify API key exists
-        env.var_any(&["OPENAI_API_KEY", "OPENAI_AUTH_TOKEN"])
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "OpenAI API key not found.\n\
+        AiBackend::OpenAi => {
+            // Verify API key exists
+            env.var_any(&["OPENAI_API_KEY", "OPENAI_AUTH_TOKEN"])
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "OpenAI API key not found.\n\
                  Set one of these environment variables:\n\
                  - OPENAI_API_KEY\n\
                  - OPENAI_AUTH_TOKEN"
+                    )
+                })?;
+
+            Ok(AiCredentialInfo {
+                provider: AiProvider::OpenAi,
+                model,
+            })
+        }
+
+        AiBackend::Bedrock => {
+            // Verify Bedrock configuration
+            env.var("ANTHROPIC_AUTH_TOKEN").ok_or_else(|| {
+                anyhow::anyhow!(
+                    "AWS Bedrock authentication not configured.\n\
+                 Set ANTHROPIC_AUTH_TOKEN environment variable."
                 )
             })?;
 
-        return Ok(AiCredentialInfo {
-            provider: AiProvider::OpenAi,
-            model,
-        });
-    }
-
-    // Check Bedrock
-    if use_bedrock {
-        let registry = get_model_registry();
-        let model = model_override
-            .map(String::from)
-            .or_else(|| env.var("ANTHROPIC_MODEL"))
-            .unwrap_or_else(|| {
-                registry
-                    .get_default_model("claude")
-                    .unwrap_or("claude-sonnet-4-6")
-                    .to_string()
-            });
-
-        // Verify Bedrock configuration
-        env.var("ANTHROPIC_AUTH_TOKEN").ok_or_else(|| {
-            anyhow::anyhow!(
-                "AWS Bedrock authentication not configured.\n\
-                 Set ANTHROPIC_AUTH_TOKEN environment variable."
-            )
-        })?;
-
-        env.var("ANTHROPIC_BEDROCK_BASE_URL").ok_or_else(|| {
-            anyhow::anyhow!(
-                "AWS Bedrock base URL not configured.\n\
+            env.var("ANTHROPIC_BEDROCK_BASE_URL").ok_or_else(|| {
+                anyhow::anyhow!(
+                    "AWS Bedrock base URL not configured.\n\
                  Set ANTHROPIC_BEDROCK_BASE_URL environment variable."
-            )
-        })?;
+                )
+            })?;
 
-        return Ok(AiCredentialInfo {
-            provider: AiProvider::Bedrock,
-            model,
-        });
-    }
+            Ok(AiCredentialInfo {
+                provider: AiProvider::Bedrock,
+                model,
+            })
+        }
 
-    // Default: Claude API
-    let registry = get_model_registry();
-    let model = model_override
-        .map(String::from)
-        .or_else(|| env.var("ANTHROPIC_MODEL"))
-        .unwrap_or_else(|| {
-            registry
-                .get_default_model("claude")
-                .unwrap_or("claude-sonnet-4-6")
-                .to_string()
-        });
-
-    // Verify API key exists
-    env.var_any(&[
-        "CLAUDE_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-    ])
-    .ok_or_else(|| {
-        anyhow::anyhow!(
-            "Claude API key not found.\n\
+        AiBackend::Default => {
+            // Verify API key exists
+            env.var_any(&[
+                "CLAUDE_API_KEY",
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+            ])
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Claude API key not found.\n\
                  Set one of these environment variables:\n\
                  - CLAUDE_API_KEY\n\
                  - ANTHROPIC_API_KEY\n\
                  - ANTHROPIC_AUTH_TOKEN"
-        )
-    })?;
+                )
+            })?;
 
-    Ok(AiCredentialInfo {
-        provider: AiProvider::Claude,
-        model,
-    })
+            Ok(AiCredentialInfo {
+                provider: AiProvider::Claude,
+                model,
+            })
+        }
+    }
 }
 
 /// Validates that GitHub CLI is available and authenticated.
@@ -507,6 +446,96 @@ mod tests {
             chain.contains("Claude Code CLI not available"),
             "unexpected error: {chain}"
         );
+    }
+
+    #[test]
+    fn backend_env_var_overrides_legacy_use_flags() {
+        // OMNI_DEV_AI_BACKEND=openai wins even though USE_OLLAMA is set.
+        let env = MapEnv::new()
+            .with("OMNI_DEV_AI_BACKEND", "openai")
+            .with("USE_OLLAMA", "true")
+            .with("OPENAI_API_KEY", "sk-test-dummy");
+
+        let info = check_ai_credentials_with(&env, None).unwrap();
+        assert_eq!(info.provider, AiProvider::OpenAi);
+        assert_eq!(info.model, "gpt-5-mini");
+    }
+
+    #[test]
+    fn backend_default_value_forces_direct_api() {
+        // `--ai-backend default` propagates as OMNI_DEV_AI_BACKEND=default and
+        // must override the USE_* soup.
+        let env = MapEnv::new()
+            .with("OMNI_DEV_AI_BACKEND", "default")
+            .with("USE_OLLAMA", "true")
+            .with("ANTHROPIC_API_KEY", "sk-test-dummy");
+
+        let info = check_ai_credentials_with(&env, None).unwrap();
+        assert_eq!(info.provider, AiProvider::Claude);
+    }
+
+    #[test]
+    fn backend_env_var_selects_ollama_and_bedrock() {
+        let env = MapEnv::new().with("OMNI_DEV_AI_BACKEND", "ollama");
+        let info = check_ai_credentials_with(&env, None).unwrap();
+        assert_eq!(info.provider, AiProvider::Ollama);
+        assert_eq!(info.model, "llama2");
+
+        let env = MapEnv::new()
+            .with("OMNI_DEV_AI_BACKEND", "bedrock")
+            .with("ANTHROPIC_AUTH_TOKEN", "tok")
+            .with("ANTHROPIC_BEDROCK_BASE_URL", "https://bedrock.example.com");
+        let info = check_ai_credentials_with(&env, None).unwrap();
+        assert_eq!(info.provider, AiProvider::Bedrock);
+    }
+
+    #[test]
+    fn unknown_backend_value_is_hard_error() {
+        let env = MapEnv::new()
+            .with("OMNI_DEV_AI_BACKEND", "junk")
+            .with("ANTHROPIC_API_KEY", "sk-test-dummy");
+
+        let err = check_ai_credentials_with(&env, None).expect_err("unknown backend must error");
+        assert!(format!("{err:#}").contains("junk"));
+    }
+
+    #[test]
+    fn claude_api_honours_claude_model_chain() {
+        // The headline #1118 bug: CLAUDE_MODEL / CLAUDE_CODE_MODEL were
+        // silently ignored by the direct-API and Bedrock paths.
+        let env = MapEnv::new()
+            .with("CLAUDE_MODEL", "claude-opus-4-6")
+            .with("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+            .with("ANTHROPIC_API_KEY", "sk-test-dummy");
+
+        let info = check_ai_credentials_with(&env, None).unwrap();
+        assert_eq!(info.provider, AiProvider::Claude);
+        assert_eq!(info.model, "claude-opus-4-6");
+    }
+
+    #[test]
+    fn bedrock_honours_claude_model_chain() {
+        let env = MapEnv::new()
+            .with("CLAUDE_CODE_USE_BEDROCK", "true")
+            .with("CLAUDE_CODE_MODEL", "claude-opus-4-6")
+            .with("ANTHROPIC_AUTH_TOKEN", "tok")
+            .with("ANTHROPIC_BEDROCK_BASE_URL", "https://bedrock.example.com");
+
+        let info = check_ai_credentials_with(&env, None).unwrap();
+        assert_eq!(info.provider, AiProvider::Bedrock);
+        assert_eq!(info.model, "claude-opus-4-6");
+    }
+
+    #[test]
+    fn omni_dev_model_beats_provider_var() {
+        let env = MapEnv::new()
+            .with("USE_OPENAI", "true")
+            .with("OMNI_DEV_MODEL", "gpt-4.1")
+            .with("OPENAI_MODEL", "gpt-5-mini")
+            .with("OPENAI_API_KEY", "sk-test-dummy");
+
+        let info = check_ai_credentials_with(&env, None).unwrap();
+        assert_eq!(info.model, "gpt-4.1");
     }
 
     #[test]
