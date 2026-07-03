@@ -53,6 +53,13 @@ started, or that survives a daemon restart, will heartbeat against an empty map.
 The daemon answers `{ known: false }`, which is the companion's signal to
 re-`register`. No state is persisted to make this work.
 
+The registry is also **capped at 256 windows** (#1140): where the TTL bounds how
+*stale* an entry can get, the cap bounds how *many* can exist, so a misbehaving
+client flooding `register` with distinct keys cannot grow daemon memory faster
+than the TTL reaps it. A `register` that would exceed the cap evicts the
+longest-silent entry instead of failing; an evicted live window comes back
+through the normal `{ known: false }` heartbeat path within ~10 s.
+
 ## CLI
 
 ```bash
@@ -135,6 +142,9 @@ Where:
 - `key` — a stable per-window identifier the companion **generates once per
   `activate()`** (a UUID). The daemon does not derive identity from
   `vscode.env.sessionId`; report it (and `pid`) only as metadata.
+- `register` never errors because of registry pressure: past the 256-entry cap
+  it evicts the longest-silent entry rather than rejecting, so the companion
+  needs no retry logic (an evicted window re-registers off its next heartbeat).
 - `folders` — absolute workspace-folder paths.
 - A `list` `entry` is `{ key, folders[], repo?, title?, pid?, last_seen }` with
   `last_seen` as an RFC 3339 timestamp; consumers compute age from it. Entries are
