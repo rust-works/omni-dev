@@ -16,6 +16,12 @@
       "Bash(cargo build *)",
       "Bash(cargo fmt *)",
       "Bash(cargo insta *)",
+      "Bash(cargo check *)",
+      "Bash(cargo llvm-cov *)",
+      "Bash(cargo deny check *)",
+      "Bash(./scripts/build.sh)",
+      "Bash(./scripts/build.sh *)",
+      "Bash(omni-dev git commit message view *)",
       "mcp__omni-dev__git_check_commits",
       "Read(//Users/jky/.claude/plans/**)"
     ]
