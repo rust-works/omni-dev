@@ -46,14 +46,80 @@ pub fn token_path_for_socket(socket: &Path) -> PathBuf {
 
 /// Creates `dir` (and ancestors) if absent and tightens it to owner-only
 /// (`0700`) on Unix.
+///
+/// On Unix the mode is passed to `mkdir(2)` itself, so no directory is ever
+/// looser than `0700` even for an instant (the umask can only clear bits); the
+/// follow-up `chmod` re-tightens pre-existing directories and guarantees the
+/// exact mode under exotic umasks (#1139).
 pub fn ensure_dir_0700(dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dir)
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(dir)
         .with_context(|| format!("failed to create directory {}", dir.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
             .with_context(|| format!("failed to set 0700 on {}", dir.display()))?;
+    }
+    Ok(())
+}
+
+/// Writes `contents` to `path`, owner read/write only (`0600`) from birth on
+/// Unix.
+///
+/// The mode is passed to `open(2)` at creation, so a fresh file is never
+/// group/world-readable even for an instant; a pre-existing looser-perm file
+/// is re-tightened via [`ensure_handle_0600`] *before* the contents land in it
+/// (#1132). On non-Unix platforms this is a plain truncating write.
+pub fn write_file_0600(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to create file {}", path.display()))?;
+    ensure_handle_0600(&file)
+        .with_context(|| format!("failed to set 0600 on {}", path.display()))?;
+    file.write_all(contents)
+        .with_context(|| format!("failed to write file {}", path.display()))?;
+    Ok(())
+}
+
+/// Tightens an open file to owner read/write only (`0600`) on Unix if its
+/// current mode is any looser.
+///
+/// Operates on the handle (`fchmod(2)`), so there is no path race and the
+/// umask does not apply. No-op on non-Unix platforms.
+pub fn ensure_handle_0600(file: &std::fs::File) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = file
+            .metadata()
+            .context("failed to read file metadata")?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .context("failed to set 0600 on open file")?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
     }
     Ok(())
 }
@@ -117,6 +183,38 @@ mod tests {
         check_socket_path_len(Path::new("/tmp/short.sock")).unwrap();
         let too_long = PathBuf::from(format!("/{}", "a".repeat(MAX_SOCKET_PATH_LEN)));
         assert!(check_socket_path_len(&too_long).is_err());
+    }
+
+    #[test]
+    fn write_file_0600_creates_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("fresh.token");
+        write_file_0600(&file, b"secret").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"secret");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_0600_retightens_preexisting_loose_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("stale.token");
+        std::fs::write(&file, "old-secret-with-longer-content").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_file_0600(&file, b"new").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"new");
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

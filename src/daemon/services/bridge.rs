@@ -85,14 +85,14 @@ impl BridgeService {
     }
 }
 
-/// Writes `token` to `path` (`0600`), creating its parent directory (`0700`).
+/// Writes `token` to `path` (`0600` from birth, #1132), creating its parent
+/// directory (`0700`).
 fn write_token(path: &Path, token: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         paths::ensure_dir_0700(parent)?;
     }
-    std::fs::write(path, token)
+    paths::write_file_0600(path, token.as_bytes())
         .with_context(|| format!("failed to write token file {}", path.display()))?;
-    paths::set_file_0600(path)?;
     Ok(())
 }
 
@@ -334,6 +334,22 @@ mod tests {
         BridgeService::start(config, None, token_path)
             .await
             .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_token_retightens_preexisting_loose_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge.token");
+        std::fs::write(&path, "stale-token").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_token(&path, "fresh-token").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fresh-token");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[tokio::test]
