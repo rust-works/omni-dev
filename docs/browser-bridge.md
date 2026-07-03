@@ -316,8 +316,10 @@ bridge runs.
 ### Resource & robustness limits
 - Per-request timeout (`--request-timeout`, default 30s → `504`), max response
   body size (`--max-body-bytes`), and a concurrency cap (`--max-concurrent`).
-- **Fail-closed binding**: ports bind without `SO_REUSEADDR`; if a fixed port is
-  taken, the bridge exits rather than racing a squatter.
+- **Fail-closed binding**: ports bind with `SO_REUSEADDR` so a restart can rebind
+  through a lingering `TIME_WAIT` (#990); a live listener on a fixed port still
+  yields `EADDRINUSE` and the bridge exits rather than racing a squatter
+  (`SO_REUSEADDR` ≠ `SO_REUSEPORT`).
 - Caller header names/values with CR/LF are rejected; the request path is
   normalized and traversal-checked before the `/__bridge/` routing split.
 
