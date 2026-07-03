@@ -44,6 +44,17 @@ pub fn token_path_for_socket(socket: &Path) -> PathBuf {
     )
 }
 
+/// The daemon log file co-located with a control socket
+/// (`<socket dir>/daemon.log`).
+///
+/// A custom `--socket` keeps its log beside it. The non-macOS `daemon start`
+/// launcher appends the detached daemon's stdout/stderr here.
+pub fn log_path_for_socket(socket: &Path) -> PathBuf {
+    socket
+        .parent()
+        .map_or_else(|| PathBuf::from("daemon.log"), |dir| dir.join("daemon.log"))
+}
+
 /// Creates `dir` (and ancestors) if absent and tightens it to owner-only
 /// (`0700`) on Unix.
 ///
@@ -175,6 +186,19 @@ mod tests {
         assert_eq!(
             token_path_for_socket(Path::new("daemon.sock")),
             Path::new("bridge.token")
+        );
+    }
+
+    #[test]
+    fn log_sits_beside_its_socket() {
+        assert_eq!(
+            log_path_for_socket(Path::new("/tmp/x/daemon.sock")),
+            Path::new("/tmp/x/daemon.log")
+        );
+        // A bare filename (parent is the empty path) still yields a log name.
+        assert_eq!(
+            log_path_for_socket(Path::new("daemon.sock")),
+            Path::new("daemon.log")
         );
     }
 
