@@ -372,6 +372,22 @@ As of `SCHEMA_VERSION 56.0.9-2026-06-30`, the validator covers:
   `status.color`, `heading.level`, etc.), reported as
   `AdfSchemaViolation::MissingAttr` / `InvalidAttr`.
 
+### Nesting depth limit
+
+JFM → ADF conversion caps nesting at **64 levels** (issue #1130):
+
+- **Block containers** (blockquotes, lists, panels, expands, layout columns,
+  directive-table cells) past the cap fail the conversion with a clean
+  "maximum depth" error.
+- **Inline nesting** (emphasis, strikethrough, link text, bracketed spans,
+  `:span` directives) past the cap degrades gracefully: the remaining run is
+  emitted as literal text.
+
+The opposite ADF → JFM direction is independently bounded by serde_json's
+128-level recursion limit when the ADF JSON is parsed. Realistic documents
+nest well under 20 levels; the cap exists to stop pathological input from
+overflowing the stack.
+
 ## Generic Directive System
 
 JFM uses the CommonMark Generic Directives proposal to represent ADF-specific
