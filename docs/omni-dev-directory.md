@@ -39,7 +39,7 @@ chain — see [settings.json](#settingsjson).
 | `models.yaml` | AI model catalog overrides | YAML | project / user / embedded | Chain B | [`src/claude/model_config.rs:178`](../src/claude/model_config.rs#L178) |
 | `context/feature-contexts/*.yaml` | Per-feature AI prompt context fragments | YAML | inside the active `.omni-dev/` (plus `local/` override) | Chain A (variant) | [`src/claude/context/discovery.rs:502`](../src/claude/context/discovery.rs#L502) |
 | `local/<any>` | Gitignored personal overrides for any of the above | follows the underlying file | personal | top of Chain A | [`src/claude/context/discovery.rs:44`](../src/claude/context/discovery.rs#L44) |
-| `~/.omni-dev/settings.json` | API credentials and env-var fallbacks (Atlassian / Datadog / etc.) | JSON | user (home) only | none — single path | [`src/utils/settings.rs:52`](../src/utils/settings.rs#L52) |
+| `~/.omni-dev/settings.json` | API credentials and env-var fallbacks (Atlassian / Datadog / etc.); written `0600` inside a `0700` dir | JSON | user (home) only | none — single path | [`src/utils/settings.rs:127`](../src/utils/settings.rs#L127) |
 
 Missing files are not an error. Each loader falls through to a lower-precedence
 tier (or to the embedded default, where one exists) and omni-dev continues.
@@ -105,11 +105,19 @@ design.
 ### Settings (`~/.omni-dev/settings.json`)
 
 `Settings::get_settings_path` in
-[`src/utils/settings.rs:49-53`](../src/utils/settings.rs#L49-L53) returns a
+[`src/utils/settings.rs:127`](../src/utils/settings.rs#L127) returns a
 single path: `$HOME/.omni-dev/settings.json`. There is no walk-up, no
 project-scoped equivalent, and no XDG fallback. This is intentional:
 credentials are personal and should never be checked into a project's
 `.omni-dev/`.
+
+All writes go through `Settings::upsert_env_vars` / `Settings::remove_env_vars`
+(the Atlassian and Datadog `auth login` / `logout` flows). Because the `env`
+map holds credentials, the file is created `0600` inside a `0700`
+`~/.omni-dev/` and re-tightened on every write
+([`src/utils/settings.rs:265`](../src/utils/settings.rs#L265), issue #1128) —
+the same owner-only posture as the daemon's runtime state
+([`src/daemon/paths.rs`](../src/daemon/paths.rs)).
 
 ## File specs
 
@@ -236,7 +244,7 @@ JSON file at `~/.omni-dev/settings.json` containing an `env` map. Each key
 corresponds to an environment variable name that omni-dev (or one of its
 sub-clients) consults; values are used **as a fallback** for the actual
 environment — real environment variables always win. See
-[`src/utils/settings.rs:56-65`](../src/utils/settings.rs#L56-L65).
+[`src/utils/settings.rs:60-71`](../src/utils/settings.rs#L60-L71).
 
 Minimal valid example:
 
@@ -327,11 +335,11 @@ current source — you can grep your logs against them verbatim.
 
 | File:line | Level | Trigger | Message |
 |---|---|---|---|
-| [`src/utils/settings.rs:41-42`](../src/utils/settings.rs#L41-L42) | `Result::Err` (propagated via `anyhow::Context`) | File exists but cannot be read | `Failed to read settings file: {}` |
-| [`src/utils/settings.rs:44-45`](../src/utils/settings.rs#L44-L45) | `Result::Err` (propagated via `anyhow::Context`) | File exists but is not valid JSON or does not match the `Settings` schema | `Failed to parse settings file: {}` |
+| [`src/utils/settings.rs:119-120`](../src/utils/settings.rs#L119-L120) | `Result::Err` (propagated via `anyhow::Context`) | File exists but cannot be read | `Failed to read settings file: {}` |
+| [`src/utils/settings.rs:122-123`](../src/utils/settings.rs#L122-L123) | `Result::Err` (propagated via `anyhow::Context`) | File exists but is not valid JSON or does not match the `Settings` schema | `Failed to parse settings file: {}` |
 
 Missing `~/.omni-dev/settings.json` is silent (see
-[`src/utils/settings.rs:34-37`](../src/utils/settings.rs#L34-L37)) — `load`
+[`src/utils/settings.rs:113-116`](../src/utils/settings.rs#L113-L116)) — `load`
 returns an empty `Settings { env: {} }`.
 
 ### `commit-guidelines.md` / `pr-guidelines.md`

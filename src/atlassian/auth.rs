@@ -3,9 +3,7 @@
 //! Loads and saves Atlassian Cloud API credentials from/to the
 //! `~/.omni-dev/settings.json` file using the existing `env` map.
 
-use std::fs;
-
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Serialize;
 
 use crate::atlassian::error::AtlassianError;
@@ -136,56 +134,24 @@ pub fn status() -> AuthStatus {
 /// Reads the existing settings file, merges the new credential keys into
 /// the `env` map, and writes back. Preserves all other settings.
 pub fn save_credentials(credentials: &AtlassianCredentials) -> Result<()> {
-    let settings_path = Settings::get_settings_path()?;
+    save_credentials_to(&Settings::get_settings_path()?, credentials)
+}
 
-    // Read existing settings as a generic JSON value to preserve unknown fields
-    let mut settings_value: serde_json::Value = if settings_path.exists() {
-        let content = fs::read_to_string(&settings_path)
-            .with_context(|| format!("Failed to read {}", settings_path.display()))?;
-        serde_json::from_str(&content)
-            .with_context(|| format!("Failed to parse {}", settings_path.display()))?
-    } else {
-        serde_json::json!({})
-    };
-
-    // Ensure the "env" key exists as an object
-    if !settings_value
-        .get("env")
-        .is_some_and(serde_json::Value::is_object)
-    {
-        settings_value["env"] = serde_json::json!({});
-    }
-
-    // Merge credential keys — safe because we just ensured "env" is an object above
-    let Some(env) = settings_value["env"].as_object_mut() else {
-        anyhow::bail!("Internal error: env key is not an object after initialization");
-    };
-    env.insert(
-        ATLASSIAN_INSTANCE_URL.to_string(),
-        serde_json::Value::String(credentials.instance_url.clone()),
-    );
-    env.insert(
-        ATLASSIAN_EMAIL.to_string(),
-        serde_json::Value::String(credentials.email.clone()),
-    );
-    env.insert(
-        ATLASSIAN_API_TOKEN.to_string(),
-        serde_json::Value::String(credentials.api_token.expose_secret().to_string()),
-    );
-
-    // Ensure parent directory exists
-    if let Some(parent) = settings_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create directory {}", parent.display()))?;
-    }
-
-    // Write back
-    let formatted = serde_json::to_string_pretty(&settings_value)
-        .context("Failed to serialize settings JSON")?;
-    fs::write(&settings_path, formatted)
-        .with_context(|| format!("Failed to write {}", settings_path.display()))?;
-
-    Ok(())
+/// [`save_credentials`], writing to an explicit settings-file path.
+///
+/// Tests inject a tempdir path instead of redirecting `HOME` (issue #1030).
+pub(crate) fn save_credentials_to(
+    settings_path: &std::path::Path,
+    credentials: &AtlassianCredentials,
+) -> Result<()> {
+    Settings::upsert_env_vars(
+        settings_path,
+        &[
+            (ATLASSIAN_INSTANCE_URL, credentials.instance_url.as_str()),
+            (ATLASSIAN_EMAIL, credentials.email.as_str()),
+            (ATLASSIAN_API_TOKEN, credentials.api_token.expose_secret()),
+        ],
+    )
 }
 
 /// Crate-internal test utilities for code that calls [`load_credentials`] /
@@ -281,6 +247,8 @@ pub(crate) mod test_util {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     #[test]
@@ -428,31 +396,48 @@ mod tests {
         assert!(!scope.has_token);
     }
 
-    /// Single test for save_credentials to avoid HOME env var race conditions.
-    /// Tests both fresh-file creation and merge-with-existing in sequence.
+    /// The production wrapper resolves `~/.omni-dev/settings.json` from
+    /// `HOME`, which `dirs::home_dir()` reads internally — so this one test
+    /// must redirect `HOME` (under the shared [`EnvGuard`]). Every other save
+    /// test injects a path into `save_credentials_to` instead (issue #1030).
+    #[test]
+    fn save_credentials_resolves_default_settings_path() {
+        let guard = EnvGuard::take();
+        let dir = with_empty_home(&guard);
+
+        let creds = AtlassianCredentials {
+            instance_url: "https://wrapper.atlassian.net".to_string(),
+            email: "wrapper@example.com".to_string(),
+            api_token: "wrapper-token".into(),
+        };
+        save_credentials(&creds).unwrap();
+
+        let settings_path = dir.path().join(".omni-dev").join("settings.json");
+        let val: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(val["env"]["ATLASSIAN_EMAIL"], "wrapper@example.com");
+    }
+
+    /// Save against injected settings-file paths — no `HOME` mutation, so the
+    /// test needs no lock (issue #1030). Covers fresh-file creation and
+    /// merge-with-existing.
     #[test]
     fn save_credentials_creates_and_preserves() {
-        // Share the mutex with the other env-mutating tests in this module
-        // so that setting HOME here doesn't race with `status()` tests.
-        let _guard = EnvGuard::take();
-        let original_home = std::env::var("HOME").ok();
-
         // ── Part 1: creates file from scratch ──────────────────────
         {
             let temp_dir = {
                 std::fs::create_dir_all("tmp").ok();
                 tempfile::TempDir::new_in("tmp").unwrap()
             };
-            std::env::set_var("HOME", temp_dir.path());
+            let settings_path = temp_dir.path().join(".omni-dev").join("settings.json");
 
             let creds = AtlassianCredentials {
                 instance_url: "https://save.atlassian.net".to_string(),
                 email: "save@example.com".to_string(),
                 api_token: "save-token".into(),
             };
-            save_credentials(&creds).unwrap();
+            save_credentials_to(&settings_path, &creds).unwrap();
 
-            let settings_path = temp_dir.path().join(".omni-dev").join("settings.json");
             assert!(settings_path.exists());
             let content = fs::read_to_string(&settings_path).unwrap();
             let val: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -462,6 +447,14 @@ mod tests {
             );
             assert_eq!(val["env"]["ATLASSIAN_EMAIL"], "save@example.com");
             assert_eq!(val["env"]["ATLASSIAN_API_TOKEN"], "save-token");
+
+            // The credential store is created owner-only (issue #1128).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = fs::metadata(&settings_path).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600);
+            }
         }
 
         // ── Part 2: preserves existing keys ────────────────────────
@@ -479,14 +472,12 @@ mod tests {
             )
             .unwrap();
 
-            std::env::set_var("HOME", temp_dir.path());
-
             let creds = AtlassianCredentials {
                 instance_url: "https://org.atlassian.net".to_string(),
                 email: "user@test.com".to_string(),
                 api_token: "token".into(),
             };
-            save_credentials(&creds).unwrap();
+            save_credentials_to(&settings_path, &creds).unwrap();
 
             let content = fs::read_to_string(&settings_path).unwrap();
             let val: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -496,11 +487,6 @@ mod tests {
                 val["env"]["ATLASSIAN_INSTANCE_URL"],
                 "https://org.atlassian.net"
             );
-        }
-
-        // Restore HOME
-        if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
         }
     }
 

@@ -97,6 +97,11 @@ The lookup order for every such variable is **process environment first, then
 the `settings.json` `env` map** — so exported shell / CI variables always win
 and secret injection is unaffected.
 
+Because the `env` map holds secrets, the `auth login` / `logout` flows write
+the file `0600` inside a `0700` `~/.omni-dev/` and re-tighten it on every
+write (`Settings::upsert_env_vars` / `Settings::remove_env_vars` in
+`src/utils/settings.rs`).
+
 ### Selecting a profile
 
 A **profile** is a named `env` bundle, letting one machine hold several
