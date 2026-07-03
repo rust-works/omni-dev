@@ -144,7 +144,7 @@ User-facing details — required env vars, model selection, Claude CLI sandbox s
 Architectural rationale for the sandboxed `claude-cli` subprocess backend — threat model, sandbox flag choices, escape-hatch design, budget-cap enforcement — lives in [ADR-0028](docs/adrs/adr-0028.md).
 
 Dev-only notes:
-- `ClaudeCliAiClient::run` is the warn site for both escape hatches, the INFO-level `total_cost_usd` log, and the post-response WARN when reported cost exceeds the configured cap.
+- `ClaudeCliAiClient::run` is the warn site for both escape hatches, the INFO-level `total_cost_usd` log, and the post-response WARN when reported cost exceeds the configured cap. `ClaudeCliAiClient::max_budget_from_value` is the warn site for a set-but-invalid cap value (#1135).
 - `--beta-header` is ignored for the `claude-cli` backend (`claude`'s `--betas` flag has different semantics).
 
 ### Browser Bridge
