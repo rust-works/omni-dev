@@ -174,16 +174,18 @@ pub(crate) fn save_credentials_to(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 pub(crate) mod test_util {
     use super::{ATLASSIAN_API_TOKEN, ATLASSIAN_EMAIL, ATLASSIAN_INSTANCE_URL};
+    use crate::utils::settings::PROFILE_ENV_VAR;
 
-    /// Mutex shared by every test that mutates `HOME` and the Atlassian
-    /// credential env vars. Serialises those tests against each other so
-    /// parallel execution doesn't race on process-wide env state.
+    /// Mutex shared by every test that mutates `HOME`, `OMNI_DEV_PROFILE`, or
+    /// the Atlassian credential env vars. Serialises those tests against each
+    /// other so parallel execution doesn't race on process-wide env state.
     pub(crate) static AUTH_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// RAII guard: snapshots `HOME` + every Atlassian credential env var on
-    /// construction and restores them on drop. Concentrating the save/restore
-    /// branches into one place (here) instead of inlining them in each test
-    /// keeps coverage high — every test exercises the same guard drop path.
+    /// RAII guard: snapshots `HOME`, `OMNI_DEV_PROFILE`, and every Atlassian
+    /// credential env var on construction and restores them on drop.
+    /// Concentrating the save/restore branches into one place (here) instead
+    /// of inlining them in each test keeps coverage high — every test
+    /// exercises the same guard drop path.
     pub(crate) struct EnvGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
         snapshot: Vec<(&'static str, Option<String>)>,
@@ -196,6 +198,7 @@ pub(crate) mod test_util {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let keys = [
                 "HOME",
+                PROFILE_ENV_VAR,
                 ATLASSIAN_INSTANCE_URL,
                 ATLASSIAN_EMAIL,
                 ATLASSIAN_API_TOKEN,
@@ -210,16 +213,19 @@ pub(crate) mod test_util {
             }
         }
 
-        /// Clears the three Atlassian credential env vars and points `HOME`
-        /// at a fresh empty tempdir so `load_credentials()` returns
-        /// `CredentialsNotFound`. Useful for testing the Err propagation
-        /// path of code that calls `create_client()`.
+        /// Clears the three Atlassian credential env vars plus
+        /// `OMNI_DEV_PROFILE` and points `HOME` at a fresh empty tempdir so
+        /// `load_credentials()` returns `CredentialsNotFound` and settings
+        /// writes target the base `env` map. Useful for testing the Err
+        /// propagation path of code that calls `create_client()` and the
+        /// `HOME`-resolving credential-write wrappers.
         pub(crate) fn clear_credentials(&self) -> tempfile::TempDir {
             let dir = {
                 std::fs::create_dir_all("tmp").ok();
                 tempfile::TempDir::new_in("tmp").unwrap()
             };
             std::env::set_var("HOME", dir.path());
+            std::env::remove_var(PROFILE_ENV_VAR);
             std::env::remove_var(ATLASSIAN_INSTANCE_URL);
             std::env::remove_var(ATLASSIAN_EMAIL);
             std::env::remove_var(ATLASSIAN_API_TOKEN);
@@ -340,6 +346,7 @@ mod tests {
             tempfile::TempDir::new_in("tmp").unwrap()
         };
         std::env::set_var("HOME", dir.path());
+        std::env::remove_var(crate::utils::settings::PROFILE_ENV_VAR);
         std::env::remove_var(ATLASSIAN_INSTANCE_URL);
         std::env::remove_var(ATLASSIAN_EMAIL);
         std::env::remove_var(ATLASSIAN_API_TOKEN);

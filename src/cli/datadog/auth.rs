@@ -9,7 +9,7 @@ use serde::Deserialize;
 use crate::datadog::auth::{self, DatadogCredentials, DEFAULT_SITE};
 use crate::datadog::client::DatadogClient;
 use crate::utils::env::SystemEnv;
-use crate::utils::settings::{active_profile_from, Settings};
+use crate::utils::settings::{active_profile_from, profile_suffix, Settings};
 
 /// Manages Datadog API credentials.
 #[derive(Parser)]
@@ -110,12 +110,6 @@ fn run_login_to(
     println!("\nRun `omni-dev datadog auth status` to verify.");
 
     Ok(())
-}
-
-/// Renders ` (profile '<name>')` for credential-store messages, or the empty
-/// string when no profile is active.
-fn profile_suffix(profile: Option<&str>) -> String {
-    profile.map_or_else(String::new, |name| format!(" (profile '{name}')"))
 }
 
 /// Removes Datadog API credentials.
@@ -332,6 +326,26 @@ mod tests {
     fn run_logout_is_idempotent_when_no_credentials() {
         let (_dir, settings_path) = temp_settings();
         run_logout(&settings_path, None).unwrap();
+    }
+
+    /// `LogoutCommand::execute` resolves the settings path from `HOME` and
+    /// the profile from `OMNI_DEV_PROFILE`, so this one test redirects both
+    /// under the shared [`crate::atlassian::auth::test_util::EnvGuard`];
+    /// every other logout test injects them into `run_logout` (issue #1030).
+    #[test]
+    fn logout_command_execute_resolves_default_settings_path() {
+        let guard = crate::atlassian::auth::test_util::EnvGuard::take();
+        let dir = guard.clear_credentials();
+        let omni_dir = dir.path().join(".omni-dev");
+        fs::create_dir_all(&omni_dir).unwrap();
+        let settings_path = omni_dir.join("settings.json");
+        fs::write(&settings_path, r#"{"env": {"DATADOG_API_KEY": "a"}}"#).unwrap();
+
+        LogoutCommand.execute().unwrap();
+
+        let val: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(val["env"].get(DATADOG_API_KEY).is_none());
     }
 
     // ── profile-targeted login/logout (issue #1116) ───────────────

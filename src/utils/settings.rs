@@ -60,6 +60,14 @@ pub fn active_profile_from<E: EnvSource>(raw: &E) -> Option<String> {
     raw.var(PROFILE_ENV_VAR).filter(|s| !s.is_empty())
 }
 
+/// Renders ` (profile '<name>')` for credential-store CLI messages, or the
+/// empty string when no profile is active — so `auth login`/`logout` output
+/// names the env map it actually wrote to (issue #1116).
+#[must_use]
+pub fn profile_suffix(profile: Option<&str>) -> String {
+    profile.map_or_else(String::new, |name| format!(" (profile '{name}')"))
+}
+
 /// An [`EnvSource`](crate::utils::env::EnvSource) with the settings/profile
 /// fallback — the value form of [`get_env_var`].
 ///
@@ -575,6 +583,12 @@ mod tests {
             active_profile_from(&MapEnv::new().with(PROFILE_ENV_VAR, "work")).as_deref(),
             Some("work")
         );
+    }
+
+    #[test]
+    fn profile_suffix_names_profile_or_is_empty() {
+        assert_eq!(profile_suffix(None), "");
+        assert_eq!(profile_suffix(Some("work")), " (profile 'work')");
     }
 
     #[test]
