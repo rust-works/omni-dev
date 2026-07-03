@@ -374,9 +374,10 @@ Arguments:
   <ATTACHMENT_ID>  Attachment ID
 
 Options:
-      --force  Skips the confirmation prompt
-      --purge  Permanently purges the attachment instead of moving to trash (requires space admin)
-  -h, --help   Print help
+      --force    Skips the confirmation prompt
+      --dry-run  Prints what would be deleted without making any API calls
+      --purge    Permanently purges the attachment instead of moving to trash (requires space admin)
+  -h, --help     Print help
 
 
 ================================================================================
