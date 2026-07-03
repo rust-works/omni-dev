@@ -336,6 +336,7 @@ mod tests {
             "jira_search",
             "jira_create",
             "jira_write",
+            "jira_edit",
             "jira_transition",
             "jira_transition_list",
             "jira_comment",

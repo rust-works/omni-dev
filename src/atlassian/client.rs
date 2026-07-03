@@ -204,7 +204,7 @@ pub struct EditMetaField {
 }
 
 /// Schema type information for an editable field.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EditMetaSchema {
     /// Base type: `string`, `number`, `option`, `array`, `user`, `date`, etc.
     pub kind: String,
@@ -212,12 +212,26 @@ pub struct EditMetaSchema {
     /// For custom fields: the plugin type URI, e.g.
     /// `com.atlassian.jira.plugin.system.customfieldtypes:textarea`.
     pub custom: Option<String>,
+
+    /// For `array` fields: the element type, e.g. `string` (labels),
+    /// `option`, `component`, `version`.
+    pub items: Option<String>,
+
+    /// For system fields: the canonical system name, e.g. `labels`,
+    /// `description`. `None` for custom fields.
+    pub system: Option<String>,
 }
 
 impl EditMetaField {
-    /// Returns `true` when the field is a rich-text (ADF) custom field.
+    /// Returns `true` when the field carries rich-text (ADF) content on the
+    /// wire: textarea custom fields, plus the system `description` and
+    /// `environment` fields.
     pub fn is_adf_rich_text(&self) -> bool {
         self.schema.custom.as_deref() == Some(TEXTAREA_CUSTOM_TYPE)
+            || matches!(
+                self.schema.system.as_deref(),
+                Some("description" | "environment")
+            )
     }
 }
 
@@ -1171,6 +1185,21 @@ struct JiraEditMetaSchemaRaw {
     kind: Option<String>,
     #[serde(default)]
     custom: Option<String>,
+    #[serde(default)]
+    items: Option<String>,
+    #[serde(default)]
+    system: Option<String>,
+}
+
+impl From<Option<JiraEditMetaSchemaRaw>> for EditMetaSchema {
+    fn from(raw: Option<JiraEditMetaSchemaRaw>) -> Self {
+        raw.map_or_else(Self::default, |s| Self {
+            kind: s.kind.unwrap_or_default(),
+            custom: s.custom,
+            items: s.items,
+            system: s.system,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -2715,6 +2744,21 @@ mod tests {
                         "custom": "com.atlassian.jira.plugin.system.customfieldtypes:select",
                         "customId": 10001
                     }
+                },
+                "labels": {
+                    "name": "Labels",
+                    "schema": {
+                        "type": "array",
+                        "items": "string",
+                        "system": "labels"
+                    }
+                },
+                "description": {
+                    "name": "Description",
+                    "schema": {
+                        "type": "string",
+                        "system": "description"
+                    }
                 }
             }
         });
@@ -2731,13 +2775,21 @@ mod tests {
         let client = AtlassianClient::new(&server.uri(), "user@test.com", "token").unwrap();
         let meta = client.get_editmeta("ACCS-1").await.unwrap();
 
-        assert_eq!(meta.fields.len(), 2);
+        assert_eq!(meta.fields.len(), 4);
         let ac = meta.fields.get("customfield_19300").unwrap();
         assert_eq!(ac.name, "Acceptance Criteria");
         assert!(ac.is_adf_rich_text());
         let opt = meta.fields.get("customfield_10001").unwrap();
         assert_eq!(opt.schema.kind, "option");
         assert!(!opt.is_adf_rich_text());
+        let labels = meta.fields.get("labels").unwrap();
+        assert_eq!(labels.schema.kind, "array");
+        assert_eq!(labels.schema.items.as_deref(), Some("string"));
+        assert_eq!(labels.schema.system.as_deref(), Some("labels"));
+        assert!(!labels.is_adf_rich_text());
+        let description = meta.fields.get("description").unwrap();
+        assert_eq!(description.schema.system.as_deref(), Some("description"));
+        assert!(description.is_adf_rich_text());
     }
 
     #[tokio::test]
@@ -7800,21 +7852,11 @@ impl AtlassianClient {
             .into_iter()
             .map(|(id, field)| {
                 let allowed_values = field.allowed_value_strings();
-                let schema = field.schema.map_or_else(
-                    || EditMetaSchema {
-                        kind: String::new(),
-                        custom: None,
-                    },
-                    |s| EditMetaSchema {
-                        kind: s.kind.unwrap_or_default(),
-                        custom: s.custom,
-                    },
-                );
                 (
                     id,
                     EditMetaField {
                         name: field.name.unwrap_or_default(),
-                        schema,
+                        schema: field.schema.into(),
                         allowed_values,
                     },
                 )
@@ -7963,21 +8005,11 @@ impl AtlassianClient {
             .into_iter()
             .map(|(id, field)| {
                 let allowed_values = field.allowed_value_strings();
-                let schema = field.schema.map_or_else(
-                    || EditMetaSchema {
-                        kind: String::new(),
-                        custom: None,
-                    },
-                    |s| EditMetaSchema {
-                        kind: s.kind.unwrap_or_default(),
-                        custom: s.custom,
-                    },
-                );
                 (
                     id,
                     EditMetaField {
                         name: field.name.unwrap_or_default(),
-                        schema,
+                        schema: field.schema.into(),
                         allowed_values,
                     },
                 )
