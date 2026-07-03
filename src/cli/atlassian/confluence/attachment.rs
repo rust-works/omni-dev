@@ -934,6 +934,77 @@ mod tests {
         assert!(err.to_string().contains("404"));
     }
 
+    /// Dry-run with a failing writer covers `?` on guard_destructive_with_io.
+    #[tokio::test]
+    async fn delete_execute_dry_run_propagates_guard_error() {
+        use crate::test_support::failing_io::FailingWriter;
+        let server = wiremock::MockServer::start().await;
+        let cmd = DeleteCommand {
+            attachment_id: "att-1".to_string(),
+            force: false,
+            dry_run: true,
+            purge: false,
+        };
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut writer = FailingWriter;
+        let err = cmd
+            .execute_with_io(
+                &delete_test_api(&server),
+                "https://example.atlassian.net",
+                &mut input,
+                &mut writer,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated write failure"));
+    }
+
+    /// Force-mode + failing writer covers `?` on the post-API writeln.
+    #[tokio::test]
+    async fn delete_execute_force_propagates_writeln_error() {
+        use crate::test_support::failing_io::FailingWriter;
+        let server = wiremock::MockServer::start().await;
+        mount_delete_mock(&server, "att-1").await;
+        let cmd = DeleteCommand {
+            attachment_id: "att-1".to_string(),
+            force: true,
+            dry_run: false,
+            purge: false,
+        };
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut writer = FailingWriter;
+        let err = cmd
+            .execute_with_io(
+                &delete_test_api(&server),
+                "https://example.atlassian.net",
+                &mut input,
+                &mut writer,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated write failure"));
+    }
+
+    /// End-to-end exercise of the public `execute()` wrapper through the
+    /// `AttachmentCommand` dispatch arm.
+    #[tokio::test]
+    async fn delete_execute_with_force_drives_create_client_and_calls_delete() {
+        use crate::test_support::atlassian_env::AtlassianEnvGuard;
+        let server = wiremock::MockServer::start().await;
+        mount_delete_mock(&server, "att-1").await;
+
+        let _env = AtlassianEnvGuard::new(&server.uri(), "u@t.com", "tok");
+        let cmd = AttachmentCommand {
+            command: AttachmentSubcommands::Delete(DeleteCommand {
+                attachment_id: "att-1".to_string(),
+                force: true,
+                dry_run: false,
+                purge: false,
+            }),
+        };
+        cmd.execute().await.unwrap();
+    }
+
     // ── extra coverage for print_upload ────────────────────────────
 
     #[test]
