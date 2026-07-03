@@ -331,6 +331,9 @@ fn try_record(entry: &LogRecord) -> anyhow::Result<()> {
 }
 
 /// Appends a single line with `O_APPEND | O_CREATE`, creating the file `0600`.
+/// A pre-existing looser-perm file (an older version's, or a user-set
+/// `OMNI_DEV_LOG_FILE` target) is re-tightened to `0600` on every open, via
+/// the handle so there is no path race (#1139).
 /// When bodies are enabled (lines may exceed the atomic-write size) an advisory
 /// exclusive lock guards the write; the common no-body path relies on
 /// `O_APPEND` single-write atomicity and takes no lock.
@@ -343,6 +346,7 @@ fn append_line(path: &std::path::Path, line: &str) -> anyhow::Result<()> {
         .create(true)
         .mode(0o600)
         .open(path)?;
+    crate::daemon::paths::ensure_handle_0600(&file)?;
 
     if bodies_enabled() {
         match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive) {
@@ -919,6 +923,39 @@ mod tests {
     fn scrub_argv_handles_trailing_flag_without_value() {
         let input = argv(&["omni-dev", "--body"]);
         assert_eq!(scrub_argv(&input), input);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_line_creates_file_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        append_line(&path, "{\"kind\":\"http\"}\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"kind\":\"http\"}\n"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_line_retightens_preexisting_loose_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        std::fs::write(&path, "old\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        append_line(&path, "new\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old\nnew\n");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
