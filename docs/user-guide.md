@@ -622,7 +622,7 @@ and select it with `--profile <name>` (or `OMNI_DEV_PROFILE`). See
 
 > **⚠️ Destructive commands require confirmation.**
 >
-> Five Atlassian subcommands prompt for confirmation by default and refuse
+> Six Atlassian subcommands prompt for confirmation by default and refuse
 > to run unless either the user explicitly confirms (CLI) or the caller
 > opts in (MCP):
 >
@@ -631,6 +631,7 @@ and select it with `--profile <name>` (or `OMNI_DEV_PROFILE`). See
 > - `omni-dev atlassian jira watcher remove --user <ACCOUNT_ID> <KEY>`
 > - `omni-dev atlassian confluence delete <ID>`
 > - `omni-dev atlassian confluence label remove --labels <LABELS> <ID>`
+> - `omni-dev atlassian confluence attachment delete <ATTACHMENT_ID>`
 >
 > **CLI behaviour.** Each command prompts on stdin:
 >
@@ -656,6 +657,9 @@ and select it with `--profile <name>` (or `OMNI_DEV_PROFILE`). See
 > ```text
 > Refusing to delete PROJ-123: pass `confirm: true` to authorise this irreversible operation.
 > ```
+>
+> The exception is `confluence_attachment_delete`, which mirrors the CLI's
+> `--force` mode and deletes without a `confirm` parameter.
 >
 > Interactive prompts catch human accidents; `--force` keeps scripts
 > working; `--dry-run` is a server-free preview; the MCP `confirm: true`
