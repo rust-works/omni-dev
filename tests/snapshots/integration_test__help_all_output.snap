@@ -2995,13 +2995,14 @@ omni-dev git commit message amend - Amends commit messages based on a YAML confi
 
 Amends commit messages based on a YAML configuration file
 
-Usage: amend <YAML_FILE>
+Usage: amend [OPTIONS] <YAML_FILE>
 
 Arguments:
   <YAML_FILE>  YAML file containing commit amendments
 
 Options:
-  -h, --help  Print help
+      --allow-pushed  Allows amending commits that already exist in remote main branches (rewrites published history)
+  -h, --help          Print help
 
 
 ================================================================================
@@ -3066,6 +3067,8 @@ Options:
           Beta header to send with API requests (format: key:value). Only sent if the model supports it in the registry
       --auto-apply
           Skips confirmation prompt and applies amendments automatically
+      --allow-pushed
+          Allows amending commits that already exist in remote main branches (rewrites published history)
       --save-only <FILE>
           Saves generated amendments to file without applying
       --use-context

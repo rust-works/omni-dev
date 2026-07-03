@@ -245,6 +245,25 @@ amendments:
       - Role-based access control
 ```
 
+#### Safety: already-pushed commits
+
+Amending rewrites history, so `amend` (and `twiddle`'s apply step) refuses to
+touch a commit that is already contained in a remote main branch (for example
+`origin/main`). The same containment information appears in `view` output as
+the per-commit `in_main_branches` field.
+
+If you are certain you want to rewrite published history, pass the override
+flag:
+
+```bash
+omni-dev git commit message amend --allow-pushed amendments.yaml
+```
+
+Main-branch detection is local and offline: it uses the remote's symbolic
+`HEAD` ref when available, falling back to common branch names
+(`main`/`master`/`develop`). Remotes whose main branch cannot be determined
+locally are skipped conservatively.
+
 ### `check` - Commit Message Validation
 
 Validate commit messages against guidelines without modifying anything.
