@@ -183,6 +183,8 @@ mod tests {
             "confluence_children",
             "confluence_comment_list",
             "confluence_comment_add",
+            "confluence_comment_audit",
+            "confluence_comment_reanchor",
             "confluence_label_list",
             "confluence_label_add",
             "confluence_label_remove",
