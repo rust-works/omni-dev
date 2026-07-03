@@ -377,6 +377,17 @@ fn first_capture(pattern: &str, text: &str) -> Result<Option<String>> {
         .map(|m| m.as_str().to_owned()))
 }
 
+/// Slices a search window of at most `len` bytes starting at `start` (which
+/// must be a char boundary, e.g. from `str::find`), walking the end back off
+/// any multibyte sequence so the slice cannot panic (#1136).
+fn search_window(s: &str, start: usize, len: usize) -> &str {
+    let mut end = (start + len).min(s.len());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[start..end]
+}
+
 /// Harvests session tokens and the initial query's `doc_id` + `variables` from
 /// the `/me` HTML shell. (Step 1 of the recipe.)
 fn parse_session_from_me(html: &str) -> Result<PartialSession> {
@@ -407,7 +418,7 @@ fn parse_session_from_me(html: &str) -> Result<PartialSession> {
     })?;
 
     // queryID (== doc_id for persisted queries); fall back to an explicit doc_id.
-    let window = &html[anchor..(anchor + 4000).min(html.len())];
+    let window = search_window(html, anchor, 4000);
     let init_doc = first_capture(r#""queryID":"(\d+)""#, window)?
         .or(first_capture(r#""doc_id":"(\d+)""#, window)?)
         .with_context(|| {
@@ -455,7 +466,7 @@ fn refetch_doc_in_bundle(js: &str) -> Result<Option<String>> {
     let Some(at) = js.find(&marker) else {
         return Ok(None);
     };
-    let window = &js[at..(at + 2000).min(js.len())];
+    let window = search_window(js, at, 2000);
     first_capture(r#"exports\s*=\s*"(\d+)""#, window)
 }
 
@@ -974,6 +985,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_session_from_me_tolerates_multibyte_at_window_edge() {
+        let mut html = concat!(
+            r#"junk "DTSGInitialData",[],{"token":"DTSG_TOK"} more "#,
+            r#""LSD",[],{"token":"LSD_TOK"} and "USER_ID":"55501" then "#,
+            r#"ProfileCometTimelineFeedQuery preload "variables":{"userID":"55501","count":3,"__pv":true} "#,
+            r#""queryID":"111222333" tail"#
+        )
+        .to_owned();
+        // Pad so a 4-byte scalar straddles `anchor + 4000` (#1136).
+        let anchor = html.find(INIT_FRIENDLY).unwrap();
+        html.push_str(&"x".repeat(anchor + 3998 - html.len()));
+        html.push('😀');
+        html.push_str(" tail");
+        assert!(!html.is_char_boundary(anchor + 4000));
+
+        let s = parse_session_from_me(&html).unwrap();
+        assert_eq!(s.init_doc, "111222333");
+    }
+
+    #[test]
     fn parse_session_from_me_errors_name_the_missing_piece() {
         let err = parse_session_from_me("nothing useful here").unwrap_err();
         assert!(err.to_string().contains("fb_dtsg"), "got: {err}");
@@ -1000,6 +1031,22 @@ mod tests {
             Some("27008916165384435")
         );
         assert!(refetch_doc_in_bundle("unrelated bundle").unwrap().is_none());
+    }
+
+    #[test]
+    fn refetch_doc_in_bundle_tolerates_multibyte_at_window_edge() {
+        let mut js = r#"__d("ProfileCometTimelineFeedRefetchQuery_facebookRelayOperation",[],(function(a){a.exports="27008916165384435"}),null);"#.to_owned();
+        // Pad so a 4-byte scalar straddles `at + 2000` (#1136).
+        let at = js.find(REFETCH_FRIENDLY).unwrap();
+        js.push_str(&"x".repeat(at + 1998 - js.len()));
+        js.push('😀');
+        js.push_str(" tail");
+        assert!(!js.is_char_boundary(at + 2000));
+
+        assert_eq!(
+            refetch_doc_in_bundle(&js).unwrap().as_deref(),
+            Some("27008916165384435")
+        );
     }
 
     #[test]
