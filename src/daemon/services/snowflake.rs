@@ -27,13 +27,15 @@ pub struct SnowflakeService {
 }
 
 impl SnowflakeService {
-    /// Creates the service. Cheap — no eager auth or I/O; each `(account, user)`
-    /// session is authenticated lazily on its first query.
+    /// Creates the service and starts the engine's background keep-alive
+    /// heartbeat. Cheap — no eager auth or I/O; each `(account, user)` session
+    /// is authenticated lazily on its first query, and the heartbeat only
+    /// touches sessions that exist.
     #[must_use]
     pub fn new(config: SnowflakeEngineConfig) -> Self {
-        Self {
-            engine: SnowflakeEngine::new(config),
-        }
+        let engine = SnowflakeEngine::new(config);
+        engine.start_heartbeat();
+        Self { engine }
     }
 }
 
