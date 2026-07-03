@@ -110,9 +110,13 @@ metadata per-row only).
 
 ## Configuration
 
-Account, user, and default context resolve **env var first, then
-`~/.omni-dev/settings.json`** (the Atlassian credential pattern), and are
-overridable per request via flags:
+Account, user, and default context resolve **in the client invocation** — env
+var first, then `~/.omni-dev/settings.json`, honouring `--profile` /
+`OMNI_DEV_PROFILE` (the Atlassian credential pattern) — and the resolved values
+are sent with each query. Explicit flags override the resolution. The daemon
+also resolves the same variables once at startup, but only as a **fallback**
+for requests that omit a field (e.g. clients speaking the socket protocol
+directly without resolving defaults themselves):
 
 | Setting   | Env var               | `query` flag    |
 |-----------|-----------------------|-----------------|
@@ -142,6 +146,11 @@ rather than by the per-request timeout.
 background keep-alive task heartbeats idle sessions (see
 [Reliability](#reliability)).
 
+The pool size, the timeouts, and the heartbeat interval are operational
+(config-only) settings read from the **daemon's** environment once at startup —
+restart the daemon (`omni-dev daemon restart`) to change them. They are not
+affected by the client's `--profile`.
+
 `settings.json` fallback example:
 
 ```json
@@ -152,11 +161,14 @@ To hold several accounts on one machine, put each account's `SNOWFLAKE_*`
 variables in a named **profile** and select it with `--profile` /
 `OMNI_DEV_PROFILE` (see
 [Credential Profiles](configuration-best-practices.md#credential-profiles)).
-Because the service pools sessions by `(account, user)`, distinct profiles
-produce distinct pools automatically.
+The CLI resolves the profile's values and sends them with the query, so the
+resident daemon serves whichever profile each invocation selects — its own
+startup profile is irrelevant. Because the service pools sessions by
+`(account, user)`, distinct profiles produce distinct pools automatically.
 
-The service is **account-agnostic**: there is no hardcoded account list. Defaults
-are applied at session creation; the per-query flags issue `USE WAREHOUSE/ROLE/
+The service is **account-agnostic**: there is no hardcoded account list. The
+daemon's startup defaults apply as the session's base context at creation;
+client-resolved values and per-query flags issue `USE WAREHOUSE/ROLE/
 DATABASE/SCHEMA` on the reused session, so one session serves varied query
 contexts without re-auth.
 
