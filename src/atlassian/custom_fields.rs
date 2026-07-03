@@ -12,7 +12,8 @@ use std::collections::BTreeMap;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::atlassian::adf_validated::markdown_to_validated_adf;
+use crate::atlassian::adf::AdfDocument;
+use crate::atlassian::adf_validated::{markdown_to_validated_adf, ValidatedAdfDocument};
 use crate::atlassian::client::{EditMeta, EditMetaField};
 use crate::atlassian::document::CustomFieldSection;
 
@@ -76,15 +77,13 @@ pub fn resolve_custom_fields(
     Ok(out)
 }
 
-/// Looks up a field by id-or-name, preferring exact `customfield_<id>`
-/// matches before falling back to a name lookup.
+/// Looks up a field by id-or-name, preferring an exact id match
+/// (`customfield_<id>` or a system id like `labels`/`parent`) before falling
+/// back to a name lookup. An exact id therefore shadows an identically
+/// spelled display name.
 fn lookup_field<'a>(editmeta: &'a EditMeta, key: &str) -> Result<(String, &'a EditMetaField)> {
-    if looks_like_field_id(key) {
-        if let Some(field) = editmeta.fields.get(key) {
-            return Ok((key.to_string(), field));
-        }
-        // Fall through to name lookup in case the caller named a field
-        // literally "customfield_something".
+    if let Some(field) = editmeta.fields.get(key) {
+        return Ok((key.to_string(), field));
     }
 
     let matches: Vec<_> = editmeta
@@ -128,18 +127,16 @@ fn resolve_section_field<'a>(
     lookup_field(editmeta, &section.name)
 }
 
-fn looks_like_field_id(s: &str) -> bool {
-    s.starts_with("customfield_") && s[12..].chars().all(|c| c.is_ascii_digit())
-}
-
 /// Converts a frontmatter / `--set-field` scalar targeting a rich-text custom
 /// field into the API JSON shape.
 ///
 /// String values are treated as JFM markdown and converted to ADF (matching
 /// the contract for `content`/description and for body sections). An empty
-/// string or YAML null clears the field by emitting `null`. Non-string
-/// scalars (numbers, bools, sequences, mappings) are rejected — rich-text
-/// fields require either a JFM string or a body section.
+/// string or YAML null clears the field by emitting `null`. A mapping is
+/// treated as a raw ADF document: it must carry `type: doc` and pass nesting
+/// validation, and is then forwarded as-is (the escape hatch for structured
+/// rich-text content that JFM cannot express). Other scalars (numbers,
+/// bools, sequences) are rejected.
 ///
 /// Null handling is load-bearing for the CLI: `--set-field "Name="` parses
 /// the empty RHS as YAML null (not a string), so a "clear the field"
@@ -152,6 +149,7 @@ fn rich_text_scalar_to_api_value(
     let s = match value {
         serde_yaml::Value::String(s) => s.clone(),
         serde_yaml::Value::Null => String::new(),
+        serde_yaml::Value::Mapping(_) => return adf_mapping_to_api_value(value, field, id),
         _ => bail!(
             "Field '{}' ({}) is a rich-text field; supply JFM markdown as a string or use a `<!-- field: {} ({}) -->` body section",
             field.name,
@@ -161,6 +159,35 @@ fn rich_text_scalar_to_api_value(
         ),
     };
     string_to_rich_text_api_value(&s, &field.name, id)
+}
+
+/// Validates and forwards a raw ADF document supplied for a rich-text field.
+fn adf_mapping_to_api_value(
+    value: &serde_yaml::Value,
+    field: &EditMetaField,
+    id: &str,
+) -> Result<serde_json::Value> {
+    let json = yaml_to_json(value)?;
+    if json.get("type").and_then(serde_json::Value::as_str) != Some("doc") {
+        bail!(
+            "Field '{}' ({}) is a rich-text field; a mapping value must be a raw ADF document with `type: doc` (or supply JFM markdown as a string)",
+            field.name,
+            id
+        );
+    }
+    let doc: AdfDocument = serde_json::from_value(json).with_context(|| {
+        format!(
+            "Custom field '{}' ({}) value is not a valid ADF document",
+            field.name, id
+        )
+    })?;
+    let validated = ValidatedAdfDocument::try_new(doc).with_context(|| {
+        format!(
+            "Custom field '{}' ({}) failed ADF nesting validation",
+            field.name, id
+        )
+    })?;
+    serde_json::to_value(&validated).context("Failed to serialize custom field ADF document")
 }
 
 /// Shared conversion: empty → `null`; otherwise JFM → validated ADF JSON.
@@ -231,6 +258,15 @@ fn scalar_to_api_value(
             let seq = value.as_sequence().ok_or_else(|| {
                 anyhow!("expected a sequence for array field '{}'", field.name)
             })?;
+            // Element shape depends on the array's item type: labels and
+            // labels-like custom fields take bare strings, components and
+            // versions take `{"name"}`, options (the historical default)
+            // take `{"value"}`.
+            let wrap: fn(String) -> serde_json::Value = match field.schema.items.as_deref() {
+                Some("string") => serde_json::Value::String,
+                Some("component" | "version") => |s| serde_json::json!({ "name": s }),
+                _ => |s| serde_json::json!({ "value": s }),
+            };
             let items: Vec<serde_json::Value> = seq
                 .iter()
                 .map(|v| {
@@ -241,14 +277,23 @@ fn scalar_to_api_value(
                         )
                     })?;
                     validate_option_value(field, id, &s)?;
-                    Ok(serde_json::json!({ "value": s }))
+                    Ok(wrap(s))
                 })
                 .collect::<Result<_>>()?;
             Ok(serde_json::Value::Array(items))
         }
+        ("issuelink", _) => match value {
+            serde_yaml::Value::String(s) => Ok(serde_json::json!({ "key": s })),
+            // Pre-shaped payloads ({"key": ...} / {"id": ...}) pass through.
+            serde_yaml::Value::Mapping(_) => yaml_to_json(value),
+            _ => Err(anyhow!(
+                "expected an issue key string (e.g. 'PROJ-123') for issue-link field '{}'",
+                field.name
+            )),
+        },
         ("string" | "number" | "date" | "datetime", _) => yaml_to_json(value),
         (other, _) => Err(anyhow!(
-            "Unsupported field type '{other}' for '{}'; custom field writes currently support option, textfield, number, date, and array-of-options",
+            "Unsupported field type '{other}' for '{}'; custom field writes currently support option, textfield, number, date, issue-link, and arrays of options, strings/labels, components, or versions",
             field.name
         )),
     }
@@ -385,11 +430,27 @@ mod tests {
                     schema: EditMetaSchema {
                         kind: (*kind).to_string(),
                         custom: custom.map(str::to_string),
+                        ..EditMetaSchema::default()
                     },
                     allowed_values: Vec::new(),
                 },
             );
         }
+        EditMeta { fields }
+    }
+
+    /// Builds a single-field [`EditMeta`] from a full [`EditMetaSchema`], for
+    /// tests exercising `items`/`system` dispatch.
+    fn meta_with_schema(id: &str, name: &str, schema: EditMetaSchema) -> EditMeta {
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            id.to_string(),
+            EditMetaField {
+                name: name.to_string(),
+                schema,
+                allowed_values: Vec::new(),
+            },
+        );
         EditMeta { fields }
     }
 
@@ -403,7 +464,7 @@ mod tests {
                 name: name.to_string(),
                 schema: EditMetaSchema {
                     kind: kind.to_string(),
-                    custom: None,
+                    ..EditMetaSchema::default()
                 },
                 allowed_values: allowed.iter().map(|v| (*v).to_string()).collect(),
             },
@@ -563,6 +624,278 @@ mod tests {
             out.get("customfield_10004").unwrap(),
             &serde_json::json!([{"value": "backend"}, {"value": "auth"}])
         );
+    }
+
+    #[test]
+    fn scalar_string_array_field_emits_plain_strings() {
+        // Issue #1157: labels (system field, items: string) must go on the
+        // wire as bare strings, not option objects.
+        let editmeta = meta_with_schema(
+            "labels",
+            "Labels",
+            EditMetaSchema {
+                kind: "array".to_string(),
+                items: Some("string".to_string()),
+                system: Some("labels".to_string()),
+                ..EditMetaSchema::default()
+            },
+        );
+        let mut scalars = BTreeMap::new();
+        scalars.insert(
+            "Labels".to_string(),
+            serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String("lock-state-v2".to_string()),
+                serde_yaml::Value::String("phase-1".to_string()),
+            ]),
+        );
+        let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
+        assert_eq!(
+            out.get("labels").unwrap(),
+            &serde_json::json!(["lock-state-v2", "phase-1"])
+        );
+    }
+
+    #[test]
+    fn scalar_custom_labels_field_emits_plain_strings() {
+        let editmeta = meta_with_schema(
+            "customfield_10050",
+            "Team Tags",
+            EditMetaSchema {
+                kind: "array".to_string(),
+                custom: Some(
+                    "com.atlassian.jira.plugin.system.customfieldtypes:labels".to_string(),
+                ),
+                items: Some("string".to_string()),
+                ..EditMetaSchema::default()
+            },
+        );
+        let mut scalars = BTreeMap::new();
+        scalars.insert(
+            "Team Tags".to_string(),
+            serde_yaml::Value::Sequence(vec![serde_yaml::Value::String("infra".to_string())]),
+        );
+        let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
+        assert_eq!(
+            out.get("customfield_10050").unwrap(),
+            &serde_json::json!(["infra"])
+        );
+    }
+
+    #[test]
+    fn scalar_component_array_field_wraps_in_name_objects() {
+        let editmeta = meta_with_schema(
+            "components",
+            "Components",
+            EditMetaSchema {
+                kind: "array".to_string(),
+                items: Some("component".to_string()),
+                system: Some("components".to_string()),
+                ..EditMetaSchema::default()
+            },
+        );
+        let mut scalars = BTreeMap::new();
+        scalars.insert(
+            "Components".to_string(),
+            serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String("backend".to_string()),
+                serde_yaml::Value::String("auth".to_string()),
+            ]),
+        );
+        let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
+        assert_eq!(
+            out.get("components").unwrap(),
+            &serde_json::json!([{"name": "backend"}, {"name": "auth"}])
+        );
+    }
+
+    #[test]
+    fn scalar_issuelink_field_wraps_key() {
+        // Issue #1157: Parent (schema type issuelink) accepts an issue key
+        // string and becomes `{"key": ...}` on the wire.
+        let editmeta = meta(&[("parent", "Parent", "issuelink", None)]);
+        let mut scalars = BTreeMap::new();
+        scalars.insert(
+            "Parent".to_string(),
+            serde_yaml::Value::String("PROJ-123".to_string()),
+        );
+        let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
+        assert_eq!(
+            out.get("parent").unwrap(),
+            &serde_json::json!({"key": "PROJ-123"})
+        );
+    }
+
+    #[test]
+    fn scalar_issuelink_field_passes_through_mapping() {
+        let editmeta = meta(&[("parent", "Parent", "issuelink", None)]);
+        let mut scalars = BTreeMap::new();
+        scalars.insert(
+            "Parent".to_string(),
+            serde_yaml::from_str("id: '10042'").unwrap(),
+        );
+        let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
+        assert_eq!(
+            out.get("parent").unwrap(),
+            &serde_json::json!({"id": "10042"})
+        );
+    }
+
+    #[test]
+    fn scalar_issuelink_field_rejects_non_string() {
+        let editmeta = meta(&[("parent", "Parent", "issuelink", None)]);
+        let mut scalars = BTreeMap::new();
+        scalars.insert("Parent".to_string(), serde_yaml::Value::Number(7.into()));
+        let err = resolve_custom_fields(&scalars, &[], &editmeta).unwrap_err();
+        assert!(format!("{err:#}").contains("expected an issue key string"));
+    }
+
+    #[test]
+    fn system_field_id_resolves_without_customfield_prefix() {
+        // Issue #1157: `labels` (a system field id) must resolve by id even
+        // though it does not start with `customfield_`.
+        let editmeta = meta_with_schema(
+            "labels",
+            "Labels",
+            EditMetaSchema {
+                kind: "array".to_string(),
+                items: Some("string".to_string()),
+                system: Some("labels".to_string()),
+                ..EditMetaSchema::default()
+            },
+        );
+        let mut scalars = BTreeMap::new();
+        scalars.insert(
+            "labels".to_string(),
+            serde_yaml::Value::Sequence(vec![serde_yaml::Value::String("a".to_string())]),
+        );
+        let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
+        assert_eq!(out.get("labels").unwrap(), &serde_json::json!(["a"]));
+    }
+
+    #[test]
+    fn scalar_string_to_system_description_converts_jfm_to_adf() {
+        let editmeta = meta_with_schema(
+            "description",
+            "Description",
+            EditMetaSchema {
+                kind: "string".to_string(),
+                system: Some("description".to_string()),
+                ..EditMetaSchema::default()
+            },
+        );
+        let mut scalars = BTreeMap::new();
+        scalars.insert(
+            "Description".to_string(),
+            serde_yaml::Value::String("A paragraph.".to_string()),
+        );
+        let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
+        let value = out.get("description").unwrap();
+        assert_eq!(value["type"], "doc");
+        assert_eq!(value["version"], 1);
+    }
+
+    #[test]
+    fn rich_text_field_accepts_explicit_adf_mapping() {
+        // Issue #1157: a raw ADF document (mapping with `type: doc`) is
+        // validated and forwarded as-is, bypassing JFM conversion.
+        let editmeta = meta(&[(
+            "customfield_19300",
+            "Acceptance Criteria",
+            "string",
+            Some(CUSTOM_TEXTAREA),
+        )]);
+        let adf_yaml: serde_yaml::Value = serde_yaml::from_str(
+            r"
+type: doc
+version: 1
+content:
+  - type: paragraph
+    content:
+      - type: text
+        text: hand-built
+",
+        )
+        .unwrap();
+        let mut scalars = BTreeMap::new();
+        scalars.insert("Acceptance Criteria".to_string(), adf_yaml);
+        let out = resolve_custom_fields(&scalars, &[], &editmeta).unwrap();
+        let value = out.get("customfield_19300").unwrap();
+        assert_eq!(value["type"], "doc");
+        assert_eq!(value["content"][0]["content"][0]["text"], "hand-built");
+    }
+
+    #[test]
+    fn rich_text_field_rejects_mapping_without_doc_type() {
+        let editmeta = meta(&[(
+            "customfield_19300",
+            "Acceptance Criteria",
+            "string",
+            Some(CUSTOM_TEXTAREA),
+        )]);
+        let mut scalars = BTreeMap::new();
+        scalars.insert(
+            "Acceptance Criteria".to_string(),
+            serde_yaml::from_str("some: mapping").unwrap(),
+        );
+        let err = resolve_custom_fields(&scalars, &[], &editmeta).unwrap_err();
+        assert!(format!("{err:#}").contains("must be a raw ADF document with `type: doc`"));
+    }
+
+    #[test]
+    fn rich_text_field_rejects_malformed_adf_document() {
+        // `type: doc` but not deserializable as an ADF document (content
+        // must be a sequence of nodes).
+        let editmeta = meta(&[(
+            "customfield_19300",
+            "Acceptance Criteria",
+            "string",
+            Some(CUSTOM_TEXTAREA),
+        )]);
+        let mut scalars = BTreeMap::new();
+        scalars.insert(
+            "Acceptance Criteria".to_string(),
+            serde_yaml::from_str("{type: doc, version: 1, content: nope}").unwrap(),
+        );
+        let err = resolve_custom_fields(&scalars, &[], &editmeta).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("is not a valid ADF document"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn rich_text_field_rejects_adf_mapping_with_invalid_nesting() {
+        let editmeta = meta(&[(
+            "customfield_19300",
+            "Acceptance Criteria",
+            "string",
+            Some(CUSTOM_TEXTAREA),
+        )]);
+        let adf_yaml: serde_yaml::Value = serde_yaml::from_str(
+            r"
+type: doc
+version: 1
+content:
+  - type: panel
+    attrs:
+      panelType: info
+    content:
+      - type: expand
+        attrs:
+          title: x
+        content:
+          - type: paragraph
+            content:
+              - type: text
+                text: body
+",
+        )
+        .unwrap();
+        let mut scalars = BTreeMap::new();
+        scalars.insert("Acceptance Criteria".to_string(), adf_yaml);
+        let err = resolve_custom_fields(&scalars, &[], &editmeta).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("ADF nesting validation"), "got: {msg}");
     }
 
     #[test]

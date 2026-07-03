@@ -118,8 +118,10 @@ pub struct JiraCreateParams {
     /// "`<Field> is required`" error directly. Values are natural JSON: a
     /// string or number for scalar/number/date fields, a string for
     /// select/option fields (sent as `{"value": ...}`), an array of strings
-    /// for multi-selects. Use this for fields a project requires at create
-    /// time — without them JIRA rejects the create with HTTP 400.
+    /// for multi-selects and labels, an issue key string for issue-link
+    /// fields such as `Parent` (sent as `{"key": ...}`). Use this for fields
+    /// a project requires at create time — without them JIRA rejects the
+    /// create with HTTP 400. To change fields after creation use `jira_edit`.
     #[serde(default)]
     pub custom_fields: Option<std::collections::BTreeMap<String, serde_json::Value>>,
     /// When true, validate and return the would-be request (method, path,
@@ -275,6 +277,29 @@ pub struct JiraWriteParams {
     #[serde(default)]
     pub fields: Option<std::collections::BTreeMap<String, serde_json::Value>>,
     /// When true, validate and return the would-be request (method, path,
+    /// body) without updating the issue. Defaults to `false`.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// Parameters for the `jira_edit` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct JiraEditParams {
+    /// JIRA issue key (e.g., `PROJ-123`).
+    pub key: String,
+    /// Map of field display name or canonical id (e.g. `"Labels"`, `"labels"`,
+    /// `"Story Points"`, `"customfield_19300"`) to its new value. Names are
+    /// resolved against the issue's edit screen (editmeta) and values are
+    /// coerced to the API shape: select/option fields take the option string
+    /// (becomes `{"value": ...}`), multi-selects an array of option strings,
+    /// labels a plain string array, number/date fields the bare scalar,
+    /// issue-link fields (e.g. Parent) an issue key string (becomes
+    /// `{"key": ...}`). Rich-text fields (e.g. Acceptance Criteria) take JFM
+    /// markdown (auto-converted to ADF; the empty string `""` clears the
+    /// field) or a raw ADF document object (`{"type": "doc", ...}`) which is
+    /// validated and forwarded as-is.
+    pub fields: std::collections::BTreeMap<String, serde_json::Value>,
+    /// When true, resolve and return the would-be request (method, path,
     /// body) without updating the issue. Defaults to `false`.
     #[serde(default)]
     pub dry_run: bool,
@@ -565,17 +590,8 @@ async fn run_jira_create(client: &AtlassianClient, params: &JiraCreateParams) ->
         _ => None,
     };
 
-    // Bridge the JSON `custom_fields` map into the CLI resolver's YAML-scalar
-    // shape (a `serde_json::Value` always serialises into a `serde_yaml::Value`,
-    // so `.ok()` never drops a field).
-    let custom_scalars: std::collections::BTreeMap<String, serde_yaml::Value> = match params
-        .custom_fields
-        .as_ref()
-    {
-        Some(fields) => fields
-            .iter()
-            .filter_map(|(name, value)| serde_yaml::to_value(value).ok().map(|y| (name.clone(), y)))
-            .collect(),
+    let custom_scalars = match params.custom_fields.as_ref() {
+        Some(fields) => json_fields_to_yaml_scalars(fields),
         None => std::collections::BTreeMap::new(),
     };
 
@@ -804,6 +820,73 @@ async fn jira_create_dry_run_preview(
         "/rest/api/3/issue".to_string(),
         Some(serde_json::json!({ "fields": fields })),
     )
+}
+
+/// Bridges a JSON `fields`/`custom_fields` map into the shared resolver's
+/// YAML-scalar shape (a `serde_json::Value` always serialises into a
+/// `serde_yaml::Value`, so `.ok()` never drops a field).
+fn json_fields_to_yaml_scalars(
+    fields: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> std::collections::BTreeMap<String, serde_yaml::Value> {
+    fields
+        .iter()
+        .filter_map(|(name, value)| serde_yaml::to_value(value).ok().map(|y| (name.clone(), y)))
+        .collect()
+}
+
+/// Success report returned by `jira_edit` as YAML.
+#[derive(Debug, Serialize)]
+struct JiraEditReport {
+    /// Always `"ok"` — present so callers can assert on a stable marker.
+    status: &'static str,
+    /// The issue that was updated.
+    key: String,
+    /// Canonical ids of the fields sent in the update, in wire order.
+    updated_fields: Vec<String>,
+}
+
+/// Sets arbitrary fields on an existing issue: resolves display names or
+/// canonical ids against the issue's editmeta, coerces values to the API
+/// shape via the shared resolver, and PUTs the update.
+///
+/// Unlike `run_jira_write`'s `fields` escape hatch, an editmeta failure here
+/// is fatal — name resolution is this tool's whole contract, so there is no
+/// pass-through fallback.
+async fn run_jira_edit(
+    client: &AtlassianClient,
+    cache: &CatalogueCache,
+    key: &str,
+    fields: &std::collections::BTreeMap<String, serde_json::Value>,
+    dry_run: bool,
+) -> Result<String> {
+    if fields.is_empty() {
+        anyhow::bail!("no fields supplied for {key}: pass at least one `fields` entry");
+    }
+    let scalars = json_fields_to_yaml_scalars(fields);
+    let editmeta = cache.editmeta(client, key).await?;
+    let resolved = resolve_custom_fields(&scalars, &[], &editmeta)?;
+
+    if dry_run {
+        // Mirror the wire body built by `update_issue_with_custom_fields`.
+        let body: serde_json::Map<String, serde_json::Value> = resolved
+            .iter()
+            .map(|(id, value)| (id.clone(), value.clone()))
+            .collect();
+        return dry_run_request_yaml(
+            "PUT",
+            format!("/rest/api/3/issue/{key}"),
+            Some(serde_json::json!({ "fields": body })),
+        );
+    }
+
+    client
+        .update_issue_with_custom_fields(key, None, None, &resolved)
+        .await?;
+    yaml_result(&JiraEditReport {
+        status: "ok",
+        key: key.to_string(),
+        updated_fields: resolved.keys().cloned().collect(),
+    })
 }
 
 /// Updates a JIRA issue. Any combination of description (`content`),
@@ -1220,6 +1303,8 @@ impl OmniDevServer {
                        targeting rich-text custom fields (e.g. Acceptance Criteria) are \
                        auto-converted from JFM to ADF; pass the empty string `\"\"` to clear \
                        such a field. Pass a JSON object value to bypass conversion (raw ADF). \
+                       To set fields by display name with automatic value coercion, prefer \
+                       the `jira_edit` tool. \
                        At least one of `content`, `assignee`, `reporter`, or `fields` must be \
                        supplied. Set `dry_run: true` first when uncertain about required fields \
                        or formatting — validates the input and returns the request that would be \
@@ -1247,6 +1332,41 @@ impl OmniDevServer {
             params.assignee.as_deref(),
             params.reporter.as_deref(),
             params.fields.as_ref(),
+            params.dry_run,
+        )
+        .await
+        .map_err(tool_error)?;
+        ok_text(text)
+    }
+
+    /// Tool: set arbitrary fields on an existing JIRA issue by name or id.
+    #[tool(
+        description = "Set arbitrary fields on an existing JIRA issue by field display name or \
+                       canonical id — labels, selects, story points, dates, rich-text custom \
+                       fields (e.g. Acceptance Criteria), parent, and other editable fields. \
+                       Names are resolved against the issue's edit screen and values coerced to \
+                       the API shape, so pass natural values: `{\"Labels\": [\"a\", \"b\"], \
+                       \"Story Points\": 8, \"Acceptance Criteria\": \"- one\\n- two\"}`. String \
+                       values for rich-text fields are JFM markdown auto-converted to ADF \
+                       (`\"\"` clears the field); pass a raw ADF object (`{\"type\": \"doc\", \
+                       ...}`) to bypass conversion. Complements `jira_write` (description \
+                       body, assignee/reporter, raw-id fields); to change workflow status use \
+                       `jira_transition`; for hierarchy `jira_link_parent` remains the \
+                       canonical surface. Set `dry_run: true` to preview the request (method, \
+                       path, body) without updating. Returns `{status: ok, key, \
+                       updated_fields}` as YAML. Mirrors the CLI's `omni-dev atlassian jira \
+                       write --set-field`."
+    )]
+    pub async fn jira_edit(
+        &self,
+        Parameters(params): Parameters<JiraEditParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (client, _instance_url) = create_client().map_err(tool_error)?;
+        let text = run_jira_edit(
+            &client,
+            &self.catalogue_cache,
+            &params.key,
+            &params.fields,
             params.dry_run,
         )
         .await
@@ -2234,6 +2354,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_jira_create_parent_issuelink_wraps_key() {
+        // Issue #1157: an issuelink-type field (Parent) is accepted in
+        // `custom_fields` and shaped as `{"key": ...}` in the create POST.
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/createmeta"))
+            .and(query_param("projectKeys", "PROJ"))
+            .and(query_param("issuetypeNames", "Story"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "projects": [{
+                    "issuetypes": [{
+                        "fields": {
+                            "parent": {
+                                "name": "Parent",
+                                "schema": {"type": "issuelink", "system": "parent"}
+                            }
+                        }
+                    }]
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue"))
+            .and(body_json(serde_json::json!({
+                "fields": {
+                    "project": {"key": "PROJ"},
+                    "issuetype": {"name": "Story"},
+                    "summary": "Child story",
+                    "parent": {"key": "PROJ-1"}
+                }
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": "101",
+                "key": "PROJ-101",
+                "self": "https://example.atlassian.net/rest/api/3/issue/101"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert(
+            "Parent".to_string(),
+            serde_json::Value::String("PROJ-1".to_string()),
+        );
+        let params = JiraCreateParams {
+            description_path: None,
+            document_path: None,
+            document: None,
+            project: Some("PROJ".to_string()),
+            summary: Some("Child story".to_string()),
+            description: None,
+            issue_type: Some("Story".to_string()),
+            custom_fields: Some(fields),
+            dry_run: false,
+        };
+        let yaml = run_jira_create(&client, &params).await.unwrap();
+        assert!(yaml.contains("PROJ-101"));
+    }
+
+    #[tokio::test]
     async fn run_jira_create_without_custom_fields_skips_createmeta() {
         // The fast path must not hit createmeta when no custom fields are
         // requested — only the create POST. An empty map behaves like None.
@@ -3018,6 +3204,291 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    // ── run_jira_edit ──────────────────────────────────────────────────────
+
+    /// Editmeta covering the field shapes `jira_edit` dispatches on: labels,
+    /// a number custom field, a select with allowed values, a rich-text
+    /// textarea, and an issue-link parent.
+    fn editmeta_edit_body() -> serde_json::Value {
+        serde_json::json!({
+            "fields": {
+                "labels": {
+                    "name": "Labels",
+                    "schema": {"type": "array", "items": "string", "system": "labels"}
+                },
+                "customfield_10016": {
+                    "name": "Story Points",
+                    "schema": {
+                        "type": "number",
+                        "custom": "com.atlassian.jira.plugin.system.customfieldtypes:float"
+                    }
+                },
+                "customfield_10001": {
+                    "name": "Severity",
+                    "schema": {
+                        "type": "option",
+                        "custom": "com.atlassian.jira.plugin.system.customfieldtypes:select"
+                    },
+                    "allowedValues": [{"value": "Low"}, {"value": "High"}]
+                },
+                "customfield_19300": {
+                    "name": "Acceptance Criteria",
+                    "schema": {
+                        "type": "string",
+                        "custom": "com.atlassian.jira.plugin.system.customfieldtypes:textarea"
+                    }
+                },
+                "parent": {
+                    "name": "Parent",
+                    "schema": {"type": "issuelink", "system": "parent"}
+                }
+            }
+        })
+    }
+
+    async fn mount_editmeta_edit(server: &MockServer, key: &str) {
+        Mock::given(method("GET"))
+            .and(path(format!("/rest/api/3/issue/{key}/editmeta")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(editmeta_edit_body()))
+            .mount(server)
+            .await;
+    }
+
+    fn edit_fields(
+        entries: &[(&str, serde_json::Value)],
+    ) -> std::collections::BTreeMap<String, serde_json::Value> {
+        entries
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn run_jira_edit_labels_sent_as_plain_strings() {
+        let server = MockServer::start().await;
+        mount_editmeta_edit(&server, "PROJ-1").await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .and(body_json(serde_json::json!({
+                "fields": {"labels": ["lock-state-v2", "phase-1"]}
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let fields = edit_fields(&[("Labels", serde_json::json!(["lock-state-v2", "phase-1"]))]);
+        let out = run_jira_edit(&client, &mock_cache(), "PROJ-1", &fields, false)
+            .await
+            .unwrap();
+        assert!(out.contains("status: ok"), "got: {out}");
+        assert!(out.contains("key: PROJ-1"), "got: {out}");
+        assert!(out.contains("- labels"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn run_jira_edit_resolves_display_names_to_ids() {
+        let server = MockServer::start().await;
+        mount_editmeta_edit(&server, "PROJ-1").await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .and(body_json(serde_json::json!({
+                "fields": {
+                    "customfield_10016": 8,
+                    "customfield_10001": {"value": "High"}
+                }
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let fields = edit_fields(&[
+            ("Story Points", serde_json::json!(8)),
+            ("Severity", serde_json::json!("High")),
+        ]);
+        let out = run_jira_edit(&client, &mock_cache(), "PROJ-1", &fields, false)
+            .await
+            .unwrap();
+        assert!(out.contains("- customfield_10016"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn run_jira_edit_textarea_string_converts_to_adf() {
+        let server = MockServer::start().await;
+        mount_editmeta_edit(&server, "PROJ-1").await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .and(body_json(serde_json::json!({
+                "fields": {
+                    "customfield_19300": {
+                        "version": 1,
+                        "type": "doc",
+                        "content": [{
+                            "type": "paragraph",
+                            "content": [{"type": "text", "text": "criteria"}]
+                        }]
+                    }
+                }
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let fields = edit_fields(&[("Acceptance Criteria", serde_json::json!("criteria"))]);
+        run_jira_edit(&client, &mock_cache(), "PROJ-1", &fields, false)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_jira_edit_explicit_adf_object_forwarded() {
+        let raw_adf = serde_json::json!({
+            "type": "doc",
+            "version": 1,
+            "content": [{"type": "paragraph", "content": [{"type": "text", "text": "hand-built"}]}]
+        });
+        let server = MockServer::start().await;
+        mount_editmeta_edit(&server, "PROJ-1").await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .and(body_json(serde_json::json!({
+                "fields": {"customfield_19300": raw_adf.clone()}
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let fields = edit_fields(&[("Acceptance Criteria", raw_adf)]);
+        run_jira_edit(&client, &mock_cache(), "PROJ-1", &fields, false)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_jira_edit_issuelink_field_wraps_key() {
+        let server = MockServer::start().await;
+        mount_editmeta_edit(&server, "PROJ-1").await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .and(body_json(serde_json::json!({
+                "fields": {"parent": {"key": "PROJ-100"}}
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let fields = edit_fields(&[("Parent", serde_json::json!("PROJ-100"))]);
+        run_jira_edit(&client, &mock_cache(), "PROJ-1", &fields, false)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_jira_edit_dry_run_previews_without_put() {
+        // No PUT mock mounted — a PUT would panic as an unmatched request.
+        let server = MockServer::start().await;
+        mount_editmeta_edit(&server, "PROJ-1").await;
+
+        let client = mock_client(&server.uri());
+        let fields = edit_fields(&[("Labels", serde_json::json!(["a"]))]);
+        let out = run_jira_edit(&client, &mock_cache(), "PROJ-1", &fields, true)
+            .await
+            .unwrap();
+        assert!(out.contains("dry_run: true"), "got: {out}");
+        assert!(out.contains("method: PUT"), "got: {out}");
+        assert!(out.contains("path: /rest/api/3/issue/PROJ-1"), "got: {out}");
+        assert!(out.contains("labels"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn run_jira_edit_empty_fields_errors_without_http() {
+        // No mocks mounted — any HTTP call would panic as unmatched.
+        let server = MockServer::start().await;
+        let client = mock_client(&server.uri());
+        let err = run_jira_edit(
+            &client,
+            &mock_cache(),
+            "PROJ-1",
+            &std::collections::BTreeMap::new(),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("no fields supplied"),
+            "got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_jira_edit_unknown_field_lists_candidates() {
+        let server = MockServer::start().await;
+        mount_editmeta_edit(&server, "PROJ-1").await;
+
+        let client = mock_client(&server.uri());
+        let fields = edit_fields(&[("Nonexistent", serde_json::json!("x"))]);
+        let err = run_jira_edit(&client, &mock_cache(), "PROJ-1", &fields, false)
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Unknown custom field 'Nonexistent'"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("Story Points"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn run_jira_edit_editmeta_failure_is_fatal() {
+        // Unlike `jira_write`'s escape hatch, there is no pass-through
+        // fallback: resolution is the tool's contract.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1/editmeta"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let fields = edit_fields(&[("Labels", serde_json::json!(["a"]))]);
+        let err = run_jira_edit(&client, &mock_cache(), "PROJ-1", &fields, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("500"), "got: {err:#}");
+    }
+
+    #[tokio::test]
+    async fn run_jira_edit_put_error_surfaces_detail() {
+        let server = MockServer::start().await;
+        mount_editmeta_edit(&server, "PROJ-1").await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "errorMessages": [],
+                "errors": {"labels": "Field 'labels' cannot be set"}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server.uri());
+        let fields = edit_fields(&[("Labels", serde_json::json!(["a"]))]);
+        let err = run_jira_edit(&client, &mock_cache(), "PROJ-1", &fields, false)
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("400"), "got: {msg}");
+        assert!(msg.contains("labels"), "got: {msg}");
     }
 
     // ── run_jira_transition ────────────────────────────────────────────────
