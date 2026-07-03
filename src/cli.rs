@@ -1,7 +1,7 @@
 //! CLI interface for omni-dev.
 
 use anyhow::Result;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 
 pub mod ai;
 pub mod atlassian;
@@ -26,30 +26,18 @@ pub mod transcript;
 #[cfg(unix)]
 pub mod worktrees;
 
-/// CLI-side selector for the AI backend dispatched by
-/// [`create_default_claude_client`][crate::claude::client::create_default_claude_client].
-///
-/// `None` (flag omitted) preserves env-var dispatch; an explicit value
-/// overrides `OMNI_DEV_AI_BACKEND`. Propagation to the env var happens
-/// in `Cli::propagate_global_flags`.
-#[derive(Clone, Copy, Debug, ValueEnum)]
-#[value(rename_all = "kebab-case")]
-pub enum AiBackend {
-    /// Default backend dispatch (HTTP to Anthropic/Bedrock/OpenAI/Ollama via
-    /// the existing `USE_*` env vars).
-    Default,
-    /// Shell out to the `claude -p` CLI (reuses an existing Claude Code auth
-    /// session). Equivalent to setting `OMNI_DEV_AI_BACKEND=claude-cli`.
-    ClaudeCli,
-}
+// The `--ai-backend` value enum lives with the shared backend/model resolver;
+// re-exported here so `crate::cli::AiBackend` keeps working.
+pub use crate::claude::backend::AiBackend;
 
 /// Top-level clap-derived CLI struct; the library entry point for embedding
 /// omni-dev programmatically.
 ///
-/// Global flags (`--ai-backend`, `--claude-cli-allow-tools`,
-/// `--claude-cli-allow-mcp`, `--claude-cli-max-budget-usd`, `--models-yaml`)
-/// are propagated to environment variables read by downstream factories
-/// before dispatching to a [`Commands`] variant.
+/// Global flags (`--ai-backend`, `--model`, `--beta-header`,
+/// `--claude-cli-allow-tools`, `--claude-cli-allow-mcp`,
+/// `--claude-cli-max-budget-usd`, `--models-yaml`) are propagated to
+/// environment variables read by downstream factories before dispatching to a
+/// [`Commands`] variant.
 #[derive(Parser)]
 #[command(name = "omni-dev")]
 #[command(
@@ -60,9 +48,28 @@ pub enum AiBackend {
 pub struct Cli {
     /// Selects the AI backend used by commands that invoke an AI model.
     ///
-    /// Overrides the `OMNI_DEV_AI_BACKEND` environment variable.
+    /// Overrides the `OMNI_DEV_AI_BACKEND` environment variable and the
+    /// legacy `USE_OPENAI`/`USE_OLLAMA`/`CLAUDE_CODE_USE_BEDROCK` variables
+    /// (`default` forces the direct Anthropic API even when they are set).
     #[arg(long, global = true, value_enum)]
     pub ai_backend: Option<AiBackend>,
+
+    /// AI model to use for commands that invoke an AI model.
+    ///
+    /// Highest-precedence model selector: it overrides `OMNI_DEV_MODEL` and
+    /// every per-backend model variable (`CLAUDE_MODEL`, `CLAUDE_CODE_MODEL`,
+    /// `ANTHROPIC_MODEL`, `OPENAI_MODEL`, `OLLAMA_MODEL`). Equivalent to
+    /// setting `OMNI_DEV_MODEL`.
+    #[arg(long, global = true, value_name = "MODEL")]
+    pub model: Option<String>,
+
+    /// Beta header to send with AI API requests (format: key:value).
+    ///
+    /// Only sent if the model supports it in the model registry. Equivalent
+    /// to setting `OMNI_DEV_BETA_HEADER`. Ignored when `--ai-backend` is
+    /// `claude-cli` (the CLI negotiates betas itself).
+    #[arg(long, global = true, value_name = "KEY:VALUE")]
+    pub beta_header: Option<String>,
 
     /// Weakens the `claude-cli` sandbox by allowing the nested `claude -p`
     /// session to use its default built-in tools (Read, Edit, Write, Bash,
@@ -189,11 +196,19 @@ impl Cli {
     /// subcommand. Setting the env vars here (rather than threading extra
     /// arguments through every command) keeps factory signatures stable.
     fn propagate_global_flags(&self) {
+        // Every value — including `default` — is written to the env var so
+        // the flag decisively overrides both a pre-set OMNI_DEV_AI_BACKEND
+        // and the legacy USE_* selection flags (#1118).
         if let Some(backend) = self.ai_backend {
-            match backend {
-                AiBackend::Default => std::env::remove_var("OMNI_DEV_AI_BACKEND"),
-                AiBackend::ClaudeCli => std::env::set_var("OMNI_DEV_AI_BACKEND", "claude-cli"),
-            }
+            std::env::set_var(crate::claude::backend::AI_BACKEND_ENV, backend.env_value());
+        }
+
+        if let Some(model) = &self.model {
+            std::env::set_var(crate::claude::backend::MODEL_ENV, model);
+        }
+
+        if let Some(beta_header) = &self.beta_header {
+            std::env::set_var(crate::claude::backend::BETA_HEADER_ENV, beta_header);
         }
 
         if self.claude_cli_allow_tools {

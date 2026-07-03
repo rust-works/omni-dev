@@ -10,24 +10,18 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use std::process::{Command, Stdio};
 
-use super::parse_beta_header;
 use crate::data::context::ScopeDefinition;
 
 /// `omni-dev git commit message staged` CLI command.
+///
+/// Model/beta-header selection uses the global `--model`/`--beta-header`
+/// flags (propagated as `OMNI_DEV_MODEL`/`OMNI_DEV_BETA_HEADER`) and the
+/// per-backend env chain; there are no subcommand-local flags.
 #[derive(Parser)]
 pub struct StagedCommand {
     /// Print the generated message to stdout instead of committing.
     #[arg(long)]
     pub print_only: bool,
-
-    /// Claude API model to use (if not specified, uses settings or default).
-    #[arg(long)]
-    pub model: Option<String>,
-
-    /// Beta header to send with API requests (format: key:value).
-    /// Only sent if the model supports it in the registry.
-    #[arg(long, value_name = "KEY:VALUE")]
-    pub beta_header: Option<String>,
 
     /// Override the context directory used to load project scopes.
     #[arg(long, value_name = "DIR")]
@@ -50,15 +44,10 @@ impl StagedCommand {
     /// `repo` is the repository location resolved at the CLI boundary
     /// (`None` = current working directory).
     pub async fn execute(self, repo: Option<&std::path::Path>) -> Result<()> {
-        let beta = self
-            .beta_header
-            .as_deref()
-            .map(parse_beta_header)
-            .transpose()?;
         let _ = run_staged(
             self.print_only,
-            self.model,
-            beta,
+            None,
+            None,
             self.context_dir.as_deref(),
             repo,
         )
@@ -474,8 +463,6 @@ mod tests {
         let temp_dir = init_empty_repo();
         let cmd = StagedCommand {
             print_only: true,
-            model: None,
-            beta_header: None,
             context_dir: None,
         };
         let err = cmd.execute(Some(temp_dir.path())).await.unwrap_err();
@@ -483,25 +470,6 @@ mod tests {
         assert!(
             msg.to_lowercase().contains("no staged changes"),
             "expected 'no staged changes' error from execute(), got: {msg}"
-        );
-    }
-
-    // `execute()` parses `--beta-header` before any other work; an invalid
-    // value should error out with a clear "Invalid --beta-header" message.
-    #[tokio::test]
-    async fn staged_command_execute_rejects_malformed_beta_header() {
-        let temp_dir = init_empty_repo();
-        let cmd = StagedCommand {
-            print_only: true,
-            model: None,
-            beta_header: Some("no-colon-here".to_string()),
-            context_dir: None,
-        };
-        let err = cmd.execute(Some(temp_dir.path())).await.unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("Invalid --beta-header"),
-            "expected beta-header parse error, got: {msg}"
         );
     }
 

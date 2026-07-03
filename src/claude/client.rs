@@ -4685,4 +4685,121 @@ mod tests {
         let result = create_default_claude_client_with(&MapEnv::new(), None, None).await;
         assert!(result.is_err());
     }
+
+    // ── shared-resolver behaviors introduced by #1118 ───────────────
+
+    #[tokio::test]
+    async fn factory_default_claude_branch_honours_claude_model_chain() {
+        // The headline #1118 bug: CLAUDE_MODEL / CLAUDE_CODE_MODEL were
+        // silently ignored by the direct-API branch.
+        let env = MapEnv::new()
+            .with("CLAUDE_MODEL", "claude-opus-4-6")
+            .with("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+            .with("CLAUDE_API_KEY", "sk-test");
+
+        let client = create_default_claude_client_with(&env, None, None)
+            .await
+            .expect("factory should succeed");
+        assert_eq!(client.get_ai_client_metadata().model, "claude-opus-4-6");
+    }
+
+    #[tokio::test]
+    async fn factory_bedrock_branch_honours_claude_model_chain() {
+        let env = MapEnv::new()
+            .with("CLAUDE_CODE_USE_BEDROCK", "true")
+            .with("CLAUDE_CODE_MODEL", "claude-opus-4-6")
+            .with("ANTHROPIC_AUTH_TOKEN", "tok")
+            .with("ANTHROPIC_BEDROCK_BASE_URL", "https://bedrock.example.com");
+
+        let client = create_default_claude_client_with(&env, None, None)
+            .await
+            .expect("factory should succeed");
+        assert_eq!(client.get_ai_client_metadata().model, "claude-opus-4-6");
+    }
+
+    #[tokio::test]
+    async fn factory_omni_dev_model_beats_provider_var() {
+        let env = MapEnv::new()
+            .with("USE_OPENAI", "true")
+            .with("OMNI_DEV_MODEL", "gpt-4.1")
+            .with("OPENAI_MODEL", "gpt-5-mini")
+            .with("OPENAI_API_KEY", "sk-test");
+
+        let client = create_default_claude_client_with(&env, None, None)
+            .await
+            .expect("factory should succeed");
+        assert_eq!(client.get_ai_client_metadata().model, "gpt-4.1");
+    }
+
+    #[tokio::test]
+    async fn factory_backend_env_var_beats_legacy_use_flags() {
+        // OMNI_DEV_AI_BACKEND=openai wins even though USE_OLLAMA is set.
+        let env = MapEnv::new()
+            .with("OMNI_DEV_AI_BACKEND", "openai")
+            .with("USE_OLLAMA", "true")
+            .with("OPENAI_API_KEY", "sk-test");
+
+        let client = create_default_claude_client_with(&env, None, None)
+            .await
+            .expect("factory should succeed");
+        assert_eq!(client.get_ai_client_metadata().model, "gpt-5-mini");
+    }
+
+    #[tokio::test]
+    async fn factory_backend_default_value_forces_direct_api() {
+        // `--ai-backend default` propagates as OMNI_DEV_AI_BACKEND=default and
+        // must override the USE_* soup, dispatching the direct Claude client.
+        let env = MapEnv::new()
+            .with("OMNI_DEV_AI_BACKEND", "default")
+            .with("USE_OLLAMA", "true")
+            .with("CLAUDE_API_KEY", "sk-test");
+
+        let client = create_default_claude_client_with(&env, None, None)
+            .await
+            .expect("factory should succeed");
+        assert_eq!(client.get_ai_client_metadata().model, "claude-sonnet-4-6");
+    }
+
+    #[tokio::test]
+    async fn factory_unknown_backend_value_is_hard_error() {
+        let env = MapEnv::new()
+            .with("OMNI_DEV_AI_BACKEND", "junk")
+            .with("CLAUDE_API_KEY", "sk-test");
+
+        let err = create_default_claude_client_with(&env, None, None)
+            .await
+            .map(|_| ())
+            .expect_err("unknown backend must error");
+        assert!(format!("{err:#}").contains("junk"));
+    }
+
+    #[tokio::test]
+    async fn factory_beta_header_env_var_is_applied() {
+        let env = MapEnv::new()
+            .with("ANTHROPIC_MODEL", "claude-3-7-sonnet-20250219")
+            .with(
+                "OMNI_DEV_BETA_HEADER",
+                "anthropic-beta:output-128k-2025-02-19",
+            )
+            .with("CLAUDE_API_KEY", "sk-test");
+
+        let client = create_default_claude_client_with(&env, None, None)
+            .await
+            .expect("factory should accept a registry-supported beta header");
+        // The beta header raises the model's max output tokens.
+        assert_eq!(client.get_ai_client_metadata().max_response_length, 128000);
+    }
+
+    #[tokio::test]
+    async fn factory_beta_header_env_var_malformed_is_hard_error() {
+        let env = MapEnv::new()
+            .with("OMNI_DEV_BETA_HEADER", "no-colon-here")
+            .with("CLAUDE_API_KEY", "sk-test");
+
+        let err = create_default_claude_client_with(&env, None, None)
+            .await
+            .map(|_| ())
+            .expect_err("malformed beta header must error");
+        assert!(format!("{err:#}").contains("no-colon-here"));
+    }
 }
