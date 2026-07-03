@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 
 use crate::atlassian::client::{AtlassianClient, JiraAttachment};
 use crate::cli::atlassian::helpers::create_client;
+use crate::utils::path::attachment_filename;
 
 /// Image MIME types for filtering.
 const IMAGE_MIME_TYPES: &[&str] = &[
@@ -178,7 +179,8 @@ async fn download_file(
         format_size(attachment.size)
     );
     let data = client.get_bytes(&attachment.content_url).await?;
-    let path = Path::new(output_dir).join(&attachment.filename);
+    let path =
+        Path::new(output_dir).join(attachment_filename(&attachment.filename, &attachment.id));
     fs::write(&path, &data).with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())
 }
@@ -343,6 +345,49 @@ mod tests {
         let result = run_download(&client, "PROJ-1", temp.path().to_str().unwrap(), None).await;
         assert!(result.is_ok());
         assert!(temp.path().join("test.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn run_download_sanitizes_traversal_filename() {
+        let server = wiremock::MockServer::start().await;
+        let content_url = format!("{}/attachment/1", server.uri());
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/rest/api/3/issue/PROJ-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "fields": {
+                        "attachment": [{
+                            "id": "1",
+                            "filename": "../../evil.txt",
+                            "mimeType": "text/plain",
+                            "size": 4,
+                            "content": content_url
+                        }]
+                    }
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/attachment/1"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"EVIL".as_slice()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            crate::atlassian::client::AtlassianClient::new(&server.uri(), "u@t.com", "tok")
+                .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        run_download(&client, "PROJ-1", temp.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+        assert!(temp.path().join("evil.txt").exists());
+        let escaped = temp.path().parent().unwrap().parent().unwrap();
+        assert!(!escaped.join("evil.txt").exists());
     }
 
     #[tokio::test]
