@@ -8,18 +8,25 @@
 //! `warehouse`/`role`/`database`/`schema`, with the number of browser auths
 //! capped at the pool size and grown lazily.
 //!
+//! A background keep-alive heartbeat ([`SnowflakeEngine::start_heartbeat`])
+//! periodically heartbeats idle sessions so their master tokens stay valid and
+//! an idle pool never re-prompts browser SSO.
+//!
 //! This is the standalone engine, analogous to [`crate::browser`]; the daemon
 //! adapter lives in [`crate::daemon::services::snowflake`].
 
 pub mod client;
 pub mod session;
 
+use std::sync::{Mutex as StdMutex, MutexGuard};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use chrono::TimeDelta;
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::utils::settings::Settings;
 use client::{Error as ClientError, Row, SnowflakeClient, SnowflakeClientConfig, SnowflakeSession};
@@ -45,6 +52,9 @@ const ENV_HTTP_TIMEOUT: &str = "SNOWFLAKE_HTTP_TIMEOUT";
 const ENV_AUTH_TIMEOUT: &str = "SNOWFLAKE_AUTH_TIMEOUT";
 /// Env var for the overall per-query deadline incl. async polling (seconds).
 const ENV_QUERY_TIMEOUT: &str = "SNOWFLAKE_QUERY_TIMEOUT";
+/// Env var for the idle-session keep-alive heartbeat interval (seconds; `0`
+/// disables the heartbeat).
+const ENV_HEARTBEAT_INTERVAL: &str = "SNOWFLAKE_HEARTBEAT_INTERVAL";
 
 /// Default pool size when `SNOWFLAKE_POOL_SIZE` is unset: the max concurrent
 /// queries (and max browser auths) per `(account, user)`.
@@ -54,6 +64,14 @@ const DEFAULT_POOL_SIZE: usize = 4;
 const DEFAULT_AUTH_TIMEOUT: Duration = Duration::from_secs(150);
 /// Max characters of SQL shown in the "running" preview for a busy session.
 const SQL_PREVIEW_MAX: usize = 60;
+/// Default keep-alive heartbeat interval: a quarter of the default 3600s
+/// session-token validity (Snowflake's own drivers clamp their heartbeat
+/// frequency to 900–3600s), so an idle session renews comfortably before
+/// either token lapses.
+const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(900);
+/// Extra margin past the heartbeat interval when deciding to proactively renew
+/// an idle session's token before it would lapse mid-cycle.
+const HEARTBEAT_RENEW_MARGIN_SECS: i64 = 60;
 
 /// Engine defaults, resolved from environment variables and then
 /// `~/.omni-dev/settings.json` (the Atlassian credential-resolution pattern).
@@ -83,6 +101,9 @@ pub struct SnowflakeEngineConfig {
     pub auth_timeout: Duration,
     /// Overall deadline for one query (submit + async-result polling).
     pub query_timeout: Duration,
+    /// How often the background task heartbeats idle sessions to keep their
+    /// master token alive. Zero disables the heartbeat.
+    pub heartbeat_interval: Duration,
 }
 
 impl Default for SnowflakeEngineConfig {
@@ -98,6 +119,7 @@ impl Default for SnowflakeEngineConfig {
             http_timeout: client::config::DEFAULT_HTTP_TIMEOUT,
             auth_timeout: DEFAULT_AUTH_TIMEOUT,
             query_timeout: client::config::DEFAULT_QUERY_TIMEOUT,
+            heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
         }
     }
 }
@@ -135,8 +157,20 @@ impl SnowflakeEngineConfig {
             http_timeout: secs(ENV_HTTP_TIMEOUT).unwrap_or(client::config::DEFAULT_HTTP_TIMEOUT),
             auth_timeout: secs(ENV_AUTH_TIMEOUT).unwrap_or(DEFAULT_AUTH_TIMEOUT),
             query_timeout: secs(ENV_QUERY_TIMEOUT).unwrap_or(client::config::DEFAULT_QUERY_TIMEOUT),
+            heartbeat_interval: heartbeat_interval_from(
+                settings.get_env_var(ENV_HEARTBEAT_INTERVAL),
+            ),
         })
     }
+}
+
+/// Parses the heartbeat-interval setting: seconds, with `0` meaning disabled.
+/// Unset or unparseable values fall back to the default. (The `secs` helper in
+/// [`SnowflakeEngineConfig::from_env_and_settings`] rejects `0`, which here is
+/// a meaningful value.)
+fn heartbeat_interval_from(raw: Option<String>) -> Duration {
+    raw.and_then(|s| s.trim().parse::<u64>().ok())
+        .map_or(DEFAULT_HEARTBEAT_INTERVAL, Duration::from_secs)
 }
 
 /// A single arbitrary-SQL query request routed to the engine.
@@ -175,11 +209,22 @@ impl QueryRequest {
     }
 }
 
+/// The running keep-alive heartbeat loop: cancelled and awaited on shutdown.
+struct HeartbeatTask {
+    token: CancellationToken,
+    handle: JoinHandle<()>,
+}
+
 /// The account-agnostic Snowflake query engine: lazy multiplexed auth, bounded
 /// per-identity session pools, and concurrent arbitrary-SQL execution.
+///
+/// A background keep-alive heartbeat for idle sessions is started by
+/// [`start_heartbeat`](Self::start_heartbeat) and stopped by
+/// [`shutdown`](Self::shutdown).
 pub struct SnowflakeEngine {
     config: SnowflakeEngineConfig,
     registry: PoolRegistry,
+    heartbeat: StdMutex<Option<HeartbeatTask>>,
 }
 
 impl SnowflakeEngine {
@@ -189,7 +234,53 @@ impl SnowflakeEngine {
         Self {
             config,
             registry: PoolRegistry::new(),
+            heartbeat: StdMutex::new(None),
         }
+    }
+
+    /// Starts the background keep-alive heartbeat loop (idempotent).
+    ///
+    /// Every `heartbeat_interval` the loop heartbeats each pool's idle sessions
+    /// — renewing a session token about to lapse — so the server-side
+    /// `CLIENT_SESSION_KEEP_ALIVE` actually extends the master token and an
+    /// idle pool survives past the token TTL without a new browser SSO (#1107).
+    /// Busy sessions are skipped; the query path keeps them alive inline.
+    ///
+    /// No-op when the interval is zero (disabled) or when called outside a
+    /// tokio runtime. Stopped by [`shutdown`](Self::shutdown).
+    pub fn start_heartbeat(&self) {
+        let interval = self.config.heartbeat_interval;
+        if interval.is_zero() {
+            return;
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            tracing::debug!("no tokio runtime; Snowflake keep-alive heartbeat not started");
+            return;
+        }
+        let mut guard = self.lock_heartbeat();
+        if guard.is_some() {
+            return;
+        }
+        let token = CancellationToken::new();
+        let loop_token = token.clone();
+        let registry = self.registry.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = loop_token.cancelled() => break,
+                    () = tokio::time::sleep(interval) => {
+                        heartbeat_all_pools(&registry, interval).await;
+                    }
+                }
+            }
+        });
+        *guard = Some(HeartbeatTask { token, handle });
+    }
+
+    fn lock_heartbeat(&self) -> MutexGuard<'_, Option<HeartbeatTask>> {
+        self.heartbeat
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// A snapshot of every active pool.
@@ -220,8 +311,13 @@ impl SnowflakeEngine {
         self.registry.take_all().len()
     }
 
-    /// Drops every pool (and its sessions).
+    /// Stops the keep-alive heartbeat, then drops every pool (and its sessions).
     pub async fn shutdown(&self) {
+        let task = self.lock_heartbeat().take();
+        if let Some(task) = task {
+            task.token.cancel();
+            let _ = task.handle.await;
+        }
         let pools = self.registry.take_all();
         drop(pools);
     }
@@ -329,6 +425,91 @@ impl SnowflakeEngine {
                 pool.checkin(checkout, QueryContext::default());
                 Err(anyhow::Error::new(e).context("Snowflake query failed"))
             }
+        }
+    }
+}
+
+impl Drop for SnowflakeEngine {
+    fn drop(&mut self) {
+        // Best-effort: an engine dropped without `shutdown()` must not leave the
+        // heartbeat loop running forever. Cancellation is sync; the task itself
+        // is detached and exits on its next select.
+        let task = self.lock_heartbeat().take();
+        if let Some(task) = task {
+            task.token.cancel();
+        }
+    }
+}
+
+/// Sends one keep-alive round to every pool's currently-idle sessions,
+/// discarding any session that is dead beyond renewal.
+async fn heartbeat_all_pools(registry: &PoolRegistry, interval: Duration) {
+    for pool in registry.pools() {
+        let checkouts = pool.checkout_all_idle();
+        if checkouts.is_empty() {
+            continue;
+        }
+        let total = checkouts.len();
+        let mut kept = 0usize;
+        for checkout in checkouts {
+            if keep_session_alive(checkout.session(), interval).await {
+                pool.restore(checkout);
+                kept += 1;
+            } else {
+                pool.discard(checkout);
+            }
+        }
+        tracing::debug!(
+            pool = pool.id(),
+            kept,
+            total,
+            "Snowflake keep-alive heartbeat round"
+        );
+    }
+}
+
+/// Keeps one idle session alive: proactively renews a session token that would
+/// lapse before the next tick (the heartbeat itself is authorized by the
+/// session token), then heartbeats so the server extends the master token.
+///
+/// Returns whether the session is still usable: `false` only when the master
+/// token has expired (a full re-auth is unavoidable), so the caller discards
+/// it. Transient errors keep the session for the next tick.
+async fn keep_session_alive(session: &SnowflakeSession, interval: Duration) -> bool {
+    let margin_secs = i64::try_from(interval.as_secs())
+        .unwrap_or(i64::MAX)
+        .saturating_add(HEARTBEAT_RENEW_MARGIN_SECS);
+    let margin = TimeDelta::try_seconds(margin_secs).unwrap_or(TimeDelta::MAX);
+    if session.session_expiring_within(margin) {
+        match session.renew().await {
+            Ok(()) => {}
+            Err(e) if e.is_session_expired() => {
+                tracing::warn!("Snowflake keep-alive: master token expired; discarding session");
+                return false;
+            }
+            Err(e) => {
+                // Transient: keep the session and try again next tick.
+                tracing::warn!("Snowflake keep-alive renew failed: {e}");
+                return true;
+            }
+        }
+    }
+    match session.heartbeat().await {
+        Ok(()) => true,
+        Err(e) if e.is_session_expired() => match session.renew().await {
+            Ok(()) => true,
+            Err(renew_err) if renew_err.is_session_expired() => {
+                tracing::warn!("Snowflake keep-alive: master token expired; discarding session");
+                false
+            }
+            Err(renew_err) => {
+                tracing::warn!("Snowflake keep-alive renew failed: {renew_err}");
+                true
+            }
+        },
+        Err(e) => {
+            tracing::warn!("Snowflake keep-alive heartbeat failed: {e}");
+            true
         }
     }
 }
@@ -499,6 +680,62 @@ mod tests {
     #[test]
     fn default_config_has_a_nonzero_pool_size() {
         assert!(SnowflakeEngineConfig::default().pool_size >= 1);
+    }
+
+    #[test]
+    fn heartbeat_interval_from_parses_seconds_zero_and_garbage() {
+        assert_eq!(heartbeat_interval_from(None), DEFAULT_HEARTBEAT_INTERVAL);
+        assert_eq!(
+            heartbeat_interval_from(Some("300".to_string())),
+            Duration::from_secs(300)
+        );
+        // `0` is meaningful: it disables the heartbeat.
+        assert_eq!(
+            heartbeat_interval_from(Some(" 0 ".to_string())),
+            Duration::ZERO
+        );
+        assert_eq!(
+            heartbeat_interval_from(Some("garbage".to_string())),
+            DEFAULT_HEARTBEAT_INTERVAL
+        );
+    }
+
+    #[tokio::test]
+    async fn start_heartbeat_is_a_noop_when_disabled() {
+        let engine = SnowflakeEngine::new(SnowflakeEngineConfig {
+            heartbeat_interval: Duration::ZERO,
+            ..SnowflakeEngineConfig::default()
+        });
+        engine.start_heartbeat();
+        assert!(engine.lock_heartbeat().is_none());
+    }
+
+    #[test]
+    fn start_heartbeat_is_a_noop_outside_a_runtime() {
+        let engine = SnowflakeEngine::new(SnowflakeEngineConfig::default());
+        engine.start_heartbeat();
+        assert!(engine.lock_heartbeat().is_none());
+    }
+
+    #[tokio::test]
+    async fn start_heartbeat_is_idempotent_and_shutdown_stops_it() {
+        let engine = SnowflakeEngine::new(SnowflakeEngineConfig::default());
+        engine.start_heartbeat();
+        // Cancelling the running task's token lets a replacement be detected: a
+        // second start must keep this task, not spawn (and orphan) a fresh one.
+        engine.lock_heartbeat().as_ref().unwrap().token.cancel();
+        engine.start_heartbeat();
+        assert!(
+            engine
+                .lock_heartbeat()
+                .as_ref()
+                .unwrap()
+                .token
+                .is_cancelled(),
+            "second start must not replace the running task"
+        );
+        engine.shutdown().await;
+        assert!(engine.lock_heartbeat().is_none());
     }
 
     #[test]
@@ -732,6 +969,161 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(rows.len(), 1, "renewed and retried transparently");
+        }
+    }
+
+    mod keep_alive {
+        use super::*;
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// A short interval so `session_expiring_within(interval + margin)` is
+        /// false for the test session's fresh 3600s token.
+        const INTERVAL: Duration = Duration::from_secs(60);
+
+        /// Mounts a `session/heartbeat` handler answering with `body`.
+        async fn mount_heartbeat(server: &MockServer, body: serde_json::Value) {
+            Mock::given(method("POST"))
+                .and(path("/session/heartbeat"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(server)
+                .await;
+        }
+
+        /// Mounts a `session/token-request` (renew) handler answering with `body`.
+        async fn mount_renew(server: &MockServer, body: serde_json::Value) {
+            Mock::given(method("POST"))
+                .and(path("/session/token-request"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(server)
+                .await;
+        }
+
+        fn ok_body() -> serde_json::Value {
+            json!({ "success": true, "data": {} })
+        }
+
+        fn renew_ok_body() -> serde_json::Value {
+            json!({
+                "success": true,
+                "data": { "sessionToken": "fresh", "validityInSecondsST": 3600 }
+            })
+        }
+
+        fn expired_body() -> serde_json::Value {
+            json!({ "success": false, "code": "390112", "message": "expired", "data": {} })
+        }
+
+        #[tokio::test]
+        async fn keep_session_alive_heartbeats_a_healthy_session() {
+            let server = MockServer::start().await;
+            mount_heartbeat(&server, ok_body()).await;
+            let session = client::test_session(&server.uri(), Duration::from_secs(5));
+            assert!(keep_session_alive(&session, INTERVAL).await);
+            let reqs = server.received_requests().await.unwrap();
+            assert_eq!(reqs.len(), 1, "one heartbeat, no renew");
+        }
+
+        #[tokio::test]
+        async fn keep_session_alive_renews_when_the_heartbeat_reports_expiry() {
+            let server = MockServer::start().await;
+            mount_heartbeat(&server, expired_body()).await;
+            mount_renew(&server, renew_ok_body()).await;
+            let session = client::test_session(&server.uri(), Duration::from_secs(5));
+            assert!(keep_session_alive(&session, INTERVAL).await);
+            let reqs = server.received_requests().await.unwrap();
+            assert!(
+                reqs.iter()
+                    .any(|r| r.url.path() == "/session/token-request"),
+                "renewed after the expired heartbeat"
+            );
+        }
+
+        #[tokio::test]
+        async fn keep_session_alive_discards_when_the_master_token_is_dead() {
+            let server = MockServer::start().await;
+            mount_heartbeat(&server, expired_body()).await;
+            mount_renew(&server, expired_body()).await;
+            let session = client::test_session(&server.uri(), Duration::from_secs(5));
+            assert!(!keep_session_alive(&session, INTERVAL).await);
+        }
+
+        #[tokio::test]
+        async fn keep_session_alive_keeps_the_session_on_transient_errors() {
+            let server = MockServer::start().await;
+            mount_heartbeat(
+                &server,
+                json!({ "success": false, "code": "390001", "message": "hiccup", "data": {} }),
+            )
+            .await;
+            let session = client::test_session(&server.uri(), Duration::from_secs(5));
+            assert!(keep_session_alive(&session, INTERVAL).await);
+        }
+
+        #[tokio::test]
+        async fn keep_session_alive_proactively_renews_a_token_expiring_before_the_next_tick() {
+            let server = MockServer::start().await;
+            mount_heartbeat(&server, ok_body()).await;
+            mount_renew(&server, renew_ok_body()).await;
+            let session = client::test_session(&server.uri(), Duration::from_secs(5));
+            // interval + margin exceeds the fresh 3600s validity → renew first.
+            assert!(keep_session_alive(&session, Duration::from_secs(7200)).await);
+            let reqs = server.received_requests().await.unwrap();
+            assert_eq!(
+                reqs[0].url.path(),
+                "/session/token-request",
+                "renew ran first"
+            );
+            assert_eq!(reqs[1].url.path(), "/session/heartbeat");
+        }
+
+        #[tokio::test]
+        async fn engine_heartbeat_loop_beats_idle_sessions_and_stops_on_shutdown() {
+            let server = MockServer::start().await;
+            mount_heartbeat(&server, ok_body()).await;
+
+            let engine = SnowflakeEngine::new(SnowflakeEngineConfig {
+                heartbeat_interval: Duration::from_millis(50),
+                ..SnowflakeEngineConfig::default()
+            });
+            // Park one idle session in a pool, bypassing the (live-only) SSO.
+            let pool = engine
+                .registry
+                .get_or_create(&SessionKey::new("ACCT", "user"), 2);
+            let uri = server.uri();
+            let checkout = pool
+                .checkout(|| async {
+                    Ok::<_, std::convert::Infallible>((
+                        client::test_session(&uri, Duration::from_secs(5)),
+                        QueryContext::default(),
+                    ))
+                })
+                .await
+                .unwrap();
+            pool.checkin(checkout, QueryContext::default());
+
+            engine.start_heartbeat();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while server.received_requests().await.unwrap().is_empty() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "no heartbeat within the deadline"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // The borrowed session was restored, not consumed.
+            assert_eq!(pool.live(), 1);
+
+            engine.shutdown().await;
+            let after = server.received_requests().await.unwrap().len();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                after,
+                "no heartbeats after shutdown"
+            );
+            assert_eq!(engine.pool_count(), 0, "pools drained on shutdown");
         }
     }
 }
