@@ -85,8 +85,8 @@ pub(crate) fn test_session(base_url: &str, query_timeout: std::time::Duration) -
     SnowflakeSession::new(
         transport,
         session::LoginTokens {
-            session_token: "test-sess".to_string(),
-            master_token: "test-mast".to_string(),
+            session_token: "test-sess".into(),
+            master_token: "test-mast".into(),
             session_validity_secs: 3600,
             master_validity_secs: 14_400,
         },

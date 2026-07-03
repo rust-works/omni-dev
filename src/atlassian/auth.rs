@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::atlassian::error::AtlassianError;
+use crate::utils::secret::Secret;
 use crate::utils::settings::Settings;
 
 /// Environment variable / settings key for the Atlassian instance URL.
@@ -29,8 +30,8 @@ pub struct AtlassianCredentials {
     /// User email address.
     pub email: String,
 
-    /// API token.
-    pub api_token: String,
+    /// API token (secret; redacted in `Debug` output).
+    pub api_token: Secret,
 }
 
 /// Loads Atlassian credentials from environment variables or settings.json.
@@ -72,7 +73,7 @@ pub fn load_credentials_with_instance(
     Ok(AtlassianCredentials {
         instance_url,
         email,
-        api_token,
+        api_token: api_token.into(),
     })
 }
 
@@ -169,7 +170,7 @@ pub fn save_credentials(credentials: &AtlassianCredentials) -> Result<()> {
     );
     env.insert(
         ATLASSIAN_API_TOKEN.to_string(),
-        serde_json::Value::String(credentials.api_token.clone()),
+        serde_json::Value::String(credentials.api_token.expose_secret().to_string()),
     );
 
     // Ensure parent directory exists
@@ -336,15 +337,20 @@ mod tests {
         let creds = AtlassianCredentials {
             instance_url: "https://org.atlassian.net".to_string(),
             email: "user@test.com".to_string(),
-            api_token: "token".to_string(),
+            api_token: "super-sekret-api-token-value".into(),
         };
         let cloned = creds.clone();
         assert_eq!(cloned.instance_url, creds.instance_url);
         assert_eq!(cloned.email, creds.email);
         assert_eq!(cloned.api_token, creds.api_token);
-        // Verify Debug is implemented
+        // Debug must never print the token value (#1131).
         let debug = format!("{creds:?}");
         assert!(debug.contains("AtlassianCredentials"));
+        assert!(
+            !debug.contains("super-sekret-api-token-value"),
+            "leaked token: {debug}"
+        );
+        assert!(debug.contains("api_token: <redacted>"));
     }
 
     use super::test_util::EnvGuard;
@@ -442,7 +448,7 @@ mod tests {
             let creds = AtlassianCredentials {
                 instance_url: "https://save.atlassian.net".to_string(),
                 email: "save@example.com".to_string(),
-                api_token: "save-token".to_string(),
+                api_token: "save-token".into(),
             };
             save_credentials(&creds).unwrap();
 
@@ -478,7 +484,7 @@ mod tests {
             let creds = AtlassianCredentials {
                 instance_url: "https://org.atlassian.net".to_string(),
                 email: "user@test.com".to_string(),
-                api_token: "token".to_string(),
+                api_token: "token".into(),
             };
             save_credentials(&creds).unwrap();
 
@@ -512,7 +518,7 @@ mod tests {
             load_credentials_with_instance(Some("https://override.atlassian.net/")).unwrap();
         assert_eq!(creds.instance_url, "https://override.atlassian.net");
         assert_eq!(creds.email, "person@example.com");
-        assert_eq!(creds.api_token, "token");
+        assert_eq!(creds.api_token.expose_secret(), "token");
     }
 
     #[test]
