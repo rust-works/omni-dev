@@ -223,7 +223,9 @@ impl OmniDevServer {
                        to only report problems without modifying anything. Mirrors \
                        `omni-dev git commit message twiddle --auto-apply`. Set `dry_run = true` to \
                        return the proposed amendments as YAML without applying them. The editor is \
-                       never started from this tool."
+                       never started from this tool. Commits already contained in a remote main \
+                       branch are refused (rewriting published history); overriding requires a \
+                       human running `omni-dev git commit message amend --allow-pushed` from the CLI."
     )]
     pub async fn git_twiddle_commits(
         &self,

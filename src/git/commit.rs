@@ -115,7 +115,15 @@ pub struct FileChange {
 
 impl CommitInfo {
     /// Creates a `CommitInfo` from a `git2::Commit`.
-    pub fn from_git_commit(repo: &Repository, commit: &Commit) -> Result<Self> {
+    ///
+    /// `main_tips` is the precomputed set of remote main-branch tips (see
+    /// [`crate::git::main_branches::detect_main_branch_tips`]); callers resolve
+    /// it once per invocation rather than per commit.
+    pub fn from_git_commit(
+        repo: &Repository,
+        commit: &Commit,
+        main_tips: &[crate::git::main_branches::MainBranchTip],
+    ) -> Result<Self> {
         let hash = commit.id().to_string();
 
         let author = format!(
@@ -135,10 +143,9 @@ impl CommitInfo {
 
         let original_message = commit.message().unwrap_or("").to_string();
 
-        // TODO: Implement main branch detection
-        let in_main_branches = Vec::new();
+        let in_main_branches =
+            crate::git::main_branches::branches_containing(repo, main_tips, commit.id())?;
 
-        // TODO: Implement commit analysis
         let analysis = CommitAnalysis::analyze_commit(repo, commit)?;
 
         Ok(Self {

@@ -17,6 +17,8 @@ pub struct AmendmentHandler {
     /// Workdir the `git` subprocesses are pinned to, so amendments target the
     /// injected repository rather than the process current working directory.
     repo_root: PathBuf,
+    /// Permits amending commits that already exist in remote main branches.
+    allow_pushed: bool,
 }
 
 impl AmendmentHandler {
@@ -26,7 +28,18 @@ impl AmendmentHandler {
         Ok(Self {
             repo,
             repo_root: repo_root.to_path_buf(),
+            allow_pushed: false,
         })
+    }
+
+    /// Permits amending commits that already exist in remote main branches.
+    ///
+    /// Off by default: amending a pushed commit rewrites published history, so
+    /// callers must opt in explicitly (the `--allow-pushed` CLI flag).
+    #[must_use]
+    pub fn with_allow_pushed(mut self, allow_pushed: bool) -> Self {
+        self.allow_pushed = allow_pushed;
+        self
     }
 
     /// Builds a `git` subprocess pinned to the handler's repo workdir, so every
@@ -80,15 +93,20 @@ impl AmendmentHandler {
             .context("Cannot amend commits with uncommitted changes")?;
 
         // Check if commits exist and are not in remote main branches
+        let main_tips = crate::git::main_branches::detect_main_branch_tips(&self.repo)?;
         for amendment in &amendment_file.amendments {
-            self.validate_commit_amendable(&amendment.commit)?;
+            self.validate_commit_amendable(&amendment.commit, &main_tips)?;
         }
 
         Ok(())
     }
 
     /// Validates that a commit can be safely amended.
-    fn validate_commit_amendable(&self, commit_hash: &str) -> Result<()> {
+    fn validate_commit_amendable(
+        &self,
+        commit_hash: &str,
+        main_tips: &[crate::git::main_branches::MainBranchTip],
+    ) -> Result<()> {
         // Check if commit exists
         let oid = Oid::from_str(commit_hash)
             .with_context(|| format!("Invalid commit hash: {commit_hash}"))?;
@@ -98,9 +116,21 @@ impl AmendmentHandler {
             .find_commit(oid)
             .with_context(|| format!("Commit not found: {commit_hash}"))?;
 
-        // TODO: Check if commit is in remote main branches
-        // This would require implementing main branch detection and remote checking
-        // For now, we'll skip this check as it's complex and the basic functionality works
+        let containing =
+            crate::git::main_branches::branches_containing(&self.repo, main_tips, oid)?;
+        if !containing.is_empty() {
+            let short_hash = &commit_hash[..SHORT_HASH_LEN.min(commit_hash.len())];
+            let branches = containing.join(", ");
+            if !self.allow_pushed {
+                anyhow::bail!(
+                    "Refusing to amend commit {short_hash}: it is already in remote main \
+                     branch(es): {branches}\n\
+                     Amending pushed commits rewrites published history. Re-run with \
+                     --allow-pushed to override."
+                );
+            }
+            println!("⚠️  Amending commit {short_hash} that exists in {branches} (--allow-pushed)");
+        }
 
         Ok(())
     }
@@ -364,5 +394,155 @@ impl AmendmentHandler {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// Runs `git` in `dir` with a deterministic identity, asserting success.
+    fn git_in(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(dir)
+            .args([
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "tag.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "git {args:?} failed: {stderr}");
+    }
+
+    /// Builds a work repo on `main` with one commit pushed to a bare `origin`
+    /// remote. Local identity and no-signing config are set so the handler's
+    /// own `git` subprocesses stay hermetic. All three temp dirs are returned
+    /// so the caller keeps them alive: work repo, bare remote, and a scratch
+    /// dir for amendment YAML files (outside the worktree, which must stay
+    /// clean for the safety checks).
+    fn repo_with_pushed_main() -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir) {
+        let tmp_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
+        std::fs::create_dir_all(&tmp_root).unwrap();
+        let bare = tempfile::tempdir_in(&tmp_root).unwrap();
+        git_in(bare.path(), &["init", "--bare"]);
+
+        let work = tempfile::tempdir_in(&tmp_root).unwrap();
+        git_in(work.path(), &["init"]);
+        git_in(work.path(), &["checkout", "-b", "main"]);
+        git_in(work.path(), &["config", "user.email", "test@example.com"]);
+        git_in(work.path(), &["config", "user.name", "Test"]);
+        git_in(work.path(), &["config", "commit.gpgsign", "false"]);
+        std::fs::write(work.path().join("file.txt"), "content").unwrap();
+        git_in(work.path(), &["add", "."]);
+        git_in(work.path(), &["commit", "-m", "initial pushed commit"]);
+        git_in(
+            work.path(),
+            &["remote", "add", "origin", bare.path().to_str().unwrap()],
+        );
+        git_in(work.path(), &["push", "origin", "main"]);
+
+        let scratch = tempfile::tempdir_in(&tmp_root).unwrap();
+        (work, bare, scratch)
+    }
+
+    fn head_hash(dir: &Path) -> String {
+        Repository::open(dir)
+            .unwrap()
+            .head()
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string()
+    }
+
+    fn head_message(dir: &Path) -> String {
+        let repo = Repository::open(dir).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        head.message().unwrap_or("").to_string()
+    }
+
+    /// Writes an amendment YAML targeting `hash` into `scratch` and returns
+    /// its path as a string.
+    fn amendment_yaml(scratch: &Path, hash: &str, message: &str) -> String {
+        let file = crate::data::amendments::AmendmentFile {
+            amendments: vec![crate::data::amendments::Amendment {
+                commit: hash.to_string(),
+                message: message.to_string(),
+                summary: String::new(),
+            }],
+        };
+        let path = scratch.join("amendments.yaml");
+        file.save_to_file(&path).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn refuses_amending_commit_in_remote_main() {
+        let (work, _bare, scratch) = repo_with_pushed_main();
+        let hash = head_hash(work.path());
+        let yaml = amendment_yaml(scratch.path(), &hash, "rewritten message");
+
+        let handler = AmendmentHandler::new(work.path()).unwrap();
+        let err = handler
+            .apply_amendments(&yaml)
+            .expect_err("amending a pushed commit must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&hash[..SHORT_HASH_LEN]),
+            "error should name the short hash, got: {msg}"
+        );
+        assert!(
+            msg.contains("origin/main"),
+            "error should name the containing branch, got: {msg}"
+        );
+        assert!(
+            msg.contains("--allow-pushed"),
+            "error should mention the override flag, got: {msg}"
+        );
+        // The commit must be untouched.
+        assert_eq!(head_hash(work.path()), hash);
+    }
+
+    #[test]
+    fn allow_pushed_overrides_refusal() {
+        let (work, _bare, scratch) = repo_with_pushed_main();
+        let hash = head_hash(work.path());
+        let yaml = amendment_yaml(scratch.path(), &hash, "rewritten message");
+
+        let handler = AmendmentHandler::new(work.path())
+            .unwrap()
+            .with_allow_pushed(true);
+        handler
+            .apply_amendments(&yaml)
+            .expect("--allow-pushed must permit amending a pushed commit");
+        assert_eq!(head_message(work.path()).trim(), "rewritten message");
+    }
+
+    #[test]
+    fn unpushed_commit_amends_without_flag() {
+        let (work, _bare, scratch) = repo_with_pushed_main();
+        std::fs::write(work.path().join("new.txt"), "more").unwrap();
+        git_in(work.path(), &["add", "."]);
+        git_in(work.path(), &["commit", "-m", "unpushed commit"]);
+        let hash = head_hash(work.path());
+        let yaml = amendment_yaml(scratch.path(), &hash, "improved unpushed message");
+
+        let handler = AmendmentHandler::new(work.path()).unwrap();
+        handler
+            .apply_amendments(&yaml)
+            .expect("amending an unpushed commit must not require the flag");
+        assert_eq!(
+            head_message(work.path()).trim(),
+            "improved unpushed message"
+        );
     }
 }

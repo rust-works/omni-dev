@@ -53,16 +53,8 @@ impl RemoteInfo {
         repo_root: &std::path::Path,
     ) -> Result<String> {
         // First try to get the remote HEAD reference
-        let head_ref_name = format!("refs/remotes/{remote_name}/HEAD");
-        if let Ok(head_ref) = repo.find_reference(&head_ref_name) {
-            if let Ok(Some(target)) = head_ref.symbolic_target() {
-                // Extract branch name from refs/remotes/origin/main
-                if let Some(branch_name) =
-                    target.strip_prefix(&format!("refs/remotes/{remote_name}/"))
-                {
-                    return Ok(branch_name.to_string());
-                }
-            }
+        if let Some(branch_name) = Self::main_branch_from_remote_head(repo, remote_name) {
+            return Ok(branch_name);
         }
 
         // Try using GitHub CLI for GitHub repositories
@@ -77,32 +69,8 @@ impl RemoteInfo {
         }
 
         // Fallback to checking common branch names, preferring origin remote
-        let common_branches = ["main", "master", "develop"];
-
-        // First, check if this is the origin remote or if origin remote branches exist
-        if remote_name == "origin" {
-            for branch_name in &common_branches {
-                let reference_name = format!("refs/remotes/origin/{branch_name}");
-                if repo.find_reference(&reference_name).is_ok() {
-                    return Ok((*branch_name).to_string());
-                }
-            }
-        } else {
-            // For non-origin remotes, first check if origin has these branches
-            for branch_name in &common_branches {
-                let origin_reference = format!("refs/remotes/origin/{branch_name}");
-                if repo.find_reference(&origin_reference).is_ok() {
-                    return Ok((*branch_name).to_string());
-                }
-            }
-
-            // Then check the actual remote
-            for branch_name in &common_branches {
-                let reference_name = format!("refs/remotes/{remote_name}/{branch_name}");
-                if repo.find_reference(&reference_name).is_ok() {
-                    return Ok((*branch_name).to_string());
-                }
-            }
+        if let Some(branch_name) = Self::main_branch_from_common_names(repo, remote_name) {
+            return Ok(branch_name);
         }
 
         // If no common branch found, try to find any branch
@@ -121,6 +89,64 @@ impl RemoteInfo {
 
         // If still no branch found, return "unknown"
         Ok("unknown".to_string())
+    }
+
+    /// Detects the main branch for a remote using only local refs — no network,
+    /// no `gh` subprocess.
+    ///
+    /// Returns `None` when neither the remote's symbolic HEAD nor a common
+    /// branch name (`main`/`master`/`develop`) resolves. Callers that treat the
+    /// result as a safety signal must stay conservative on `None`; unlike
+    /// [`Self::detect_main_branch`], this never falls back to an arbitrary
+    /// remote branch.
+    pub(crate) fn detect_main_branch_local(repo: &Repository, remote_name: &str) -> Option<String> {
+        Self::main_branch_from_remote_head(repo, remote_name)
+            .or_else(|| Self::main_branch_from_common_names(repo, remote_name))
+    }
+
+    /// Returns the branch the remote's symbolic `HEAD` reference points at.
+    fn main_branch_from_remote_head(repo: &Repository, remote_name: &str) -> Option<String> {
+        let head_ref_name = format!("refs/remotes/{remote_name}/HEAD");
+        let head_ref = repo.find_reference(&head_ref_name).ok()?;
+        let target = head_ref.symbolic_target().ok()??;
+        // Extract branch name from refs/remotes/origin/main
+        target
+            .strip_prefix(&format!("refs/remotes/{remote_name}/"))
+            .map(ToString::to_string)
+    }
+
+    /// Returns the first common branch name (`main`/`master`/`develop`) that
+    /// exists as a remote-tracking ref, preferring the origin remote.
+    fn main_branch_from_common_names(repo: &Repository, remote_name: &str) -> Option<String> {
+        let common_branches = ["main", "master", "develop"];
+
+        // First, check if this is the origin remote or if origin remote branches exist
+        if remote_name == "origin" {
+            for branch_name in &common_branches {
+                let reference_name = format!("refs/remotes/origin/{branch_name}");
+                if repo.find_reference(&reference_name).is_ok() {
+                    return Some((*branch_name).to_string());
+                }
+            }
+        } else {
+            // For non-origin remotes, first check if origin has these branches
+            for branch_name in &common_branches {
+                let origin_reference = format!("refs/remotes/origin/{branch_name}");
+                if repo.find_reference(&origin_reference).is_ok() {
+                    return Some((*branch_name).to_string());
+                }
+            }
+
+            // Then check the actual remote
+            for branch_name in &common_branches {
+                let reference_name = format!("refs/remotes/{remote_name}/{branch_name}");
+                if repo.find_reference(&reference_name).is_ok() {
+                    return Some((*branch_name).to_string());
+                }
+            }
+        }
+
+        None
     }
 
     /// Returns the default branch from GitHub using gh CLI.
@@ -272,5 +298,59 @@ mod tests {
                 prop_assert!(RemoteInfo::extract_github_repo_name(&url).is_err());
             }
         }
+    }
+
+    // ── detect_main_branch_local ─────────────────────────────────────
+
+    /// Creates a repo with one commit, anchored at `$CARGO_MANIFEST_DIR/tmp`,
+    /// and returns the commit id for wiring up remote-tracking refs.
+    fn repo_with_commit() -> (tempfile::TempDir, Repository, git2::Oid) {
+        let tmp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp");
+        std::fs::create_dir_all(&tmp_root).unwrap();
+        let temp_dir = tempfile::tempdir_in(&tmp_root).unwrap();
+        let repo = Repository::init(temp_dir.path()).unwrap();
+        let oid = {
+            let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+            let tree_id = repo.index().unwrap().write_tree().unwrap();
+            let tree = repo.find_tree(tree_id).unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+                .unwrap()
+        };
+        (temp_dir, repo, oid)
+    }
+
+    #[test]
+    fn local_detection_prefers_symbolic_head() {
+        let (_dir, repo, oid) = repo_with_commit();
+        repo.reference("refs/remotes/origin/trunk", oid, false, "test")
+            .unwrap();
+        repo.reference_symbolic(
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/trunk",
+            false,
+            "test",
+        )
+        .unwrap();
+        let result = RemoteInfo::detect_main_branch_local(&repo, "origin");
+        assert_eq!(result.as_deref(), Some("trunk"));
+    }
+
+    #[test]
+    fn local_detection_falls_back_to_common_names() {
+        let (_dir, repo, oid) = repo_with_commit();
+        repo.reference("refs/remotes/origin/master", oid, false, "test")
+            .unwrap();
+        let result = RemoteInfo::detect_main_branch_local(&repo, "origin");
+        assert_eq!(result.as_deref(), Some("master"));
+    }
+
+    #[test]
+    fn local_detection_returns_none_for_uncommon_branches() {
+        // Unlike `detect_main_branch`, the local variant must not fall back to
+        // an arbitrary remote branch: `None` keeps safety consumers conservative.
+        let (_dir, repo, oid) = repo_with_commit();
+        repo.reference("refs/remotes/origin/exotic", oid, false, "test")
+            .unwrap();
+        assert_eq!(RemoteInfo::detect_main_branch_local(&repo, "origin"), None);
     }
 }

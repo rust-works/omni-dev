@@ -145,6 +145,7 @@ fn amend_command_with_temporary_repo() -> Result<()> {
     // and no shared mutex are needed.
     let amend_cmd = AmendCommand {
         yaml_file: amendment_file_path.to_string_lossy().to_string(),
+        allow_pushed: false,
     };
     amend_cmd
         .execute(Some(test_repo.repo_path.as_path()))
@@ -179,6 +180,7 @@ fn amend_preflight_checks_injected_repo_worktree() -> Result<()> {
 
     let err = AmendCommand {
         yaml_file: amendment_file.to_string_lossy().to_string(),
+        allow_pushed: false,
     }
     .execute(Some(repo_a.repo_path.as_path()))
     .expect_err("amend must bail on the injected repo's dirty worktree");
