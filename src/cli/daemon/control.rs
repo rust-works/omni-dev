@@ -23,7 +23,11 @@ const POLL_BUDGET: Duration = Duration::from_secs(5);
 /// Launches a background daemon bound to `socket`.
 ///
 /// macOS installs and loads a launchd LaunchAgent (auto-start at login);
-/// elsewhere a detached `omni-dev daemon run` is spawned.
+/// elsewhere a detached `omni-dev daemon run` is spawned: `setsid` puts it in
+/// its own session (so it survives the launching terminal and its SIGHUP),
+/// stdin comes from `/dev/null`, and stdout/stderr are appended to a `0600`
+/// `daemon.log` beside the socket. Auto-start at login is macOS-only for now
+/// (#1174 tracks a systemd user unit).
 #[cfg(target_os = "macos")]
 pub(super) fn launch(socket: &Path) -> Result<()> {
     crate::daemon::launchd::install_and_load(socket)
@@ -31,13 +35,54 @@ pub(super) fn launch(socket: &Path) -> Result<()> {
 
 #[cfg(not(target_os = "macos"))]
 pub(super) fn launch(socket: &Path) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
     use anyhow::Context;
+
+    use crate::daemon::paths;
+
     let exe = std::env::current_exe().context("could not resolve the current executable")?;
-    std::process::Command::new(exe)
+    if let Some(dir) = socket.parent() {
+        paths::ensure_dir_0700(dir)?;
+    }
+    let log_path = paths::log_path_for_socket(socket);
+    let log = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&log_path)
+        .with_context(|| format!("failed to open daemon log {}", log_path.display()))?;
+    paths::ensure_handle_0600(&log)
+        .with_context(|| format!("failed to set 0600 on {}", log_path.display()))?;
+    let log_err = log
+        .try_clone()
+        .with_context(|| format!("failed to clone handle for {}", log_path.display()))?;
+
+    let mut command = std::process::Command::new(exe);
+    command
         .arg("daemon")
         .arg("run")
         .arg("--socket")
         .arg(socket)
+        .stdin(Stdio::null())
+        .stdout(log)
+        .stderr(log_err);
+    // `pre_exec` runs between fork and exec in the child, where only
+    // async-signal-safe calls are allowed — which is exactly why it is
+    // `unsafe` and there is no safe route to `setsid` on `Command`.
+    // SAFETY: `setsid(2)` is async-signal-safe, allocates nothing, and cannot
+    // fail here with EPERM because a freshly forked child is never a
+    // process-group leader.
+    #[allow(unsafe_code)]
+    unsafe {
+        command.pre_exec(|| {
+            if nix::libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command
         .spawn()
         .context("failed to spawn the daemon process")?;
     Ok(())

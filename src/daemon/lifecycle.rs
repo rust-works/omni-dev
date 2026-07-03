@@ -5,9 +5,12 @@ use tokio_util::sync::CancellationToken;
 
 /// Spawns a task that cancels `shutdown` when the process is asked to stop.
 ///
-/// On Unix this listens for both `SIGTERM` (what `launchctl bootout` and
-/// service managers send) and `SIGINT` (Ctrl-C in a foreground `daemon run`).
-/// Elsewhere it listens for Ctrl-C only.
+/// On Unix this listens for `SIGTERM` (what `launchctl bootout` and service
+/// managers send), `SIGINT` (Ctrl-C in a foreground `daemon run`), and
+/// `SIGHUP` (the default disposition would hard-kill; treating it as a
+/// graceful stop keeps the socket unlinked and services drained even though a
+/// `daemon start`-launched daemon sits in its own session and never sees a
+/// terminal hangup). Elsewhere it listens for Ctrl-C only.
 pub fn install_signal_handlers(shutdown: CancellationToken) {
     #[cfg(unix)]
     {
@@ -27,9 +30,17 @@ pub fn install_signal_handlers(shutdown: CancellationToken) {
                     return;
                 }
             };
+            let mut hangup = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("failed to install SIGHUP handler: {e}");
+                    return;
+                }
+            };
             tokio::select! {
                 _ = term.recv() => tracing::info!("received SIGTERM; shutting down"),
                 _ = interrupt.recv() => tracing::info!("received SIGINT; shutting down"),
+                _ = hangup.recv() => tracing::info!("received SIGHUP; shutting down"),
             }
             shutdown.cancel();
         });
