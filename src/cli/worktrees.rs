@@ -110,8 +110,8 @@ fn render_windows(result: &Value) -> String {
         "REPO", "TITLE", "FOLDER", "AGE"
     );
     for window in windows {
-        let repo = window.get("repo").and_then(Value::as_str).unwrap_or("-");
-        let title = window.get("title").and_then(Value::as_str).unwrap_or("");
+        let repo = sanitize(window.get("repo").and_then(Value::as_str).unwrap_or("-"));
+        let title = sanitize(window.get("title").and_then(Value::as_str).unwrap_or(""));
         let folder_disp = folder_summary(window);
         let age = age_secs(window.get("last_seen").and_then(Value::as_str));
         out.push_str(&format!(
@@ -129,13 +129,20 @@ fn folder_summary(window: &Value) -> String {
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default();
-    let first = folders.first().and_then(Value::as_str).unwrap_or("");
+    let first = sanitize(folders.first().and_then(Value::as_str).unwrap_or(""));
     let extra = folders.len().saturating_sub(1);
     if extra > 0 {
         format!("{first} (+{extra})")
     } else {
-        first.to_string()
+        first
     }
+}
+
+/// Strips control characters (C0, DEL, C1) from an untrusted registry string so
+/// a malicious `register` payload cannot inject terminal escape sequences into
+/// the rendered table (#1137). The `--json` path stays verbatim.
+fn sanitize(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// Seconds elapsed since an RFC 3339 timestamp (0 if absent/unparseable).
@@ -201,6 +208,38 @@ mod tests {
         assert!(table.contains("/home/me/omni-dev (+1)"), "{table}");
         // A header line plus exactly one data row.
         assert_eq!(table.lines().count(), 2, "{table}");
+    }
+
+    #[test]
+    fn render_windows_strips_control_bytes() {
+        // C0 (ESC, CR, BEL), DEL, and C1 (CSI) bytes in every untrusted field
+        // must not reach the terminal (#1137).
+        let result = json!({ "windows": [{
+            "key": "w1",
+            "repo": "evil\x1b[31mrepo",
+            "title": "ti\rtle\x07\u{9b}2J",
+            "folders": ["/tmp/a\x1b]0;owned\x07\u{7f}", "/tmp/b"],
+            "last_seen": "2000-01-01T00:00:00Z",
+        }]});
+        let table = render_windows(&result);
+        assert!(
+            !table.contains(|c: char| c.is_control() && c != '\n'),
+            "{table:?}"
+        );
+        // Visible text survives with only the control bytes removed.
+        assert!(table.contains("evil[31mrepo"), "{table:?}");
+        assert!(table.contains("title2J"), "{table:?}");
+        assert!(table.contains("/tmp/a]0;owned (+1)"), "{table:?}");
+        // Embedded CR/LF cannot forge extra rows: header plus one data row.
+        assert_eq!(table.lines().count(), 2, "{table:?}");
+    }
+
+    #[test]
+    fn folder_summary_strips_control_bytes() {
+        assert_eq!(
+            folder_summary(&json!({ "folders": ["/a\x1b[2J/b"] })),
+            "/a[2J/b"
+        );
     }
 
     #[test]
