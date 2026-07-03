@@ -111,7 +111,12 @@ persisted; everything is loopback/filesystem-local. The residual exposure is
 bounded by socket ownership — reading the socket reveals your open repo *paths*,
 and writing it (already requiring the owning local user) could inject entries or
 trigger a focus. The focus action additionally requires the target to be an
-existing absolute directory before spawning `code`.
+existing absolute directory before spawning `code`. Registry strings
+(`title`/`repo`/`folders`) are writer-influenced metadata, so the `worktrees
+list` table strips control characters (C0, DEL, C1) before rendering to the
+terminal — a registered entry cannot inject ANSI escape sequences into the
+operator's TTY (#1137). Native tray menus do not interpret ANSI, and the
+`--json` output escapes control bytes via JSON encoding.
 
 ## Companion contract (for the extension and other clients)
 
@@ -148,7 +153,9 @@ Where:
 - `folders` — absolute workspace-folder paths.
 - A `list` `entry` is `{ key, folders[], repo?, title?, pid?, last_seen }` with
   `last_seen` as an RFC 3339 timestamp; consumers compute age from it. Entries are
-  sorted by `(repo, key)` for deterministic output.
+  sorted by `(repo, key)` for deterministic output. Fields are stored and served
+  verbatim on the wire (and in `--json`); only the human-readable `worktrees list`
+  table sanitizes them for terminal display (see Security).
 
 Companion lifecycle, per window:
 
