@@ -306,6 +306,12 @@ environment treatment:
 A defence-in-depth suffix is also appended to the system prompt instructing
 the model not to emit `function_calls` XML.
 
+When the [tool-access escape hatch](#escape-hatch-tool-access) is enabled,
+the environment scrub additionally removes well-known secret vars
+(`*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `*_CREDENTIALS`, AWS
+credentials) — see that section for details and the
+`OMNI_DEV_CLAUDE_CLI_KEEP_ENV` exemption list.
+
 ### Tuning environment variables
 
 | Variable                                  | Default        | Effect                                                              |
@@ -313,6 +319,7 @@ the model not to emit `function_calls` XML.
 | `OMNI_DEV_CLAUDE_CLI_BIN`                 | `claude` (PATH) | Path to the `claude` binary.                                       |
 | `OMNI_DEV_CLAUDE_CLI_TIMEOUT_SECS`        | `600`          | Wall-clock timeout for one subprocess invocation.                   |
 | `OMNI_DEV_CLAUDE_CLI_STDOUT_MAX_BYTES`    | `4194304`      | Stdout cap; output beyond this aborts the invocation.               |
+| `OMNI_DEV_CLAUDE_CLI_KEEP_ENV`            | (unset)        | Comma-separated exact names exempted from the [tool-hatch secret scrub](#escape-hatch-tool-access). |
 
 ### Escape hatch: tool access
 
@@ -329,6 +336,23 @@ so the nested session uses Claude Code's default tool set (Read, Edit, Write,
 Bash, Glob, Grep) and can act on your filesystem and shell. All other
 sandbox flags still apply unless you also enable
 [MCP access](#escape-hatch-mcp-access).
+
+**Be aware:** the prompt sent to the nested session is built from untrusted
+content — diffs, commit messages, JIRA/Confluence text. With tools enabled, a
+prompt-injection payload hidden in that content can drive tool calls against
+your filesystem and shell ([#1144](https://github.com/rust-works/omni-dev/issues/1144)).
+To limit the blast radius, enabling this hatch also scrubs well-known secret
+env vars from the subprocess: anything ending in `_API_KEY`, `_TOKEN`,
+`_SECRET`, `_PASSWORD`, or `_CREDENTIALS`, plus `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY`. Two exceptions: `ANTHROPIC_API_KEY` and
+`ANTHROPIC_AUTH_TOKEN` are always kept (the nested `claude` may authenticate
+through them), and names listed in `OMNI_DEV_CLAUDE_CLI_KEEP_ENV`
+(comma-separated, exact) are exempted — use it when a tool-enabled workflow
+legitimately needs a credential, e.g.
+`OMNI_DEV_CLAUDE_CLI_KEEP_ENV=GITHUB_TOKEN` for env-authenticated `gh`. When
+both escape hatches are enabled, MCP servers spawned by the nested session
+also see the scrubbed environment; servers that rely on inherited env
+credentials need the same exemption.
 
 A `WARN` log is emitted on every invocation while this is active. Grep for
 it with `RUST_LOG=omni_dev=warn`:
