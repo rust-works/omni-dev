@@ -39,14 +39,6 @@ pub(super) fn read_interactive_line(
     }
 }
 
-/// Parses a `--beta-header key:value` string into a `(key, value)` tuple.
-pub(crate) fn parse_beta_header(s: &str) -> Result<(String, String)> {
-    let (k, v) = s
-        .split_once(':')
-        .ok_or_else(|| anyhow::anyhow!("Invalid --beta-header format '{s}'. Expected key:value"))?;
-    Ok((k.to_string(), v.to_string()))
-}
-
 /// Computes the default commit range when the user gave none:
 /// `<base>..HEAD` with the base resolved remote-first (see
 /// [`crate::git::GitRepository::resolve_default_base_branch`]).
@@ -209,43 +201,6 @@ mod tests {
     use crate::cli::Cli;
     // Parser trait must be in scope for try_parse_from
     use clap::Parser as _ClapParser;
-
-    #[test]
-    fn parse_beta_header_valid() {
-        let (key, value) = parse_beta_header("anthropic-beta:output-128k-2025-02-19").unwrap();
-        assert_eq!(key, "anthropic-beta");
-        assert_eq!(value, "output-128k-2025-02-19");
-    }
-
-    #[test]
-    fn parse_beta_header_multiple_colons() {
-        // Only splits on the first colon
-        let (key, value) = parse_beta_header("key:value:with:colons").unwrap();
-        assert_eq!(key, "key");
-        assert_eq!(value, "value:with:colons");
-    }
-
-    #[test]
-    fn parse_beta_header_missing_colon() {
-        let result = parse_beta_header("no-colon-here");
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("no-colon-here"));
-    }
-
-    #[test]
-    fn parse_beta_header_empty_value() {
-        let (key, value) = parse_beta_header("key:").unwrap();
-        assert_eq!(key, "key");
-        assert_eq!(value, "");
-    }
-
-    #[test]
-    fn parse_beta_header_empty_key() {
-        let (key, value) = parse_beta_header(":value").unwrap();
-        assert_eq!(key, "");
-        assert_eq!(value, "value");
-    }
 
     #[test]
     fn cli_parses_git_commit_message_view() {

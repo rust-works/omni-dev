@@ -140,7 +140,7 @@ Declares the env vars the server understands. `required: []` is intentional — 
       "type": "string"
     },
     "OMNI_DEV_AI_BACKEND": {
-      "description": "Select the AI backend explicitly. Options: claude-cli, ollama, openai, bedrock, or unset for the default Anthropic API",
+      "description": "Select the AI backend explicitly. Options: default, claude-cli, openai, ollama, bedrock. When set it overrides the legacy USE_* selection variables; unset falls back to them, then the default Anthropic API",
       "type": "string"
     },
     "OMNI_DEV_CONFIG_DIR": {
@@ -149,6 +149,10 @@ Declares the env vars the server understands. `required: []` is intentional — 
     },
     "OMNI_DEV_EDITOR": {
       "description": "Editor command used for interactive prompts (falls back to EDITOR, then a platform default)",
+      "type": "string"
+    },
+    "OMNI_DEV_MODEL": {
+      "description": "Backend-agnostic AI model override (what the global --model flag sets); takes precedence over CLAUDE_MODEL, ANTHROPIC_MODEL, OPENAI_MODEL, and OLLAMA_MODEL",
       "type": "string"
     },
     "OPENAI_API_KEY": {

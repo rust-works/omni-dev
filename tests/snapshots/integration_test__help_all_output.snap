@@ -28,7 +28,11 @@ Commands:
 
 Options:
       --ai-backend <AI_BACKEND>
-          Selects the AI backend used by commands that invoke an AI model [possible values: default, claude-cli]
+          Selects the AI backend used by commands that invoke an AI model [possible values: default, claude-cli, openai, ollama, bedrock]
+      --model <MODEL>
+          AI model to use for commands that invoke an AI model
+      --beta-header <KEY:VALUE>
+          Beta header to send with AI API requests (format: key:value)
       --claude-cli-allow-tools
           Weakens the `claude-cli` sandbox by allowing the nested `claude -p` session to use its default built-in tools (Read, Edit, Write, Bash, Glob, Grep)
       --claude-cli-allow-mcp
@@ -70,11 +74,10 @@ omni-dev ai chat - Interactive AI chat session
 
 Interactive AI chat session
 
-Usage: chat [OPTIONS]
+Usage: chat
 
 Options:
-      --model <MODEL>  AI model to use (overrides environment configuration)
-  -h, --help           Print help
+  -h, --help  Print help
 
 
 ================================================================================
@@ -2928,7 +2931,6 @@ Usage: pr [OPTIONS]
 
 Options:
       --base <BRANCH>              Base branch for the PR to be merged into (defaults to main/master)
-      --model <MODEL>              Claude API model to use (if not specified, uses settings or default)
       --auto-apply                 Skips confirmation prompt and creates PR automatically
       --save-only <FILE>           Saves generated PR details to file without creating PR
       --ready                      Creates PR as ready for review (overrides default)
@@ -3018,8 +3020,6 @@ Arguments:
   [COMMIT_RANGE]  Commit range to check (e.g., HEAD~3..HEAD, abc123..def456). Defaults to commits ahead of the default base branch (origin/main, origin/master, main, or master)
 
 Options:
-      --model <MODEL>              Claude API model to use (if not specified, uses settings or default)
-      --beta-header <KEY:VALUE>    Beta header to send with API requests (format: key:value). Only sent if the model supports it in the registry
       --context-dir <CONTEXT_DIR>  Path to custom context directory (defaults to .omni-dev/)
       --guidelines <GUIDELINES>    Explicit path to guidelines file
       --format <FORMAT>            Output format: text (default), json, yaml [default: text]
@@ -3043,11 +3043,9 @@ Generates a commit message from staged changes and commits them (mirrors the `gi
 Usage: staged [OPTIONS]
 
 Options:
-      --print-only               Print the generated message to stdout instead of committing
-      --model <MODEL>            Claude API model to use (if not specified, uses settings or default)
-      --beta-header <KEY:VALUE>  Beta header to send with API requests (format: key:value). Only sent if the model supports it in the registry
-      --context-dir <DIR>        Override the context directory used to load project scopes
-  -h, --help                     Print help
+      --print-only         Print the generated message to stdout instead of committing
+      --context-dir <DIR>  Override the context directory used to load project scopes
+  -h, --help               Print help
 
 
 ================================================================================
@@ -3062,10 +3060,6 @@ Arguments:
   [COMMIT_RANGE]  Commit range to analyze and improve (e.g., HEAD~3..HEAD, abc123..def456)
 
 Options:
-      --model <MODEL>
-          Claude API model to use (if not specified, uses settings or default)
-      --beta-header <KEY:VALUE>
-          Beta header to send with API requests (format: key:value). Only sent if the model supports it in the registry
       --auto-apply
           Skips confirmation prompt and applies amendments automatically
       --allow-pushed

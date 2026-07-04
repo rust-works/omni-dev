@@ -4517,9 +4517,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn factory_claude_cli_backend_ignores_beta_header_without_validation() {
+        // The claude-cli arm warns and drops the beta header instead of
+        // validating it — the model may be a short alias ("sonnet") the
+        // registry does not know, and even an unsupported header/model pair
+        // must not error on this backend.
+        let env = MapEnv::new()
+            .with("OMNI_DEV_AI_BACKEND", "claude-cli")
+            .with("CLAUDE_MODEL", "sonnet")
+            .with("OMNI_DEV_BETA_HEADER", "anthropic-beta:not-a-real-beta");
+
+        let client = create_default_claude_client_with(&env, None, None)
+            .await
+            .expect("claude-cli must ignore the beta header, not validate it");
+        let metadata = client.get_ai_client_metadata();
+        assert_eq!(metadata.provider, "Claude CLI");
+        assert_eq!(metadata.model, "sonnet");
+        assert_eq!(
+            metadata.active_beta, None,
+            "beta header must not be forwarded"
+        );
+    }
+
+    #[tokio::test]
     async fn factory_ollama_branch_probes_loaded_context_length() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Activate an INFO subscriber for this (current-thread) test so the
+        // probe's success `info!` event fires in-process and its fields are
+        // evaluated. Discard the formatted output — we assert on the probed
+        // value below, not the log line.
+        let _log_guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(std::io::sink)
+                .finish(),
+        );
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -4787,7 +4821,7 @@ mod tests {
             .await
             .expect("factory should accept a registry-supported beta header");
         // The beta header raises the model's max output tokens.
-        assert_eq!(client.get_ai_client_metadata().max_response_length, 128000);
+        assert_eq!(client.get_ai_client_metadata().max_response_length, 128_000);
     }
 
     #[tokio::test]

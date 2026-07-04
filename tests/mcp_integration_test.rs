@@ -1331,6 +1331,9 @@ async fn ai_chat_returns_tool_error_when_credentials_missing() -> Result<()> {
 
     let original_home = std::env::var("HOME").ok();
     let snapshots: Vec<(&str, Option<String>)> = vec![
+        "OMNI_DEV_AI_BACKEND",
+        "OMNI_DEV_MODEL",
+        "OMNI_DEV_BETA_HEADER",
         "USE_OPENAI",
         "USE_OLLAMA",
         "CLAUDE_CODE_USE_BEDROCK",
