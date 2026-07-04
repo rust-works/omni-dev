@@ -133,23 +133,25 @@ impl Filter {
     }
 }
 
-/// Parses a relative duration like `30m`, `2h`, `1d`, `1w`, `45s`.
-fn parse_since(s: &str) -> Result<DateTime<Utc>> {
+/// Parses a relative duration like `30m`, `2h`, `1d`, `1w`, `45s` into the
+/// absolute cutoff `now - duration`. Shared by `--since` (log search) and
+/// `--older-than` (`omni-dev log prune`).
+pub(crate) fn parse_since(s: &str) -> Result<DateTime<Utc>> {
     let s = s.trim();
-    let (num, unit) =
-        s.split_at(s.find(|c: char| !c.is_ascii_digit()).with_context(|| {
-            format!("invalid --since duration: {s} (expected e.g. 30m, 2h, 1d)")
-        })?);
+    let (num, unit) = s.split_at(
+        s.find(|c: char| !c.is_ascii_digit())
+            .with_context(|| format!("invalid duration: {s} (expected e.g. 30m, 2h, 1d)"))?,
+    );
     let n: i64 = num
         .parse()
-        .with_context(|| format!("invalid --since duration: {s}"))?;
+        .with_context(|| format!("invalid duration: {s} (expected e.g. 30m, 2h, 1d)"))?;
     let dur = match unit {
         "s" => Duration::seconds(n),
         "m" => Duration::minutes(n),
         "h" => Duration::hours(n),
         "d" => Duration::days(n),
         "w" => Duration::weeks(n),
-        other => bail!("invalid --since unit: {other} (use s, m, h, d, or w)"),
+        other => bail!("invalid duration unit: {other} (use s, m, h, d, or w)"),
     };
     Ok(Utc::now() - dur)
 }

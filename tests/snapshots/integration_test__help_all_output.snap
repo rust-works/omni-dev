@@ -3127,7 +3127,11 @@ omni-dev log - Search the local invocation + HTTP request log
 
 Search the local invocation + HTTP request log
 
-Usage: log [OPTIONS]
+Usage: log [OPTIONS] [COMMAND]
+
+Commands:
+  prune  Prune old records to bound the log's on-disk growth
+  help   Print this message or the help of the given subcommand(s)
 
 Options:
       --since <DUR>      Only records newer than this relative window (e.g. `30m`, `2h`, `1d`)
@@ -3144,6 +3148,21 @@ Options:
   -n, --limit <N>        Show at most N (most recent) matching records
   -f, --follow           Follow the log, printing new matching records as they are appended
   -h, --help             Print help (see more with '--help')
+
+
+================================================================================
+
+omni-dev log prune - Prune old records to bound the log's on-disk growth
+
+Prune old records to bound the log's on-disk growth
+
+Usage: prune [OPTIONS]
+
+Options:
+      --older-than <DUR>  Remove records older than this relative window (e.g. `7d`, `24h`, `2w`)
+      --max-size <SIZE>   Trim the oldest records until the file is at most this size (e.g. `10mb`, `512kb`, `1048576`); applied after `--older-than`
+      --dry-run           Report what would be removed without modifying the log
+  -h, --help              Print help
 
 
 ================================================================================
