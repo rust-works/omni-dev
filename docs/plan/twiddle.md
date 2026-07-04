@@ -1,6 +1,6 @@
 # Twiddle Command Implementation Plan
 
-**Status:** In Progress — Phases 1 and 2 Built; Phase 3 (contextual intelligence) Aspirational. See the **Implementation Status** section below for the current phase breakdown.
+**Status:** In Progress — Phases 1–3 Built (including Phase 3, contextual intelligence); later polish/edge-case phases Aspirational. See the **Implementation Status** section below for the current phase breakdown.
 
 ## Implementation Status
 
@@ -16,14 +16,15 @@
 - ✅ Preview functionality operational (`src/cli/git.rs:324-342`)
 - ✅ Comprehensive error messages via ClaudeError enum
 
-**Phase 3: Contextual Intelligence** - 🔄 **PLANNED**
-- 🔄 Project-level context discovery (.omni-dev/, .gitmessage, CONTRIBUTING.md)
-- 🔄 Branch-aware commit analysis and work pattern detection
-- 🔄 Multi-commit range context understanding
-- 🔄 File-based architectural context recognition
-- 🔄 Enhanced Claude prompting with project-specific guidelines
+**Phase 3: Contextual Intelligence** - ✅ **COMPLETED**
+- ✅ Project-level context discovery (.omni-dev/, .gitmessage, CONTRIBUTING.md)
+- ✅ Branch-aware commit analysis and work pattern detection
+- ✅ Multi-commit range context understanding
+- ✅ File-based architectural context recognition
+- ✅ Enhanced Claude prompting with project-specific guidelines
+- Shipped as `--use-context` (default on) / `--no-context` / `--work-context` / `--branch-context` / `--context-dir`; see [user-guide.md § Contextual Intelligence](../user-guide.md#contextual-intelligence)
 
-**Current Status**: Ready for production use with full Phase 1 & 2 functionality. Phase 3 (contextual intelligence) and subsequent phases remain for future development.
+**Current Status**: Ready for production use with full Phase 1–3 functionality. The later polish and edge-case phases below remain for future development.
 
 ### Key Accomplishments
 - ✅ Full `omni-dev git commit message twiddle` command implementation
@@ -53,7 +54,7 @@ omni-dev git commit message twiddle [COMMIT_RANGE]
 3. Execute amend command logic → Apply amendments
 ```
 
-### Enhanced Contextual Flow (Phase 3 - Planned)
+### Enhanced Contextual Flow (Phase 3 - Implemented)
 ```
 omni-dev git commit message twiddle [COMMIT_RANGE] --use-context
     ↓
@@ -136,7 +137,7 @@ pub struct TwiddleCommand {
     #[arg(long, value_name = "FILE")]
     pub save_only: Option<String>,
     
-    // Phase 3 Contextual Enhancements - PLANNED
+    // Phase 3 Contextual Enhancements - Implemented
     /// Use additional project context for better suggestions
     #[arg(long, default_value = "true")]
     pub use_context: bool,
@@ -621,6 +622,12 @@ impl TwiddleCommand {
 ### 9. Documentation
 
 #### Command Help
+
+> Historical sketch from the original plan — the flag set and default model
+> have moved on. The canonical flag reference is
+> [user-guide.md § twiddle](../user-guide.md#twiddle---ai-powered-improvement),
+> and `omni-dev git commit message twiddle --help` is the source of truth.
+
 ```
 USAGE:
     omni-dev git commit message twiddle [OPTIONS] [COMMIT_RANGE]
@@ -634,7 +641,7 @@ OPTIONS:
         --auto-apply             Skip confirmation and apply changes automatically
         --save-only <FILE>       Save amendments to file without applying
     
-    Phase 3 (Contextual Intelligence - Planned):
+    Phase 3 (Contextual Intelligence - Implemented):
         --use-context            Use project context for enhanced suggestions [default: true]
         --context-dir <DIR>      Path to custom context directory [default: .omni-dev]
         --work-context <TEXT>    Specify work context (e.g., "feature: user auth")
@@ -718,14 +725,14 @@ export OMNI_DEV_CLAUDE_MODEL="claude-3-5-sonnet-20241022"
 3. ✅ Comprehensive error messages (`src/claude/error.rs`)
 4. ✅ Help documentation and examples (CLI help text, templates)
 
-#### Phase 3: Contextual Intelligence 🔄 **PLANNED**
-1. 🔄 Project-level context discovery system (`.omni-dev/`, `.gitmessage`, docs parsing)
-2. 🔄 Branch analysis and work pattern detection
-3. 🔄 Multi-commit range context understanding
-4. 🔄 File-based architectural context recognition  
-5. 🔄 Enhanced Claude prompting with project-specific guidelines
-6. 🔄 Context-aware CLI options (`--use-context`, `--work-context`)
-7. 🔄 Configuration file standards (commit-guidelines.md, scopes.yaml)
+#### Phase 3: Contextual Intelligence ✅ COMPLETED
+1. ✅ Project-level context discovery system (`.omni-dev/`, `.gitmessage`, docs parsing)
+2. ✅ Branch analysis and work pattern detection
+3. ✅ Multi-commit range context understanding
+4. ✅ File-based architectural context recognition
+5. ✅ Enhanced Claude prompting with project-specific guidelines
+6. ✅ Context-aware CLI options (`--use-context`, `--work-context`)
+7. ✅ Configuration file standards (commit-guidelines.md, scopes.yaml)
 
 #### Phase 4: Polish & Testing 🔄 **TODO**
 1. 🔄 Comprehensive test suite (unit, integration, golden tests)
@@ -767,32 +774,31 @@ docs/plan/twiddle.md          # ✅ This file (updated with contextual plan)
 Cargo.toml                    # ✅ Added reqwest, tokio dependencies
 ```
 
-### Phase 3 Contextual Intelligence - 🔄 PLANNED  
+### Phase 3 Contextual Intelligence - ✅ COMPLETED
 ```
 src/
 ├── claude/
-│   ├── context/               # 🔄 NEW - Contextual intelligence module
-│   │   ├── mod.rs            # 🔄 Context system exports
-│   │   ├── discovery.rs      # 🔄 Project context discovery
-│   │   ├── branch.rs         # 🔄 Branch analysis and patterns
-│   │   ├── files.rs          # 🔄 File-based context recognition
-│   │   └── patterns.rs       # 🔄 Work pattern detection
-│   └── prompts.rs            # 🔄 Enhanced with contextual prompting
+│   ├── context/               # ✅ Contextual intelligence module (mod lives in context.rs)
+│   │   ├── discovery.rs      # ✅ Project context discovery
+│   │   ├── branch.rs         # ✅ Branch analysis and patterns
+│   │   ├── files.rs          # ✅ File-based context recognition
+│   │   └── patterns.rs       # ✅ Work pattern detection
+│   └── prompts.rs            # ✅ Enhanced with contextual prompting
 ├── cli/
-│   └── git.rs                # 🔄 Extended TwiddleCommand with context options
+│   └── git/twiddle.rs        # ✅ TwiddleCommand with context options
 └── data/
-    ├── context.rs            # 🔄 NEW - Context data structures  
-    └── amendments.rs         # 🔄 Enhanced with context validation
+    ├── context.rs            # ✅ Context data structures
+    └── amendments.rs         # ✅ Enhanced with context validation
 
 # Project Configuration Examples (User-created)
-.omni-dev/                    # 🔄 NEW - Project-specific context directory
-├── commit-guidelines.md      # 🔄 Project commit conventions
-├── commit-template.txt       # 🔄 Default commit message template
-├── scopes.yaml              # 🔄 Valid scopes and descriptions
+.omni-dev/                    # ✅ Project-specific context directory
+├── commit-guidelines.md      # ✅ Project commit conventions
+├── commit-template.txt       # ✅ Default commit message template
+├── scopes.yaml              # ✅ Valid scopes and descriptions
 └── context/
-    └── feature-contexts/     # 🔄 Feature-specific context files
+    └── feature-contexts/     # ✅ Feature-specific context files
 
-.gitmessage                   # 🔄 Standard git commit template support
+.gitmessage                   # ✅ Standard git commit template support
 ```
 
 ## Summary

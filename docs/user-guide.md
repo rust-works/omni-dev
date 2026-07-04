@@ -173,13 +173,23 @@ omni-dev git commit message twiddle [RANGE] [OPTIONS]
 
 | Option | Description | Example |
 |--------|-------------|---------|
+| `--fresh` | Ignore existing messages and generate fresh ones from the diffs alone (the default; conflicts with `--refine`) | `--fresh` |
+| `--refine` | Use the existing messages as the starting point for AI refinement (conflicts with `--fresh`) | `--refine` |
 | `--use-context` | Enable AI contextual intelligence | `--use-context` |
-| `--concurrency N` | Number of parallel commit processors (default: 4) | `--concurrency 2` |
-| `--no-coherence` | Skip cross-commit coherence refinement pass | `--no-coherence` |
-| `--auto-apply` | Apply changes without confirmation | `--auto-apply` |
-| `--save-only FILE` | Save suggestions to file instead of applying | `--save-only suggestions.yaml` |
+| `--work-context TEXT` | Describe the work being done to steer suggestions | `--work-context "feature: user auth"` |
+| `--branch-context TEXT` | Override the context detected from the branch name | `--branch-context "bugfix: login flow"` |
 | `--context-dir PATH` | Custom context directory | `--context-dir ./config` |
 | `--no-context` | Disable contextual features | `--no-context` |
+| `--model MODEL` | Claude API model to use (defaults from settings or the model registry) | `--model claude-sonnet-4-5` |
+| `--beta-header KEY:VALUE` | Beta header to send with API requests (only sent if the model supports it) | `--beta-header key:value` |
+| `--concurrency N` | Number of parallel commit processors (default: 4) | `--concurrency 2` |
+| `--no-coherence` | Skip cross-commit coherence refinement pass | `--no-coherence` |
+| `--no-ai` | Skip AI processing and only output the repository analysis YAML | `--no-ai` |
+| `--auto-apply` | Apply changes without confirmation | `--auto-apply` |
+| `--allow-pushed` | Allow amending commits already in remote main branches (rewrites published history) | `--allow-pushed` |
+| `--check` | Run commit message validation after applying amendments | `--check` |
+| `--save-only FILE` | Save suggestions to file instead of applying | `--save-only suggestions.yaml` |
+| `--quiet` | Only show errors/warnings, suppress info-level output | `--quiet` |
 
 **Commit Range Examples:**
 
@@ -1620,6 +1630,23 @@ omni-dev git commit message twiddle 'main..HEAD' --use-context
 
 # 3. Review suggestions and apply
 # ✅ Professional commit history ready for review
+```
+
+### Refine, Inspect, or Validate
+
+By default twiddle generates fresh messages from the diffs alone (`--fresh`).
+When the existing messages are already close to right, refine them instead —
+and you can inspect the analysis or validate the result:
+
+```bash
+# Keep the existing messages as the AI's starting point
+omni-dev git commit message twiddle 'main..HEAD' --refine
+
+# Skip the AI entirely and print the repository analysis YAML
+omni-dev git commit message twiddle 'main..HEAD' --no-ai
+
+# Validate the amended messages right after applying them
+omni-dev git commit message twiddle 'main..HEAD' --auto-apply --check
 ```
 
 ### Complete Feature Development Workflow
