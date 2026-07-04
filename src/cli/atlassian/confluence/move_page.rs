@@ -5,7 +5,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 
-use crate::atlassian::confluence_api::{ConfluenceApi, MovePosition as ApiMovePosition, MovedPage};
+use crate::atlassian::confluence_api::ConfluenceApi;
+use crate::atlassian::confluence_types::{MovePosition as ApiMovePosition, MovedPage};
 use crate::cli::atlassian::helpers::create_client;
 
 /// Position for a Confluence page move.

@@ -3,8 +3,8 @@
 use anyhow::Result;
 use clap::Parser;
 
-use crate::atlassian::client::FieldSelection;
 use crate::atlassian::jira_api::JiraApi;
+use crate::atlassian::jira_types::FieldSelection;
 use crate::cli::atlassian::format::ContentFormat;
 use crate::cli::atlassian::helpers::{create_client, run_read, run_read_jira_with_fields};
 

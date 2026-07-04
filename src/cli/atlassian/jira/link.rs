@@ -5,7 +5,8 @@ use clap::{Parser, Subcommand};
 
 use std::io::{self, BufRead, Write};
 
-use crate::atlassian::client::{AtlassianClient, JiraIssueLink, JiraLinkType, JiraRemoteIssueLink};
+use crate::atlassian::client::AtlassianClient;
+use crate::atlassian::jira_types::{JiraIssueLink, JiraLinkType, JiraRemoteIssueLink};
 use crate::cli::atlassian::confirm::{guard_destructive_with_io, GuardOptions, GuardOutcome};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
@@ -950,7 +951,7 @@ mod tests {
 
     // ── remote links ───────────────────────────────────────────────
 
-    use crate::atlassian::client::{JiraRemoteIssueLinkIcon, JiraRemoteIssueLinkObject};
+    use crate::atlassian::jira_types::{JiraRemoteIssueLinkIcon, JiraRemoteIssueLinkObject};
 
     fn sample_remote_link(
         id: &str,

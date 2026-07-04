@@ -6,14 +6,16 @@ use anyhow::{Context, Result};
 use clap::ValueEnum;
 use serde::Serialize;
 
-use crate::atlassian::client::{
-    AgileBoardList, AgileSprintList, ConfluenceSearchResults, ConfluenceUserGetResults,
-    ConfluenceUserSearchResults, CreateMeta, JiraDevStatus, JiraDevStatusSummary, JiraProjectList,
-    JiraProjectVersionList, JiraSearchResult, JiraUserGetResults, JiraUserSearchResults,
-    JiraWatcherList, JiraWorklogList,
-};
-use crate::atlassian::confluence_api::{
+use crate::atlassian::confluence_types::{
     ConfluenceAttachmentPage, ConfluenceSpacePage, PageSummaryPage,
+};
+use crate::atlassian::confluence_types::{
+    ConfluenceSearchResults, ConfluenceUserGetResults, ConfluenceUserSearchResults,
+};
+use crate::atlassian::jira_types::{
+    AgileBoardList, AgileSprintList, CreateMeta, JiraDevStatus, JiraDevStatusSummary,
+    JiraProjectList, JiraProjectVersionList, JiraSearchResult, JiraUserGetResults,
+    JiraUserSearchResults, JiraWatcherList, JiraWorklogList,
 };
 
 /// Output/input format for Atlassian content (read/write/create commands).
@@ -251,9 +253,10 @@ pub fn output_as<T: Serialize + JsonlSerialize>(data: &T, format: &OutputFormat)
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::atlassian::client::{
-        AgileBoard, AgileSprint, ConfluenceSearchResult, ConfluenceUserSearchResult, JiraComment,
-        JiraDevStatusCount, JiraIssue, JiraProject, JiraProjectVersion, JiraUser, JiraWorklog,
+    use crate::atlassian::confluence_types::{ConfluenceSearchResult, ConfluenceUserSearchResult};
+    use crate::atlassian::jira_types::{
+        AgileBoard, AgileSprint, JiraComment, JiraDevStatusCount, JiraIssue, JiraProject,
+        JiraProjectVersion, JiraUser, JiraWorklog,
     };
 
     // ── ContentFormat ──────────────────────────────────────────────
@@ -654,7 +657,7 @@ mod tests {
 
     #[test]
     fn confluence_attachment_page_jsonl() {
-        use crate::atlassian::confluence_api::{ConfluenceAttachment, ConfluenceAttachmentPage};
+        use crate::atlassian::confluence_types::{ConfluenceAttachment, ConfluenceAttachmentPage};
         let page = ConfluenceAttachmentPage {
             results: vec![
                 ConfluenceAttachment {
@@ -688,7 +691,7 @@ mod tests {
 
     #[test]
     fn confluence_attachment_page_jsonl_empty() {
-        use crate::atlassian::confluence_api::ConfluenceAttachmentPage;
+        use crate::atlassian::confluence_types::ConfluenceAttachmentPage;
         let page = ConfluenceAttachmentPage {
             results: vec![],
             next_cursor: None,
@@ -698,7 +701,7 @@ mod tests {
 
     #[test]
     fn confluence_space_page_jsonl() {
-        use crate::atlassian::confluence_api::{ConfluenceSpace, ConfluenceSpacePage};
+        use crate::atlassian::confluence_types::{ConfluenceSpace, ConfluenceSpacePage};
         let page = ConfluenceSpacePage {
             results: vec![
                 ConfluenceSpace {
@@ -729,7 +732,7 @@ mod tests {
 
     #[test]
     fn confluence_space_page_jsonl_empty() {
-        use crate::atlassian::confluence_api::ConfluenceSpacePage;
+        use crate::atlassian::confluence_types::ConfluenceSpacePage;
         let page = ConfluenceSpacePage {
             results: vec![],
             next_cursor: None,
@@ -739,7 +742,7 @@ mod tests {
 
     #[test]
     fn jira_user_search_results_jsonl() {
-        use crate::atlassian::client::{JiraUserSearchResult, JiraUserSearchResults};
+        use crate::atlassian::jira_types::{JiraUserSearchResult, JiraUserSearchResults};
         let list = JiraUserSearchResults {
             users: vec![
                 JiraUserSearchResult {
@@ -767,7 +770,7 @@ mod tests {
 
     #[test]
     fn jira_user_get_results_jsonl() {
-        use crate::atlassian::client::{JiraUserGetResults, JiraUserRecord};
+        use crate::atlassian::jira_types::{JiraUserGetResults, JiraUserRecord};
         let list = JiraUserGetResults {
             users: vec![
                 JiraUserRecord {
@@ -796,7 +799,7 @@ mod tests {
 
     #[test]
     fn confluence_user_get_results_jsonl() {
-        use crate::atlassian::client::{ConfluenceUserGetResults, ConfluenceUserRecord};
+        use crate::atlassian::confluence_types::{ConfluenceUserGetResults, ConfluenceUserRecord};
         let list = ConfluenceUserGetResults {
             users: vec![ConfluenceUserRecord {
                 account_id: "abc".to_string(),

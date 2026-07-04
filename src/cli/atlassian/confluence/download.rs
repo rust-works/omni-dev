@@ -13,7 +13,8 @@ use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 
 use crate::atlassian::api::AtlassianApi;
-use crate::atlassian::confluence_api::{ChildPage, ConfluenceApi, ConfluenceAttachment};
+use crate::atlassian::confluence_api::ConfluenceApi;
+use crate::atlassian::confluence_types::{ChildPage, ConfluenceAttachment};
 use crate::atlassian::document::content_item_to_document;
 use crate::cli::atlassian::format::ContentFormat;
 use crate::cli::atlassian::helpers::create_client;

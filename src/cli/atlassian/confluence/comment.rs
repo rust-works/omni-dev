@@ -7,9 +7,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::atlassian::adf::AdfDocument;
 use crate::atlassian::adf_validated::{markdown_to_validated_adf, ValidatedAdfDocument};
-use crate::atlassian::confluence_api::{
-    CommentKind, ConfluenceApi, ConfluenceComment, InlineAnchor,
-};
+use crate::atlassian::confluence_api::ConfluenceApi;
+use crate::atlassian::confluence_types::{CommentKind, ConfluenceComment, InlineAnchor};
 use crate::atlassian::convert::adf_to_markdown;
 use crate::atlassian::document::JfmDocument;
 use crate::atlassian::inline_comment::{
