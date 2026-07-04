@@ -59,7 +59,8 @@ pool** of authenticated sessions (`SNOWFLAKE_POOL_SIZE`, default 4):
 
 A separate session is required per concurrent in-flight context because v1 `USE`
 mutates session-global state; the SQL API **v2** would allow per-request context
-without this (see issue #1003).
+without this (a v2 client was proposed in #1003 but closed as not planned;
+non-interactive auth — PAT / key-pair JWT — is tracked in #1108).
 
 `daemon status`, `omni-dev snowflake sessions`, and the tray submenu list each
 pool **and each individual authenticated session** under it — its id, current
@@ -247,11 +248,35 @@ The service is reachable directly over the daemon's Unix control socket
 
 Ops:
 
-| op           | payload                                                                 | success payload                          |
-|--------------|-------------------------------------------------------------------------|------------------------------------------|
-| `query`      | `{ account?, user?, warehouse?, role?, database?, schema?, sql }`        | `{ columns: [...], rows: [...] }`        |
-| `sessions`   | `null`                                                                  | `{ sessions: [{ id, account, user, created_at, last_used, query_count }] }` |
-| `disconnect` | `{ account, user }`                                                     | `{ disconnected: <bool> }`               |
+| op           | payload                                                            | success payload                                        |
+|--------------|--------------------------------------------------------------------|--------------------------------------------------------|
+| `query`      | `{ account?, user?, warehouse?, role?, database?, schema?, sql }`  | `{ columns: [...], rows: [...] }`                      |
+| `sessions`   | `null`                                                             | `{ sessions: [<pool>] }` — one entry per pool, see below |
+| `disconnect` | `{ account, user }`                                                | `{ disconnected: <bool> }`                             |
+
+Each `<pool>` entry in the `sessions` reply describes one `(account, user)`
+session pool, including its live members (the CLI and tray render all of these
+fields):
+
+```json
+{
+  "id": 1, "account": "MYACCT", "user": "me",
+  "created_at": "…", "last_used": "…", "query_count": 7,
+  "sessions": 2, "max_sessions": 4,
+  "members": [
+    {
+      "id": 3, "busy": true,
+      "context": { "warehouse": "WH", "role": null, "database": null, "schema": null },
+      "last_used": "…", "query_count": 5,
+      "running": { "sql": "SELECT …", "started_at": "…" }
+    }
+  ]
+}
+```
+
+`sessions` / `max_sessions` count live authenticated sessions against the pool
+cap; `members[]` carries one entry per live session, whose `running` is `null`
+while the member is idle.
 
 Example exchange:
 

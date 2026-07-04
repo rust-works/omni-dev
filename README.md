@@ -48,6 +48,8 @@ omni-dev git branch create pr
 - 🎯 **Conventional Commits**: Automatic detection and formatting
 - 🌐 **Browser Bridge**: Drive HTTP requests through an authenticated browser
   tab without exfiltrating cookies or tokens
+- 🗂️ **Worktrees View**: One live view of every repo and git worktree open
+  across all your VS Code windows
 - 🛡️ **Safety First**: Working directory validation, protection against
   amending commits already in remote main branches, and error recovery
 - ⚡ **Fast & Reliable**: Built with Rust for memory safety and performance
@@ -99,9 +101,11 @@ columns).
 Beyond these two niches, omni-dev also ships a supervised **daemon** that
 hosts a **browser bridge** (an authenticated proxy that runs requests
 through a logged-in browser tab for SSO-gated dashboards such as Grafana
-and Loki) and a **Snowflake** SQL service (one external-browser SSO session
-reused for concurrent queries), plus a local append-only **request log**
-(`omni-dev log`). These have no direct incumbent in either table below, so
+and Loki), a **Snowflake** SQL service (one external-browser SSO session
+reused for concurrent queries), and a **worktrees** registry (one live view of
+the repos open across every VS Code window), plus a local append-only
+**request log** (`omni-dev log`). These have no direct incumbent in either
+table below, so
 they are called out here rather than scored against tools that don't aim
 for them.
 
@@ -344,8 +348,8 @@ overrides, and a transparent proxy for tools that speak plain HTTP.
 
 Host long-lived services in one supervised process behind a private per-user
 Unix-domain control socket. The browser bridge is the first service migrated
-onto it (Snowflake is the second), and on macOS an optional menu-bar app gives
-live control. `daemon start` installs a launchd LaunchAgent for auto-start at
+onto it (Snowflake and the worktrees registry followed), and on macOS an
+optional menu-bar app gives live control. `daemon start` installs a launchd LaunchAgent for auto-start at
 login, and `status` reports every hosted service. See
 [Running under the daemon](docs/browser-bridge.md#running-under-the-daemon) and
 [ADR-0039](docs/adrs/adr-0039.md) for the architecture.
@@ -411,6 +415,24 @@ omni-dev log --format json -n 20
 
 Set `OMNI_DEV_LOG_DISABLE=1` to turn it off, or `OMNI_DEV_LOG_BODIES=1` /
 `OMNI_DEV_LOG_HEADERS=1` to opt into capturing bodies/headers.
+
+### 🗂️ Worktrees
+
+See every repo and git worktree open across **all** your VS Code windows in
+one live view. A VS Code extension host is sandboxed per window — no extension
+alone can see a sibling window's folders — so a small first-party companion
+extension registers each window with the daemon, which aggregates them into a
+single registry served back to the CLI, tray, and extension UI. The registry
+is in-memory only; windows that crash without unregistering age out
+automatically. See [docs/worktrees-service.md](docs/worktrees-service.md) and
+[ADR-0040](docs/adrs/adr-0040.md).
+
+```bash
+# One line per open window and its folders (add --json for machines)
+omni-dev worktrees list
+```
+
+Runs on the daemon, so it is Unix-only.
 
 ### 📈 Coverage Diff
 
@@ -709,12 +731,26 @@ omni-dev git commit message twiddle 'main..HEAD' --concurrency 2
 
 | Option | Description | Example |
 |--------|-------------|---------|
+| `--fresh` | Generate fresh messages from the diffs alone (the default; conflicts with `--refine`) | `--fresh` |
+| `--refine` | Refine the existing messages instead of starting fresh (conflicts with `--fresh`) | `--refine` |
 | `--use-context` | Enable contextual intelligence | `--use-context` |
+| `--work-context TEXT` | Describe the work being done to steer suggestions | `--work-context "feature: user auth"` |
+| `--branch-context TEXT` | Override the context detected from the branch name | `--branch-context "bugfix: login flow"` |
+| `--context-dir PATH` | Custom context directory | `--context-dir ./config` |
+| `--model MODEL` | Claude API model to use (defaults from settings) | `--model claude-sonnet-4-5` |
+| `--beta-header KEY:VALUE` | Beta header for API requests (model-gated) | `--beta-header key:value` |
 | `--concurrency N` | Number of parallel commit processors (default: 4) | `--concurrency 3` |
 | `--no-coherence` | Skip cross-commit coherence refinement pass | `--no-coherence` |
-| `--context-dir PATH` | Custom context directory | `--context-dir ./config` |
+| `--no-ai` | Skip AI; output the repository analysis YAML only | `--no-ai` |
 | `--auto-apply` | Apply without confirmation | `--auto-apply` |
+| `--allow-pushed` | Allow amending commits already in remote main branches | `--allow-pushed` |
+| `--check` | Validate the messages after applying | `--check` |
 | `--save-only FILE` | Save to file without applying | `--save-only fixes.yaml` |
+| `--quiet` | Only show errors/warnings | `--quiet` |
+
+See the [User Guide's Key Options table](docs/user-guide.md#twiddle---ai-powered-improvement)
+for the full reference; `omni-dev git commit message twiddle --help` is the
+source of truth.
 
 ## 📖 Real-World Examples
 
