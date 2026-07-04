@@ -978,3 +978,136 @@ fn bodies_flag_creates_parent_and_writes_record() {
         .lines()
         .any(|l| l.contains(r#""kind":"invocation""#)));
 }
+
+// ── Log pruning + rotation (#1121) ──────────────────────────────────────
+
+/// One `kind: "http"` NDJSON line with the given id and RFC3339 timestamp.
+fn seed_line(id: &str, ts: &str) -> String {
+    format!("{{\"id\":\"{id}\",\"kind\":\"http\",\"timestamp\":\"{ts}\"}}\n")
+}
+
+#[test]
+fn log_prune_by_age_removes_old_records() {
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("log.jsonl");
+    // A record in the distant past and one in the distant future.
+    fs::write(
+        &log,
+        format!(
+            "{}{}",
+            seed_line("old", "2000-01-01T00:00:00.000Z"),
+            seed_line("keep", "2999-01-01T00:00:00.000Z"),
+        ),
+    )
+    .unwrap();
+
+    let output = run_with_log(&log, &["log", "prune", "--older-than", "1d"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.starts_with("Removed 1 record(s); kept 1"),
+        "unexpected summary: {stdout}"
+    );
+
+    let contents = fs::read_to_string(&log).unwrap();
+    assert!(!contents.contains(r#""id":"old""#), "old record pruned");
+    assert!(contents.contains(r#""id":"keep""#), "recent record kept");
+}
+
+#[test]
+fn log_prune_dry_run_reports_without_removing() {
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("log.jsonl");
+    fs::write(
+        &log,
+        format!(
+            "{}{}",
+            seed_line("old", "2000-01-01T00:00:00.000Z"),
+            seed_line("keep", "2999-01-01T00:00:00.000Z"),
+        ),
+    )
+    .unwrap();
+
+    let output = run_with_log(&log, &["log", "prune", "--older-than", "1d", "--dry-run"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.starts_with("Would remove 1 record(s)"), "{stdout}");
+
+    // A dry run leaves the old record in place.
+    let contents = fs::read_to_string(&log).unwrap();
+    assert!(contents.contains(r#""id":"old""#), "dry run keeps the file");
+}
+
+#[test]
+fn log_prune_by_size_keeps_newest_within_budget() {
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("log.jsonl");
+    // Five future-dated records (so age never removes any); each ~55 bytes.
+    let mut body = String::new();
+    for i in 0..5 {
+        body.push_str(&seed_line(&i.to_string(), "2999-01-01T00:00:00.000Z"));
+    }
+    fs::write(&log, &body).unwrap();
+
+    // A budget that fits only the two newest records.
+    let output = run_with_log(&log, &["log", "prune", "--max-size", "120b"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.starts_with("Removed "), "{stdout}");
+
+    let contents = fs::read_to_string(&log).unwrap();
+    assert!(!contents.contains(r#""id":"0""#), "oldest dropped");
+    assert!(contents.contains(r#""id":"4""#), "newest kept");
+}
+
+#[test]
+fn log_prune_rejects_invalid_inputs() {
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("log.jsonl");
+
+    // No bound given.
+    assert!(!run_with_log(&log, &["log", "prune"]).status.success());
+    // Unparseable duration and size each fail.
+    assert!(
+        !run_with_log(&log, &["log", "prune", "--older-than", "nope"])
+            .status
+            .success()
+    );
+    assert!(!run_with_log(&log, &["log", "prune", "--max-size", "nope"])
+        .status
+        .success());
+}
+
+#[cfg(unix)]
+#[test]
+fn log_auto_rotates_at_size_cap() {
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("log.jsonl");
+
+    // A cap smaller than a single invocation record forces a rotation on
+    // every write past the first; keep only two rotated files.
+    for _ in 0..5 {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni-dev"))
+            .arg("help-all")
+            .env("OMNI_DEV_LOG_FILE", &log)
+            .env("OMNI_DEV_LOG_MAX_SIZE", "100")
+            .env("OMNI_DEV_LOG_KEEP_FILES", "2")
+            .output()
+            .expect("failed to run binary");
+        assert!(output.status.success());
+    }
+
+    let sibling = |suffix: &str| {
+        let mut name = log.clone().into_os_string();
+        name.push(suffix);
+        PathBuf::from(name)
+    };
+    assert!(log.exists(), "live log present");
+    assert!(sibling(".1").exists(), "one rotated file present");
+    assert!(sibling(".2").exists(), "second rotated file present");
+    assert!(
+        !sibling(".3").exists(),
+        "keep-files bound drops the oldest beyond 2"
+    );
+    assert!(sibling(".lock").exists(), "rotation lock file present");
+}
