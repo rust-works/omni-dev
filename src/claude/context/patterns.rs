@@ -353,8 +353,11 @@ fn estimate_lines_changed(diff_summary: &str) -> i32 {
     for line in diff_summary.lines() {
         if let Some(changes_part) = line.split('|').nth(1) {
             if let Some(numbers_part) = changes_part.split_whitespace().next() {
-                if let Ok(num) = numbers_part.parse::<i32>() {
-                    total += num;
+                // `git diff --stat` counts are always non-negative; parse as
+                // `u32` so a stray `-1` token can never drive the total below
+                // zero (the `estimate_lines_nonnegative` invariant).
+                if let Ok(num) = numbers_part.parse::<u32>() {
+                    total += num as i32;
                 }
             }
         }
@@ -491,6 +494,24 @@ mod tests {
     #[test]
     fn estimate_lines_no_numbers() {
         assert_eq!(estimate_lines_changed("no pipe here"), 0);
+    }
+
+    #[test]
+    fn estimate_lines_ignores_negative_token() {
+        // A negative count after `|` must not drive the total below zero
+        // (regression for the `estimate_lines_nonnegative` property, which
+        // shrank to `"|-1\u{b}"`).
+        assert_eq!(estimate_lines_changed("|-1\u{b}"), 0);
+        assert_eq!(estimate_lines_changed(" src/main.rs | -5 ----"), 0);
+    }
+
+    #[test]
+    fn estimate_lines_ignores_pipe_without_number() {
+        // A `|` with no token after it (`numbers_part` is `None`) must be
+        // skipped without contributing to the total. Covers the fall-through
+        // path deterministically instead of relying on the property test.
+        assert_eq!(estimate_lines_changed("src/main.rs |"), 0);
+        assert_eq!(estimate_lines_changed("src/main.rs |   "), 0);
     }
 
     // ── detect_single_commit_pattern ───────────────────────────────
