@@ -137,6 +137,11 @@ No secret material is ever written, under any code path:
   `--body` values are redacted (`@file` references are kept), and any flag
   whose name has a `token`/`secret`/`password`/`passwd`/`key` segment has its
   value redacted (flags ending in `-file`/`-path` carry paths and are exempt).
+  Every argv element is then run through the same URL query/fragment redaction
+  as `--url` above, so a secret carried in a URL argument (e.g.
+  `--url /path?access_token=…` or a presigned target) is redacted even though
+  `--url` is not a secret-bearing flag name; benign argv passes through
+  byte-identical.
 
 ### What redaction does not cover: prompt bodies
 
