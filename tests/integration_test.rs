@@ -896,6 +896,37 @@ fn invocation_command_line_redacts_argv_secrets() {
 }
 
 #[test]
+fn invocation_command_line_redacts_url_query_secrets() {
+    // A secret carried in a `--url` query/fragment (not a secret-ish flag name,
+    // so untouched by the flag-value scrub) must not reach the log via the
+    // invocation record's argv (#1162). The bridge target is the natural vector.
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("log.jsonl");
+
+    run_with_log(
+        &log,
+        &[
+            "browser",
+            "bridge",
+            "request",
+            "--url",
+            "/api/export?access_token=hunter2&sig=deadbeef&page=3",
+        ],
+    );
+
+    let contents = fs::read_to_string(&log).expect("log file should exist");
+    assert!(
+        !contents.contains("hunter2") && !contents.contains("deadbeef"),
+        "url query secrets must not appear anywhere in the log:\n{contents}"
+    );
+    // The redacted, still-greppable form is what lands on disk; benign params
+    // (and the path) survive so substring filtering keeps working.
+    assert!(contents.contains("access_token=REDACTED"));
+    assert!(contents.contains("sig=REDACTED"));
+    assert!(contents.contains("page=3"));
+}
+
+#[test]
 fn log_disable_appends_nothing() {
     let dir = TempDir::new().unwrap();
     let log = dir.path().join("log.jsonl");
