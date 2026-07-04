@@ -78,14 +78,18 @@ pub(crate) fn build_http_client() -> Result<Client> {
         .context("Failed to build HTTP client")
 }
 
-/// Appends a best-effort `service = claude` HTTP record for one AI-backend
-/// `POST` attempt (direct Anthropic, Bedrock, or OpenAI-compatible).
+/// Appends a best-effort HTTP record for one AI-backend request attempt. The
+/// `service` tag distinguishes the backend that issued it (`anthropic`,
+/// `bedrock`, `openai`, or `ollama`) so their traffic is filterable apart;
+/// `method` covers both the chat `POST` and the metadata probes (GET/POST).
 pub(crate) fn record_ai_http(
+    service: &str,
+    method: &str,
     url: &str,
     started: Instant,
     result: &reqwest::Result<reqwest::Response>,
 ) {
-    request_log::record_http_result("claude", "POST", url, started, result);
+    request_log::record_http_result(service, method, url, started, result);
 }
 
 /// Returns the maximum output tokens for a model from the registry,

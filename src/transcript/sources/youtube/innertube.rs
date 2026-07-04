@@ -129,13 +129,15 @@ pub async fn fetch_browse(http: &reqwest::Client, base_url: &str, body: &Value) 
         base = base_url.trim_end_matches('/'),
         path = BROWSE_PATH,
     );
-    let response = http
+    let started = std::time::Instant::now();
+    let result = http
         .post(&url)
         .header(API_KEY_HEADER, WEB_INNERTUBE_API_KEY)
         .json(body)
         .send()
-        .await?
-        .error_for_status()?;
+        .await;
+    super::record_yt_http("POST", &url, started, &result);
+    let response = result?.error_for_status()?;
     Ok(response.text().await?)
 }
 
@@ -167,13 +169,15 @@ pub async fn fetch_player_response(
         "racyCheckOk": true,
     });
 
-    let response = http
+    let started = std::time::Instant::now();
+    let result = http
         .post(&url)
         .header(API_KEY_HEADER, INNERTUBE_API_KEY)
         .json(&body)
         .send()
-        .await?
-        .error_for_status()?;
+        .await;
+    super::record_yt_http("POST", &url, started, &result);
+    let response = result?.error_for_status()?;
     Ok(response.text().await?)
 }
 
@@ -209,13 +213,15 @@ pub async fn fetch_player_response_web(
         "racyCheckOk": true,
     });
 
-    let response = http
+    let started = std::time::Instant::now();
+    let result = http
         .post(&url)
         .header(API_KEY_HEADER, WEB_INNERTUBE_API_KEY)
         .json(&body)
         .send()
-        .await?
-        .error_for_status()?;
+        .await;
+    super::record_yt_http("POST", &url, started, &result);
+    let response = result?.error_for_status()?;
     Ok(response.text().await?)
 }
 
