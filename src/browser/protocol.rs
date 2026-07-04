@@ -54,6 +54,12 @@ pub struct ControlRequest {
     /// the browser snippet defaults to `include`, preserving v1 behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentials: Option<String>,
+    /// Request-body transfer encoding. `Some("base64")` means `body` is a base64
+    /// string the browser snippet decodes to a byte array before `fetch()`;
+    /// absent (the default) means `body` is UTF-8 text, preserving v1
+    /// wire-compat. Mirrors the response-side `encoding` on [`BrowserReply`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
 }
 
 fn default_method() -> String {
@@ -91,6 +97,12 @@ pub struct Command {
     /// to let the browser snippet default to `include`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentials: Option<String>,
+    /// Request-body transfer encoding. `Some("base64")` tells the browser
+    /// snippet to decode `body` to a byte array before `fetch()`; absent (the
+    /// default) means `body` is UTF-8 text, kept off the wire for back-compat
+    /// with buffered clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
 }
 
 /// Server → browser cancellation frame.
@@ -385,6 +397,7 @@ mod tests {
             target: None,
             allow_origin: None,
             credentials: None,
+            encoding: None,
         };
         // Back-compat: an absent override is not serialised, so the wire body
         // stays byte-identical to a pre-feature client's.
@@ -411,6 +424,7 @@ mod tests {
             body: None,
             stream: false,
             credentials: None,
+            encoding: None,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(!json.contains('\n'));
@@ -430,6 +444,7 @@ mod tests {
             body: None,
             stream: true,
             credentials: None,
+            encoding: None,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"stream\":true"));
@@ -530,6 +545,7 @@ mod tests {
             target: None,
             allow_origin: None,
             credentials: None,
+            encoding: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("credentials"));
@@ -545,9 +561,52 @@ mod tests {
             body: None,
             stream: false,
             credentials: Some("omit".to_string()),
+            encoding: None,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains(r#""credentials":"omit""#));
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(cmd, back);
+    }
+
+    #[test]
+    fn request_encoding_omitted_when_absent_and_round_trips_when_present() {
+        // Absent (the default): a base64 request encoding is never serialised, so
+        // the wire stays byte-identical to a pre-feature client's.
+        let cmd = Command {
+            id: 3,
+            url: "/upload".to_string(),
+            method: "POST".to_string(),
+            headers: BTreeMap::new(),
+            body: Some("plain".to_string()),
+            stream: false,
+            credentials: None,
+            encoding: None,
+        };
+        assert!(!serde_json::to_string(&cmd).unwrap().contains("encoding"));
+
+        // Present: `encoding: "base64"` round-trips on both request-side types.
+        let req = ControlRequest {
+            url: "/upload".to_string(),
+            method: "POST".to_string(),
+            headers: BTreeMap::new(),
+            body: Some("aGk=".to_string()),
+            stream: false,
+            target: None,
+            allow_origin: None,
+            credentials: None,
+            encoding: Some("base64".to_string()),
+        };
+        let back: ControlRequest =
+            serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(back.encoding.as_deref(), Some("base64"));
+
+        let cmd = Command {
+            encoding: Some("base64".to_string()),
+            ..cmd
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains(r#""encoding":"base64""#));
         let back: Command = serde_json::from_str(&json).unwrap();
         assert_eq!(cmd, back);
     }
