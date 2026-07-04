@@ -279,8 +279,9 @@ Resolution rules:
 | Target origin matches several tabs | `409` — target by connection id instead |
 
 > Requests are routed to **exactly one** tab; there is no fan-out to multiple
-> tabs. `--allow-origin` remains a single global value applied to every
-> connection (a per-origin allowlist is future work, tracked in #1185).
+> tabs. The outbound scope is granted **per connecting origin** — `--allow-origin`
+> is repeatable and each tab carries only its own grant (see
+> [Outbound request scope](#outbound-request-scope-default-closed)).
 
 ## Security model
 
@@ -315,13 +316,30 @@ bridge runs.
 - **Relative URLs only by default** (resolved against the page origin).
   Absolute / cross-origin URLs are rejected unless explicitly enabled with
   `--allow-origin <url>`.
-- The `serve --allow-origin` global feeds **two** checks at different times: the
-  WebSocket **upgrade** gate (the *extension's* origin, at connection time) and
-  the per-request outbound-URL check (the *target's* origin). To widen the
-  outbound scope for a single request **without** disturbing the connected tab,
-  pass `request --allow-origin <url>` instead: it reaches only the outbound-URL
-  check, takes precedence over the global for that request, and never the WS
-  gate. A WARN is logged at dispatch whenever the per-request override is used.
+- **Per-origin allowlist.** `serve --allow-origin` is **repeatable** and scoped
+  per connecting tab. Each value is either a bare `ORIGIN` (shorthand: a tab on
+  that origin may reach it) or a `CONNECT=OUTBOUND` mapping (a tab connecting
+  from `CONNECT` may reach `OUTBOUND`). Repeats under the same connecting origin
+  accumulate its outbound set. So a Grafana tab and a Facebook tab each carry
+  only their own grant — neither can borrow the other's outbound scope:
+
+  ```bash
+  omni-dev browser bridge serve \
+    --allow-origin https://grafana.internal \
+    --allow-origin https://www.facebook.com=https://static.xx.fbcdn.net
+  ```
+
+- The allowlist feeds **two** checks at different times: the WebSocket **upgrade**
+  gate (the *connecting tab's* origin must be a configured key, at connection
+  time) and the per-request outbound-URL check (the *target's* origin must be in
+  the outbound set granted to the tab the request is **routed to**, keyed by that
+  tab's connecting origin). With no `--allow-origin` at all the gate is open (the
+  token is the gate) and outbound scope is closed to relative URLs only.
+- To widen the outbound scope for a single request **without** disturbing the
+  connected tab, pass `request --allow-origin <url>` instead: it reaches only the
+  outbound-URL check, takes precedence over the per-origin grant for that request,
+  and never the WS gate. A WARN is logged at dispatch whenever the per-request
+  override is used.
 - **Security note:** a per-request override lets a session-token holder direct
   the tab's `fetch` at an arbitrary cross-origin URL. Blast radius is bounded by
   the browser's own CORS (the response body is readable only if the target sends
@@ -361,7 +379,7 @@ bridge runs.
 | `--ws-port <PORT>` | `9999` | WebSocket-plane port. `0` binds a random free port. |
 | `--control-port <PORT>` | `9998` | HTTP control-plane port. `0` binds a random free port. |
 | `--request-timeout <SECS>` | `30` | Per-request timeout before the control plane returns `504`. |
-| `--allow-origin <URL>` | — | Permit this exact cross-origin for the WS upgrade and outbound URLs. |
+| `--allow-origin <URL[=URL]>` | — | Permit a cross-origin for the WS upgrade and outbound URLs. Repeatable, scoped per connecting tab: bare `ORIGIN`, or a `CONNECT=OUTBOUND` mapping. |
 | `--max-body-bytes <N>` | `8388608` | Maximum browser response body size accepted. |
 | `--max-concurrent <N>` | `64` | Maximum concurrent in-flight requests. |
 | `--token-file <PATH>` | — | Read the session token from this `0600` file instead of generating one. |

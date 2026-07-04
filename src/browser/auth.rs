@@ -10,6 +10,7 @@
 //! rather than framework types so the security checks can be unit-tested in
 //! isolation from axum / tungstenite.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -265,9 +266,13 @@ pub enum ScopeError {
 /// Enforces the default-closed outbound scope.
 ///
 /// Relative URLs (page-origin) are always allowed. Absolute or
-/// protocol-relative URLs are rejected unless their origin exactly matches
-/// `allow_origin`.
-pub fn validate_outbound_url(url: &str, allow_origin: Option<&str>) -> Result<(), ScopeError> {
+/// protocol-relative URLs are rejected unless their origin matches one of the
+/// `allowed` origins. An empty `allowed` slice permits relative URLs only.
+///
+/// The caller resolves `allowed`: the per-request override (a single origin) or
+/// the per-origin allowlist entry for the tab a request is routed to (see
+/// [`OriginAllowlist::outbound_for`]).
+pub fn validate_outbound_url(url: &str, allowed: &[&str]) -> Result<(), ScopeError> {
     // Protocol-relative (`//host/...`) is cross-origin.
     let is_relative = url.starts_with('/') && !url.starts_with("//");
     if is_relative {
@@ -277,10 +282,17 @@ pub fn validate_outbound_url(url: &str, allow_origin: Option<&str>) -> Result<()
         return Ok(());
     }
 
-    let allow = allow_origin.ok_or(ScopeError::CrossOriginDenied)?;
+    // No grant covers an absolute URL — reject before parsing (a malformed
+    // absolute URL with no allowance is still simply cross-origin-denied).
+    if allowed.is_empty() {
+        return Err(ScopeError::CrossOriginDenied);
+    }
     let target = url::Url::parse(url).map_err(|_| ScopeError::Malformed)?;
-    let allowed = url::Url::parse(allow).map_err(|_| ScopeError::Malformed)?;
-    if origins_match(&target, &allowed) {
+    let permitted = allowed
+        .iter()
+        .filter_map(|a| url::Url::parse(a).ok())
+        .any(|allow| origins_match(&target, &allow));
+    if permitted {
         Ok(())
     } else {
         Err(ScopeError::CrossOriginDenied)
@@ -291,6 +303,112 @@ fn origins_match(a: &url::Url, b: &url::Url) -> bool {
     a.scheme() == b.scheme()
         && a.host_str() == b.host_str()
         && a.port_or_known_default() == b.port_or_known_default()
+}
+
+/// Canonical `scheme://host[:port]` serialisation of a URL's origin, with the
+/// scheme's default port dropped (so `https://h` and `https://h:443` collapse to
+/// one key). Returns `None` for a URL that does not parse or whose origin is
+/// opaque (e.g. `data:`), which are never valid allowlist entries.
+fn canonical_origin(s: &str) -> Option<String> {
+    let origin = url::Url::parse(s.trim()).ok()?.origin();
+    origin.is_tuple().then(|| origin.ascii_serialization())
+}
+
+/// A per-connecting-origin outbound allowlist for the bridge.
+///
+/// Maps each **connecting tab origin** (the `Origin` presented at the WebSocket
+/// upgrade) to the set of **outbound origins** a request routed to that tab may
+/// reach. This is the mechanism behind per-origin scoping: a Grafana tab and a
+/// Facebook tab each carry only their own grant, so neither can borrow the
+/// other's outbound scope.
+///
+/// Built from repeatable `--allow-origin` values, each either a bare `ORIGIN`
+/// (shorthand: the tab may reach its own origin) or an explicit
+/// `CONNECT=OUTBOUND` mapping; repeats accumulate outbound origins under the same
+/// connecting key. An empty allowlist is the unconfigured default — the WS gate
+/// admits any origin (the session token is the gate) and outbound scope is
+/// default-closed (relative URLs only).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OriginAllowlist {
+    /// Canonical connecting-origin → canonical permitted outbound origins.
+    map: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl OriginAllowlist {
+    /// Parses repeatable `--allow-origin` CLI values into an allowlist.
+    ///
+    /// Each value is `ORIGIN` (shorthand for `ORIGIN=ORIGIN`) or
+    /// `CONNECT=OUTBOUND`. Both sides must be valid, non-opaque origins; a
+    /// malformed or empty side is a hard error naming the offending value.
+    pub fn parse<S: AsRef<str>>(values: &[S]) -> Result<Self, String> {
+        let mut map: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for raw in values {
+            let raw = raw.as_ref().trim();
+            if raw.is_empty() {
+                return Err("empty --allow-origin value".to_string());
+            }
+            let (connect, outbound) = match raw.split_once('=') {
+                Some((c, o)) => (c.trim(), o.trim()),
+                None => (raw, raw),
+            };
+            let connect = canonical_origin(connect).ok_or_else(|| {
+                format!("invalid --allow-origin connecting origin: {connect:?} (in {raw:?})")
+            })?;
+            let outbound = canonical_origin(outbound).ok_or_else(|| {
+                format!("invalid --allow-origin outbound origin: {outbound:?} (in {raw:?})")
+            })?;
+            map.entry(connect).or_default().insert(outbound);
+        }
+        Ok(Self { map })
+    }
+
+    /// Whether no `--allow-origin` was configured (the default-open WS gate,
+    /// default-closed outbound case).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Whether a WebSocket upgrade from `origin` is permitted.
+    ///
+    /// An empty allowlist admits any origin (the token in the subprotocol is the
+    /// gate). Otherwise the connecting origin must be a configured key — an
+    /// origin-less upgrade is rejected once any entry exists.
+    #[must_use]
+    pub fn permits_connection(&self, origin: Option<&str>) -> bool {
+        if self.map.is_empty() {
+            return true;
+        }
+        origin
+            .and_then(canonical_origin)
+            .is_some_and(|o| self.map.contains_key(&o))
+    }
+
+    /// The outbound origins granted to a request routed to a tab on `origin`.
+    ///
+    /// Empty when the tab's origin is unknown or carries no grant — leaving only
+    /// relative URLs permitted (see [`validate_outbound_url`]).
+    #[must_use]
+    pub fn outbound_for(&self, origin: Option<&str>) -> Vec<&str> {
+        origin
+            .and_then(canonical_origin)
+            .and_then(|o| self.map.get(&o))
+            .map(|set| set.iter().map(String::as_str).collect())
+            .unwrap_or_default()
+    }
+
+    /// Renders the configured entries as `CONNECT → OUTBOUND[, OUTBOUND…]` lines
+    /// (connecting-origin sorted) for the startup banner. Empty when unconfigured.
+    #[must_use]
+    pub fn describe(&self) -> Vec<String> {
+        self.map
+            .iter()
+            .map(|(connect, outbound)| {
+                let outbound = outbound.iter().cloned().collect::<Vec<_>>().join(", ");
+                format!("{connect} → {outbound}")
+            })
+            .collect()
+    }
 }
 
 /// Extracts and verifies the bridge token from WebSocket subprotocols.
@@ -306,23 +424,6 @@ where
         .into_iter()
         .map(str::trim)
         .find(|p| constant_time_eq(p, token))
-}
-
-/// Whether a WebSocket upgrade's `Origin` is permitted.
-///
-/// With no `--allow-origin` configured, any origin is accepted (the token in
-/// the subprotocol is the gate). With one configured, the origin must match.
-#[must_use]
-pub fn ws_origin_allowed(origin: Option<&str>, allow_origin: Option<&str>) -> bool {
-    match allow_origin {
-        None => true,
-        Some(allowed) => origin.is_some_and(|o| {
-            url::Url::parse(o)
-                .ok()
-                .zip(url::Url::parse(allowed).ok())
-                .is_some_and(|(o, a)| origins_match(&o, &a))
-        }),
-    }
 }
 
 #[cfg(test)]
@@ -409,29 +510,34 @@ mod tests {
 
     #[test]
     fn outbound_scope_is_default_closed() {
-        assert_eq!(validate_outbound_url("/api/foo", None), Ok(()));
+        assert_eq!(validate_outbound_url("/api/foo", &[]), Ok(()));
         assert_eq!(
-            validate_outbound_url("https://evil.test/x", None),
+            validate_outbound_url("https://evil.test/x", &[]),
             Err(ScopeError::CrossOriginDenied)
         );
         assert_eq!(
-            validate_outbound_url("//evil.test/x", None),
+            validate_outbound_url("//evil.test/x", &[]),
             Err(ScopeError::CrossOriginDenied)
         );
     }
 
     #[test]
-    fn outbound_scope_honors_allow_origin() {
+    fn outbound_scope_honors_allowed_origins() {
         assert_eq!(
-            validate_outbound_url("https://ok.test/x", Some("https://ok.test")),
+            validate_outbound_url("https://ok.test/x", &["https://ok.test"]),
             Ok(())
         );
         assert_eq!(
-            validate_outbound_url("https://evil.test/x", Some("https://ok.test")),
+            validate_outbound_url("https://evil.test/x", &["https://ok.test"]),
             Err(ScopeError::CrossOriginDenied)
         );
-        // Relative always allowed regardless of allow-origin.
-        assert_eq!(validate_outbound_url("/x", Some("https://ok.test")), Ok(()));
+        // Any origin in the slice permits the URL.
+        assert_eq!(
+            validate_outbound_url("https://b.test/x", &["https://a.test", "https://b.test"]),
+            Ok(())
+        );
+        // Relative always allowed regardless of the outbound grant.
+        assert_eq!(validate_outbound_url("/x", &["https://ok.test"]), Ok(()));
     }
 
     #[test]
@@ -442,18 +548,84 @@ mod tests {
     }
 
     #[test]
-    fn ws_origin_allowed_logic() {
-        assert!(ws_origin_allowed(Some("https://anything.test"), None));
-        assert!(ws_origin_allowed(None, None));
-        assert!(ws_origin_allowed(
-            Some("https://ok.test"),
-            Some("https://ok.test")
-        ));
-        assert!(!ws_origin_allowed(
-            Some("https://evil.test"),
-            Some("https://ok.test")
-        ));
-        assert!(!ws_origin_allowed(None, Some("https://ok.test")));
+    fn empty_allowlist_opens_the_ws_gate() {
+        let empty = OriginAllowlist::default();
+        assert!(empty.is_empty());
+        // Token is the gate: any origin (or none) connects.
+        assert!(empty.permits_connection(Some("https://anything.test")));
+        assert!(empty.permits_connection(None));
+        // ...and outbound is default-closed (no origins granted).
+        assert!(empty.outbound_for(Some("https://anything.test")).is_empty());
+    }
+
+    #[test]
+    fn allowlist_gates_connection_by_configured_key() {
+        let list = OriginAllowlist::parse(&["https://ok.test"]).unwrap();
+        assert!(list.permits_connection(Some("https://ok.test")));
+        // Port normalisation: the default https port collapses onto the key.
+        assert!(list.permits_connection(Some("https://ok.test:443")));
+        assert!(!list.permits_connection(Some("https://evil.test")));
+        // An origin-less upgrade is rejected once any entry exists.
+        assert!(!list.permits_connection(None));
+    }
+
+    #[test]
+    fn shorthand_grants_a_tab_its_own_origin() {
+        let list = OriginAllowlist::parse(&["https://grafana.internal"]).unwrap();
+        assert_eq!(
+            list.outbound_for(Some("https://grafana.internal")),
+            vec!["https://grafana.internal"]
+        );
+        // A tab with no matching key carries no outbound grant.
+        assert!(list.outbound_for(Some("https://other.test")).is_empty());
+        assert!(list.outbound_for(None).is_empty());
+    }
+
+    #[test]
+    fn mapping_scopes_outbound_per_connecting_origin() {
+        // A Grafana tab and a Facebook tab each carry only their own grant.
+        let list = OriginAllowlist::parse(&[
+            "https://grafana.internal",
+            "https://www.facebook.com=https://static.xx.fbcdn.net",
+        ])
+        .unwrap();
+        assert_eq!(
+            list.outbound_for(Some("https://grafana.internal")),
+            vec!["https://grafana.internal"]
+        );
+        assert_eq!(
+            list.outbound_for(Some("https://www.facebook.com")),
+            vec!["https://static.xx.fbcdn.net"]
+        );
+        // The Grafana tab cannot borrow Facebook's outbound scope.
+        assert_eq!(
+            validate_outbound_url(
+                "https://static.xx.fbcdn.net/x",
+                &list.outbound_for(Some("https://grafana.internal"))
+            ),
+            Err(ScopeError::CrossOriginDenied)
+        );
+    }
+
+    #[test]
+    fn repeated_keys_accumulate_outbound_origins() {
+        let list = OriginAllowlist::parse(&[
+            "https://app.test=https://a.cdn.test",
+            "https://app.test=https://b.cdn.test",
+        ])
+        .unwrap();
+        assert_eq!(
+            list.outbound_for(Some("https://app.test")),
+            vec!["https://a.cdn.test", "https://b.cdn.test"]
+        );
+    }
+
+    #[test]
+    fn parse_rejects_malformed_and_empty_values() {
+        assert!(OriginAllowlist::parse(&["not a url"]).is_err());
+        assert!(OriginAllowlist::parse(&["https://ok.test=nonsense"]).is_err());
+        assert!(OriginAllowlist::parse(&[""]).is_err());
+        assert!(OriginAllowlist::parse(&["=https://ok.test"]).is_err());
     }
 
     #[cfg(unix)]

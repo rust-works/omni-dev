@@ -2121,8 +2121,8 @@ Options:
           HTTP control-plane port. `0` binds a random free port [default: 9998]
       --request-timeout <REQUEST_TIMEOUT>
           Per-request timeout in seconds before the control plane returns `504` [default: 30]
-      --allow-origin <URL>
-          Permit this exact cross-origin for both the WebSocket upgrade and outbound request URLs (e.g. `https://grafana.internal`). Without it, only same-origin (relative) URLs are allowed
+      --allow-origin <URL[=URL]>
+          Permit a cross-origin for the WebSocket upgrade and outbound request URLs. Repeatable, and scoped per connecting tab: a bare `ORIGIN` (e.g. `https://grafana.internal`) lets a tab on that origin reach it, while `CONNECT=OUTBOUND` (e.g. `https://www.facebook.com=https://static.xx.fbcdn.net`) grants a tab on CONNECT the OUTBOUND scope only. Without any, only same-origin (relative) URLs are allowed
       --max-body-bytes <MAX_BODY_BYTES>
           Maximum browser response body size accepted, in bytes [default: 8388608]
       --max-concurrent <MAX_CONCURRENT>
@@ -2385,8 +2385,8 @@ Options:
           Browser-bridge WebSocket-plane port (`0` binds a random free port) [default: 9999]
       --bridge-control-port <BRIDGE_CONTROL_PORT>
           Browser-bridge HTTP control-plane port (`0` binds a random free port) [default: 9998]
-      --bridge-allow-origin <URL>
-          Permit this cross-origin for the bridge's WebSocket upgrade and outbound URLs (the bridge's `--allow-origin`)
+      --bridge-allow-origin <URL[=URL]>
+          Permit a cross-origin for the bridge's WebSocket upgrade and outbound URLs (the bridge's `--allow-origin`). Repeatable and scoped per connecting tab: a bare `ORIGIN`, or a `CONNECT=OUTBOUND` mapping
       --bridge-token-file <PATH>
           Read the bridge session token from this `0600` file instead of generating one
       --no-menu
