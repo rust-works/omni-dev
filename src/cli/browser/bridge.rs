@@ -65,11 +65,14 @@ pub struct ServeCommand {
     #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS)]
     pub request_timeout: u64,
 
-    /// Permit this exact cross-origin for both the WebSocket upgrade and
-    /// outbound request URLs (e.g. `https://grafana.internal`). Without it,
-    /// only same-origin (relative) URLs are allowed.
-    #[arg(long, value_name = "URL")]
-    pub allow_origin: Option<String>,
+    /// Permit a cross-origin for the WebSocket upgrade and outbound request
+    /// URLs. Repeatable, and scoped per connecting tab: a bare `ORIGIN` (e.g.
+    /// `https://grafana.internal`) lets a tab on that origin reach it, while
+    /// `CONNECT=OUTBOUND` (e.g. `https://www.facebook.com=https://static.xx.fbcdn.net`)
+    /// grants a tab on CONNECT the OUTBOUND scope only. Without any, only
+    /// same-origin (relative) URLs are allowed.
+    #[arg(long, value_name = "URL[=URL]")]
+    pub allow_origin: Vec<String>,
 
     /// Maximum browser response body size accepted, in bytes.
     #[arg(long, default_value_t = DEFAULT_MAX_BODY_BYTES)]
@@ -89,11 +92,13 @@ impl ServeCommand {
     /// Executes the serve command.
     pub async fn execute(self) -> Result<()> {
         let token = auth::resolve_token(self.token_file.as_deref())?;
+        let allow_origins = auth::OriginAllowlist::parse(&self.allow_origin)
+            .map_err(|e| anyhow::anyhow!("invalid --allow-origin: {e}"))?;
         let config = BridgeConfig {
             ws_port: self.ws_port,
             control_port: self.control_port,
             request_timeout: Duration::from_secs(self.request_timeout),
-            allow_origin: self.allow_origin,
+            allow_origins,
             max_body_bytes: self.max_body_bytes,
             max_concurrent: self.max_concurrent.max(1),
         };
@@ -130,7 +135,7 @@ mod tests {
         assert_eq!(c.ws_port, 9999);
         assert_eq!(c.control_port, 9998);
         assert_eq!(c.request_timeout, 30);
-        assert!(c.allow_origin.is_none());
+        assert!(c.allow_origin.is_empty());
         assert!(c.token_file.is_none());
     }
 
@@ -154,9 +159,26 @@ mod tests {
             "8",
         ]);
         assert_eq!(c.request_timeout, 5);
-        assert_eq!(c.allow_origin.as_deref(), Some("https://ok.test"));
+        assert_eq!(c.allow_origin, vec!["https://ok.test".to_string()]);
         assert_eq!(c.max_body_bytes, 1024);
         assert_eq!(c.max_concurrent, 8);
+    }
+
+    #[test]
+    fn allow_origin_is_repeatable_and_accepts_mappings() {
+        let c = parse(&[
+            "--allow-origin",
+            "https://grafana.internal",
+            "--allow-origin",
+            "https://www.facebook.com=https://static.xx.fbcdn.net",
+        ]);
+        assert_eq!(
+            c.allow_origin,
+            vec![
+                "https://grafana.internal".to_string(),
+                "https://www.facebook.com=https://static.xx.fbcdn.net".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -172,7 +194,7 @@ mod tests {
             ws_port: 0,
             control_port,
             request_timeout: DEFAULT_TIMEOUT_SECS,
-            allow_origin: None,
+            allow_origin: Vec::new(),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_concurrent: DEFAULT_MAX_CONCURRENT,
             token_file: None,

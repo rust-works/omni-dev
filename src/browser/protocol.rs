@@ -43,11 +43,11 @@ pub struct ControlRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     /// Request-scoped outbound-origin override. When present it takes
-    /// precedence over `serve --allow-origin` for *this request's*
-    /// [`crate::browser::auth::validate_outbound_url`] check only, letting one
-    /// request target a cross-origin URL without affecting the connection-time
-    /// `ws_origin_allowed` gate. Server-side scope check only — never sent to
-    /// the browser.
+    /// precedence over the per-origin `serve --allow-origin` grant for *this
+    /// request's* [`crate::browser::auth::validate_outbound_url`] check only,
+    /// letting one request target a cross-origin URL without affecting the
+    /// connection-time WS-upgrade gate. Server-side scope check only — never sent
+    /// to the browser.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_origin: Option<String>,
     /// Fetch credentials mode (`include` | `omit` | `same-origin`). Absent means

@@ -61,8 +61,9 @@ pub struct BridgeConfig {
     pub control_port: u16,
     /// Per-request timeout before the control plane returns `504`.
     pub request_timeout: Duration,
-    /// Optional cross-origin allowlist for both the WS upgrade and outbound URLs.
-    pub allow_origin: Option<String>,
+    /// Per-connecting-origin cross-origin allowlist for both the WS upgrade gate
+    /// and outbound URLs. Empty = the default-open gate / default-closed scope.
+    pub allow_origins: auth::OriginAllowlist,
     /// Maximum browser response body size accepted, in bytes.
     pub max_body_bytes: usize,
     /// Maximum number of concurrent in-flight requests.
@@ -77,7 +78,7 @@ impl Default for BridgeConfig {
             ws_port: DEFAULT_WS_PORT,
             control_port: DEFAULT_CONTROL_PORT,
             request_timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-            allow_origin: None,
+            allow_origins: auth::OriginAllowlist::default(),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_concurrent: DEFAULT_MAX_CONCURRENT,
         }
@@ -428,8 +429,8 @@ fn print_startup(config: &BridgeConfig, token: &str) {
     println!("  control plane : http://127.0.0.1:{}", config.control_port);
     println!("  websocket     : ws://127.0.0.1:{}", config.ws_port);
     println!("  session token : {token}");
-    if let Some(origin) = &config.allow_origin {
-        println!("  allow-origin  : {origin}");
+    for line in config.allow_origins.describe() {
+        println!("  allow-origin  : {line}");
     }
     println!();
     println!("Paste this into the DevTools console of the authenticated tab:");
@@ -481,7 +482,7 @@ async fn handle_ws_conn(stream: TcpStream, state: AppState) {
     use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 
     let token = state.token.clone();
-    let allow_origin = state.config.allow_origin.clone();
+    let allow_origins = state.config.allow_origins.clone();
     let captured_origin: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
     let co = captured_origin.clone();
 
@@ -493,7 +494,7 @@ async fn handle_ws_conn(stream: TcpStream, state: AppState) {
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string);
 
-            if !auth::ws_origin_allowed(origin.as_deref(), allow_origin.as_deref()) {
+            if !allow_origins.permits_connection(origin.as_deref()) {
                 tracing::warn!("Rejected WebSocket upgrade: origin not allowed");
                 return Err(ws_error(StatusCode::FORBIDDEN, "origin not allowed"));
             }
@@ -714,7 +715,8 @@ async fn proxy_handler(State(state): State<AppState>, request: Request) -> Respo
         stream,
         target: target_header(&parts.headers),
         // The transparent proxy has no per-request override channel; cross-origin
-        // proxying is governed solely by the `serve --allow-origin` global.
+        // proxying is governed by the per-origin allowlist entry for the tab the
+        // request routes to (keyed by that tab's connecting `Origin`).
         allow_origin: None,
         // The transparent proxy has no per-request credentials control; it keeps
         // the snippet default (`include`), matching pre-credentials behavior.
@@ -894,26 +896,33 @@ fn tab_list(tabs: &HashMap<u64, WsConn>) -> String {
         .join(", ")
 }
 
-/// Resolves the outbound-origin allowlist for a single request.
+/// Resolves the outbound origins permitted for a single request, given the
+/// connecting origin of the tab it is routed to (`target_origin`).
 ///
-/// A per-request `request --allow-origin` override (`req.allow_origin`) takes
-/// precedence over the `serve --allow-origin` global; otherwise the global is
-/// used. This value reaches **only** [`auth::validate_outbound_url`] — never the
-/// connection-time `ws_origin_allowed` gate — so a request may target a
-/// cross-origin URL without the page's own tab being rejected at upgrade.
+/// Precedence: a per-request `request --allow-origin` override
+/// (`req.allow_origin`) wins, widening this one request's scope; otherwise the
+/// per-origin allowlist grants the outbound set bound to the target tab's
+/// connecting origin. The result reaches **only** [`auth::validate_outbound_url`]
+/// — never the connection-time WS-upgrade gate ([`auth::OriginAllowlist::permits_connection`])
+/// — so a request may target a cross-origin URL without the page's own tab being
+/// rejected at upgrade.
 ///
 /// A WARN is logged whenever the per-request override is exercised, since it
 /// widens this request's outbound scope beyond what `serve` was started with.
-fn resolve_allow_origin<'a>(req: &'a ControlRequest, state: &'a AppState) -> Option<&'a str> {
+fn resolve_outbound<'a>(
+    req: &'a ControlRequest,
+    state: &'a AppState,
+    target_origin: Option<&'a str>,
+) -> Vec<&'a str> {
     match req.allow_origin.as_deref() {
         Some(origin) => {
             tracing::warn!(
                 "Per-request --allow-origin override in effect; outbound scope for this request \
                  widened to {origin}"
             );
-            Some(origin)
+            vec![origin]
         }
-        None => state.config.allow_origin.as_deref(),
+        None => state.config.allow_origins.outbound_for(target_origin),
     }
 }
 
@@ -951,7 +960,19 @@ async fn dispatch(
     req: ControlRequest,
 ) -> Result<ResponseEnvelope, (StatusCode, String)> {
     let started = Instant::now();
-    auth::validate_outbound_url(&req.url, resolve_allow_origin(&req, state)).map_err(|_| {
+
+    // Resolve the target tab first: its connecting origin selects this request's
+    // per-origin outbound scope. Clone the sender + origin so the tab lock is
+    // released before the scope check and the await below.
+    let (sender, target_origin) = {
+        let tabs = state.lock_tabs();
+        let (conn_id, sender) = resolve_target(&tabs, req.target.as_deref())?;
+        let origin = tabs.get(&conn_id).and_then(|c| c.origin.clone());
+        (sender, origin)
+    };
+
+    let allowed = resolve_outbound(&req, state, target_origin.as_deref());
+    auth::validate_outbound_url(&req.url, &allowed).map_err(|_| {
         (
             StatusCode::FORBIDDEN,
             "outbound URL is cross-origin; pass --allow-origin to permit it".to_string(),
@@ -999,22 +1020,12 @@ async fn dispatch(
         }
     };
 
-    {
-        let tabs = state.lock_tabs();
-        let (_conn_id, sender) = match resolve_target(&tabs, req.target.as_deref()) {
-            Ok(t) => t,
-            Err(e) => {
-                state.correlator.remove(id);
-                return Err(e);
-            }
-        };
-        if sender.send(Message::Text(frame.into())).is_err() {
-            state.correlator.remove(id);
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no browser connected".to_string(),
-            ));
-        }
+    if sender.send(Message::Text(frame.into())).is_err() {
+        state.correlator.remove(id);
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no browser connected".to_string(),
+        ));
     }
 
     match tokio::time::timeout(state.config.request_timeout, rx).await {
@@ -1130,7 +1141,20 @@ async fn start_stream(
     req: ControlRequest,
 ) -> Result<(u16, BTreeMap<String, String>, StreamDriver), (StatusCode, String)> {
     let started = Instant::now();
-    auth::validate_outbound_url(&req.url, resolve_allow_origin(&req, state)).map_err(|_| {
+
+    // Resolve the target tab first: its connecting origin selects this request's
+    // per-origin outbound scope, and its id is retained to cancel the stream if
+    // the consumer goes away. Clone the sender + origin so the tab lock is
+    // released before the scope check and the awaits below.
+    let (conn_id, sender, target_origin) = {
+        let tabs = state.lock_tabs();
+        let (conn_id, sender) = resolve_target(&tabs, req.target.as_deref())?;
+        let origin = tabs.get(&conn_id).and_then(|c| c.origin.clone());
+        (conn_id, sender, origin)
+    };
+
+    let allowed = resolve_outbound(&req, state, target_origin.as_deref());
+    auth::validate_outbound_url(&req.url, &allowed).map_err(|_| {
         (
             StatusCode::FORBIDDEN,
             "outbound URL is cross-origin; pass --allow-origin to permit it".to_string(),
@@ -1178,24 +1202,13 @@ async fn start_stream(
         }
     };
 
-    let conn_id = {
-        let tabs = state.lock_tabs();
-        let (conn_id, sender) = match resolve_target(&tabs, req.target.as_deref()) {
-            Ok(t) => t,
-            Err(e) => {
-                state.correlator.remove(id);
-                return Err(e);
-            }
-        };
-        if sender.send(Message::Text(frame.into())).is_err() {
-            state.correlator.remove(id);
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no browser connected".to_string(),
-            ));
-        }
-        conn_id
-    };
+    if sender.send(Message::Text(frame.into())).is_err() {
+        state.correlator.remove(id);
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no browser connected".to_string(),
+        ));
+    }
 
     let idle = state.config.request_timeout;
     let (status, headers) = match tokio::time::timeout(idle, rx.recv()).await {
@@ -1568,7 +1581,7 @@ mod tests {
                 ws_port: 0,
                 control_port: 0,
                 request_timeout: Duration::from_secs(5),
-                allow_origin: None,
+                allow_origins: auth::OriginAllowlist::default(),
                 max_body_bytes: 1024,
                 max_concurrent: 8,
             }),
@@ -1607,77 +1620,84 @@ mod tests {
         }
     }
 
-    /// Builds a state whose `serve` global allow-origin is set, to prove a
-    /// per-request override wins over (and a missing one falls back to) it.
-    fn state_with_global_origin(global: Option<&str>) -> AppState {
+    /// Builds a state whose `serve` per-origin allowlist is set from
+    /// `--allow-origin` values, to exercise `resolve_outbound`.
+    fn state_with_allowlist(values: &[&str]) -> AppState {
         let mut state = test_state();
         let mut config = (*state.config).clone();
-        config.allow_origin = global.map(str::to_string);
+        config.allow_origins = auth::OriginAllowlist::parse(values).unwrap();
         state.config = Arc::new(config);
         state
     }
 
     #[test]
-    fn resolve_allow_origin_prefers_per_request_override() {
-        let state = state_with_global_origin(Some("https://global.test"));
+    fn resolve_outbound_prefers_per_request_override() {
+        let state = state_with_allowlist(&["https://grafana.internal"]);
         let req = ControlRequest {
             allow_origin: Some("https://per-request.test".to_string()),
             ..plain_request()
         };
-        // The per-request value wins over the serve global.
+        // The per-request value wins over the tab's per-origin grant.
         assert_eq!(
-            resolve_allow_origin(&req, &state),
-            Some("https://per-request.test")
+            resolve_outbound(&req, &state, Some("https://grafana.internal")),
+            vec!["https://per-request.test"]
         );
         // A request carrying the override permits its matched cross-origin
         // target, and still rejects an unmatched one.
+        let allowed = resolve_outbound(&req, &state, Some("https://grafana.internal"));
         assert_eq!(
-            auth::validate_outbound_url(
-                "https://per-request.test/x",
-                resolve_allow_origin(&req, &state)
-            ),
+            auth::validate_outbound_url("https://per-request.test/x", &allowed),
             Ok(())
         );
-        assert!(auth::validate_outbound_url(
-            "https://other.test/x",
-            resolve_allow_origin(&req, &state)
-        )
-        .is_err());
+        assert!(auth::validate_outbound_url("https://other.test/x", &allowed).is_err());
     }
 
     #[test]
-    fn resolve_allow_origin_falls_back_to_global() {
-        let state = state_with_global_origin(Some("https://global.test"));
+    fn resolve_outbound_uses_the_target_tabs_grant() {
+        let state = state_with_allowlist(&[
+            "https://grafana.internal",
+            "https://www.facebook.com=https://static.xx.fbcdn.net",
+        ]);
         let req = plain_request();
         assert!(req.allow_origin.is_none());
-        // With no per-request override, the serve global governs the scope.
+        // With no override, the target tab's connecting origin selects its scope.
         assert_eq!(
-            resolve_allow_origin(&req, &state),
-            Some("https://global.test")
+            resolve_outbound(&req, &state, Some("https://grafana.internal")),
+            vec!["https://grafana.internal"]
         );
+        assert_eq!(
+            resolve_outbound(&req, &state, Some("https://www.facebook.com")),
+            vec!["https://static.xx.fbcdn.net"]
+        );
+        // A tab with no grant gets an empty (default-closed) outbound set.
+        assert!(resolve_outbound(&req, &state, Some("https://other.test")).is_empty());
     }
 
     #[test]
-    fn per_request_override_does_not_affect_ws_origin_gate() {
+    fn per_request_override_does_not_affect_ws_connection_gate() {
         // The per-request override feeds only the outbound-URL check. The
-        // connection-time WS gate reads the `serve` global directly, so a tab on
-        // origin A stays connectable even when a request override permits B.
-        let state = state_with_global_origin(None);
+        // connection-time WS gate reads the allowlist directly, so a request
+        // override permitting B never widens which origins may connect.
+        let state = state_with_allowlist(&["https://a.test"]);
         let req = ControlRequest {
             allow_origin: Some("https://b.test".to_string()),
             ..plain_request()
         };
         // Outbound to B is permitted by the override...
+        let allowed = resolve_outbound(&req, &state, Some("https://a.test"));
         assert_eq!(
-            auth::validate_outbound_url("https://b.test/x", resolve_allow_origin(&req, &state)),
+            auth::validate_outbound_url("https://b.test/x", &allowed),
             Ok(())
         );
-        // ...while the WS upgrade gate (serve global = None) still admits any
-        // origin, unchanged by the per-request value.
-        assert!(auth::ws_origin_allowed(
-            Some("https://a.test"),
-            state.config.allow_origin.as_deref()
-        ));
+        // ...while the WS upgrade gate admits A (a configured key) but not B.
+        assert!(state
+            .config
+            .allow_origins
+            .permits_connection(Some("https://a.test")));
+        assert!(!state
+            .config
+            .allow_origins
+            .permits_connection(Some("https://b.test")));
     }
 
     #[tokio::test]
@@ -1847,7 +1867,7 @@ mod tests {
             ws_port: 0,
             control_port: 0,
             request_timeout: Duration::from_secs(5),
-            allow_origin: None,
+            allow_origins: auth::OriginAllowlist::default(),
             max_body_bytes: 1024,
             max_concurrent: 8,
         }
