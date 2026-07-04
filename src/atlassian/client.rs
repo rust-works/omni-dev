@@ -5766,11 +5766,7 @@ impl AtlassianClient {
     pub async fn get_bytes(&self, url: &str) -> Result<Vec<u8>> {
         let response = self.get_json_raw_accept(url, "*/*").await?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
+        let response = Self::ensure_success(response).await?;
 
         let bytes = response
             .bytes()
@@ -5832,6 +5828,36 @@ impl AtlassianClient {
         .context("Failed to send GET request to Atlassian API")
     }
 
+    /// Returns `response` unchanged if its status is a success, otherwise reads
+    /// the body and fails with [`AtlassianError::ApiRequestFailed`].
+    ///
+    /// Centralises the "check status → read body → build error" block copied
+    /// after nearly every request. Call sites that need bespoke diagnostics for
+    /// specific status codes (e.g. `jira_write_error`, `confluence_write_error`)
+    /// build their error directly instead of using this helper.
+    pub(crate) async fn ensure_success(response: reqwest::Response) -> Result<reqwest::Response> {
+        if response.status().is_success() {
+            return Ok(response);
+        }
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        Err(AtlassianError::ApiRequestFailed { status, body }.into())
+    }
+
+    /// Deserialises `response`'s JSON body into `T`, attaching `context` on
+    /// failure.
+    ///
+    /// Pairs with [`Self::ensure_success`]; the common
+    /// `Self::parse_json(Self::ensure_success(resp).await?, "…").await?`
+    /// spelling replaces the hand-copied status-check + `json().context(…)`
+    /// block.
+    pub(crate) async fn parse_json<T: serde::de::DeserializeOwned>(
+        response: reqwest::Response,
+        context: &'static str,
+    ) -> Result<T> {
+        response.json().await.context(context)
+    }
+
     /// Fetches a JIRA issue by key with only the standard fields.
     ///
     /// Thin shim over [`Self::get_issue_with_fields`] with
@@ -5885,16 +5911,11 @@ impl AtlassianClient {
             .await
             .context("Failed to send request to JIRA API")?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-
-        let envelope: JiraIssueEnvelope = response
-            .json()
-            .await
-            .context("Failed to parse JIRA issue response")?;
+        let envelope: JiraIssueEnvelope = Self::parse_json(
+            Self::ensure_success(response).await?,
+            "Failed to parse JIRA issue response",
+        )
+        .await?;
 
         Ok(envelope.into_issue(&selection))
     }
@@ -5995,16 +6016,11 @@ impl AtlassianClient {
             .await
             .context("Failed to send editmeta request to JIRA API")?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-
-        let raw: JiraEditMetaResponse = response
-            .json()
-            .await
-            .context("Failed to parse JIRA editmeta response")?;
+        let raw: JiraEditMetaResponse = Self::parse_json(
+            Self::ensure_success(response).await?,
+            "Failed to parse JIRA editmeta response",
+        )
+        .await?;
 
         let fields = raw
             .fields
@@ -6141,16 +6157,11 @@ impl AtlassianClient {
             .await
             .context("Failed to send createmeta request to JIRA API")?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-
-        let raw: JiraCreateMetaResponse = response
-            .json()
-            .await
-            .context("Failed to parse JIRA createmeta response")?;
+        let raw: JiraCreateMetaResponse = Self::parse_json(
+            Self::ensure_success(response).await?,
+            "Failed to parse JIRA createmeta response",
+        )
+        .await?;
 
         let Some(project) = raw.projects.into_iter().next() else {
             return Ok(EditMeta::default());
@@ -6208,16 +6219,11 @@ impl AtlassianClient {
             .await
             .context("Failed to send createmeta request to JIRA API")?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-
-        let raw: JiraCreateMetaFullResponse = response
-            .json()
-            .await
-            .context("Failed to parse JIRA createmeta response")?;
+        let raw: JiraCreateMetaFullResponse = Self::parse_json(
+            Self::ensure_success(response).await?,
+            "Failed to parse JIRA createmeta response",
+        )
+        .await?;
 
         let mut fields: Vec<CreateMetaField> = raw
             .projects
@@ -6288,16 +6294,11 @@ impl AtlassianClient {
 
             let response = self.get_json(&url).await?;
 
-            if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let body = response.text().await.unwrap_or_default();
-                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-            }
-
-            let resp: JiraCommentsResponse = response
-                .json()
-                .await
-                .context("Failed to parse comments response")?;
+            let resp: JiraCommentsResponse = Self::parse_json(
+                Self::ensure_success(response).await?,
+                "Failed to parse comments response",
+            )
+            .await?;
 
             let page_count = resp.comments.len() as u32;
             for c in resp.comments {
@@ -6335,11 +6336,7 @@ impl AtlassianClient {
 
         let response = self.post_json(&url, &body).await?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
+        Self::ensure_success(response).await?;
 
         Ok(())
     }
@@ -6370,16 +6367,11 @@ impl AtlassianClient {
 
         let response = self.put_json(&url, &body).await?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-
-        let entry: JiraCommentEntry = response
-            .json()
-            .await
-            .context("Failed to parse updated comment response")?;
+        let entry: JiraCommentEntry = Self::parse_json(
+            Self::ensure_success(response).await?,
+            "Failed to parse updated comment response",
+        )
+        .await?;
 
         Ok(JiraComment {
             id: entry.id,
@@ -6405,16 +6397,11 @@ impl AtlassianClient {
 
         let response = self.get_json(&url).await?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-
-        let resp: JiraWorklogResponse = response
-            .json()
-            .await
-            .context("Failed to parse worklog response")?;
+        let resp: JiraWorklogResponse = Self::parse_json(
+            Self::ensure_success(response).await?,
+            "Failed to parse worklog response",
+        )
+        .await?;
 
         let worklogs: Vec<JiraWorklog> = resp
             .worklogs
@@ -6470,11 +6457,7 @@ impl AtlassianClient {
 
         let response = self.post_json(&url, &body).await?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
+        Self::ensure_success(response).await?;
 
         Ok(())
     }
@@ -6498,16 +6481,11 @@ impl AtlassianClient {
 
         let response = self.get_json(&url).await?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-
-        let resp: JiraTransitionsResponse = response
-            .json()
-            .await
-            .context("Failed to parse transitions response")?;
+        let resp: JiraTransitionsResponse = Self::parse_json(
+            Self::ensure_success(response).await?,
+            "Failed to parse transitions response",
+        )
+        .await?;
 
         Ok(resp
             .transitions
@@ -6535,11 +6513,7 @@ impl AtlassianClient {
 
         let response = self.post_json(&url, &body).await?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
+        Self::ensure_success(response).await?;
 
         Ok(())
     }
@@ -6574,16 +6548,11 @@ impl AtlassianClient {
                 .await
                 .context("Failed to send search request to JIRA API")?;
 
-            if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let body = response.text().await.unwrap_or_default();
-                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-            }
-
-            let page: JiraSearchResponse = response
-                .json()
-                .await
-                .context("Failed to parse JIRA search response")?;
+            let page: JiraSearchResponse = Self::parse_json(
+                Self::ensure_success(response).await?,
+                "Failed to parse JIRA search response",
+            )
+            .await?;
 
             let page_count = page.issues.len();
             for r in page.issues {
@@ -6644,16 +6613,11 @@ impl AtlassianClient {
 
             let response = self.get_json(url.as_str()).await?;
 
-            if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let body = response.text().await.unwrap_or_default();
-                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-            }
-
-            let resp: ConfluenceContentSearchResponse = response
-                .json()
-                .await
-                .context("Failed to parse Confluence search response")?;
+            let resp: ConfluenceContentSearchResponse = Self::parse_json(
+                Self::ensure_success(response).await?,
+                "Failed to parse Confluence search response",
+            )
+            .await?;
 
             let page_count = resp.results.len() as u32;
             for r in resp.results {
@@ -6723,16 +6687,11 @@ impl AtlassianClient {
 
             let response = self.get_json(url.as_str()).await?;
 
-            if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let body = response.text().await.unwrap_or_default();
-                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-            }
-
-            let page: Vec<JiraUserSearchEntry> = response
-                .json()
-                .await
-                .context("Failed to parse JIRA user search response")?;
+            let page: Vec<JiraUserSearchEntry> = Self::parse_json(
+                Self::ensure_success(response).await?,
+                "Failed to parse JIRA user search response",
+            )
+            .await?;
 
             let page_count = page.len() as u32;
             for entry in page {
@@ -6792,16 +6751,11 @@ impl AtlassianClient {
 
             let response = self.get_json(url.as_str()).await?;
 
-            if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let body = response.text().await.unwrap_or_default();
-                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-            }
-
-            let resp: ConfluenceUserSearchResponse = response
-                .json()
-                .await
-                .context("Failed to parse Confluence user search response")?;
+            let resp: ConfluenceUserSearchResponse = Self::parse_json(
+                Self::ensure_success(response).await?,
+                "Failed to parse Confluence user search response",
+            )
+            .await?;
 
             let page_count = resp.results.len() as u32;
             for r in resp.results {
@@ -6985,16 +6939,11 @@ impl AtlassianClient {
 
             let response = self.get_json(&url).await?;
 
-            if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let body = response.text().await.unwrap_or_default();
-                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-            }
-
-            let resp: AgileBoardListResponse = response
-                .json()
-                .await
-                .context("Failed to parse board list response")?;
+            let resp: AgileBoardListResponse = Self::parse_json(
+                Self::ensure_success(response).await?,
+                "Failed to parse board list response",
+            )
+            .await?;
 
             let page_count = resp.values.len() as u32;
             for b in resp.values {
@@ -7056,16 +7005,11 @@ impl AtlassianClient {
 
             let response = self.get_json(url.as_str()).await?;
 
-            if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let body = response.text().await.unwrap_or_default();
-                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-            }
-
-            let resp: AgileIssueListResponse = response
-                .json()
-                .await
-                .context("Failed to parse board issues response")?;
+            let resp: AgileIssueListResponse = Self::parse_json(
+                Self::ensure_success(response).await?,
+                "Failed to parse board issues response",
+            )
+            .await?;
 
             let page_count = resp.issues.len() as u32;
             for r in resp.issues {
@@ -7123,16 +7067,11 @@ impl AtlassianClient {
 
             let response = self.get_json(&url).await?;
 
-            if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let body = response.text().await.unwrap_or_default();
-                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-            }
-
-            let resp: AgileSprintListResponse = response
-                .json()
-                .await
-                .context("Failed to parse sprint list response")?;
+            let resp: AgileSprintListResponse = Self::parse_json(
+                Self::ensure_success(response).await?,
+                "Failed to parse sprint list response",
+            )
+            .await?;
 
             let page_count = resp.values.len() as u32;
             for s in resp.values {
@@ -7196,16 +7135,11 @@ impl AtlassianClient {
 
             let response = self.get_json(url.as_str()).await?;
 
-            if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let body = response.text().await.unwrap_or_default();
-                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-            }
-
-            let resp: AgileIssueListResponse = response
-                .json()
-                .await
-                .context("Failed to parse sprint issues response")?;
+            let resp: AgileIssueListResponse = Self::parse_json(
+                Self::ensure_success(response).await?,
+                "Failed to parse sprint issues response",
+            )
+            .await?;
 
             let page_count = resp.issues.len() as u32;
             for r in resp.issues {
@@ -7246,11 +7180,7 @@ impl AtlassianClient {
 
         let response = self.post_json(&url, &body).await?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
+        Self::ensure_success(response).await?;
 
         Ok(())
     }
@@ -7282,16 +7212,11 @@ impl AtlassianClient {
 
         let response = self.post_json(&url, &body).await?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-
-        let entry: AgileSprintEntry = response
-            .json()
-            .await
-            .context("Failed to parse sprint create response")?;
+        let entry: AgileSprintEntry = Self::parse_json(
+            Self::ensure_success(response).await?,
+            "Failed to parse sprint create response",
+        )
+        .await?;
 
         Ok(AgileSprint {
             id: entry.id,
@@ -7345,11 +7270,7 @@ impl AtlassianClient {
             .put_json(&url, &serde_json::Value::Object(body))
             .await?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
+        Self::ensure_success(response).await?;
 
         Ok(())
     }
@@ -7372,16 +7293,11 @@ impl AtlassianClient {
 
         let response = self.get_json(&url).await?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-
-        let entries: Vec<JiraProjectVersionEntry> = response
-            .json()
-            .await
-            .context("Failed to parse project versions response")?;
+        let entries: Vec<JiraProjectVersionEntry> = Self::parse_json(
+            Self::ensure_success(response).await?,
+            "Failed to parse project versions response",
+        )
+        .await?;
 
         let versions: Vec<JiraProjectVersion> = entries
             .into_iter()
@@ -7442,16 +7358,11 @@ impl AtlassianClient {
 
         let response = self.post_json(&url, &body).await?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-
-        let entry: JiraProjectVersionEntry = response
-            .json()
-            .await
-            .context("Failed to parse version create response")?;
+        let entry: JiraProjectVersionEntry = Self::parse_json(
+            Self::ensure_success(response).await?,
+            "Failed to parse version create response",
+        )
+        .await?;
 
         Ok(JiraProjectVersion {
             id: entry.id,
@@ -7474,16 +7385,11 @@ impl AtlassianClient {
 
         let response = self.get_json(&url).await?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-
-        let resp: JiraIssueLinksResponse = response
-            .json()
-            .await
-            .context("Failed to parse issue links response")?;
+        let resp: JiraIssueLinksResponse = Self::parse_json(
+            Self::ensure_success(response).await?,
+            "Failed to parse issue links response",
+        )
+        .await?;
 
         let mut links = Vec::new();
         for entry in resp.fields.issuelinks {
@@ -7522,16 +7428,11 @@ impl AtlassianClient {
 
         let response = self.get_json(&url).await?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-
-        let entries: Vec<JiraRemoteIssueLinkEntry> = response
-            .json()
-            .await
-            .context("Failed to parse remote issue links response")?;
+        let entries: Vec<JiraRemoteIssueLinkEntry> = Self::parse_json(
+            Self::ensure_success(response).await?,
+            "Failed to parse remote issue links response",
+        )
+        .await?;
 
         let mut links = Vec::with_capacity(entries.len());
         for entry in entries {
@@ -7568,15 +7469,11 @@ impl AtlassianClient {
     pub async fn get_link_types(&self) -> Result<Vec<JiraLinkType>> {
         let url = format!("{}/rest/api/3/issueLinkType", self.instance_url);
         let response = self.get_json(&url).await?;
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-        let resp: JiraLinkTypesResponse = response
-            .json()
-            .await
-            .context("Failed to parse link types response")?;
+        let resp: JiraLinkTypesResponse = Self::parse_json(
+            Self::ensure_success(response).await?,
+            "Failed to parse link types response",
+        )
+        .await?;
         Ok(resp
             .issue_link_types
             .into_iter()
@@ -7599,11 +7496,7 @@ impl AtlassianClient {
         let url = format!("{}/rest/api/3/issueLink", self.instance_url);
         let body = serde_json::json!({"type": {"name": type_name}, "inwardIssue": {"key": inward_key}, "outwardIssue": {"key": outward_key}});
         let response = self.post_json(&url, &body).await?;
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
+        Self::ensure_success(response).await?;
         Ok(())
     }
 
@@ -7611,11 +7504,7 @@ impl AtlassianClient {
     pub async fn remove_issue_link(&self, link_id: &str) -> Result<()> {
         let url = format!("{}/rest/api/3/issueLink/{}", self.instance_url, link_id);
         let response = self.delete(&url).await?;
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
+        Self::ensure_success(response).await?;
         Ok(())
     }
 
@@ -7626,11 +7515,7 @@ impl AtlassianClient {
         let url = format!("{}/rest/api/3/issue/{}", self.instance_url, issue_key);
         let body = serde_json::json!({"fields": {"parent": {"key": parent_key}}});
         let response = self.put_json(&url, &body).await?;
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
+        Self::ensure_success(response).await?;
         Ok(())
     }
 
@@ -7638,15 +7523,11 @@ impl AtlassianClient {
     pub async fn get_issue_id(&self, key: &str) -> Result<String> {
         let url = format!("{}/rest/api/3/issue/{}?fields=", self.instance_url, key);
         let response = self.get_json(&url).await?;
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-        let resp: JiraIssueIdResponse = response
-            .json()
-            .await
-            .context("Failed to parse issue ID response")?;
+        let resp: JiraIssueIdResponse = Self::parse_json(
+            Self::ensure_success(response).await?,
+            "Failed to parse issue ID response",
+        )
+        .await?;
         Ok(resp.id)
     }
 
@@ -7662,15 +7543,11 @@ impl AtlassianClient {
             self.instance_url, issue_id
         );
         let response = self.get_json(&url).await?;
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-        let resp: DevStatusSummaryResponse = response
-            .json()
-            .await
-            .context("Failed to parse DevStatus summary response")?;
+        let resp: DevStatusSummaryResponse = Self::parse_json(
+            Self::ensure_success(response).await?,
+            "Failed to parse DevStatus summary response",
+        )
+        .await?;
 
         fn extract_count(cat: Option<DevStatusSummaryCategory>) -> JiraDevStatusCount {
             match cat {
@@ -7771,20 +7648,11 @@ impl AtlassianClient {
                     self.instance_url, issue_id, app, dt
                 );
                 let response = self.get_json(&url).await?;
-                if !response.status().is_success() {
-                    let http_status = response.status().as_u16();
-                    let body = response.text().await.unwrap_or_default();
-                    return Err(AtlassianError::ApiRequestFailed {
-                        status: http_status,
-                        body,
-                    }
-                    .into());
-                }
-
-                let resp: DevStatusResponse = response
-                    .json()
-                    .await
-                    .context("Failed to parse DevStatus response")?;
+                let resp: DevStatusResponse = Self::parse_json(
+                    Self::ensure_success(response).await?,
+                    "Failed to parse DevStatus response",
+                )
+                .await?;
 
                 for detail in resp.detail {
                     for pr in detail.pull_requests {
@@ -7851,16 +7719,11 @@ impl AtlassianClient {
 
         let response = self.get_json(&url).await?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-
-        let resp: JiraAttachmentIssueResponse = response
-            .json()
-            .await
-            .context("Failed to parse attachment response")?;
+        let resp: JiraAttachmentIssueResponse = Self::parse_json(
+            Self::ensure_success(response).await?,
+            "Failed to parse attachment response",
+        )
+        .await?;
 
         Ok(resp
             .fields
@@ -7896,16 +7759,11 @@ impl AtlassianClient {
 
             let response = self.get_json(&url).await?;
 
-            if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let body = response.text().await.unwrap_or_default();
-                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-            }
-
-            let resp: JiraChangelogResponse = response
-                .json()
-                .await
-                .context("Failed to parse changelog response")?;
+            let resp: JiraChangelogResponse = Self::parse_json(
+                Self::ensure_success(response).await?,
+                "Failed to parse changelog response",
+            )
+            .await?;
 
             let page_count = resp.values.len() as u32;
             for e in resp.values {
@@ -7940,16 +7798,11 @@ impl AtlassianClient {
 
         let response = self.get_json(&url).await?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-
-        let entries: Vec<JiraFieldEntry> = response
-            .json()
-            .await
-            .context("Failed to parse field list response")?;
+        let entries: Vec<JiraFieldEntry> = Self::parse_json(
+            Self::ensure_success(response).await?,
+            "Failed to parse field list response",
+        )
+        .await?;
 
         Ok(entries
             .into_iter()
@@ -7979,16 +7832,11 @@ impl AtlassianClient {
 
         let response = self.get_json(&url).await?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-
-        let resp: JiraFieldContextsResponse = response
-            .json()
-            .await
-            .context("Failed to parse field contexts response")?;
+        let resp: JiraFieldContextsResponse = Self::parse_json(
+            Self::ensure_success(response).await?,
+            "Failed to parse field contexts response",
+        )
+        .await?;
 
         Ok(resp.values.into_iter().map(|c| c.id).collect())
     }
@@ -8020,16 +7868,11 @@ impl AtlassianClient {
 
         let response = self.get_json(&url).await?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-
-        let resp: JiraFieldOptionsResponse = response
-            .json()
-            .await
-            .context("Failed to parse field options response")?;
+        let resp: JiraFieldOptionsResponse = Self::parse_json(
+            Self::ensure_success(response).await?,
+            "Failed to parse field options response",
+        )
+        .await?;
 
         Ok(resp
             .values
@@ -8061,16 +7904,11 @@ impl AtlassianClient {
 
             let response = self.get_json(&url).await?;
 
-            if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let body = response.text().await.unwrap_or_default();
-                return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-            }
-
-            let resp: JiraProjectSearchResponse = response
-                .json()
-                .await
-                .context("Failed to parse project search response")?;
+            let resp: JiraProjectSearchResponse = Self::parse_json(
+                Self::ensure_success(response).await?,
+                "Failed to parse project search response",
+            )
+            .await?;
 
             let page_count = resp.values.len() as u32;
             for p in resp.values {
@@ -8102,11 +7940,7 @@ impl AtlassianClient {
 
         let response = self.delete(&url).await?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
+        Self::ensure_success(response).await?;
 
         Ok(())
     }
@@ -8117,16 +7951,11 @@ impl AtlassianClient {
 
         let response = self.get_json(&url).await?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
-
-        let json: serde_json::Value = response
-            .json()
-            .await
-            .context("Failed to parse watchers response")?;
+        let json: serde_json::Value = Self::parse_json(
+            Self::ensure_success(response).await?,
+            "Failed to parse watchers response",
+        )
+        .await?;
 
         let watch_count = json["watchCount"].as_u64().unwrap_or(0) as u32;
 
@@ -8153,11 +7982,7 @@ impl AtlassianClient {
 
         let response = self.post_json(&url, &body).await?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
+        Self::ensure_success(response).await?;
 
         Ok(())
     }
@@ -8171,11 +7996,7 @@ impl AtlassianClient {
 
         let response = self.delete(&url).await?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
+        Self::ensure_success(response).await?;
 
         Ok(())
     }
@@ -8193,11 +8014,7 @@ impl AtlassianClient {
             .await
             .context("Failed to send request to JIRA API")?;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AtlassianError::ApiRequestFailed { status, body }.into());
-        }
+        let response = Self::ensure_success(response).await?;
 
         response
             .json()

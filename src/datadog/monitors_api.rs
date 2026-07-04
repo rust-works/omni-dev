@@ -7,7 +7,7 @@
 //!
 //! [#619]: https://github.com/rust-works/omni-dev/issues/619
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use url::Url;
 
 use crate::datadog::client::DatadogClient;
@@ -68,14 +68,10 @@ impl<'a> MonitorsApi<'a> {
             let remaining = cap - out.len();
             let page_size = remaining.min(LIST_PAGE_SIZE);
             let url = build_list_url(self.client.base_url(), filter, page, page_size)?;
-            let response = self.client.get_json(url.as_str()).await?;
-            if !response.status().is_success() {
-                return Err(DatadogClient::response_to_error(response).await.into());
-            }
-            let batch: Vec<Monitor> = response
-                .json()
-                .await
-                .context("Failed to parse /api/v1/monitor response")?;
+            let batch: Vec<Monitor> = self
+                .client
+                .get_parsed(url.as_str(), "Failed to parse /api/v1/monitor response")
+                .await?;
             let exhausted = batch.len() < page_size;
             out.extend(batch);
             if out.len() >= cap || exhausted {
@@ -90,14 +86,12 @@ impl<'a> MonitorsApi<'a> {
     /// Fetches a single monitor by id.
     pub async fn get(&self, id: i64) -> Result<Monitor> {
         let url = build_get_url(self.client.base_url(), id)?;
-        let response = self.client.get_json(url.as_str()).await?;
-        if !response.status().is_success() {
-            return Err(DatadogClient::response_to_error(response).await.into());
-        }
-        response
-            .json::<Monitor>()
+        self.client
+            .get_parsed(
+                url.as_str(),
+                "Failed to parse /api/v1/monitor/<id> response",
+            )
             .await
-            .context("Failed to parse /api/v1/monitor/<id> response")
     }
 
     /// Searches monitors against the free-text / faceted query string,
@@ -116,14 +110,13 @@ impl<'a> MonitorsApi<'a> {
             let remaining = cap - collected;
             let per_page = remaining.min(SEARCH_PAGE_SIZE);
             let url = build_search_url(self.client.base_url(), query, page, per_page)?;
-            let response = self.client.get_json(url.as_str()).await?;
-            if !response.status().is_success() {
-                return Err(DatadogClient::response_to_error(response).await.into());
-            }
-            let batch: MonitorSearchResult = response
-                .json()
-                .await
-                .context("Failed to parse /api/v1/monitor/search response")?;
+            let batch: MonitorSearchResult = self
+                .client
+                .get_parsed(
+                    url.as_str(),
+                    "Failed to parse /api/v1/monitor/search response",
+                )
+                .await?;
             let batch_len = batch.monitors.len();
             let page_count = batch.metadata.as_ref().and_then(|m| m.page_count);
             let exhausted_by_size = batch_len < per_page;
@@ -163,8 +156,7 @@ fn build_list_url(
     page: u32,
     page_size: usize,
 ) -> Result<Url> {
-    let mut url =
-        Url::parse(&format!("{base_url}/api/v1/monitor")).context("Invalid Datadog base URL")?;
+    let mut url = DatadogClient::api_url(base_url, "/api/v1/monitor")?;
     {
         let mut q = url.query_pairs_mut();
         if let Some(name) = filter.name.as_deref() {
@@ -184,13 +176,12 @@ fn build_list_url(
 
 /// Builds `{base_url}/api/v1/monitor/{id}`.
 fn build_get_url(base_url: &str, id: i64) -> Result<Url> {
-    Url::parse(&format!("{base_url}/api/v1/monitor/{id}")).context("Invalid Datadog base URL")
+    DatadogClient::api_url(base_url, &format!("/api/v1/monitor/{id}"))
 }
 
 /// Builds `{base_url}/api/v1/monitor/search?query=…&page=…&per_page=…`.
 fn build_search_url(base_url: &str, query: &str, page: u32, per_page: usize) -> Result<Url> {
-    let mut url = Url::parse(&format!("{base_url}/api/v1/monitor/search"))
-        .context("Invalid Datadog base URL")?;
+    let mut url = DatadogClient::api_url(base_url, "/api/v1/monitor/search")?;
     url.query_pairs_mut()
         .append_pair("query", query)
         .append_pair("page", &page.to_string())

@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 use reqwest::Client;
+use url::Url;
 
 use crate::datadog::auth::{base_url_for_site, DatadogCredentials};
 use crate::datadog::error::DatadogError;
@@ -76,6 +77,49 @@ impl DatadogClient {
     #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// Builds an absolute API URL by joining `path` onto `base_url`.
+    ///
+    /// `path` is the full path portion including the leading `/api/…` segment
+    /// (the version varies: `/api/v1/…`, `/api/v2/…`). Centralises the
+    /// `Url::parse(…).context("Invalid Datadog base URL")` spelling repeated
+    /// across the `*_api.rs` modules. Takes `base_url` (rather than `&self`) so
+    /// the free `build_*_url` functions — and their unit tests, which pass
+    /// literal base URLs — can call it unchanged.
+    pub(crate) fn api_url(base_url: &str, path: &str) -> Result<Url> {
+        Url::parse(&format!("{base_url}{path}")).context("Invalid Datadog base URL")
+    }
+
+    /// Checks `response` for success and deserialises its JSON body into `T`.
+    ///
+    /// Non-success responses become a [`DatadogError`] via
+    /// [`Self::response_to_error`] (preserving the 429 rate-limit summary); on
+    /// success the body is parsed with `context` attached on failure. Used by
+    /// the paginated and POST call sites that already hold a response;
+    /// single-shot GETs use [`Self::get_parsed`].
+    pub(crate) async fn parse_response<T: serde::de::DeserializeOwned>(
+        &self,
+        response: reqwest::Response,
+        context: &'static str,
+    ) -> Result<T> {
+        if !response.status().is_success() {
+            return Err(Self::response_to_error(response).await.into());
+        }
+        response.json().await.context(context)
+    }
+
+    /// Sends an authenticated GET and deserialises the JSON body into `T`.
+    ///
+    /// Convenience wrapper over [`Self::get_json`] + [`Self::parse_response`]
+    /// for the common single-request GET-then-parse pattern.
+    pub(crate) async fn get_parsed<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        context: &'static str,
+    ) -> Result<T> {
+        let response = self.get_json(url).await?;
+        self.parse_response(response, context).await
     }
 
     /// Sends an authenticated GET request and returns the raw response.

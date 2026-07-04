@@ -11,7 +11,7 @@
 //!
 //! [`MonitorsApi::list`]: crate::datadog::monitors_api::MonitorsApi::list
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use url::Url;
 
 use crate::datadog::client::DatadogClient;
@@ -75,14 +75,9 @@ impl<'a> EventsApi<'a> {
             ));
         }
         let url = build_list_url(self.client.base_url(), filter, from, to, limit, after)?;
-        let response = self.client.get_json(url.as_str()).await?;
-        if !response.status().is_success() {
-            return Err(DatadogClient::response_to_error(response).await.into());
-        }
-        response
-            .json::<EventsResponse>()
+        self.client
+            .get_parsed(url.as_str(), "Failed to parse /api/v2/events response")
             .await
-            .context("Failed to parse /api/v2/events response")
     }
 
     /// Lists events, auto-paginating via cursor as needed.
@@ -162,8 +157,7 @@ fn build_list_url(
     limit: usize,
     after: Option<&str>,
 ) -> Result<Url> {
-    let mut url =
-        Url::parse(&format!("{base_url}/api/v2/events")).context("Invalid Datadog base URL")?;
+    let mut url = DatadogClient::api_url(base_url, "/api/v2/events")?;
     {
         let mut q = url.query_pairs_mut();
         if let Some(query) = filter.query.as_deref() {
