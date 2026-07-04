@@ -40,6 +40,19 @@ async fn start_bridge_with(
     timeout: Duration,
     max_body_bytes: usize,
 ) -> (u16, u16, String) {
+    let allow_origins =
+        browser::auth::OriginAllowlist::parse(&allow_origin.into_iter().collect::<Vec<_>>())
+            .expect("valid --allow-origin in test");
+    start_bridge_allowlist(allow_origins, timeout, max_body_bytes).await
+}
+
+/// Boots a bridge from a prebuilt per-origin allowlist, so tests can exercise
+/// multiple `--allow-origin` grants at once.
+async fn start_bridge_allowlist(
+    allow_origins: browser::auth::OriginAllowlist,
+    timeout: Duration,
+    max_body_bytes: usize,
+) -> (u16, u16, String) {
     let token = "test-token-abcdef".to_string();
 
     // The reserve→drop→rebind dance below has an inherent race: between dropping a
@@ -62,7 +75,7 @@ async fn start_bridge_with(
             ws_port,
             control_port,
             request_timeout: timeout,
-            allow_origin: allow_origin.clone(),
+            allow_origins: allow_origins.clone(),
             max_body_bytes,
             max_concurrent: 64,
         };
@@ -1346,6 +1359,94 @@ async fn route_by_origin_selects_the_right_tab() {
         .unwrap();
     let env: Value = resp.json().await.unwrap();
     assert_eq!(env["body"], "tab:B:/p");
+}
+
+/// POSTs a request targeted at `target` for `url` and returns the HTTP status.
+async fn targeted_scope_status(
+    http: &reqwest::Client,
+    base: &str,
+    tok: &str,
+    target: &str,
+    url: &str,
+) -> u16 {
+    http.post(format!("{base}/__bridge/request"))
+        .bearer_auth(tok)
+        .header("x-omni-bridge", "1")
+        .json(&serde_json::json!({"url": url, "method": "GET", "target": target}))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+/// The per-origin allowlist (#1185): each connected tab carries only its own
+/// outbound grant, so a request routed to the Grafana tab cannot reach the scope
+/// granted to the Facebook tab, and vice versa.
+#[tokio::test]
+async fn per_origin_allowlist_isolates_outbound_scope() {
+    let allow = browser::auth::OriginAllowlist::parse(&[
+        "https://grafana.internal",
+        "https://www.facebook.com=https://static.xx.fbcdn.net",
+    ])
+    .unwrap();
+    let (control_port, ws_port, token) =
+        start_bridge_allowlist(allow, Duration::from_secs(5), 1024 * 1024).await;
+    let _g = FakeBrowser::connect_tagged(ws_port, &token, "https://grafana.internal", "G").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _f = FakeBrowser::connect_tagged(ws_port, &token, "https://www.facebook.com", "F").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (http, base, tok) = client(control_port, &token);
+
+    // Grafana tab may reach its own origin, but NOT Facebook's outbound scope.
+    let g = "https://grafana.internal";
+    let fbcdn = "https://static.xx.fbcdn.net";
+    assert_eq!(
+        targeted_scope_status(&http, &base, &tok, g, &format!("{g}/api")).await,
+        200
+    );
+    assert_eq!(
+        targeted_scope_status(&http, &base, &tok, g, &format!("{fbcdn}/x")).await,
+        403
+    );
+    // Facebook tab may reach fbcdn, but NOT Grafana's origin.
+    let fb = "https://www.facebook.com";
+    assert_eq!(
+        targeted_scope_status(&http, &base, &tok, fb, &format!("{fbcdn}/x")).await,
+        200
+    );
+    assert_eq!(
+        targeted_scope_status(&http, &base, &tok, fb, &format!("{g}/api")).await,
+        403
+    );
+}
+
+/// With a per-origin allowlist configured, a tab connecting from an origin that
+/// is not a configured key is rejected at the WebSocket upgrade; a configured
+/// key connects (#1185).
+#[tokio::test]
+async fn per_origin_gate_rejects_unconfigured_connecting_origin() {
+    let allow = browser::auth::OriginAllowlist::parse(&["https://ok.test"]).unwrap();
+    let (_control_port, ws_port, token) =
+        start_bridge_allowlist(allow, Duration::from_secs(5), 1024 * 1024).await;
+    let uri: tokio_tungstenite::tungstenite::http::Uri =
+        format!("ws://127.0.0.1:{ws_port}/").parse().unwrap();
+
+    let good = ClientRequestBuilder::new(uri.clone())
+        .with_sub_protocol(&token)
+        .with_header("Origin", "https://ok.test");
+    assert!(
+        tokio_tungstenite::connect_async(good).await.is_ok(),
+        "a configured connecting origin must be admitted"
+    );
+
+    let bad = ClientRequestBuilder::new(uri)
+        .with_sub_protocol(&token)
+        .with_header("Origin", "https://evil.test");
+    assert!(
+        tokio_tungstenite::connect_async(bad).await.is_err(),
+        "an unconfigured connecting origin must be rejected at upgrade"
+    );
 }
 
 /// A request targeted by connection id (read from status) routes to that tab,
