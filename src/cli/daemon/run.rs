@@ -35,10 +35,11 @@ pub struct RunCommand {
     #[arg(long, default_value_t = DEFAULT_CONTROL_PORT)]
     pub bridge_control_port: u16,
 
-    /// Permit this cross-origin for the bridge's WebSocket upgrade and outbound
-    /// URLs (the bridge's `--allow-origin`).
-    #[arg(long, value_name = "URL")]
-    pub bridge_allow_origin: Option<String>,
+    /// Permit a cross-origin for the bridge's WebSocket upgrade and outbound
+    /// URLs (the bridge's `--allow-origin`). Repeatable and scoped per connecting
+    /// tab: a bare `ORIGIN`, or a `CONNECT=OUTBOUND` mapping.
+    #[arg(long, value_name = "URL[=URL]")]
+    pub bridge_allow_origin: Vec<String>,
 
     /// Read the bridge session token from this `0600` file instead of
     /// generating one.
@@ -63,10 +64,12 @@ impl RunCommand {
     pub fn into_run_config(self) -> Result<DaemonRunConfig> {
         let socket_path = server::resolve_socket(self.socket)?;
         let bridge_token_path = paths::token_path_for_socket(&socket_path);
+        let allow_origins = crate::browser::auth::OriginAllowlist::parse(&self.bridge_allow_origin)
+            .map_err(|e| anyhow::anyhow!("invalid --bridge-allow-origin: {e}"))?;
         let bridge_config = BridgeConfig {
             ws_port: self.bridge_ws_port,
             control_port: self.bridge_control_port,
-            allow_origin: self.bridge_allow_origin,
+            allow_origins,
             ..BridgeConfig::default()
         };
         Ok(DaemonRunConfig {
