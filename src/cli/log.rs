@@ -36,9 +36,14 @@ pub struct LogCommand {
     /// Subcommand; when absent, the flags below search the log.
     #[command(subcommand)]
     action: Option<LogAction>,
-    /// Only records newer than this relative window (e.g. `30m`, `2h`, `1d`).
-    #[arg(long, value_name = "DUR")]
+    /// Lower time bound: a relative window (`30m`, `2h`, `1d`), a date
+    /// (`2026-07-01`), or an RFC3339 timestamp.
+    #[arg(long, value_name = "DUR_OR_TS")]
     since: Option<String>,
+    /// Upper time bound: same forms as `--since` (a relative value means that
+    /// long ago). Pair with `--since` for a bounded window.
+    #[arg(long, value_name = "DUR_OR_TS")]
+    until: Option<String>,
     /// Match the HTTP method (case-insensitive), e.g. `GET`.
     #[arg(long, value_name = "METHOD")]
     method: Option<String>,
@@ -96,6 +101,7 @@ impl LogCommand {
         let path = request_log::log_file_path().context("could not resolve the log file path")?;
         let filter = Filter::build(query::FilterInput {
             since: self.since.as_deref(),
+            until: self.until.as_deref(),
             method: self.method.as_deref(),
             status: self.status.as_deref(),
             service: self.service.as_deref(),

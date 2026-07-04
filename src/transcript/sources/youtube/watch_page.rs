@@ -70,14 +70,14 @@ pub async fn fetch_visitor_data(http: &reqwest::Client, base_url: &str) -> Resul
         base = base_url.trim_end_matches('/'),
         video = BOOTSTRAP_VIDEO_ID,
     );
-    let body = http
+    let started = std::time::Instant::now();
+    let result = http
         .get(&url)
         .header(reqwest::header::USER_AGENT, BROWSER_USER_AGENT)
         .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
+        .await;
+    super::record_yt_http("GET", &url, started, &result);
+    let body = result?.error_for_status()?.text().await?;
 
     extract_visitor_data(&body)
         .map(str::to_string)

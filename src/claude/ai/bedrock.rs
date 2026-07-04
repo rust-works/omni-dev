@@ -203,7 +203,7 @@ impl AiClient for BedrockAiClient {
 
             let started = std::time::Instant::now();
             let send_result = builder.json(&request).send().await;
-            super::record_ai_http(&api_url, started, &send_result);
+            super::record_ai_http("bedrock", "POST", &api_url, started, &send_result);
             let response = send_result.map_err(|e| ClaudeError::NetworkError(e.to_string()))?;
 
             let response = super::check_error_response(response).await?;
@@ -257,6 +257,35 @@ impl AiClient for BedrockAiClient {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn send_request_posts_to_base_url_and_returns_text() {
+        // Drives the whole send path (including the best-effort HTTP record)
+        // against a mock server via the injectable base_url.
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"id":"msg_1","type":"message","role":"assistant","model":"m",
+                    "content":[{"type":"text","text":"hi there"}],"stop_reason":"end_turn"}"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = BedrockAiClient::new(
+            "claude-3-opus-20240229".to_string(),
+            "test_token".to_string(),
+            server.uri(),
+            None,
+        )
+        .unwrap();
+
+        let out = client.send_request("system", "user").await.unwrap();
+        assert_eq!(out, "hi there");
+    }
 
     #[test]
     fn get_api_url() {

@@ -85,14 +85,14 @@ pub async fn resolve_channel_id(
         ),
     };
 
-    let body = http
+    let started = std::time::Instant::now();
+    let result = http
         .get(&page_url)
         .header(reqwest::header::USER_AGENT, BROWSER_USER_AGENT)
         .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
+        .await;
+    super::record_yt_http("GET", &page_url, started, &result);
+    let body = result?.error_for_status()?.text().await?;
 
     extract_channel_id(&body)
         .map(str::to_string)
@@ -113,13 +113,10 @@ pub async fn fetch_recent_videos(
         base = base_url.trim_end_matches('/'),
         id = channel_id,
     );
-    let body = http
-        .get(&url)
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
+    let started = std::time::Instant::now();
+    let result = http.get(&url).send().await;
+    super::record_yt_http("GET", &url, started, &result);
+    let body = result?.error_for_status()?.text().await?;
     Ok(parse_rss(&body))
 }
 

@@ -23,6 +23,12 @@ types, so the log is a complete invocation history, not just an HTTP history:
 Every HTTP record shares an `invocation_id` with the invocation that issued it,
 so you can pull a run and all of its requests with a single `--id`.
 
+**Coverage caveat:** only requests issued by `omni-dev`'s own in-process HTTP
+clients are recorded. GitHub operations that shell out to the `gh` CLI (PR
+creation, some git integration) run in a **separate process** and are therefore
+invisible to the log — the parent invocation is still recorded, but the network
+calls `gh` makes are not.
+
 ## Location
 
 Resolved in this order:
@@ -64,10 +70,11 @@ below. The `prune` subcommand trims it; see [Bounding growth](#bounding-growth).
 
 | Flag | Matches |
 |------|---------|
-| `--since <DUR>` | Records newer than a relative window: `30m`, `2h`, `1d`, `1w`, `45s`. |
+| `--since <DUR_OR_TS>` | Lower time bound: a relative window (`30m`, `2h`, `1d`, `1w`, `45s`), a date (`2026-07-01`), or an RFC3339 timestamp. |
+| `--until <DUR_OR_TS>` | Upper time bound: same forms as `--since` (a relative value means that long ago). Pair with `--since` for a bounded window. |
 | `--method <METHOD>` | HTTP method (case-insensitive). |
 | `--status <STATUS>` | Exact (`200`), class (`5xx`), or comma list (`4xx,5xx`). |
-| `--service <NAME>` | `jira`, `confluence`, `datadog`, `browser-bridge`, `snowflake`, `claude`, `claude-cli`. |
+| `--service <NAME>` | `jira`, `confluence`, `datadog`, `browser-bridge`, `snowflake`, `transcript`, `anthropic`, `bedrock`, `openai`, `ollama`, `claude-cli`. |
 | `--command <PATH>` | Resolved command-path prefix on whole segments, e.g. `"jira read"`. |
 | `--url <SUBSTR>` | Substring of the request URL. |
 | `--grep <REGEX>` | Regular expression against the raw JSON line. |
@@ -87,8 +94,19 @@ below. The `prune` subcommand trims it; see [Bounding growth](#bounding-growth).
 
 - **Structured terms:** `field:value` — `kind`, `source`, `service`, `method`,
   `status` (supports `5xx`), `command`, `url`, `id`, `invocation_id` (alias
-  `inv`), `mcp_tool` (alias `tool`), `via_daemon`, `error`. Field matching is
-  shared with the flags, so `--status 5xx` and `status:5xx` behave identically.
+  `inv`), `mcp_tool` (alias `tool`), `via_daemon`, `error`, plus the fields that
+  were previously reachable only through `--grep`: `exit_code` (alias `exit`),
+  `duration_ms` (aliases `duration`, `dur`), `elapsed_ms` (alias `elapsed`),
+  `hostname` (alias `host`), `system_user` (alias `user`), `cwd`, and
+  `auth_principal` (alias `principal`). Field matching is shared with the flags,
+  so `--status 5xx` and `status:5xx` behave identically.
+- **Numeric comparisons:** numeric fields (`exit_code`, `duration_ms`,
+  `elapsed_ms`, and `status`) accept a leading comparator — `>`, `>=`, `<`,
+  `<=`, or bare `=`/`N` for equality — so slow requests and failed runs are
+  expressible directly (`elapsed:>1000`, `exit_code:>0`). `status` still also
+  accepts its class syntax (`5xx`).
+- **Text fields** (`url`, `hostname`, `system_user`, `cwd`, `auth_principal`)
+  match a case-insensitive substring.
 - **Bare tokens** are fuzzy substring matches against the raw JSON line.
 - **Operators:** `AND` (also implicit between adjacent terms), `OR`, `NOT` (or a
   leading `-`), and parentheses. Use `"quotes"` for a value containing spaces.
@@ -96,6 +114,8 @@ below. The `prune` subcommand trims it; see [Bounding growth](#bounding-growth).
 ```bash
 omni-dev log --query 'kind:http AND (status:5xx OR method:POST)'
 omni-dev log --query 'service:jira -status:2xx'        # jira requests that did not 2xx
+omni-dev log --query 'elapsed:>1000'                   # requests slower than 1s
+omni-dev log --query 'kind:invocation exit_code:>0'    # failed runs
 ```
 
 ### Examples
@@ -107,11 +127,17 @@ omni-dev log -n 20
 # Server errors in the last two hours.
 omni-dev log --since 2h --status 5xx
 
+# Slow datadog requests (native — no jq needed).
+omni-dev log --service datadog --query 'elapsed:>1000'
+
+# A bounded historical window.
+omni-dev log --since 2026-07-01 --until 2026-07-02
+
 # A run and every request it made.
 omni-dev log --id 0001718000000-0a1b2c3d4e5f6071
 
-# Compose with jq.
-omni-dev log --format json --service datadog | jq 'select(.elapsed_ms > 1000)'
+# Compose with jq for anything not directly expressible.
+omni-dev log --format json --service datadog | jq 'select(.status_code == 429)'
 
 # Follow live.
 omni-dev log -f --service browser-bridge
@@ -235,7 +261,8 @@ data-sensitivity note, not a credential leak.
 Requests executed inside the daemon (the browser bridge and the Snowflake
 session pool) set `via_daemon: true`. Because the daemon is a separate process
 from the CLI that asked it to act, such requests carry the *daemon's*
-`invocation_id`, not the CLI's — cross-socket correlation is a planned follow-up.
+`invocation_id`, not the CLI's — cross-socket correlation is a planned follow-up
+([#1198](https://github.com/rust-works/omni-dev/issues/1198)).
 
 ## Schema and compatibility
 

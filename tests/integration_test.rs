@@ -1111,3 +1111,97 @@ fn log_auto_rotates_at_size_cap() {
     );
     assert!(sibling(".lock").exists(), "rotation lock file present");
 }
+
+// ── Log filter surface (#1122) ──────────────────────────────────────────
+
+/// A pre-populated log with distinct records for exercising the new filter
+/// surface (#1122): a failed transcript invocation, its slow transcript HTTP
+/// request, and a fast anthropic request on a later day.
+fn seeded_log(dir: &std::path::Path) -> std::path::PathBuf {
+    let log = dir.join("log.jsonl");
+    let lines = [
+        r#"{"id":"0001","invocation_id":"inv-a","kind":"invocation","timestamp":"2026-07-01T00:00:00.000Z","command":["transcript","fetch"],"exit_code":1,"duration_ms":100,"source":"cli"}"#,
+        r#"{"id":"0002","invocation_id":"inv-a","kind":"http","timestamp":"2026-07-01T00:00:01.000Z","service":"transcript","method":"GET","status_code":200,"elapsed_ms":2500,"url":"https://www.youtube.com/watch?v=x"}"#,
+        r#"{"id":"0003","invocation_id":"inv-b","kind":"http","timestamp":"2026-07-03T00:00:00.000Z","service":"anthropic","method":"POST","status_code":200,"elapsed_ms":50,"url":"https://api.anthropic.com/v1/messages"}"#,
+    ];
+    fs::write(&log, format!("{}\n", lines.join("\n"))).unwrap();
+    log
+}
+
+#[test]
+fn log_filters_slow_requests_and_failed_runs() {
+    let dir = TempDir::new().unwrap();
+    let log = seeded_log(dir.path());
+
+    // Slow requests: only the 2500ms transcript request, not the 50ms one.
+    let out = run_with_log(
+        &log,
+        &["log", "--query", "elapsed:>1000", "--format", "json"],
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains(r#""id":"0002""#),
+        "slow request present:\n{stdout}"
+    );
+    assert!(!stdout.contains(r#""id":"0003""#), "fast request excluded");
+
+    // Failed runs: the exit_code:1 invocation.
+    let out = run_with_log(
+        &log,
+        &["log", "--query", "exit_code:>0", "--format", "json"],
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains(r#""id":"0001""#),
+        "failed run present:\n{stdout}"
+    );
+    assert!(!stdout.contains(r#""id":"0002""#));
+}
+
+#[test]
+fn log_filters_by_service_and_bounded_window() {
+    let dir = TempDir::new().unwrap();
+    let log = seeded_log(dir.path());
+
+    // The new transcript service tag is filterable.
+    let out = run_with_log(
+        &log,
+        &["log", "--service", "transcript", "--format", "json"],
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains(r#""id":"0002""#),
+        "transcript record present:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(r#""id":"0003""#),
+        "anthropic record excluded"
+    );
+
+    // A bounded window with absolute dates keeps only July 3rd's record.
+    let out = run_with_log(
+        &log,
+        &[
+            "log",
+            "--since",
+            "2026-07-02",
+            "--until",
+            "2026-07-04",
+            "--format",
+            "json",
+        ],
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains(r#""id":"0003""#),
+        "in-window record present:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(r#""id":"0001""#),
+        "before --since excluded"
+    );
+    assert!(
+        !stdout.contains(r#""id":"0002""#),
+        "before --since excluded"
+    );
+}

@@ -44,7 +44,10 @@ struct Segment {
 /// [`super::player_response::SelectedTrack::fetch_url`], which already
 /// carries the signed signature, `fmt=json3`, and any `tlang=` parameter.
 pub async fn fetch(http: &reqwest::Client, url: &str) -> Result<String> {
-    let response = http.get(url).send().await?.error_for_status()?;
+    let started = std::time::Instant::now();
+    let result = http.get(url).send().await;
+    super::record_yt_http("GET", url, started, &result);
+    let response = result?.error_for_status()?;
     Ok(response.text().await?)
 }
 
