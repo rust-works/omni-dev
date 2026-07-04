@@ -9,7 +9,7 @@
 //!
 //! [`MonitorsApi::list`]: crate::datadog::monitors_api::MonitorsApi::list
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Serialize;
 
 use crate::datadog::client::DatadogClient;
@@ -77,13 +77,12 @@ impl<'a> LogsApi<'a> {
         };
         let url = format!("{}/api/v2/logs/events/search", self.client.base_url());
         let response = self.client.post_json(&url, &body).await?;
-        if !response.status().is_success() {
-            return Err(DatadogClient::response_to_error(response).await.into());
-        }
-        response
-            .json::<LogSearchResult>()
+        self.client
+            .parse_response(
+                response,
+                "Failed to parse /api/v2/logs/events/search response",
+            )
             .await
-            .context("Failed to parse /api/v2/logs/events/search response")
     }
 
     /// Searches log events, auto-paginating via cursor as needed.

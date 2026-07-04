@@ -4,7 +4,7 @@
 //! endpoint (`GET /api/v1/hosts`). Auto-paginates via `start` / `count`
 //! query parameters, capped at [`HARD_CAP`] hosts per invocation.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use url::Url;
 
 use crate::datadog::client::DatadogClient;
@@ -63,14 +63,10 @@ impl<'a> HostsApi<'a> {
             let remaining = cap - hosts.len();
             let count = remaining.min(LIST_PAGE_SIZE);
             let url = build_list_url(self.client.base_url(), filter, start, count)?;
-            let response = self.client.get_json(url.as_str()).await?;
-            if !response.status().is_success() {
-                return Err(DatadogClient::response_to_error(response).await.into());
-            }
-            let parsed: HostsResponse = response
-                .json()
-                .await
-                .context("Failed to parse /api/v1/hosts response")?;
+            let parsed: HostsResponse = self
+                .client
+                .get_parsed(url.as_str(), "Failed to parse /api/v1/hosts response")
+                .await?;
             let batch_len = parsed.host_list.len();
             let exhausted = batch_len < count;
             if total_matching.is_none() {
@@ -106,8 +102,7 @@ fn build_list_url(
     start: usize,
     count: usize,
 ) -> Result<Url> {
-    let mut url =
-        Url::parse(&format!("{base_url}/api/v1/hosts")).context("Invalid Datadog base URL")?;
+    let mut url = DatadogClient::api_url(base_url, "/api/v1/hosts")?;
     {
         let mut q = url.query_pairs_mut();
         if let Some(f) = filter.filter.as_deref() {

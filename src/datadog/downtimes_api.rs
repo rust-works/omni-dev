@@ -7,7 +7,7 @@
 //! server-side pagination — so the façade does not loop. The optional
 //! `current_only` filter restricts the response to active downtimes.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use url::Url;
 
 use crate::datadog::client::DatadogClient;
@@ -30,20 +30,14 @@ impl<'a> DowntimesApi<'a> {
     /// downtimes are returned.
     pub async fn list(&self, current_only: bool) -> Result<Vec<Downtime>> {
         let url = build_list_url(self.client.base_url(), current_only)?;
-        let response = self.client.get_json(url.as_str()).await?;
-        if !response.status().is_success() {
-            return Err(DatadogClient::response_to_error(response).await.into());
-        }
-        response
-            .json::<Vec<Downtime>>()
+        self.client
+            .get_parsed(url.as_str(), "Failed to parse /api/v1/downtime response")
             .await
-            .context("Failed to parse /api/v1/downtime response")
     }
 }
 
 fn build_list_url(base_url: &str, current_only: bool) -> Result<Url> {
-    let mut url =
-        Url::parse(&format!("{base_url}/api/v1/downtime")).context("Invalid Datadog base URL")?;
+    let mut url = DatadogClient::api_url(base_url, "/api/v1/downtime")?;
     if current_only {
         url.query_pairs_mut().append_pair("current_only", "true");
     }
