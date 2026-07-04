@@ -73,7 +73,7 @@ through the normal `{ known: false }` heartbeat path within ~10 s.
 omni-dev worktrees list
 
 # Machine-readable JSON (byte-identical to the on-socket payload).
-omni-dev worktrees list --json
+omni-dev worktrees list -o json
 
 # Against a non-default daemon socket.
 omni-dev worktrees list --socket /path/to/daemon.sock
@@ -84,7 +84,7 @@ state** (`+ahead -behind`, or `-` when the branch tracks no upstream), the
 primary folder, and how long ago the window was last seen. The branch and sync
 columns are computed by the daemon from the worktree on disk — see
 [Git enrichment](#git-enrichment) — so they reflect the live branch rather than
-whatever the companion happened to report. `--json` carries the same fields plus
+whatever the companion happened to report. `-o json` carries the same fields plus
 the companion-reported `title`.
 
 The companion extension feeds the registry; the CLI only reads it. If the daemon
@@ -120,8 +120,8 @@ daemon: running
   worktrees        ok         3 window(s) across 2 repo(s)
 ```
 
-The `--json` status detail carries the same enriched window entries as
-`worktrees list --json`.
+The `-o json` status detail carries the same enriched window entries as
+`worktrees list -o json`.
 
 ## Git enrichment
 
@@ -159,7 +159,7 @@ strings it renders before writing to the terminal — a registered entry cannot
 inject ANSI escape sequences into the operator's TTY (#1137). The daemon-computed
 `branch` is a git ref name (which cannot contain control bytes) but is sanitized
 on the same path as defense-in-depth. Native tray menus do not interpret ANSI,
-and the `--json` output escapes control bytes via JSON encoding.
+and the `-o json` output escapes control bytes via JSON encoding.
 
 ## Companion contract (for the extension and other clients)
 
@@ -199,7 +199,7 @@ Where:
   with `last_seen` as an RFC 3339 timestamp; consumers compute age from it.
   Entries are sorted by `(repo, key)` for deterministic output. The
   companion-reported fields are stored and served verbatim on the wire (and in
-  `--json`); only the human-readable `worktrees list` table sanitizes them for
+  `-o json`); only the human-readable `worktrees list` table sanitizes them for
   terminal display (see Security).
 - `branch`, `ahead`, `behind` are **daemon-computed, not companion-reported**:
   the daemon derives them from the primary folder's git state on every read (see

@@ -87,8 +87,12 @@ pub struct DiffCommand {
     pub baseline_report_format: ReportFormat,
 
     /// Output format.
-    #[arg(long, value_enum, default_value_t = OutputFormatArg::Markdown)]
-    pub format: OutputFormatArg,
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormatArg::Markdown)]
+    pub output: OutputFormatArg,
+
+    /// Deprecated: use `-o`/`--output` instead.
+    #[arg(long = "format", hide = true)]
+    pub format: Option<OutputFormatArg>,
 
     /// Fail (non-zero exit) when patch coverage is below this percentage.
     #[arg(long, value_name = "PCT")]
@@ -150,7 +154,11 @@ impl DiffCommand {
     ///
     /// `repo` is the repository location resolved at the CLI boundary
     /// (`None` = current working directory).
-    pub async fn execute(self, repo: Option<&Path>) -> Result<()> {
+    pub async fn execute(mut self, repo: Option<&Path>) -> Result<()> {
+        if let Some(format) = self.format.take() {
+            eprintln!("warning: --format is deprecated; use -o/--output instead");
+            self.output = format;
+        }
         let outcome = self.run(repo)?;
         println!("{}", outcome.rendered);
         if outcome.below_gate {
@@ -211,7 +219,7 @@ impl DiffCommand {
         let result = analyze(&head, &diff, baseline.as_ref(), scope);
 
         let opts = self.render_options();
-        let rendered = render(&result, &opts, self.format.into())?;
+        let rendered = render(&result, &opts, self.output.into())?;
 
         let patch_percent = result.patch.percent();
         let below_gate = match self.fail_under_patch {
@@ -345,7 +353,8 @@ mod tests {
             head_ref: None,
             baseline_report: None,
             baseline_report_format: ReportFormat::Auto,
-            format: OutputFormatArg::Markdown,
+            output: OutputFormatArg::Markdown,
+            format: None,
             fail_under_patch: None,
             strip_prefix: None,
             collapse_ranges: false,
@@ -406,7 +415,7 @@ mod tests {
         for format in [OutputFormatArg::Yaml, OutputFormatArg::Json] {
             let report = write_head_lcov(&repo);
             let mut cmd = command(report, &base);
-            cmd.format = format;
+            cmd.output = format;
             let outcome = cmd.run(Some(&repo)).unwrap();
             assert!(outcome.rendered.contains("patch_coverage"));
         }
@@ -526,6 +535,17 @@ mod tests {
         let mut cmd = command(report, &base);
         cmd.fail_under_patch = Some(99.0);
         assert!(cmd.execute(Some(&repo)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn execute_folds_deprecated_format_flag() {
+        let (_dir, repo, base) = repo_with_added_file();
+        let report = write_head_lcov(&repo);
+        // The deprecated `--format` is folded into `output` with a warning
+        // before `run` reads it.
+        let mut cmd = command(report, &base);
+        cmd.format = Some(OutputFormatArg::Yaml);
+        assert!(cmd.execute(Some(&repo)).await.is_ok());
     }
 
     /// The injected repo root drives BOTH the git repository and relative

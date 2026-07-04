@@ -115,6 +115,7 @@ mod tests {
         let cmd = JiraCommand {
             command: JiraSubcommands::Read(read::ReadCommand {
                 key: "PROJ-1".to_string(),
+                out_file: None,
                 output: None,
                 format: ContentFormat::Jfm,
                 fields: vec![],

@@ -847,11 +847,11 @@ fn omni_dev_log_reads_back_records_byte_identically() {
     assert!(run_with_log(&log, &["help-all"]).status.success());
 
     let on_disk = fs::read_to_string(&log).unwrap();
-    let output = run_with_log(&log, &["log", "--format", "json"]);
+    let output = run_with_log(&log, &["log", "-o", "json"]);
     assert!(output.status.success());
     let rendered = String::from_utf8(output.stdout).unwrap();
 
-    // `omni-dev log --format json` reproduces the on-disk NDJSON verbatim,
+    // `omni-dev log -o json` reproduces the on-disk NDJSON verbatim,
     // except its own (later) invocation line, which is appended after the read.
     for line in on_disk.lines().filter(|l| !l.is_empty()) {
         assert!(

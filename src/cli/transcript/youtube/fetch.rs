@@ -23,8 +23,12 @@ pub struct FetchCommand {
     pub lang: String,
 
     /// Output format.
-    #[arg(long, value_enum, default_value_t = CliFormat::Srt)]
-    pub format: CliFormat,
+    #[arg(short = 'o', long, value_enum, default_value_t = CliFormat::Srt)]
+    pub output: CliFormat,
+
+    /// Deprecated: use `-o`/`--output` instead.
+    #[arg(long = "format", hide = true)]
+    pub format: Option<CliFormat>,
 
     /// Allow falling through to auto-generated (ASR) captions when no manual
     /// track matches.
@@ -37,13 +41,18 @@ pub struct FetchCommand {
     pub translate: Option<String>,
 
     /// Output file (writes to stdout if omitted).
-    #[arg(short, long)]
-    pub output: Option<String>,
+    #[arg(long = "out-file", value_name = "PATH")]
+    pub out_file: Option<String>,
 }
 
 impl FetchCommand {
-    /// Fetches the transcript and writes it to stdout or `--output`.
-    pub async fn execute(self) -> Result<()> {
+    /// Fetches the transcript and writes it to stdout or `--out-file`.
+    pub async fn execute(mut self) -> Result<()> {
+        if let Some(format) = self.format.take() {
+            eprintln!("warning: --format is deprecated; use -o/--output instead");
+            self.output = format;
+        }
+
         let yt = Youtube::new()?;
         let opts = FetchOpts {
             language: self.lang,
@@ -51,8 +60,8 @@ impl FetchCommand {
             translate_to: self.translate,
         };
         let transcript = yt.fetch(&self.url, &opts).await?;
-        let rendered = Format::from(self.format).render(&transcript)?;
-        write_output(&rendered, self.output.as_deref())
+        let rendered = Format::from(self.output).render(&transcript)?;
+        write_output(&rendered, self.out_file.as_deref())
     }
 }
 
@@ -86,10 +95,11 @@ mod tests {
         let cmd = parse(&["https://youtu.be/dQw4w9WgXcQ"]);
         assert_eq!(cmd.url, "https://youtu.be/dQw4w9WgXcQ");
         assert_eq!(cmd.lang, "en");
-        assert_eq!(cmd.format, CliFormat::Srt);
+        assert_eq!(cmd.output, CliFormat::Srt);
+        assert_eq!(cmd.format, None);
         assert!(!cmd.auto);
         assert_eq!(cmd.translate, None);
-        assert_eq!(cmd.output, None);
+        assert_eq!(cmd.out_file, None);
     }
 
     #[test]
@@ -98,39 +108,65 @@ mod tests {
             "abc",
             "--lang",
             "fr",
-            "--format",
+            "-o",
             "vtt",
             "--auto",
             "--translate",
             "en",
-            "--output",
+            "--out-file",
             "out.vtt",
         ]);
         assert_eq!(cmd.url, "abc");
         assert_eq!(cmd.lang, "fr");
-        assert_eq!(cmd.format, CliFormat::Vtt);
+        assert_eq!(cmd.output, CliFormat::Vtt);
         assert!(cmd.auto);
         assert_eq!(cmd.translate.as_deref(), Some("en"));
-        assert_eq!(cmd.output.as_deref(), Some("out.vtt"));
+        assert_eq!(cmd.out_file.as_deref(), Some("out.vtt"));
     }
 
     #[test]
-    fn fetch_command_short_output_flag() {
-        let cmd = parse(&["abc", "-o", "out.srt"]);
-        assert_eq!(cmd.output.as_deref(), Some("out.srt"));
+    fn fetch_command_out_file_flag() {
+        let cmd = parse(&["abc", "--out-file", "out.srt"]);
+        assert_eq!(cmd.out_file.as_deref(), Some("out.srt"));
     }
 
     #[test]
-    fn fetch_command_format_accepts_each_variant() {
+    fn fetch_command_output_accepts_each_variant() {
         for (arg, want) in [
             ("srt", CliFormat::Srt),
             ("vtt", CliFormat::Vtt),
             ("txt", CliFormat::Txt),
             ("json", CliFormat::Json),
         ] {
-            let cmd = parse(&["abc", "--format", arg]);
-            assert_eq!(cmd.format, want);
+            let cmd = parse(&["abc", "-o", arg]);
+            assert_eq!(cmd.output, want);
         }
+    }
+
+    #[test]
+    fn fetch_command_deprecated_format_alias_still_parses() {
+        // `--format` is captured separately; `execute` folds it into `output`
+        // with a stderr warning.
+        let cmd = parse(&["abc", "--format", "vtt"]);
+        assert_eq!(cmd.format, Some(CliFormat::Vtt));
+        assert_eq!(cmd.output, CliFormat::Srt);
+    }
+
+    #[tokio::test]
+    async fn fetch_command_execute_folds_deprecated_format_flag() {
+        // The deprecated `--format` folds into `output` with a warning. `"abc"`
+        // is an invalid locator, so `fetch` short-circuits in `extract_video_id`
+        // before any HTTP request — covering the fold with no network.
+        let cmd = FetchCommand {
+            url: "abc".to_string(),
+            lang: "en".to_string(),
+            output: CliFormat::Srt,
+            format: Some(CliFormat::Vtt),
+            auto: false,
+            translate: None,
+            out_file: None,
+        };
+        assert!(cmd.execute().await.is_err());
     }
 
     #[test]

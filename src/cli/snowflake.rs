@@ -13,6 +13,7 @@ use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 
+use crate::cli::format::TableOrJson;
 use crate::daemon::client::DaemonClient;
 use crate::daemon::protocol::DaemonEnvelope;
 use crate::daemon::server;
@@ -91,8 +92,11 @@ pub struct QueryCommand {
     #[arg(long, value_name = "PATH")]
     pub socket: Option<PathBuf>,
     /// Output format.
-    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
-    pub format: OutputFormat,
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Json)]
+    pub output: OutputFormat,
+    /// Deprecated: use `-o`/`--output` instead.
+    #[arg(long = "format", hide = true)]
+    pub format: Option<OutputFormat>,
     /// SQL to run. Read from stdin when omitted.
     pub sql: Option<String>,
 }
@@ -100,6 +104,10 @@ pub struct QueryCommand {
 impl QueryCommand {
     /// Executes the query command.
     pub async fn execute(mut self) -> Result<()> {
+        if let Some(format) = self.format.take() {
+            eprintln!("warning: --format is deprecated; use -o/--output instead");
+            self.output = format;
+        }
         let sql = match self.sql.take() {
             Some(sql) => sql,
             None => read_stdin()?,
@@ -116,7 +124,7 @@ impl QueryCommand {
 
         let socket = server::resolve_socket(self.socket)?;
         let result = call(&socket, "query", payload).await?;
-        print_value(&result, self.format)
+        print_value(&result, self.output)
     }
 
     /// Builds the query request, filling each unset identity/context field from
@@ -144,21 +152,27 @@ pub struct SessionsCommand {
     /// Control-socket path. Defaults to the per-user runtime location.
     #[arg(long, value_name = "PATH")]
     pub socket: Option<PathBuf>,
-    /// Emit machine-readable JSON instead of a table.
-    #[arg(long)]
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = TableOrJson::Table)]
+    pub output: TableOrJson,
+    /// Deprecated: use `-o`/`--output json` instead.
+    #[arg(long, hide = true)]
     pub json: bool,
 }
 
 impl SessionsCommand {
     /// Executes the sessions command.
-    pub async fn execute(self) -> Result<()> {
+    pub async fn execute(mut self) -> Result<()> {
+        if self.json {
+            eprintln!("warning: --json is deprecated; use -o/--output json instead");
+            self.output = TableOrJson::Json;
+        }
         let socket = server::resolve_socket(self.socket)?;
         let result = call(&socket, "sessions", Value::Null).await?;
-        if self.json {
-            println!("{}", serde_json::to_string_pretty(&result)?);
-            return Ok(());
+        match self.output {
+            TableOrJson::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+            TableOrJson::Table => println!("{}", render_sessions(&result)),
         }
-        println!("{}", render_sessions(&result));
         Ok(())
     }
 }
@@ -368,7 +382,7 @@ mod tests {
             "me",
             "--warehouse",
             "WH",
-            "--format",
+            "-o",
             "yaml",
             "SELECT 1",
         ]) else {
@@ -378,7 +392,19 @@ mod tests {
         assert_eq!(cmd.user.as_deref(), Some("me"));
         assert_eq!(cmd.warehouse.as_deref(), Some("WH"));
         assert_eq!(cmd.sql.as_deref(), Some("SELECT 1"));
-        assert_eq!(cmd.format, OutputFormat::Yaml);
+        assert_eq!(cmd.output, OutputFormat::Yaml);
+    }
+
+    #[test]
+    fn query_deprecated_format_alias_still_parses() {
+        let SnowflakeSubcommands::Query(cmd) = parse(&["query", "--format", "yaml", "SELECT 1"])
+        else {
+            panic!("expected query");
+        };
+        // The deprecated `--format` is captured separately; `execute` folds it
+        // into `output` with a stderr warning.
+        assert_eq!(cmd.format, Some(OutputFormat::Yaml));
+        assert_eq!(cmd.output, OutputFormat::Json);
     }
 
     #[test]
@@ -387,7 +413,8 @@ mod tests {
             panic!("expected query");
         };
         assert!(cmd.sql.is_none());
-        assert_eq!(cmd.format, OutputFormat::Json);
+        assert_eq!(cmd.output, OutputFormat::Json);
+        assert!(cmd.format.is_none());
         assert!(cmd.socket.is_none());
     }
 
@@ -438,11 +465,55 @@ mod tests {
     }
 
     #[test]
-    fn sessions_json_flag_parses() {
+    fn sessions_output_flag_parses() {
+        let SnowflakeSubcommands::Sessions(cmd) = parse(&["sessions", "-o", "json"]) else {
+            panic!("expected sessions");
+        };
+        assert_eq!(cmd.output, TableOrJson::Json);
+        assert!(!cmd.json);
+    }
+
+    #[test]
+    fn sessions_deprecated_json_flag_still_parses() {
         let SnowflakeSubcommands::Sessions(cmd) = parse(&["sessions", "--json"]) else {
             panic!("expected sessions");
         };
+        // Captured separately; `execute` folds it into `output` with a warning.
         assert!(cmd.json);
+        assert_eq!(cmd.output, TableOrJson::Table);
+    }
+
+    #[tokio::test]
+    async fn query_execute_folds_deprecated_format_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        // Deprecated `--format` folds into `output` before the (absent-daemon)
+        // socket call fails.
+        let cmd = QueryCommand {
+            account: None,
+            user: None,
+            warehouse: None,
+            role: None,
+            database: None,
+            schema: None,
+            socket: Some(dir.path().join("absent.sock")),
+            output: OutputFormat::Json,
+            format: Some(OutputFormat::Yaml),
+            sql: Some("SELECT 1".to_string()),
+        };
+        assert!(cmd.execute().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn sessions_execute_folds_deprecated_json_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        // Deprecated `--json` folds into `output` before the (absent-daemon)
+        // socket call fails.
+        let cmd = SessionsCommand {
+            socket: Some(dir.path().join("absent.sock")),
+            output: TableOrJson::Table,
+            json: true,
+        };
+        assert!(cmd.execute().await.is_err());
     }
 
     #[test]

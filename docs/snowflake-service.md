@@ -86,10 +86,10 @@ omni-dev snowflake query --account MYACCT --user me \
   --warehouse WH --role ANALYST --database DB --schema PUBLIC "SELECT 1"
 
 # YAML instead of JSON.
-omni-dev snowflake query --account MYACCT --user me --format yaml "SELECT 1"
+omni-dev snowflake query --account MYACCT --user me -o yaml "SELECT 1"
 
 # List / evict multiplexed sessions.
-omni-dev snowflake sessions          # table; --json for machines
+omni-dev snowflake sessions          # table; -o json for machines
 omni-dev snowflake disconnect --account MYACCT --user me
 ```
 

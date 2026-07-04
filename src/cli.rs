@@ -16,6 +16,7 @@ pub mod coverage;
 #[cfg(unix)]
 pub mod daemon;
 pub mod datadog;
+pub mod format;
 pub mod git;
 pub mod help;
 pub mod log;

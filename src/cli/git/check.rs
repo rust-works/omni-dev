@@ -3,6 +3,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 
+use crate::data::check::OutputFormat;
+
 /// Check command options - validates commit messages against guidelines.
 #[derive(Parser)]
 pub struct CheckCommand {
@@ -20,9 +22,13 @@ pub struct CheckCommand {
     #[arg(long)]
     pub guidelines: Option<std::path::PathBuf>,
 
-    /// Output format: text (default), json, yaml.
-    #[arg(long, default_value = "text")]
-    pub format: String,
+    /// Output format.
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Text)]
+    pub output: OutputFormat,
+
+    /// Deprecated: use `-o`/`--output` instead.
+    #[arg(long = "format", hide = true)]
+    pub format: Option<OutputFormat>,
 
     /// Exits with error code if any issues found (including warnings).
     #[arg(long)]
@@ -77,10 +83,13 @@ impl CheckCommand {
             eprintln!("warning: --batch-size is deprecated; use --concurrency instead");
             self.concurrency = bs;
         }
-        use crate::data::check::OutputFormat;
 
-        // Parse output format
-        let output_format: OutputFormat = self.format.parse().unwrap_or(OutputFormat::Text);
+        // Resolve deprecated --format into -o/--output
+        if let Some(format) = self.format.take() {
+            eprintln!("warning: --format is deprecated; use -o/--output instead");
+            self.output = format;
+        }
+        let output_format = self.output;
 
         // Preflight check: validate AI credentials before any processing.
         // Model/beta-header selection uses the global `--model`/`--beta-header`
@@ -1468,7 +1477,8 @@ mod tests {
             commit_range: None,
             context_dir: None,
             guidelines: None,
-            format: "text".to_string(),
+            output: OutputFormat::Text,
+            format: None,
             strict: false,
             quiet,
             verbose: false,
@@ -1479,6 +1489,17 @@ mod tests {
             no_suggestions: false,
             twiddle: false,
         }
+    }
+
+    #[tokio::test]
+    async fn execute_folds_deprecated_format_flag() {
+        // A non-git temp dir makes preflight bail immediately after the
+        // deprecated `--format` fold runs (no AI credentials or network needed).
+        let dir = tempfile::tempdir().unwrap();
+        let mut cmd = make_check_cmd(true);
+        cmd.format = Some(OutputFormat::Json);
+        let result = cmd.execute(Some(dir.path())).await;
+        assert!(result.is_err());
     }
 
     fn make_check_commit(hash: &str) -> (crate::git::CommitInfo, tempfile::NamedTempFile) {

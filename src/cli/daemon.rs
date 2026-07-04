@@ -110,6 +110,7 @@ mod tests {
             let cmd = DaemonCommand {
                 command: DaemonSubcommands::Status(status::StatusCommand {
                     socket: Some(socket.clone()),
+                    output: crate::cli::format::TableOrJson::Table,
                     json,
                 }),
             };

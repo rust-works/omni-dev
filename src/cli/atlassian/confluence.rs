@@ -127,6 +127,7 @@ mod tests {
         let cmd = ConfluenceCommand {
             command: ConfluenceSubcommands::Read(read::ReadCommand {
                 id: "12345".to_string(),
+                out_file: None,
                 output: None,
                 format: ContentFormat::Jfm,
                 version: None,
@@ -318,6 +319,7 @@ mod tests {
         let other = ConfluenceCommand {
             command: ConfluenceSubcommands::Read(read::ReadCommand {
                 id: "1".to_string(),
+                out_file: None,
                 output: None,
                 format: ContentFormat::Jfm,
                 version: None,
