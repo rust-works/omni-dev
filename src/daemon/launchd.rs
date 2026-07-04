@@ -226,8 +226,8 @@ fn bootout(domain: &str) {
 ///
 /// launchd hands us a `malloc`-ed array of inherited fds; we take ownership of
 /// the first (the plist declares exactly one), set it non-blocking, adopt it as a
-/// Tokio listener, and free the array. The symbol lives in libSystem, so no
-/// `#[link]` attribute is required.
+/// Tokio listener, close any extra descriptors, and free the array. The symbol
+/// lives in libSystem, so no `#[link]` attribute is required.
 #[allow(unsafe_code)]
 pub(crate) fn launchd_listener(name: &str) -> Result<Option<UnixListener>> {
     use nix::libc::{self, c_char, c_int, size_t};
@@ -269,6 +269,26 @@ pub(crate) fn launchd_listener(name: &str) -> Result<Option<UnixListener>> {
     // SAFETY: on success `fds` points at `cnt >= 1` ints; read the first, then
     // free the array exactly once. The fd stays valid after the array is freed.
     let raw = unsafe { *fds };
+
+    // The plist declares exactly one `Listener`, so `cnt` is always 1 in practice.
+    // Should the kernel ever hand us more, we adopt only the first; close the rest
+    // so they are not leaked for the process lifetime.
+    if cnt > 1 {
+        tracing::warn!(
+            "launch_activate_socket({name}) returned {cnt} descriptors; adopting the first and \
+             closing {} extra",
+            cnt - 1
+        );
+        for i in 1..cnt {
+            // SAFETY: `fds` points at `cnt` ints; `i` is in `1..cnt`, so `fds.add(i)`
+            // is in bounds. Each extra fd is owned by us and closed exactly once.
+            let extra = unsafe { *fds.add(i) };
+            unsafe { libc::close(extra) };
+        }
+    }
+
+    // SAFETY: non-null `fds` is the array launchd allocated; free it exactly once.
+    // The fds read above stay valid after the array itself is freed.
     unsafe { libc::free(fds.cast()) };
 
     // SAFETY: `raw` is a listening Unix-domain socket fd handed off by launchd and
