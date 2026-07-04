@@ -85,21 +85,7 @@ pub(crate) fn record_ai_http(
     started: Instant,
     result: &reqwest::Result<reqwest::Response>,
 ) {
-    match result {
-        Ok(r) => {
-            request_log::record_http(
-                "claude",
-                "POST",
-                url,
-                started,
-                Some(r.status().as_u16()),
-                None,
-            );
-        }
-        Err(e) => {
-            request_log::record_http("claude", "POST", url, started, None, Some(&e.to_string()));
-        }
-    }
+    request_log::record_http_result("claude", "POST", url, started, result);
 }
 
 /// Returns the maximum output tokens for a model from the registry,

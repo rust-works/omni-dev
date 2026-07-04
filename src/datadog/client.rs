@@ -1,10 +1,9 @@
 //! Datadog REST API client.
 //!
 //! Thin `reqwest` wrapper that injects the `DD-API-KEY` and
-//! `DD-APPLICATION-KEY` headers on every request and retries 429 responses
-//! with `Retry-After` / `X-RateLimit-Reset` awareness.
-
-use std::time::{Duration, Instant};
+//! `DD-APPLICATION-KEY` headers on every request and retries 429 responses via
+//! the shared [`retry_429`](crate::utils::http::retry_429) driver (which honours
+//! `Retry-After` / `X-RateLimit-Reset`).
 
 use anyhow::{Context, Result};
 use reqwest::Client;
@@ -12,17 +11,8 @@ use reqwest::Client;
 use crate::datadog::auth::{base_url_for_site, DatadogCredentials};
 use crate::datadog::error::DatadogError;
 use crate::request_log;
+use crate::utils::http::{retry_429, REQUEST_TIMEOUT};
 use crate::utils::secret::Secret;
-
-/// HTTP request timeout for Datadog API calls.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Maximum number of retries on HTTP 429 (Too Many Requests).
-const MAX_RETRIES: u32 = 3;
-
-/// Default retry delay when no `Retry-After` / `X-RateLimit-Reset` header
-/// is present. Used as the base for exponential backoff.
-const DEFAULT_RETRY_DELAY_SECS: u64 = 2;
 
 /// HTTP client for Datadog REST APIs.
 #[derive(Debug)]
@@ -88,54 +78,22 @@ impl DatadogClient {
         &self.base_url
     }
 
-    /// Appends a best-effort HTTP record for one Datadog request attempt.
-    fn log_request(
-        method: &str,
-        url: &str,
-        started: Instant,
-        result: &reqwest::Result<reqwest::Response>,
-    ) {
-        match result {
-            Ok(r) => request_log::record_http(
-                "datadog",
-                method,
-                url,
-                started,
-                Some(r.status().as_u16()),
-                None,
-            ),
-            Err(e) => request_log::record_http(
-                "datadog",
-                method,
-                url,
-                started,
-                None,
-                Some(&e.to_string()),
-            ),
-        }
-    }
-
     /// Sends an authenticated GET request and returns the raw response.
     pub async fn get_json(&self, url: &str) -> Result<reqwest::Response> {
-        for attempt in 0..=MAX_RETRIES {
-            let started = Instant::now();
-            let result = self
-                .client
-                .get(url)
-                .header("DD-API-KEY", self.api_key.expose_secret())
-                .header("DD-APPLICATION-KEY", self.app_key.expose_secret())
-                .header("Accept", "application/json")
-                .send()
-                .await;
-            Self::log_request("GET", url, started, &result);
-            let response = result.context("Failed to send GET request to Datadog API")?;
-
-            if response.status().as_u16() != 429 || attempt == MAX_RETRIES {
-                return Ok(response);
-            }
-            Self::wait_for_retry(&response, attempt).await;
-        }
-        unreachable!()
+        retry_429(
+            || {
+                self.client
+                    .get(url)
+                    .header("DD-API-KEY", self.api_key.expose_secret())
+                    .header("DD-APPLICATION-KEY", self.app_key.expose_secret())
+                    .header("Accept", "application/json")
+            },
+            |started, result| {
+                request_log::record_http_result("datadog", "GET", url, started, result);
+            },
+        )
+        .await
+        .context("Failed to send GET request to Datadog API")
     }
 
     /// Sends an authenticated POST request with a JSON body and returns the raw response.
@@ -144,27 +102,22 @@ impl DatadogClient {
         url: &str,
         body: &T,
     ) -> Result<reqwest::Response> {
-        for attempt in 0..=MAX_RETRIES {
-            let started = Instant::now();
-            let result = self
-                .client
-                .post(url)
-                .header("DD-API-KEY", self.api_key.expose_secret())
-                .header("DD-APPLICATION-KEY", self.app_key.expose_secret())
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/json")
-                .json(body)
-                .send()
-                .await;
-            Self::log_request("POST", url, started, &result);
-            let response = result.context("Failed to send POST request to Datadog API")?;
-
-            if response.status().as_u16() != 429 || attempt == MAX_RETRIES {
-                return Ok(response);
-            }
-            Self::wait_for_retry(&response, attempt).await;
-        }
-        unreachable!()
+        retry_429(
+            || {
+                self.client
+                    .post(url)
+                    .header("DD-API-KEY", self.api_key.expose_secret())
+                    .header("DD-APPLICATION-KEY", self.app_key.expose_secret())
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/json")
+                    .json(body)
+            },
+            |started, result| {
+                request_log::record_http_result("datadog", "POST", url, started, result);
+            },
+        )
+        .await
+        .context("Failed to send POST request to Datadog API")
     }
 
     /// Consumes a non-success response and turns it into a [`DatadogError`].
@@ -186,30 +139,6 @@ impl DatadogClient {
         };
         DatadogError::ApiRequestFailed { status, body }
     }
-
-    /// Waits before retrying a rate-limited request.
-    ///
-    /// Consults, in order: `Retry-After`, then Datadog's `X-RateLimit-Reset`,
-    /// then exponential backoff (`DEFAULT_RETRY_DELAY_SECS ^ (attempt+1)`).
-    async fn wait_for_retry(response: &reqwest::Response, attempt: u32) {
-        let headers = response.headers();
-        let delay = header_u64(headers, "Retry-After")
-            .or_else(|| header_u64(headers, "X-RateLimit-Reset"))
-            .unwrap_or_else(|| DEFAULT_RETRY_DELAY_SECS.pow(attempt + 1));
-
-        eprintln!(
-            "Rate limited (429). Retrying in {delay}s (attempt {})...",
-            attempt + 1
-        );
-        tokio::time::sleep(Duration::from_secs(delay)).await;
-    }
-}
-
-fn header_u64(headers: &reqwest::header::HeaderMap, name: &str) -> Option<u64> {
-    headers
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
 }
 
 fn format_rate_limit(headers: &reqwest::header::HeaderMap) -> Option<String> {
