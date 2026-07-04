@@ -54,6 +54,7 @@ pub mod resources;
 pub mod snowflake;
 pub mod transcript;
 pub mod utils;
+pub mod worktrees;
 
 #[cfg(test)]
 mod test_support;
