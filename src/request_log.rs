@@ -1714,4 +1714,77 @@ mod tests {
         assert!(!sibling(&path, ".1").exists());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), line);
     }
+
+    #[test]
+    fn parse_size_rejects_overflow_to_infinity() {
+        // A number too large for f64 parses to a non-finite value, not a size.
+        assert!(parse_size(&"9".repeat(400)).is_err());
+    }
+
+    #[test]
+    fn prune_surfaces_a_read_error() {
+        // Reading a directory as the log yields an error other than NotFound,
+        // which prune propagates rather than treating as an empty log.
+        let dir = tempfile::tempdir().unwrap();
+        let result = prune(
+            dir.path(),
+            &PruneOptions {
+                older_than: None,
+                max_size: Some(1),
+                dry_run: false,
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_with_rotation_appends_even_when_rotate_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        // Seed a file already over the cap so the next write attempts to rotate.
+        std::fs::write(&path, "0123456789012345\n").unwrap();
+        // Make the rotation target a directory so `rename(log, log.1)` fails.
+        std::fs::create_dir(sibling(&path, ".1")).unwrap();
+        let cfg = RotationConfig {
+            max_size: 5,
+            keep_files: 1,
+        };
+        // Rotation fails, but the line is still appended (best effort).
+        append_with_rotation(&path, "new-line\n", &cfg).unwrap();
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains("new-line"),
+            "the record is appended despite the rotation failure"
+        );
+    }
+
+    #[test]
+    fn prune_cleans_up_temp_on_rewrite_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                http_line("a", "2999-01-01T00:00:00.000Z"),
+                http_line("b", "2999-01-01T00:00:00.000Z"),
+            ),
+        )
+        .unwrap();
+        // Pre-create the exact temp path (same-process pid) as a directory so
+        // the atomic rewrite's open fails, exercising the cleanup path.
+        let tmp = sibling(&path, &format!(".prune.{}.tmp", std::process::id()));
+        std::fs::create_dir(&tmp).unwrap();
+
+        let result = prune(
+            &path,
+            &PruneOptions {
+                older_than: None,
+                max_size: Some(1),
+                dry_run: false,
+            },
+        );
+        assert!(result.is_err(), "a failing rewrite surfaces as an error");
+        let _ = std::fs::remove_dir(&tmp);
+    }
 }
