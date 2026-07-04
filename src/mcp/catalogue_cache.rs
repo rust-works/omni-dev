@@ -30,8 +30,9 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use tokio::sync::RwLock;
 
-use crate::atlassian::client::{
-    AgileBoardList, AtlassianClient, EditMeta, JiraField, JiraLinkType, JiraProjectList,
+use crate::atlassian::client::AtlassianClient;
+use crate::atlassian::jira_types::{
+    AgileBoardList, EditMeta, JiraField, JiraLinkType, JiraProjectList,
 };
 
 /// Default cache lifetime. Catalogue data changes rarely (admin-only).

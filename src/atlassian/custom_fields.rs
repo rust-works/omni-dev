@@ -14,11 +14,11 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use crate::atlassian::adf::AdfDocument;
 use crate::atlassian::adf_validated::{markdown_to_validated_adf, ValidatedAdfDocument};
-use crate::atlassian::client::{EditMeta, EditMetaField};
 use crate::atlassian::document::CustomFieldSection;
+use crate::atlassian::jira_types::{EditMeta, EditMetaField};
 
 #[cfg(test)]
-use crate::atlassian::client::TEXTAREA_CUSTOM_TYPE as CUSTOM_TEXTAREA;
+use crate::atlassian::jira_types::TEXTAREA_CUSTOM_TYPE as CUSTOM_TEXTAREA;
 
 /// Resolves a mixed set of frontmatter scalars and body sections into an
 /// API-ready custom field map keyed by stable field ID.
@@ -441,7 +441,7 @@ pub fn merge_set_field_overrides(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::atlassian::client::{EditMetaField, EditMetaSchema};
+    use crate::atlassian::jira_types::{EditMetaField, EditMetaSchema};
 
     fn meta(entries: &[(&str, &str, &str, Option<&str>)]) -> EditMeta {
         let mut fields = BTreeMap::new();

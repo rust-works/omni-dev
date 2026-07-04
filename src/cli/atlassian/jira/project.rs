@@ -3,7 +3,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::atlassian::client::{AtlassianClient, CreateMeta, JiraProjectList};
+use crate::atlassian::client::AtlassianClient;
+use crate::atlassian::jira_types::{CreateMeta, JiraProjectList};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -238,7 +239,7 @@ fn print_create_meta(meta: &CreateMeta) {
 
 /// Summarizes a field's allowed values for the table's `ALLOWED` column:
 /// the first few display values, with a trailing count when truncated.
-fn summarize_allowed(field: &crate::atlassian::client::CreateMetaField) -> String {
+fn summarize_allowed(field: &crate::atlassian::jira_types::CreateMetaField) -> String {
     const MAX_SHOWN: usize = 3;
     if field.allowed_values.is_empty() {
         return "-".to_string();
@@ -263,7 +264,7 @@ fn summarize_allowed(field: &crate::atlassian::client::CreateMetaField) -> Strin
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::atlassian::client::JiraProject;
+    use crate::atlassian::jira_types::JiraProject;
 
     fn sample_project(
         key: &str,
@@ -422,7 +423,7 @@ mod tests {
 
     // ── print_create_meta / summarize_allowed ──────────────────────
 
-    use crate::atlassian::client::{CreateMeta, CreateMetaAllowedValue, CreateMetaField};
+    use crate::atlassian::jira_types::{CreateMeta, CreateMetaAllowedValue, CreateMetaField};
 
     fn allowed(value: &str) -> CreateMetaAllowedValue {
         CreateMetaAllowedValue {

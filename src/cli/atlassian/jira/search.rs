@@ -3,7 +3,8 @@
 use anyhow::Result;
 use clap::Parser;
 
-use crate::atlassian::client::{AtlassianClient, JiraSearchResult};
+use crate::atlassian::client::AtlassianClient;
+use crate::atlassian::jira_types::JiraSearchResult;
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -153,7 +154,7 @@ fn print_search_results(result: &JiraSearchResult) {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::atlassian::client::JiraIssue;
+    use crate::atlassian::jira_types::JiraIssue;
 
     fn sample_issue(
         key: &str,

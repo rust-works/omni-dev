@@ -7,7 +7,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use serde::Serialize;
 
-use crate::atlassian::confluence_api::{ConfluenceApi, PageMetadata, PageVersion, SinceFilter};
+use crate::atlassian::confluence_api::ConfluenceApi;
+use crate::atlassian::confluence_types::{PageMetadata, PageVersion, SinceFilter};
 use crate::cli::atlassian::format::{output_as, JsonlSerialize, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 

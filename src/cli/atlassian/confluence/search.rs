@@ -3,7 +3,8 @@
 use anyhow::Result;
 use clap::Parser;
 
-use crate::atlassian::client::{AtlassianClient, ConfluenceSearchResults};
+use crate::atlassian::client::AtlassianClient;
+use crate::atlassian::confluence_types::ConfluenceSearchResults;
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -133,7 +134,7 @@ fn print_search_results(result: &ConfluenceSearchResults) {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::atlassian::client::ConfluenceSearchResult;
+    use crate::atlassian::confluence_types::ConfluenceSearchResult;
 
     fn sample_page(id: &str, title: &str, space: &str) -> ConfluenceSearchResult {
         ConfluenceSearchResult {

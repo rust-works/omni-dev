@@ -3,7 +3,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::atlassian::client::{AtlassianClient, JiraTransition};
+use crate::atlassian::client::AtlassianClient;
+use crate::atlassian::jira_types::JiraTransition;
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -329,7 +330,7 @@ mod tests {
             JiraTransition {
                 id: "21".to_string(),
                 name: "In Progress".to_string(),
-                to_status: Some(crate::atlassian::client::JiraTransitionToStatus {
+                to_status: Some(crate::atlassian::jira_types::JiraTransitionToStatus {
                     id: "3".to_string(),
                     name: "In Progress".to_string(),
                     category: Some("indeterminate".to_string()),
@@ -339,7 +340,7 @@ mod tests {
             JiraTransition {
                 id: "31".to_string(),
                 name: "Done".to_string(),
-                to_status: Some(crate::atlassian::client::JiraTransitionToStatus {
+                to_status: Some(crate::atlassian::jira_types::JiraTransitionToStatus {
                     id: "10000".to_string(),
                     name: "Done".to_string(),
                     category: Some("done".to_string()),

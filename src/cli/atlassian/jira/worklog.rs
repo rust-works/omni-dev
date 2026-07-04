@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::atlassian::client::JiraWorklogList;
+use crate::atlassian::jira_types::JiraWorklogList;
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -169,7 +169,7 @@ fn format_date(date: &str) -> &str {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::atlassian::client::JiraWorklog;
+    use crate::atlassian::jira_types::JiraWorklog;
 
     fn sample_worklog(
         id: &str,

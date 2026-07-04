@@ -3,7 +3,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::atlassian::client::{AgileSprintList, AtlassianClient, JiraSearchResult};
+use crate::atlassian::client::AtlassianClient;
+use crate::atlassian::jira_types::{AgileSprintList, JiraSearchResult};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -433,7 +434,7 @@ fn print_sprint_issues(result: &JiraSearchResult) {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::atlassian::client::{AgileSprint, JiraIssue};
+    use crate::atlassian::jira_types::{AgileSprint, JiraIssue};
 
     fn sample_sprint(
         id: u64,

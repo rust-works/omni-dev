@@ -25,7 +25,8 @@ use super::catalogue_cache::CatalogueCache;
 use super::dry_run::dry_run_request_yaml;
 use super::error::tool_error;
 use super::server::OmniDevServer;
-use crate::atlassian::client::{AgileBoard, AtlassianClient, JiraAttachment, JiraProject};
+use crate::atlassian::client::AtlassianClient;
+use crate::atlassian::jira_types::{AgileBoard, JiraAttachment, JiraProject};
 use crate::cli::atlassian::helpers::create_client;
 use crate::utils::path::attachment_filename;
 
@@ -226,7 +227,7 @@ pub(crate) async fn board_list_yaml(
         .cloned()
         .collect();
     let total = boards.len() as u32;
-    let view = crate::atlassian::client::AgileBoardList { boards, total };
+    let view = crate::atlassian::jira_types::AgileBoardList { boards, total };
     serde_yaml::to_string(&view).context("Failed to serialize boards as YAML")
 }
 
@@ -819,7 +820,7 @@ pub(crate) async fn project_list_yaml(
         .cloned()
         .collect();
     let total = projects.len() as u32;
-    let view = crate::atlassian::client::JiraProjectList { projects, total };
+    let view = crate::atlassian::jira_types::JiraProjectList { projects, total };
     serde_yaml::to_string(&view).context("Failed to serialize projects as YAML")
 }
 

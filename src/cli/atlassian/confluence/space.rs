@@ -3,7 +3,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::atlassian::confluence_api::{ConfluenceApi, ConfluenceSpacePage, PageSummaryPage};
+use crate::atlassian::confluence_api::ConfluenceApi;
+use crate::atlassian::confluence_types::{ConfluenceSpacePage, PageSummaryPage};
 use crate::cli::atlassian::format::{output_as, OutputFormat};
 use crate::cli::atlassian::helpers::create_client;
 
@@ -332,7 +333,7 @@ fn print_pages(page: &PageSummaryPage) {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::await_holding_lock)]
 mod tests {
     use super::*;
-    use crate::atlassian::confluence_api::ConfluenceSpace;
+    use crate::atlassian::confluence_types::ConfluenceSpace;
 
     fn sample_space(id: &str, key: &str, archived: bool) -> ConfluenceSpace {
         ConfluenceSpace {
@@ -545,7 +546,7 @@ mod tests {
 
     // ── PagesCommand: variants, display, run, execute ────────────────
 
-    use crate::atlassian::confluence_api::{PageSummary, PageSummaryPage};
+    use crate::atlassian::confluence_types::{PageSummary, PageSummaryPage};
 
     fn sample_page_summary(id: &str, title: &str) -> PageSummary {
         PageSummary {

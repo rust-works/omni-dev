@@ -21,9 +21,10 @@ use crate::atlassian::adf::AdfDocument;
 use crate::atlassian::adf_validated::{markdown_to_validated_adf, ValidatedAdfDocument};
 use crate::atlassian::api::{AtlassianApi, ContentItem};
 use crate::atlassian::client::AtlassianClient;
-use crate::atlassian::confluence_api::{
-    ChildPage, CommentKind, ConfluenceApi, ConfluenceAttachmentPage, ConfluenceSpacePage,
-    MovePosition, PageSummaryPage,
+use crate::atlassian::confluence_api::ConfluenceApi;
+use crate::atlassian::confluence_types::{
+    ChildPage, CommentKind, ConfluenceAttachmentPage, ConfluenceSpacePage, MovePosition,
+    PageSummaryPage,
 };
 use crate::atlassian::create::{prepend_warnings, resolve_confluence_create};
 use crate::atlassian::document::{content_item_to_document, JfmDocument, JfmFrontmatter};
@@ -686,7 +687,7 @@ fn parse_write_content(
 
 /// Serializes search results as YAML for the tool response body.
 fn serialize_search_results(
-    results: &crate::atlassian::client::ConfluenceSearchResults,
+    results: &crate::atlassian::confluence_types::ConfluenceSearchResults,
 ) -> Result<String> {
     serde_yaml::to_string(results).context("Failed to serialize search results")
 }
@@ -2510,7 +2511,7 @@ mod tests {
 
     #[test]
     fn serialize_search_results_emits_yaml() {
-        use crate::atlassian::client::{ConfluenceSearchResult, ConfluenceSearchResults};
+        use crate::atlassian::confluence_types::{ConfluenceSearchResult, ConfluenceSearchResults};
         let results = ConfluenceSearchResults {
             results: vec![ConfluenceSearchResult {
                 id: "12345".to_string(),

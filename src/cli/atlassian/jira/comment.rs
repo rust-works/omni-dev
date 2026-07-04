@@ -5,9 +5,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::atlassian::adf::AdfDocument;
 use crate::atlassian::adf_validated::{markdown_to_validated_adf, ValidatedAdfDocument};
-use crate::atlassian::client::{AtlassianClient, JiraComment, JiraVisibility, JiraVisibilityType};
+use crate::atlassian::client::AtlassianClient;
 use crate::atlassian::convert::adf_to_markdown;
 use crate::atlassian::document::JfmDocument;
+use crate::atlassian::jira_types::{JiraComment, JiraVisibility, JiraVisibilityType};
 use crate::cli::atlassian::format::{output_as, ContentFormat, OutputFormat};
 use crate::cli::atlassian::helpers::{create_client, read_input};
 

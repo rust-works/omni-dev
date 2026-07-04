@@ -9,7 +9,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::atlassian::adf::AdfDocument;
 use crate::atlassian::api::ContentMetadata;
-use crate::atlassian::confluence_api::{resolve_version, ConfluenceApi, PageVersion};
+use crate::atlassian::confluence_api::{resolve_version, ConfluenceApi};
+use crate::atlassian::confluence_types::PageVersion;
 use crate::atlassian::diff::{diff_documents, DiffOptions};
 use crate::atlassian::diff_format::{
     render, render_section, CompareContext, CompareOutput, Cursor, Detail, Filter, Includes,
