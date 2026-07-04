@@ -11,12 +11,14 @@
 //! external consumers.
 
 pub mod cue;
+pub mod detect;
 pub mod error;
 pub mod format;
 pub mod source;
 pub mod sources;
 
 pub use cue::Cue;
+pub use detect::detect;
 pub use error::{Result, TranscriptError};
 pub use format::Format;
 pub use source::{FetchOpts, LanguageInfo, MediaInfo, TrackKind, Transcript, TranscriptSource};

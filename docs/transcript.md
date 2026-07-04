@@ -7,6 +7,26 @@ generic VTT/SRT URLs, …) can be added without restructuring.
 
 ## CLI usage
 
+### Auto-detecting `fetch`
+
+`omni-dev transcript fetch <url>` probes every registered source and dispatches
+to the one that recognises the locator — no provider name required. It accepts
+the same flags as the per-source `fetch` below and is the shortest path when you
+have a URL and don't care which source handles it:
+
+```bash
+# Source auto-detected from the locator shape.
+omni-dev transcript fetch https://www.youtube.com/watch?v=jNQXAC9IVRw
+omni-dev transcript fetch jNQXAC9IVRw --format vtt -o me-at-the-zoo.vtt
+```
+
+A locator no registered source recognises fails with `InvalidLocator` before any
+network call. With only YouTube registered today, `fetch <url>` resolves to the
+YouTube source whenever the URL is a YouTube locator; the dispatch generalises
+the moment a second source is added (see "Adding a new source").
+
+### Per-source subcommands
+
 The provider is the first positional argument so per-source flags and help
 output stay clean:
 
@@ -153,6 +173,7 @@ that bridges `clap` argument parsing to library types.
 src/
   transcript/                     # library: no clap
     cue.rs                        # Cue { start_ms, end_ms, text }
+    detect.rs                     # detect(url) → Box<dyn TranscriptSource>
     error.rs                      # TranscriptError + Result alias
     source.rs                     # TranscriptSource trait + value types
     format.rs                     # Format enum + dispatch
@@ -162,6 +183,7 @@ src/
       youtube/{url,player_response,timedtext,innertube,watch_page}.rs
   cli/transcript/                 # CLI: clap dispatch only
     mod.rs                        # TranscriptCommand + TranscriptSubcommands
+    fetch.rs                      # provider-less auto-detecting `fetch`
     format.rs                     # CliFormat ↔ Format bridge
     youtube/{mod,fetch,info,list_langs}.rs
 ```
@@ -181,8 +203,13 @@ pub trait TranscriptSource: Send + Sync {
 ```
 
 `matches` is `where Self: Sized` so it stays out of the `dyn` vtable —
-sources can be used through `Box<dyn TranscriptSource>` (a future
-`omni-dev transcript fetch <url>` auto-detect path, tracked in #1187).
+sources can be used through `Box<dyn TranscriptSource>`. That is what powers
+the auto-detecting `omni-dev transcript fetch <url>` path:
+[`detect`](../src/transcript/detect.rs) probes each registered source's
+`matches` in order and returns the first as a `Box<dyn TranscriptSource>`,
+which the CLI then drives through the trait's `fetch`/`list_languages`/`info`
+(`matches` itself is static, so `detect` names each source concretely rather
+than calling through the box). Delivered in #1187.
 
 Format converters take `&[Cue]` and never reach back into a source, so
 they are reused as-is by every implementation.
@@ -251,6 +278,16 @@ Register the module by adding one line to
 
 ```rust
 pub mod vimeo;
+```
+
+Then add one probe arm to [`detect`](../src/transcript/detect.rs) so the
+provider-less `transcript fetch <url>` path can route to it (order matters only
+if two sources could claim the same locator — put the more specific first):
+
+```rust
+if Vimeo::matches(url) {
+    return Ok(Box::new(Vimeo::new()?));
+}
 ```
 
 That's the entire library surface. Note what is *not* needed:

@@ -3290,11 +3290,32 @@ Transcript and caption fetching from media platforms
 Usage: transcript <COMMAND>
 
 Commands:
+  fetch    Fetch a transcript, auto-detecting the source from the locator
   youtube  YouTube: fetch captions, list available languages, and inspect video metadata
   help     Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
+
+
+================================================================================
+
+omni-dev transcript fetch - Fetch a transcript, auto-detecting the source from the locator
+
+Fetch a transcript, auto-detecting the source from the locator
+
+Usage: fetch [OPTIONS] <URL>
+
+Arguments:
+  <URL>  Media URL or source-specific locator (e.g. a bare YouTube video ID). The source is auto-detected from its shape
+
+Options:
+      --lang <LANG>       Preferred caption language (e.g. `en`, `en-US`). Prefix fallback is applied — `en` matches `en-US` [default: en]
+      --format <FORMAT>   Output format [default: srt] [possible values: srt, vtt, txt, json]
+      --auto              Allow falling through to auto-generated (ASR) captions when no manual track matches
+      --translate <LANG>  Synthesise a translated track in this target language when no native track matches
+  -o, --output <OUTPUT>   Output file (writes to stdout if omitted)
+  -h, --help              Print help (see more with '--help')
 
 
 ================================================================================
