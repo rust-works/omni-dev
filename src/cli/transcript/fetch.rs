@@ -13,7 +13,7 @@ use clap::Parser;
 use crate::cli::transcript::format::CliFormat;
 use crate::transcript::detect::detect;
 use crate::transcript::format::Format;
-use crate::transcript::source::FetchOpts;
+use crate::transcript::source::{FetchOpts, Transcript};
 
 /// Fetches a transcript, auto-detecting the source from the locator.
 #[derive(Parser)]
@@ -47,19 +47,34 @@ pub struct FetchCommand {
 }
 
 impl FetchCommand {
-    /// Detects the source, fetches the transcript, and writes it to stdout or
-    /// `--output`.
+    /// Detects the source from the locator, then fetches, renders, and writes.
     pub async fn execute(self) -> Result<()> {
         let source = detect(&self.url)?;
-        let opts = FetchOpts {
-            language: self.lang,
-            allow_auto: self.auto,
-            translate_to: self.translate,
-        };
-        let transcript = source.fetch(&self.url, &opts).await?;
-        let rendered = Format::from(self.format).render(&transcript)?;
-        write_output(&rendered, self.output.as_deref())
+        let transcript = source.fetch(&self.url, &self.fetch_opts()).await?;
+        render_and_write(&transcript, self.format, self.output.as_deref())
     }
+
+    /// Map the parsed CLI flags onto the library's [`FetchOpts`].
+    fn fetch_opts(&self) -> FetchOpts {
+        FetchOpts {
+            language: self.lang.clone(),
+            allow_auto: self.auto,
+            translate_to: self.translate.clone(),
+        }
+    }
+}
+
+/// Render `transcript` in `format` and write it to stdout or `output`.
+///
+/// Split from [`FetchCommand::execute`] so the render + write wiring is
+/// unit-testable without the network-bound fetch that precedes it.
+fn render_and_write(
+    transcript: &Transcript,
+    format: CliFormat,
+    output: Option<&str>,
+) -> Result<()> {
+    let rendered = Format::from(format).render(transcript)?;
+    write_output(&rendered, output)
 }
 
 fn write_output(text: &str, file: Option<&str>) -> Result<()> {
@@ -143,5 +158,33 @@ mod tests {
     fn write_output_invalid_path_errors() {
         let err = write_output("x", Some("/nonexistent_dir_for_test/out.txt")).unwrap_err();
         assert!(err.to_string().contains("Failed to write"));
+    }
+
+    use crate::transcript::cue::Cue;
+    use crate::transcript::source::{TrackKind, Transcript};
+
+    #[test]
+    fn fetch_opts_maps_flags() {
+        let cmd = parse(&["abc", "--lang", "fr", "--auto", "--translate", "en"]);
+        let opts = cmd.fetch_opts();
+        assert_eq!(opts.language, "fr");
+        assert!(opts.allow_auto);
+        assert_eq!(opts.translate_to.as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn render_and_write_renders_selected_format_to_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.txt");
+        let transcript = Transcript {
+            source: "stub".into(),
+            locator_id: "vid".into(),
+            language: "en".into(),
+            kind: TrackKind::Manual,
+            cues: vec![Cue::new(0, 1_000, "hello world")],
+        };
+        render_and_write(&transcript, CliFormat::Txt, Some(path.to_str().unwrap())).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.contains("hello world"));
     }
 }

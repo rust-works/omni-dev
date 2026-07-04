@@ -55,12 +55,11 @@ mod tests {
 
     #[test]
     fn unrecognised_locator_is_invalid_locator() {
-        // `Box<dyn TranscriptSource>` is not `Debug`, so match rather than
-        // `unwrap_err` (which needs the `Ok` type to be `Debug`).
-        match detect("https://vimeo.com/76979871") {
-            Err(TranscriptError::InvalidLocator(msg)) => assert!(msg.contains("vimeo.com")),
-            Err(other) => panic!("expected InvalidLocator, got {other:?}"),
-            Ok(_) => panic!("expected InvalidLocator, but a source matched"),
-        }
+        // `Box<dyn TranscriptSource>` is not `Debug`, so use `matches!` rather
+        // than `unwrap_err` (which needs the `Ok` type to be `Debug`).
+        assert!(matches!(
+            detect("https://vimeo.com/76979871"),
+            Err(TranscriptError::InvalidLocator(msg)) if msg.contains("vimeo.com")
+        ));
     }
 }
