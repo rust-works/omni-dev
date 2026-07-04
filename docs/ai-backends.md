@@ -386,8 +386,13 @@ A `WARN` log is emitted on every invocation while this is active. Grep for
 it with `RUST_LOG=omni_dev=warn`:
 
 ```
-claude -p sandbox weakened: tool-access escape hatch is enabled ...
+claude -p sandbox weakened: tool-access escape hatch is enabled ... Enabled via command-line flag.
 ```
+
+The trailing clause names where the hatch was enabled — a command-line
+flag, a process environment variable (e.g. a shell export), or the `env`
+map in `$HOME/.omni-dev/settings.json` — so a deliberate one-off flag is
+distinguishable from a forgotten persistent setting (issue #1143).
 
 ### Escape hatch: MCP access
 
@@ -405,10 +410,11 @@ servers frequently hold OAuth tokens (Gmail, Drive, Slack) or expose internal
 network services — enabling this exposes them to the nested session. Use
 deliberately.
 
-A `WARN` log is emitted on every invocation while this is active:
+A `WARN` log is emitted on every invocation while this is active, ending
+with the same source-naming clause as the tool-access warning:
 
 ```
-claude -p sandbox weakened: MCP-access escape hatch is enabled ...
+claude -p sandbox weakened: MCP-access escape hatch is enabled ... Enabled via process environment variable (e.g. a shell export).
 ```
 
 The two escape hatches are independent — enable tools without MCP, MCP

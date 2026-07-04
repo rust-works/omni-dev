@@ -12,14 +12,81 @@
 //! credentials (Atlassian, Datadog), every write is hardened: parent directory
 //! `0700`, file `0600`, re-tightened on each write (issue #1128).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::utils::env::{EnvSource, SystemEnv};
+
+/// Where a resolved environment value came from, for provenance reporting
+/// (issue #1143).
+///
+/// An ambient setting — a shell export or a `settings.json` `env` entry — is
+/// sticky across invocations, so warnings about security-sensitive values
+/// (e.g. the claude-cli escape hatches) name the source to distinguish a
+/// deliberate one-off flag from a forgotten persistent setting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvValueSource {
+    /// Exported into the process environment by a command-line flag during
+    /// this invocation (see `Cli::propagate_global_flags`).
+    CliFlag,
+    /// The process environment (a shell export or inherited variable).
+    ProcessEnv,
+    /// The base `env` map in `$HOME/.omni-dev/settings.json`.
+    SettingsEnv,
+    /// The named profile's `env` map in `$HOME/.omni-dev/settings.json`.
+    SettingsProfile(String),
+}
+
+impl fmt::Display for EnvValueSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CliFlag => write!(f, "command-line flag"),
+            Self::ProcessEnv => write!(f, "process environment variable (e.g. a shell export)"),
+            Self::SettingsEnv => write!(f, "the env map in $HOME/.omni-dev/settings.json"),
+            Self::SettingsProfile(name) => {
+                write!(
+                    f,
+                    "the profile '{name}' env map in $HOME/.omni-dev/settings.json"
+                )
+            }
+        }
+    }
+}
+
+/// Env-var keys that `Cli::propagate_global_flags` exported from command-line
+/// flags this invocation. Additive-only, written once at startup, so readers
+/// can attribute a process-env hit to the flag that set it rather than to an
+/// ambient shell export. Not an env-mutation seam: tests exercise the sourced
+/// resolvers through their injected `from_cli_flag` parameter instead.
+static CLI_FLAG_EXPORTS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// Records that `key` was exported into the process environment by a
+/// command-line flag, so [`get_env_var_sourced`] reports
+/// [`EnvValueSource::CliFlag`] for it instead of
+/// [`EnvValueSource::ProcessEnv`].
+pub fn note_cli_flag_export(key: &str) {
+    // Recover from poisoning rather than losing provenance: the set is
+    // insert-only, so a panicked writer cannot leave it inconsistent.
+    let mut set = CLI_FLAG_EXPORTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set.insert(key.to_string());
+}
+
+/// Returns whether `key` was exported by a command-line flag this invocation.
+#[must_use]
+pub fn exported_by_cli_flag(key: &str) -> bool {
+    CLI_FLAG_EXPORTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(key)
+}
 
 /// Environment variable that selects the active profile, mirroring `AWS_PROFILE`.
 ///
@@ -161,15 +228,37 @@ impl Settings {
         active: Option<&str>,
         key: &str,
     ) -> Option<String> {
+        self.resolve_with_source(raw, active, key)
+            .map(|(value, _)| value)
+    }
+
+    /// Like [`Settings::resolve_with`], but also reports which layer supplied
+    /// the value: the raw process environment, the active profile's `env`, or
+    /// the base `env` (issue #1143). Same precedence, same profile isolation.
+    ///
+    /// A [`EnvValueSource::CliFlag`] attribution is layered on top by
+    /// [`get_env_var_sourced`], which knows about flag exports; this resolver
+    /// only distinguishes what it can see.
+    pub fn resolve_with_source<E: EnvSource>(
+        &self,
+        raw: &E,
+        active: Option<&str>,
+        key: &str,
+    ) -> Option<(String, EnvValueSource)> {
         if let Some(value) = raw.var(key) {
-            return Some(value);
+            return Some((value, EnvValueSource::ProcessEnv));
         }
         match active {
             Some(name) => self
                 .profiles
                 .get(name)
-                .and_then(|p| p.env.get(key).cloned()),
-            None => self.env.get(key).cloned(),
+                .and_then(|p| p.env.get(key).cloned())
+                .map(|value| (value, EnvValueSource::SettingsProfile(name.to_string()))),
+            None => self
+                .env
+                .get(key)
+                .cloned()
+                .map(|value| (value, EnvValueSource::SettingsEnv)),
         }
     }
 
@@ -377,22 +466,57 @@ pub fn get_env_var(key: &str) -> Result<String> {
     get_env_var_with(&SystemEnv, Settings::load, key)
 }
 
-/// Pure core of [`get_env_var`]: `env` is the raw source and `load` produces the
-/// settings lazily — it is invoked only on a raw-env miss, preserving the
-/// no-disk fast path. Tests inject a `MapEnv` and a closure returning `Ok`/`Err`
-/// to cover both the resolved and load-failure branches without touching disk.
+/// Like [`get_env_var`], but also reports where the value came from.
+///
+/// The source is a command-line flag export, the process environment, or a
+/// settings.json `env` map (issue #1143) — for warnings about
+/// security-sensitive values (e.g. the claude-cli escape hatches) that
+/// should name their source.
+pub fn get_env_var_sourced(key: &str) -> Result<(String, EnvValueSource)> {
+    get_env_var_sourced_with(&SystemEnv, Settings::load, exported_by_cli_flag(key), key)
+}
+
+/// Pure core of [`get_env_var`]: [`get_env_var_sourced_with`] with the source
+/// dropped.
 fn get_env_var_with<E, F>(env: &E, load: F, key: &str) -> Result<String>
 where
     E: EnvSource,
     F: FnOnce() -> Result<Settings>,
 {
+    get_env_var_sourced_with(env, load, false, key).map(|(value, _)| value)
+}
+
+/// Pure core of [`get_env_var_sourced`]: `env` is the raw source, `load`
+/// produces the settings lazily — it is invoked only on a raw-env miss,
+/// preserving the no-disk fast path — and `from_cli_flag` says whether a flag
+/// exported `key` this invocation (injected so tests never touch the
+/// process-global flag registry). Tests inject a `MapEnv` and a closure
+/// returning `Ok`/`Err` to cover both the resolved and load-failure branches
+/// without touching disk.
+fn get_env_var_sourced_with<E, F>(
+    env: &E,
+    load: F,
+    from_cli_flag: bool,
+    key: &str,
+) -> Result<(String, EnvValueSource)>
+where
+    E: EnvSource,
+    F: FnOnce() -> Result<Settings>,
+{
     // A raw process-env hit short-circuits without loading settings from disk.
+    // A flag export always lands in the process env, so the flag attribution
+    // only ever applies on this branch.
     if let Some(value) = env.var(key) {
-        return Ok(value);
+        let source = if from_cli_flag {
+            EnvValueSource::CliFlag
+        } else {
+            EnvValueSource::ProcessEnv
+        };
+        return Ok((value, source));
     }
     match load() {
         Ok(settings) => settings
-            .resolve_with(env, active_profile_from(env).as_deref(), key)
+            .resolve_with_source(env, active_profile_from(env).as_deref(), key)
             .ok_or_else(|| anyhow::anyhow!("Environment variable not found: {key}")),
         Err(err) => {
             // If we couldn't load settings, just return the original env var error
@@ -572,6 +696,65 @@ mod tests {
         );
     }
 
+    // ── sourced resolution (issue #1143: provenance for warnings) ──
+
+    #[test]
+    fn resolve_with_source_process_env_is_process_env() {
+        let settings = settings_with_profile();
+        let raw = MapEnv::new().with("ATLASSIAN_EMAIL", "cli@x.com");
+        assert_eq!(
+            settings.resolve_with_source(&raw, None, "ATLASSIAN_EMAIL"),
+            Some(("cli@x.com".to_string(), EnvValueSource::ProcessEnv))
+        );
+    }
+
+    #[test]
+    fn resolve_with_source_base_env_is_settings_env() {
+        let settings = settings_with_profile();
+        let raw = MapEnv::new();
+        assert_eq!(
+            settings.resolve_with_source(&raw, None, "ATLASSIAN_EMAIL"),
+            Some(("base@x.com".to_string(), EnvValueSource::SettingsEnv))
+        );
+    }
+
+    #[test]
+    fn resolve_with_source_profile_env_names_profile() {
+        let settings = settings_with_profile();
+        let raw = MapEnv::new();
+        assert_eq!(
+            settings.resolve_with_source(&raw, Some("work"), "ATLASSIAN_EMAIL"),
+            Some((
+                "me@work.com".to_string(),
+                EnvValueSource::SettingsProfile("work".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn resolve_with_source_missing_key_is_none() {
+        let settings = settings_with_profile();
+        let raw = MapEnv::new();
+        assert_eq!(settings.resolve_with_source(&raw, None, "MISSING"), None);
+    }
+
+    #[test]
+    fn env_value_source_display_names_each_layer() {
+        assert_eq!(EnvValueSource::CliFlag.to_string(), "command-line flag");
+        assert_eq!(
+            EnvValueSource::ProcessEnv.to_string(),
+            "process environment variable (e.g. a shell export)"
+        );
+        assert_eq!(
+            EnvValueSource::SettingsEnv.to_string(),
+            "the env map in $HOME/.omni-dev/settings.json"
+        );
+        assert_eq!(
+            EnvValueSource::SettingsProfile("work".to_string()).to_string(),
+            "the profile 'work' env map in $HOME/.omni-dev/settings.json"
+        );
+    }
+
     #[test]
     fn active_profile_from_reads_and_trims_empty() {
         assert_eq!(active_profile_from(&MapEnv::new()), None);
@@ -688,6 +871,59 @@ mod tests {
         assert_eq!(err.to_string(), "disk boom");
         let chain = format!("{err:#}");
         assert!(chain.contains("Environment variable not found: MISSING"));
+    }
+
+    // ── sourced get_env_var seam (issue #1143) ──
+
+    #[test]
+    fn get_env_var_sourced_with_raw_hit_is_process_env() {
+        let env = MapEnv::new().with("K", "v");
+        let resolved =
+            get_env_var_sourced_with(&env, || panic!("must not load settings"), false, "K")
+                .unwrap();
+        assert_eq!(resolved, ("v".to_string(), EnvValueSource::ProcessEnv));
+    }
+
+    #[test]
+    fn get_env_var_sourced_with_flag_export_is_cli_flag() {
+        let env = MapEnv::new().with("K", "true");
+        let resolved =
+            get_env_var_sourced_with(&env, || panic!("must not load settings"), true, "K").unwrap();
+        assert_eq!(resolved, ("true".to_string(), EnvValueSource::CliFlag));
+    }
+
+    #[test]
+    fn get_env_var_sourced_with_falls_back_to_settings_sources() {
+        let settings = settings_with_profile();
+        let env = MapEnv::new();
+        let resolved =
+            get_env_var_sourced_with(&env, || Ok(settings), false, "ATLASSIAN_EMAIL").unwrap();
+        assert_eq!(
+            resolved,
+            ("base@x.com".to_string(), EnvValueSource::SettingsEnv)
+        );
+
+        let settings = settings_with_profile();
+        let env = MapEnv::new().with(PROFILE_ENV_VAR, "work");
+        let resolved =
+            get_env_var_sourced_with(&env, || Ok(settings), false, "ATLASSIAN_EMAIL").unwrap();
+        assert_eq!(
+            resolved,
+            (
+                "me@work.com".to_string(),
+                EnvValueSource::SettingsProfile("work".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn cli_flag_export_registry_roundtrip() {
+        // Unique key: the registry is a process-global, additive-only set, so
+        // this test must not share keys with other tests (or production code).
+        const KEY: &str = "OMNI_DEV_TEST_1143_REGISTRY_ROUNDTRIP";
+        assert!(!exported_by_cli_flag(KEY));
+        note_cli_flag_export(KEY);
+        assert!(exported_by_cli_flag(KEY));
     }
 
     // ── env-write helpers (injected paths, no HOME mutation — issue #1030) ──

@@ -39,6 +39,7 @@ use tracing::{debug, info, warn};
 use super::{AiClient, AiClientCapabilities, AiClientMetadata, RequestOptions};
 use crate::claude::error::ClaudeError;
 use crate::request_log;
+use crate::utils::settings::EnvValueSource;
 
 /// Default subprocess timeout.
 pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
@@ -194,10 +195,19 @@ pub struct ClaudeCliAiClient {
     /// When true, skip `--tools ""` (escape hatch for future tool-enabled
     /// use cases). Off by default.
     allow_tools: bool,
+    /// Where the tool-access escape hatch was enabled from, when known —
+    /// named in the sandbox-weakened WARN so a deliberate one-off flag is
+    /// distinguishable from a sticky shell export or settings.json entry
+    /// (issue #1143). `None` for programmatic construction (tests,
+    /// embedders); the WARN then omits the source clause.
+    allow_tools_source: Option<EnvValueSource>,
     /// When true, skip `--strict-mcp-config`, letting the nested session
     /// pick up MCP servers from the user's `~/.claude/settings.json`.
     /// Off by default. Independent of [`Self::allow_tools`].
     allow_mcp: bool,
+    /// Where the MCP-access escape hatch was enabled from, when known.
+    /// Same semantics as [`Self::allow_tools_source`].
+    allow_mcp_source: Option<EnvValueSource>,
     /// Path to the `claude` binary (defaults to `claude` on PATH).
     binary_path: PathBuf,
     /// Optional per-invocation spending cap in USD (forwarded to
@@ -210,15 +220,20 @@ impl ClaudeCliAiClient {
     /// compiled-in defaults when unset).
     #[must_use]
     pub fn new(model: String) -> Self {
-        Self::new_with_config(
+        let (allow_tools, allow_tools_source) = Self::allow_tools_from_env();
+        let (allow_mcp, allow_mcp_source) = Self::allow_mcp_from_env();
+        let mut client = Self::new_with_config(
             model,
             Self::timeout_from_env(),
             Self::stdout_cap_from_env(),
-            Self::allow_tools_from_env(),
+            allow_tools,
             Self::binary_from_env(),
         )
-        .with_allow_mcp(Self::allow_mcp_from_env())
-        .with_max_budget_usd(Self::max_budget_from_env())
+        .with_allow_mcp(allow_mcp)
+        .with_max_budget_usd(Self::max_budget_from_env());
+        client.allow_tools_source = allow_tools_source;
+        client.allow_mcp_source = allow_mcp_source;
+        client
     }
 
     /// Creates a client with explicit configuration. Primarily for tests.
@@ -239,7 +254,9 @@ impl ClaudeCliAiClient {
             timeout,
             stdout_cap,
             allow_tools,
+            allow_tools_source: None,
             allow_mcp: false,
+            allow_mcp_source: None,
             binary_path,
             max_budget_usd: None,
         }
@@ -282,21 +299,36 @@ impl ClaudeCliAiClient {
     }
 
     /// Reads [`ALLOW_TOOLS_ENV_VAR`] and returns whether the tool-access
-    /// escape hatch is enabled. Accepts `true` / `1` / `yes` (case-insensitive);
-    /// everything else (including unset) means disabled.
-    fn allow_tools_from_env() -> bool {
-        crate::utils::settings::get_env_var(ALLOW_TOOLS_ENV_VAR)
-            .ok()
-            .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+    /// escape hatch is enabled, plus where the enabling value came from.
+    /// Accepts `true` / `1` / `yes` (case-insensitive); everything else
+    /// (including unset) means disabled, with no source.
+    fn allow_tools_from_env() -> (bool, Option<EnvValueSource>) {
+        Self::hatch_from_env(ALLOW_TOOLS_ENV_VAR)
     }
 
     /// Reads [`ALLOW_MCP_ENV_VAR`] and returns whether the MCP-access escape
-    /// hatch is enabled. Accepts `true` / `1` / `yes` (case-insensitive);
-    /// everything else (including unset) means disabled.
-    fn allow_mcp_from_env() -> bool {
-        crate::utils::settings::get_env_var(ALLOW_MCP_ENV_VAR)
-            .ok()
-            .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+    /// hatch is enabled, plus where the enabling value came from. Accepts
+    /// `true` / `1` / `yes` (case-insensitive); everything else (including
+    /// unset) means disabled, with no source.
+    fn allow_mcp_from_env() -> (bool, Option<EnvValueSource>) {
+        Self::hatch_from_env(ALLOW_MCP_ENV_VAR)
+    }
+
+    /// Shared reader for the two boolean escape hatches: resolves `env_var`
+    /// through the settings fallback chain and reports the source of a
+    /// truthy value so the sandbox-weakened WARN can name it (issue #1143).
+    fn hatch_from_env(env_var: &str) -> (bool, Option<EnvValueSource>) {
+        match crate::utils::settings::get_env_var_sourced(env_var) {
+            Ok((value, source))
+                if matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "true" | "1" | "yes"
+                ) =>
+            {
+                (true, Some(source))
+            }
+            _ => (false, None),
+        }
     }
 
     /// Reads [`MAX_BUDGET_ENV_VAR`] and returns the parsed spending cap.
@@ -328,6 +360,44 @@ impl ClaudeCliAiClient {
             );
         }
         parsed
+    }
+
+    /// Renders the sandbox-weakened WARN for the tool-access escape hatch.
+    /// Pure so the message — including the source clause — is unit-testable
+    /// (the WARN itself fires per invocation in `run_with_options_inner`).
+    fn tool_hatch_warning(source: Option<&EnvValueSource>) -> String {
+        format!(
+            "claude -p sandbox weakened: tool-access escape hatch is enabled \
+             (--claude-cli-allow-tools / {ALLOW_TOOLS_ENV_VAR}). \
+             The nested session can now read, edit, and execute against the \
+             environment it inherits, and its prompt is built from untrusted \
+             content (diffs, commit messages, JIRA text) that could carry a \
+             prompt-injection payload. Well-known secret env vars (*_API_KEY, \
+             *_TOKEN, *_SECRET, *_PASSWORD, *_CREDENTIALS, AWS credentials) \
+             are scrubbed from the subprocess; set \
+             {KEEP_ENV_VAR} to exempt specific names.{}",
+            Self::enabled_via(source)
+        )
+    }
+
+    /// Renders the sandbox-weakened WARN for the MCP-access escape hatch.
+    /// Pure for the same reason as [`Self::tool_hatch_warning`].
+    fn mcp_hatch_warning(source: Option<&EnvValueSource>) -> String {
+        format!(
+            "claude -p sandbox weakened: MCP-access escape hatch is enabled \
+             (--claude-cli-allow-mcp / {ALLOW_MCP_ENV_VAR}). \
+             The nested session can now load MCP servers configured in \
+             ~/.claude/settings.json, exposing any OAuth tokens or \
+             network-attached services they hold.{}",
+            Self::enabled_via(source)
+        )
+    }
+
+    /// Renders the trailing `Enabled via …` clause naming where an escape
+    /// hatch was turned on (issue #1143), or the empty string when the
+    /// source is unknown (programmatic construction).
+    fn enabled_via(source: Option<&EnvValueSource>) -> String {
+        source.map_or_else(String::new, |source| format!(" Enabled via {source}."))
     }
 
     /// Builds the subprocess [`Command`] without spawning.
@@ -515,25 +585,15 @@ impl ClaudeCliAiClient {
 
         if self.allow_tools {
             warn!(
-                "claude -p sandbox weakened: tool-access escape hatch is enabled \
-                 (--claude-cli-allow-tools / OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS). \
-                 The nested session can now read, edit, and execute against the \
-                 environment it inherits, and its prompt is built from untrusted \
-                 content (diffs, commit messages, JIRA text) that could carry a \
-                 prompt-injection payload. Well-known secret env vars (*_API_KEY, \
-                 *_TOKEN, *_SECRET, *_PASSWORD, *_CREDENTIALS, AWS credentials) \
-                 are scrubbed from the subprocess; set \
-                 OMNI_DEV_CLAUDE_CLI_KEEP_ENV to exempt specific names."
+                "{}",
+                Self::tool_hatch_warning(self.allow_tools_source.as_ref())
             );
         }
 
         if self.allow_mcp {
             warn!(
-                "claude -p sandbox weakened: MCP-access escape hatch is enabled \
-                 (--claude-cli-allow-mcp / OMNI_DEV_CLAUDE_CLI_ALLOW_MCP). \
-                 The nested session can now load MCP servers configured in \
-                 ~/.claude/settings.json, exposing any OAuth tokens or \
-                 network-attached services they hold."
+                "{}",
+                Self::mcp_hatch_warning(self.allow_mcp_source.as_ref())
             );
         }
 
@@ -1365,30 +1425,30 @@ mod tests {
     #[test]
     fn allow_tools_from_env_defaults_to_false_when_unset() {
         let _g = AllowToolsEnvGuard::new();
-        assert!(!ClaudeCliAiClient::allow_tools_from_env());
+        assert!(!ClaudeCliAiClient::allow_tools_from_env().0);
     }
 
     #[test]
     fn allow_tools_from_env_true() {
         let g = AllowToolsEnvGuard::new();
         g.set("true");
-        assert!(ClaudeCliAiClient::allow_tools_from_env());
+        assert!(ClaudeCliAiClient::allow_tools_from_env().0);
     }
 
     #[test]
     fn allow_tools_from_env_true_case_insensitive_and_trimmed() {
         let g = AllowToolsEnvGuard::new();
         g.set("  TRUE  ");
-        assert!(ClaudeCliAiClient::allow_tools_from_env());
+        assert!(ClaudeCliAiClient::allow_tools_from_env().0);
     }
 
     #[test]
     fn allow_tools_from_env_one_and_yes_accepted() {
         let g = AllowToolsEnvGuard::new();
         g.set("1");
-        assert!(ClaudeCliAiClient::allow_tools_from_env());
+        assert!(ClaudeCliAiClient::allow_tools_from_env().0);
         g.set("yes");
-        assert!(ClaudeCliAiClient::allow_tools_from_env());
+        assert!(ClaudeCliAiClient::allow_tools_from_env().0);
     }
 
     #[test]
@@ -1397,7 +1457,7 @@ mod tests {
         for v in ["false", "0", "no", "off", "TRUE1", "YES!", ""] {
             g.set(v);
             assert!(
-                !ClaudeCliAiClient::allow_tools_from_env(),
+                !ClaudeCliAiClient::allow_tools_from_env().0,
                 "value {v:?} should not enable the escape hatch"
             );
         }
@@ -1466,30 +1526,30 @@ mod tests {
     #[test]
     fn allow_mcp_from_env_defaults_to_false_when_unset() {
         let _g = AllowMcpEnvGuard::new();
-        assert!(!ClaudeCliAiClient::allow_mcp_from_env());
+        assert!(!ClaudeCliAiClient::allow_mcp_from_env().0);
     }
 
     #[test]
     fn allow_mcp_from_env_true() {
         let g = AllowMcpEnvGuard::new();
         g.set("true");
-        assert!(ClaudeCliAiClient::allow_mcp_from_env());
+        assert!(ClaudeCliAiClient::allow_mcp_from_env().0);
     }
 
     #[test]
     fn allow_mcp_from_env_true_case_insensitive_and_trimmed() {
         let g = AllowMcpEnvGuard::new();
         g.set("  TRUE  ");
-        assert!(ClaudeCliAiClient::allow_mcp_from_env());
+        assert!(ClaudeCliAiClient::allow_mcp_from_env().0);
     }
 
     #[test]
     fn allow_mcp_from_env_one_and_yes_accepted() {
         let g = AllowMcpEnvGuard::new();
         g.set("1");
-        assert!(ClaudeCliAiClient::allow_mcp_from_env());
+        assert!(ClaudeCliAiClient::allow_mcp_from_env().0);
         g.set("yes");
-        assert!(ClaudeCliAiClient::allow_mcp_from_env());
+        assert!(ClaudeCliAiClient::allow_mcp_from_env().0);
     }
 
     #[test]
@@ -1498,7 +1558,7 @@ mod tests {
         for v in ["false", "0", "no", "off", "TRUE1", "YES!", ""] {
             g.set(v);
             assert!(
-                !ClaudeCliAiClient::allow_mcp_from_env(),
+                !ClaudeCliAiClient::allow_mcp_from_env().0,
                 "value {v:?} should not enable the escape hatch"
             );
         }
@@ -1706,6 +1766,46 @@ mod tests {
             assert_eq!(ClaudeCliAiClient::max_budget_from_value("0.50"), Some(0.50));
         });
         assert!(logs.is_empty(), "no WARN expected for a valid cap: {logs}");
+    }
+
+    // ── sandbox-weakened WARN messages (issue #1143: source provenance) ──
+
+    #[test]
+    fn tool_hatch_warning_names_cli_flag_source() {
+        let msg = ClaudeCliAiClient::tool_hatch_warning(Some(&EnvValueSource::CliFlag));
+        assert!(msg.contains("tool-access escape hatch is enabled"));
+        assert!(msg.contains(ALLOW_TOOLS_ENV_VAR));
+        assert!(msg.ends_with("Enabled via command-line flag."));
+    }
+
+    #[test]
+    fn tool_hatch_warning_names_process_env_source() {
+        let msg = ClaudeCliAiClient::tool_hatch_warning(Some(&EnvValueSource::ProcessEnv));
+        assert!(msg.ends_with("Enabled via process environment variable (e.g. a shell export)."));
+    }
+
+    #[test]
+    fn mcp_hatch_warning_names_settings_sources() {
+        let msg = ClaudeCliAiClient::mcp_hatch_warning(Some(&EnvValueSource::SettingsEnv));
+        assert!(msg.contains("MCP-access escape hatch is enabled"));
+        assert!(msg.contains(ALLOW_MCP_ENV_VAR));
+        assert!(msg.ends_with("Enabled via the env map in $HOME/.omni-dev/settings.json."));
+
+        let profile = EnvValueSource::SettingsProfile("work".to_string());
+        let msg = ClaudeCliAiClient::mcp_hatch_warning(Some(&profile));
+        assert!(msg
+            .ends_with("Enabled via the profile 'work' env map in $HOME/.omni-dev/settings.json."));
+    }
+
+    #[test]
+    fn hatch_warnings_omit_source_clause_when_unknown() {
+        let tool = ClaudeCliAiClient::tool_hatch_warning(None);
+        assert!(tool.ends_with("to exempt specific names."));
+        assert!(!tool.contains("Enabled via"));
+
+        let mcp = ClaudeCliAiClient::mcp_hatch_warning(None);
+        assert!(mcp.ends_with("services they hold."));
+        assert!(!mcp.contains("Enabled via"));
     }
 
     #[test]
