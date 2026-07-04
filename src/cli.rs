@@ -211,12 +211,17 @@ impl Cli {
             std::env::set_var(crate::claude::backend::BETA_HEADER_ENV, beta_header);
         }
 
+        // The escape-hatch exports are also recorded in the flag-provenance
+        // registry so the sandbox-weakened WARN can attribute them to the
+        // flag rather than to an ambient shell export (issue #1143).
         if self.claude_cli_allow_tools {
             std::env::set_var("OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS", "true");
+            crate::utils::settings::note_cli_flag_export("OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS");
         }
 
         if self.claude_cli_allow_mcp {
             std::env::set_var("OMNI_DEV_CLAUDE_CLI_ALLOW_MCP", "true");
+            crate::utils::settings::note_cli_flag_export("OMNI_DEV_CLAUDE_CLI_ALLOW_MCP");
         }
 
         if let Some(budget) = self.claude_cli_max_budget_usd {
@@ -652,6 +657,11 @@ mod tests {
         cli.claude_cli_allow_tools = true;
         cli.propagate_global_flags();
         assert_eq!(std::env::var(ALLOW_TOOLS_VAR).ok().as_deref(), Some("true"));
+        // The flag export is recorded for WARN provenance (issue #1143). The
+        // registry is additive-only, so this assertion is order-independent.
+        assert!(crate::utils::settings::exported_by_cli_flag(
+            ALLOW_TOOLS_VAR
+        ));
     }
 
     #[test]
@@ -661,6 +671,7 @@ mod tests {
         cli.claude_cli_allow_mcp = true;
         cli.propagate_global_flags();
         assert_eq!(std::env::var(ALLOW_MCP_VAR).ok().as_deref(), Some("true"));
+        assert!(crate::utils::settings::exported_by_cli_flag(ALLOW_MCP_VAR));
     }
 
     #[test]
