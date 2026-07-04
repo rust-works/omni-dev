@@ -109,6 +109,25 @@ pub struct GitStagedCommitParams {
     pub repo_path: Option<String>,
 }
 
+/// Parameters for the `git_amend_commits` tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GitAmendCommitsParams {
+    /// Amendments to apply, as an inline YAML document with an `amendments`
+    /// list. Each entry needs `commit` (full 40-char SHA), `message` (the new
+    /// message), and `summary` (may be empty), matching the YAML produced by
+    /// `git_twiddle_commits` in `dry_run` mode. Applied deterministically — no
+    /// AI is involved.
+    pub amendments_yaml: String,
+    /// When true, permits amending commits that already exist in a remote main
+    /// branch (rewrites published history). Defaults to `false`, which refuses
+    /// such commits — mirrors the CLI `--allow-pushed` flag.
+    #[serde(default)]
+    pub allow_pushed: bool,
+    /// Path to the git repository. Defaults to the current working directory.
+    #[serde(default)]
+    pub repo_path: Option<String>,
+}
+
 /// Parameters for the `git_create_pr` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GitCreatePrParams {
@@ -246,6 +265,41 @@ impl OmniDevServer {
         )]))
     }
 
+    /// Tool: apply commit message amendments from an inline YAML document.
+    #[tool(
+        description = "Apply commit message amendments deterministically from an inline YAML \
+                       document (no AI). This is the apply-messages-from-YAML counterpart to \
+                       `git_twiddle_commits`: use `git_twiddle_commits` with `dry_run = true` to \
+                       generate the `amendments` YAML, then pass it here to apply. Mutating: \
+                       rewrites commit messages via `git commit --amend` / interactive rebase. \
+                       Mirrors `omni-dev git commit message amend`. Commits already contained in a \
+                       remote main branch are refused unless `allow_pushed = true` (rewriting \
+                       published history)."
+    )]
+    pub async fn git_amend_commits(
+        &self,
+        Parameters(params): Parameters<GitAmendCommitsParams>,
+        cancellation: CancellationToken,
+    ) -> Result<CallToolResult, McpError> {
+        let repo_path = params.repo_path.clone();
+        repo_path.as_deref().map(validate_repo_path).transpose()?;
+
+        let amendments_yaml = params.amendments_yaml.clone();
+        let allow_pushed = params.allow_pushed;
+        let outcome = spawn_blocking_cancellable(&cancellation, move || {
+            crate::cli::git::run_amend(
+                &amendments_yaml,
+                allow_pushed,
+                repo_path.as_deref().map(std::path::Path::new),
+            )
+        })
+        .await?;
+
+        Ok(CallToolResult::success(vec![Content::text(
+            format_amend_payload(&outcome),
+        )]))
+    }
+
     /// Tool: generate a commit message from staged changes and commit them.
     #[tool(
         description = "Generate a Conventional Commits message from the currently staged diff \
@@ -353,6 +407,14 @@ fn format_twiddle_payload(outcome: &crate::cli::git::TwiddleOutcome, dry_run: bo
         dry_run,
         outcome.amendment_count,
         indent_for_yaml(&outcome.amendments_yaml),
+    )
+}
+
+/// Formats the payload returned by the `git_amend_commits` tool.
+fn format_amend_payload(outcome: &crate::cli::git::AmendOutcome) -> String {
+    format!(
+        "# git_amend_commits outcome\napplied: {}\namendment_count: {}",
+        outcome.applied, outcome.amendment_count,
     )
 }
 
@@ -587,6 +649,47 @@ mod tests {
             repo_path: Some("/no/such/path/for/mcp/test".to_string()),
         };
         let err = server.git_create_pr(Parameters(params)).await.unwrap_err();
+        assert!(!err.message.is_empty());
+    }
+
+    #[test]
+    fn format_amend_payload_reports_applied_and_count() {
+        let outcome = crate::cli::git::AmendOutcome {
+            applied: true,
+            amendment_count: 3,
+        };
+        let payload = format_amend_payload(&outcome);
+        assert!(payload.contains("applied: true"));
+        assert!(payload.contains("amendment_count: 3"));
+    }
+
+    #[test]
+    fn format_amend_payload_reports_noop() {
+        let outcome = crate::cli::git::AmendOutcome {
+            applied: false,
+            amendment_count: 0,
+        };
+        let payload = format_amend_payload(&outcome);
+        assert!(payload.contains("applied: false"));
+        assert!(payload.contains("amendment_count: 0"));
+    }
+
+    #[tokio::test]
+    async fn git_amend_commits_handler_invalid_repo_path_returns_tool_error() {
+        use crate::mcp::server::OmniDevServer;
+        use rmcp::handler::server::wrapper::Parameters;
+        use tokio_util::sync::CancellationToken;
+
+        let server = OmniDevServer::new();
+        let params = GitAmendCommitsParams {
+            amendments_yaml: "amendments: []\n".to_string(),
+            allow_pushed: false,
+            repo_path: Some("/no/such/path/for/mcp/test".to_string()),
+        };
+        let err = server
+            .git_amend_commits(Parameters(params), CancellationToken::new())
+            .await
+            .unwrap_err();
         assert!(!err.message.is_empty());
     }
 }

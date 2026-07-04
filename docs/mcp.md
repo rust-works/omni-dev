@@ -81,7 +81,7 @@ wire format, directional semantics where order matters, and a `Mirrors
 carries the reverse reference (`mirrors the \`<tool>\` MCP tool`) in its
 `--help`, so the two surfaces stay discoverable from each other.
 
-### Git (5 tools)
+### Git (6 tools)
 
 | Tool | Purpose | CLI equivalent |
 |------|---------|----------------|
@@ -89,6 +89,7 @@ carries the reverse reference (`mirrors the \`<tool>\` MCP tool`) in its
 | `git_check_commits` | Validate commit messages against guidelines | `omni-dev git commit message check` |
 | `git_view_commits` | YAML commit analysis for a range | `omni-dev git commit message view` |
 | `git_twiddle_commits` | AI-powered commit message improvement | `omni-dev git commit message twiddle` |
+| `git_amend_commits` | Apply commit-message amendments deterministically from inline YAML (the apply counterpart to `git_twiddle_commits`) | `omni-dev git commit message amend` |
 | `git_create_pr` | AI-drafted PR title + body, optionally pushed | `omni-dev git branch create pr` |
 
 ### JIRA — core (11 tools)
@@ -96,7 +97,7 @@ carries the reverse reference (`mirrors the \`<tool>\` MCP tool`) in its
 | Tool | Purpose |
 |------|---------|
 | `jira_read` | Fetch a single issue (JFM markdown or ADF JSON). Supports `output_file`, `--fields`, `--all-fields` |
-| `jira_search` | JQL search; returns matching issues as YAML |
+| `jira_search` | JQL search; returns matching issues as YAML. Pass a raw `jql`, or the convenience filters `project` / `assignee` / `status` (ANDed) |
 | `jira_create` | Create a new issue. Supports `custom_fields` (a `{name-or-id: value}` map resolved against the create screen, including labels and issue-link fields such as `Parent`) for fields a project requires at create time |
 | `jira_bulk_create` | Create many issues and (optionally) wire dependency links between them in one call — for epic decomposition. See [Bulk create + link](#bulk-create--link-jira_bulk_create) |
 | `jira_write` | Update an issue body, `assignee`, `reporter`, or arbitrary raw-id `fields`. At least one of `content` or another field is required. (Set the parent for hierarchy via the `jira_link_parent` tool; prefer `jira_edit` for name-resolved field updates.) |
@@ -183,6 +184,54 @@ Read-only access to Datadog v1/v2 endpoints. Authentication uses
 | `claude_skills_clean` | Remove omni-dev-managed skill symlinks and exclude-block entries |
 | `claude_skills_status` | Report which omni-dev skill symlinks are present and current |
 | `config_models_show` | List supported AI models and token limits |
+
+### Snowflake (3 tools)
+
+Read-only SQL access, multiplexed through the daemon's authenticate-once
+Snowflake sessions — so these tools require a running daemon (`omni-dev daemon
+start`). First-time use of an `(account, user)` authenticates via
+external-browser SSO **on the daemon host**. **Unix-only** (the daemon uses a
+Unix control socket) — these tools are not compiled on Windows, matching the
+`omni-dev snowflake` CLI. See [Snowflake service](snowflake-service.md).
+
+| Tool | Purpose | CLI equivalent |
+|------|---------|----------------|
+| `snowflake_query` | Run SQL and return the result set as YAML | `omni-dev snowflake query` |
+| `snowflake_sessions` | List active multiplexed sessions | `omni-dev snowflake sessions` |
+| `snowflake_disconnect` | Evict one session by `account` + `user` | `omni-dev snowflake disconnect` |
+
+### Request log (1 tool)
+
+| Tool | Purpose | CLI equivalent |
+|------|---------|----------------|
+| `log_search` | Search the local invocation + HTTP request log (filters + `oneline`/`json`/`full`; `--follow` has no MCP form) | `omni-dev log` |
+
+### Transcript (3 tools)
+
+Read-only YouTube content fetch. The mutating `sync` subcommand has no MCP form.
+
+| Tool | Purpose | CLI equivalent |
+|------|---------|----------------|
+| `transcript_youtube_fetch` | Fetch a transcript rendered as `txt` (default) / `srt` / `vtt` / `json` | `omni-dev transcript youtube fetch` |
+| `transcript_youtube_info` | Video metadata (title, author, duration, tracks) as YAML | `omni-dev transcript youtube info` |
+| `transcript_youtube_list_langs` | List available caption tracks as YAML | `omni-dev transcript youtube list-langs` |
+
+### Coverage (1 tool)
+
+| Tool | Purpose | CLI equivalent |
+|------|---------|----------------|
+| `coverage_diff` | Diff/patch coverage from a report path + git diff; returns the rendered report, patch percentage, and gate result. Never fails the call — reports `below_gate` instead | `omni-dev coverage diff` |
+
+### Browser bridge (1 tool)
+
+Drives one HTTP request through a running, authenticated browser tab (requires a
+running bridge and a session token). **Not read-only** — a non-GET method can
+mutate remote state. `serve` / `harvest` are not MCP-appropriate. See [browser
+bridge](browser-bridge.md).
+
+| Tool | Purpose | CLI equivalent |
+|------|---------|----------------|
+| `browser_bridge_request` | Send a request through the tab; returns the buffered response envelope as YAML (streaming unsupported) | `omni-dev browser bridge request` |
 
 ## Resources
 

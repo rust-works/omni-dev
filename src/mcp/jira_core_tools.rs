@@ -55,8 +55,23 @@ pub struct JiraReadParams {
 /// Parameters for the `jira_search` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct JiraSearchParams {
-    /// JQL query string (e.g., `project = PROJ AND status = Open`).
-    pub jql: String,
+    /// Raw JQL query string (e.g., `project = PROJ AND status = Open`). When
+    /// provided it is used verbatim and the convenience filters below are
+    /// ignored. Optional — supply either `jql` or at least one filter.
+    #[serde(default)]
+    pub jql: Option<String>,
+    /// Convenience filter: project key. ANDed with the other filters when
+    /// `jql` is not provided.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Convenience filter: assignee (display name or email). ANDed with the
+    /// other filters when `jql` is not provided.
+    #[serde(default)]
+    pub assignee: Option<String>,
+    /// Convenience filter: status name. ANDed with the other filters when
+    /// `jql` is not provided.
+    #[serde(default)]
+    pub status: Option<String>,
     /// Maximum number of results. Defaults to 20; `0` means unlimited.
     #[serde(default)]
     pub limit: Option<u32>,
@@ -1197,8 +1212,10 @@ impl OmniDevServer {
     /// Tool: search JIRA issues by JQL.
     #[tool(description = "Search JIRA issues using a JQL query (e.g. \
                        `project = PROJ AND status = Open ORDER BY created DESC`; dates are \
-                       `YYYY-MM-DD`). Returns matching issues as YAML. `limit` defaults to 20; \
-                       pass `0` for unlimited. To list issues on a board or sprint instead, use \
+                       `YYYY-MM-DD`). Returns matching issues as YAML. Provide either a raw `jql` \
+                       string, or the convenience filters `project` / `assignee` / `status` (ANDed \
+                       together) — at least one is required. `limit` defaults to 20; pass `0` for \
+                       unlimited. To list issues on a board or sprint instead, use \
                        `jira_board_issues` / `jira_sprint_issues`.")]
     pub async fn jira_search(
         &self,
@@ -1209,8 +1226,21 @@ impl OmniDevServer {
         // returns the standard set. Keep it on the schema so callers can
         // grow into richer selections later without a breaking change.
         let _ = params.fields;
+        // Reuse the CLI's JQL builder so both surfaces assemble identical
+        // queries from a raw `jql` or the project/assignee/status filters.
+        let jql = crate::cli::atlassian::jira::search::build_jql_from_filters(
+            params.jql.as_deref(),
+            params.project.as_deref(),
+            params.assignee.as_deref(),
+            params.status.as_deref(),
+        )
+        .ok_or_else(|| {
+            tool_error(anyhow::anyhow!(
+                "Provide a raw `jql` query, or at least one filter (`project`, `assignee`, `status`)"
+            ))
+        })?;
         let (client, _instance_url) = create_client().map_err(tool_error)?;
-        let text = run_jira_search(&client, &params.jql, limit)
+        let text = run_jira_search(&client, &jql, limit)
             .await
             .map_err(tool_error)?;
         ok_text(text)
