@@ -138,6 +138,26 @@ No secret material is ever written, under any code path:
   whose name has a `token`/`secret`/`password`/`passwd`/`key` segment has its
   value redacted (flags ending in `-file`/`-path` carry paths and are exempt).
 
+### What redaction does not cover: prompt bodies
+
+The guarantees above keep *secret material* out of the log; they do not make
+prompt **content** secret. AI prompts carry whatever you asked about — repo
+diffs, commit messages, JIRA/Confluence data — and that content surfaces on
+three paths:
+
+- `OMNI_DEV_LOG_BODIES=1` records AI request/response bodies, which **are** the
+  prompts.
+- `RUST_LOG=debug` stderr tracing emits the **full system/user prompt and full
+  response** from every AI backend. Tracing is ephemeral and stderr-only, but
+  if you redirect it to a file or paste it into a bug report, prompt bodies go
+  with it.
+- On a `claude-cli` subprocess failure, the returned error embeds the child's
+  **stdout/stderr verbatim**, which can carry prompt-derived content into
+  whatever captures the error (terminal, CI logs, this log's `error` field).
+
+No API keys or tokens appear on any of these paths — this is a
+data-sensitivity note, not a credential leak.
+
 ## Daemon-served requests
 
 Requests executed inside the daemon (the browser bridge and the Snowflake
