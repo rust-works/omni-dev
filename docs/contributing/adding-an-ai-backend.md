@@ -125,40 +125,41 @@ impl AiClient for MistralAiClient {
 Don't roll your own — that's how you avoid the rest of the codebase
 noticing your backend exists.
 
-### 2. Wire it into the factory
+### 2. Extend the shared resolver, then wire the factory
 
-Add a dispatch branch to `create_default_claude_client` in
-[`src/claude/client.rs:1618`](../../src/claude/client.rs#L1618). The current
-order is:
+Backend/model/beta-header selection lives in one place:
+[`src/claude/backend.rs`](../../src/claude/backend.rs). Add:
 
-1. `OMNI_DEV_AI_BACKEND=claude-cli` → [`ClaudeCliAiClient`](../../src/claude/ai/claude_cli.rs)
-2. `USE_OLLAMA=true` → `OpenAiAiClient::new_ollama`
-3. `USE_OPENAI=true` → `OpenAiAiClient::new_openai`
-4. `CLAUDE_CODE_USE_BEDROCK=true` → [`BedrockAiClient`](../../src/claude/ai/bedrock.rs)
-5. Default → [`ClaudeAiClient`](../../src/claude/ai/claude.rs)
+1. A variant to the `AiBackend` enum (with an explicit `#[value(name =
+   "mistral")]` so the `--ai-backend` value renders correctly) and arms in
+   `env_value` / `from_env_value`.
+2. A model-resolution arm in `resolve_model` (which family vars / registry
+   default apply). Add named constants for any new env vars.
 
-Pick an env-var convention consistent with the table above
-(`USE_MISTRAL=true`) and slot your branch in before the default. The
-existing branches at lines 1676–1748 show the pattern: resolve the model
-name from registry/env, call `validate_beta_header`, look up the API key,
-construct the client, return `Ok(ClaudeClient::new(Box::new(ai_client)))`.
+`--ai-backend mistral` and `OMNI_DEV_AI_BACKEND=mistral` then work with no
+further wiring. Only add a legacy-style `USE_MISTRAL=true` selector to
+`resolve_backend` if you have a compatibility reason — new backends should
+be selected via `OMNI_DEV_AI_BACKEND` alone.
 
-### 3. Mirror it in preflight — **same PR, lock-step**
+Then add one dispatch arm to the `match` in
+`create_default_claude_client_with`
+([`src/claude/client.rs`](../../src/claude/client.rs)): call
+`validate_beta_header`, look up the API key, construct the client, return
+`Ok(ClaudeClient::new(Box::new(ai_client)))`. The existing arms show the
+pattern.
 
-[`src/utils/preflight.rs:52`](../../src/utils/preflight.rs#L52) — the
-`check_ai_credentials` function mirrors the same five-way switch and runs
-**before** any backend is constructed. Failing to update preflight is the
-single most common cause of "my backend works in dev but the binary errors
-out at startup".
+### 3. Add the preflight arm — **same PR**
+
+[`src/utils/preflight.rs`](../../src/utils/preflight.rs) — the
+`check_ai_credentials_with` function matches on the same resolved
+`AiBackend` and runs **before** any backend is constructed. Because it
+shares `resolve_backend`/`resolve_model`, selection and model resolution
+cannot drift; you only supply the credential check.
 
 Add a variant to the `AiProvider` enum at
 [`src/utils/preflight.rs:22`](../../src/utils/preflight.rs#L22), then add a
-branch that:
-
-1. Checks the same env var your factory branch checks.
-2. Resolves the model name the same way.
-3. Verifies the API key with the same `get_env_vars(...)` lookup.
-4. Returns `Ok(AiCredentialInfo { provider: AiProvider::Mistral, model })`.
+match arm that verifies the API key (same lookup as the factory arm) and
+returns `Ok(AiCredentialInfo { provider: AiProvider::Mistral, model })`.
 
 ### 4. Register models
 
@@ -206,10 +207,11 @@ coverage is welcome but not required.
 
 ## Gotchas
 
-- **Preflight must change in lock-step.** `CLAUDE.md` calls this out
-  explicitly; it's the rule the codebase enforces by convention rather
-  than by compiler. The two switches must list backends in the same order
-  for the same env vars.
+- **Factory and preflight share the resolver but not the credential
+  checks.** Selection/model drift is impossible (both call
+  `crate::claude::backend`), but a missing preflight match arm won't
+  compile only because `AiBackend` is exhaustively matched — keep the
+  credential logic in both arms consistent by hand.
 - **Beta headers are Anthropic-specific.** The factory calls
   `validate_beta_header(&model, &beta_header)?` for HTTP backends. Models
   with no beta-header table just get a no-op validation. For backends that
@@ -219,10 +221,10 @@ coverage is welcome but not required.
   [ADR-0014](../adrs/adr-0014.md). Don't reshape prompts inside the
   backend module unless the API genuinely needs it (e.g. OpenAI's
   `messages[0]` system role vs. Anthropic's top-level `system` field).
-- **Selection is env-var only.** There's no `--ai-backend` CLI flag; per-
-  backend flags (`--claude-cli-allow-tools`, `--claude-cli-max-budget-usd`)
-  live on individual subcommands. Don't invent a global selector flag —
-  it's been considered and intentionally deferred.
+- **Selection is the global `--ai-backend` flag / `OMNI_DEV_AI_BACKEND`.**
+  New enum variants surface in the flag's possible values automatically —
+  which also means the help snapshot changes, so run the `update-snapshots`
+  skill. Don't invent per-backend `USE_*` selector vars; those are legacy.
 
 ## ADRs
 

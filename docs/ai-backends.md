@@ -28,37 +28,52 @@ between them. For dev-facing notes on the dispatch implementation, see the
 | Backend       | Selector                                                                         | Required credentials                                                                       | Default model                | Best when                                                            |
 |---------------|----------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------|------------------------------|----------------------------------------------------------------------|
 | Claude CLI    | `--ai-backend claude-cli` or `OMNI_DEV_AI_BACKEND=claude-cli`                    | An authenticated `claude` CLI session                                                      | `claude-sonnet-4-6`          | You already use Claude Code and want to reuse its auth and billing.  |
-| Ollama        | `USE_OLLAMA=true`                                                                | None (local server)                                                                        | `llama2`                     | Offline / local-only inference, experimenting with open models.      |
-| OpenAI        | `USE_OPENAI=true`                                                                | `OPENAI_API_KEY` or `OPENAI_AUTH_TOKEN`                                                    | `gpt-5-mini` (registry)      | You're an OpenAI customer or want non-Claude models via OpenAI.      |
-| AWS Bedrock   | `CLAUDE_CODE_USE_BEDROCK=true`                                                   | `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BEDROCK_BASE_URL`                                       | `claude-sonnet-4-6`          | Your org runs Anthropic models through AWS Bedrock.                  |
-| Claude API    | *(default — no flag)*                                                            | `CLAUDE_API_KEY` or `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`                          | `claude-sonnet-4-6`          | You have an Anthropic API key. Lowest-friction starting point.       |
+| Ollama        | `--ai-backend ollama` (legacy: `USE_OLLAMA=true`)                                | None (local server)                                                                        | `llama2`                     | Offline / local-only inference, experimenting with open models.      |
+| OpenAI        | `--ai-backend openai` (legacy: `USE_OPENAI=true`)                                | `OPENAI_API_KEY` or `OPENAI_AUTH_TOKEN`                                                    | `gpt-5-mini` (registry)      | You're an OpenAI customer or want non-Claude models via OpenAI.      |
+| AWS Bedrock   | `--ai-backend bedrock` (legacy: `CLAUDE_CODE_USE_BEDROCK=true`)                  | `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BEDROCK_BASE_URL`                                       | `claude-sonnet-4-6`          | Your org runs Anthropic models through AWS Bedrock.                  |
+| Claude API    | *(default — no flag)* or `--ai-backend default`                                  | `CLAUDE_API_KEY` or `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`                          | `claude-sonnet-4-6`          | You have an Anthropic API key. Lowest-friction starting point.       |
 
 ## Dispatch Order and Model Selection
 
-Backends are evaluated in a strict priority order — the first match wins.
-The CLI flag or environment variable on the left is what selects the row;
-later rows are ignored once an earlier one matches.
+The global `--ai-backend` flag accepts `default`, `claude-cli`, `openai`,
+`ollama`, and `bedrock`, and is equivalent to setting `OMNI_DEV_AI_BACKEND`
+to the same value (the flag wins when both are set). When
+`OMNI_DEV_AI_BACKEND` is set it decides the backend **outright** — including
+`default`, which forces the direct Claude API even when the legacy `USE_*`
+variables are set. An unknown value is a hard error listing the valid values.
 
-| Priority | Selector                                                | Backend       |
+When `OMNI_DEV_AI_BACKEND` is unset, the legacy selection flags apply in a
+strict priority order — the first match wins:
+
+| Priority | Selector (only when `OMNI_DEV_AI_BACKEND` is unset)    | Backend       |
 |----------|---------------------------------------------------------|---------------|
-| 1        | `OMNI_DEV_AI_BACKEND=claude-cli` / `--ai-backend claude-cli` | Claude CLI |
-| 2        | `USE_OLLAMA=true`                                       | Ollama        |
-| 3        | `USE_OPENAI=true`                                       | OpenAI        |
-| 4        | `CLAUDE_CODE_USE_BEDROCK=true`                          | AWS Bedrock   |
-| 5        | *(none of the above)*                                   | Claude API    |
-
-The CLI flag `--ai-backend claude-cli` takes precedence over the environment
-variable when both are set.
+| 1        | `USE_OLLAMA=true`                                       | Ollama        |
+| 2        | `USE_OPENAI=true`                                       | OpenAI        |
+| 3        | `CLAUDE_CODE_USE_BEDROCK=true`                          | AWS Bedrock   |
+| 4        | *(none of the above)*                                   | Claude API    |
 
 **Model resolution.** Every backend resolves the model through the same
 precedence chain, stopping at the first non-empty value:
 
-1. `--model <id>` (CLI flag)
-2. `CLAUDE_MODEL`
-3. `CLAUDE_CODE_MODEL`
-4. `ANTHROPIC_MODEL`
-5. Provider-specific override (`OPENAI_MODEL`, `OLLAMA_MODEL`)
-6. Registry default for the active provider
+1. `--model <id>` (global CLI flag)
+2. `OMNI_DEV_MODEL` (what `--model` propagates to; settable directly or via
+   `~/.omni-dev/settings.json` env bundles / profiles)
+3. The backend family's own variables:
+   - Claude family (Claude API, Bedrock, Claude CLI):
+     `CLAUDE_MODEL` → `CLAUDE_CODE_MODEL` → `ANTHROPIC_MODEL`
+   - OpenAI: `OPENAI_MODEL`
+   - Ollama: `OLLAMA_MODEL`
+4. Registry default for the active provider (`claude-sonnet-4-6`,
+   `gpt-5-mini`, or `llama2` for Ollama)
+
+The Claude-family variables are deliberately scoped to Claude-family
+backends: an exported `CLAUDE_MODEL` can never leak a Claude model id into
+the OpenAI or Ollama backends.
+
+**Beta headers.** The global `--beta-header key:value` flag (equivalent to
+`OMNI_DEV_BETA_HEADER`) attaches a beta header to API requests when the
+model registry lists it as supported. It is ignored (with a warning) by the
+`claude-cli` backend.
 
 See the [Model Registry](#model-registry) section below for how to list,
 override, or extend the catalogue.
@@ -66,7 +81,8 @@ override, or extend the catalogue.
 ## Claude API (default)
 
 The default backend calls the Anthropic Messages API over HTTPS. No flags
-required.
+required. To force it when legacy `USE_*` variables are exported in your
+environment, pass `--ai-backend default`.
 
 **Credentials.** Set one of (checked in order):
 
@@ -138,6 +154,10 @@ Calls the OpenAI Chat Completions API.
 **Selection.**
 
 ```bash
+omni-dev --ai-backend openai ...
+# or persistently:
+export OMNI_DEV_AI_BACKEND=openai
+# legacy (applies only when OMNI_DEV_AI_BACKEND is unset):
 export USE_OPENAI=true
 ```
 
@@ -186,6 +206,10 @@ over HTTP. No API key required.
 **Selection.**
 
 ```bash
+omni-dev --ai-backend ollama ...
+# or persistently:
+export OMNI_DEV_AI_BACKEND=ollama
+# legacy (applies only when OMNI_DEV_AI_BACKEND is unset):
 export USE_OLLAMA=true
 ```
 
@@ -237,6 +261,10 @@ Routes Anthropic model calls through AWS Bedrock's bearer-token API.
 **Selection.**
 
 ```bash
+omni-dev --ai-backend bedrock ...
+# or persistently:
+export OMNI_DEV_AI_BACKEND=bedrock
+# legacy (applies only when OMNI_DEV_AI_BACKEND is unset):
 export CLAUDE_CODE_USE_BEDROCK=true
 ```
 

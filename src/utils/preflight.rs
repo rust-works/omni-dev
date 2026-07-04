@@ -381,6 +381,26 @@ mod tests {
     }
 
     #[test]
+    fn bedrock_errors_without_auth_token() {
+        let env = MapEnv::new().with("CLAUDE_CODE_USE_BEDROCK", "true");
+        let err = check_ai_credentials_with(&env, None).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("AWS Bedrock authentication not configured"));
+    }
+
+    #[test]
+    fn bedrock_errors_without_base_url() {
+        let env = MapEnv::new()
+            .with("CLAUDE_CODE_USE_BEDROCK", "true")
+            .with("ANTHROPIC_AUTH_TOKEN", "test-token");
+        let err = check_ai_credentials_with(&env, None).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("AWS Bedrock base URL not configured"));
+    }
+
+    #[test]
     fn model_override_takes_precedence() {
         let env = MapEnv::new().with("ANTHROPIC_API_KEY", "sk-test-dummy");
 

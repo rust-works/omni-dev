@@ -125,12 +125,6 @@ impl AiBackend {
             _ => None,
         }
     }
-
-    /// Returns true for backends that speak to Claude models
-    /// (direct API, Bedrock, and the `claude -p` subprocess).
-    fn is_claude_family(self) -> bool {
-        matches!(self, Self::Default | Self::ClaudeCli | Self::Bedrock)
-    }
 }
 
 /// Returns `var`'s value when it is set and non-empty.
@@ -194,19 +188,18 @@ pub fn resolve_model(
         return model;
     }
 
-    if backend.is_claude_family() {
-        return [CLAUDE_MODEL_ENV, CLAUDE_CODE_MODEL_ENV, ANTHROPIC_MODEL_ENV]
-            .iter()
-            .find_map(|key| non_empty_var(env, key))
-            .unwrap_or_else(|| {
-                registry
-                    .get_default_model("claude")
-                    .unwrap_or(FALLBACK_CLAUDE_MODEL)
-                    .to_string()
-            });
-    }
-
     match backend {
+        AiBackend::Default | AiBackend::ClaudeCli | AiBackend::Bedrock => {
+            [CLAUDE_MODEL_ENV, CLAUDE_CODE_MODEL_ENV, ANTHROPIC_MODEL_ENV]
+                .iter()
+                .find_map(|key| non_empty_var(env, key))
+                .unwrap_or_else(|| {
+                    registry
+                        .get_default_model("claude")
+                        .unwrap_or(FALLBACK_CLAUDE_MODEL)
+                        .to_string()
+                })
+        }
         AiBackend::OpenAi => non_empty_var(env, OPENAI_MODEL_ENV).unwrap_or_else(|| {
             registry
                 .get_default_model("openai")
@@ -215,8 +208,6 @@ pub fn resolve_model(
         }),
         AiBackend::Ollama => non_empty_var(env, OLLAMA_MODEL_ENV)
             .unwrap_or_else(|| FALLBACK_OLLAMA_MODEL.to_string()),
-        // Claude-family variants returned above.
-        AiBackend::Default | AiBackend::ClaudeCli | AiBackend::Bedrock => unreachable!(),
     }
 }
 
@@ -228,10 +219,12 @@ pub fn parse_beta_header(s: &str) -> Result<(String, String)> {
     Ok((k.to_string(), v.to_string()))
 }
 
-/// Resolves the beta header: `explicit` (callers with their own parameter)
-/// wins; otherwise [`BETA_HEADER_ENV`] (set by the global `--beta-header`
-/// flag) is parsed as `key:value`. A set-but-malformed value is a hard
-/// error; unset (or empty) resolves to `None`.
+/// Resolves the beta header to send with AI API requests.
+///
+/// `explicit` (callers with their own parameter) wins; otherwise
+/// [`BETA_HEADER_ENV`] (set by the global `--beta-header` flag) is parsed as
+/// `key:value`. A set-but-malformed value is a hard error; unset (or empty)
+/// resolves to `None`.
 pub fn resolve_beta_header(
     explicit: Option<(String, String)>,
     env: &impl EnvSource,
