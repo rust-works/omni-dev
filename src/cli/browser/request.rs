@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -65,8 +65,15 @@ pub struct RequestCommand {
     pub headers: Vec<String>,
 
     /// Request body. Prefix with `@` to read from a file (e.g. `@payload.json`).
+    /// UTF-8 text only; use `--body-file` for binary payloads.
     #[arg(long)]
     pub body: Option<String>,
+
+    /// Read the request body from a file as raw bytes, base64-encoded on the
+    /// wire (the browser decodes it before `fetch()`). Use for binary payloads
+    /// such as images, protobuf, or gzip. Mutually exclusive with `--body`.
+    #[arg(long, value_name = "PATH", conflicts_with = "body")]
+    pub body_file: Option<PathBuf>,
 
     /// Fetch credentials mode. Defaults to `include` (cookies/auth sent). Use
     /// `omit` to read a wildcard-CORS cross-origin response (e.g. a public CDN
@@ -108,7 +115,7 @@ impl RequestCommand {
     pub async fn execute(self) -> Result<()> {
         let token = super::resolve_client_token(self.token_file.as_deref())?;
         let headers = parse_headers(&self.headers)?;
-        let body = resolve_body(self.body.as_deref())?;
+        let (body, encoding) = resolve_body(self.body.as_deref(), self.body_file.as_deref())?;
 
         let payload = ControlRequest {
             url: self.url,
@@ -119,6 +126,7 @@ impl RequestCommand {
             target: self.target,
             allow_origin: self.allow_origin,
             credentials: self.credentials.map(Credentials::to_fetch_value),
+            encoding,
         };
 
         let client = BridgeClient::new(self.control_port, token);
@@ -210,18 +218,33 @@ fn parse_headers(raw: &[String]) -> Result<BTreeMap<String, String>> {
     Ok(map)
 }
 
-/// Resolves a `--body` argument, reading from a file when prefixed with `@`.
-fn resolve_body(body: Option<&str>) -> Result<Option<String>> {
-    match body {
-        None => Ok(None),
-        Some(spec) => match spec.strip_prefix('@') {
+/// Resolves the request body into a `(body, encoding)` pair.
+///
+/// `--body` carries UTF-8 text (verbatim, or read from a file when prefixed with
+/// `@`) and never sets an encoding. `--body-file` reads raw bytes and
+/// base64-encodes them, tagging `encoding = "base64"` so the browser snippet
+/// decodes the body back to bytes before `fetch()`. The two are mutually
+/// exclusive (enforced by clap `conflicts_with`; re-checked here defensively).
+fn resolve_body(
+    body: Option<&str>,
+    body_file: Option<&Path>,
+) -> Result<(Option<String>, Option<String>)> {
+    match (body, body_file) {
+        (Some(_), Some(_)) => bail!("--body and --body-file are mutually exclusive"),
+        (None, Some(path)) => {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("Failed to read body file {}", path.display()))?;
+            Ok((Some(BASE64.encode(bytes)), Some("base64".to_string())))
+        }
+        (Some(spec), None) => match spec.strip_prefix('@') {
             Some(path) => {
                 let contents = std::fs::read_to_string(path)
                     .with_context(|| format!("Failed to read body file {path}"))?;
-                Ok(Some(contents))
+                Ok((Some(contents), None))
             }
-            None => Ok(Some(spec.to_string())),
+            None => Ok((Some(spec.to_string()), None)),
         },
+        (None, None) => Ok((None, None)),
     }
 }
 
@@ -290,16 +313,65 @@ mod tests {
 
     #[test]
     fn resolve_body_inline_and_file() {
-        assert_eq!(resolve_body(None).unwrap(), None);
-        assert_eq!(resolve_body(Some("hi")).unwrap(), Some("hi".to_string()));
+        // No body → no encoding.
+        assert_eq!(resolve_body(None, None).unwrap(), (None, None));
+        // Inline text → verbatim, no encoding.
+        assert_eq!(
+            resolve_body(Some("hi"), None).unwrap(),
+            (Some("hi".to_string()), None)
+        );
 
+        // `@file` → text contents, no encoding.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("payload.json");
         std::fs::write(&path, "{\"a\":1}").unwrap();
         let spec = format!("@{}", path.display());
         assert_eq!(
-            resolve_body(Some(&spec)).unwrap(),
-            Some("{\"a\":1}".to_string())
+            resolve_body(Some(&spec), None).unwrap(),
+            (Some("{\"a\":1}".to_string()), None)
         );
+    }
+
+    #[test]
+    fn resolve_body_file_base64_round_trips_binary() {
+        // Non-UTF-8 bytes that `read_to_string` would reject.
+        let raw: &[u8] = &[0xFF, 0xFE, 0x00, 0x01, 0x80];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob.bin");
+        std::fs::write(&path, raw).unwrap();
+
+        let (body, encoding) = resolve_body(None, Some(path.as_path())).unwrap();
+        assert_eq!(encoding.as_deref(), Some("base64"));
+        // The base64 payload decodes back to the exact original bytes.
+        let decoded = BASE64.decode(body.unwrap().as_bytes()).unwrap();
+        assert_eq!(decoded, raw);
+    }
+
+    #[test]
+    fn resolve_body_file_always_base64_even_for_text() {
+        // `--body-file` is the raw-bytes path: it always base64-encodes, even a
+        // perfectly valid UTF-8 file (byte-exact on the wire either way).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("text.txt");
+        std::fs::write(&path, "hello").unwrap();
+
+        let (body, encoding) = resolve_body(None, Some(path.as_path())).unwrap();
+        assert_eq!(encoding.as_deref(), Some("base64"));
+        assert_eq!(BASE64.decode(body.unwrap().as_bytes()).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn body_and_body_file_are_mutually_exclusive() {
+        // clap rejects the two flags together (`conflicts_with`).
+        assert!(RequestCommand::try_parse_from([
+            "request",
+            "--url",
+            "/x",
+            "--body",
+            "hi",
+            "--body-file",
+            "payload.bin",
+        ])
+        .is_err());
     }
 }

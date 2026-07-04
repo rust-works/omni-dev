@@ -719,6 +719,9 @@ async fn proxy_handler(State(state): State<AppState>, request: Request) -> Respo
         // The transparent proxy has no per-request credentials control; it keeps
         // the snippet default (`include`), matching pre-credentials behavior.
         credentials: None,
+        // The proxy already lossily decodes the inbound body as UTF-8 text above,
+        // so it never tags a base64 request encoding.
+        encoding: None,
     };
 
     if stream {
@@ -983,6 +986,7 @@ async fn dispatch(
         body: req.body,
         stream: false,
         credentials: req.credentials,
+        encoding: req.encoding,
     };
     let frame = match serde_json::to_string(&command) {
         Ok(f) => f,
@@ -1161,6 +1165,7 @@ async fn start_stream(
         body: req.body,
         stream: true,
         credentials: req.credentials,
+        encoding: req.encoding,
     };
     let frame = match serde_json::to_string(&command) {
         Ok(f) => f,
@@ -1598,6 +1603,7 @@ mod tests {
             target: None,
             allow_origin: None,
             credentials: None,
+            encoding: None,
         }
     }
 

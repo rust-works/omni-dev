@@ -202,6 +202,7 @@ mod tests {
                 method: "GET".to_string(),
                 headers: Vec::new(),
                 body: None,
+                body_file: None,
                 // Port 0 never has a listener, so the client fails fast.
                 control_port: 0,
                 token_file: None,
