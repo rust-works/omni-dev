@@ -27,6 +27,14 @@
     }
     return btoa(bin);
   };
+  // Inverse of toBase64: decode a base64 request body to a Uint8Array so binary
+  // payloads (images, protobuf, gzip) go out over `fetch` byte-for-byte.
+  const fromBase64 = (b64) => {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  };
   const connect = () => {
     log('connecting to ' + ENDPOINT + ' …');
     ws = new WebSocket(ENDPOINT, [TOKEN]);
@@ -53,7 +61,7 @@
         const resp = await fetch(cmd.url, {
           method: cmd.method || 'GET',
           headers: cmd.headers || {},
-          body: cmd.body || undefined,
+          body: cmd.encoding === 'base64' ? fromBase64(cmd.body || '') : (cmd.body || undefined),
           credentials: cmd.credentials || 'include',
         });
         const headers = {};

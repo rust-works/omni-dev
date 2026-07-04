@@ -2095,7 +2095,8 @@ Options:
       --url <URL>                    Request URL, relative to the browser's page origin (e.g. `/api/foo`)
       --method <METHOD>              HTTP method [default: GET]
       --header <NAME: VALUE>         Request header as `Name: Value`. May be repeated
-      --body <BODY>                  Request body. Prefix with `@` to read from a file (e.g. `@payload.json`)
+      --body <BODY>                  Request body. Prefix with `@` to read from a file (e.g. `@payload.json`). UTF-8 text only; use `--body-file` for binary payloads
+      --body-file <PATH>             Read the request body from a file as raw bytes, base64-encoded on the wire (the browser decodes it before `fetch()`). Use for binary payloads such as images, protobuf, or gzip. Mutually exclusive with `--body`
       --credentials <CREDENTIALS>    Fetch credentials mode. Defaults to `include` (cookies/auth sent). Use `omit` to read a wildcard-CORS cross-origin response (e.g. a public CDN asset), which a credentialed request cannot read [possible values: include, omit, same-origin]
       --control-port <CONTROL_PORT>  Control-plane port of the running bridge [default: 9998]
       --token-file <PATH>            Read the session token from this `0600` file instead of the environment

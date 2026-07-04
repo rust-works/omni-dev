@@ -94,6 +94,7 @@ mod tests {
             target: None,
             allow_origin: None,
             credentials: None,
+            encoding: None,
         }
     }
 

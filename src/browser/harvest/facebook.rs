@@ -521,6 +521,7 @@ impl Harvester {
             target: self.config.target.clone(),
             allow_origin: None,
             credentials: None,
+            encoding: None,
         }
     }
 
@@ -543,6 +544,7 @@ impl Harvester {
                 target: self.config.target.clone(),
                 allow_origin: Some(FBCDN_HOST.to_string()),
                 credentials: Some("omit".to_string()),
+                encoding: None,
             };
             tried += 1;
             // A single failing bundle must not abort discovery.
@@ -600,6 +602,7 @@ impl Harvester {
             target: self.config.target.clone(),
             allow_origin: None,
             credentials: None,
+            encoding: None,
         };
 
         let mut last_err = None;
