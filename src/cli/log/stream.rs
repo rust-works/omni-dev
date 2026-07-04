@@ -189,6 +189,7 @@ mod tests {
     fn empty_filter() -> Filter {
         Filter::build(FilterInput {
             since: None,
+            until: None,
             method: None,
             status: None,
             service: None,
@@ -259,6 +260,7 @@ mod tests {
     fn backlog_applies_filter() {
         let filter = Filter::build(FilterInput {
             since: None,
+            until: None,
             method: None,
             status: Some("5xx"),
             service: None,
