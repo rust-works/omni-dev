@@ -55,9 +55,18 @@ impl AmendmentHandler {
     pub fn apply_amendments(&self, yaml_file: &str) -> Result<()> {
         // Load and validate amendment file
         let amendment_file = AmendmentFile::load_from_file(yaml_file)?;
+        self.apply_amendment_file(&amendment_file)
+    }
 
+    /// Applies an already-parsed amendment file.
+    ///
+    /// The core of [`Self::apply_amendments`], split out so callers that hold
+    /// the amendments in memory (the MCP `git_amend_commits` tool, which
+    /// receives them as an inline YAML string) reuse the identical
+    /// safety-check + apply path without a round-trip through a temp file.
+    pub fn apply_amendment_file(&self, amendment_file: &AmendmentFile) -> Result<()> {
         // Safety checks
-        self.perform_safety_checks(&amendment_file)?;
+        self.perform_safety_checks(amendment_file)?;
 
         // Group amendments by their position in history
         let amendments = self.organize_amendments(&amendment_file.amendments)?;

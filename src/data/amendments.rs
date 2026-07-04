@@ -43,8 +43,17 @@ impl AmendmentFile {
             format!("Failed to read amendment file: {}", path.as_ref().display())
         })?;
 
+        Self::from_yaml_str(&content)
+    }
+
+    /// Parses and validates amendments from an in-memory YAML string.
+    ///
+    /// Shared by [`Self::load_from_file`] (which reads the file first) and the
+    /// MCP `git_amend_commits` tool, which receives the amendments YAML inline
+    /// rather than as a path on disk.
+    pub fn from_yaml_str(content: &str) -> Result<Self> {
         let amendment_file: Self =
-            crate::data::from_yaml(&content).context("Failed to parse YAML amendment file")?;
+            crate::data::from_yaml(content).context("Failed to parse YAML amendment file")?;
 
         amendment_file.validate()?;
 
@@ -295,6 +304,31 @@ mod tests {
     #[test]
     fn load_nonexistent_file_fails() {
         assert!(AmendmentFile::load_from_file("/nonexistent/path.yaml").is_err());
+    }
+
+    // ── AmendmentFile::from_yaml_str ─────────────────────────────────
+
+    #[test]
+    fn from_yaml_str_parses_and_validates() {
+        let yaml = format!(
+            "amendments:\n  - commit: {}\n    message: \"feat: inline amend\"\n    summary: \"\"\n",
+            "a".repeat(40)
+        );
+        let file = AmendmentFile::from_yaml_str(&yaml).unwrap();
+        assert_eq!(file.amendments.len(), 1);
+        assert_eq!(file.amendments[0].message, "feat: inline amend");
+    }
+
+    #[test]
+    fn from_yaml_str_rejects_invalid_hash() {
+        let yaml = "amendments:\n  - commit: short\n    message: \"m\"\n    summary: \"\"\n";
+        assert!(AmendmentFile::from_yaml_str(yaml).is_err());
+    }
+
+    #[test]
+    fn from_yaml_str_empty_list_ok() {
+        let file = AmendmentFile::from_yaml_str("amendments: []\n").unwrap();
+        assert!(file.amendments.is_empty());
     }
 
     // ── property tests ────────────────────────────────────────────

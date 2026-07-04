@@ -6,21 +6,30 @@
 
 pub mod ai_tools;
 pub mod atlassian_tools;
+pub mod browser_tools;
 pub mod cancel;
 pub mod catalogue_cache;
 pub mod config_tools;
 pub mod confluence_tools;
 pub mod content_input;
+pub mod coverage_tools;
 pub mod datadog_tools;
 pub mod dry_run;
 pub mod error;
 pub mod git_tools;
 pub mod jira_core_tools;
 pub mod jira_tools;
+pub mod log_tools;
 pub mod output_file;
 pub mod resources;
 pub mod runtime;
 pub mod server;
+// Snowflake tools talk to the daemon over its Unix control socket, so — like
+// `cli::snowflake` — they are Unix-only (`crate::daemon::{client,protocol,server}`
+// are `#[cfg(unix)]`).
+#[cfg(unix)]
+pub mod snowflake_tools;
+pub mod transcript_tools;
 pub mod truncate;
 pub mod validate;
 
