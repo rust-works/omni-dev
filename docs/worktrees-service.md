@@ -23,10 +23,16 @@ the view correct over time. See [ADR-0040](adrs/adr-0040.md).
 
 ## Architecture
 
+- `src/worktrees.rs` — the `WorktreesRegistry` engine: the in-memory `HashMap`
+  of open windows behind a `std::sync::Mutex` (never held across an `.await`),
+  the TTL reaping and entry cap/eviction, and the
+  register/heartbeat/unregister/list/first-folder operations. A standalone
+  `crate::worktrees` module, matching the browser bridge (`src/browser/`) and
+  Snowflake (`src/snowflake/`) engine/adapter split.
 - `src/daemon/services/worktrees.rs` — `WorktreesService`, a thin `DaemonService`
-  adapter holding an in-memory `HashMap` of open windows behind a
-  `std::sync::Mutex` (never held across an `.await`). Cheap to construct; persists
-  nothing.
+  adapter over that engine: it routes control-socket ops to the registry,
+  renders the tray menu/status, and drives the VS Code launcher. Cheap to
+  construct; persists nothing.
 - `src/cli/worktrees.rs` — the read-only `omni-dev worktrees list` client.
 - The companion VS Code extension (separate deliverable) — the **writer**: it
   `register`s on activation, `heartbeat`s every ~10 s, and `unregister`s on
