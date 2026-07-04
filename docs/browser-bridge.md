@@ -169,7 +169,7 @@ curl -H "Authorization: Bearer $T" -H "X-Omni-Bridge: 1" \
 | Method & path            | Purpose                                                                 |
 |--------------------------|-------------------------------------------------------------------------|
 | `GET  /__bridge/status`  | `{ "connected": bool, "browser_origin": str?, "tabs": [{id, origin?}], "pending": int }`. `tabs` lists every connected tab; `browser_origin` is the lone tab's origin (present only when exactly one is connected, for back-compat). |
-| `POST /__bridge/request` | Full control. Body `{url, method, headers, body, stream?, target?, allow_origin?, credentials?}`; returns a structured response envelope, or — when `"stream": true` — an NDJSON chunk stream (see [Streaming](#streaming-responses)). Cross-origin `url` rejected unless `serve --allow-origin` or the per-request `allow_origin` permits it (see [Outbound request scope](#outbound-request-scope-default-closed)). See [Routing to a tab](#routing-to-a-specific-tab) for `target`. |
+| `POST /__bridge/request` | Full control. Body `{url, method, headers, body, stream?, target?, allow_origin?, credentials?, encoding?}`; returns a structured response envelope, or — when `"stream": true` — an NDJSON chunk stream (see [Streaming](#streaming-responses)). Set `"encoding": "base64"` to send a binary `body` (see [Binary request bodies](#binary-request-bodies)). Cross-origin `url` rejected unless `serve --allow-origin` or the per-request `allow_origin` permits it (see [Outbound request scope](#outbound-request-scope-default-closed)). See [Routing to a tab](#routing-to-a-specific-tab) for `target`. |
 
 ```bash
 curl -s -H "Authorization: Bearer $T" -H "X-Omni-Bridge: 1" \
@@ -189,12 +189,16 @@ curl -s -H "Authorization: Bearer $T" -H "X-Omni-Bridge: 1" \
 ```bash
 omni-dev browser bridge request --url /loki/api/v1/labels --method GET
 omni-dev browser bridge request --url /api/foo --method POST --body @payload.json
+omni-dev browser bridge request --url /upload --method POST --body-file avatar.png
 omni-dev browser bridge request --control-port 9998 --url /api/foo   # custom port
 omni-dev browser bridge request --url /api/foo --header "Accept: application/json"
 omni-dev browser bridge request --url https://cdn.example.com/x.js --credentials omit
 ```
 
-`--body @file` reads the body from a file; otherwise the value is sent verbatim.
+`--body @file` reads the body from a file as UTF-8 text; otherwise the value is
+sent verbatim. `--body-file <path>` reads the body as **raw bytes** for binary
+payloads (see [Binary request bodies](#binary-request-bodies)); it is mutually
+exclusive with `--body`.
 
 `--credentials <include|omit|same-origin>` sets the browser `fetch()` credentials
 mode (default `include`, unchanged). Use `omit` to read a wildcard-CORS
@@ -208,6 +212,17 @@ Binary responses (images, gzipped blobs, file downloads) come back in the
 envelope as a base64 string with `"encoding": "base64"`; the caller decodes it.
 The transparent proxy (below) decodes automatically, so `curl` receives the raw
 bytes — pipe straight to a file with `--output`.
+
+#### Binary request bodies
+
+The request side is symmetric. `--body`/`@file` carries UTF-8 text only; to
+upload a binary payload (image, protobuf, gzip) use `--body-file <path>`, which
+reads the file as raw bytes and base64-encodes them on the wire. The browser
+snippet decodes the base64 back to a byte array before `fetch()`, so the upstream
+server receives the exact bytes. A raw `POST /__bridge/request` caller does the
+same by base64-encoding `body` and setting `"encoding": "base64"`; omitting
+`encoding` (the default) keeps `body` as UTF-8 text, byte-identical to older
+clients. The transparent proxy always forwards the inbound request body as text.
 
 Pass `--stream` to consume a streaming / chunked / long-lived endpoint (SSE,
 log-tail) instead of buffering the whole response: the decoded body bytes are
@@ -352,7 +367,9 @@ bridge runs.
 | `--token-file <PATH>` | — | Read the session token from this `0600` file instead of generating one. |
 
 The `request` subcommand takes `--url`, `--method` (default `GET`),
-`--header` (repeatable), `--body` (`@file` supported),
+`--header` (repeatable), `--body` (`@file` supported, UTF-8 text),
+`--body-file <path>` (raw-bytes binary body, base64 on the wire; mutually
+exclusive with `--body`),
 `--credentials <include|omit|same-origin>` (default `include`), `--stream`
 (chunk the response to stdout), `--target` (route to a connection id / origin —
 see [Routing to a specific tab](#routing-to-a-specific-tab)), `--allow-origin`
