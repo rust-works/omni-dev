@@ -56,12 +56,12 @@ omni-dev coverage diff --report head.lcov --fail-under-patch 80
 # 4. Full report with project deltas, as JSON for tooling.
 omni-dev coverage diff \
   --report head.lcov --baseline-report base.lcov \
-  --format json
+  -o json
 ```
 
 ## Output formats
 
-`--format` selects the renderer:
+`-o`/`--output` selects the renderer:
 
 - `markdown` (default) — the PR-comment layout. The markdown footer can carry CI
   context via `--artifact-url`, `--run-url`, `--base-sha`, `--head-sha`, and
@@ -110,7 +110,7 @@ wires it up.
 | `--head-ref <REV>` | Head revision the report was measured at (default: `HEAD`) |
 | `--baseline-report <PATH>` | Base-side report; enables project deltas + indirect changes |
 | `--baseline-report-format <FMT>` | Format of `--baseline-report` (auto-detected by default) |
-| `--format <FMT>` | `markdown` (default) \| `yaml` \| `json` |
+| `-o, --output <FMT>` | `markdown` (default) \| `yaml` \| `json` |
 | `--fail-under-patch <PCT>` | Exit non-zero when patch coverage is below `<PCT>` |
 | `--collapse-ranges` | Collapse consecutive uncovered new lines into ranges |
 | `--all-files` | Report deltas/indirect changes for all files, not just touched ones |

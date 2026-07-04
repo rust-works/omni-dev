@@ -18,7 +18,11 @@ pub struct ReadCommand {
     pub key: String,
 
     /// Output file (writes to stdout if omitted).
-    #[arg(short, long)]
+    #[arg(long = "out-file", value_name = "PATH")]
+    pub out_file: Option<String>,
+
+    /// Deprecated: use `--out-file` instead.
+    #[arg(long = "output", hide = true)]
     pub output: Option<String>,
 
     /// Output format.
@@ -38,7 +42,12 @@ pub struct ReadCommand {
 
 impl ReadCommand {
     /// Fetches the issue and outputs it.
-    pub async fn execute(self) -> Result<()> {
+    pub async fn execute(mut self) -> Result<()> {
+        if let Some(output) = self.output.take() {
+            eprintln!("warning: --output is deprecated; use --out-file instead");
+            self.out_file = Some(output);
+        }
+
         let (client, instance_url) = create_client()?;
 
         let selection = if self.all_fields {
@@ -52,7 +61,7 @@ impl ReadCommand {
         if let Some(sel) = selection {
             run_read_jira_with_fields(
                 &self.key,
-                self.output.as_deref(),
+                self.out_file.as_deref(),
                 &self.format,
                 sel,
                 &client,
@@ -63,7 +72,7 @@ impl ReadCommand {
             let api = JiraApi::new(client);
             run_read(
                 &self.key,
-                self.output.as_deref(),
+                self.out_file.as_deref(),
                 &self.format,
                 &api,
                 &instance_url,
@@ -82,13 +91,14 @@ mod tests {
     fn read_command_struct_fields() {
         let cmd = ReadCommand {
             key: "PROJ-42".to_string(),
-            output: Some("out.md".to_string()),
+            out_file: Some("out.md".to_string()),
+            output: None,
             format: ContentFormat::Adf,
             fields: vec![],
             all_fields: false,
         };
         assert_eq!(cmd.key, "PROJ-42");
-        assert_eq!(cmd.output.as_deref(), Some("out.md"));
+        assert_eq!(cmd.out_file.as_deref(), Some("out.md"));
         assert!(matches!(cmd.format, ContentFormat::Adf));
     }
 
@@ -96,13 +106,14 @@ mod tests {
     fn read_command_default_format() {
         let cmd = ReadCommand {
             key: "PROJ-1".to_string(),
+            out_file: None,
             output: None,
             format: ContentFormat::default(),
             fields: vec![],
             all_fields: false,
         };
         assert!(matches!(cmd.format, ContentFormat::Jfm));
-        assert!(cmd.output.is_none());
+        assert!(cmd.out_file.is_none());
         assert!(cmd.fields.is_empty());
         assert!(!cmd.all_fields);
     }
@@ -111,6 +122,7 @@ mod tests {
     fn read_command_with_field_selection() {
         let cmd = ReadCommand {
             key: "PROJ-9".to_string(),
+            out_file: None,
             output: None,
             format: ContentFormat::Jfm,
             fields: vec!["customfield_19300".to_string(), "Sprint".to_string()],
@@ -123,11 +135,30 @@ mod tests {
     fn read_command_all_fields() {
         let cmd = ReadCommand {
             key: "PROJ-9".to_string(),
+            out_file: None,
             output: None,
             format: ContentFormat::Jfm,
             fields: vec![],
             all_fields: true,
         };
         assert!(cmd.all_fields);
+    }
+
+    #[tokio::test]
+    async fn read_command_execute_folds_deprecated_output_flag() {
+        let guard = crate::atlassian::auth::test_util::EnvGuard::take();
+        let _home = guard.clear_credentials();
+
+        // The deprecated `--output` (file destination) is folded into
+        // `out_file` with a warning before the credential-less client is built.
+        let cmd = ReadCommand {
+            key: "PROJ-1".to_string(),
+            out_file: None,
+            output: Some("issue.md".to_string()),
+            format: ContentFormat::Jfm,
+            fields: vec![],
+            all_fields: false,
+        };
+        assert!(cmd.execute().await.is_err());
     }
 }

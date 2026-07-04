@@ -64,6 +64,10 @@ pub struct CompareCommand {
     pub budget: usize,
 
     /// Output format. `yaml` is the most useful target for AI agents.
+    //
+    // Intentionally defaults to `Yaml` rather than the `Table` used by sibling
+    // `-o/--output` commands: a diff summary is consumed by agents, not read as
+    // a table. This deviation was reviewed and kept under #1125.
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Yaml)]
     pub output: OutputFormat,
 }

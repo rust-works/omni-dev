@@ -395,7 +395,7 @@ Arguments:
   <ATTACHMENT_ID>  Attachment ID (from `attachment list`)
 
 Options:
-  -o, --output <OUTPUT>  Destination path. If omitted, the file is written to the attachment's filename in the current directory. If this names an existing directory, the file is written inside it under the attachment's filename
+      --out-file <PATH>  Destination path. If omitted, the file is written to the attachment's filename in the current directory. If this names an existing directory, the file is written inside it under the attachment's filename
   -h, --help             Print help
 
 
@@ -841,7 +841,7 @@ Arguments:
   <ID>  Confluence page ID (e.g., 12345678)
 
 Options:
-  -o, --output <OUTPUT>    Output file (writes to stdout if omitted)
+      --out-file <PATH>    Output file (writes to stdout if omitted)
       --format <FORMAT>    Output format [default: jfm] [possible values: jfm, adf]
       --version <VERSION>  Read a specific historical version instead of the current head (e.g. `--version 3`). Confluence stores each version as an immutable snapshot; omit for the latest
   -h, --help               Print help (see more with '--help')
@@ -1579,7 +1579,7 @@ Arguments:
   <KEY>  JIRA issue key (e.g., PROJ-123)
 
 Options:
-  -o, --output <OUTPUT>  Output file (writes to stdout if omitted)
+      --out-file <PATH>  Output file (writes to stdout if omitted)
       --format <FORMAT>  Output format [default: jfm] [possible values: jfm, adf]
       --fields <FIELDS>  Custom fields to include (comma-separated). Each entry may be a field ID (e.g. `customfield_19300`) or a human name (e.g. `"Acceptance Criteria"`)
       --all-fields       Include every custom field populated on the issue
@@ -2313,7 +2313,7 @@ Options:
           Optional baseline coverage report; enables project deltas and indirect-change detection
       --baseline-report-format <BASELINE_REPORT_FORMAT>
           Format of `--baseline-report` (auto-detected by default) [default: auto] [possible values: auto, lcov, llvm-cov-json, cobertura]
-      --format <FORMAT>
+  -o, --output <OUTPUT>
           Output format [default: markdown] [possible values: markdown, yaml, json]
       --fail-under-patch <PCT>
           Fail (non-zero exit) when patch coverage is below this percentage
@@ -2417,9 +2417,9 @@ Reports daemon and per-service status
 Usage: status [OPTIONS]
 
 Options:
-      --socket <PATH>  Control-socket path. Defaults to the per-user runtime location
-      --json           Emit machine-readable JSON instead of a table
-  -h, --help           Print help
+      --socket <PATH>    Control-socket path. Defaults to the per-user runtime location
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================
@@ -3023,7 +3023,7 @@ Arguments:
 Options:
       --context-dir <CONTEXT_DIR>  Path to custom context directory (defaults to .omni-dev/)
       --guidelines <GUIDELINES>    Explicit path to guidelines file
-      --format <FORMAT>            Output format: text (default), json, yaml [default: text]
+  -o, --output <OUTPUT>            Output format [default: text] [possible values: text, json, yaml]
       --strict                     Exits with error code if any issues found (including warnings)
       --quiet                      Only shows errors/warnings, suppresses info-level output
       --verbose                    Shows detailed analysis including passing commits
@@ -3032,7 +3032,7 @@ Options:
       --no-coherence               Disables the cross-commit coherence pass
       --no-suggestions             Skips generating corrected message suggestions
       --twiddle                    Offers to apply suggested messages when issues are found
-  -h, --help                       Print help
+  -h, --help                       Print help (see more with '--help')
 
 
 ================================================================================
@@ -3146,7 +3146,7 @@ Options:
       --fuzzy <TOKEN>      Require a fuzzy token (substring of the raw line); repeatable, AND-ed
       --query <EXPR>       A query expression (AND/OR/NOT, `field:value`, bare tokens); repeatable, AND-ed together
       --id <ID>            Match this record `id` or `invocation_id` (pulls a run and its requests)
-      --format <FORMAT>    Output format [default: oneline] [possible values: oneline, json, full]
+  -o, --output <OUTPUT>    Output format [default: oneline] [possible values: oneline, json, full]
   -n, --limit <N>          Show at most N (most recent) matching records
   -f, --follow             Follow the log, printing new matching records as they are appended
   -h, --help               Print help (see more with '--help')
@@ -3263,7 +3263,7 @@ Options:
       --database <DATABASE>    Per-query database (`USE DATABASE`)
       --schema <SCHEMA>        Per-query schema (`USE SCHEMA`)
       --socket <PATH>          Control-socket path. Defaults to the per-user runtime location
-      --format <FORMAT>        Output format [default: json] [possible values: json, yaml]
+  -o, --output <OUTPUT>        Output format [default: json] [possible values: json, yaml]
   -h, --help                   Print help (see more with '--help')
 
 
@@ -3276,9 +3276,9 @@ List active multiplexed sessions
 Usage: sessions [OPTIONS]
 
 Options:
-      --socket <PATH>  Control-socket path. Defaults to the per-user runtime location
-      --json           Emit machine-readable JSON instead of a table
-  -h, --help           Print help
+      --socket <PATH>    Control-socket path. Defaults to the per-user runtime location
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json]
+  -h, --help             Print help (see more with '--help')
 
 
 ================================================================================
@@ -3350,10 +3350,10 @@ Arguments:
 
 Options:
       --lang <LANG>       Preferred caption language (e.g. `en`, `en-US`). Prefix fallback is applied — `en` matches `en-US` [default: en]
-      --format <FORMAT>   Output format [default: srt] [possible values: srt, vtt, txt, json]
+  -o, --output <OUTPUT>   Output format [default: srt] [possible values: srt, vtt, txt, json]
       --auto              Allow falling through to auto-generated (ASR) captions when no manual track matches
       --translate <LANG>  Synthesise a translated track in this target language when no native track matches
-  -o, --output <OUTPUT>   Output file (writes to stdout if omitted)
+      --out-file <PATH>   Output file (writes to stdout if omitted)
   -h, --help              Print help (see more with '--help')
 
 
@@ -3369,7 +3369,7 @@ Arguments:
   <URL>  YouTube video URL or bare 11-character video ID
 
 Options:
-      --output <OUTPUT>  Output format [default: table] [possible values: table, json]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json]
   -h, --help             Print help (see more with '--help')
 
 
@@ -3385,7 +3385,7 @@ Arguments:
   <URL>  YouTube video URL or bare 11-character video ID
 
 Options:
-      --output <OUTPUT>  Output format [default: table] [possible values: table, json]
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json]
   -h, --help             Print help (see more with '--help')
 
 
@@ -3448,6 +3448,6 @@ List the repos/worktrees currently open across all windows
 Usage: list [OPTIONS]
 
 Options:
-      --socket <PATH>  Control-socket path. Defaults to the per-user runtime location
-      --json           Emit machine-readable JSON instead of a table
-  -h, --help           Print help
+      --socket <PATH>    Control-socket path. Defaults to the per-user runtime location
+  -o, --output <OUTPUT>  Output format [default: table] [possible values: table, json]
+  -h, --help             Print help (see more with '--help')

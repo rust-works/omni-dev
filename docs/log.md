@@ -86,7 +86,7 @@ below. The `prune` subcommand trims it; see [Bounding growth](#bounding-growth).
 
 | Flag | Effect |
 |------|--------|
-| `--format <oneline\|json\|full>` | `oneline` (default), `json` (NDJSON, byte-identical to the file — composes with `jq`), or `full` (pretty block). |
+| `-o, --output <oneline\|json\|full>` | `oneline` (default), `json` (NDJSON, byte-identical to the file — composes with `jq`), or `full` (pretty block). |
 | `-n, --limit <N>` | Show at most the N most recent matching records. |
 | `-f, --follow` | Tail the log, printing new matching records as they arrive. |
 
@@ -137,7 +137,7 @@ omni-dev log --since 2026-07-01 --until 2026-07-02
 omni-dev log --id 0001718000000-0a1b2c3d4e5f6071
 
 # Compose with jq for anything not directly expressible.
-omni-dev log --format json --service datadog | jq 'select(.status_code == 429)'
+omni-dev log -o json --service datadog | jq 'select(.status_code == 429)'
 
 # Follow live.
 omni-dev log -f --service browser-bridge

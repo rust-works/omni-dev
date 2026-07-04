@@ -299,8 +299,8 @@ omni-dev git commit message check --verbose
 omni-dev git commit message check --show-passing
 
 # Structured output for tooling
-omni-dev git commit message check --format json
-omni-dev git commit message check --format yaml
+omni-dev git commit message check -o json
+omni-dev git commit message check -o yaml
 
 # Offer to apply suggested fixes when issues are found
 omni-dev git commit message check --twiddle
@@ -314,7 +314,7 @@ omni-dev git commit message check --twiddle
 | `--quiet` | Suppress info-level output |
 | `--verbose` | Include detailed analysis for every commit |
 | `--show-passing` | Include passing commits in the report |
-| `--format text\|json\|yaml` | Output format (default `text`) |
+| `-o, --output text\|json\|yaml` | Output format (default `text`) |
 | `--no-coherence` | Skip the cross-commit coherence pass |
 | `--no-suggestions` | Skip generating corrected message suggestions |
 | `--twiddle` | When issues are found, prompt to apply suggested fixes |
@@ -681,7 +681,7 @@ and select it with `--profile <name>` (or `OMNI_DEV_PROFILE`). See
 ```bash
 # Read an issue as JFM markdown
 omni-dev atlassian jira read PROJ-123
-omni-dev atlassian jira read PROJ-123 -o issue.md
+omni-dev atlassian jira read PROJ-123 --out-file issue.md
 omni-dev atlassian jira read PROJ-123 --format adf   # raw ADF JSON
 
 # Include specific custom fields
@@ -1096,7 +1096,7 @@ omni-dev atlassian jira attachment images --key PROJ-123 --output-dir ./images
 ```bash
 # Read a page as JFM markdown
 omni-dev atlassian confluence read 12345
-omni-dev atlassian confluence read 12345 -o page.md
+omni-dev atlassian confluence read 12345 --out-file page.md
 omni-dev atlassian confluence read 12345 --format adf
 
 # Write changes back
@@ -1358,8 +1358,8 @@ omni-dev atlassian confluence attachment download att-98765
 
 # Write it to an explicit path (an existing directory is joined with the
 # attachment's filename)
-omni-dev atlassian confluence attachment download att-98765 --output ./diagram.png
-omni-dev atlassian confluence attachment download att-98765 --output ./downloads/
+omni-dev atlassian confluence attachment download att-98765 --out-file ./diagram.png
+omni-dev atlassian confluence attachment download att-98765 --out-file ./downloads/
 ```
 
 To capture a whole page tree *with* its attachment binaries in one command,

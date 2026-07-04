@@ -184,7 +184,7 @@ impl CheckReport {
 }
 
 /// Output format for check results.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum OutputFormat {
     /// Human-readable text format.
     #[default]

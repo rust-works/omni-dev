@@ -33,6 +33,7 @@ use serde_json::{json, Value};
 use tokio::sync::Notify;
 
 use clap::Parser as _;
+use omni_dev::cli::format::TableOrJson;
 use omni_dev::cli::worktrees::{ListCommand, WorktreesCommand, WorktreesSubcommands};
 use omni_dev::cli::Cli;
 use omni_dev::daemon::client::DaemonClient;
@@ -277,9 +278,10 @@ async fn worktrees_cli_list_against_live_daemon() {
         .await
         .unwrap();
 
-    // Table path (json = false) and JSON path (json = true).
+    // Table path and JSON path (via -o/--output and the deprecated --json).
     ListCommand {
         socket: Some(socket.clone()),
+        output: TableOrJson::Table,
         json: false,
     }
     .execute()
@@ -287,7 +289,8 @@ async fn worktrees_cli_list_against_live_daemon() {
     .unwrap();
     ListCommand {
         socket: Some(socket.clone()),
-        json: true,
+        output: TableOrJson::Json,
+        json: false,
     }
     .execute()
     .await
@@ -297,6 +300,7 @@ async fn worktrees_cli_list_against_live_daemon() {
     WorktreesCommand {
         command: WorktreesSubcommands::List(ListCommand {
             socket: Some(socket.clone()),
+            output: TableOrJson::Table,
             json: false,
         }),
     }
@@ -326,6 +330,7 @@ async fn worktrees_cli_list_against_live_daemon() {
     let missing = dir.path().join("absent.sock");
     assert!(ListCommand {
         socket: Some(missing),
+        output: TableOrJson::Table,
         json: false,
     }
     .execute()
