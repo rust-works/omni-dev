@@ -4,7 +4,7 @@
 //! writing issues. Uses Basic Auth (email + API token).
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -16,19 +16,11 @@ use crate::atlassian::adf_validated::ValidatedAdfDocument;
 use crate::atlassian::convert::adf_to_markdown;
 use crate::atlassian::error::AtlassianError;
 use crate::request_log;
-
-/// HTTP request timeout for Atlassian API calls.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+use crate::utils::http::{retry_429, REQUEST_TIMEOUT};
 
 /// Internal page size for auto-pagination. Individual API calls request
 /// this many items per page; the `limit` parameter controls the total.
 const PAGE_SIZE: u32 = 100;
-
-/// Maximum number of retries on HTTP 429 (Too Many Requests).
-const MAX_RETRIES: u32 = 3;
-
-/// Default retry delay in seconds when no `Retry-After` header is present.
-const DEFAULT_RETRY_DELAY_SECS: u64 = 2;
 
 /// JIRA's standard error envelope returned by REST API v3 on validation
 /// failures: `{ "errorMessages": [...], "errors": { "<field_id>": "<msg>" } }`.
@@ -7479,19 +7471,7 @@ impl AtlassianClient {
         } else {
             "jira"
         };
-        match result {
-            Ok(r) => request_log::record_http(
-                service,
-                method,
-                url,
-                started,
-                Some(r.status().as_u16()),
-                None,
-            ),
-            Err(e) => {
-                request_log::record_http(service, method, url, started, None, Some(&e.to_string()));
-            }
-        }
+        request_log::record_http_result(service, method, url, started, result);
     }
 
     /// Sends an authenticated GET request and returns the raw response.
@@ -7499,24 +7479,17 @@ impl AtlassianClient {
     /// Shared transport method used by both JIRA and Confluence API
     /// implementations.
     pub async fn get_json(&self, url: &str) -> Result<reqwest::Response> {
-        for attempt in 0..=MAX_RETRIES {
-            let started = Instant::now();
-            let result = self
-                .client
-                .get(url)
-                .header("Authorization", &self.auth_header)
-                .header("Accept", "application/json")
-                .send()
-                .await;
-            self.log_request("GET", url, started, &result);
-            let response = result.context("Failed to send GET request to Atlassian API")?;
-
-            if response.status().as_u16() != 429 || attempt == MAX_RETRIES {
-                return Ok(response);
-            }
-            Self::wait_for_retry(&response, attempt).await;
-        }
-        unreachable!()
+        retry_429(
+            || {
+                self.client
+                    .get(url)
+                    .header("Authorization", &self.auth_header)
+                    .header("Accept", "application/json")
+            },
+            |started, result| self.log_request("GET", url, started, result),
+        )
+        .await
+        .context("Failed to send GET request to Atlassian API")
     }
 
     /// Sends an authenticated PUT request with a JSON body and returns the raw response.
@@ -7528,25 +7501,18 @@ impl AtlassianClient {
         url: &str,
         body: &T,
     ) -> Result<reqwest::Response> {
-        for attempt in 0..=MAX_RETRIES {
-            let started = Instant::now();
-            let result = self
-                .client
-                .put(url)
-                .header("Authorization", &self.auth_header)
-                .header("Content-Type", "application/json")
-                .json(body)
-                .send()
-                .await;
-            self.log_request("PUT", url, started, &result);
-            let response = result.context("Failed to send PUT request to Atlassian API")?;
-
-            if response.status().as_u16() != 429 || attempt == MAX_RETRIES {
-                return Ok(response);
-            }
-            Self::wait_for_retry(&response, attempt).await;
-        }
-        unreachable!()
+        retry_429(
+            || {
+                self.client
+                    .put(url)
+                    .header("Authorization", &self.auth_header)
+                    .header("Content-Type", "application/json")
+                    .json(body)
+            },
+            |started, result| self.log_request("PUT", url, started, result),
+        )
+        .await
+        .context("Failed to send PUT request to Atlassian API")
     }
 
     /// Sends an authenticated POST request with a JSON body and returns the raw response.
@@ -7555,25 +7521,18 @@ impl AtlassianClient {
         url: &str,
         body: &T,
     ) -> Result<reqwest::Response> {
-        for attempt in 0..=MAX_RETRIES {
-            let started = Instant::now();
-            let result = self
-                .client
-                .post(url)
-                .header("Authorization", &self.auth_header)
-                .header("Content-Type", "application/json")
-                .json(body)
-                .send()
-                .await;
-            self.log_request("POST", url, started, &result);
-            let response = result.context("Failed to send POST request to Atlassian API")?;
-
-            if response.status().as_u16() != 429 || attempt == MAX_RETRIES {
-                return Ok(response);
-            }
-            Self::wait_for_retry(&response, attempt).await;
-        }
-        unreachable!()
+        retry_429(
+            || {
+                self.client
+                    .post(url)
+                    .header("Authorization", &self.auth_header)
+                    .header("Content-Type", "application/json")
+                    .json(body)
+            },
+            |started, result| self.log_request("POST", url, started, result),
+        )
+        .await
+        .context("Failed to send POST request to Atlassian API")
     }
 
     /// Sends an authenticated GET request and returns raw bytes.
@@ -7595,23 +7554,16 @@ impl AtlassianClient {
 
     /// Sends an authenticated DELETE request and returns the raw response.
     pub async fn delete(&self, url: &str) -> Result<reqwest::Response> {
-        for attempt in 0..=MAX_RETRIES {
-            let started = Instant::now();
-            let result = self
-                .client
-                .delete(url)
-                .header("Authorization", &self.auth_header)
-                .send()
-                .await;
-            self.log_request("DELETE", url, started, &result);
-            let response = result.context("Failed to send DELETE request to Atlassian API")?;
-
-            if response.status().as_u16() != 429 || attempt == MAX_RETRIES {
-                return Ok(response);
-            }
-            Self::wait_for_retry(&response, attempt).await;
-        }
-        unreachable!()
+        retry_429(
+            || {
+                self.client
+                    .delete(url)
+                    .header("Authorization", &self.auth_header)
+            },
+            |started, result| self.log_request("DELETE", url, started, result),
+        )
+        .await
+        .context("Failed to send DELETE request to Atlassian API")
     }
 
     /// Sends an authenticated POST request with a multipart body and returns the raw response.
@@ -7640,41 +7592,17 @@ impl AtlassianClient {
 
     /// Internal: GET with custom Accept header and 429 retry.
     async fn get_json_raw_accept(&self, url: &str, accept: &str) -> Result<reqwest::Response> {
-        for attempt in 0..=MAX_RETRIES {
-            let started = Instant::now();
-            let result = self
-                .client
-                .get(url)
-                .header("Authorization", &self.auth_header)
-                .header("Accept", accept)
-                .send()
-                .await;
-            self.log_request("GET", url, started, &result);
-            let response = result.context("Failed to send GET request to Atlassian API")?;
-
-            if response.status().as_u16() != 429 || attempt == MAX_RETRIES {
-                return Ok(response);
-            }
-            Self::wait_for_retry(&response, attempt).await;
-        }
-        unreachable!()
-    }
-
-    /// Waits before retrying a rate-limited request.
-    /// Uses `Retry-After` header if present, otherwise exponential backoff.
-    async fn wait_for_retry(response: &reqwest::Response, attempt: u32) {
-        let delay = response
-            .headers()
-            .get("Retry-After")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or_else(|| DEFAULT_RETRY_DELAY_SECS.pow(attempt + 1));
-
-        eprintln!(
-            "Rate limited (429). Retrying in {delay}s (attempt {})...",
-            attempt + 1
-        );
-        tokio::time::sleep(Duration::from_secs(delay)).await;
+        retry_429(
+            || {
+                self.client
+                    .get(url)
+                    .header("Authorization", &self.auth_header)
+                    .header("Accept", accept)
+            },
+            |started, result| self.log_request("GET", url, started, result),
+        )
+        .await
+        .context("Failed to send GET request to Atlassian API")
     }
 
     /// Fetches a JIRA issue by key with only the standard fields.
