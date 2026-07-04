@@ -33,18 +33,19 @@ where
     B: Fn() -> reqwest::RequestBuilder,
     L: Fn(Instant, &reqwest::Result<reqwest::Response>),
 {
-    for attempt in 0..=MAX_RETRIES {
+    let mut attempt = 0;
+    loop {
         let started = Instant::now();
         let result = build().send().await;
         log(started, &result);
         match result {
             Ok(response) if response.status().as_u16() == 429 && attempt < MAX_RETRIES => {
                 wait_for_retry(&response, attempt).await;
+                attempt += 1;
             }
             other => return other,
         }
     }
-    unreachable!("loop returns on the final (MAX_RETRIES) attempt")
 }
 
 /// Waits before retrying a rate-limited (`429`) request.
