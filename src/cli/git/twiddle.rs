@@ -4,7 +4,6 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing::debug;
 
-use super::parse_beta_header;
 use crate::data::amendments::AmendmentFile;
 use crate::data::RepositoryView;
 
@@ -14,15 +13,6 @@ pub struct TwiddleCommand {
     /// Commit range to analyze and improve (e.g., HEAD~3..HEAD, abc123..def456).
     #[arg(value_name = "COMMIT_RANGE")]
     pub commit_range: Option<String>,
-
-    /// Claude API model to use (if not specified, uses settings or default).
-    #[arg(long)]
-    pub model: Option<String>,
-
-    /// Beta header to send with API requests (format: key:value).
-    /// Only sent if the model supports it in the registry.
-    #[arg(long, value_name = "KEY:VALUE")]
-    pub beta_header: Option<String>,
 
     /// Skips confirmation prompt and applies amendments automatically.
     #[arg(long)]
@@ -122,9 +112,11 @@ impl TwiddleCommand {
             return self.execute_no_ai(repo_root).await;
         }
 
-        // Preflight check: validate AI credentials before any processing
-        let ai_info =
-            crate::utils::check_ai_command_prerequisites(self.model.as_deref(), repo_root)?;
+        // Preflight check: validate AI credentials before any processing.
+        // Model/beta-header selection uses the global `--model`/`--beta-header`
+        // flags (propagated as OMNI_DEV_MODEL/OMNI_DEV_BETA_HEADER) and the
+        // per-backend env chain.
+        let ai_info = crate::utils::check_ai_command_prerequisites(None, repo_root)?;
         println!(
             "✓ {} credentials verified (model: {})",
             ai_info.provider, ai_info.model
@@ -135,13 +127,7 @@ impl TwiddleCommand {
         println!("✓ Working directory is clean");
 
         // Initialize Claude client
-        let beta = self
-            .beta_header
-            .as_deref()
-            .map(parse_beta_header)
-            .transpose()?;
-        let claude_client =
-            crate::claude::create_default_claude_client(self.model.clone(), beta).await?;
+        let claude_client = crate::claude::create_default_claude_client(None, None).await?;
 
         self.execute_with_client(repo_root, claude_client).await
     }
@@ -1132,13 +1118,7 @@ impl TwiddleCommand {
         // Load guidelines, scopes, and Claude client once (they don't change between retries)
         let guidelines = self.load_check_guidelines(repo_root)?;
         let valid_scopes = self.load_check_scopes(repo_root);
-        let beta = self
-            .beta_header
-            .as_deref()
-            .map(parse_beta_header)
-            .transpose()?;
-        let claude_client =
-            crate::claude::create_default_claude_client(self.model.clone(), beta).await?;
+        let claude_client = crate::claude::create_default_claude_client(None, None).await?;
 
         for attempt in 0..=MAX_CHECK_RETRIES {
             println!();
@@ -2241,8 +2221,6 @@ mod execute_tests {
     fn make_cmd(commit_range: &str, save_path: std::path::PathBuf) -> TwiddleCommand {
         TwiddleCommand {
             commit_range: Some(commit_range.to_string()),
-            model: None,
-            beta_header: None,
             auto_apply: false,
             allow_pushed: false,
             save_only: Some(save_path.to_string_lossy().into_owned()),
@@ -2398,8 +2376,6 @@ mod execute_tests {
         let save_path = temp_dir.path().join("amendments.yaml");
         let cmd = TwiddleCommand {
             commit_range: Some("HEAD".to_string()),
-            model: None,
-            beta_header: None,
             auto_apply: false,
             allow_pushed: false,
             save_only: Some(save_path.to_string_lossy().into_owned()),
@@ -2783,8 +2759,6 @@ mod tests {
     fn make_twiddle_cmd() -> TwiddleCommand {
         TwiddleCommand {
             commit_range: None,
-            model: None,
-            beta_header: None,
             auto_apply: false,
             allow_pushed: false,
             save_only: None,

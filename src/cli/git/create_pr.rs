@@ -13,10 +13,6 @@ pub struct CreatePrCommand {
     #[arg(long, value_name = "BRANCH")]
     pub base: Option<String>,
 
-    /// Claude API model to use (if not specified, uses settings or default).
-    #[arg(long)]
-    pub model: Option<String>,
-
     /// Skips confirmation prompt and creates PR automatically.
     #[arg(long)]
     pub auto_apply: bool,
@@ -103,8 +99,9 @@ impl CreatePrCommand {
 
         // Preflight check: validate all prerequisites before any processing
         // This catches missing credentials/tools early before wasting time
-        let ai_info =
-            crate::utils::check_pr_command_prerequisites(self.model.as_deref(), repo_root)?;
+        // Model selection uses the global `--model` flag (propagated as
+        // OMNI_DEV_MODEL) and the per-backend env chain.
+        let ai_info = crate::utils::check_pr_command_prerequisites(None, repo_root)?;
         println!(
             "✓ {} credentials verified (model: {})",
             ai_info.provider, ai_info.model
@@ -128,8 +125,7 @@ impl CreatePrCommand {
         self.show_guidance_files_status(repo_root, &project_context)?;
 
         // 4. Show AI model configuration before generation
-        let claude_client =
-            crate::claude::create_default_claude_client(self.model.clone(), None).await?;
+        let claude_client = crate::claude::create_default_claude_client(None, None).await?;
         self.show_model_info_from_client(&claude_client)?;
 
         // 5. Show branch analysis and commit information
@@ -1419,7 +1415,6 @@ pub async fn run_create_pr(
 
     let cmd = CreatePrCommand {
         base: base_branch.map(str::to_string),
-        model: model.clone(),
         auto_apply: true,
         save_only: None,
         ready: false,
@@ -1521,7 +1516,6 @@ mod run_create_pr_tests {
     fn fresh_cmd() -> CreatePrCommand {
         CreatePrCommand {
             base: None,
-            model: None,
             auto_apply: true,
             save_only: None,
             ready: false,

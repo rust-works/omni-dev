@@ -129,15 +129,11 @@ The project includes a comprehensive model registry system:
 - **Dynamic Limits**: Token limits are automatically applied based on model specifications
 
 ### AI Backend Dispatch
-Backends are selected inside `src/claude/client.rs::create_default_claude_client` in this order:
+`src/claude/backend.rs` is the single source of truth for backend, model, and beta-header resolution — `resolve_backend` / `resolve_model` / `resolve_beta_header` are shared by the client factory (`src/claude/client.rs::create_default_claude_client`) and preflight (`src/utils/preflight.rs`), so the two can no longer drift (#1118).
 
-1. `OMNI_DEV_AI_BACKEND=claude-cli` (or `--ai-backend claude-cli`) → `ClaudeCliAiClient` in `src/claude/ai/claude_cli.rs`.
-2. `USE_OLLAMA=true` → `OpenAiAiClient::new_ollama` in `src/claude/ai/openai.rs`.
-3. `USE_OPENAI=true` → `OpenAiAiClient::new_openai` in `src/claude/ai/openai.rs`.
-4. `CLAUDE_CODE_USE_BEDROCK=true` → `BedrockAiClient` in `src/claude/ai/bedrock.rs`.
-5. Default → `ClaudeAiClient` in `src/claude/ai/claude.rs` (direct Anthropic API).
+Backend selection: if `OMNI_DEV_AI_BACKEND` is set (directly or via the global `--ai-backend` flag, values `default|claude-cli|openai|ollama|bedrock`) it wins outright — `default` forces the direct API even when `USE_*` flags are set, and an unknown value is a hard error. When unset, legacy order: `USE_OLLAMA=true` → `USE_OPENAI=true` → `CLAUDE_CODE_USE_BEDROCK=true` → direct API. The resolved `AiBackend` enum dispatches to `ClaudeCliAiClient` (`src/claude/ai/claude_cli.rs`), `OpenAiAiClient::new_ollama`/`new_openai` (`src/claude/ai/openai.rs`), `BedrockAiClient` (`src/claude/ai/bedrock.rs`), or `ClaudeAiClient` (`src/claude/ai/claude.rs`).
 
-Preflight (`src/utils/preflight.rs`) mirrors this switch and must change in lock-step when adding backends.
+Model selection stops at the first non-empty value: explicit param (MCP/`run_*` callers) → `OMNI_DEV_MODEL` (global `--model`) → per-family vars (Claude family: `CLAUDE_MODEL` → `CLAUDE_CODE_MODEL` → `ANTHROPIC_MODEL`; OpenAI: `OPENAI_MODEL`; Ollama: `OLLAMA_MODEL`) → registry default. `--model` and `--beta-header` are **global** flags (propagated as `OMNI_DEV_MODEL`/`OMNI_DEV_BETA_HEADER` in `Cli::propagate_global_flags`); the per-subcommand copies were removed in #1118. Adding a backend = new enum variant + resolver arms + one factory arm + one preflight arm.
 
 User-facing details — required env vars, model selection, Claude CLI sandbox semantics, the `--claude-cli-allow-tools` / `--claude-cli-allow-mcp` escape hatches, the `--claude-cli-max-budget-usd` spending cap, and per-backend troubleshooting — live in [docs/ai-backends.md](docs/ai-backends.md). Keep it in sync when changing any of those surfaces.
 

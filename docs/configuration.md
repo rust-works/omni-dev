@@ -973,16 +973,22 @@ RUST_LOG=omni_dev=debug omni-dev git commit message view HEAD --use-context
 
 ## AI Backend Selection
 
-omni-dev supports five AI backends. Selection happens once at startup in
-`src/claude/client.rs::create_default_claude_client` and is checked in this
-order:
+omni-dev supports five AI backends. Selection happens once at startup via
+the shared resolver in `src/claude/backend.rs` (used by both the client
+factory and preflight).
 
-| Order | Selector | Backend | Notes |
+The global `--ai-backend` flag accepts `default`, `claude-cli`, `openai`,
+`ollama`, and `bedrock` and is equivalent to setting `OMNI_DEV_AI_BACKEND`
+(the flag wins when both are set). When `OMNI_DEV_AI_BACKEND` is set it
+decides the backend outright — `default` forces the direct Anthropic API
+even when the legacy `USE_*` variables are set; an unknown value is a hard
+error. When it is unset, the legacy flags apply in this order:
+
+| Order | Selector (only when `OMNI_DEV_AI_BACKEND` is unset) | Backend | Notes |
 |-------|----------|---------|-------|
-| 1 | `OMNI_DEV_AI_BACKEND=claude-cli` (or `--ai-backend claude-cli`) | `ClaudeCliAiClient` | Shells out to `claude -p` in a sandbox |
-| 2 | `USE_OLLAMA=true` | `OpenAiAiClient` (Ollama) | Local Ollama server |
-| 3 | `USE_OPENAI=true` | `OpenAiAiClient` (OpenAI) | OpenAI-compatible API |
-| 4 | `CLAUDE_CODE_USE_BEDROCK=true` | `BedrockAiClient` | AWS Bedrock |
+| 1 | `USE_OLLAMA=true` | `OpenAiAiClient` (Ollama) | Local Ollama server |
+| 2 | `USE_OPENAI=true` | `OpenAiAiClient` (OpenAI) | OpenAI-compatible API |
+| 3 | `CLAUDE_CODE_USE_BEDROCK=true` | `BedrockAiClient` | AWS Bedrock |
 | (default) | — | `ClaudeAiClient` | Direct Anthropic API |
 
 The first match wins; later selectors are ignored.
@@ -990,13 +996,18 @@ The first match wins; later selectors are ignored.
 ### Model selection
 
 Once a backend is chosen, the model name resolves in this precedence
-(highest first):
+(highest first), stopping at the first non-empty value:
 
-1. `--model` flag on the invoking command
-2. `CLAUDE_MODEL` environment variable
-3. `CLAUDE_CODE_MODEL` environment variable
-4. `ANTHROPIC_MODEL` environment variable
-5. The hard-coded default for the backend
+1. `--model` global flag on any invocation
+2. `OMNI_DEV_MODEL` environment variable (what `--model` propagates to;
+   also settable via `~/.omni-dev/settings.json` env bundles / profiles)
+3. The backend family's own variables — Claude family (Claude API, Bedrock,
+   Claude CLI): `CLAUDE_MODEL` → `CLAUDE_CODE_MODEL` → `ANTHROPIC_MODEL`;
+   OpenAI: `OPENAI_MODEL`; Ollama: `OLLAMA_MODEL`
+4. The registry default for the backend's provider
+
+The Claude-family variables apply only to Claude-family backends, so an
+exported `CLAUDE_MODEL` never leaks into the OpenAI or Ollama backends.
 
 Run `omni-dev config models show` to list every model omni-dev knows about
 along with token limits and capabilities. Pass `--embedded-only` to print
@@ -1126,7 +1137,10 @@ WARN fires in addition to the abort.
 ### Bedrock backend
 
 ```bash
+export OMNI_DEV_AI_BACKEND=bedrock       # or --ai-backend bedrock
+# legacy selector (applies only when OMNI_DEV_AI_BACKEND is unset):
 export CLAUDE_CODE_USE_BEDROCK=true
+
 export ANTHROPIC_BEDROCK_BASE_URL=https://bedrock-runtime.us-east-1.amazonaws.com
 # Plus the standard AWS_* credentials your AWS SDK config requires
 ```
@@ -1135,11 +1149,13 @@ export ANTHROPIC_BEDROCK_BASE_URL=https://bedrock-runtime.us-east-1.amazonaws.co
 
 ```bash
 # OpenAI-compatible API
-export USE_OPENAI=true
+export OMNI_DEV_AI_BACKEND=openai        # or --ai-backend openai
 export OPENAI_API_KEY=...
+# legacy selector: USE_OPENAI=true
 
 # Local Ollama (defaults to http://localhost:11434)
-export USE_OLLAMA=true
+export OMNI_DEV_AI_BACKEND=ollama        # or --ai-backend ollama
+# legacy selector: USE_OLLAMA=true
 ```
 
 ## Example Setups
