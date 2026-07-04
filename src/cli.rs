@@ -70,9 +70,12 @@ pub struct Cli {
     ///
     /// **Only use for deliberately tool-capable use cases.** By default the
     /// nested session runs with `--tools ""` and cannot touch the
-    /// file system. This flag removes that guard. Equivalent to setting
-    /// `OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS=true`. Independent of
-    /// `--claude-cli-allow-mcp`.
+    /// file system. This flag removes that guard. The prompt is built from
+    /// untrusted content (diffs, commit messages, JIRA text), so well-known
+    /// secret env vars (`*_API_KEY`, `*_TOKEN`, etc.) are scrubbed from the
+    /// nested session; set `OMNI_DEV_CLAUDE_CLI_KEEP_ENV` to exempt names.
+    /// Equivalent to setting `OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS=true`.
+    /// Independent of `--claude-cli-allow-mcp`.
     ///
     /// Ignored when `--ai-backend` is not `claude-cli`.
     #[arg(long, global = true)]

@@ -17,6 +17,12 @@
 //! - Environment inherits from the parent, then removes `CLAUDE_PROJECT_DIR`,
 //!   any `CLAUDE_CODE_*`, and any `CLAUDE_PROJECT_*` vars that could re-scope
 //!   the nested session.
+//! - When the tool-access escape hatch is enabled, well-known secret vars
+//!   (`*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `*_CREDENTIALS`,
+//!   AWS credentials) are also removed, since the tool-capable session is
+//!   driven by untrusted prompt content (issue #1144). Exceptions:
+//!   `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` (the child may
+//!   authenticate through them) and names listed in [`KEEP_ENV_VAR`].
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -77,6 +83,15 @@ pub(crate) const ALLOW_MCP_ENV_VAR: &str = "OMNI_DEV_CLAUDE_CLI_ALLOW_MCP";
 /// with cost. Accepts floating-point dollar amounts (e.g. `0.50`).
 pub(crate) const MAX_BUDGET_ENV_VAR: &str = "OMNI_DEV_CLAUDE_CLI_MAX_BUDGET_USD";
 
+/// Env var exempting names from the tool-enabled secret scrub.
+///
+/// Comma-separated exact variable names (e.g. `GITHUB_TOKEN,NPM_TOKEN`)
+/// that stay in the subprocess environment when the tool-access escape
+/// hatch triggers the secret scrub (see [`SECRET_ENV_SUFFIXES`]).
+/// `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` are always kept and need
+/// not be listed. Has no effect while the scrub is inactive.
+pub(crate) const KEEP_ENV_VAR: &str = "OMNI_DEV_CLAUDE_CLI_KEEP_ENV";
+
 /// Defence-in-depth suffix appended to the caller's system prompt.
 ///
 /// Even with tools disabled at runtime, the model "knows" Claude Code tools
@@ -91,6 +106,48 @@ const SCRUBBED_ENV_PREFIXES: &[&str] = &["CLAUDE_CODE_", "CLAUDE_PROJECT_"];
 
 /// Exact env var names to remove from the subprocess environment.
 const SCRUBBED_ENV_EXACT: &[&str] = &["CLAUDE_PROJECT_DIR"];
+
+/// Suffixes marking an env var as a likely secret.
+///
+/// Matching vars are removed from the subprocess environment when the
+/// tool-access escape hatch is enabled: the tool-capable nested session
+/// is driven by untrusted prompt content (diffs, commit messages, JIRA
+/// text), so a prompt-injection payload could otherwise read inherited
+/// credentials (issue #1144).
+const SECRET_ENV_SUFFIXES: &[&str] =
+    &["_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_CREDENTIALS"];
+
+/// Exact secret env var names the suffix list misses (AWS credentials;
+/// `AWS_SESSION_TOKEN` is already caught by `_TOKEN`).
+const SECRET_ENV_EXACT: &[&str] = &["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"];
+
+/// Secret-looking vars that are never scrubbed: the nested `claude`
+/// process may authenticate through them (omni-dev itself passes no
+/// credentials to the child).
+const SECRET_ENV_KEEP: &[&str] = &["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
+
+/// Parses a [`KEEP_ENV_VAR`] value into exact names exempted from the
+/// secret scrub: splits on commas, trims whitespace, drops empty segments.
+fn parse_keep_env(value: Option<&str>) -> Vec<String> {
+    value
+        .into_iter()
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Returns whether `key` is a secret env var the tool-enabled scrub must
+/// remove: it matches [`SECRET_ENV_SUFFIXES`] or [`SECRET_ENV_EXACT`] and
+/// is neither in the built-in [`SECRET_ENV_KEEP`] allowlist nor in the
+/// user-supplied `keep` list.
+fn is_scrubbed_secret(key: &str, keep: &[String]) -> bool {
+    if SECRET_ENV_KEEP.contains(&key) || keep.iter().any(|k| k == key) {
+        return false;
+    }
+    SECRET_ENV_EXACT.contains(&key) || SECRET_ENV_SUFFIXES.iter().any(|s| key.ends_with(s))
+}
 
 /// Subset of the `claude -p --output-format json` envelope we care about.
 ///
@@ -119,10 +176,13 @@ struct JsonOutput {
 /// posture and the "AI Backend Dispatch" section of `CLAUDE.md` for
 /// dispatch ordering.
 ///
-/// Three runtime knobs weaken or bound the sandbox:
-/// - `OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS` — re-enable nested tool use.
+/// Four runtime knobs weaken or bound the sandbox:
+/// - `OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS` — re-enable nested tool use (also
+///   activates the secret env scrub, see [`SECRET_ENV_SUFFIXES`]).
 /// - `OMNI_DEV_CLAUDE_CLI_ALLOW_MCP` — re-enable nested MCP server pickup.
 /// - `OMNI_DEV_CLAUDE_CLI_MAX_BUDGET_USD` — per-invocation spending cap in USD.
+/// - `OMNI_DEV_CLAUDE_CLI_KEEP_ENV` — exact names exempted from the secret
+///   env scrub.
 pub struct ClaudeCliAiClient {
     /// Model identifier (alias like `sonnet` or full ID like
     /// `claude-sonnet-4-6`). Forwarded verbatim to `claude -p --model`.
@@ -343,18 +403,54 @@ impl ClaudeCliAiClient {
         #[cfg(unix)]
         cmd.process_group(0);
 
-        // Scrub risky env vars rather than clearing wholesale. Clearing the
-        // env breaks the Node runtime inside `claude` (needs HOME, PATH,
-        // possibly DYLD_* / homebrew PATH entries on macOS).
-        for (k, _) in std::env::vars() {
+        let keep = if self.allow_tools {
+            parse_keep_env(std::env::var(KEEP_ENV_VAR).ok().as_deref())
+        } else {
+            Vec::new()
+        };
+        self.scrub_env(&mut cmd, std::env::vars().map(|(k, _)| k), &keep);
+
+        cmd
+    }
+
+    /// Removes risky env vars from `cmd` rather than clearing wholesale
+    /// (clearing the env breaks the Node runtime inside `claude`, which
+    /// needs HOME, PATH, possibly DYLD_* / homebrew PATH entries on macOS).
+    ///
+    /// Always removes the Claude Code re-scoping vars
+    /// ([`SCRUBBED_ENV_EXACT`], [`SCRUBBED_ENV_PREFIXES`]). When the
+    /// tool-access escape hatch is enabled, additionally removes
+    /// secret-looking vars (see [`SECRET_ENV_SUFFIXES`]); `keep` lists
+    /// exact names exempted from that secret scrub (resolved from
+    /// [`KEEP_ENV_VAR`] by the caller; ignored while tools are disabled).
+    ///
+    /// Takes the environment as an iterator of keys so tests can exercise
+    /// the scrub without mutating the process environment.
+    fn scrub_env(
+        &self,
+        cmd: &mut Command,
+        keys: impl IntoIterator<Item = String>,
+        keep: &[String],
+    ) {
+        let mut scrubbed_secrets = Vec::new();
+        for k in keys {
             if SCRUBBED_ENV_EXACT.contains(&k.as_str())
                 || SCRUBBED_ENV_PREFIXES.iter().any(|p| k.starts_with(p))
             {
                 cmd.env_remove(&k);
+            } else if self.allow_tools && is_scrubbed_secret(&k, keep) {
+                cmd.env_remove(&k);
+                scrubbed_secrets.push(k);
             }
         }
-
-        cmd
+        if !scrubbed_secrets.is_empty() {
+            scrubbed_secrets.sort_unstable();
+            debug!(
+                "claude -p secret env scrub (tool-access escape hatch active): \
+                 removed {}",
+                scrubbed_secrets.join(", ")
+            );
+        }
     }
 
     async fn run(&self, system_prompt: &str, user_prompt: &str) -> Result<String> {
@@ -422,7 +518,12 @@ impl ClaudeCliAiClient {
                 "claude -p sandbox weakened: tool-access escape hatch is enabled \
                  (--claude-cli-allow-tools / OMNI_DEV_CLAUDE_CLI_ALLOW_TOOLS). \
                  The nested session can now read, edit, and execute against the \
-                 environment it inherits."
+                 environment it inherits, and its prompt is built from untrusted \
+                 content (diffs, commit messages, JIRA text) that could carry a \
+                 prompt-injection payload. Well-known secret env vars (*_API_KEY, \
+                 *_TOKEN, *_SECRET, *_PASSWORD, *_CREDENTIALS, AWS credentials) \
+                 are scrubbed from the subprocess; set \
+                 OMNI_DEV_CLAUDE_CLI_KEEP_ENV to exempt specific names."
             );
         }
 
@@ -994,6 +1095,152 @@ mod tests {
         std::env::remove_var("CLAUDE_PROJECT_DIR");
         std::env::remove_var("CLAUDE_CODE_ENTRYPOINT");
         std::env::remove_var("CLAUDE_PROJECT_SOMETHING");
+    }
+
+    fn client_with_allow_tools(model: &str) -> ClaudeCliAiClient {
+        ClaudeCliAiClient::new_with_config(
+            model.to_string(),
+            DEFAULT_TIMEOUT,
+            DEFAULT_STDOUT_CAP,
+            true,
+            PathBuf::from("claude"),
+        )
+    }
+
+    /// Collects the keys `scrub_env` recorded as removed on `cmd`
+    /// (env_remove entries show up as `(key, None)` in `get_envs`).
+    fn removed_env_keys(cmd: &Command) -> Vec<String> {
+        cmd.as_std()
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn scrub_env_removes_secrets_when_tools_allowed() {
+        let cli = client_with_allow_tools("sonnet");
+        let mut cmd = Command::new("claude");
+        let keys = [
+            "MY_API_KEY",
+            "GITHUB_TOKEN",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "DB_PASSWORD",
+            "CLIENT_SECRET",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "PATH",
+            "HOME",
+            "CLAUDE_PROJECT_DIR",
+        ]
+        .map(String::from);
+        cli.scrub_env(&mut cmd, keys, &[]);
+        let removed = removed_env_keys(&cmd);
+
+        for key in [
+            "MY_API_KEY",
+            "GITHUB_TOKEN",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "DB_PASSWORD",
+            "CLIENT_SECRET",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "CLAUDE_PROJECT_DIR",
+        ] {
+            assert!(
+                removed.contains(&key.to_string()),
+                "{key} should be scrubbed: {removed:?}"
+            );
+        }
+        for key in ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "PATH", "HOME"] {
+            assert!(
+                !removed.contains(&key.to_string()),
+                "{key} should be kept: {removed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scrub_env_leaves_secrets_when_tools_disabled() {
+        let cli = client_with_defaults("sonnet");
+        let mut cmd = Command::new("claude");
+        let keys = ["MY_API_KEY", "GITHUB_TOKEN", "CLAUDE_PROJECT_DIR"].map(String::from);
+        cli.scrub_env(&mut cmd, keys, &[]);
+        let removed = removed_env_keys(&cmd);
+
+        assert_eq!(
+            removed,
+            vec!["CLAUDE_PROJECT_DIR".to_string()],
+            "only the re-scoping var should be scrubbed on the default path"
+        );
+    }
+
+    #[test]
+    fn scrub_env_honours_keep_list() {
+        let cli = client_with_allow_tools("sonnet");
+        let mut cmd = Command::new("claude");
+        let keys = ["GITHUB_TOKEN", "NPM_TOKEN"].map(String::from);
+        cli.scrub_env(&mut cmd, keys, &["GITHUB_TOKEN".to_string()]);
+        let removed = removed_env_keys(&cmd);
+
+        assert!(
+            removed.contains(&"NPM_TOKEN".to_string()),
+            "NPM_TOKEN should be scrubbed: {removed:?}"
+        );
+        assert!(
+            !removed.contains(&"GITHUB_TOKEN".to_string()),
+            "kept GITHUB_TOKEN should survive: {removed:?}"
+        );
+    }
+
+    #[test]
+    fn parse_keep_env_handles_none_and_empty() {
+        assert!(parse_keep_env(None).is_empty());
+        assert!(parse_keep_env(Some("")).is_empty());
+        assert!(parse_keep_env(Some(" , ,")).is_empty());
+    }
+
+    #[test]
+    fn parse_keep_env_splits_and_trims() {
+        assert_eq!(
+            parse_keep_env(Some(" GITHUB_TOKEN , NPM_TOKEN ")),
+            vec!["GITHUB_TOKEN".to_string(), "NPM_TOKEN".to_string()]
+        );
+    }
+
+    #[test]
+    fn is_scrubbed_secret_matches_suffixes_and_exact_names() {
+        for key in [
+            "FOO_API_KEY",
+            "GH_TOKEN",
+            "AWS_SESSION_TOKEN",
+            "CLIENT_SECRET",
+            "DB_PASSWORD",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+        ] {
+            assert!(is_scrubbed_secret(key, &[]), "{key} should match");
+        }
+    }
+
+    #[test]
+    fn is_scrubbed_secret_ignores_non_secret_names() {
+        for key in ["PATH", "HOME", "EDITOR", "TOKENIZER", "API_KEYRING"] {
+            assert!(!is_scrubbed_secret(key, &[]), "{key} should not match");
+        }
+    }
+
+    #[test]
+    fn is_scrubbed_secret_keep_lists_take_precedence() {
+        assert!(!is_scrubbed_secret("ANTHROPIC_API_KEY", &[]));
+        assert!(!is_scrubbed_secret("ANTHROPIC_AUTH_TOKEN", &[]));
+        assert!(!is_scrubbed_secret(
+            "GITHUB_TOKEN",
+            &["GITHUB_TOKEN".to_string()]
+        ));
     }
 
     #[test]
