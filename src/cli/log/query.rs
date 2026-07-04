@@ -15,6 +15,7 @@ use crate::request_log::{LogRecord, RecordKind, Source};
 /// The raw, borrowed flag values used to build a [`Filter`].
 pub struct FilterInput<'a> {
     pub since: Option<&'a str>,
+    pub until: Option<&'a str>,
     pub method: Option<&'a str>,
     pub status: Option<&'a str>,
     pub service: Option<&'a str>,
@@ -29,6 +30,7 @@ pub struct FilterInput<'a> {
 /// A compiled predicate over [`LogRecord`] lines.
 pub struct Filter {
     since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
     method: Option<String>,
     status: Option<StatusMatcher>,
     service: Option<String>,
@@ -45,7 +47,11 @@ impl Filter {
     /// errors (bad regex/status/duration/query) before streaming begins.
     pub fn build(input: FilterInput<'_>) -> Result<Self> {
         let since = match input.since {
-            Some(s) => Some(parse_since(s)?),
+            Some(s) => Some(parse_time_bound(s)?),
+            None => None,
+        };
+        let until = match input.until {
+            Some(s) => Some(parse_time_bound(s)?),
             None => None,
         };
         let status = match input.status {
@@ -62,6 +68,7 @@ impl Filter {
         }
         Ok(Self {
             since,
+            until,
             method: input.method.map(str::to_string),
             status,
             service: input.service.map(str::to_string),
@@ -81,6 +88,12 @@ impl Filter {
         if let Some(cutoff) = self.since {
             match parse_timestamp(&rec.timestamp) {
                 Some(ts) if ts >= cutoff => {}
+                _ => return false,
+            }
+        }
+        if let Some(cutoff) = self.until {
+            match parse_timestamp(&rec.timestamp) {
+                Some(ts) if ts <= cutoff => {}
                 _ => return false,
             }
         }
@@ -133,9 +146,31 @@ impl Filter {
     }
 }
 
+/// Parses a `--since`/`--until` bound, trying three forms in order:
+///
+/// 1. An absolute RFC3339 timestamp (`2026-07-01T12:00:00Z`).
+/// 2. A date-only `YYYY-MM-DD`, interpreted as midnight UTC.
+/// 3. A relative duration back from now (delegated to [`parse_since`]).
+///
+/// Relative durations never parse as RFC3339 or a date, so the ordering is
+/// unambiguous. An absolute value is that instant; a relative value is
+/// "now minus the duration".
+fn parse_time_bound(s: &str) -> Result<DateTime<Utc>> {
+    let s = s.trim();
+
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.with_timezone(&Utc));
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Ok(date.and_time(chrono::NaiveTime::MIN).and_utc());
+    }
+
+    parse_since(s)
+}
+
 /// Parses a relative duration like `30m`, `2h`, `1d`, `1w`, `45s` into the
-/// absolute cutoff `now - duration`. Shared by `--since` (log search) and
-/// `--older-than` (`omni-dev log prune`).
+/// absolute cutoff `now - duration`. Shared by `--older-than`
+/// (`omni-dev log prune`) and the relative arm of [`parse_time_bound`].
 pub(crate) fn parse_since(s: &str) -> Result<DateTime<Utc>> {
     let s = s.trim();
     let (num, unit) = s.split_at(
@@ -256,6 +291,9 @@ fn field_matches(rec: &LogRecord, field: &str, value: &str) -> bool {
             .is_some_and(|s| source_str(s).eq_ignore_ascii_case(value)),
         "service" => opt_eq_ci(rec.service.as_deref(), value),
         "method" => opt_eq_ci(rec.method.as_deref(), value),
+        // `status` keeps its class syntax (`5xx`, `4xx,5xx`); a leading
+        // comparator (`status:>=400`) routes to the numeric matcher instead.
+        "status" if has_comparator(value) => numeric_match(rec.status_code.map(i64::from), value),
         "status" => StatusMatcher::parse(value).is_ok_and(|m| m.matches(rec.status_code)),
         "command" | "cmd" => command_matches(rec, value),
         "url" => contains_ci(rec.url.as_deref(), value),
@@ -268,7 +306,51 @@ fn field_matches(rec: &LogRecord, field: &str, value: &str) -> bool {
             Some(e) => e.to_ascii_lowercase().contains(&value.to_ascii_lowercase()),
             None => false,
         },
+        // Numeric fields: `>N`, `>=N`, `<N`, `<=N`, or bare `N` (equality).
+        "exit_code" | "exit" => numeric_match(rec.exit_code.map(i64::from), value),
+        "duration_ms" | "duration" | "dur" => {
+            numeric_match(rec.duration_ms.map(|v| v as i64), value)
+        }
+        "elapsed_ms" | "elapsed" => numeric_match(rec.elapsed_ms.map(|v| v as i64), value),
+        // Text fields: case-insensitive substring, like `url`.
+        "hostname" | "host" => contains_ci(Some(&rec.hostname), value),
+        "system_user" | "user" => contains_ci(Some(&rec.system_user), value),
+        "cwd" => contains_ci(Some(&rec.cwd), value),
+        "auth_principal" | "principal" => contains_ci(rec.auth_principal.as_deref(), value),
         _ => false,
+    }
+}
+
+/// Whether a numeric-field value carries a leading comparison operator
+/// (`>`, `<`, `=`) rather than a bare number or a status class.
+fn has_comparator(spec: &str) -> bool {
+    spec.trim_start().starts_with(['>', '<', '='])
+}
+
+/// Matches a numeric record field against a spec that may carry a leading
+/// comparator: `>N`, `>=N`, `<N`, `<=N`, `=N`, or a bare `N` (equality). An
+/// absent field never matches; an unparseable number never matches.
+fn numeric_match(field: Option<i64>, spec: &str) -> bool {
+    let Some(actual) = field else {
+        return false;
+    };
+    let spec = spec.trim();
+    let (rest, cmp): (&str, fn(i64, i64) -> bool) = if let Some(r) = spec.strip_prefix(">=") {
+        (r, |a, b| a >= b)
+    } else if let Some(r) = spec.strip_prefix("<=") {
+        (r, |a, b| a <= b)
+    } else if let Some(r) = spec.strip_prefix('>') {
+        (r, |a, b| a > b)
+    } else if let Some(r) = spec.strip_prefix('<') {
+        (r, |a, b| a < b)
+    } else if let Some(r) = spec.strip_prefix('=') {
+        (r, |a, b| a == b)
+    } else {
+        (spec, |a, b| a == b)
+    };
+    match rest.trim().parse::<i64>() {
+        Ok(n) => cmp(actual, n),
+        Err(_) => false,
     }
 }
 
@@ -494,12 +576,12 @@ mod tests {
 
     #[test]
     fn since_parses_units() {
-        assert!(parse_since("30m").is_ok());
-        assert!(parse_since("2h").is_ok());
-        assert!(parse_since("1d").is_ok());
-        assert!(parse_since("1w").is_ok());
-        assert!(parse_since("10x").is_err());
-        assert!(parse_since("h").is_err());
+        assert!(parse_time_bound("30m").is_ok());
+        assert!(parse_time_bound("2h").is_ok());
+        assert!(parse_time_bound("1d").is_ok());
+        assert!(parse_time_bound("1w").is_ok());
+        assert!(parse_time_bound("10x").is_err());
+        assert!(parse_time_bound("h").is_err());
     }
 
     #[test]
@@ -557,6 +639,7 @@ mod tests {
         let rec = http(Some(500), "jira", "GET");
         let pass = Filter::build(FilterInput {
             since: None,
+            until: None,
             method: Some("GET"),
             status: Some("5xx"),
             service: Some("jira"),
@@ -572,6 +655,7 @@ mod tests {
 
         let fail = Filter::build(FilterInput {
             since: None,
+            until: None,
             method: Some("POST"),
             status: None,
             service: None,
@@ -589,6 +673,7 @@ mod tests {
     fn empty_input<'a>() -> FilterInput<'a> {
         FilterInput {
             since: None,
+            until: None,
             method: None,
             status: None,
             service: None,
@@ -844,5 +929,116 @@ mod tests {
         // The error arm with no error present returns false.
         let rec = LogRecord::default();
         assert!(!parse_query("error:boom").unwrap().eval(&rec, &raw));
+    }
+
+    #[test]
+    fn numeric_match_operators() {
+        assert!(numeric_match(Some(1500), ">1000"));
+        assert!(!numeric_match(Some(500), ">1000"));
+        assert!(numeric_match(Some(1000), ">=1000"));
+        assert!(numeric_match(Some(200), "<500"));
+        assert!(numeric_match(Some(500), "<=500"));
+        assert!(numeric_match(Some(42), "42")); // bare == equality
+        assert!(numeric_match(Some(42), "=42"));
+        assert!(!numeric_match(Some(43), "42"));
+        // Absent field and unparseable spec never match.
+        assert!(!numeric_match(None, ">0"));
+        assert!(!numeric_match(Some(1), ">abc"));
+    }
+
+    #[test]
+    fn query_covers_numeric_fields_and_comparators() {
+        let rec = LogRecord {
+            kind: RecordKind::Invocation,
+            exit_code: Some(1),
+            duration_ms: Some(1500),
+            status_code: Some(503),
+            elapsed_ms: Some(2500),
+            ..LogRecord::default()
+        };
+        let raw = serde_json::to_string(&rec).unwrap().to_ascii_lowercase();
+        let cases = [
+            ("exit_code:>0", true),   // failed runs
+            ("exit:1", true),         // alias + equality
+            ("exit_code:0", false),   //
+            ("duration:>1000", true), // slow invocations
+            ("dur:<1000", false),
+            ("duration_ms:1500", true),
+            ("elapsed:>1000", true), // slow requests
+            ("elapsed_ms:<=2500", true),
+            ("status:>=500", true), // comparator on status
+            ("status:<500", false),
+            ("status:5xx", true), // class syntax still works
+        ];
+        for (q, want) in cases {
+            assert_eq!(parse_query(q).unwrap().eval(&rec, &raw), want, "{q}");
+        }
+    }
+
+    #[test]
+    fn query_covers_text_fields() {
+        let rec = LogRecord {
+            hostname: "build-box-01".to_string(),
+            system_user: "ci-runner".to_string(),
+            cwd: "/home/ci/project".to_string(),
+            auth_principal: Some("token-abc".to_string()),
+            ..LogRecord::default()
+        };
+        let raw = serde_json::to_string(&rec).unwrap().to_ascii_lowercase();
+        let cases = [
+            ("hostname:build-box", true),
+            ("host:BUILD-BOX-01", true), // alias + case-insensitive
+            ("host:other", false),
+            ("system_user:ci-runner", true),
+            ("user:ci", true),
+            ("cwd:/home/ci", true),
+            ("auth_principal:token-abc", true),
+            ("principal:abc", true),
+            ("principal:nope", false),
+        ];
+        for (q, want) in cases {
+            assert_eq!(parse_query(q).unwrap().eval(&rec, &raw), want, "{q}");
+        }
+        // An absent auth_principal never matches.
+        let bare = LogRecord::default();
+        assert!(!parse_query("principal:x").unwrap().eval(&bare, "{}"));
+    }
+
+    #[test]
+    fn parse_time_bound_accepts_absolute_and_relative() {
+        // RFC3339 timestamp.
+        let ts = parse_time_bound("2026-07-01T12:00:00Z").unwrap();
+        assert_eq!(ts.to_rfc3339(), "2026-07-01T12:00:00+00:00");
+        // Date-only → midnight UTC.
+        let date = parse_time_bound("2026-07-01").unwrap();
+        assert_eq!(date.to_rfc3339(), "2026-07-01T00:00:00+00:00");
+        // Relative still works and is in the past.
+        assert!(parse_time_bound("2h").unwrap() < Utc::now());
+        // Garbage is rejected.
+        assert!(parse_time_bound("not-a-time").is_err());
+    }
+
+    #[test]
+    fn until_bounds_the_upper_window() {
+        let raw = "{}";
+        let mut old = rec_http();
+        old.timestamp = "2026-06-01T00:00:00.000Z".to_string();
+        let mut recent = rec_http();
+        recent.timestamp = "2026-07-10T00:00:00.000Z".to_string();
+
+        // --until as an absolute upper bound: keep old, drop recent.
+        let mut i = empty_input();
+        i.until = Some("2026-07-01T00:00:00Z");
+        let f = Filter::build(i).unwrap();
+        assert!(f.matches(&old, raw));
+        assert!(!f.matches(&recent, raw));
+
+        // Bounded window with both ends.
+        let mut i = empty_input();
+        i.since = Some("2026-06-15");
+        i.until = Some("2026-07-05");
+        let f = Filter::build(i).unwrap();
+        assert!(!f.matches(&old, raw), "before --since");
+        assert!(!f.matches(&recent, raw), "after --until");
     }
 }

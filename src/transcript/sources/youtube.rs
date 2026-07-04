@@ -60,6 +60,38 @@ pub fn matches_url(input: &str) -> bool {
     extract_video_id(input).is_ok()
 }
 
+/// Appends a best-effort `service = "transcript"` HTTP record for one YouTube
+/// request attempt. Recorded from the raw [`reqwest::Result`] *before*
+/// `error_for_status`, so a 4xx/5xx response is logged with its real status and
+/// a transport failure with its error message. Mirrors the datadog hook
+/// ([`crate::datadog`]); URL query/fragment secrets are redacted centrally by
+/// [`crate::request_log::record_http`].
+pub(crate) fn record_yt_http(
+    method: &str,
+    url: &str,
+    started: std::time::Instant,
+    result: &reqwest::Result<reqwest::Response>,
+) {
+    match result {
+        Ok(r) => crate::request_log::record_http(
+            "transcript",
+            method,
+            url,
+            started,
+            Some(r.status().as_u16()),
+            None,
+        ),
+        Err(e) => crate::request_log::record_http(
+            "transcript",
+            method,
+            url,
+            started,
+            None,
+            Some(&e.to_string()),
+        ),
+    }
+}
+
 /// YouTube [`TranscriptSource`].
 ///
 /// Holds a single [`reqwest::Client`] reused across the watch-page,
@@ -260,6 +292,25 @@ mod tests {
     #[test]
     fn matches_url_accepts_bare_video_id() {
         assert!(matches_url(VIDEO_ID));
+    }
+
+    #[tokio::test]
+    async fn record_yt_http_logs_transport_error_without_panicking() {
+        // The Ok arm is exercised by every wiremock fetch test; this covers the
+        // Err arm — a transport-level failure (connection refused on a closed
+        // port), recorded best-effort with no status and the error text.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let url = "http://127.0.0.1:1/youtubei/v1/player";
+        let result = client.get(url).send().await;
+        assert!(
+            result.is_err(),
+            "a closed port must yield a transport error"
+        );
+        // Best-effort logging must not panic on an Err result.
+        record_yt_http("GET", url, std::time::Instant::now(), &result);
     }
 
     #[test]

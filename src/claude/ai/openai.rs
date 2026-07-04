@@ -244,6 +244,17 @@ impl OpenAiAiClient {
             || self.api_key.is_none()
     }
 
+    /// Request-log `service` tag for this backend: `ollama` for a local
+    /// Ollama-shaped instance, else `openai`. Keeps the two OpenAI-compatible
+    /// backends filterable apart in `omni-dev log`.
+    fn service_tag(&self) -> &'static str {
+        if self.is_ollama() {
+            "ollama"
+        } else {
+            "openai"
+        }
+    }
+
     /// Determines if this model is GPT-5 series (uses max_completion_tokens instead of max_tokens).
     fn is_gpt5_series(&self) -> bool {
         self.model.starts_with("gpt-5") || self.model.starts_with("o1")
@@ -344,7 +355,7 @@ impl OpenAiAiClient {
 
         let started = std::time::Instant::now();
         let send_result = req_builder.send().await;
-        super::record_ai_http(&api_url, started, &send_result);
+        super::record_ai_http(self.service_tag(), "POST", &api_url, started, &send_result);
         let response = send_result.map_err(|e| ClaudeError::NetworkError(e.to_string()))?;
 
         let response = super::check_error_response(response).await?;
@@ -389,13 +400,14 @@ impl OpenAiAiClient {
     /// to abort startup.
     pub async fn probe_loaded_context_length(&mut self) -> Option<ProbeSource> {
         let host = host_root(&self.base_url);
+        let service = self.service_tag();
 
-        if let Some(value) = probe_lm_studio(&self.client, &host, &self.model).await {
+        if let Some(value) = probe_lm_studio(&self.client, &host, &self.model, service).await {
             self.loaded_context_length = Some(value);
             return Some(ProbeSource::LmStudio);
         }
 
-        if let Some(value) = probe_ollama_native(&self.client, &host, &self.model).await {
+        if let Some(value) = probe_ollama_native(&self.client, &host, &self.model, service).await {
             self.loaded_context_length = Some(value);
             return Some(ProbeSource::Ollama);
         }
@@ -422,11 +434,14 @@ fn host_root(base_url: &str) -> String {
 /// length of a specific model id. Returns `None` if the server doesn't
 /// respond, doesn't return JSON in the expected shape, doesn't list the
 /// requested model, or the model isn't currently loaded.
-async fn probe_lm_studio(client: &Client, host: &str, model: &str) -> Option<usize> {
+async fn probe_lm_studio(client: &Client, host: &str, model: &str, service: &str) -> Option<usize> {
     let url = format!("{host}/api/v0/models");
     debug!(url = %url, model = %model, "Probing LM Studio for loaded context length");
 
-    let response = client.get(&url).timeout(PROBE_TIMEOUT).send().await.ok()?;
+    let started = std::time::Instant::now();
+    let result = client.get(&url).timeout(PROBE_TIMEOUT).send().await;
+    super::record_ai_http(service, "GET", &url, started, &result);
+    let response = result.ok()?;
     if !response.status().is_success() {
         debug!(status = %response.status(), "LM Studio probe returned non-success");
         return None;
@@ -442,17 +457,24 @@ async fn probe_lm_studio(client: &Client, host: &str, model: &str) -> Option<usi
 /// declared context length. The architecture prefix on the
 /// `model_info.<arch>.context_length` key varies (`llama`, `qwen2`,
 /// `gemma`, …), so we scan for any key ending in `.context_length`.
-async fn probe_ollama_native(client: &Client, host: &str, model: &str) -> Option<usize> {
+async fn probe_ollama_native(
+    client: &Client,
+    host: &str,
+    model: &str,
+    service: &str,
+) -> Option<usize> {
     let url = format!("{host}/api/show");
     debug!(url = %url, model = %model, "Probing Ollama for loaded context length");
 
-    let response = client
+    let started = std::time::Instant::now();
+    let result = client
         .post(&url)
         .timeout(PROBE_TIMEOUT)
         .json(&serde_json::json!({ "name": model }))
         .send()
-        .await
-        .ok()?;
+        .await;
+    super::record_ai_http(service, "POST", &url, started, &result);
+    let response = result.ok()?;
     if !response.status().is_success() {
         debug!(status = %response.status(), "Ollama probe returned non-success");
         return None;
@@ -671,6 +693,33 @@ mod tests {
         )
         .unwrap();
         assert!(!openai_client.is_ollama());
+    }
+
+    #[test]
+    fn service_tag_distinguishes_ollama_from_openai() {
+        // Request-log service tag follows is_ollama so the two OpenAI-compatible
+        // backends are filterable apart (#1122).
+        let ollama = OpenAiAiClient::new(
+            "llama2".to_string(),
+            None,
+            "http://localhost:11434".to_string(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(ollama.service_tag(), "ollama");
+
+        let openai = OpenAiAiClient::new(
+            "gpt-4".to_string(),
+            Some("sk-real-key".to_string()),
+            "https://api.openai.com".to_string(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(openai.service_tag(), "openai");
     }
 
     // ── is_gpt5_series ───────────────────────────────────────────────

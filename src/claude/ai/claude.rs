@@ -41,6 +41,10 @@ struct ClaudeResponse {
     content: Vec<Content>,
 }
 
+/// Anthropic Messages API endpoint. Held as a client field (defaulted here) so
+/// tests can point the send path at a mock server.
+const API_URL: &str = "https://api.anthropic.com/v1/messages";
+
 /// Claude API client implementation.
 pub struct ClaudeAiClient {
     /// HTTP client for API requests.
@@ -51,6 +55,8 @@ pub struct ClaudeAiClient {
     model: String,
     /// Active beta header (key, value) if enabled.
     active_beta: Option<(String, String)>,
+    /// Messages API endpoint (defaults to [`API_URL`]; overridable in tests).
+    api_url: String,
 }
 
 impl ClaudeAiClient {
@@ -67,6 +73,7 @@ impl ClaudeAiClient {
             api_key,
             model,
             active_beta,
+            api_url: API_URL.to_string(),
         })
     }
 
@@ -109,7 +116,7 @@ impl AiClient for ClaudeAiClient {
             };
 
             info!(
-                url = "https://api.anthropic.com/v1/messages",
+                url = %self.api_url,
                 model = %self.model,
                 max_tokens = self.get_max_tokens(),
                 "Sending request to Claude API"
@@ -118,7 +125,7 @@ impl AiClient for ClaudeAiClient {
             // Send request to Claude API
             let mut builder = self
                 .client
-                .post("https://api.anthropic.com/v1/messages")
+                .post(&self.api_url)
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json");
@@ -130,11 +137,7 @@ impl AiClient for ClaudeAiClient {
 
             let started = std::time::Instant::now();
             let send_result = builder.json(&request).send().await;
-            super::record_ai_http(
-                "https://api.anthropic.com/v1/messages",
-                started,
-                &send_result,
-            );
+            super::record_ai_http("anthropic", "POST", &self.api_url, started, &send_result);
             let response = send_result.map_err(|e| ClaudeError::NetworkError(e.to_string()))?;
 
             let response = super::check_error_response(response).await?;
@@ -196,6 +199,36 @@ mod tests {
         assert_eq!(client.model, "claude-sonnet-4-20250514");
         assert_eq!(client.api_key, "sk-ant-test");
         assert!(client.active_beta.is_none());
+    }
+
+    #[tokio::test]
+    async fn send_request_posts_to_configured_url_and_returns_text() {
+        // Drives the whole send path (including the best-effort HTTP record)
+        // against a mock server by overriding the endpoint field.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"content":[{"type":"text","text":"hi there"}]}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut client = ClaudeAiClient::new(
+            "claude-sonnet-4-20250514".to_string(),
+            "sk-ant-test".to_string(),
+            None,
+        )
+        .unwrap();
+        client.api_url = format!("{}/v1/messages", server.uri());
+
+        let out = client.send_request("system", "user").await.unwrap();
+        assert_eq!(out, "hi there");
     }
 
     #[test]
