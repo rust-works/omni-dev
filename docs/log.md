@@ -44,6 +44,8 @@ The directory is created `0700` and the file `0600`, the same posture as other
 | `OMNI_DEV_LOG_DISABLE=1` | Disable logging entirely. |
 | `OMNI_DEV_LOG_BODIES=1` | Opt in to recording request/response bodies (off by default; payloads are large and may contain customer content). |
 | `OMNI_DEV_LOG_HEADERS=1` | Opt in to recording (redacted) request/response headers. |
+| `OMNI_DEV_LOG_MAX_SIZE` | Enable automatic size-capped rotation on write, e.g. `10mb` (unix only; see [Bounding growth](#bounding-growth)). |
+| `OMNI_DEV_LOG_KEEP_FILES` | Number of rotated files to keep when rotation is enabled (default `3`). |
 
 Logging is **best effort**: a write failure is swallowed (logged only at
 `tracing::debug`) and can never change the command's exit code.
@@ -51,8 +53,12 @@ Logging is **best effort**: a write failure is swallowed (logged only at
 ## `omni-dev log`
 
 ```
-omni-dev log [OPTIONS]
+omni-dev log [OPTIONS]          # search (default)
+omni-dev log prune [OPTIONS]    # trim the log — see Bounding growth
 ```
+
+With no subcommand, `omni-dev log` searches and prints the log using the filters
+below. The `prune` subcommand trims it; see [Bounding growth](#bounding-growth).
 
 ### Filters
 
@@ -110,6 +116,67 @@ omni-dev log --format json --service datadog | jq 'select(.elapsed_ms > 1000)'
 # Follow live.
 omni-dev log -f --service browser-bridge
 ```
+
+## Bounding growth
+
+The log is default-on for every invocation **and** every outbound request, so on
+an active machine it grows steadily. Two opt-in bounds keep it in check; both are
+off by default, so nothing changes unless you ask for it.
+
+### `omni-dev log prune`
+
+Trims the log in place, by age and/or by size:
+
+```
+omni-dev log prune [--older-than <DUR>] [--max-size <SIZE>] [--dry-run]
+```
+
+| Flag | Effect |
+|------|--------|
+| `--older-than <DUR>` | Remove records older than a relative window (`7d`, `24h`, `2w`, `45m`). |
+| `--max-size <SIZE>` | After age pruning, drop the **oldest** records until the file is at most `<SIZE>` (`10mb`, `512kb`, or a bare byte count). |
+| `--dry-run` | Report what would be removed without modifying the file. |
+
+At least one of `--older-than` / `--max-size` is required. Sizes are binary
+(`kb`/`mb`/`gb` = 1024-based). Records with a missing or unparseable timestamp
+are kept (age pruning only removes records it can positively date as old), and
+`--max-size` always keeps at least the single most recent record.
+
+```bash
+# Keep the last 30 days; preview first.
+omni-dev log prune --older-than 30d --dry-run
+omni-dev log prune --older-than 30d
+
+# Cap the file at 20 MB, dropping the oldest records to fit.
+omni-dev log prune --max-size 20mb
+```
+
+Pruning rewrites the file atomically (a same-directory temp file is renamed over
+the original, preserving the `0600` mode), so a concurrent reader never sees a
+half-written file. It is not locked against concurrent **writers**, though: a
+record appended during the rewrite may be lost, and — because `prune` is itself
+a logged invocation — pruning the active log appends one new record of its own.
+For exact accounting, prune with `OMNI_DEV_LOG_DISABLE=1` or when the log is idle.
+
+### Automatic size-capped rotation
+
+Set `OMNI_DEV_LOG_MAX_SIZE` (e.g. `10mb`) to rotate on write: before an append
+that would push the file past the cap, `log.jsonl` is renamed to `log.jsonl.1`
+(shifting any existing `log.jsonl.1` → `.2`, and so on) and a fresh `log.jsonl`
+is started. `OMNI_DEV_LOG_KEEP_FILES` (default `3`) bounds how many rotated files
+are retained; the oldest beyond that is deleted. Total on-disk use is therefore
+roughly `(OMNI_DEV_LOG_KEEP_FILES + 1) × OMNI_DEV_LOG_MAX_SIZE`.
+
+Rotation is **unix-only** and **best effort**: when it is enabled, writers
+serialize on a stable `log.jsonl.lock` file (created `0600`) for the
+check-rotate-append sequence, and a rotation failure falls back to appending
+without rotating rather than dropping the record. The env vars are read per
+write, so they must be present in the environment of whatever writes the log
+(your shell for CLI runs, or the daemon's environment for daemon-served
+requests). A set-but-invalid `OMNI_DEV_LOG_MAX_SIZE` is ignored (logged at
+`tracing::debug`) and leaves rotation off. The `omni-dev log` reader already
+tolerates truncation and rotation, so `-f/--follow` keeps working across a
+rotation (it restarts from the top of the fresh file).
 
 ## Redaction posture
 

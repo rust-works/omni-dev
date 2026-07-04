@@ -24,15 +24,21 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use chrono::SecondsFormat;
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Default log file name under the runtime directory.
 const LOG_FILE_NAME: &str = "log.jsonl";
+
+/// Number of rotated log files kept by default when
+/// [`OMNI_DEV_LOG_MAX_SIZE`](rotation_config) enables rotation but
+/// `OMNI_DEV_LOG_KEEP_FILES` is unset. (Rotation on write is unix-only.)
+#[cfg(unix)]
+const DEFAULT_KEEP_FILES: u32 = 3;
 
 /// Which kind of record a line holds. Unknown future kinds deserialize to
 /// [`RecordKind::Unknown`] rather than failing the read.
@@ -341,6 +347,12 @@ fn try_record(entry: &LogRecord) -> anyhow::Result<()> {
 fn append_line(path: &std::path::Path, line: &str) -> anyhow::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
 
+    // Opt-in size-capped rotation takes over the write: it must stat, maybe
+    // rotate, then open a fresh file, all under a stable-path lock (#1121).
+    if let Some(cfg) = rotation_config() {
+        return append_with_rotation(path, line, &cfg);
+    }
+
     let file = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
@@ -365,7 +377,8 @@ fn append_line(path: &std::path::Path, line: &str) -> anyhow::Result<()> {
 }
 
 /// Non-unix fallback: `O_APPEND | O_CREATE` single write, no advisory lock and
-/// no mode tightening (those are unix concepts).
+/// no mode tightening (those are unix concepts). Size-capped rotation is a
+/// unix-only feature and is not applied here.
 #[cfg(not(unix))]
 fn append_line(path: &std::path::Path, line: &str) -> anyhow::Result<()> {
     let mut file = std::fs::OpenOptions::new()
@@ -374,6 +387,295 @@ fn append_line(path: &std::path::Path, line: &str) -> anyhow::Result<()> {
         .open(path)?;
     file.write_all(line.as_bytes())?;
     Ok(())
+}
+
+// --- Size management: rotation on write + `omni-dev log prune` ---
+//
+// The log is default-on for every invocation and every outbound request, so on
+// an active machine it would otherwise grow without bound (#1121). Two bounds
+// are offered, both opt-in:
+//
+//   * Automatic size-capped rotation on write, gated on `OMNI_DEV_LOG_MAX_SIZE`
+//     (+ `OMNI_DEV_LOG_KEEP_FILES`) — numbered `log.jsonl.1`, `.2`, … files.
+//   * The explicit `omni-dev log prune` command (age- and/or size-based), which
+//     rewrites the file in place via a same-dir temp file + atomic rename.
+
+/// Returns `path` with `suffix` appended to its final component (kept in the
+/// same directory), e.g. `…/log.jsonl` + `.1` → `…/log.jsonl.1`.
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Parses a human byte size: a number (with optional decimal) and an optional
+/// unit suffix — `b` (bytes, the default), `k`/`kb`/`kib`, `m`/`mb`/`mib`,
+/// `g`/`gb`/`gib` (case-insensitive, all binary/1024-based).
+pub(crate) fn parse_size(s: &str) -> anyhow::Result<u64> {
+    use anyhow::Context as _;
+
+    let lower = s.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        anyhow::bail!("empty size (expected e.g. 10mb, 512kb, 1048576)");
+    }
+    let split = lower
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(lower.len());
+    let (num, unit) = lower.split_at(split);
+    let value: f64 = num
+        .parse()
+        .with_context(|| format!("invalid size number: {s}"))?;
+    if !value.is_finite() || value < 0.0 {
+        anyhow::bail!("invalid size: {s}");
+    }
+    let mult: u64 = match unit.trim() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        other => anyhow::bail!("invalid size unit: {other} (use b, kb, mb, or gb)"),
+    };
+    Ok((value * mult as f64) as u64)
+}
+
+/// Resolved rotation policy from the environment. `None` means rotation is off
+/// (the default): `OMNI_DEV_LOG_MAX_SIZE` unset, empty, invalid, or `0`.
+/// Rotation on write is a unix-only feature.
+#[cfg(unix)]
+struct RotationConfig {
+    /// Rotate before an append that would push the file past this many bytes.
+    max_size: u64,
+    /// Number of rotated `log.jsonl.N` files to retain.
+    keep_files: u32,
+}
+
+/// Reads the rotation policy from `OMNI_DEV_LOG_MAX_SIZE` /
+/// `OMNI_DEV_LOG_KEEP_FILES`. A set-but-invalid `OMNI_DEV_LOG_MAX_SIZE` logs at
+/// debug and disables rotation rather than failing the write.
+#[cfg(unix)]
+fn rotation_config() -> Option<RotationConfig> {
+    let raw = std::env::var("OMNI_DEV_LOG_MAX_SIZE").ok()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    let max_size = match parse_size(&raw) {
+        Ok(0) => return None,
+        Ok(n) => n,
+        Err(e) => {
+            tracing::debug!("request_log: ignoring invalid OMNI_DEV_LOG_MAX_SIZE: {e}");
+            return None;
+        }
+    };
+    let keep_files = std::env::var("OMNI_DEV_LOG_KEEP_FILES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_KEEP_FILES);
+    Some(RotationConfig {
+        max_size,
+        keep_files,
+    })
+}
+
+/// Rotates `log.jsonl` → `log.jsonl.1`, shifting existing numbered files up and
+/// dropping any beyond `keep_files` (`keep_files == 0` simply discards the
+/// current file). Rotated files inherit the `0600` mode of their source.
+#[cfg(unix)]
+fn rotate(path: &Path, keep_files: u32) -> anyhow::Result<()> {
+    if keep_files == 0 {
+        // Retain no history: dropping the current file lets the caller start a
+        // fresh one on the following append.
+        let _ = std::fs::remove_file(path);
+        return Ok(());
+    }
+    // Drop the oldest retained file, then shift .(N-1) → .N … .1 → .2.
+    let _ = std::fs::remove_file(sibling(path, &format!(".{keep_files}")));
+    for i in (1..keep_files).rev() {
+        let from = sibling(path, &format!(".{i}"));
+        if from.exists() {
+            std::fs::rename(&from, sibling(path, &format!(".{}", i + 1)))?;
+        }
+    }
+    std::fs::rename(path, sibling(path, ".1"))?;
+    Ok(())
+}
+
+/// Size-capped append (unix): under an exclusive lock on a stable `<log>.lock`
+/// file — so all rotation-aware writers serialize on an inode that is never
+/// itself rotated — stat the log, rotate if this line would push a non-empty
+/// file past the cap, then append to the (possibly fresh) file. A rotation
+/// failure is logged at debug and the line is still appended (best effort).
+#[cfg(unix)]
+fn append_with_rotation(path: &Path, line: &str, cfg: &RotationConfig) -> anyhow::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let lock_path = sibling(path, ".lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_path)?;
+    crate::daemon::paths::ensure_handle_0600(&lock_file)?;
+    // Hold the lock for the whole check-rotate-append. If the lock cannot be
+    // taken, fall through unlocked rather than dropping the record.
+    let _guard = nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusive).ok();
+
+    let current = std::fs::metadata(path).map_or(0, |m| m.len());
+    if current > 0 && current.saturating_add(line.len() as u64) > cfg.max_size {
+        if let Err(e) = rotate(path, cfg.keep_files) {
+            tracing::debug!("request_log: rotation failed, appending without rotating: {e}");
+        }
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .open(path)?;
+    crate::daemon::paths::ensure_handle_0600(&file)?;
+    file.write_all(line.as_bytes())?;
+    Ok(())
+}
+
+/// Options controlling [`prune`].
+pub struct PruneOptions {
+    /// Drop records whose timestamp is strictly older than this cutoff. A
+    /// record with a missing/unparseable timestamp (or a malformed line) is
+    /// conservatively kept.
+    pub older_than: Option<DateTime<Utc>>,
+    /// After age pruning, drop the oldest records until the file is at most
+    /// this many bytes. At least the single most recent record is always kept.
+    pub max_size: Option<u64>,
+    /// Compute and report the outcome without modifying the file.
+    pub dry_run: bool,
+}
+
+/// What a [`prune`] run did (or, when `dry_run`, would do).
+pub struct PruneOutcome {
+    /// Records removed.
+    pub removed: usize,
+    /// Records retained.
+    pub kept: usize,
+    /// File size before.
+    pub bytes_before: u64,
+    /// File size after (the size the retained records occupy).
+    pub bytes_after: u64,
+}
+
+/// Prunes the log at `path` by age and/or size, rewriting it in place.
+///
+/// Non-empty lines are retained by two successive filters: age (`older_than`)
+/// then size (`max_size`, keeping the most recent records that fit). The kept
+/// lines are written to a same-directory temp file (`0600` on unix) and
+/// atomically renamed over the original, so a reader never sees a half-written
+/// file. A missing log is a no-op; a no-change prune skips the rewrite (leaving
+/// the file's inode — and any concurrent appends — untouched).
+pub fn prune(path: &Path, opts: &PruneOptions) -> anyhow::Result<PruneOutcome> {
+    use anyhow::Context as _;
+
+    let data = match std::fs::read(path) {
+        Ok(data) => data,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PruneOutcome {
+                removed: 0,
+                kept: 0,
+                bytes_before: 0,
+                bytes_after: 0,
+            });
+        }
+        Err(e) => return Err(e).context("failed to read the log file"),
+    };
+    let bytes_before = data.len() as u64;
+    let text = String::from_utf8_lossy(&data);
+
+    // Every non-empty line, then the subset passing the age filter (both in
+    // original — chronological — order).
+    let all: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let aged: Vec<&str> = all
+        .iter()
+        .copied()
+        .filter(|line| keep_by_age(line, opts.older_than))
+        .collect();
+
+    let kept: &[&str] = match opts.max_size {
+        None => &aged,
+        Some(max) => keep_by_size(&aged, max),
+    };
+
+    let bytes_after: u64 = kept.iter().map(|l| l.len() as u64 + 1).sum();
+    let outcome = PruneOutcome {
+        removed: all.len() - kept.len(),
+        kept: kept.len(),
+        bytes_before,
+        bytes_after,
+    };
+
+    if !opts.dry_run && outcome.removed > 0 {
+        rewrite_atomically(path, kept)?;
+    }
+    Ok(outcome)
+}
+
+/// Whether a raw line survives the age filter. Absent filter keeps everything;
+/// an undateable or malformed line is conservatively kept.
+fn keep_by_age(line: &str, older_than: Option<DateTime<Utc>>) -> bool {
+    let Some(cutoff) = older_than else {
+        return true;
+    };
+    match serde_json::from_str::<LogRecord>(line) {
+        Ok(rec) => match DateTime::parse_from_rfc3339(&rec.timestamp) {
+            Ok(ts) => ts.with_timezone(&Utc) >= cutoff,
+            Err(_) => true,
+        },
+        Err(_) => true,
+    }
+}
+
+/// Longest suffix of `lines` whose bytes (each line + its newline) fit in `max`,
+/// but never fewer than the single most recent line.
+fn keep_by_size<'a>(lines: &'a [&'a str], max: u64) -> &'a [&'a str] {
+    let mut acc = 0u64;
+    let mut start = lines.len();
+    for (i, line) in lines.iter().enumerate().rev() {
+        acc += line.len() as u64 + 1;
+        if acc > max {
+            break;
+        }
+        start = i;
+    }
+    if start == lines.len() && !lines.is_empty() {
+        start = lines.len() - 1; // keep at least the most recent record
+    }
+    &lines[start..]
+}
+
+/// Writes `lines` (each newline-terminated) to a same-directory temp file and
+/// atomically renames it over `path`, preserving the `0600` posture on unix.
+fn rewrite_atomically(path: &Path, lines: &[&str]) -> anyhow::Result<()> {
+    let tmp = sibling(path, &format!(".prune.{}.tmp", std::process::id()));
+    let result = (|| -> anyhow::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        #[cfg(unix)]
+        crate::daemon::paths::ensure_handle_0600(&file)?;
+        for line in lines {
+            file.write_all(line.as_bytes())?;
+            file.write_all(b"\n")?;
+        }
+        file.flush()?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// The outcome of an invocation, recorded once after `cli.execute()` returns.
@@ -1176,5 +1478,240 @@ mod tests {
         assert!(!env_flag("OMNI_DEV_TEST_FLAG_ABC"));
         std::env::remove_var("OMNI_DEV_TEST_FLAG_ABC");
         assert!(!env_flag("OMNI_DEV_TEST_FLAG_ABC"));
+    }
+
+    #[test]
+    fn parse_size_handles_units_and_bare_bytes() {
+        assert_eq!(parse_size("1048576").unwrap(), 1024 * 1024);
+        assert_eq!(parse_size("512b").unwrap(), 512);
+        assert_eq!(parse_size("10kb").unwrap(), 10 * 1024);
+        assert_eq!(parse_size("2K").unwrap(), 2 * 1024);
+        assert_eq!(parse_size("3mb").unwrap(), 3 * 1024 * 1024);
+        assert_eq!(parse_size("1gb").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_size("1.5mb").unwrap(), (1.5 * 1024.0 * 1024.0) as u64);
+        assert_eq!(parse_size(" 4mib ").unwrap(), 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_size_rejects_garbage() {
+        assert!(parse_size("").is_err());
+        assert!(parse_size("mb").is_err());
+        assert!(parse_size("10tb").is_err());
+        assert!(parse_size("-5mb").is_err());
+    }
+
+    #[test]
+    fn sibling_appends_to_final_component() {
+        let base = Path::new("/tmp/omni/log.jsonl");
+        assert_eq!(sibling(base, ".1"), Path::new("/tmp/omni/log.jsonl.1"));
+        assert_eq!(
+            sibling(base, ".lock"),
+            Path::new("/tmp/omni/log.jsonl.lock")
+        );
+    }
+
+    #[test]
+    fn keep_by_size_keeps_most_recent_that_fit() {
+        // Four 10-byte lines (11 bytes on disk each with the newline).
+        let lines = ["aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc", "dddddddddd"];
+        let refs: Vec<&str> = lines.to_vec();
+
+        // Budget for exactly two lines (22 bytes) keeps the last two.
+        assert_eq!(keep_by_size(&refs, 22), &["cccccccccc", "dddddddddd"]);
+        // A budget smaller than one line still keeps the single most recent.
+        assert_eq!(keep_by_size(&refs, 1), &["dddddddddd"]);
+        // A generous budget keeps everything.
+        assert_eq!(keep_by_size(&refs, 10_000), &refs[..]);
+        // Empty input yields empty output (no panic).
+        assert!(keep_by_size(&[], 100).is_empty());
+    }
+
+    #[test]
+    fn keep_by_age_is_conservative_on_undateable_lines() {
+        let cutoff = DateTime::parse_from_rfc3339("2026-06-01T00:00:00.000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let old = r#"{"kind":"http","timestamp":"2026-01-01T00:00:00.000Z"}"#;
+        let new = r#"{"kind":"http","timestamp":"2026-12-01T00:00:00.000Z"}"#;
+        let undated = r#"{"kind":"http"}"#;
+        let malformed = "not json at all";
+
+        assert!(!keep_by_age(old, Some(cutoff)));
+        assert!(keep_by_age(new, Some(cutoff)));
+        assert!(keep_by_age(undated, Some(cutoff)), "undated is kept");
+        assert!(keep_by_age(malformed, Some(cutoff)), "malformed is kept");
+        assert!(keep_by_age(old, None), "no filter keeps everything");
+    }
+
+    fn http_line(id: &str, ts: &str) -> String {
+        format!(r#"{{"id":"{id}","kind":"http","timestamp":"{ts}"}}"#)
+    }
+
+    #[test]
+    fn prune_by_age_drops_old_records_and_rewrites_atomically() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        let body = format!(
+            "{}\n{}\n{}\n",
+            http_line("1", "2026-01-01T00:00:00.000Z"),
+            http_line("2", "2026-06-15T00:00:00.000Z"),
+            http_line("3", "2026-12-31T00:00:00.000Z"),
+        );
+        std::fs::write(&path, &body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let cutoff = DateTime::parse_from_rfc3339("2026-06-01T00:00:00.000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let outcome = prune(
+            &path,
+            &PruneOptions {
+                older_than: Some(cutoff),
+                max_size: None,
+                dry_run: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome.removed, 1);
+        assert_eq!(outcome.kept, 2);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(!contents.contains(r#""id":"1""#));
+        assert!(contents.contains(r#""id":"2""#));
+        assert!(contents.contains(r#""id":"3""#));
+        // The atomic rewrite lands a fresh 0600 file regardless of the old mode.
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn prune_dry_run_reports_without_modifying() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        let body = format!(
+            "{}\n{}\n",
+            http_line("1", "2026-01-01T00:00:00.000Z"),
+            http_line("2", "2026-12-31T00:00:00.000Z"),
+        );
+        std::fs::write(&path, &body).unwrap();
+
+        let cutoff = DateTime::parse_from_rfc3339("2026-06-01T00:00:00.000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let outcome = prune(
+            &path,
+            &PruneOptions {
+                older_than: Some(cutoff),
+                max_size: None,
+                dry_run: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome.removed, 1);
+        // File is untouched by a dry run.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+    }
+
+    #[test]
+    fn prune_by_size_keeps_the_newest_that_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        let l1 = http_line("1", "2026-01-01T00:00:00.000Z");
+        let l2 = http_line("2", "2026-06-15T00:00:00.000Z");
+        let l3 = http_line("3", "2026-12-31T00:00:00.000Z");
+        std::fs::write(&path, format!("{l1}\n{l2}\n{l3}\n")).unwrap();
+
+        // Budget that fits only the last two lines.
+        let budget = (l2.len() + 1 + l3.len() + 1) as u64;
+        let outcome = prune(
+            &path,
+            &PruneOptions {
+                older_than: None,
+                max_size: Some(budget),
+                dry_run: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome.removed, 1);
+        assert_eq!(outcome.kept, 2);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(!contents.contains(r#""id":"1""#));
+        assert!(contents.contains(r#""id":"3""#));
+    }
+
+    #[test]
+    fn prune_missing_file_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.jsonl");
+        let outcome = prune(
+            &path,
+            &PruneOptions {
+                older_than: None,
+                max_size: Some(1),
+                dry_run: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.removed, 0);
+        assert_eq!(outcome.kept, 0);
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotation_shifts_numbered_files_and_drops_the_oldest() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        // A tiny cap so every second short line rotates.
+        let cfg = RotationConfig {
+            max_size: 20,
+            keep_files: 2,
+        };
+
+        let line = "0123456789012345\n"; // 17 bytes
+        for _ in 0..4 {
+            append_with_rotation(&path, line, &cfg).unwrap();
+        }
+
+        // The live file plus at most keep_files (2) rotated files exist; a .3
+        // must never appear.
+        assert!(path.exists());
+        assert!(sibling(&path, ".1").exists());
+        assert!(sibling(&path, ".2").exists());
+        assert!(!sibling(&path, ".3").exists());
+        // Rotated files keep the 0600 posture.
+        assert_eq!(
+            std::fs::metadata(sibling(&path, ".1"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotation_keep_zero_discards_on_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        let cfg = RotationConfig {
+            max_size: 20,
+            keep_files: 0,
+        };
+        let line = "0123456789012345\n"; // 17 bytes
+        append_with_rotation(&path, line, &cfg).unwrap();
+        append_with_rotation(&path, line, &cfg).unwrap();
+        // No .1 is retained; only the current (single-line) file survives.
+        assert!(!sibling(&path, ".1").exists());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), line);
     }
 }

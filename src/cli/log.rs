@@ -5,11 +5,12 @@
 //! `json` (byte-identical to the on-disk NDJSON), or `full`.
 
 mod format;
+mod prune;
 mod query;
 mod stream;
 
 use anyhow::{Context, Result};
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::request_log;
 use query::Filter;
@@ -27,8 +28,14 @@ pub enum Format {
 }
 
 /// Searches and pretty-prints the local invocation + HTTP request log.
+///
+/// With no subcommand, the flags below search the log; the `prune` subcommand
+/// trims it to bound its on-disk growth.
 #[derive(Parser)]
 pub struct LogCommand {
+    /// Subcommand; when absent, the flags below search the log.
+    #[command(subcommand)]
+    action: Option<LogAction>,
     /// Only records newer than this relative window (e.g. `30m`, `2h`, `1d`).
     #[arg(long, value_name = "DUR")]
     since: Option<String>,
@@ -71,9 +78,21 @@ pub struct LogCommand {
     follow: bool,
 }
 
+/// A `log` subcommand. Absent = search (the flags on [`LogCommand`]).
+#[derive(Subcommand)]
+enum LogAction {
+    /// Prune old records to bound the log's on-disk growth.
+    Prune(prune::PruneCommand),
+}
+
 impl LogCommand {
     /// Executes the `omni-dev log` command.
     pub fn execute(self) -> Result<()> {
+        if let Some(action) = self.action {
+            return match action {
+                LogAction::Prune(cmd) => cmd.execute(),
+            };
+        }
         let path = request_log::log_file_path().context("could not resolve the log file path")?;
         let filter = Filter::build(query::FilterInput {
             since: self.since.as_deref(),
